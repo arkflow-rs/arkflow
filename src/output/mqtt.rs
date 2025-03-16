@@ -242,4 +242,182 @@ impl MqttClient for AsyncClient {
         AsyncClient::disconnect(self).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // Mock MQTT client for testing
+    struct MockMqttClient {
+        connected: Arc<AtomicBool>,
+        published_messages: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    }
+
+    impl MockMqttClient {
+        fn new() -> Self {
+            Self {
+                connected: Arc::new(AtomicBool::new(true)),
+                published_messages: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MqttClient for MockMqttClient {
+        async fn create(
+            _mqtt_options: MqttOptions,
+            _cap: usize,
+        ) -> Result<(Self, rumqttc::EventLoop), Error> {
+            // Create a new EventLoop directly without using new() method
+            let (_, eventloop) = AsyncClient::new(MqttOptions::new("", "", 0), 10);
+            Ok((Self::new(), eventloop))
+        }
+
+        async fn publish<S, V>(
+            &self,
+            topic: S,
+            _qos: QoS,
+            _retain: bool,
+            payload: V,
+        ) -> Result<(), ClientError>
+        where
+            S: Into<String> + Send,
+            V: Into<Vec<u8>> + Send,
+        {
+          
+
+            let mut messages = self.published_messages.lock().await;
+            messages.push((topic.into(), payload.into()));
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<(), ClientError> {
+            self.connected.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Test creating a new MQTT output component
+    #[tokio::test]
+    async fn test_mqtt_output_new() {
+        let config = MqttOutputConfig {
+            host: "localhost".to_string(),
+            port: 1883,
+            client_id: "test_client".to_string(),
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            topic: "test/topic".to_string(),
+            qos: Some(1),
+            clean_session: Some(true),
+            keep_alive: Some(60),
+            retain: Some(false),
+        };
+
+        let output = MqttOutput::<MockMqttClient>::new(config);
+        assert!(output.is_ok());
+    }
+
+    /// Test MQTT output connection
+    #[tokio::test]
+    async fn test_mqtt_output_connect() {
+        let config = MqttOutputConfig {
+            host: "localhost".to_string(),
+            port: 1883,
+            client_id: "test_client".to_string(),
+            username: None,
+            password: None,
+            topic: "test/topic".to_string(),
+            qos: None,
+            clean_session: None,
+            keep_alive: None,
+            retain: None,
+        };
+
+        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        assert!(output.connect().await.is_ok());
+    }
+
+    /// Test MQTT message publishing
+    #[tokio::test]
+    async fn test_mqtt_output_write() {
+        let config = MqttOutputConfig {
+            host: "localhost".to_string(),
+            port: 1883,
+            client_id: "test_client".to_string(),
+            username: None,
+            password: None,
+            topic: "test/topic".to_string(),
+            qos: None,
+            clean_session: None,
+            keep_alive: None,
+            retain: None,
+        };
+
+        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        output.connect().await.unwrap();
+
+        let msg = MessageBatch::from_string("test message");
+        assert!(output.write(&msg).await.is_ok());
+
+        // Verify the message was published
+        let client = output.client.lock().await;
+        let mock_client = client.as_ref().unwrap();
+        let messages = mock_client.published_messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "test/topic");
+        assert_eq!(messages[0].1, b"test message");
+    }
+
+    /// Test MQTT output disconnection
+    #[tokio::test]
+    async fn test_mqtt_output_close() {
+        let config = MqttOutputConfig {
+            host: "localhost".to_string(),
+            port: 1883,
+            client_id: "test_client".to_string(),
+            username: None,
+            password: None,
+            topic: "test/topic".to_string(),
+            qos: None,
+            clean_session: None,
+            keep_alive: None,
+            retain: None,
+        };
+
+        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        output.connect().await.unwrap();
+        assert!(output.close().await.is_ok());
+
+        // Verify the client is disconnected
+        let client = output.client.lock().await;
+        let mock_client = client.as_ref().unwrap();
+        assert!(!mock_client.connected.load(Ordering::SeqCst));
+    }
+
+    /// Test error handling when writing to disconnected client
+    #[tokio::test]
+    async fn test_mqtt_output_write_disconnected() {
+        let config = MqttOutputConfig {
+            host: "localhost".to_string(),
+            port: 1883,
+            client_id: "test_client".to_string(),
+            username: None,
+            password: None,
+            topic: "test/topic".to_string(),
+            qos: None,
+            clean_session: None,
+            keep_alive: None,
+            retain: None,
+        };
+
+        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        output.connect().await.unwrap();
+        output.close().await.unwrap();
+
+        let msg = MessageBatch::from_string("test message");
+        assert!(output.write(&msg).await.is_err());
+    }
+}
  
