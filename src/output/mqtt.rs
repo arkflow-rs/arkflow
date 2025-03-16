@@ -5,7 +5,7 @@
 use crate::output::{register_output_builder, OutputBuilder};
 use crate::{output::Output, Error, MessageBatch};
 use async_trait::async_trait;
-use rumqttc::{AsyncClient, MqttOptions, QoS};
+use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,14 +38,14 @@ pub struct MqttOutputConfig {
 }
 
 /// MQTT output component
-pub struct MqttOutput {
+struct MqttOutput<T: MqttClient> {
     config: MqttOutputConfig,
-    client: Arc<Mutex<Option<AsyncClient>>>,
+    client: Arc<Mutex<Option<T>>>,
     connected: AtomicBool,
     eventloop_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
-impl MqttOutput {
+impl<T: MqttClient> MqttOutput<T> {
     /// Create a new MQTT output component
     pub fn new(config: MqttOutputConfig) -> Result<Self, Error> {
         Ok(Self {
@@ -58,7 +58,7 @@ impl MqttOutput {
 }
 
 #[async_trait]
-impl Output for MqttOutput {
+impl<T: MqttClient> Output for MqttOutput<T> {
     async fn connect(&self) -> Result<(), Error> {
         // Create MQTT options
         let mut mqtt_options =
@@ -80,8 +80,7 @@ impl Output for MqttOutput {
         }
 
         // Create an MQTT client
-        let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
-
+        let (client, mut eventloop) = T::create(mqtt_options, 10).await?;
         // Save the client
         let client_arc = self.client.clone();
         let mut client_guard = client_arc.lock().await;
@@ -178,10 +177,69 @@ impl OutputBuilder for MqttOutputBuilder {
             ));
         }
         let config: MqttOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MqttOutput::new(config)?))
+        Ok(Arc::new(MqttOutput::<AsyncClient>::new(config)?))
     }
 }
 
 pub fn init() {
     register_output_builder("mqtt", Arc::new(MqttOutputBuilder));
 }
+
+ 
+
+#[async_trait]
+trait MqttClient: Send + Sync {
+    async fn create(
+        mqtt_options: MqttOptions,
+        cap: usize,
+    ) -> Result<(Self, rumqttc::EventLoop), Error>
+    where
+        Self: Sized;
+
+    async fn publish<S, V>(
+        &self,
+        topic: S,
+        qos: QoS,
+        retain: bool,
+        payload: V,
+    ) -> Result<(), ClientError>
+    where
+        S: Into<String> + Send,
+        V: Into<Vec<u8>> + Send;
+        
+    // Add the disconnect method to the trait
+    async fn disconnect(&self) -> Result<(), ClientError>;
+}
+
+#[async_trait]
+impl MqttClient for AsyncClient {
+    async fn create(
+        mqtt_options: MqttOptions,
+        cap: usize,
+    ) -> Result<(Self, rumqttc::EventLoop), Error>
+    where
+        Self: Sized,
+    {
+        let (client, eventloop) = AsyncClient::new(mqtt_options, cap);
+        Ok((client, eventloop))
+    }
+
+    async fn publish<S, V>(
+        &self,
+        topic: S,
+        qos: QoS,
+        retain: bool,
+        payload: V,
+    ) -> Result<(), ClientError>
+    where
+        S: Into<String> + Send,
+        V: Into<Vec<u8>> + Send,
+    {
+        AsyncClient::publish(self, topic, qos, retain, payload).await
+    }
+    
+    async fn disconnect(&self) -> Result<(), ClientError>{
+        AsyncClient::disconnect(self).await
+    }
+}
+ 
