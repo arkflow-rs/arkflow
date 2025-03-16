@@ -9,7 +9,11 @@ use crate::{output::Output, MessageBatch};
 use crate::{Content, Error};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
+use rdkafka::error::KafkaResult;
+use rdkafka::message::ToBytes;
+use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::util::Timeout;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -52,12 +56,12 @@ pub struct KafkaOutputConfig {
 }
 
 /// Kafka output component
-pub struct KafkaOutput {
+struct KafkaOutput<T> {
     config: KafkaOutputConfig,
-    producer: Arc<RwLock<Option<FutureProducer>>>,
+    producer: Arc<RwLock<Option<T>>>,
 }
 
-impl KafkaOutput {
+impl<T: KafkaClient> KafkaOutput<T> {
     /// Create a new Kafka output component
     pub fn new(config: KafkaOutputConfig) -> Result<Self, Error> {
         Ok(Self {
@@ -68,7 +72,7 @@ impl KafkaOutput {
 }
 
 #[async_trait]
-impl Output for KafkaOutput {
+impl<T: KafkaClient> Output for KafkaOutput<T> {
     async fn connect(&self) -> Result<(), Error> {
         let mut client_config = ClientConfig::new();
 
@@ -91,8 +95,7 @@ impl Output for KafkaOutput {
         }
 
         // Create a producer
-        let producer: FutureProducer = client_config
-            .create()
+        let producer = T::create(&client_config)
             .map_err(|e| Error::Connection(format!("A Kafka producer cannot be created: {}", e)))?;
 
         // Save the producer instance
@@ -172,10 +175,50 @@ impl OutputBuilder for KafkaOutputBuilder {
         }
         let config: KafkaOutputConfig = serde_json::from_value(config.clone().unwrap())?;
 
-        Ok(Arc::new(KafkaOutput::new(config)?))
+        Ok(Arc::new(KafkaOutput::<FutureProducer>::new(config)?))
     }
 }
 
 pub fn init() {
     register_output_builder("kafka", Arc::new(KafkaOutputBuilder));
+}
+#[async_trait]
+trait KafkaClient: Send + Sync {
+    fn create(config: &ClientConfig) -> KafkaResult<Self>
+    where
+        Self: Sized;
+
+    async fn send<K, P, T>(
+        &self,
+        record: FutureRecord<'_, K, P>,
+        queue_timeout: T,
+    ) -> OwnedDeliveryResult
+    where
+        K: ToBytes + ?Sized + Sync,
+        P: ToBytes + ?Sized + Sync,
+        T: Into<Timeout> + Sync + Send;
+
+    fn flush<T: Into<Timeout>>(&self, timeout: T) -> KafkaResult<()>;
+}
+#[async_trait]
+impl KafkaClient for FutureProducer {
+    fn create(config: &ClientConfig) -> KafkaResult<Self> {
+        config.create()
+    }
+    async fn send<K, P, T>(
+        &self,
+        record: FutureRecord<'_, K, P>,
+        queue_timeout: T,
+    ) -> OwnedDeliveryResult
+    where
+        K: ToBytes + ?Sized + Sync,
+        P: ToBytes + ?Sized + Sync,
+        T: Into<Timeout> + Sync + Send,
+    {
+        FutureProducer::send(self, record, queue_timeout).await
+    }
+
+    fn flush<T: Into<Timeout>>(&self, timeout: T) -> KafkaResult<()> {
+        Producer::flush(self, timeout)
+    }
 }
