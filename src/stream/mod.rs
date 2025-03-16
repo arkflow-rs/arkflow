@@ -15,7 +15,7 @@ pub struct Stream {
     input: Arc<dyn Input>,
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
-    thread_num: i32,
+    thread_num: u32,
 }
 
 impl Stream {
@@ -24,7 +24,7 @@ impl Stream {
         input: Arc<dyn Input>,
         pipeline: Pipeline,
         output: Arc<dyn Output>,
-        thread_num: i32,
+        thread_num: u32,
     ) -> Self {
         Self {
             input,
@@ -48,8 +48,7 @@ impl Stream {
         let wg = WaitGroup::new();
 
         let worker = wg.worker();
-        let output_arc = self.output.clone();
-        tokio::spawn(Self::do_input(input, input_sender, worker, output_arc));
+        tokio::spawn(Self::do_input(input, input_sender, worker));
 
         for i in 0..self.thread_num {
             let pipeline = self.pipeline.clone();
@@ -102,7 +101,7 @@ impl Stream {
                     for x in &msg.0 {
                         match self.output.write(x).await {
                             Ok(_) => {
-                                success_cnt = success_cnt + 1;
+                                success_cnt += 1;
                             }
                             Err(e) => {
                                 error!("{}", e);
@@ -111,7 +110,7 @@ impl Stream {
                     }
 
                     // Confirm that the message has been successfully processed
-                    if size == &success_cnt {
+                    if *size == success_cnt {
                         msg.1.ack().await;
                     }
                 }
@@ -134,7 +133,6 @@ impl Stream {
         input: Arc<dyn Input>,
         input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
         _worker: Worker,
-        output_arc: Arc<dyn Output>,
     ) {
         // Set up signal handlers
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
@@ -166,7 +164,7 @@ impl Stream {
                                 return;
                             }
                             Error::Disconnection => loop {
-                                match output_arc.connect().await {
+                                match input.connect().await {
                                     Ok(_) => {
                                         info!("input reconnected");
                                         break;
@@ -211,7 +209,6 @@ pub struct StreamConfig {
 }
 
 impl StreamConfig {
-    /// 根据配置构建流
     pub fn build(&self) -> Result<Stream, Error> {
         let input = self.input.build()?;
         let (pipeline, thread_num) = self.pipeline.build()?;
