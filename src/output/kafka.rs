@@ -539,10 +539,12 @@ mod tests {
         let output = KafkaOutput::<MockKafkaClient>::new(config).unwrap();
         output.connect().await.unwrap();
 
-        // Set the producer to fail
-        let producer_guard = output.producer.read().await;
-        let producer = producer_guard.as_ref().unwrap();
-        producer.should_fail.store(true, Ordering::SeqCst);
+        // Set the producer to fail before acquiring the write lock
+        {
+            let producer_guard = output.producer.read().await;
+            let producer = producer_guard.as_ref().unwrap();
+            producer.should_fail.store(true, Ordering::SeqCst);
+        }
 
         // Close the connection
         let result = output.close().await;
