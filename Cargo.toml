@@ -9,26 +9,23 @@ homepage = "https://github.com/chenquan/arkflow"
 license = "Apache-2.0"
 
 [dependencies]
-# 异步运行时
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
+waitgroup = "0.1.2"
 
-# 序列化/反序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+humantime = "2.1.0"
 
-# 错误处理
 thiserror = "2.0"
 anyhow = "1.0"
 
-# 日志和监控
 tracing = "0.1"
 tracing-subscriber = "0.3"
 prometheus = "0.13"
 
-# 数据处理
 datafusion = "46"
 arrow-json = "54"
 prost-reflect = "0.14.7"
@@ -37,23 +34,19 @@ protobuf-parse = "3.7.2"
 protobuf = "3.7.2"
 
 
-# 配置和插件系统
 toml = "0.8"
 lazy_static = "1.4"
 
-# HTTP客户端/服务器
 axum = "0.6"
 reqwest = { version = "0.12", features = ["json"] }
 
 
-# 命令行工具
 clap = { version = "4.3", features = ["derive"] }
 colored = "3.0"
+
 flume = "=0.11"
 rumqttc = "0.24.0"
 
-# 时间格式化
-humantime = "2.1.0"
 
 
 # Kafka
@@ -62,10 +55,7 @@ rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 
-waitgroup = "0.1.2"
 
 [dev-dependencies]
 tempfile = "3.19.0"
-
-# 测试工具
 mockall = "0.12"
