@@ -185,15 +185,27 @@ mod tests {
         map.insert("null_field", Value::Null);
         map.insert("bool_field", Value::Bool(true));
         map.insert("int_field", Value::Number(serde_json::Number::from(42)));
-        map.insert("uint_field", Value::Number(serde_json::Number::from(100u64)));
-        map.insert("float_field", Value::Number(serde_json::Number::from_f64(3.14).unwrap()));
+        map.insert(
+            "uint_field",
+            Value::Number(serde_json::Number::from(100u64)),
+        );
+        map.insert(
+            "float_field",
+            Value::Number(serde_json::Number::from_f64(3.14).unwrap()),
+        );
         map.insert("string_field", Value::String("test".to_string()));
-        map.insert("array_field", Value::Array(vec![Value::Number(serde_json::Number::from(1))]));
-        map.insert("object_field", Value::Object({
-            let mut inner = serde_json::Map::new();
-            inner.insert("key".to_string(), Value::String("value".to_string()));
-            inner
-        }));
+        map.insert(
+            "array_field",
+            Value::Array(vec![Value::Number(serde_json::Number::from(1))]),
+        );
+        map.insert(
+            "object_field",
+            Value::Object({
+                let mut inner = serde_json::Map::new();
+                inner.insert("key".to_string(), Value::String("value".to_string()));
+                inner
+            }),
+        );
 
         // Serialize to JSON bytes
         serde_json::to_vec(&map).unwrap()
@@ -221,7 +233,8 @@ mod tests {
 
                 // Verify column names
                 let schema = batch.schema();
-                let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let field_names: Vec<&str> =
+                    schema.fields().iter().map(|f| f.name().as_str()).collect();
                 assert!(field_names.contains(&"null_field"));
                 assert!(field_names.contains(&"bool_field"));
                 assert!(field_names.contains(&"int_field"));
@@ -230,8 +243,8 @@ mod tests {
                 assert!(field_names.contains(&"string_field"));
                 assert!(field_names.contains(&"array_field"));
                 assert!(field_names.contains(&"object_field"));
-            },
-            _ => panic!("Expected Arrow content")
+            }
+            _ => panic!("Expected Arrow content"),
         }
     }
 
@@ -245,7 +258,10 @@ mod tests {
         let result = processor.process(msg_batch).await.unwrap();
 
         // Verify the result
-        assert!(result.is_empty(), "Should return empty result for empty input");
+        assert!(
+            result.is_empty(),
+            "Should return empty result for empty input"
+        );
     }
 
     #[tokio::test]
@@ -343,8 +359,8 @@ mod tests {
                 assert_eq!(obj_map["string_field"], "test");
                 assert_eq!(obj_map["int_field"], 42);
                 assert_eq!(obj_map["bool_field"], true);
-            },
-            _ => panic!("Expected Binary content")
+            }
+            _ => panic!("Expected Binary content"),
         }
     }
 
@@ -377,17 +393,29 @@ mod tests {
         for (i, field) in schema.fields().iter().enumerate() {
             match field.name().as_str() {
                 "bool_field" => {
-                    let array = result.column(i).as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let array = result
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .unwrap();
                     assert_eq!(array.value(0), true);
-                },
+                }
                 "int_field" => {
-                    let array = result.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let array = result
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
                     assert_eq!(array.value(0), 42);
-                },
+                }
                 "string_field" => {
-                    let array = result.column(i).as_any().downcast_ref::<StringArray>().unwrap();
+                    let array = result
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
                     assert_eq!(array.value(0), "test");
-                },
+                }
                 _ => {}
             }
         }
@@ -397,13 +425,13 @@ mod tests {
     async fn test_arrow_to_json_function() {
         // Test the arrow_to_json function directly
         // Create a simple Arrow record batch
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("test_field", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "test_field",
+            DataType::Utf8,
+            false,
+        )]));
 
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec!["test_value"])),
-        ];
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["test_value"]))];
 
         let record_batch = RecordBatch::try_new(schema, columns).unwrap();
 

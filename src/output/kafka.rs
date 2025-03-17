@@ -226,9 +226,9 @@ impl KafkaClient for FutureProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use rdkafka::Timestamp;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // Mock Kafka client for testing
@@ -282,13 +282,14 @@ mod tests {
             // Check if we should simulate a failure
             if self.should_fail.load(Ordering::SeqCst) {
                 let err = rdkafka::error::KafkaError::MessageProduction(
-                    rdkafka::types::RDKafkaErrorCode::QueueFull);
+                    rdkafka::types::RDKafkaErrorCode::QueueFull,
+                );
                 // Create OwnedMessage instead of Vec<u8> for the error return
                 let payload = rdkafka::message::OwnedMessage::new(
                     Some(record.payload.unwrap().to_bytes().to_vec()),
                     None,
                     record.topic.to_string(),
-                     Timestamp::NotAvailable,
+                    Timestamp::NotAvailable,
                     0,
                     0,
                     None,
@@ -301,12 +302,17 @@ mod tests {
             messages.push((
                 record.topic.to_string(),
                 record.payload.unwrap().to_bytes().to_vec(),
-                record.key.map(|k| String::from_utf8_lossy(k.to_bytes()).to_string()),
+                record
+                    .key
+                    .map(|k| String::from_utf8_lossy(k.to_bytes()).to_string()),
             ));
 
             // Return a successful delivery
             // Convert RDKafkaRespErr to i32 for the success case
-            Ok((rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR as i32, 0))
+            Ok((
+                rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR as i32,
+                0,
+            ))
         }
 
         fn flush<T: Into<Timeout>>(&self, _timeout: T) -> KafkaResult<()> {

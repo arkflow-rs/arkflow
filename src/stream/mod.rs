@@ -40,9 +40,10 @@ impl Stream {
         self.input.connect().await?;
         self.output.connect().await?;
 
-        let (input_sender, input_receiver) = flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(1000);
+        let (input_sender, input_receiver) =
+            flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
-            flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(1000);
+            flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let input = Arc::clone(&self.input);
 
         let wg = WaitGroup::new();

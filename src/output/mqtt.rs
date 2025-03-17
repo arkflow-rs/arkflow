@@ -185,8 +185,6 @@ pub fn init() {
     register_output_builder("mqtt", Arc::new(MqttOutputBuilder));
 }
 
- 
-
 #[async_trait]
 trait MqttClient: Send + Sync {
     async fn create(
@@ -206,7 +204,7 @@ trait MqttClient: Send + Sync {
     where
         S: Into<String> + Send,
         V: Into<Vec<u8>> + Send;
-        
+
     // Add the disconnect method to the trait
     async fn disconnect(&self) -> Result<(), ClientError>;
 }
@@ -237,8 +235,8 @@ impl MqttClient for AsyncClient {
     {
         AsyncClient::publish(self, topic, qos, retain, payload).await
     }
-    
-    async fn disconnect(&self) -> Result<(), ClientError>{
+
+    async fn disconnect(&self) -> Result<(), ClientError> {
         AsyncClient::disconnect(self).await
     }
 }
@@ -286,8 +284,6 @@ mod tests {
             S: Into<String> + Send,
             V: Into<Vec<u8>> + Send,
         {
-          
-
             let mut messages = self.published_messages.lock().await;
             messages.push((topic.into(), payload.into()));
             Ok(())
@@ -420,4 +416,3 @@ mod tests {
         assert!(output.write(&msg).await.is_err());
     }
 }
- 

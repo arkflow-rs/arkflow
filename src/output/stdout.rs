@@ -213,9 +213,18 @@ mod tests {
 
         // Test multiple messages
         // Write multiple messages one by one
-        output.write(&MessageBatch::from_string("first")).await.unwrap();
-        output.write(&MessageBatch::from_string("second")).await.unwrap();
-        output.write(&MessageBatch::from_string("third")).await.unwrap();
+        output
+            .write(&MessageBatch::from_string("first"))
+            .await
+            .unwrap();
+        output
+            .write(&MessageBatch::from_string("second"))
+            .await
+            .unwrap();
+        output
+            .write(&MessageBatch::from_string("third"))
+            .await
+            .unwrap();
 
         let writer = output.writer.lock().await;
         let output_content = writer.get_output();

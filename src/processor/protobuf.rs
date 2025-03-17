@@ -293,7 +293,10 @@ impl ProtobufProcessor {
                     prost_reflect::Kind::Enum(_) => {
                         if let Some(value) = column.as_any().downcast_ref::<Int32Array>() {
                             if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::EnumNumber(value.value(0)));
+                                proto_msg.set_field_by_name(
+                                    field_name,
+                                    Value::EnumNumber(value.value(0)),
+                                );
                             }
                         }
                     }
@@ -388,7 +391,6 @@ impl ProcessorBuilder for ProtobufProcessorBuilder {
 pub fn init() {
     register_processor_builder("protobuf", Arc::new(ProtobufProcessorBuilder));
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -507,7 +509,11 @@ message TestMessage {
 
         // Test processor creation
         let processor = ProtobufProcessor::new(config);
-        assert!(processor.is_ok(), "Failed to create ProtobufProcessor: {:?}", processor.err());
+        assert!(
+            processor.is_ok(),
+            "Failed to create ProtobufProcessor: {:?}",
+            processor.err()
+        );
 
         // Clean up is handled automatically when temp_dir goes out of scope
         drop(temp_dir);
@@ -533,22 +539,42 @@ message TestMessage {
 
         // Test conversion from protobuf to arrow
         let arrow_batch = processor.protobuf_to_arrow(&proto_data);
-        assert!(arrow_batch.is_ok(), "Failed to convert Protobuf to Arrow: {:?}", arrow_batch.err());
+        assert!(
+            arrow_batch.is_ok(),
+            "Failed to convert Protobuf to Arrow: {:?}",
+            arrow_batch.err()
+        );
 
         let batch = arrow_batch.unwrap();
 
         // Verify the converted data
         assert_eq!(batch.num_rows(), 1, "Expected 1 row in the Arrow batch");
-        assert_eq!(batch.num_columns(), 10, "Expected 10 columns in the Arrow batch");
+        assert_eq!(
+            batch.num_columns(),
+            10,
+            "Expected 10 columns in the Arrow batch"
+        );
 
         // Verify specific field values
-        let bool_array = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let bool_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert_eq!(bool_array.value(0), true);
 
-        let int32_array = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let int32_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(int32_array.value(0), 42);
 
-        let string_array = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+        let string_array = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(string_array.value(0), "test string");
 
         // Clean up
@@ -575,23 +601,43 @@ message TestMessage {
 
         // Test conversion from Arrow to Protobuf
         let proto_data = processor.arrow_to_protobuf(&arrow_batch);
-        assert!(proto_data.is_ok(), "Failed to convert Arrow to Protobuf: {:?}", proto_data.err());
+        assert!(
+            proto_data.is_ok(),
+            "Failed to convert Arrow to Protobuf: {:?}",
+            proto_data.err()
+        );
 
         // Verify the converted data by converting it back to Arrow
         let proto_bytes = proto_data.unwrap();
         let arrow_batch_2 = processor.protobuf_to_arrow(&proto_bytes);
-        assert!(arrow_batch_2.is_ok(), "Failed to convert back to Arrow: {:?}", arrow_batch_2.err());
+        assert!(
+            arrow_batch_2.is_ok(),
+            "Failed to convert back to Arrow: {:?}",
+            arrow_batch_2.err()
+        );
 
         let batch = arrow_batch_2.unwrap();
 
         // Verify specific field values after round-trip conversion
-        let bool_array = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let bool_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert_eq!(bool_array.value(0), true);
 
-        let int32_array = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let int32_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(int32_array.value(0), 42);
 
-        let string_array = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+        let string_array = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(string_array.value(0), "test string");
 
         // Clean up
@@ -617,8 +663,15 @@ message TestMessage {
         let empty_batch = MessageBatch::new_binary(vec![]);
         let result = processor.process(empty_batch).await;
 
-        assert!(result.is_ok(), "Failed to process empty batch: {:?}", result.err());
-        assert!(result.unwrap().is_empty(), "Expected empty result for empty batch");
+        assert!(
+            result.is_ok(),
+            "Failed to process empty batch: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "Expected empty result for empty batch"
+        );
 
         // Clean up
         drop(temp_dir);
@@ -647,7 +700,11 @@ message TestMessage {
 
         // Test processing
         let result = processor.process(msg_batch).await;
-        assert!(result.is_ok(), "Failed to process binary to arrow: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to process binary to arrow: {:?}",
+            result.err()
+        );
 
         let batches = result.unwrap();
         assert_eq!(batches.len(), 1, "Expected 1 message batch");
@@ -657,7 +714,7 @@ message TestMessage {
             Content::Arrow(batch) => {
                 assert_eq!(batch.num_rows(), 1, "Expected 1 row");
                 assert_eq!(batch.num_columns(), 10, "Expected 10 columns");
-            },
+            }
             _ => panic!("Expected Arrow content"),
         }
 
@@ -688,7 +745,11 @@ message TestMessage {
 
         // Test processing
         let result = processor.process(msg_batch).await;
-        assert!(result.is_ok(), "Failed to process arrow to binary: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to process arrow to binary: {:?}",
+            result.err()
+        );
 
         let batches = result.unwrap();
         assert_eq!(batches.len(), 1, "Expected 1 message batch");
@@ -697,7 +758,7 @@ message TestMessage {
         match &batches[0].content {
             Content::Binary(data) => {
                 assert_eq!(data.len(), 1, "Expected 1 binary message");
-            },
+            }
             _ => panic!("Expected Binary content"),
         }
 
@@ -705,4 +766,3 @@ message TestMessage {
         drop(temp_dir);
     }
 }
-
