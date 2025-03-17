@@ -1,0 +1,66 @@
+[package]
+name = "arkflow"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+
+[dependencies]
+tokio = { workspace = true}
+async-trait = { workspace = true }
+futures = { workspace = true }
+waitgroup = {workspace = true}
+
+serde = { workspace = true}
+
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+humantime = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+tracing = {workspace = true}
+tracing-subscriber = {workspace = true}
+prometheus = { workspace = true }
+
+datafusion = { workspace = true }
+arrow-json = { workspace = true }
+prost-reflect = { workspace = true }
+prost-types = { workspace = true }
+protobuf-parse = { workspace = true }
+protobuf = { workspace = true }
+
+
+toml = { workspace = true }
+lazy_static = { workspace = true }
+
+axum = { workspace = true }
+reqwest = { workspace = true }
+
+
+clap = { workspace = true }
+colored = { workspace = true }
+
+flume = { workspace = true }
+rumqttc = { workspace = true }
+
+
+
+# Kafka
+aws-msk-iam-sasl-signer = { workspace = true }
+rdkafka = { workspace = true }
+rdkafka-sys ={ workspace = true }
+sasl2-sys = { workspace = true }
+
+arkflow-core = { workspace = true }
+arkflow-plugin = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mockall = { workspace = true }
+

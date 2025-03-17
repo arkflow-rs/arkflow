@@ -1,5 +1,4 @@
-[package]
-name = "arkflow"
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
@@ -8,7 +7,16 @@ repository = "https://github.com/chenquan/arkflow"
 homepage = "https://github.com/chenquan/arkflow"
 license = "Apache-2.0"
 
-[dependencies]
+[workspace]
+members = [
+    "crates/arkflow-plugin",
+    "crates/arkflow-core",
+    "crates/arkflow"
+]
+
+resolver = "2"
+
+[workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -55,7 +63,9 @@ rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 
-
-[dev-dependencies]
+arkflow-core = { path = "crates/arkflow-core", version = "0.1.0" }
+arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.1.0" }
 tempfile = "3.19.0"
 mockall = "0.12"
+#
+#[workspace.dev-dependencies]
