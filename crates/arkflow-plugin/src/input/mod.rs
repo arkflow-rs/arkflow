@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 
 pub mod file;
-mod generate;
+pub mod generate;
 pub mod http;
 pub mod kafka;
 pub mod memory;

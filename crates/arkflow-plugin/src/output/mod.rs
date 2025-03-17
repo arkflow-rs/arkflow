@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-mod drop;
+pub mod drop;
 pub mod file;
 pub mod http;
 pub mod kafka;
