@@ -15,7 +15,7 @@ pub struct Stream {
     input: Arc<dyn Input>,
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
-    thread_num: i32,
+    thread_num: u32,
 }
 
 impl Stream {
@@ -24,7 +24,7 @@ impl Stream {
         input: Arc<dyn Input>,
         pipeline: Pipeline,
         output: Arc<dyn Output>,
-        thread_num: i32,
+        thread_num: u32,
     ) -> Self {
         Self {
             input,
@@ -40,16 +40,16 @@ impl Stream {
         self.input.connect().await?;
         self.output.connect().await?;
 
-        let (input_sender, input_receiver) = flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(1000);
+        let (input_sender, input_receiver) =
+            flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
-            flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(1000);
+            flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let input = Arc::clone(&self.input);
 
         let wg = WaitGroup::new();
 
         let worker = wg.worker();
-        let output_arc = self.output.clone();
-        tokio::spawn(Self::do_input(input, input_sender, worker, output_arc));
+        tokio::spawn(Self::do_input(input, input_sender, worker));
 
         for i in 0..self.thread_num {
             let pipeline = self.pipeline.clone();
@@ -111,7 +111,7 @@ impl Stream {
                     }
 
                     // Confirm that the message has been successfully processed
-                    if size == &success_cnt {
+                    if *size == success_cnt {
                         msg.1.ack().await;
                     }
                 }
@@ -134,7 +134,6 @@ impl Stream {
         input: Arc<dyn Input>,
         input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
         _worker: Worker,
-        output_arc: Arc<dyn Output>,
     ) {
         // Set up signal handlers
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
@@ -166,7 +165,7 @@ impl Stream {
                                 return;
                             }
                             Error::Disconnection => loop {
-                                match output_arc.connect().await {
+                                match input.connect().await {
                                     Ok(_) => {
                                         info!("input reconnected");
                                         break;

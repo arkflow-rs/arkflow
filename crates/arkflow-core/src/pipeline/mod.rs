@@ -45,13 +45,13 @@ impl Pipeline {
 /// Pipeline configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
-    pub thread_num: i32,
+    pub thread_num: u32,
     pub processors: Vec<crate::processor::ProcessorConfig>,
 }
 
 impl PipelineConfig {
     /// Build pipelines based on your configuration
-    pub fn build(&self) -> Result<(Pipeline, i32), Error> {
+    pub fn build(&self) -> Result<(Pipeline, u32), Error> {
         let mut processors = Vec::new();
         for processor_config in &self.processors {
             processors.push(processor_config.build()?);
