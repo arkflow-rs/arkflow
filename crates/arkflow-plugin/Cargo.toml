@@ -17,6 +17,7 @@ futures = { workspace = true }
 waitgroup = { workspace = true }
 
 serde = { workspace = true }
+pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
