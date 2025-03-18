@@ -72,18 +72,18 @@ impl EngineConfig {
 
         // Determine the format based on the file extension.
         if let Some(format) = get_format_from_path(path) {
-            match format {
+            return match format {
                 ConfigFormat::YAML => {
-                    return serde_yaml::from_str(&content)
-                        .map_err(|e| Error::Config(format!("YAML parsing error: {}", e)));
+                    serde_yaml::from_str(&content)
+                        .map_err(|e| Error::Config(format!("YAML parsing error: {}", e)))
                 }
                 ConfigFormat::JSON => {
-                    return serde_json::from_str(&content)
-                        .map_err(|e| Error::Config(format!("JSON parsing error: {}", e)));
+                    serde_json::from_str(&content)
+                        .map_err(|e| Error::Config(format!("JSON parsing error: {}", e)))
                 }
                 ConfigFormat::TOML => {
-                    return toml::from_str(&content)
-                        .map_err(|e| Error::Config(format!("TOML parsing error: {}", e)));
+                    toml::from_str(&content)
+                        .map_err(|e| Error::Config(format!("TOML parsing error: {}", e)))
                 }
             }
         };
@@ -91,38 +91,7 @@ impl EngineConfig {
         Err(Error::Config("The configuration file format cannot be determined. Please use YAML, JSON, or TOML format.".to_string()))
     }
 
-    /// Save configuration to file
-    pub fn save_to_file(&self, path: &str) -> Result<(), Error> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| Error::Config(format!("Configuration cannot be serialized.: {}", e)))?;
 
-        std::fs::write(path, content).map_err(|e| {
-            Error::Config(format!("Unable to write to the configuration file.: {}", e))
-        })
-    }
-}
-
-/// Create default configuration
-pub fn default_config() -> EngineConfig {
-    EngineConfig {
-        streams: vec![],
-        http: Some(HttpServerConfig {
-            address: "0.0.0.0:8000".to_string(),
-            cors_enabled: false,
-            health_enabled: true,
-        }),
-        metrics: Some(MetricsConfig {
-            enabled: true,
-            type_name: "prometheus".to_string(),
-            prefix: Some("benthos".to_string()),
-            tags: None,
-        }),
-        logging: Some(LoggingConfig {
-            level: "info".to_string(),
-            file_output: None,
-            file_path: None,
-        }),
-    }
 }
 
 /// Get configuration format from file path.
