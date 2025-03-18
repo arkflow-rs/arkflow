@@ -30,7 +30,7 @@ pub struct LoggingConfig {
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    /// Flow configuration
+    /// Streams configuration
     pub streams: Vec<StreamConfig>,
     /// Logging configuration (optional)
     pub logging: Option<LoggingConfig>,
