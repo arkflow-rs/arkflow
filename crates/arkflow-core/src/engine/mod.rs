@@ -37,7 +37,7 @@ impl Engine {
                 match stream.run().await {
                     Ok(_) => info!("Flow #{} completed successfully", i + 1),
                     Err(e) => {
-                        error!("Stream #{} ran with error: {}", i + 1, e)
+                        error!("Flow #{} ran with error: {}", i + 1, e)
                     }
                 }
             });
