@@ -76,7 +76,7 @@ impl BatchProcessor {
                 }
                 let schema = combined_content[0].schema();
                 let batch = arrow::compute::concat_batches(&schema, &combined_content)
-                    .map_err(|e| Error::Processing(format!("Merge batches failed: {}", e)))?;
+                    .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
                 Ok(vec![MessageBatch::new_arrow(batch)])
             }
             "binary" => {
@@ -89,7 +89,7 @@ impl BatchProcessor {
                 }
                 Ok(vec![MessageBatch::new_binary(combined_content)])
             }
-            _ => Err(Error::Processing("Invalid data type".to_string())),
+            _ => Err(Error::Process("Invalid data type".to_string())),
         };
 
         batch.clear();
@@ -107,12 +107,12 @@ impl Processor for BatchProcessor {
         match &msg.content {
             Content::Arrow(_) => {
                 if self.config.data_type != "arrow" {
-                    return Err(Error::Processing("Invalid data type".to_string()));
+                    return Err(Error::Process("Invalid data type".to_string()));
                 }
             }
             Content::Binary(_) => {
                 if self.config.data_type != "binary" {
-                    return Err(Error::Processing("Invalid data type".to_string()));
+                    return Err(Error::Process("Invalid data type".to_string()));
                 }
             }
         }
@@ -244,7 +244,7 @@ mod tests {
 
         assert!(result.is_err(), "Should return error for invalid data type");
         assert!(
-            matches!(result, Err(Error::Processing(_))),
+            matches!(result, Err(Error::Process(_))),
             "Should be processing error"
         );
 

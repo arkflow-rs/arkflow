@@ -44,11 +44,11 @@ impl Input for GenerateInput {
         if let Some(count) = self.config.count {
             let current_count = self.count.load(Ordering::SeqCst);
             if current_count >= count as i64 {
-                return Err(Error::Done);
+                return Err(Error::EOF);
             }
             // Check if adding the current batch would exceed the total count limit
             if current_count + self.batch_size as i64 > count as i64 {
-                return Err(Error::Done);
+                return Err(Error::EOF);
             }
         }
         let mut msgs = Vec::with_capacity(self.batch_size);
@@ -167,7 +167,7 @@ mod tests {
 
         // Read the third batch of messages (reached the limit of count=5, because 2+2+2>5)
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
     }
 
     #[tokio::test]
@@ -226,7 +226,7 @@ mod tests {
 
         // Try to read the third batch of messages (should return Done error)
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
     }
 
     #[tokio::test]

@@ -110,7 +110,7 @@ impl Input for HttpInput {
         } else {
             // If the queue is empty, an error is returned after waiting for a while
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            Err(Error::Processing("The queue is empty".to_string()))
+            Err(Error::Process("The queue is empty".to_string()))
         }
     }
 
@@ -209,7 +209,7 @@ mod tests {
         let result = input.read().await;
         assert!(result.is_err());
         match result {
-            Err(Error::Processing(_)) => {} // Expected error type
+            Err(Error::Process(_)) => {} // Expected error type
             _ => panic!("Expected Processing error"),
         }
 

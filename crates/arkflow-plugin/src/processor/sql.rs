@@ -45,7 +45,7 @@ impl SqlProcessor {
             .unwrap_or(DEFAULT_TABLE_NAME);
 
         ctx.register_batch(table_name, batch)
-            .map_err(|e| Error::Processing(format!("Registration failed: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
 
         // Execute the SQL query and collect the results.
         let sql_options = SQLOptions::new()
@@ -55,12 +55,12 @@ impl SqlProcessor {
         let df = ctx
             .sql_with_options(&self.config.query, sql_options)
             .await
-            .map_err(|e| Error::Processing(format!("SQL query error: {}", e)))?;
+            .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
 
         let result_batches = df
             .collect()
             .await
-            .map_err(|e| Error::Processing(format!("Collection query results error: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?;
 
         if result_batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -72,7 +72,7 @@ impl SqlProcessor {
 
         Ok(
             arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Processing(format!("Batch merge failed: {}", e)))?,
+                .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
     }
 }
@@ -88,7 +88,7 @@ impl Processor for SqlProcessor {
         let batch: RecordBatch = match msg_batch.content {
             Content::Arrow(v) => v,
             Content::Binary(_) => {
-                return Err(Error::Processing("Unsupported input format".to_string()))?;
+                return Err(Error::Process("Unsupported input format".to_string()))?;
             }
         };
 
@@ -305,7 +305,7 @@ mod tests {
         let result = processor.process(msg_batch).await;
 
         // Verify that an error is returned
-        assert!(matches!(result, Err(Error::Processing(_))));
+        assert!(matches!(result, Err(Error::Process(_))));
     }
 
     #[tokio::test]
@@ -322,7 +322,7 @@ mod tests {
         let result = processor.process(msg_batch).await;
 
         // Verify that an error is returned
-        assert!(matches!(result, Err(Error::Processing(_))));
+        assert!(matches!(result, Err(Error::Process(_))));
     }
 
     #[tokio::test]

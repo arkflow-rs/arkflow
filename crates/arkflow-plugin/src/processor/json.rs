@@ -24,9 +24,7 @@ pub struct JsonToArrowProcessor;
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         match msg_batch.content {
-            Content::Arrow(_) => Err(Error::Processing(
-                "The input must be binary data".to_string(),
-            )),
+            Content::Arrow(_) => Err(Error::Process("The input must be binary data".to_string())),
             Content::Binary(v) => {
                 let mut batches = Vec::with_capacity(v.len());
                 for x in v {
@@ -39,7 +37,7 @@ impl Processor for JsonToArrowProcessor {
 
                 let schema = batches[0].schema();
                 let batch = arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| Error::Processing(format!("Merge batches failed: {}", e)))?;
+                    .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
                 Ok(vec![MessageBatch::new_arrow(batch)])
             }
         }
@@ -60,7 +58,7 @@ impl Processor for ArrowToJsonProcessor {
                 let json_data = arrow_to_json(&v)?;
                 Ok(vec![MessageBatch::new_binary(vec![json_data])])
             }
-            Content::Binary(_) => Err(Error::Processing(
+            Content::Binary(_) => Err(Error::Process(
                 "The input must be in Arrow format".to_string(),
             )),
         }
@@ -74,7 +72,7 @@ impl Processor for ArrowToJsonProcessor {
 fn json_to_arrow(content: &Bytes) -> Result<RecordBatch, Error> {
     // 解析JSON内容
     let json_value: Value = serde_json::from_slice(content)
-        .map_err(|e| Error::Processing(format!("JSON解析错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("JSON解析错误: {}", e)))?;
 
     match json_value {
         Value::Object(obj) => {
@@ -134,9 +132,9 @@ fn json_to_arrow(content: &Bytes) -> Result<RecordBatch, Error> {
             // 创建schema和记录批次
             let schema = Arc::new(Schema::new(fields));
             RecordBatch::try_new(schema, columns)
-                .map_err(|e| Error::Processing(format!("创建Arrow记录批次失败: {}", e)))
+                .map_err(|e| Error::Process(format!("创建Arrow记录批次失败: {}", e)))
         }
-        _ => Err(Error::Processing("输入必须是JSON对象".to_string())),
+        _ => Err(Error::Process("输入必须是JSON对象".to_string())),
     }
 }
 
@@ -147,10 +145,10 @@ fn arrow_to_json(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
     let mut writer = arrow::json::ArrayWriter::new(&mut buf);
     writer
         .write(batch)
-        .map_err(|e| Error::Processing(format!("Arrow JSON序列化错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON序列化错误: {}", e)))?;
     writer
         .finish()
-        .map_err(|e| Error::Processing(format!("Arrow JSON序列化完成错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON序列化完成错误: {}", e)))?;
 
     Ok(buf)
 }

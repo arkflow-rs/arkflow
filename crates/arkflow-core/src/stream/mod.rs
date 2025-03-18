@@ -160,7 +160,7 @@ impl Stream {
                     }
                     Err(e) => {
                         match e {
-                            Error::Done => {
+                            Error::EOF => {
                                 // When input is complete, close the sender to notify all workers
                                 return;
                             }

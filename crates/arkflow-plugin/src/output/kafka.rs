@@ -120,7 +120,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
 
         match &msg.content {
             Content::Arrow(_) => {
-                return Err(Error::Processing(
+                return Err(Error::Process(
                     "The arrow format is not supported".to_string(),
                 ))
             }
@@ -139,7 +139,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
                         .send(record, Duration::from_secs(5))
                         .await
                         .map_err(|(e, _)| {
-                            Error::Processing(format!("Failed to send a Kafka message: {}", e))
+                            Error::Process(format!("Failed to send a Kafka message: {}", e))
                         })?;
                 }
             }

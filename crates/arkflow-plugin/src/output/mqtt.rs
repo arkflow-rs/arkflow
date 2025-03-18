@@ -142,7 +142,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             client
                 .publish(&self.config.topic, qos_level, retain, payload)
                 .await
-                .map_err(|e| Error::Processing(format!("MQTT publishing failed: {}", e)))?;
+                .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
         }
 
         Ok(())

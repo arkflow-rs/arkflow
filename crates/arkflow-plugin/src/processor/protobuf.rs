@@ -121,7 +121,7 @@ impl ProtobufProcessor {
     fn protobuf_to_arrow(&self, data: &[u8]) -> Result<RecordBatch, Error> {
         // 解析Protobuf消息
         let proto_msg = DynamicMessage::decode(self.descriptor.clone(), data)
-            .map_err(|e| Error::Processing(format!("Protobuf message parsing failed: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Protobuf message parsing failed: {}", e)))?;
 
         // Building an Arrow Schema
         let mut fields = Vec::new();
@@ -178,7 +178,7 @@ impl ProtobufProcessor {
                     columns.push(Arc::new(Int32Array::from(vec![value.clone()])));
                 }
                 _ => {
-                    return Err(Error::Processing(format!(
+                    return Err(Error::Process(format!(
                         "Unsupported field type: {}",
                         field_name
                     )));
@@ -191,7 +191,7 @@ impl ProtobufProcessor {
         // Create RecordBatch
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, columns)
-            .map_err(|e| Error::Processing(format!("Creating an Arrow record batch failed: {}", e)))
+            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))
     }
 
     /// Convert Arrow format to Protobuf.
@@ -204,7 +204,7 @@ impl ProtobufProcessor {
 
         // Ensure there is only one line of data.
         if batch.num_rows() != 1 {
-            return Err(Error::Processing(
+            return Err(Error::Process(
                 "Only supports single-line Arrow data conversion to Protobuf.".to_string(),
             ));
         }
@@ -301,7 +301,7 @@ impl ProtobufProcessor {
                         }
                     }
                     _ => {
-                        return Err(Error::Processing(format!(
+                        return Err(Error::Process(format!(
                             "Unsupported Protobuf type: {:?}",
                             proto_field.kind()
                         )))
@@ -313,7 +313,7 @@ impl ProtobufProcessor {
         let mut buf = Vec::new();
         proto_msg
             .encode(&mut buf)
-            .map_err(|e| Error::Processing(format!("Protobuf encoding failed: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
 
         Ok(buf)
     }
@@ -346,7 +346,7 @@ impl Processor for ProtobufProcessor {
 
                 let schema = batches[0].schema();
                 let batch = arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| Error::Processing(format!("Batch merge failed: {}", e)))?;
+                    .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?;
                 Ok(vec![MessageBatch::new_arrow(batch)])
             }
         }

@@ -78,7 +78,7 @@ impl Output for HttpOutput {
             body = content[0].clone();
         } else {
             body = serde_json::to_string(&content)
-                .map_err(|_| Error::Processing("Unable to serialize message".to_string()))?;
+                .map_err(|_| Error::Process("Unable to serialize message".to_string()))?;
         }
 
         // Build the request
@@ -128,7 +128,7 @@ impl Output for HttpOutput {
                             .text()
                             .await
                             .unwrap_or_else(|_| "<Unable to read response body>".to_string());
-                        last_error = Some(Error::Processing(format!(
+                        last_error = Some(Error::Process(format!(
                             "HTTP Request Failed: Status code {}, response: {}",
                             status, body
                         )));
@@ -503,7 +503,7 @@ mod tests {
         // Should fail with either Processing or Connection error
         assert!(result.is_err(), "Write should fail with error response");
         match result {
-            Err(Error::Processing(_)) => {} // Expected error type 1
+            Err(Error::Process(_)) => {}    // Expected error type 1
             Err(Error::Connection(_)) => {} // Also acceptable error type
             _ => panic!("Expected Processing or Connection error, got {:?}", result),
         }

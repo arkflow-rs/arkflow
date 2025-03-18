@@ -60,7 +60,7 @@ impl Input for FileInput {
         if !self.config.start_from_beginning.unwrap_or(true) {
             reader
                 .seek(SeekFrom::End(0))
-                .map_err(|e| Error::Processing(format!("Unable to seek to end of file: {}", e)))?;
+                .map_err(|e| Error::Process(format!("Unable to seek to end of file: {}", e)))?;
         }
 
         let reader_arc = self.reader.clone();
@@ -78,7 +78,7 @@ impl Input for FileInput {
         }
 
         if self.eof_reached.load(Ordering::SeqCst) && self.config.close_on_eof.unwrap_or(true) {
-            return Err(Error::Done);
+            return Err(Error::EOF);
         }
 
         let bytes_read;
@@ -97,11 +97,11 @@ impl Input for FileInput {
             self.eof_reached.store(true, Ordering::SeqCst);
 
             if self.config.close_on_eof.unwrap_or(true) {
-                return Err(Error::Done);
+                return Err(Error::EOF);
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            return Err(Error::Processing("Wait for new data".to_string()));
+            return Err(Error::Process("Wait for new data".to_string()));
         }
 
         // Remove the trailing line break
@@ -234,7 +234,7 @@ mod tests {
 
         // End of file, should return Done error
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
 
         // Close the connection
         assert!(input.close().await.is_ok());
@@ -266,7 +266,7 @@ mod tests {
 
         // Reading from the end, should have no data, return Done error
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
 
         // Append new data
         let mut file = std::fs::OpenOptions::new()
@@ -283,7 +283,7 @@ mod tests {
 
         // Now should be able to read the newly added line
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
 
         // Close the connection
         assert!(input.close().await.is_ok());
@@ -319,7 +319,7 @@ mod tests {
 
         // End of file, but don't close, should return Processing error
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Processing(_))));
+        assert!(matches!(result, Err(Error::Process(_))));
 
         // Append new data
         let mut file = std::fs::OpenOptions::new()

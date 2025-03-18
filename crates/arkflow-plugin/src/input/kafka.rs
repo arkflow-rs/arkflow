@@ -102,7 +102,7 @@ impl Input for KafkaInput {
             Ok(kafka_message) => {
                 // Create internal message from Kafka message
                 let payload = kafka_message.payload().ok_or_else(|| {
-                    Error::Processing("The Kafka message has no content".to_string())
+                    Error::Process("The Kafka message has no content".to_string())
                 })?;
 
                 let mut binary_data = Vec::new();

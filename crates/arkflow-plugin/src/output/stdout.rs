@@ -65,10 +65,10 @@ impl<T: StdWriter> StdoutOutput<T> {
         let mut writer = arrow::json::ArrayWriter::new(&mut buf);
         writer
             .write(message_batch)
-            .map_err(|e| Error::Processing(format!("Arrow JSON serialization error: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
         writer
             .finish()
-            .map_err(|e| Error::Processing(format!("Arrow JSON serialization error: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
         let s = String::from_utf8_lossy(&buf);
 
         if self.config.append_newline.unwrap_or(true) {

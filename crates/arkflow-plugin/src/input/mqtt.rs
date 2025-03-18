@@ -179,12 +179,12 @@ impl Input for MqttInput {
                         }
                     }
                     Err(_) => {
-                        Err(Error::Done)
+                        Err(Error::EOF)
                     }
                 }
             },
             _ = close_rx.recv()=>{
-                Err(Error::Done)
+                Err(Error::EOF)
             }
         }
     }

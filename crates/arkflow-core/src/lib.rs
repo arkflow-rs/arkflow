@@ -26,14 +26,15 @@ pub enum Error {
     Config(String),
 
     #[error("Read error: {0}")]
-    Reading(String),
+    Read(String),
 
-    #[error("Handling errors: {0}")]
-    Processing(String),
+    #[error("Process errors: {0}")]
+    Process(String),
 
     #[error("Connection error: {0}")]
     Connection(String),
 
+    /// Reconnection should be attempted after a connection loss.
     #[error("Connection lost")]
     Disconnection,
 
@@ -43,8 +44,8 @@ pub enum Error {
     #[error("Unknown error: {0}")]
     Unknown(String),
 
-    #[error("Complete")]
-    Done,
+    #[error("EOF")]
+    EOF,
 }
 
 pub type Bytes = Vec<u8>;
@@ -87,13 +88,13 @@ impl MessageBatch {
     /// Parse the message content into a string.
     pub fn as_string(&self) -> Result<Vec<String>, Error> {
         match &self.content {
-            Content::Arrow(_) => Err(Error::Processing("无法解析为JSON".to_string())),
+            Content::Arrow(_) => Err(Error::Process("无法解析为JSON".to_string())),
             Content::Binary(v) => {
                 let x: Result<Vec<String>, Error> = v
                     .iter()
                     .map(|v| {
                         String::from_utf8(v.clone())
-                            .map_err(|_| Error::Processing("无法解析为字符串".to_string()))
+                            .map_err(|_| Error::Process("无法解析为字符串".to_string()))
                     })
                     .collect();
                 Ok(x?)

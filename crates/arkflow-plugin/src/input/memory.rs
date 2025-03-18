@@ -75,7 +75,7 @@ impl Input for MemoryInput {
         if let Some(msg) = msg_option {
             Ok((msg, Arc::new(NoopAck)))
         } else {
-            Err(Error::Done)
+            Err(Error::EOF)
         }
     }
 
@@ -162,7 +162,7 @@ mod tests {
         let result = input.read().await;
         assert!(result.is_err());
         match result {
-            Err(Error::Done) => {} // Expected error type
+            Err(Error::EOF) => {} // Expected error type
             _ => panic!("Expected Done error"),
         }
     }
@@ -192,7 +192,7 @@ mod tests {
         let result = input.read().await;
         assert!(result.is_err());
         match result {
-            Err(Error::Done) => {} // Expected error type
+            Err(Error::EOF) => {} // Expected error type
             _ => panic!("Expected Done error"),
         }
     }
@@ -218,7 +218,7 @@ mod tests {
         let result = input.read().await;
         assert!(result.is_err());
         match result {
-            Err(Error::Done) => {} // Expected error type
+            Err(Error::EOF) => {} // Expected error type
             _ => panic!("Expected Done error"),
         }
     }
@@ -279,7 +279,7 @@ mod tests {
         let result = input.read().await;
         assert!(result.is_err());
         match result {
-            Err(Error::Done) => {} // Expected error type
+            Err(Error::EOF) => {} // Expected error type
             _ => panic!("Expected Done error"),
         }
     }

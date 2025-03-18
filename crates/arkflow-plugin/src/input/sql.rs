@@ -38,7 +38,7 @@ impl Input for SqlInput {
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
         if self.read.load(Ordering::Acquire) {
-            return Err(Error::Done);
+            return Err(Error::EOF);
         }
 
         let ctx = SessionContext::new();
@@ -57,18 +57,18 @@ impl Input for SqlInput {
         let df = ctx
             .sql_with_options(&self.sql_config.select_sql, sql_options)
             .await
-            .map_err(|e| Error::Reading(format!("Failed to execute select_sql: {}", e)))?;
+            .map_err(|e| Error::Read(format!("Failed to execute select_sql: {}", e)))?;
 
         let result_batches = df
             .collect()
             .await
-            .map_err(|e| Error::Reading(format!("Failed to collect data from SQL query: {}", e)))?;
+            .map_err(|e| Error::Read(format!("Failed to collect data from SQL query: {}", e)))?;
 
         let x = match result_batches.len() {
             0 => RecordBatch::new_empty(Arc::new(Schema::empty())),
             1 => result_batches[0].clone(),
             _ => arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Processing(format!("Merge batches failed: {}", e)))?,
+                .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?,
         };
 
         self.read.store(true, Ordering::Release);
@@ -178,7 +178,7 @@ mod tests {
 
         // Verify idempotency (second read should return Done error)
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Done)));
+        assert!(matches!(result, Err(Error::EOF)));
 
         Ok(())
     }
@@ -193,7 +193,7 @@ mod tests {
         };
         let input = SqlInput::new(config).unwrap();
         let result = input.read().await;
-        assert!(matches!(result, Err(Error::Reading(_))));
+        assert!(matches!(result, Err(Error::Read(_))));
     }
 
     #[tokio::test]
