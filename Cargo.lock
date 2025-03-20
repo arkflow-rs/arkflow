@@ -168,7 +168,6 @@ dependencies = [
 name = "arkflow-plugin"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arkflow-core",
  "arrow-json",
  "async-trait",
@@ -178,14 +177,12 @@ dependencies = [
  "colored",
  "datafusion",
  "flume",
- "futures",
  "humantime",
  "lazy_static",
  "mockall",
- "prometheus",
  "prost-reflect",
  "prost-types",
- "protobuf 3.7.2",
+ "protobuf",
  "protobuf-parse",
  "rdkafka",
  "rdkafka-sys",
@@ -196,12 +193,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
- "thiserror 2.0.12",
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
- "waitgroup",
 ]
 
 [[package]]
@@ -3359,21 +3353,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prometheus"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
-dependencies = [
- "cfg-if",
- "fnv",
- "lazy_static",
- "memchr",
- "parking_lot",
- "protobuf 2.28.0",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3418,12 +3397,6 @@ dependencies = [
 
 [[package]]
 name = "protobuf"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
-
-[[package]]
-name = "protobuf"
 version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
@@ -3442,7 +3415,7 @@ dependencies = [
  "anyhow",
  "indexmap",
  "log",
- "protobuf 3.7.2",
+ "protobuf",
  "protobuf-support",
  "tempfile",
  "thiserror 1.0.69",
