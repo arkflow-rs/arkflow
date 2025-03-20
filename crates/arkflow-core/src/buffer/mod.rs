@@ -1,5 +1,3 @@
-mod memory;
-
 use crate::input::Ack;
 use crate::{Error, MessageBatch};
 use async_trait::async_trait;
