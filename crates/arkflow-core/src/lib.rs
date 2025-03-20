@@ -4,6 +4,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use serde::Serialize;
 use thiserror::Error;
 
+pub mod buffer;
 pub mod cli;
 pub mod config;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod input;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
+
 pub mod stream;
 
 /// Error in the stream processing engine
