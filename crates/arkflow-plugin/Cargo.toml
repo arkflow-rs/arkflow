@@ -17,7 +17,6 @@ futures = { workspace = true }
 waitgroup = { workspace = true }
 
 serde = { workspace = true }
-
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 humantime = { workspace = true }
@@ -36,21 +35,16 @@ prost-types = { workspace = true }
 protobuf-parse = { workspace = true }
 protobuf = { workspace = true }
 
-
 toml = { workspace = true }
 lazy_static = { workspace = true }
 
 axum = { workspace = true }
 reqwest = { workspace = true }
 
-
 clap = { workspace = true }
 colored = { workspace = true }
-
 flume = { workspace = true }
 rumqttc = { workspace = true }
-
-
 
 # Kafka
 aws-msk-iam-sasl-signer = { workspace = true }
@@ -58,6 +52,7 @@ rdkafka = { workspace = true }
 rdkafka-sys = { workspace = true }
 sasl2-sys = { workspace = true }
 
+# arkflow
 arkflow-core = { workspace = true }
 
 [dev-dependencies]

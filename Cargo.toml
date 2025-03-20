@@ -67,5 +67,3 @@ arkflow-core = { path = "crates/arkflow-core", version = "0.1.0" }
 arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.1.0" }
 tempfile = "3.19.0"
 mockall = "0.12"
-#
-#[workspace.dev-dependencies]

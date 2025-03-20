@@ -201,7 +201,7 @@ impl Stream {
     }
 }
 
-/// 流配置
+/// Stream configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamConfig {
     pub input: crate::input::InputConfig,
@@ -210,7 +210,7 @@ pub struct StreamConfig {
 }
 
 impl StreamConfig {
-    /// 根据配置构建流
+    /// Build stream based on configuration
     pub fn build(&self) -> Result<Stream, Error> {
         let input = self.input.build()?;
         let (pipeline, thread_num) = self.pipeline.build()?;
