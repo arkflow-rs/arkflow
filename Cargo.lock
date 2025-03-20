@@ -1387,9 +1387,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common"
-version = "46.0.0"
+version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af67ddc82e1c8e6843c326ca13aa20e5420cce9f886b4e1ee39ea43defae3145"
+checksum = "1f53d7ec508e1b3f68bd301cee3f649834fad51eff9240d898a4b2614cfd0a7a"
 dependencies = [
  "ahash",
  "arrow",
