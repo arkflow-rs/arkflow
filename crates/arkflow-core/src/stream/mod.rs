@@ -64,15 +64,12 @@ impl Stream {
                     match input_receiver.recv_async().await {
                         Ok((msg, ack)) => {
                             // Process messages through pipeline
-                            debug!("Processing input message: {:?}", &msg.as_string());
+                            // debug!("Processing input message: {:?}", &msg.as_string());
                             let processed = pipeline.process(msg).await;
 
                             // Process result messages
                             match processed {
                                 Ok(msgs) => {
-                                    for x in &msgs {
-                                        debug!("Processing output message: {:?}", x.as_string());
-                                    }
 
                                     if let Err(e) = output_sender.send_async((msgs, ack)).await {
                                         error!("Failed to send processed message: {}", e);
@@ -152,7 +149,7 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok(msg) => {
-                        debug!("Received input message: {:?}", &msg.0.as_string());
+                        // debug!("Received input message: {:?}", &msg.0.as_string());
                         if let Err(e) = input_sender.send_async(msg).await {
                             error!("Failed to send input message: {}", e);
                             break;
