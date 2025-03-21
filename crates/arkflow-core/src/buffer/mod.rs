@@ -13,7 +13,7 @@ lazy_static::lazy_static! {
 pub trait Buffer: Send + Sync {
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error>;
 
-    async fn reade(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>;
+    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>;
 
     async fn close(&self) -> Result<(), Error>;
 }
