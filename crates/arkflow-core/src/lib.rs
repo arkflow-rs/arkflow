@@ -62,14 +62,8 @@ pub type Bytes = Vec<u8>;
 #[derive(Clone, Debug)]
 pub struct MessageBatch(RecordBatch);
 
-#[derive(Clone, Debug)]
-pub enum MessageType {
-    Binary,
-    Arrow,
-}
-
 impl MessageBatch {
-    pub fn new_binary(content: Vec<Bytes>) -> Self {
+    pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
         let fields = vec![Field::new("value", DataType::Binary, false)];
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(content.len());
 
@@ -80,27 +74,29 @@ impl MessageBatch {
 
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| Error::Process(format!("创建Arrow记录批次失败: {}", e)))
-            .unwrap();
+            .map_err(|e| Error::Process(format!("创建Arrow记录批次失败: {}", e)))?;
 
-        Self(batch)
+        Ok(Self(batch))
     }
+
     pub fn from_json<T: Serialize>(value: &T) -> Result<Self, Error> {
         let content = serde_json::to_vec(value)?;
-        Ok(Self::new_binary(vec![content]))
+        Ok(Self::new_binary(vec![content])?)
     }
+
     pub fn new_arrow(content: RecordBatch) -> Self {
         Self(content)
     }
 
     /// Create a message from a string.
-    pub fn from_string(content: &str) -> Self {
+    pub fn from_string(content: &str) -> Result<Self, Error> {
         Self::new_binary(vec![content.as_bytes().to_vec()])
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
     pub fn len(&self) -> usize {
         self.0.num_rows()
     }
@@ -126,19 +122,27 @@ impl From<MessageBatch> for RecordBatch {
     }
 }
 
-impl From<Vec<Bytes>> for MessageBatch {
-    fn from(content: Vec<Bytes>) -> Self {
-        Self::new_binary(content)
+impl TryFrom<Vec<Bytes>> for MessageBatch {
+    type Error = Error;
+
+    fn try_from(value: Vec<Bytes>) -> Result<Self, Self::Error> {
+        Self::new_binary(value)
     }
 }
-impl From<Vec<String>> for MessageBatch {
-    fn from(content: Vec<String>) -> Self {
-        Self::new_binary(content.into_iter().map(|s| s.into_bytes()).collect())
+
+impl TryFrom<Vec<String>> for MessageBatch {
+    type Error = Error;
+
+    fn try_from(value: Vec<String>) -> Result<Self, Self::Error> {
+        Self::new_binary(value.into_iter().map(|s| s.into_bytes()).collect())
     }
 }
-impl From<Vec<&str>> for MessageBatch {
-    fn from(content: Vec<&str>) -> Self {
-        Self::new_binary(content.into_iter().map(|s| s.as_bytes().to_vec()).collect())
+
+impl TryFrom<Vec<&str>> for MessageBatch {
+    type Error = Error;
+
+    fn try_from(value: Vec<&str>) -> Result<Self, Self::Error> {
+        Self::new_binary(value.into_iter().map(|s| s.as_bytes().to_vec()).collect())
     }
 }
 
