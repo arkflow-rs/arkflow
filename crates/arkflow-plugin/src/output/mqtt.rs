@@ -35,6 +35,9 @@ pub struct MqttOutputConfig {
     pub keep_alive: Option<u64>,
     /// Whether to retain the message
     pub retain: Option<bool>,
+
+    /// The field name of the data to be sent
+    pub value_field: Option<String>,
 }
 
 /// MQTT output component
@@ -309,6 +312,7 @@ mod tests {
             clean_session: Some(true),
             keep_alive: Some(60),
             retain: Some(false),
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config);
@@ -329,6 +333,7 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
@@ -349,12 +354,13 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
         output.connect().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         assert!(output.write(&msg).await.is_ok());
 
         // Verify the message was published
@@ -380,6 +386,7 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
@@ -406,13 +413,14 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
         output.connect().await.unwrap();
         output.close().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         assert!(output.write(&msg).await.is_err());
     }
 }

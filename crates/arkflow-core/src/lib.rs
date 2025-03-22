@@ -100,6 +100,28 @@ impl MessageBatch {
     pub fn len(&self) -> usize {
         self.0.num_rows()
     }
+    pub fn to_binary(&self, name: &str) -> Result<Vec<&[u8]>, Error> {
+        let Some(array_ref) = self.0.column_by_name(name) else {
+            return Err(Error::Process("not found column".to_string()));
+        };
+
+        let data = array_ref.to_data();
+
+        if *data.data_type() != DataType::Binary {
+            return Err(Error::Process("not support data type".to_string()));
+        }
+
+        let Some(v) = array_ref.as_any().downcast_ref::<BinaryArray>() else {
+            return Err(Error::Process("not support data type".to_string()));
+        };
+        let mut vec_bytes = vec![];
+        for x in v {
+            if let Some(data) = x {
+                vec_bytes.push(data)
+            }
+        }
+        Ok(vec_bytes)
+    }
 }
 
 impl Deref for MessageBatch {

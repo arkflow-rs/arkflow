@@ -107,7 +107,7 @@ impl Input for KafkaInput {
 
                 let mut binary_data = Vec::new();
                 binary_data.push(payload.to_vec());
-                let msg_batch = MessageBatch::new_binary(binary_data);
+                let msg_batch = MessageBatch::new_binary(binary_data)?;
 
                 // Create acknowledgment object
                 let topic = kafka_message.topic().to_string();

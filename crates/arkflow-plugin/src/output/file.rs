@@ -11,6 +11,7 @@ use std::sync::Arc;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
+use datafusion::arrow::array::Array;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -19,6 +20,8 @@ use tokio::sync::Mutex;
 pub struct FileOutputConfig {
     /// Output file path
     pub path: String,
+    /// Output field
+    pub field: String,
     /// Whether to add a newline after each message
     pub append_newline: Option<bool>,
     /// Whether to append to the end of the file (instead of overwriting)
@@ -76,17 +79,17 @@ impl Output for FileOutput {
         if !self.connected.load(Ordering::SeqCst) || writer_arc_guard.is_none() {
             return Err(Error::Connection("The output is not connected".to_string()));
         }
-
-        let content = msg.as_string()?;
+        let vec = msg.to_binary(&self.config.field)?;
         let writer = writer_arc_guard.as_ref();
         let mut file =
             writer.ok_or(Error::Connection("The output is not connected".to_string()))?;
 
-        for x in content {
+        for x in vec {
             if self.config.append_newline.unwrap_or(true) {
-                writeln!(file, "{}", x).map_err(Error::Io)?
+                file.write(x).map_err(Error::Io)?;
+                file.write("\n".as_ref()).map_err(Error::Io)?;
             } else {
-                write!(file, "{}", x).map_err(Error::Io)?
+                file.write(x).map_err(Error::Io)?;
             }
         }
 
@@ -134,6 +137,7 @@ mod tests {
         let file_path = dir.path().join("test.txt");
 
         let config = FileOutputConfig {
+            field: "value".to_string(),
             path: file_path.to_str().unwrap().to_string(),
             append_newline: Some(true),
             append: Some(false),
@@ -142,7 +146,7 @@ mod tests {
         let output = FileOutput::new(config).unwrap();
         output.connect().await.unwrap();
 
-        let msg = MessageBatch::from_string("test content");
+        let msg = MessageBatch::from_string("test content").unwrap();
         output.write(&msg).await.unwrap();
         output.close().await.unwrap();
 
@@ -157,6 +161,7 @@ mod tests {
         let file_path = dir.path().join("append.txt");
 
         let config = FileOutputConfig {
+            field: "value".to_string(),
             path: file_path.to_str().unwrap().to_string(),
             append_newline: Some(false),
             append: Some(true),
@@ -167,12 +172,12 @@ mod tests {
 
         // First write
         output
-            .write(&MessageBatch::from_string("first"))
+            .write(&MessageBatch::from_string("first").unwrap())
             .await
             .unwrap();
         // Second write
         output
-            .write(&MessageBatch::from_string("second"))
+            .write(&MessageBatch::from_string("second").unwrap())
             .await
             .unwrap();
         output.close().await.unwrap();
@@ -188,6 +193,7 @@ mod tests {
         let file_path = dir.path().join("newline.txt");
 
         let config = FileOutputConfig {
+            field: "value".to_string(),
             path: file_path.to_str().unwrap().to_string(),
             append_newline: Some(false),
             append: Some(false),
@@ -196,7 +202,7 @@ mod tests {
         let output = FileOutput::new(config).unwrap();
         output.connect().await.unwrap();
         output
-            .write(&MessageBatch::from_string("no_newline"))
+            .write(&MessageBatch::from_string("no_newline").unwrap())
             .await
             .unwrap();
         output.close().await.unwrap();
@@ -209,6 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_directory() {
         let config = FileOutputConfig {
+            field: "value".to_string(),
             path: "/invalid/path/test.txt".to_string(),
             append_newline: Some(true),
             append: Some(false),

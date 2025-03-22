@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+const BODY_FIELD: &str = "body";
 
 /// HTTP output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,7 @@ pub struct HttpOutputConfig {
     pub retry_count: u32,
     /// Request header
     pub headers: Option<std::collections::HashMap<String, String>>,
+    pub body_field: Option<String>,
 }
 
 /// HTTP output component
@@ -69,7 +71,7 @@ impl Output for HttpOutput {
         }
 
         let client = client_arc_guard.as_ref().unwrap();
-        let content = msg.as_string()?;
+        let content = msg.to_binary(self.config.body_field.as_deref().unwrap_or(BODY_FIELD))?;
         if content.is_empty() {
             return Ok(());
         }
@@ -78,7 +80,8 @@ impl Output for HttpOutput {
             body = content[0].clone();
         } else {
             body = serde_json::to_string(&content)
-                .map_err(|_| Error::Process("Unable to serialize message".to_string()))?;
+                .map_err(|_| Error::Process("Unable to serialize message".to_string()))?
+                .as_ref();
         }
 
         // Build the request
@@ -201,6 +204,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create a new HTTP output component
@@ -218,6 +222,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create and connect the HTTP output
@@ -244,6 +249,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create, connect, and close the HTTP output
@@ -272,11 +278,12 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create HTTP output without connecting
         let output = HttpOutput::new(config).unwrap();
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(&msg).await;
 
         // Should return connection error
@@ -297,6 +304,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create and connect HTTP output
@@ -304,7 +312,7 @@ mod tests {
         output.connect().await.unwrap();
 
         // Create empty message
-        let msg = MessageBatch::new_binary(vec![]);
+        let msg = MessageBatch::new_binary(vec![]).unwrap();
         let result = output.write(&msg).await;
 
         // Should succeed with empty message
@@ -325,6 +333,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: Some(headers),
+            body_field: None,
         };
 
         // Create and connect HTTP output
@@ -346,6 +355,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create and connect HTTP output
@@ -353,7 +363,7 @@ mod tests {
         output.connect().await.unwrap();
 
         // Try to write a message
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(&msg).await;
 
         // Should return config error
@@ -423,12 +433,13 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create, connect, and write to HTTP output
         let output = HttpOutput::new(config).unwrap();
         output.connect().await.unwrap();
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(&msg).await;
 
         // Should succeed with 200 OK response
@@ -453,6 +464,7 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             headers: None,
+            body_field: None,
         };
 
         // Create, connect, and write to HTTP output
@@ -460,7 +472,7 @@ mod tests {
         output.connect().await.unwrap();
 
         // Use a valid JSON string for the message
-        let msg = MessageBatch::from_string("{\"test\": \"message\"}");
+        let msg = MessageBatch::from_string("{\"test\": \"message\"}").unwrap();
 
         // Add a small delay to ensure server is ready
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -492,12 +504,13 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 0, // No retries
             headers: None,
+            body_field: None,
         };
 
         // Create, connect, and write to HTTP output
         let output = HttpOutput::new(config).unwrap();
         output.connect().await.unwrap();
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(&msg).await;
 
         // Should fail with either Processing or Connection error
@@ -529,12 +542,13 @@ mod tests {
             timeout_ms: 1000,
             retry_count: 2, // 2 retries
             headers: None,
+            body_field: None,
         };
 
         // Create, connect, and write to HTTP output
         let output = HttpOutput::new(config).unwrap();
         output.connect().await.unwrap();
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
 
         // Measure time to verify retry delay
         let start = std::time::Instant::now();
