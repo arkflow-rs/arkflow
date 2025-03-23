@@ -20,19 +20,48 @@ pub struct SqlInputConfig {
     select_sql: String,
     /// Table name (used in SQL queries)
     table_name: Option<String>,
-    table_path: String,
+    // table_path: String,
     #[serde(flatten)]
     input_type: InputType,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct AvroConfig {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct ArrowConfig {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct JsonConfig {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct CsvConfig {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct ParquetConfig {
+    path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "input_type", rename_all = "lowercase")]
 pub enum InputType {
-    AVRO,
-    ARROW,
-    JSON,
-    CSV,
-    PARQUET,
+    AVRO(AvroConfig),
+    ARROW(ArrowConfig),
+    JSON(JsonConfig),
+    CSV(CsvConfig),
+    PARQUET(ParquetConfig),
 }
 
 pub struct SqlInput {
@@ -66,26 +95,26 @@ impl Input for SqlInput {
             .table_name
             .as_deref()
             .unwrap_or(DEFAULT_TABLE_NAME);
-        let table_path = &self.sql_config.table_path;
+
         match self.sql_config.input_type {
-            InputType::AVRO => {
-                ctx.register_avro(table_name, table_path, AvroReadOptions::default())
+            InputType::AVRO(ref c) => {
+                ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
-            InputType::ARROW => {
-                ctx.register_arrow(table_name, table_path, ArrowReadOptions::default())
+            InputType::ARROW(ref c) => {
+                ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
             }
-            InputType::JSON => {
-                ctx.register_json(table_name, table_path, NdJsonReadOptions::default())
+            InputType::JSON(ref c) => {
+                ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
             }
-            InputType::CSV => {
-                ctx.register_csv(table_name, table_path, CsvReadOptions::default())
+            InputType::CSV(ref c) => {
+                ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
             }
-            InputType::PARQUET => {
-                ctx.register_parquet(table_name, table_path, ParquetReadOptions::default())
+            InputType::PARQUET(ref c) => {
+                ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
             }
         }
