@@ -9,7 +9,7 @@ use datafusion::prelude::*;
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::error;
 
 const DEFAULT_TABLE_NAME: &str = "flow";
@@ -66,14 +66,19 @@ struct ParquetConfig {
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
+    close_tx: broadcast::Sender<()>,
+
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
 }
 
 impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
+        let (close_tx, _) = broadcast::channel::<()>(1);
+
         Ok(Self {
             sql_config,
             stream: Arc::new(Mutex::new(None)),
+            close_tx,
         })
     }
 }
@@ -150,18 +155,25 @@ impl Input for SqlInput {
         }
         let stream_lock = stream_lock.as_mut().unwrap();
 
-        let value_opt = stream_lock.as_mut().try_next().await.map_err(|e| {
-            error!("Failed to read: {}", e);
-            Error::EOF
-        })?;
-        let Some(value) = value_opt else {
-            return Err(Error::EOF);
-        };
+        let mut close_rx = self.close_tx.subscribe();
 
-        Ok((MessageBatch::new_arrow(value), Arc::new(NoopAck)))
+        tokio::select! {
+            _ = close_rx.recv() => {
+                Err(Error::EOF)
+            }
+            Some(value) = stream_lock.as_mut().try_next() => {
+                let value = value.map_err(|e| {
+                    error!("Failed to read: {}", e);
+                    Error::EOF
+                })?;
+                Ok((MessageBatch::new_arrow(value), Arc::new(NoopAck)))
+            }
+
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {
+        let _ = self.close_tx.send(());
         Ok(())
     }
 }
