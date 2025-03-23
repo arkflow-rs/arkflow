@@ -16,7 +16,7 @@ const DEFAULT_TABLE_NAME: &str = "flow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
-    select_sql: String,
+    select_sql: Option<String>,
     /// Table name (used in SQL queries)
     table_name: Option<String>,
 
@@ -119,7 +119,13 @@ impl Input for SqlInput {
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))?;
 
         let df = ctx
-            .sql(&self.sql_config.select_sql)
+            .sql(
+                &self
+                    .sql_config
+                    .select_sql
+                    .as_deref()
+                    .unwrap_or(format!("SELECT * FROM {}", table_name).as_str()),
+            )
             .await
             .map_err(|e| Error::Config(format!("Failed to execute select_table_sql: {}", e)))?;
         let stream = df
