@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
-use futures_util::stream::StreamExt;
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -67,7 +66,6 @@ struct ParquetConfig {
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
-
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
 }
 
@@ -75,7 +73,6 @@ impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
         Ok(Self {
             sql_config,
-
             stream: Arc::new(Mutex::new(None)),
         })
     }
