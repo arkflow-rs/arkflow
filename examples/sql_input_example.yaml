@@ -4,13 +4,10 @@ logging:
 streams:
   - input:
       type: "sql"
-      create_table_sql: |
-        CREATE EXTERNAL TABLE source
-        STORED AS CSV
-        LOCATION './examples/input_data.csv'
-        OPTIONS ('has_header' 'true');
+      input_type: "csv"
+      path: './examples/input_data.csv'
       select_sql: |
-        select * from source;
+        select * from flow;
     
     
 

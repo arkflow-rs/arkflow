@@ -24,6 +24,17 @@ pub struct SqlInputConfig {
     #[serde(flatten)]
     input_type: InputType,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "input_type", rename_all = "lowercase")]
+enum InputType {
+    AVRO(AvroConfig),
+    ARROW(ArrowConfig),
+    JSON(JsonConfig),
+    CSV(CsvConfig),
+    PARQUET(ParquetConfig),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 struct AvroConfig {
@@ -52,16 +63,6 @@ struct CsvConfig {
 #[serde(rename_all = "lowercase")]
 struct ParquetConfig {
     path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "input_type", rename_all = "lowercase")]
-pub enum InputType {
-    AVRO(AvroConfig),
-    ARROW(ArrowConfig),
-    JSON(JsonConfig),
-    CSV(CsvConfig),
-    PARQUET(ParquetConfig),
 }
 
 pub struct SqlInput {
