@@ -65,5 +65,5 @@ sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 
 arkflow-core = { path = "crates/arkflow-core", version = "0.1.0" }
 arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.1.0" }
-tempfile = "3.19.0"
+tempfile = "3.19.1"
 mockall = "0.12"
