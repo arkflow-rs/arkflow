@@ -23,6 +23,7 @@ humantime = { workspace = true }
 tracing = { workspace = true }
 
 datafusion = { workspace = true }
+datafusion-functions-json = "*"
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }

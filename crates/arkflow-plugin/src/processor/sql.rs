@@ -37,7 +37,10 @@ impl SqlProcessor {
     /// Execute SQL query
     async fn execute_query(&self, batch: RecordBatch) -> Result<RecordBatch, Error> {
         // Create a session context
-        let ctx = SessionContext::new();
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Session context creation failed: {}", e)))?;
+
         let table_name = self
             .config
             .table_name
