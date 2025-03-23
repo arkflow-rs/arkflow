@@ -20,7 +20,7 @@ pub struct SqlInputConfig {
     select_sql: String,
     /// Table name (used in SQL queries)
     table_name: Option<String>,
-    // table_path: String,
+
     #[serde(flatten)]
     input_type: InputType,
 }
@@ -67,7 +67,7 @@ struct ParquetConfig {
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
-    // read: AtomicBool,
+
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
 }
 
@@ -75,7 +75,7 @@ impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
         Ok(Self {
             sql_config,
-            // read: AtomicBool::new(false),
+
             stream: Arc::new(Mutex::new(None)),
         })
     }
@@ -142,9 +142,6 @@ impl Input for SqlInput {
         }
         let stream_lock = stream_lock.as_mut().unwrap();
 
-        while let Some(record_batch) = stream_lock.as_mut().next().await {
-            println!("{record_batch:?}");
-        }
         let value_opt = stream_lock.as_mut().try_next().await.map_err(|e| {
             error!("Failed to read: {}", e);
             Error::EOF
@@ -152,6 +149,7 @@ impl Input for SqlInput {
         let Some(value) = value_opt else {
             return Err(Error::EOF);
         };
+
         Ok((MessageBatch::new_arrow(value), Arc::new(NoopAck)))
     }
 
