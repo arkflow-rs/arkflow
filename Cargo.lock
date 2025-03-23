@@ -178,6 +178,7 @@ dependencies = [
  "datafusion",
  "datafusion-functions-json",
  "flume",
+ "futures-util",
  "humantime",
  "lazy_static",
  "mockall",
