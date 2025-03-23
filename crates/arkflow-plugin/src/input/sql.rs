@@ -72,6 +72,7 @@ struct ParquetConfig {
     table_name: Option<String>,
     path: String,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlConfig {
     name: Option<String>,
