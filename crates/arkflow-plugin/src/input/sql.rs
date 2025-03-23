@@ -118,13 +118,18 @@ impl Input for SqlInput {
         }
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))?;
 
+        let sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
         let df = ctx
-            .sql(
+            .sql_with_options(
                 &self
                     .sql_config
                     .select_sql
                     .as_deref()
                     .unwrap_or(format!("SELECT * FROM {}", table_name).as_str()),
+                sql_options,
             )
             .await
             .map_err(|e| Error::Config(format!("Failed to execute select_table_sql: {}", e)))?;
