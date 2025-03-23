@@ -35,8 +35,6 @@ pub enum InputType {
     PARQUET,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ObjectStore {}
 pub struct SqlInput {
     sql_config: SqlInputConfig,
     // read: AtomicBool,
