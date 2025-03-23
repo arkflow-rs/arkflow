@@ -125,7 +125,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::{Array, BooleanArray, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -364,5 +364,26 @@ mod tests {
 
         // Verify that close returns Ok
         assert!(processor.close().await.is_ok());
+    }
+    #[tokio::test]
+    async fn test_sql_processor_json() {
+        // Test closing the processor
+        let config = SqlProcessorConfig {
+            query: r#"SELECT *,json_contains('{"a":1}','a') FROM flow"#.to_string(),
+            table_name: None,
+        };
+        let processor = SqlProcessor::new(config).unwrap();
+        let x = processor.process(MessageBatch::new_arrow(create_test_batch())).await.unwrap();
+        for xx in x {
+            match xx.content {
+                Content::Arrow(v) => {
+                    v.column(2).as_any().downcast_ref::<BooleanArray>().unwrap().iter().for_each(|v| {
+                        assert!(v.unwrap())
+                    });
+                }
+                Content::Binary(_) => {}
+            }
+        }
+        processor.close().await.unwrap()
     }
 }
