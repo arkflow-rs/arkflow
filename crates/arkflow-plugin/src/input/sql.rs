@@ -41,7 +41,10 @@ impl Input for SqlInput {
             return Err(Error::EOF);
         }
 
-        let ctx = SessionContext::new();
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+
         let sql_options = SQLOptions::new()
             .with_allow_ddl(true)
             .with_allow_dml(false)
