@@ -25,6 +25,7 @@ tracing = { workspace = true }
 
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
+datafusion-table-providers = { version = "0.3", features = ["mysql"] }
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }

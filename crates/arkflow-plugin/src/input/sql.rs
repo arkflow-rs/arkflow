@@ -1,11 +1,16 @@
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
+use datafusion_table_providers::{
+    common::DatabaseCatalogProvider, mysql::MySQLTableFactory,
+    sql::db_connection_pool::mysqlpool::MySQLConnectionPool, util::secrets::to_secret_map,
+};
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -17,8 +22,6 @@ const DEFAULT_TABLE_NAME: &str = "flow";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
     select_sql: Option<String>,
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
 
     #[serde(flatten)]
     input_type: InputType,
@@ -32,36 +35,54 @@ enum InputType {
     JSON(JsonConfig),
     CSV(CsvConfig),
     PARQUET(ParquetConfig),
+    MYSQL(MysqlConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 struct AvroConfig {
+    /// Table name (used in SQL queries)
+    table_name: Option<String>,
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 struct ArrowConfig {
+    /// Table name (used in SQL queries)
+    table_name: Option<String>,
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 struct JsonConfig {
+    /// Table name (used in SQL queries)
+    table_name: Option<String>,
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 struct CsvConfig {
+    /// Table name (used in SQL queries)
+    table_name: Option<String>,
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 struct ParquetConfig {
+    /// Table name (used in SQL queries)
+    table_name: Option<String>,
     path: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MysqlConfig {
+    name: Option<String>,
+    uri: String,
+    ssl: MysqlSslConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MysqlSslConfig {
+    ssl_mode: String,
+    root_cert: Option<String>,
 }
 
 pub struct SqlInput {
@@ -93,32 +114,52 @@ impl Input for SqlInput {
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
 
-        let table_name = self
-            .sql_config
-            .table_name
-            .as_deref()
-            .unwrap_or(DEFAULT_TABLE_NAME);
-
         match self.sql_config.input_type {
             InputType::AVRO(ref c) => {
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
             InputType::ARROW(ref c) => {
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
             }
             InputType::JSON(ref c) => {
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
             }
             InputType::CSV(ref c) => {
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
             }
             InputType::PARQUET(ref c) => {
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
+            }
+            InputType::MYSQL(ref c) => {
+                let name = c.name.as_deref().unwrap_or("mysql");
+                let mut params = HashMap::from([
+                    ("connection_string".to_string(), c.uri.to_string()),
+                    ("sslmode".to_string(), c.ssl.ssl_mode.to_string()),
+                ]);
+
+                if let Some(ref v) = c.ssl.root_cert {
+                    params.insert("sslrootcert".to_string(), v.to_string());
+                }
+
+                let mysql_params = to_secret_map();
+                let mysql_pool = Arc::new(
+                    MySQLConnectionPool::new(mysql_params)
+                        .await
+                        .expect("unable to create MySQL connection pool"),
+                );
+                let catalog = DatabaseCatalogProvider::try_new(mysql_pool).await.unwrap();
+                ctx.register_catalog(name, Arc::new(catalog));
+                Ok(())
             }
         }
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))?;
