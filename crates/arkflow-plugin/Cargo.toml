@@ -25,7 +25,8 @@ tracing = { workspace = true }
 
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
-datafusion-table-providers = { version = "0.3", features = ["mysql"] }
+datafusion-table-providers = { version = "0.3", features = ["mysql", "postgres", "duckdb", "sqlite"] }
+duckdb = "1.2"
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
