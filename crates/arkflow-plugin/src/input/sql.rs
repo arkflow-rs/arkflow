@@ -324,6 +324,7 @@ impl SqlInput {
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
 }
+
 pub(crate) struct SqlInputBuilder;
 impl InputBuilder for SqlInputBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
