@@ -7,14 +7,13 @@ use async_trait::async_trait;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
-use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPoolFactory;
 use datafusion_table_providers::sql::db_connection_pool::Mode;
 use datafusion_table_providers::{
-    common::DatabaseCatalogProvider, mysql::MySQLTableFactory,
-    sql::db_connection_pool::mysqlpool::MySQLConnectionPool, util::secrets::to_secret_map,
+    common::DatabaseCatalogProvider, sql::db_connection_pool::mysqlpool::MySQLConnectionPool,
+    util::secrets::to_secret_map,
 };
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
