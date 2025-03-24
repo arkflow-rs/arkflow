@@ -44,7 +44,7 @@ impl Cli {
         let config = match EngineConfig::from_file(config_path) {
             Ok(config) => config,
             Err(e) => {
-                error!("Failed to load configuration file: {}", e);
+                println!("Failed to load configuration file: {}", e);
                 process::exit(1);
             }
         };

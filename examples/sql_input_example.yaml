@@ -6,8 +6,8 @@ streams:
       type: "sql"
       input_type: "csv"
       path: './examples/input_data.csv'
-#      select_sql: |
-#        select * from flow;
+      select_sql: |
+        select * from flow;
     
     
 
