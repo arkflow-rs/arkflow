@@ -74,13 +74,13 @@ ArkFlow使用YAML格式的配置文件，支持以下主要配置项：
 logging:
   level: info  # 日志级别：debug, info, warn, error
 
-streams:       # 流定义列表
+streams: # 流定义列表
   - input:      # 输入配置
-      # ...
+    # ...
     pipeline:   # 处理管道配置
-      # ...
+    # ...
     output:     # 输出配置
-      # ...
+    # ...
 ```
 
 ### 输入组件
@@ -90,9 +90,9 @@ ArkFlow支持多种输入源：
 - **Kafka**：从Kafka主题读取数据
 - **MQTT**：从MQTT主题订阅消息
 - **HTTP**：通过HTTP接收数据
-- **FILE**：使用SQL从文件读取数据
+- **FILE**：使用SQL从文件(Csv、Json、Parquet、Avro、Arrow)读取数据
 - **生成器**：生成测试数据
-- **SQL**：从数据库查询数据
+- **DATABASE**：从数据库(MySQL、PostgreSQL、SQLite、Duckdb)查询数据
 
 示例：
 
@@ -200,7 +200,6 @@ streams:
     output:
       type: "stdout"
 ```
-
 
 ## 许可证
 

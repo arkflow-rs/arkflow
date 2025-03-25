@@ -92,9 +92,9 @@ ArkFlow supports multiple input sources:
 - **Kafka**: Read data from Kafka topics
 - **MQTT**: Subscribe to messages from MQTT topics
 - **HTTP**: Receive data via HTTP
-- **FILE**: Reading data from files using SQL
+- **FILE**: Reading data from files(Csv,Json, Parquet, Avro, Arrow) using SQL
 - **Generator**: Generate test data
-- **SQL**: Query data from databases
+- **DATABASE**: Query data from databases(MySQL, PostgreSQL, SQLite, Duckdb)
 
 Example:
 
