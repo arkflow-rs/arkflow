@@ -90,9 +90,9 @@ ArkFlow支持多种输入源：
 - **Kafka**：从Kafka主题读取数据
 - **MQTT**：从MQTT主题订阅消息
 - **HTTP**：通过HTTP接收数据
-- **FILE**：使用SQL从文件(Csv、Json、Parquet、Avro、Arrow)读取数据
+- **文件**：使用SQL从文件(Csv、Json、Parquet、Avro、Arrow)读取数据
 - **生成器**：生成测试数据
-- **DATABASE**：从数据库(MySQL、PostgreSQL、SQLite、Duckdb)查询数据
+- **数据库**：从数据库(MySQL、PostgreSQL、SQLite、Duckdb)查询数据
 
 示例：
 
@@ -137,7 +137,7 @@ ArkFlow支持多种输出目标：
 - **MQTT**：将消息发布到MQTT主题
 - **HTTP**：通过HTTP发送数据
 - **标准输出**：将数据输出到控制台
-- **DROP**: 丢弃数据
+- **Drop**: 丢弃数据
 
 示例：
 
