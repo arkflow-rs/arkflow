@@ -157,7 +157,7 @@ mod tests {
 
         // Test write with simple text
         let msg = MessageBatch::from_string("test message");
-        assert!(output.write(&msg).await.is_ok());
+        assert!(output.write(msg).await.is_ok());
 
         // Test close
         assert!(output.close().await.is_ok());
@@ -173,7 +173,7 @@ mod tests {
 
         // Test binary data
         let binary_msg = MessageBatch::from_string("binary test");
-        assert!(output.write(&binary_msg).await.is_ok());
+        assert!(output.write(binary_msg).await.is_ok());
 
         // Test Arrow data (would need more complex setup)
         // TODO: Add Arrow data type test cases
@@ -188,7 +188,7 @@ mod tests {
         };
         let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
         let msg = MessageBatch::from_string("test");
-        output.write(&msg).await.unwrap();
+        output.write(msg).await.unwrap();
         let writer = output.writer.lock().await;
         assert_eq!(writer.get_output(), "test\n");
 
@@ -198,7 +198,7 @@ mod tests {
         };
         let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
         let msg = MessageBatch::from_string("test");
-        output.write(&msg).await.unwrap();
+        output.write(msg).await.unwrap();
         let writer = output.writer.lock().await;
         assert_eq!(writer.get_output(), "test");
     }
@@ -214,15 +214,15 @@ mod tests {
         // Test multiple messages
         // Write multiple messages one by one
         output
-            .write(&MessageBatch::from_string("first"))
+            .write(MessageBatch::from_string("first"))
             .await
             .unwrap();
         output
-            .write(&MessageBatch::from_string("second"))
+            .write(MessageBatch::from_string("second"))
             .await
             .unwrap();
         output
-            .write(&MessageBatch::from_string("third"))
+            .write(MessageBatch::from_string("third"))
             .await
             .unwrap();
 

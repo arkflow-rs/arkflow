@@ -71,7 +71,7 @@ mod tests {
         let message_batch = MessageBatch::new_binary(binary_data);
 
         // Test write method with binary data
-        let result = drop_output.write(&message_batch).await;
+        let result = drop_output.write(message_batch).await;
         assert!(
             result.is_ok(),
             "write() should return Ok(()) for binary data"
@@ -98,7 +98,7 @@ mod tests {
         let message_batch = MessageBatch::new_arrow(batch);
 
         // Test write method with Arrow data
-        let result = drop_output.write(&message_batch).await;
+        let result = drop_output.write(message_batch).await;
         assert!(
             result.is_ok(),
             "write() should return Ok(()) for Arrow data"
@@ -130,7 +130,7 @@ mod tests {
 
         // Write multiple messages
         for _ in 0..5 {
-            let write_result = drop_output.write(&message_batch).await;
+            let write_result = drop_output.write(message_batch.clone()).await;
             assert!(write_result.is_ok(), "write() should return Ok(())");
         }
 

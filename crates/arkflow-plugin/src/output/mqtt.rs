@@ -355,7 +355,7 @@ mod tests {
         output.connect().await.unwrap();
 
         let msg = MessageBatch::from_string("test message");
-        assert!(output.write(&msg).await.is_ok());
+        assert!(output.write(msg).await.is_ok());
 
         // Verify the message was published
         let client = output.client.lock().await;
@@ -413,6 +413,6 @@ mod tests {
         output.close().await.unwrap();
 
         let msg = MessageBatch::from_string("test message");
-        assert!(output.write(&msg).await.is_err());
+        assert!(output.write(msg).await.is_err());
     }
 }

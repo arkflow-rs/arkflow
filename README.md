@@ -7,13 +7,15 @@ English | [中文](README_zh.md)
 [![Rust](https://github.com/chenquan/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/chenquan/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting multiple input/output sources and processors.
+High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting
+multiple input/output sources and processors.
 
 ## Features
 
 - **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, and other input/output sources
-- **Powerful Processing Capabilities**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch processing, and other processors
+- **Powerful Processing Capabilities**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch
+  processing, and other processors
 - **Extensible**: Modular design, easy to extend with new input, output, and processor components
 
 ## Installation
@@ -74,13 +76,13 @@ ArkFlow uses YAML format configuration files, supporting the following main conf
 logging:
   level: info  # Log level: debug, info, warn, error
 
-streams:       # Stream definition list
+streams: # Stream definition list
   - input:      # Input configuration
-      # ...
+    # ...
     pipeline:   # Processing pipeline configuration
-      # ...
+    # ...
     output:     # Output configuration
-      # ...
+    # ...
 ```
 
 ### Input Components
@@ -90,7 +92,7 @@ ArkFlow supports multiple input sources:
 - **Kafka**: Read data from Kafka topics
 - **MQTT**: Subscribe to messages from MQTT topics
 - **HTTP**: Receive data via HTTP
-- **SQL**: Reading data from files using SQL
+- **FILE**: Reading data from files using SQL
 - **Generator**: Generate test data
 - **SQL**: Query data from databases
 
@@ -137,6 +139,7 @@ ArkFlow supports multiple output targets:
 - **MQTT**: Publish messages to MQTT topics
 - **HTTP**: Send data via HTTP
 - **Standard Output**: Output data to the console
+- **DROP**: Discard data
 
 Example:
 
@@ -199,7 +202,6 @@ streams:
     output:
       type: "stdout"
 ```
-
 
 ## License
 

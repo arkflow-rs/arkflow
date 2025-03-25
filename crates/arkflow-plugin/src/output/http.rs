@@ -277,7 +277,7 @@ mod tests {
         // Create HTTP output without connecting
         let output = HttpOutput::new(config).unwrap();
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should return connection error
         assert!(result.is_err(), "Write should fail when not connected");
@@ -305,7 +305,7 @@ mod tests {
 
         // Create empty message
         let msg = MessageBatch::new_binary(vec![]);
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should succeed with empty message
         assert!(result.is_ok(), "Write should succeed with empty message");
@@ -354,7 +354,7 @@ mod tests {
 
         // Try to write a message
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should return config error
         assert!(result.is_err(), "Write should fail with unsupported method");
@@ -429,7 +429,7 @@ mod tests {
         let output = HttpOutput::new(config).unwrap();
         output.connect().await.unwrap();
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should succeed with 200 OK response
         assert!(result.is_ok(), "Write should succeed with 200 OK response");
@@ -465,7 +465,7 @@ mod tests {
         // Add a small delay to ensure server is ready
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should succeed with 201 Created response
         assert!(
@@ -498,7 +498,7 @@ mod tests {
         let output = HttpOutput::new(config).unwrap();
         output.connect().await.unwrap();
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should fail with either Processing or Connection error
         assert!(result.is_err(), "Write should fail with error response");
@@ -538,7 +538,7 @@ mod tests {
 
         // Measure time to verify retry delay
         let start = std::time::Instant::now();
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
         let elapsed = start.elapsed();
 
         // Should fail after retries
