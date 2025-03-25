@@ -20,7 +20,7 @@ impl Output for DropOutput {
         Ok(())
     }
 
-    async fn write(&self, _: &MessageBatch) -> Result<(), Error> {
+    async fn write(&self, _: MessageBatch) -> Result<(), Error> {
         Ok(())
     }
 

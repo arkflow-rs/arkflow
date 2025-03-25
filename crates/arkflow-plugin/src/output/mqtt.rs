@@ -102,7 +102,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         Ok(())
     }
 
-    async fn write(&self, msg: &MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         if !self.connected.load(Ordering::SeqCst) {
             return Err(Error::Connection("The output is not connected".to_string()));
         }

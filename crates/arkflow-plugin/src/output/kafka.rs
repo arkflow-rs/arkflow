@@ -106,7 +106,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         Ok(())
     }
 
-    async fn write(&self, msg: &MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         let producer_arc = self.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {

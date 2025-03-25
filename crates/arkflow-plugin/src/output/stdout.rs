@@ -45,8 +45,8 @@ where
         Ok(())
     }
 
-    async fn write(&self, batch: &MessageBatch) -> Result<(), Error> {
-        match &batch.content {
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+        match &msg.content {
             Content::Arrow(v) => self.arrow_stdout(&v).await,
             Content::Binary(v) => self.binary_stdout(&v).await,
         }

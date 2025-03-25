@@ -61,7 +61,7 @@ impl Output for HttpOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: &MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         let client_arc = self.client.clone();
         let client_arc_guard = client_arc.lock().await;
         if !self.connected.load(Ordering::SeqCst) || client_arc_guard.is_none() {
