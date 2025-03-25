@@ -90,7 +90,7 @@ ArkFlow supports multiple input sources:
 - **Kafka**: Read data from Kafka topics
 - **MQTT**: Subscribe to messages from MQTT topics
 - **HTTP**: Receive data via HTTP
-- **File**: Read data from files
+- **SQL**: Reading data from files using SQL
 - **Generator**: Generate test data
 - **SQL**: Query data from databases
 
@@ -136,7 +136,6 @@ ArkFlow supports multiple output targets:
 - **Kafka**: Write data to Kafka topics
 - **MQTT**: Publish messages to MQTT topics
 - **HTTP**: Send data via HTTP
-- **File**: Write data to files
 - **Standard Output**: Output data to the console
 
 Example:
