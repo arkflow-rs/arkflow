@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tracing::error;
 
-const DEFAULT_TABLE_NAME: &str = "flow";
+const DEFAULT_NAME: &str = "flow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
@@ -207,32 +207,32 @@ impl SqlInput {
     async fn init_connect(&self, ctx: &mut SessionContext) -> Result<(), Error> {
         match self.sql_config.input_type {
             InputType::Avro(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
             InputType::Arrow(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
             }
             InputType::Json(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
             }
             InputType::Csv(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
             }
             InputType::Parquet(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
             }
             InputType::Mysql(ref c) => {
-                let name = c.name.as_deref().unwrap_or("mysql");
+                let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 let mut params = HashMap::from([
                     ("connection_string".to_string(), c.uri.to_string()),
                     ("sslmode".to_string(), c.ssl.ssl_mode.to_string()),
@@ -267,7 +267,7 @@ impl SqlInput {
                     .map_err(|e| {
                         return Error::Config(format!("Failed to create duckdb catalog: {}", e));
                     })?;
-                let name = c.name.as_deref().unwrap_or("duckdb");
+                let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
@@ -293,7 +293,7 @@ impl SqlInput {
                     .map_err(|e| {
                         return Error::Config(format!("Failed to create postgres catalog: {}", e));
                     })?;
-                let name = c.name.as_deref().unwrap_or("postgres");
+                let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
@@ -316,7 +316,7 @@ impl SqlInput {
                     .map_err(|e| {
                         return Error::Config(format!("Failed to create sqlite catalog: {}", e));
                     })?;
-                let name = c.name.as_deref().unwrap_or("sqlite");
+                let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog_provider));
                 Ok(())
             }
