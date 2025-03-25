@@ -106,7 +106,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         Ok(())
     }
 
-    async fn write(&self, msg: &MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         let producer_arc = self.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {
@@ -405,7 +405,7 @@ mod tests {
 
         // Create a test message
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
         assert!(result.is_ok(), "Failed to write message to Kafka");
 
         // Verify the message was sent
@@ -437,7 +437,7 @@ mod tests {
 
         // Create a test message
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
         assert!(result.is_ok(), "Failed to write message to Kafka");
 
         // Verify the message was sent with the key
@@ -464,7 +464,7 @@ mod tests {
         // Create Kafka output without connecting
         let output = KafkaOutput::<MockKafkaClient>::new(config).unwrap();
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
 
         // Should return connection error
         assert!(result.is_err(), "Write should fail when not connected");
@@ -498,7 +498,7 @@ mod tests {
 
         // Create a test message
         let msg = MessageBatch::from_string("test message");
-        let result = output.write(&msg).await;
+        let result = output.write(msg).await;
         assert!(result.is_err(), "Write should fail with producer error");
     }
 

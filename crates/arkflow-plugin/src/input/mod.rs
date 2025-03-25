@@ -4,7 +4,6 @@
 
 use std::sync::OnceLock;
 
-pub mod file;
 pub mod generate;
 pub mod http;
 pub mod kafka;
@@ -18,7 +17,6 @@ lazy_static::lazy_static! {
 
 pub fn init() {
     INITIALIZED.get_or_init(|| {
-        file::init();
         generate::init();
         http::init();
         kafka::init();

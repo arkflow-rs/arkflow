@@ -19,7 +19,7 @@ pub trait Output: Send + Sync {
     async fn connect(&self) -> Result<(), Error>;
 
     /// Write a message to the output destination
-    async fn write(&self, msg: &MessageBatch) -> Result<(), Error>;
+    async fn write(&self, msg: MessageBatch) -> Result<(), Error>;
 
     /// Close the output destination connection
     async fn close(&self) -> Result<(), Error>;

@@ -99,7 +99,7 @@ impl Stream {
                 Ok(msg) => {
                     let size = &msg.0.len();
                     let mut success_cnt = 0;
-                    for x in &msg.0 {
+                    for x in msg.0 {
                         match self.output.write(x).await {
                             Ok(_) => {
                                 success_cnt = success_cnt + 1;

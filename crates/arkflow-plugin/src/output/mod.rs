@@ -5,7 +5,6 @@
 use std::sync::OnceLock;
 
 pub mod drop;
-pub mod file;
 pub mod http;
 pub mod kafka;
 pub mod mqtt;
@@ -18,7 +17,6 @@ lazy_static::lazy_static! {
 pub fn init() {
     INITIALIZED.get_or_init(|| {
         drop::init();
-        file::init();
         http::init();
         kafka::init();
         mqtt::init();

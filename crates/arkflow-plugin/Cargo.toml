@@ -13,6 +13,7 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +24,9 @@ humantime = { workspace = true }
 tracing = { workspace = true }
 
 datafusion = { workspace = true }
+datafusion-functions-json = "*"
+datafusion-table-providers = { git = "https://github.com/ark-flow/datafusion-table-providers.git", branch = "datafusion-46", features = ["mysql", "postgres", "duckdb", "sqlite"] }
+duckdb = "=1.2.1"
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }

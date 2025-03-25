@@ -2,7 +2,7 @@ use crate::config::EngineConfig;
 use crate::engine::Engine;
 use clap::{Arg, Command};
 use std::process;
-use tracing::{error, info, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 pub struct Cli {
@@ -44,7 +44,7 @@ impl Cli {
         let config = match EngineConfig::from_file(config_path) {
             Ok(config) => config,
             Err(e) => {
-                error!("Failed to load configuration file: {}", e);
+                println!("Failed to load configuration file: {}", e);
                 process::exit(1);
             }
         };

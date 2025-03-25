@@ -31,7 +31,4 @@ streams:
 
 
     output:
-#      type: "stdout"
-      type: "file"
-      append: false
-      path: "examples/output.txt"
+      type: "stdout"
