@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time;
 
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::Mutex;
+use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,28 +20,95 @@ pub struct MemoryBufferConfig {
 
 pub struct MemoryBuffer {
     config: MemoryBufferConfig,
-    queue: Arc<Mutex<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
-    pub rx: Arc<Receiver<()>>,
+    queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    pub cond_rx: Arc<Receiver<()>>,
+    pub write_tx: Arc<Sender<()>>,
 }
 
 impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
         let duration = config.duration.clone();
-        let (tx, rx) = tokio::sync::broadcast::<()>::channel(1);
-        tokio::spawn(async {
+        let (cond_tx, cond_rx) = tokio::sync::broadcast::channel(1);
+        let (write_tx, mut write_rx) = tokio::sync::broadcast::channel(1);
+        tokio::spawn(async move {
             loop {
-                sleep(duration).await;
-                match tx.send(()) {
-                    Ok(_) => {}
-                    Err(_) => {}
+                tokio::select! {
+                    _ = write_rx.recv() => {
+                        match cond_tx.send(()) {
+                            Ok(_) => {}
+                            _ => {
+                                break;
+                            }
+                        }
+                    },
+                    _ = sleep(duration) => {
+                        match cond_tx.send(()) {
+                            Ok(_) => {}
+                            _ => {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
         Ok(Self {
             config,
             queue: Arc::new(Default::default()),
-            rx: Arc::new(rx),
+            cond_rx: Arc::new(cond_rx),
+            write_tx: Arc::new(write_tx),
         })
+    }
+
+    // 处理队列中的所有消息
+    async fn process_messages(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+        let queue_arc = self.queue.clone();
+        let mut queue_lock = queue_arc.write().await;
+
+        // 如果队列为空，返回 None
+        if queue_lock.is_empty() {
+            return Ok(None);
+        }
+
+        // 收集所有消息和确认
+        let mut messages = Vec::new();
+        let mut acks = Vec::new();
+
+        while let Some((msg, ack)) = queue_lock.pop_back() {
+            messages.push(msg);
+            acks.push(ack);
+        }
+
+        // 如果没有消息，返回 None
+        if messages.is_empty() {
+            return Ok(None);
+        }
+
+        // 合并所有消息
+        let mut combined_message = messages.remove(0);
+        for msg in messages {
+            match (&mut combined_message.content, &msg.content) {
+                (
+                    arkflow_core::Content::Binary(combined),
+                    arkflow_core::Content::Binary(to_add),
+                ) => {
+                    combined.extend(to_add);
+                }
+                (arkflow_core::Content::Arrow(combined), arkflow_core::Content::Arrow(to_add)) => {
+                    let schema = combined.schema();
+                    if let Ok(merged) =
+                        datafusion::arrow::compute::concat_batches(&schema, &[combined, to_add])
+                    {
+                        *combined = merged;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let combined_ack = Arc::new(ArrayAck(acks));
+
+        Ok(Some((combined_message, combined_ack)))
     }
 }
 
@@ -49,42 +116,49 @@ impl MemoryBuffer {
 impl Buffer for MemoryBuffer {
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
         let queue_arc = self.queue.clone();
-        let mut queue_lock = queue_arc.lock().await;
-        if queue_lock.len() >= self.config.max_cap as usize {
-            queue_lock.pop_back();
+        loop {
+            {
+                let queue_lock = queue_arc.read().await;
+                if queue_lock.len() >= self.config.max_cap as usize {
+                    let _ = self.write_tx.send(());
+                } else {
+                    break;
+                }
+            }
         }
+
+        let mut queue_lock = queue_arc.write().await;
+
         queue_lock.push_front((msg, arc));
 
         Ok(())
     }
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let mut rx_arc = self.rx.clone();
-        let result = rx_arc.recv().await;
-        if result.is_err() {
-            return Ok(None);
-        }
+        let mut cond_rx_arc = self.cond_rx.clone();
+        match &cond_rx_arc.recv().await {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(Error::EOF);
+            }
+        };
 
-        let queue_arc = self.queue.clone();
-        let mut queue_lock = queue_arc.lock().await;
-        let mut v = vec![];
-        let mut acks = vec![];
-        while let Some((msg, ack)) = queue_lock.pop_front() {
-            v.push(msg);
-            acks.push(ack);
-        }
-        Ok(queue_lock.pop_back())
+        self.process_messages().await
     }
 
     async fn close(&self) -> Result<(), Error> {
-        todo!()
+        // 清空队列
+        let queue_arc = self.queue.clone();
+        let mut queue_lock = queue_arc.write().await;
+        queue_lock.clear();
+        Ok(())
     }
 }
 struct ArrayAck(Vec<Arc<dyn Ack>>);
+#[async_trait]
 impl Ack for ArrayAck {
     async fn ack(&self) {
-        let x = &self.0;
-        for ack in &self.0.iter() {
+        for ack in self.0.iter() {
             ack.ack().await;
         }
     }
