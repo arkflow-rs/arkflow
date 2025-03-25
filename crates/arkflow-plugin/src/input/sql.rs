@@ -36,15 +36,15 @@ pub struct SqlInputConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "input_type", rename_all = "lowercase")]
 enum InputType {
-    AVRO(AvroConfig),
-    ARROW(ArrowConfig),
-    JSON(JsonConfig),
-    CSV(CsvConfig),
-    PARQUET(ParquetConfig),
-    MYSQL(MysqlConfig),
-    DUCKDB(DuckDBConfig),
-    POSTGRES(PostgresConfig),
-    SQLITE(SqliteConfig),
+    Avro(AvroConfig),
+    Arrow(ArrowConfig),
+    Json(JsonConfig),
+    Csv(CsvConfig),
+    Parquet(ParquetConfig),
+    Mysql(MysqlConfig),
+    Duckdb(DuckDBConfig),
+    Postgres(PostgresConfig),
+    Sqlite(SqliteConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,32 +206,32 @@ impl Input for SqlInput {
 impl SqlInput {
     async fn init_connect(&self, ctx: &mut SessionContext) -> Result<(), Error> {
         match self.sql_config.input_type {
-            InputType::AVRO(ref c) => {
+            InputType::Avro(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
-            InputType::ARROW(ref c) => {
+            InputType::Arrow(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
             }
-            InputType::JSON(ref c) => {
+            InputType::Json(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
             }
-            InputType::CSV(ref c) => {
+            InputType::Csv(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
             }
-            InputType::PARQUET(ref c) => {
+            InputType::Parquet(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
             }
-            InputType::MYSQL(ref c) => {
+            InputType::Mysql(ref c) => {
                 let name = c.name.as_deref().unwrap_or("mysql");
                 let mut params = HashMap::from([
                     ("connection_string".to_string(), c.uri.to_string()),
@@ -253,7 +253,7 @@ impl SqlInput {
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
-            InputType::DUCKDB(ref c) => {
+            InputType::Duckdb(ref c) => {
                 let duckdb_pool = Arc::new(
                     DuckDbConnectionPool::new_file(&c.file_path, &AccessMode::ReadOnly).map_err(
                         |e| {
@@ -271,13 +271,13 @@ impl SqlInput {
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
-            InputType::POSTGRES(ref c) => {
+            InputType::Postgres(ref c) => {
                 let mut params = HashMap::from([
                     ("connection_string".to_string(), c.uri.to_string()),
                     ("sslmode".to_string(), c.ssl.ssl_mode.to_string()),
                 ]);
                 if let Some(ref v) = c.ssl.root_cert {
-                    params.insert("sslrootcert".to_string(), v.to_string().parse().unwrap());
+                    params.insert("sslrootcert".to_string(), v.to_string());
                 }
                 let postgres_params = to_secret_map(params);
                 let postgres_pool = Arc::new(
@@ -297,7 +297,7 @@ impl SqlInput {
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
-            InputType::SQLITE(ref c) => {
+            InputType::Sqlite(ref c) => {
                 let sqlite_pool = Arc::new(
                     SqliteConnectionPoolFactory::new(
                         &c.file_path,
