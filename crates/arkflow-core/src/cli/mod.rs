@@ -2,7 +2,7 @@ use crate::config::EngineConfig;
 use crate::engine::Engine;
 use clap::{Arg, Command};
 use std::process;
-use tracing::{error, info, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 pub struct Cli {
