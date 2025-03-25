@@ -1,6 +1,6 @@
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Content, Error, MessageBatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +16,14 @@ use tokio::time::sleep;
 pub struct MemoryBufferConfig {
     max_cap: u32,
     duration: time::Duration,
+    data_type: DataType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DataType {
+    Arrow,
+    Binary,
 }
 
 pub struct MemoryBuffer {
@@ -75,7 +83,12 @@ impl MemoryBuffer {
         let mut acks = Vec::new();
 
         while let Some((msg, ack)) = queue_lock.pop_back() {
-            messages.push(msg);
+            match (&self.config.data_type, msg.content) {
+                (DataType::Arrow, Content::Arrow(v)) => {}
+                (DataType::Binary, Content::Binary(v)) => {}
+                (_, _) => {}
+            }
+            // messages.push(msg);
             acks.push(ack);
         }
 
