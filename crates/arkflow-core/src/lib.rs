@@ -52,10 +52,11 @@ pub type Bytes = Vec<u8>;
 
 /// Represents a message in a stream processing engine.
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MessageBatch {
     /// Message content
     pub content: Content,
+    error: Option<Error>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,7 @@ pub enum Content {
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Self {
         Self {
+            error: None,
             content: Content::Binary(content),
         }
     }
@@ -76,6 +78,7 @@ impl MessageBatch {
     }
     pub fn new_arrow(content: RecordBatch) -> Self {
         Self {
+            error: None,
             content: Content::Arrow(content),
         }
     }
@@ -117,5 +120,20 @@ impl MessageBatch {
             Content::Arrow(v) => v.num_rows(),
             Content::Binary(v) => v.len(),
         }
+    }
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    pub fn error(&self) -> Option<&Error> {
+        self.error.as_ref()
+    }
+
+    pub fn set_error(&mut self, error: Error) {
+        self.error = Some(error);
+    }
+
+    pub fn clear_error(&mut self) {
+        self.error = None;
     }
 }
