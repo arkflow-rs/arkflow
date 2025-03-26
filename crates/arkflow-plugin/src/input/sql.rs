@@ -34,7 +34,7 @@ pub struct SqlInputConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "input_type", rename_all = "lowercase")]
+#[serde(tag = "input_type", rename_all = "snake_case")]
 enum InputType {
     Avro(AvroConfig),
     Arrow(ArrowConfig),

@@ -7,7 +7,7 @@ use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatc
 use flume::Sender;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use waitgroup::{WaitGroup, Worker};
 
 /// A stream structure, containing input, pipe, output, and an optional buffer.
@@ -64,16 +64,11 @@ impl Stream {
                     match input_receiver.recv_async().await {
                         Ok((msg, ack)) => {
                             // Process messages through pipeline
-                            debug!("Processing input message: {:?}", &msg.as_string());
                             let processed = pipeline.process(msg).await;
 
                             // Process result messages
                             match processed {
                                 Ok(msgs) => {
-                                    for x in &msgs {
-                                        debug!("Processing output message: {:?}", x.as_string());
-                                    }
-
                                     if let Err(e) = output_sender.send_async((msgs, ack)).await {
                                         error!("Failed to send processed message: {}", e);
                                         break;
@@ -153,7 +148,6 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok(msg) => {
-                        debug!("Received input message: {:?}", &msg.0.as_string());
                         if let Err(e) = input_sender.send_async(msg).await {
                             error!("Failed to send input message: {}", e);
                             break;
@@ -188,7 +182,7 @@ impl Stream {
                     }
                     };
                 }
-            };
+            }
         }
         info!("input stopped");
     }

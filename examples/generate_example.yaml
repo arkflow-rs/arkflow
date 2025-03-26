@@ -5,8 +5,8 @@ streams:
   - input:
       type: "generate"
       context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
-      interval: 1ms
-      batch_size: 10000
+      interval: 1s
+      batch_size: 1
 
 
     pipeline:
@@ -20,8 +20,8 @@ streams:
 
         - type: "sql"
           # SQL查询语句，支持标准SQL语法
-          query: "SELECT count(*) FROM flow WHERE value >= 10 group by sensor"
-        - type: "arrow_to_json"
+          query: "SELECT count(*) ,111 as x FROM flow WHERE value >= 10 group by sensor"
+#        - type: "arrow_to_json"
 
 
     output:

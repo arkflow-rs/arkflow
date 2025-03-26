@@ -52,7 +52,6 @@ streams:
         - type: "json_to_arrow"
         - type: "sql"
           query: "SELECT * FROM flow WHERE value >= 10"
-        - type: "arrow_to_json"
 
     output:
       type: "stdout"
@@ -126,7 +125,6 @@ pipeline:
     - type: json_to_arrow
     - type: sql
       query: "SELECT * FROM flow WHERE value >= 10"
-    - type: arrow_to_json
 ```
 
 ### 输出组件
@@ -170,7 +168,6 @@ streams:
         - type: json_to_arrow
         - type: sql
           query: "SELECT * FROM flow WHERE value > 100"
-        - type: arrow_to_json
 
     output:
       type: kafka
@@ -195,7 +192,6 @@ streams:
         - type: "json_to_arrow"
         - type: "sql"
           query: "SELECT count(*) FROM flow WHERE value >= 10 group by sensor"
-        - type: "arrow_to_json"
 
     output:
       type: "stdout"
