@@ -56,7 +56,7 @@ pub type Bytes = Vec<u8>;
 pub struct MessageBatch {
     /// Message content
     pub content: Content,
-    error: Option<Error>,
+    error: Option<anyhow::Error>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,11 +125,11 @@ impl MessageBatch {
         self.error.is_some()
     }
 
-    pub fn error(&self) -> Option<&Error> {
+    pub fn error(&self) -> Option<&anyhow::Error> {
         self.error.as_ref()
     }
 
-    pub fn set_error(&mut self, error: Error) {
+    pub fn set_error(&mut self, error: anyhow::Error) {
         self.error = Some(error);
     }
 

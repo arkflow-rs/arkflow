@@ -188,7 +188,7 @@ impl Stream {
                     }
                     };
                 }
-            };
+            }
         }
         info!("input stopped");
     }
