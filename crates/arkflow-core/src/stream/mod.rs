@@ -80,6 +80,7 @@ impl Stream {
                                     }
                                 }
                                 Err(e) => {
+                                    ack.ack().await;
                                     error!("{}", e)
                                 }
                             }
