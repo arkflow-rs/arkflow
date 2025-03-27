@@ -127,8 +127,8 @@ impl Buffer for MemoryBuffer {
     }
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let mut cond_rx_arc = self.cond_rx.clone();
-        if let Err(e) = &cond_rx_arc.recv().await {
+        let mut rx = self.cond_rx.resubscribe();
+        if let Err(e) = rx.recv().await {
             error!("send error:{}", e);
             return Err(Error::EOF);
         }

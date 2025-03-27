@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 use waitgroup::{WaitGroup, Worker};
+use crate::buffer::Buffer;
 
 /// A stream structure, containing input, pipe, output, and an optional buffer.
 pub struct Stream {
@@ -16,6 +17,7 @@ pub struct Stream {
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
     thread_num: u32,
+    pub buffer: Option<Arc<dyn Buffer>>,
 }
 
 impl Stream {
@@ -24,12 +26,14 @@ impl Stream {
         input: Arc<dyn Input>,
         pipeline: Pipeline,
         output: Arc<dyn Output>,
+        buffer: Option<Arc<dyn Buffer>>,
         thread_num: u32,
     ) -> Self {
         Self {
             input,
             pipeline: Arc::new(pipeline),
             output,
+            buffer,
             thread_num,
         }
     }
@@ -202,6 +206,7 @@ pub struct StreamConfig {
     pub input: crate::input::InputConfig,
     pub pipeline: crate::pipeline::PipelineConfig,
     pub output: crate::output::OutputConfig,
+    pub buffer: Option<crate::buffer::BufferConfig>,
 }
 
 impl StreamConfig {
@@ -210,7 +215,12 @@ impl StreamConfig {
         let input = self.input.build()?;
         let (pipeline, thread_num) = self.pipeline.build()?;
         let output = self.output.build()?;
+        let buffer = if let Some(buffer_config) = &self.buffer {
+            Some(buffer_config.build()?)
+        } else {
+            None
+        };
 
-        Ok(Stream::new(input, pipeline, output, thread_num))
+        Ok(Stream::new(input, pipeline, output,buffer, thread_num))
     }
 }
