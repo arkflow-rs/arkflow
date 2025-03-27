@@ -1,5 +1,7 @@
 use crate::config::EngineConfig;
 use std::process;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 pub struct Engine {
@@ -29,12 +31,30 @@ impl Engine {
                 }
             }
         }
+        // Set up signal handlers
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, exiting...");
+
+                },
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, exiting...");
+                }
+            }
+
+            token_clone.cancel();
+        });
 
         for (i, mut stream) in streams.into_iter().enumerate() {
             info!("Starting flow #{}", i + 1);
-
+            let cancellation_token = token.clone();
             let handle = tokio::spawn(async move {
-                match stream.run().await {
+                match stream.run(cancellation_token).await {
                     Ok(_) => info!("Flow #{} completed successfully", i + 1),
                     Err(e) => {
                         error!("Flow #{} ran with error: {}", i + 1, e)

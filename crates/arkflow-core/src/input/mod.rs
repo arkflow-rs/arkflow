@@ -6,6 +6,7 @@ use crate::{Error, MessageBatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 
 lazy_static::lazy_static! {
@@ -38,6 +39,37 @@ pub struct NoopAck;
 #[async_trait]
 impl Ack for NoopAck {
     async fn ack(&self) {}
+}
+
+pub struct VecAck(Vec<Arc<dyn Ack>>);
+
+#[async_trait]
+impl Ack for VecAck {
+    async fn ack(&self) {
+        for ack in &self.0 {
+            ack.ack().await;
+        }
+    }
+}
+
+impl Deref for VecAck {
+    type Target = Vec<Arc<dyn Ack>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for VecAck {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<Arc<dyn Ack>> for VecAck {
+    fn from(ack: Arc<dyn Ack>) -> Self {
+        VecAck(vec![ack])
+    }
 }
 
 /// Input configuration

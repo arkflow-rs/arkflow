@@ -1,3 +1,4 @@
+use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
 use arkflow_core::{Error, MessageBatch};
@@ -7,7 +8,7 @@ use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar};
 use std::time;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::RwLock;
@@ -16,35 +17,31 @@ use tracing::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBufferConfig {
-    max_cap: u32,
-    duration: time::Duration,
+    capacity: u32,
+    #[serde(deserialize_with = "deserialize_duration")]
+    timeout: time::Duration,
 }
 
 pub struct MemoryBuffer {
     config: MemoryBufferConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     pub cond_rx: Arc<Receiver<()>>,
-    pub write_tx: Arc<Sender<()>>,
+    pub cond_tx: Arc<Sender<()>>,
 }
 
 impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
-        let duration = config.duration.clone();
+        let duration = config.timeout.clone();
         let (cond_tx, cond_rx) = tokio::sync::broadcast::channel(1);
-        let (write_tx, mut write_rx) = tokio::sync::broadcast::channel(1);
+        let cond_rx = Arc::new(cond_rx);
+        let cond_tx = Arc::new(cond_tx);
+        let cond_tx_clone = Arc::clone(&cond_tx);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = write_rx.recv() => {
-                        match cond_tx.send(()) {
-                            Ok(_) => {}
-                            _ => {
-                                break;
-                            }
-                        }
-                    },
+
                     _ = sleep(duration) => {
-                        match cond_tx.send(()) {
+                        match cond_tx_clone.send(()) {
                             Ok(_) => {}
                             _ => {
                                 break;
@@ -57,8 +54,8 @@ impl MemoryBuffer {
         Ok(Self {
             config,
             queue: Arc::new(Default::default()),
-            cond_rx: Arc::new(cond_rx),
-            write_tx: Arc::new(write_tx),
+            cond_rx,
+            cond_tx,
         })
     }
 
@@ -78,7 +75,6 @@ impl MemoryBuffer {
 
         while let Some((msg, ack)) = queue_lock.pop_back() {
             messages.push(msg);
-            // messages.push(msg);
             acks.push(ack);
         }
 
@@ -103,8 +99,8 @@ impl Buffer for MemoryBuffer {
         loop {
             {
                 let queue_lock = queue_arc.read().await;
-                if queue_lock.len() >= self.config.max_cap as usize {
-                    let _ = self.write_tx.send(());
+                if queue_lock.len() >= self.config.capacity as usize {
+                    let _ = self.cond_tx.clone().send(());
                 } else {
                     break;
                 }
@@ -121,18 +117,19 @@ impl Buffer for MemoryBuffer {
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let mut rx = self.cond_rx.resubscribe();
         if let Err(e) = rx.recv().await {
-            error!("send error:{}", e);
+            error!("receiver error:{}", e);
             return Err(Error::EOF);
         }
 
         self.process_messages().await
     }
 
+    async fn flush(&self) -> Result<(), Error> {
+        let _ = self.cond_tx.clone().send(());
+        Ok(())
+    }
+
     async fn close(&self) -> Result<(), Error> {
-        // 清空队列
-        let queue_arc = self.queue.clone();
-        let mut queue_lock = queue_arc.write().await;
-        queue_lock.clear();
         Ok(())
     }
 }
@@ -173,8 +170,8 @@ mod tests {
     #[tokio::test]
     async fn test_memory_buffer_new() {
         let p = MemoryBuffer::new(MemoryBufferConfig {
-            max_cap: 10,
-            duration: time::Duration::from_secs(10),
+            capacity: 10,
+            timeout: time::Duration::from_secs(10),
         })
         .unwrap();
 

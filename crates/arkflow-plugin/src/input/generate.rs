@@ -1,11 +1,11 @@
+use crate::time::deserialize_duration;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateInputConfig {
     context: String,
@@ -65,14 +65,6 @@ impl Input for GenerateInput {
     async fn close(&self) -> Result<(), Error> {
         Ok(())
     }
-}
-
-fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    humantime::parse_duration(&s).map_err(serde::de::Error::custom)
 }
 
 pub(crate) struct GenerateInputBuilder;

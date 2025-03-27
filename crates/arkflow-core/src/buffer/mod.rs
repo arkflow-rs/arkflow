@@ -15,6 +15,8 @@ pub trait Buffer: Send + Sync {
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>;
 
+    async fn flush(&self) -> Result<(), Error>;
+
     async fn close(&self) -> Result<(), Error>;
 }
 
