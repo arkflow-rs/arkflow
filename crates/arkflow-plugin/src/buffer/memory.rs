@@ -1,16 +1,18 @@
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Content, Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
+use datafusion::arrow;
+use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time;
-
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBufferConfig {
@@ -83,11 +85,7 @@ impl MemoryBuffer {
         let mut acks = Vec::new();
 
         while let Some((msg, ack)) = queue_lock.pop_back() {
-            match (&self.config.data_type, msg.content) {
-                (DataType::Arrow, Content::Arrow(v)) => {}
-                (DataType::Binary, Content::Binary(v)) => {}
-                (_, _) => {}
-            }
+            messages.push(msg);
             // messages.push(msg);
             acks.push(ack);
         }
@@ -96,32 +94,13 @@ impl MemoryBuffer {
         if messages.is_empty() {
             return Ok(None);
         }
+        let schema = messages[0].schema();
+        let x: Vec<RecordBatch> = messages.iter().map(|batch| batch.clone().into()).collect();
+        let new_batch = arrow::compute::concat_batches(&schema, &x)
+            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
-        // 合并所有消息
-        let mut combined_message = messages.remove(0);
-        for msg in messages {
-            match (&mut combined_message.content, &msg.content) {
-                (
-                    arkflow_core::Content::Binary(combined),
-                    arkflow_core::Content::Binary(to_add),
-                ) => {
-                    combined.extend(to_add);
-                }
-                (arkflow_core::Content::Arrow(combined), arkflow_core::Content::Arrow(to_add)) => {
-                    let schema = combined.schema();
-                    if let Ok(merged) =
-                        datafusion::arrow::compute::concat_batches(&schema, &[combined, to_add])
-                    {
-                        *combined = merged;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let combined_ack = Arc::new(ArrayAck(acks));
-
-        Ok(Some((combined_message, combined_ack)))
+        let new_ack = Arc::new(ArrayAck(acks));
+        Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
     }
 }
 
@@ -149,12 +128,10 @@ impl Buffer for MemoryBuffer {
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let mut cond_rx_arc = self.cond_rx.clone();
-        match &cond_rx_arc.recv().await {
-            Ok(_) => {}
-            Err(_) => {
-                return Err(Error::EOF);
-            }
-        };
+        if let Err(e) = &cond_rx_arc.recv().await {
+            error!("send error:{}", e);
+            return Err(Error::EOF);
+        }
 
         self.process_messages().await
     }
