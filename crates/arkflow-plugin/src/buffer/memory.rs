@@ -18,14 +18,6 @@ use tracing::error;
 pub struct MemoryBufferConfig {
     max_cap: u32,
     duration: time::Duration,
-    data_type: DataType,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DataType {
-    Arrow,
-    Binary,
 }
 
 pub struct MemoryBuffer {
@@ -171,4 +163,26 @@ impl BufferBuilder for MemoryBufferBuilder {
 
 pub fn init() {
     register_buffer_builder("memory", Arc::new(MemoryBufferBuilder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::input::NoopAck;
+
+    #[tokio::test]
+    async fn test_memory_buffer_new() {
+        let p = MemoryBuffer::new(MemoryBufferConfig {
+            max_cap: 10,
+            duration: time::Duration::from_secs(10),
+        })
+        .unwrap();
+
+        let x = p
+            .write(
+                MessageBatch::new_binary(vec!["test".as_bytes().to_vec()]).unwrap(),
+                Arc::new(NoopAck),
+            )
+            .await;
+    }
 }
