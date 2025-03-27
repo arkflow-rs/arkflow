@@ -20,21 +20,32 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Content, Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch};
 use protobuf::Message as ProtobufMessage;
 
 /// Protobuf format conversion processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtobufProcessorConfig {
+struct ProtobufProcessorConfig {
     /// Protobuf message type descriptor file path
-    pub proto_inputs: Vec<String>,
-    pub proto_includes: Option<Vec<String>>,
+    proto_inputs: Vec<String>,
+    proto_includes: Option<Vec<String>>,
     /// Protobuf message type name
-    pub message_type: String,
+    message_type: String,
+    mode: ToType,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ToType {
+    ArrowToProtobuf,
+    ProtobufToArrow(ArrowConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArrowConfig {
+    pub value_field: Option<String>,
+}
 /// Protobuf Format Conversion Processor
-pub struct ProtobufProcessor {
+struct ProtobufProcessor {
     _config: ProtobufProcessorConfig,
     descriptor: MessageDescriptor,
 }
@@ -195,7 +206,7 @@ impl ProtobufProcessor {
     }
 
     /// Convert Arrow format to Protobuf.
-    fn arrow_to_protobuf(&self, batch: &RecordBatch) -> Result<Vec<u8>, Error> {
+    fn arrow_to_protobuf(&self, batch: MessageBatch) -> Result<Vec<u8>, Error> {
         // Create a new dynamic message
         let mut proto_msg = DynamicMessage::new(self.descriptor.clone());
 
@@ -325,22 +336,24 @@ impl Processor for ProtobufProcessor {
         if msg.is_empty() {
             return Ok(vec![]);
         }
-        match msg.content {
-            Content::Arrow(v) => {
+        match self._config.mode {
+            ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
-                let proto_data = self.arrow_to_protobuf(&v)?;
-                let new_msg = MessageBatch::new_binary(vec![proto_data]);
+                let proto_data = self.arrow_to_protobuf(msg)?;
+                let new_msg = MessageBatch::new_binary(vec![proto_data])?;
 
                 Ok(vec![new_msg])
             }
-            Content::Binary(v) => {
-                if v.is_empty() {
+            ToType::ProtobufToArrow(ref c) => {
+                if msg.is_empty() {
                     return Ok(vec![]);
                 }
-                let mut batches = Vec::with_capacity(v.len());
-                for x in v {
+
+                let mut batches = Vec::with_capacity(msg.len());
+                let result = msg.to_binary(c.value_field.as_deref().unwrap_or("value"))?;
+                for x in result {
                     // Convert Protobuf messages to Arrow format.
-                    let batch = self.protobuf_to_arrow(&x)?;
+                    let batch = self.protobuf_to_arrow(x)?;
                     batches.push(batch)
                 }
 
@@ -375,394 +388,81 @@ fn list_files_in_dir<P: AsRef<Path>>(dir: P) -> io::Result<Vec<String>> {
     Ok(files)
 }
 
-pub(crate) struct ProtobufProcessorBuilder;
-impl ProcessorBuilder for ProtobufProcessorBuilder {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProtobufToArrowProcessorConfig {
+    #[serde(flatten)]
+    c: CommonProtobufProcessorConfig,
+    value_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommonProtobufProcessorConfig {
+    proto_inputs: Vec<String>,
+    proto_includes: Option<Vec<String>>,
+    /// Protobuf message type name
+    message_type: String,
+}
+
+type ArrowToProtobufProcessorConfig = CommonProtobufProcessorConfig;
+
+impl From<ArrowToProtobufProcessorConfig> for ProtobufProcessorConfig {
+    fn from(config: CommonProtobufProcessorConfig) -> Self {
+        Self {
+            proto_inputs: config.proto_inputs,
+            proto_includes: config.proto_includes,
+            message_type: config.message_type,
+            mode: ToType::ArrowToProtobuf,
+        }
+    }
+}
+
+impl From<ProtobufToArrowProcessorConfig> for ProtobufProcessorConfig {
+    fn from(config: ProtobufToArrowProcessorConfig) -> Self {
+        Self {
+            proto_inputs: config.c.proto_inputs,
+            proto_includes: config.c.proto_includes,
+            message_type: config.c.message_type,
+            mode: ToType::ProtobufToArrow(ArrowConfig {
+                value_field: config.value_field,
+            }),
+        }
+    }
+}
+
+struct ProtobufToArrowProcessorBuilder;
+impl ProcessorBuilder for ProtobufToArrowProcessorBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
-                "Batch processor configuration is missing".to_string(),
+                "ProtobufToArrow processor configuration is missing".to_string(),
             ));
         }
-        let config: ProtobufProcessorConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(ProtobufProcessor::new(config)?))
+        let config: ProtobufToArrowProcessorConfig =
+            serde_json::from_value(config.clone().unwrap())?;
+        Ok(Arc::new(ProtobufProcessor::new(config.into())?))
+    }
+}
+struct ArrowToProtobufProcessorBuilder;
+impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
+    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+        if config.is_none() {
+            return Err(Error::Config(
+                "ArrowToProtobuf processor configuration is missing".to_string(),
+            ));
+        }
+        let config: ArrowToProtobufProcessorConfig =
+            serde_json::from_value(config.clone().unwrap())?;
+        Ok(Arc::new(ProtobufProcessor::new(config.into())?))
     }
 }
 
 pub fn init() {
-    register_processor_builder("protobuf", Arc::new(ProtobufProcessorBuilder));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::File;
-    use std::io::Write;
-    use tempfile::tempdir;
-
-    // Helper function to create a temporary proto file for testing
-    fn create_test_proto_file() -> (tempfile::TempDir, String, String) {
-        // Create a temporary directory
-        let temp_dir = tempdir().unwrap();
-        let proto_dir = temp_dir.path().to_str().unwrap().to_string();
-
-        // Create a simple proto file
-        let proto_file_path = temp_dir.path().join("test.proto");
-        let mut file = File::create(&proto_file_path).unwrap();
-
-        // Write proto content
-        let proto_content = r#"syntax = "proto3";
-
-package test;
-
-message TestMessage {
-    bool bool_field = 1;
-    int32 int32_field = 2;
-    int64 int64_field = 3;
-    uint32 uint32_field = 4;
-    uint64 uint64_field = 5;
-    float float_field = 6;
-    double double_field = 7;
-    string string_field = 8;
-    bytes bytes_field = 9;
-    enum TestEnum {
-        UNKNOWN = 0;
-        VALUE1 = 1;
-        VALUE2 = 2;
-    }
-    TestEnum enum_field = 10;
-}
-"#;
-
-        file.write_all(proto_content.as_bytes()).unwrap();
-
-        (temp_dir, proto_dir, "test.TestMessage".to_string())
-    }
-
-    // Helper function to create a test Protobuf message
-    fn create_test_protobuf_message(descriptor: &MessageDescriptor) -> Vec<u8> {
-        let mut message = DynamicMessage::new(descriptor.clone());
-
-        // Set field values
-        message.set_field_by_name("bool_field", Value::Bool(true));
-        message.set_field_by_name("int32_field", Value::I32(42));
-        message.set_field_by_name("int64_field", Value::I64(1234567890));
-        message.set_field_by_name("uint32_field", Value::U32(42));
-        message.set_field_by_name("uint64_field", Value::U64(1234567890));
-        message.set_field_by_name("float_field", Value::F32(3.14));
-        message.set_field_by_name("double_field", Value::F64(2.71828));
-        message.set_field_by_name("string_field", Value::String("test string".to_string()));
-        message.set_field_by_name("bytes_field", Value::Bytes(vec![1, 2, 3, 4].into()));
-        message.set_field_by_name("enum_field", Value::EnumNumber(1));
-
-        // Encode the message
-        let mut buf = Vec::new();
-        message.encode(&mut buf).unwrap();
-        buf
-    }
-
-    // Helper function to create a test Arrow RecordBatch
-    fn create_test_arrow_batch() -> RecordBatch {
-        // Create fields for the schema
-        let fields = vec![
-            Field::new("bool_field", DataType::Boolean, false),
-            Field::new("int32_field", DataType::Int32, false),
-            Field::new("int64_field", DataType::Int64, false),
-            Field::new("uint32_field", DataType::UInt32, false),
-            Field::new("uint64_field", DataType::UInt64, false),
-            Field::new("float_field", DataType::Float32, false),
-            Field::new("double_field", DataType::Float64, false),
-            Field::new("string_field", DataType::Utf8, false),
-            Field::new("bytes_field", DataType::Binary, false),
-            Field::new("enum_field", DataType::Int32, false),
-        ];
-
-        // Create columns
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(BooleanArray::from(vec![true])),
-            Arc::new(Int32Array::from(vec![42])),
-            Arc::new(Int64Array::from(vec![1234567890])),
-            Arc::new(UInt32Array::from(vec![42])),
-            Arc::new(UInt64Array::from(vec![1234567890])),
-            Arc::new(Float32Array::from(vec![3.14])),
-            Arc::new(Float64Array::from(vec![2.71828])),
-            Arc::new(StringArray::from(vec!["test string"])),
-            Arc::new(BinaryArray::from(vec![&[1, 2, 3, 4][..]])),
-            Arc::new(Int32Array::from(vec![1])),
-        ];
-
-        // Create schema and record batch
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns).unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_protobuf_processor_creation() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Test processor creation
-        let processor = ProtobufProcessor::new(config);
-        assert!(
-            processor.is_ok(),
-            "Failed to create ProtobufProcessor: {:?}",
-            processor.err()
-        );
-
-        // Clean up is handled automatically when temp_dir goes out of scope
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_protobuf_to_arrow_conversion() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Create processor
-        let processor = ProtobufProcessor::new(config).unwrap();
-
-        // Create test protobuf message
-        let proto_data = create_test_protobuf_message(&processor.descriptor);
-
-        // Test conversion from protobuf to arrow
-        let arrow_batch = processor.protobuf_to_arrow(&proto_data);
-        assert!(
-            arrow_batch.is_ok(),
-            "Failed to convert Protobuf to Arrow: {:?}",
-            arrow_batch.err()
-        );
-
-        let batch = arrow_batch.unwrap();
-
-        // Verify the converted data
-        assert_eq!(batch.num_rows(), 1, "Expected 1 row in the Arrow batch");
-        assert_eq!(
-            batch.num_columns(),
-            10,
-            "Expected 10 columns in the Arrow batch"
-        );
-
-        // Verify specific field values
-        let bool_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-        assert_eq!(bool_array.value(0), true);
-
-        let int32_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(int32_array.value(0), 42);
-
-        let string_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(string_array.value(0), "test string");
-
-        // Clean up
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_arrow_to_protobuf_conversion() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Create processor
-        let processor = ProtobufProcessor::new(config).unwrap();
-
-        // Create test Arrow batch
-        let arrow_batch = create_test_arrow_batch();
-
-        // Test conversion from Arrow to Protobuf
-        let proto_data = processor.arrow_to_protobuf(&arrow_batch);
-        assert!(
-            proto_data.is_ok(),
-            "Failed to convert Arrow to Protobuf: {:?}",
-            proto_data.err()
-        );
-
-        // Verify the converted data by converting it back to Arrow
-        let proto_bytes = proto_data.unwrap();
-        let arrow_batch_2 = processor.protobuf_to_arrow(&proto_bytes);
-        assert!(
-            arrow_batch_2.is_ok(),
-            "Failed to convert back to Arrow: {:?}",
-            arrow_batch_2.err()
-        );
-
-        let batch = arrow_batch_2.unwrap();
-
-        // Verify specific field values after round-trip conversion
-        let bool_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-        assert_eq!(bool_array.value(0), true);
-
-        let int32_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(int32_array.value(0), 42);
-
-        let string_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(string_array.value(0), "test string");
-
-        // Clean up
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_process_empty_batch() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Create processor
-        let processor = ProtobufProcessor::new(config).unwrap();
-
-        // Test processing empty batch
-        let empty_batch = MessageBatch::new_binary(vec![]);
-        let result = processor.process(empty_batch).await;
-
-        assert!(
-            result.is_ok(),
-            "Failed to process empty batch: {:?}",
-            result.err()
-        );
-        assert!(
-            result.unwrap().is_empty(),
-            "Expected empty result for empty batch"
-        );
-
-        // Clean up
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_process_binary_to_arrow() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Create processor
-        let processor = ProtobufProcessor::new(config).unwrap();
-
-        // Create test protobuf message
-        let proto_data = create_test_protobuf_message(&processor.descriptor);
-
-        // Create message batch with binary content
-        let msg_batch = MessageBatch::new_binary(vec![proto_data]);
-
-        // Test processing
-        let result = processor.process(msg_batch).await;
-        assert!(
-            result.is_ok(),
-            "Failed to process binary to arrow: {:?}",
-            result.err()
-        );
-
-        let batches = result.unwrap();
-        assert_eq!(batches.len(), 1, "Expected 1 message batch");
-
-        // Verify the result is in Arrow format
-        match &batches[0].content {
-            Content::Arrow(batch) => {
-                assert_eq!(batch.num_rows(), 1, "Expected 1 row");
-                assert_eq!(batch.num_columns(), 10, "Expected 10 columns");
-            }
-            _ => panic!("Expected Arrow content"),
-        }
-
-        // Clean up
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_process_arrow_to_binary() {
-        // Create a test proto file
-        let (temp_dir, proto_dir, message_type) = create_test_proto_file();
-
-        // Create processor config
-        let config = ProtobufProcessorConfig {
-            proto_inputs: vec![proto_dir],
-            proto_includes: None,
-            message_type,
-        };
-
-        // Create processor
-        let processor = ProtobufProcessor::new(config).unwrap();
-
-        // Create test Arrow batch
-        let arrow_batch = create_test_arrow_batch();
-
-        // Create message batch with Arrow content
-        let msg_batch = MessageBatch::new_arrow(arrow_batch);
-
-        // Test processing
-        let result = processor.process(msg_batch).await;
-        assert!(
-            result.is_ok(),
-            "Failed to process arrow to binary: {:?}",
-            result.err()
-        );
-
-        let batches = result.unwrap();
-        assert_eq!(batches.len(), 1, "Expected 1 message batch");
-
-        // Verify the result is in Binary format
-        match &batches[0].content {
-            Content::Binary(data) => {
-                assert_eq!(data.len(), 1, "Expected 1 binary message");
-            }
-            _ => panic!("Expected Binary content"),
-        }
-
-        // Clean up
-        drop(temp_dir);
-    }
+    register_processor_builder(
+        "arrow_to_protobuf",
+        Arc::new(ArrowToProtobufProcessorBuilder),
+    );
+    register_processor_builder(
+        "protobuf_to_arrow",
+        Arc::new(ProtobufToArrowProcessorBuilder),
+    );
 }

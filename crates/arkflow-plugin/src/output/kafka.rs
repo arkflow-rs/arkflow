@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Content, Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch};
 
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum CompressionType {
     None,
     Gzip,
@@ -53,6 +53,8 @@ pub struct KafkaOutputConfig {
     pub compression: Option<CompressionType>,
     /// Acknowledgment level (0=no acknowledgment, 1=leader acknowledgment, all=all replica acknowledgments)
     pub acks: Option<String>,
+    /// Value type
+    pub value_field: Option<String>,
 }
 
 /// Kafka output component
@@ -113,36 +115,28 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        let payloads = msg.as_string()?;
+        let value_field = self.config.value_field.as_deref().unwrap_or("value");
+        let payloads = msg.to_binary(value_field)?;
         if payloads.is_empty() {
             return Ok(());
         }
 
-        match &msg.content {
-            Content::Arrow(_) => {
-                return Err(Error::Process(
-                    "The arrow format is not supported".to_string(),
-                ))
-            }
-            Content::Binary(v) => {
-                for x in v {
-                    // Create record
-                    let mut record = FutureRecord::to(&self.config.topic).payload(&x);
+        for x in payloads {
+            // Create record
+            let mut record = FutureRecord::to(&self.config.topic).payload(x);
 
-                    // Set partition key if available
-                    if let Some(key) = &self.config.key {
-                        record = record.key(key);
-                    }
-
-                    // Get the producer and send the message
-                    producer
-                        .send(record, Duration::from_secs(5))
-                        .await
-                        .map_err(|(e, _)| {
-                            Error::Process(format!("Failed to send a Kafka message: {}", e))
-                        })?;
-                }
+            // Set partition key if available
+            if let Some(key) = &self.config.key {
+                record = record.key(key);
             }
+
+            // Get the producer and send the message
+            producer
+                .send(record, Duration::from_secs(5))
+                .await
+                .map_err(|(e, _)| {
+                    Error::Process(format!("Failed to send a Kafka message: {}", e))
+                })?;
         }
         Ok(())
     }
@@ -337,6 +331,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create a new Kafka output component
@@ -355,6 +350,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output
@@ -378,6 +374,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and try to connect the Kafka output
@@ -397,6 +394,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output
@@ -404,7 +402,7 @@ mod tests {
         output.connect().await.unwrap();
 
         // Create a test message
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(msg).await;
         assert!(result.is_ok(), "Failed to write message to Kafka");
 
@@ -429,6 +427,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output
@@ -436,7 +435,7 @@ mod tests {
         output.connect().await.unwrap();
 
         // Create a test message
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(msg).await;
         assert!(result.is_ok(), "Failed to write message to Kafka");
 
@@ -459,11 +458,12 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create Kafka output without connecting
         let output = KafkaOutput::<MockKafkaClient>::new(config).unwrap();
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(msg).await;
 
         // Should return connection error
@@ -485,6 +485,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output
@@ -497,7 +498,7 @@ mod tests {
         producer.should_fail.store(true, Ordering::SeqCst);
 
         // Create a test message
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         let result = output.write(msg).await;
         assert!(result.is_err(), "Write should fail with producer error");
     }
@@ -513,6 +514,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output
@@ -539,6 +541,7 @@ mod tests {
             client_id: None,
             compression: None,
             acks: None,
+            value_field: None,
         };
 
         // Create and connect the Kafka output

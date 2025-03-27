@@ -3,10 +3,9 @@
 //! Outputs the processed data to standard output
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Bytes, Content, Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use datafusion::arrow;
-use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Stdout, Write};
 use std::string::String;
@@ -46,10 +45,7 @@ where
     }
 
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
-        match &msg.content {
-            Content::Arrow(v) => self.arrow_stdout(&v).await,
-            Content::Binary(v) => self.binary_stdout(&v).await,
-        }
+        self.arrow_stdout(msg).await
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -57,14 +53,14 @@ where
     }
 }
 impl<T: StdWriter> StdoutOutput<T> {
-    async fn arrow_stdout(&self, message_batch: &RecordBatch) -> Result<(), Error> {
+    async fn arrow_stdout(&self, message_batch: MessageBatch) -> Result<(), Error> {
         let mut writer_std = self.writer.lock().await;
 
         // Use Arrow's JSON serialization functionality
         let mut buf = Vec::new();
         let mut writer = arrow::json::ArrayWriter::new(&mut buf);
         writer
-            .write(message_batch)
+            .write(&message_batch)
             .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
         writer
             .finish()
@@ -78,17 +74,6 @@ impl<T: StdWriter> StdoutOutput<T> {
         }
 
         writer_std.flush().map_err(Error::Io)?;
-        Ok(())
-    }
-    async fn binary_stdout(&self, msg: &[Bytes]) -> Result<(), Error> {
-        let mut writer_std = self.writer.lock().await;
-        for x in msg {
-            if self.config.append_newline.unwrap_or(true) {
-                writeln!(writer_std, "{}", String::from_utf8_lossy(&x)).map_err(Error::Io)?
-            } else {
-                write!(writer_std, "{}", String::from_utf8_lossy(&x)).map_err(Error::Io)?
-            }
-        }
         Ok(())
     }
 }
@@ -156,7 +141,7 @@ mod tests {
         assert!(output.connect().await.is_ok());
 
         // Test write with simple text
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         assert!(output.write(msg).await.is_ok());
 
         // Test close
@@ -172,64 +157,10 @@ mod tests {
         let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
 
         // Test binary data
-        let binary_msg = MessageBatch::from_string("binary test");
+        let binary_msg = MessageBatch::from_string("binary test").unwrap();
         assert!(output.write(binary_msg).await.is_ok());
 
         // Test Arrow data (would need more complex setup)
         // TODO: Add Arrow data type test cases
-    }
-
-    /// Test newline configuration behavior
-    #[tokio::test]
-    async fn test_newline_config() {
-        // Test with newline enabled
-        let config = StdoutOutputConfig {
-            append_newline: Some(true),
-        };
-        let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
-        let msg = MessageBatch::from_string("test");
-        output.write(msg).await.unwrap();
-        let writer = output.writer.lock().await;
-        assert_eq!(writer.get_output(), "test\n");
-
-        // Test with newline disabled
-        let config = StdoutOutputConfig {
-            append_newline: Some(false),
-        };
-        let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
-        let msg = MessageBatch::from_string("test");
-        output.write(msg).await.unwrap();
-        let writer = output.writer.lock().await;
-        assert_eq!(writer.get_output(), "test");
-    }
-
-    /// Test output content verification
-    #[tokio::test]
-    async fn test_output_content() {
-        let config = StdoutOutputConfig {
-            append_newline: Some(true),
-        };
-        let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
-
-        // Test multiple messages
-        // Write multiple messages one by one
-        output
-            .write(MessageBatch::from_string("first"))
-            .await
-            .unwrap();
-        output
-            .write(MessageBatch::from_string("second"))
-            .await
-            .unwrap();
-        output
-            .write(MessageBatch::from_string("third"))
-            .await
-            .unwrap();
-
-        let writer = output.writer.lock().await;
-        let output_content = writer.get_output();
-        assert!(output_content.contains("first\n"));
-        assert!(output_content.contains("second\n"));
-        assert!(output_content.contains("third\n"));
     }
 }

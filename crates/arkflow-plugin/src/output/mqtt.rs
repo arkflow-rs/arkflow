@@ -35,6 +35,8 @@ pub struct MqttOutputConfig {
     pub keep_alive: Option<u64>,
     /// Whether to retain the message
     pub retain: Option<bool>,
+    /// Value type
+    pub value_field: Option<String>,
 }
 
 /// MQTT output component
@@ -113,8 +115,10 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .as_ref()
             .ok_or_else(|| Error::Connection("The MQTT client is not initialized".to_string()))?;
 
+        let value_field = self.config.value_field.as_deref().unwrap_or("value");
+
         // Get the message content
-        let payloads = match msg.as_string() {
+        let payloads = match msg.to_binary(value_field) {
             Ok(v) => v.to_vec(),
             Err(e) => {
                 return Err(e);
@@ -309,6 +313,7 @@ mod tests {
             clean_session: Some(true),
             keep_alive: Some(60),
             retain: Some(false),
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config);
@@ -329,6 +334,7 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
@@ -349,12 +355,13 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
         output.connect().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         assert!(output.write(msg).await.is_ok());
 
         // Verify the message was published
@@ -380,6 +387,7 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
@@ -406,13 +414,14 @@ mod tests {
             clean_session: None,
             keep_alive: None,
             retain: None,
+            value_field: None,
         };
 
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
         output.connect().await.unwrap();
         output.close().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message");
+        let msg = MessageBatch::from_string("test message").unwrap();
         assert!(output.write(msg).await.is_err());
     }
 }

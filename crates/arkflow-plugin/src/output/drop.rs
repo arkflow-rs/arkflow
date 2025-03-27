@@ -68,7 +68,7 @@ mod tests {
 
         // Create a binary message batch
         let binary_data = vec![b"test message".to_vec()];
-        let message_batch = MessageBatch::new_binary(binary_data);
+        let message_batch = MessageBatch::new_binary(binary_data).unwrap();
 
         // Test write method with binary data
         let result = drop_output.write(message_batch).await;
@@ -126,7 +126,7 @@ mod tests {
 
         // Create a binary message batch
         let binary_data = vec![b"test message".to_vec()];
-        let message_batch = MessageBatch::new_binary(binary_data);
+        let message_batch = MessageBatch::new_binary(binary_data).unwrap();
 
         // Write multiple messages
         for _ in 0..5 {

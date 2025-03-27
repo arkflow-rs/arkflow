@@ -18,17 +18,14 @@ streams:
         - type: "sql"
           # SQL查询语句，支持标准SQL语法
           query: "SELECT count(timestamp) as timestamp, sum(value) as value, cast(count(sensor) as string) as  sensor FROM flow WHERE value >= 10 order by sensor"
-        - type: "protobuf"
-          mode: "from_arrow"
+        - type: "arrow_to_protobuf"
           proto_inputs:
             - "examples/"
           message_type: "message.Message"
-        - type: "protobuf"
-          mode: "to_arrow"
+        - type: "protobuf_to_arrow"
           proto_inputs:
             - "examples/"
           message_type: "message.Message"
-        - type: "arrow_to_json"
 
     output:
       type: "stdout"

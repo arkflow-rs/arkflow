@@ -19,7 +19,6 @@ streams:
         - type: "sql"
           # SQL查询语句，支持标准SQL语法
           query: "SELECT * FROM flow"
-        - type: "arrow_to_json"
 
 
     output:
