@@ -209,3 +209,8 @@ ArkFlow is licensed under the [Apache License 2.0](LICENSE).
 ## Community
 
 Discord: https://discord.gg/CwKhzb8pux
+
+
+
+
+If you like or are using this project to learn or start your solution, please give it a star⭐. Thanks!

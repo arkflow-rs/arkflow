@@ -206,3 +206,6 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
+
+
+如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！
