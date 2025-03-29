@@ -13,6 +13,7 @@ use std::time;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBufferConfig {
@@ -35,15 +36,25 @@ impl MemoryBuffer {
         let duration = config.timeout.clone();
         let close = CancellationToken::new();
         let close_clone = close.clone();
+
         tokio::spawn(async move {
             loop {
+                let timer = sleep(duration);
                 tokio::select! {
-                    _ = sleep(duration) => {
+                    _ = timer => {
                         // notify read
-                        notify_clone.notify_one();
+                        info!("time");
+
+                        notify_clone.notify_waiters();
                     }
-                    _ = close_clone.cancelled()=>{
+                    _ = close_clone.cancelled() => {
+                         // notify read
+                        info!("cancelled");
+                        notify_clone.notify_waiters();
                         break;
+                    }
+                    _ = notify_clone.notified() => {
+                        info!("reset timer");
                     }
                 }
             }
@@ -64,7 +75,6 @@ impl MemoryBuffer {
             return Ok(None);
         }
 
-        // 收集所有消息和确认
         let mut messages = Vec::new();
         let mut acks = Vec::new();
 
@@ -93,9 +103,11 @@ impl Buffer for MemoryBuffer {
         let queue_arc = self.queue.clone();
         {
             let queue_lock = queue_arc.read().await;
-            if queue_lock.len() >= self.config.capacity as usize {
+            let len = queue_lock.len();
+
+            if len >= self.config.capacity as usize - 1 {
                 let notify = self.notify.clone();
-                notify.notify_one();
+                notify.notify_waiters();
             }
         }
 

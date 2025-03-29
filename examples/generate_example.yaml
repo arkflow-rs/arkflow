@@ -10,7 +10,7 @@ streams:
 
     buffer:
       type: "memory"
-      capacity: 5
+      capacity: 10
       timeout: 10s
     pipeline:
       thread_num: 4
@@ -23,7 +23,7 @@ streams:
 
         - type: "sql"
           # SQL查询语句，支持标准SQL语法
-          query: "SELECT count(*) ,111 as x FROM flow WHERE value >= 10 group by sensor"
+          query: "SELECT count(*) ,111 as x FROM flow  group by sensor"
 #        - type: "arrow_to_json"
 
 
