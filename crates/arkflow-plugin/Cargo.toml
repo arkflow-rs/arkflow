@@ -12,6 +12,7 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 

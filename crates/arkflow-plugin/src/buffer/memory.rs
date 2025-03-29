@@ -8,12 +8,11 @@ use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar};
+use std::sync::Arc;
 use std::time;
-use tokio::sync::broadcast::{Receiver, Sender};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
-use tracing::error;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBufferConfig {
@@ -25,46 +24,42 @@ pub struct MemoryBufferConfig {
 pub struct MemoryBuffer {
     config: MemoryBufferConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
-    pub cond_rx: Arc<Receiver<()>>,
-    pub cond_tx: Arc<Sender<()>>,
+    notify: Arc<Notify>,
+    close: CancellationToken,
 }
 
 impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
+        let notify = Arc::new(Notify::new());
+        let notify_clone = notify.clone();
         let duration = config.timeout.clone();
-        let (cond_tx, cond_rx) = tokio::sync::broadcast::channel(1);
-        let cond_rx = Arc::new(cond_rx);
-        let cond_tx = Arc::new(cond_tx);
-        let cond_tx_clone = Arc::clone(&cond_tx);
+        let close = CancellationToken::new();
+        let close_clone = close.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-
                     _ = sleep(duration) => {
-                        match cond_tx_clone.send(()) {
-                            Ok(_) => {}
-                            _ => {
-                                break;
-                            }
-                        }
+                        // notify read
+                        notify_clone.notify_one();
+                    }
+                    _ = close_clone.cancelled()=>{
+                        break;
                     }
                 }
             }
         });
         Ok(Self {
+            close,
+            notify,
             config,
             queue: Arc::new(Default::default()),
-            cond_rx,
-            cond_tx,
         })
     }
 
-    // 处理队列中的所有消息
     async fn process_messages(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let queue_arc = self.queue.clone();
         let mut queue_lock = queue_arc.write().await;
 
-        // 如果队列为空，返回 None
         if queue_lock.is_empty() {
             return Ok(None);
         }
@@ -96,14 +91,11 @@ impl MemoryBuffer {
 impl Buffer for MemoryBuffer {
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
         let queue_arc = self.queue.clone();
-        loop {
-            {
-                let queue_lock = queue_arc.read().await;
-                if queue_lock.len() >= self.config.capacity as usize {
-                    let _ = self.cond_tx.clone().send(());
-                } else {
-                    break;
-                }
+        {
+            let queue_lock = queue_arc.read().await;
+            if queue_lock.len() >= self.config.capacity as usize {
+                let notify = self.notify.clone();
+                notify.notify_one();
             }
         }
 
@@ -115,21 +107,27 @@ impl Buffer for MemoryBuffer {
     }
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let mut rx = self.cond_rx.resubscribe();
-        if let Err(e) = rx.recv().await {
-            error!("receiver error:{}", e);
-            return Err(Error::EOF);
-        }
+        let notify = self.notify.clone();
+        notify.notified().await;
 
         self.process_messages().await
     }
 
     async fn flush(&self) -> Result<(), Error> {
-        let _ = self.cond_tx.clone().send(());
+        let notify = self.notify.clone();
+        notify.notify_one();
         Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
+        // if let Some(queue) = self.queue.try_read() {
+        //     if !queue.is_empty() {
+        //         let notify = self.notify.clone();
+        //         notify.notify_one();
+        //     }
+        // }
+        self.close.cancel();
+
         Ok(())
     }
 }
