@@ -19,7 +19,7 @@ ArkFlow is a high-performance Rust stream processing engine that provides powerf
 
 ```bash
 # Clone repository
-git clone https://github.com/chenquan/arkflow.git
+git clone https://github.com/ark-flow/arkflow.git
 cd arkflow
 
 # Build project
@@ -83,14 +83,3 @@ streams: # Stream definition list
     buffer:     # Buffer configuration
     # ... 
 ```
-
-### Input Components
-
-ArkFlow supports various input sources:
-
-- **Kafka**: Read data from Kafka topics
-- **MQTT**: Subscribe to MQTT topic messages
-- **HTTP**: Receive data via HTTP
-- **File**: Read file data using SQL (supports Csv, Json, Parquet, Avro, Arrow)
-- **Generator**: Generate test data
-- **Database**: Query data from databases (supports MySQL, PostgreSQL, SQLite, Duckdb)
