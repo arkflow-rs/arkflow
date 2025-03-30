@@ -25,4 +25,4 @@ jobs:
         run: npm install
       - name: Test build website
         working-directory: ./docs
-        run: npm build
+        run: npm run build
