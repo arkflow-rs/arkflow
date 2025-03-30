@@ -84,6 +84,8 @@ streams: # Stream definition list
     # ...
     output:     # Output configuration
     # ...
+    buffer:     # Buffer configuration
+    # ... 
 ```
 
 ### Input Components
@@ -150,6 +152,21 @@ output:
     - localhost:9092
   topic: output-topic
   client_id: arkflow-producer
+```
+
+### Buffer Components
+
+ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
+
+- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation
+
+Example:
+
+```yaml
+buffer:
+  type: memory
+  capacity: 10000  # Maximum number of messages to buffer
+  timeout: 10s  # Maximum time to buffer messages
 ```
 
 ## Examples

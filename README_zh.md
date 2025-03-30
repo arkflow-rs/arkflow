@@ -82,6 +82,8 @@ streams: # 流定义列表
     # ...
     output:     # 输出配置
     # ...
+    buffer:     # 缓冲配置
+    # ... 
 ```
 
 ### 输入组件
@@ -149,6 +151,22 @@ output:
   topic: output-topic
   client_id: arkflow-producer
 ```
+
+### 缓冲组件
+
+ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:
+
+- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合
+
+示例：
+
+```yaml
+buffer:
+  type: memory
+  capacity: 10000  # Maximum number of messages to buffer
+  timeout: 10s  # Maximum time to buffer messages
+```
+
 
 ## 示例
 
