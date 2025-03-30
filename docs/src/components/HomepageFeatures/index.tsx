@@ -12,7 +12,7 @@ type FeatureItem = {
 const FeatureList: FeatureItem[] = [
     {
         title: 'High Performance',
-        Svg: require('@site/static/img/undraw_docusaurus_mountain.svg').default,
+        Svg: require('@site/static/img/home-1.svg').default,
         description: (
             <>
                 Built on Rust and Tokio async runtime, offering excellent performance and low latency.
@@ -21,7 +21,7 @@ const FeatureList: FeatureItem[] = [
     },
     {
         title: 'Multiple Data Sources',
-        Svg: require('@site/static/img/undraw_docusaurus_tree.svg').default,
+        Svg: require('@site/static/img/home-2.svg').default,
         description: (
             <>
                 Support for Kafka, MQTT, HTTP, files, and other input/output sources.
@@ -30,7 +30,7 @@ const FeatureList: FeatureItem[] = [
     },
     {
         title: 'Powerful Processing Capabilities',
-        Svg: require('@site/static/img/undraw_docusaurus_react.svg').default,
+        Svg: require('@site/static/img/home-3.svg').default,
         description: (
             <>
                 Built-in SQL queries, JSON processing, Protobuf encoding/decoding,
@@ -40,7 +40,7 @@ const FeatureList: FeatureItem[] = [
     },
     {
         title: 'Extensible',
-        Svg: require('@site/static/img/undraw_docusaurus_react.svg').default,
+        Svg: require('@site/static/img/home-4.svg').default,
         description: (
             <>
                 Modular design, easy to extend with new input, output, and processor components.
@@ -51,7 +51,7 @@ const FeatureList: FeatureItem[] = [
 
 function Feature({title, Svg, description}: FeatureItem) {
     return (
-        <div className={clsx('col col--4')}>
+        <div className={clsx('col col--3')}>
             <div className="text--center">
                 <Svg className={styles.featureSvg} role="img"/>
             </div>
