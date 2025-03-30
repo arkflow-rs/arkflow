@@ -13,7 +13,6 @@ use std::time;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBufferConfig {
@@ -43,18 +42,14 @@ impl MemoryBuffer {
                 tokio::select! {
                     _ = timer => {
                         // notify read
-                        info!("time");
-
                         notify_clone.notify_waiters();
                     }
                     _ = close_clone.cancelled() => {
                          // notify read
-                        info!("cancelled");
                         notify_clone.notify_waiters();
                         break;
                     }
                     _ = notify_clone.notified() => {
-                        info!("reset timer");
                     }
                 }
             }
@@ -127,7 +122,7 @@ impl Buffer for MemoryBuffer {
 
     async fn flush(&self) -> Result<(), Error> {
         let notify = self.notify.clone();
-        notify.notify_one();
+        notify.notify_waiters();
         Ok(())
     }
 
