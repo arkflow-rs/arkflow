@@ -1,5 +1,7 @@
 # Generate
 
+Generate is an input component that generates test data.
+
 ## Configuration
 
 ### **context**
