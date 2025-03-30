@@ -17,11 +17,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: yarn
+          cache: pnpm
 
       - name: Install dependencies
         working-directory: ./docs
-        run: yarn install --frozen-lockfile
+        run: pnpm install
       - name: Test build website
         working-directory: ./docs
-        run: yarn build
+        run: pnpm build
