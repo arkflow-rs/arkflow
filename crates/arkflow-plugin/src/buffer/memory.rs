@@ -100,7 +100,7 @@ impl Buffer for MemoryBuffer {
             let queue_lock = queue_arc.read().await;
             let len = queue_lock.len();
 
-            if len >= self.config.capacity as usize - 1 {
+            if len + 1 >= self.config.capacity as usize {
                 let notify = self.notify.clone();
                 notify.notify_waiters();
             }
