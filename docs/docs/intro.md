@@ -42,7 +42,10 @@ streams:
       context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
       interval: 1s
       batch_size: 10
-
+    buffer:
+      type: "memory"
+      capacity: 10
+      timeout: 10s
     pipeline:
       thread_num: 4
       processors:
