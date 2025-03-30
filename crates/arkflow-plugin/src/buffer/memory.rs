@@ -96,20 +96,17 @@ impl MemoryBuffer {
 impl Buffer for MemoryBuffer {
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
         let queue_arc = self.queue.clone();
-        {
-            let queue_lock = queue_arc.read().await;
-            let len = queue_lock.len();
-
-            if len + 1 >= self.config.capacity as usize {
-                let notify = self.notify.clone();
-                notify.notify_waiters();
-            }
-        }
 
         let mut queue_lock = queue_arc.write().await;
-
         queue_lock.push_front((msg, arc));
-
+        let cnt = queue_lock.iter().map(|x| x.0.len()).reduce(|acc, x| {
+            return acc + x;
+        });
+        let cnt = cnt.unwrap_or(0);
+        if cnt >= self.config.capacity as usize {
+            let notify = self.notify.clone();
+            notify.notify_waiters();
+        }
         Ok(())
     }
 
