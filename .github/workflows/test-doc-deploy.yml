@@ -9,7 +9,6 @@ jobs:
   test-deploy:
     name: Test deployment
     runs-on: ubuntu-latest
-    working-directory: docs
 
     steps:
       - uses: actions/checkout@v4
