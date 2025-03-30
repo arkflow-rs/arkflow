@@ -3,9 +3,10 @@ use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, Noop
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateInputConfig {
     context: String,
@@ -19,15 +20,16 @@ pub struct GenerateInput {
     config: GenerateInputConfig,
     count: AtomicI64,
     batch_size: usize,
+    first: AtomicBool,
 }
 impl GenerateInput {
     pub fn new(config: GenerateInputConfig) -> Result<Self, Error> {
         let batch_size = config.batch_size.unwrap_or(1);
-
         Ok(Self {
             config,
             count: AtomicI64::new(0),
             batch_size,
+            first: AtomicBool::new(true),
         })
     }
 }
@@ -39,7 +41,9 @@ impl Input for GenerateInput {
     }
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
-        tokio::time::sleep(self.config.interval).await;
+        if !self.first.swap(false, Ordering::SeqCst) {
+            tokio::time::sleep(self.config.interval).await;
+        }
 
         if let Some(count) = self.config.count {
             let current_count = self.count.load(Ordering::SeqCst);

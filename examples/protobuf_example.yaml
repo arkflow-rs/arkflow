@@ -10,7 +10,7 @@ streams:
 
     buffer:
       type: "memory"
-      capacity: 10
+      capacity: 100
       timeout: 10s
 
 
