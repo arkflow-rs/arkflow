@@ -2,6 +2,8 @@
 
 The SQL processor component allows you to process data using SQL queries. It uses DataFusion as the query engine to execute SQL statements on the data.
 
+Reference to [SQL](../../category/sql).
+
 ## Configuration
 
 ### **query**

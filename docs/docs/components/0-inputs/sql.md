@@ -2,6 +2,8 @@
 
 The SQL input component allows you to query data from various input sources using SQL.
 
+Reference to [SQL](../../category/sql).
+
 ## Configuration
 
 ### **select_sql**
