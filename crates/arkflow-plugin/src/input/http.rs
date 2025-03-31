@@ -57,7 +57,7 @@ impl HttpInput {
             Err(_) => return StatusCode::BAD_REQUEST,
         };
 
-        state.send_async(msg).await;
+        let _ = state.send_async(msg).await;
 
         StatusCode::OK
     }
