@@ -8,7 +8,10 @@ streams:
       path: '/'
 
 
-
+    buffer:
+      type: "memory"
+      capacity: 10
+      timeout: 10s
     pipeline:
       thread_num: 4
       processors:
@@ -20,7 +23,7 @@ streams:
 
         - type: "sql"
           # SQL查询语句，支持标准SQL语法
-          query: "SELECT sum(value),avg(value) ,111 as x FROM flow  group by sensor"
+          query: "SELECT sum(value),avg(value) ,111 as x FROM flow"
 #        - type: "arrow_to_json"
 
 
