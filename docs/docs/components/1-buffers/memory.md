@@ -20,7 +20,7 @@ type: `string`
 
 required: `true`
 
-example: `1s`、`1m`、`1h`、`1d`
+example: `1ms`, `1s`, `1m`, `1h`, `1d`
 
 ## Examples
 

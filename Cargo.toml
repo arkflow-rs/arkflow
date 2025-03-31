@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.2.0-alpha"
+version = "0.2.0-rc1"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
@@ -64,7 +64,7 @@ rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 
-arkflow-core = { path = "crates/arkflow-core", version = "0.2.0-alpha" }
-arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.2.0-alpha" }
+arkflow-core = { path = "crates/arkflow-core", version = "0.2.0-rc1" }
+arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.2.0-rc1" }
 tempfile = "3.19.1"
 mockall = "0.12"
