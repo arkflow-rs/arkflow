@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 /// HTTP input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +37,6 @@ type AppState = Arc<Sender<MessageBatch>>;
 
 impl HttpInput {
     pub fn new(config: HttpInputConfig) -> Result<Self, Error> {
-        let notify = Arc::new(Notify::new());
         let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
 
         Ok(Self {
