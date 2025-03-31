@@ -120,7 +120,7 @@ RANGE and GROUPS modes require an ORDER BY clause (with RANGE the ORDER BY must 
 
 ## Aggregate functions
 
-All [aggregate functions](aggregate_functions.md) can be used as window functions.
+All [aggregate functions](./aggregate_functions) can be used as window functions.
 
 ## Ranking Functions
 
