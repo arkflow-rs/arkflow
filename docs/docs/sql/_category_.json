@@ -4,6 +4,6 @@
   "link": {
     "title": "SQL",
     "type": "generated-index",
-    "description": "SQL "
+    "description": "SQL query engine documentation, including comprehensive coverage of data types, operators, query syntax, subqueries, aggregate functions, window functions, and more"
   }
 }
