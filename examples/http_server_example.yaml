@@ -1,0 +1,31 @@
+# generate示例配置
+logging:
+  level: info
+streams:
+  - input:
+      type: "http"
+      address: '0.0.0.0:8090'
+      path: '/'
+
+
+    buffer:
+      type: "memory"
+      capacity: 10
+      timeout: 10s
+    pipeline:
+      thread_num: 4
+      processors:
+#        - type: "batch"
+#          count: 3
+#          timeout_ms: 10000
+#          data_type: "binary"
+        - type: "json_to_arrow"
+
+        - type: "sql"
+          # SQL查询语句，支持标准SQL语法
+          query: "SELECT sum(value),avg(value) ,111 as x FROM flow"
+#        - type: "arrow_to_json"
+
+
+    output:
+      type: "stdout"

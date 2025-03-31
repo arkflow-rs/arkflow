@@ -6,8 +6,8 @@ use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, Noop
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use axum::{extract::State, http::StatusCode, routing::post, Router};
+use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,20 +27,24 @@ pub struct HttpInputConfig {
 /// HTTP input component
 pub struct HttpInput {
     config: HttpInputConfig,
-    queue: Arc<Mutex<VecDeque<MessageBatch>>>,
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
+    sender: Arc<Sender<MessageBatch>>,
+    receiver: Arc<Receiver<MessageBatch>>,
     connected: AtomicBool,
 }
 
-type AppState = Arc<Mutex<VecDeque<MessageBatch>>>;
+type AppState = Arc<Sender<MessageBatch>>;
 
 impl HttpInput {
     pub fn new(config: HttpInputConfig) -> Result<Self, Error> {
+        let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
+
         Ok(Self {
             config,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
             server_handle: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
+            sender: Arc::new(sender),
+            receiver: Arc::new(receiver),
         })
     }
 
@@ -53,8 +57,8 @@ impl HttpInput {
             Err(_) => return StatusCode::BAD_REQUEST,
         };
 
-        let mut queue = state.lock().await;
-        queue.push_back(msg);
+        let _ = state.send_async(msg).await;
+
         StatusCode::OK
     }
 }
@@ -66,13 +70,12 @@ impl Input for HttpInput {
             return Ok(());
         }
 
-        let queue = self.queue.clone();
         let path = self.config.path.clone();
         let address = self.config.address.clone();
 
         let app = Router::new()
             .route(&path, post(Self::handle_request))
-            .with_state(queue);
+            .with_state(self.sender.clone());
 
         let addr: SocketAddr = address
             .parse()
@@ -98,18 +101,9 @@ impl Input for HttpInput {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
 
-        // Try to get a message from the queue
-        let msg_option;
-        {
-            let mut queue = self.queue.lock().await;
-            msg_option = queue.pop_front();
-        }
-
-        if let Some(msg) = msg_option {
+        if let Ok(msg) = self.receiver.recv_async().await {
             Ok((msg, Arc::new(NoopAck)))
         } else {
-            // If the queue is empty, an error is returned after waiting for a while
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             Err(Error::Process("The queue is empty".to_string()))
         }
     }
