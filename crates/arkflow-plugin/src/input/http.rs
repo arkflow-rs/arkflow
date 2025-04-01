@@ -5,15 +5,27 @@
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
+use axum::http::header;
+use axum::http::header::HeaderMap;
 use axum::{extract::State, http::StatusCode, routing::post, Router};
+use base64::Engine;
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_http::cors::CorsLayer;
 
 /// HTTP input configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthType {
+    /// Basic authentication
+    Basic { username: String, password: String },
+    /// Bearer token authentication
+    Bearer { token: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpInputConfig {
     /// Listening address
@@ -22,6 +34,8 @@ pub struct HttpInputConfig {
     pub path: String,
     /// Whether CORS is enabled
     pub cors_enabled: Option<bool>,
+    /// Authentication configuration
+    pub auth: Option<AuthType>,
 }
 
 /// HTTP input component
@@ -31,13 +45,20 @@ pub struct HttpInput {
     sender: Arc<Sender<MessageBatch>>,
     receiver: Arc<Receiver<MessageBatch>>,
     connected: AtomicBool,
+    auth: Option<AuthType>,
 }
 
-type AppState = Arc<Sender<MessageBatch>>;
+struct AppStateInner {
+    sender: Sender<MessageBatch>,
+    auth: Option<AuthType>,
+}
+
+type AppState = Arc<AppStateInner>;
 
 impl HttpInput {
     pub fn new(config: HttpInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
+        let auth = config.auth.clone();
 
         Ok(Self {
             config,
@@ -45,19 +66,27 @@ impl HttpInput {
             connected: AtomicBool::new(false),
             sender: Arc::new(sender),
             receiver: Arc::new(receiver),
+            auth,
         })
     }
 
     async fn handle_request(
         State(state): State<AppState>,
+        headers: HeaderMap,
         body: axum::extract::Json<serde_json::Value>,
     ) -> StatusCode {
+        if let Some(auth_config) = &state.auth {
+            if !validate_auth(&headers, auth_config).await {
+                return StatusCode::UNAUTHORIZED;
+            }
+        }
+
         let msg = match MessageBatch::from_json(&body.0) {
             Ok(msg) => msg,
             Err(_) => return StatusCode::BAD_REQUEST,
         };
 
-        let _ = state.send_async(msg).await;
+        let _ = state.sender.send_async(msg).await;
 
         StatusCode::OK
     }
@@ -73,9 +102,18 @@ impl Input for HttpInput {
         let path = self.config.path.clone();
         let address = self.config.address.clone();
 
-        let app = Router::new()
+        let app_state = Arc::new(AppStateInner {
+            sender: self.sender.as_ref().clone(),
+            auth: self.auth.clone(),
+        });
+
+        let mut app = Router::new()
             .route(&path, post(Self::handle_request))
-            .with_state(self.sender.clone());
+            .with_state(app_state);
+
+        if self.config.cors_enabled.unwrap_or(false) {
+            app = app.layer(CorsLayer::very_permissive());
+        }
 
         let addr: SocketAddr = address
             .parse()
@@ -135,4 +173,43 @@ impl InputBuilder for HttpInputBuilder {
 
 pub fn init() {
     register_input_builder("http", Arc::new(HttpInputBuilder));
+}
+
+async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {
+    let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+
+    match auth_config {
+        AuthType::Basic { username, password } => {
+            let Ok(auth_str) = auth_header.to_str() else {
+                return false;
+            };
+
+            if !auth_str.starts_with("Basic ") {
+                return false;
+            }
+
+            let credentials = auth_str.trim_start_matches("Basic ");
+            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credentials) else {
+                return false;
+            };
+
+            if let Ok(auth_string) = String::from_utf8(decoded) {
+                let parts: Vec<&str> = auth_string.splitn(2, ':').collect();
+                return parts.len() == 2 && parts[0] == username && parts[1] == password;
+            }
+
+            false
+        }
+        AuthType::Bearer { token } => {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if auth_str.starts_with("Bearer ") {
+                    let received_token = auth_str.trim_start_matches("Bearer ");
+                    return received_token == token;
+                }
+            }
+            false
+        }
+    }
 }

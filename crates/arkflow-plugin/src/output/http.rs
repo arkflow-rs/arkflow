@@ -5,11 +5,21 @@
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
+use base64::Engine;
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Authentication type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthType {
+    /// Basic authentication
+    Basic { username: String, password: String },
+    /// Bearer token authentication
+    Bearer { token: String },
+}
 
 /// HTTP output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +36,8 @@ pub struct HttpOutputConfig {
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// Body type
     pub body_field: Option<String>,
+    /// Authentication configuration
+    pub auth: Option<AuthType>,
 }
 
 /// HTTP output component
@@ -33,15 +45,18 @@ pub struct HttpOutput {
     config: HttpOutputConfig,
     client: Arc<Mutex<Option<Client>>>,
     connected: AtomicBool,
+    auth: Option<AuthType>,
 }
 
 impl HttpOutput {
     /// Create a new HTTP output component
     pub fn new(config: HttpOutputConfig) -> Result<Self, Error> {
+        let auth = config.auth.clone();
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
+            auth,
         })
     }
 }
@@ -107,6 +122,22 @@ impl HttpOutput {
                 )))
             }
         };
+
+        // Add authentication header if configured
+        if let Some(auth_config) = &self.auth {
+            match auth_config {
+                AuthType::Basic { username, password } => {
+                    let credentials = format!("{}:{}", username, password);
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+                    request_builder =
+                        request_builder.header(header::AUTHORIZATION, format!("Basic {}", encoded));
+                }
+                AuthType::Bearer { token } => {
+                    request_builder =
+                        request_builder.header(header::AUTHORIZATION, format!("Bearer {}", token));
+                }
+            }
+        }
 
         // Add request headers
         if let Some(headers) = &self.config.headers {
