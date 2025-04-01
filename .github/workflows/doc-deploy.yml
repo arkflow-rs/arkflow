@@ -22,6 +22,7 @@ jobs:
         with:
           node-version: '18'
           cache: 'pnpm'
+          cache-dependency-path: ./docs/pnpm-lock.yaml
 
       - name: Install dependencies
         working-directory: ./docs
