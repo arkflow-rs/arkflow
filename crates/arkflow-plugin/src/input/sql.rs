@@ -98,7 +98,7 @@ struct MysqlSslConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDBConfig {
     name: Option<String>,
-    file_path: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,7 +117,7 @@ struct PostgresSslConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SqliteConfig {
     name: Option<String>,
-    file_path: String,
+    path: String,
 }
 
 pub struct SqlInput {
@@ -255,7 +255,7 @@ impl SqlInput {
             }
             InputType::Duckdb(ref c) => {
                 let duckdb_pool = Arc::new(
-                    DuckDbConnectionPool::new_file(&c.file_path, &AccessMode::ReadOnly).map_err(
+                    DuckDbConnectionPool::new_file(&c.path, &AccessMode::ReadOnly).map_err(
                         |e| {
                             return Error::Config(format!("Failed to create duckdb pool: {}", e));
                         },
@@ -300,7 +300,7 @@ impl SqlInput {
             InputType::Sqlite(ref c) => {
                 let sqlite_pool = Arc::new(
                     SqliteConnectionPoolFactory::new(
-                        &c.file_path,
+                        &c.path,
                         Mode::File,
                         Duration::from_millis(5000),
                     )
