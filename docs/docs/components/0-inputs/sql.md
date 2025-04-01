@@ -91,7 +91,7 @@ options:
 - `name`: Optional connection name
 
   type: `string`
-- `file_path`: Path to DuckDB file
+- `path`: Path to DuckDB file
 
   type: `string`
 
@@ -114,7 +114,7 @@ options:
 - `name`: Optional connection name
 
   type: `string`
-- `file_path`: Path to SQLite file
+- `path`: Path to SQLite file
 
   type: `string`
 
