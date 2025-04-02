@@ -193,7 +193,7 @@ dependencies = [
  "async-trait",
  "aws-msk-iam-sasl-signer",
  "axum",
- "base64 0.21.7",
+ "base64 0.22.1",
  "clap",
  "colored",
  "datafusion",
