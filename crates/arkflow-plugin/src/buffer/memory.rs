@@ -73,7 +73,7 @@ impl MemoryBuffer {
         let mut messages = Vec::new();
         let mut acks = Vec::new();
 
-        while let Some((msg, ack)) = queue_lock.pop_front() {
+        while let Some((msg, ack)) = queue_lock.pop_back() {
             messages.push(msg);
             acks.push(ack);
         }
