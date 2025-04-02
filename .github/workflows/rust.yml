@@ -16,8 +16,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - uses: lukka/get-cmake@latest
     - name: Build
       run: cargo build --verbose
-    - uses: lukka/get-cmake@latest
     - name: Run tests
       run: cargo test --verbose
