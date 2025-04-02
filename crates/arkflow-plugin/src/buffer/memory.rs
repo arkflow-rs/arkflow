@@ -31,7 +31,7 @@ pub struct MemoryBuffer {
 impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
-        let notify_clone = notify.clone();
+        let notify_clone = Arc::clone(&notify);
         let duration = config.timeout.clone();
         let close = CancellationToken::new();
         let close_clone = close.clone();
@@ -63,7 +63,7 @@ impl MemoryBuffer {
     }
 
     async fn process_messages(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let queue_arc = self.queue.clone();
+        let queue_arc = Arc::clone(&self.queue);
         let mut queue_lock = queue_arc.write().await;
 
         if queue_lock.is_empty() {
@@ -73,7 +73,7 @@ impl MemoryBuffer {
         let mut messages = Vec::new();
         let mut acks = Vec::new();
 
-        while let Some((msg, ack)) = queue_lock.pop_back() {
+        while let Some((msg, ack)) = queue_lock.pop_front() {
             messages.push(msg);
             acks.push(ack);
         }
@@ -83,7 +83,7 @@ impl MemoryBuffer {
             return Ok(None);
         }
         let schema = messages[0].schema();
-        let x: Vec<RecordBatch> = messages.iter().map(|batch| batch.clone().into()).collect();
+        let x: Vec<RecordBatch> = messages.into_iter().map(|batch| batch.into()).collect();
         let new_batch = arrow::compute::concat_batches(&schema, &x)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
@@ -95,7 +95,7 @@ impl MemoryBuffer {
 #[async_trait]
 impl Buffer for MemoryBuffer {
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
-        let queue_arc = self.queue.clone();
+        let queue_arc = Arc::clone(&self.queue);
 
         let mut queue_lock = queue_arc.write().await;
         queue_lock.push_front((msg, arc));
@@ -111,25 +111,19 @@ impl Buffer for MemoryBuffer {
     }
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let notify = self.notify.clone();
+        let notify = Arc::clone(&self.notify);
         notify.notified().await;
 
         self.process_messages().await
     }
 
     async fn flush(&self) -> Result<(), Error> {
-        let notify = self.notify.clone();
+        let notify = Arc::clone(&self.notify);
         notify.notify_waiters();
         Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
-        // if let Some(queue) = self.queue.try_read() {
-        //     if !queue.is_empty() {
-        //         let notify = self.notify.clone();
-        //         notify.notify_one();
-        //     }
-        // }
         self.close.cancel();
 
         Ok(())
