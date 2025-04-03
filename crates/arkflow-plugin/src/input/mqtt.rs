@@ -193,7 +193,7 @@ impl Input for MqttInput {
 
     async fn close(&self) -> Result<(), Error> {
         // Send a shutdown signal
-        let _ = self.cancellation_token.cancel();
+        let _ = self.cancellation_token.clone().cancel();
 
         // Disconnect the MQTT connection
         let client_arc = Arc::clone(&self.client);
