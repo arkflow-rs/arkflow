@@ -20,7 +20,8 @@ use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 const DEFAULT_NAME: &str = "flow";
@@ -122,19 +123,18 @@ struct SqliteConfig {
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
-    close_tx: broadcast::Sender<()>,
-
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
+    pub cancellation_token: CancellationToken,
 }
 
 impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
-        let (close_tx, _) = broadcast::channel::<()>(1);
+        let cancellation_token = CancellationToken::new();
 
         Ok(Self {
             sql_config,
             stream: Arc::new(Mutex::new(None)),
-            close_tx,
+            cancellation_token,
         })
     }
 }
@@ -174,13 +174,13 @@ impl Input for SqlInput {
         if stream_lock.is_none() {
             return Err(Error::Process("Stream is None".to_string()));
         }
-        let stream_lock = stream_lock.as_mut().unwrap();
 
-        let mut close_rx = self.close_tx.subscribe();
-        // let result = stream_lock.as_mut().try_next().await;
+        let cancellation_token = self.cancellation_token.clone();
+
+        let stream_lock = stream_lock.as_mut().unwrap();
         let mut stream_pin = stream_lock.as_mut();
         tokio::select! {
-            _ = close_rx.recv() => {
+            _ =  cancellation_token.cancelled() => {
                 Err(Error::EOF)
             }
             result = stream_pin.try_next() => {
@@ -198,7 +198,7 @@ impl Input for SqlInput {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        let _ = self.close_tx.send(());
+        let _ = self.cancellation_token.clone().cancel();
         Ok(())
     }
 }

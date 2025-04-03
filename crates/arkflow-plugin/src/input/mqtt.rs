@@ -42,7 +42,7 @@ pub struct MqttInput {
     client: Arc<Mutex<Option<AsyncClient>>>,
     sender: Sender<MqttMsg>,
     receiver: Receiver<MqttMsg>,
-    pub cancellation_token: CancellationToken,
+    cancellation_token: CancellationToken,
 }
 
 enum MqttMsg {
