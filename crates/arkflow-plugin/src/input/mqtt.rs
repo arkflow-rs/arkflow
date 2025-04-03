@@ -10,9 +10,9 @@ use flume::{Receiver, Sender};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
-
 /// MQTT input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MqttInputConfig {
@@ -42,7 +42,7 @@ pub struct MqttInput {
     client: Arc<Mutex<Option<AsyncClient>>>,
     sender: Sender<MqttMsg>,
     receiver: Receiver<MqttMsg>,
-    close_tx: broadcast::Sender<()>,
+    pub cancellation_token: CancellationToken,
 }
 
 enum MqttMsg {
@@ -54,13 +54,13 @@ impl MqttInput {
     /// Create a new MQTT input component
     pub fn new(config: MqttInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
-        let (close_tx, _) = broadcast::channel(1);
+        let cancellation_token = CancellationToken::new();
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
             sender,
             receiver,
-            close_tx,
+            cancellation_token,
         })
     }
 }
@@ -111,7 +111,9 @@ impl Input for MqttInput {
         *client_guard = Some(client);
 
         let sender_clone = Sender::clone(&self.sender);
-        let mut rx = self.close_tx.subscribe();
+
+        let cancellation_token = self.cancellation_token.clone();
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -141,7 +143,7 @@ impl Input for MqttInput {
                             }
                         }
                     }
-                    _ = rx.recv() => {
+                    _ = cancellation_token.cancelled() => {
                         break;
                     }
                 }
@@ -158,8 +160,8 @@ impl Input for MqttInput {
                 return Err(Error::Disconnection);
             }
         }
+        let cancellation_token = self.cancellation_token.clone();
 
-        let mut close_rx = self.close_tx.subscribe();
         tokio::select! {
             result = self.receiver.recv_async() =>{
                 match result {
@@ -183,7 +185,7 @@ impl Input for MqttInput {
                     }
                 }
             },
-            _ = close_rx.recv()=>{
+            _ = cancellation_token.cancelled()=>{
                 Err(Error::EOF)
             }
         }
@@ -191,7 +193,7 @@ impl Input for MqttInput {
 
     async fn close(&self) -> Result<(), Error> {
         // Send a shutdown signal
-        let _ = self.close_tx.send(());
+        let _ = self.cancellation_token.cancel();
 
         // Disconnect the MQTT connection
         let client_arc = Arc::clone(&self.client);
