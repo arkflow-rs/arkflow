@@ -40,8 +40,8 @@ pub struct MqttInputConfig {
 pub struct MqttInput {
     config: MqttInputConfig,
     client: Arc<Mutex<Option<AsyncClient>>>,
-    sender: Arc<Sender<MqttMsg>>,
-    receiver: Arc<Receiver<MqttMsg>>,
+    sender: Sender<MqttMsg>,
+    receiver: Receiver<MqttMsg>,
     close_tx: broadcast::Sender<()>,
 }
 
@@ -56,10 +56,10 @@ impl MqttInput {
         let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
         let (close_tx, _) = broadcast::channel(1);
         Ok(Self {
-            config: config.clone(),
+            config,
             client: Arc::new(Mutex::new(None)),
-            sender: Arc::new(sender),
-            receiver: Arc::new(receiver),
+            sender,
+            receiver,
             close_tx,
         })
     }
@@ -106,11 +106,11 @@ impl Input for MqttInput {
             })?;
         }
 
-        let client_arc = self.client.clone();
+        let client_arc = Arc::new(&self.client);
         let mut client_guard = client_arc.lock().await;
         *client_guard = Some(client);
 
-        let sender_arc = self.sender.clone();
+        let sender_clone = Sender::clone(&self.sender);
         let mut rx = self.close_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -120,7 +120,7 @@ impl Input for MqttInput {
                             Ok(event) => {
                                 if let Event::Incoming(Packet::Publish(publish)) = event {
                                     // Add messages to the queue
-                                    match sender_arc.send_async(MqttMsg::Publish(publish)).await {
+                                    match sender_clone.send_async(MqttMsg::Publish(publish)).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -131,7 +131,7 @@ impl Input for MqttInput {
                             Err(e) => {
                                // Log the error and wait a short time before continuing
                                 error!("MQTT event loop error: {}", e);
-                                match sender_arc.send_async(MqttMsg::Err(Error::Disconnection)).await {
+                                match sender_clone.send_async(MqttMsg::Err(Error::Disconnection)).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -153,7 +153,7 @@ impl Input for MqttInput {
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
         {
-            let client_arc = self.client.clone();
+            let client_arc = Arc::clone(&self.client);
             if client_arc.lock().await.is_none() {
                 return Err(Error::Disconnection);
             }
@@ -169,7 +169,7 @@ impl Input for MqttInput {
                                  let payload = publish.payload.to_vec();
                             let msg = MessageBatch::new_binary(vec![payload])?;
                             Ok((msg, Arc::new(MqttAck {
-                                client: self.client.clone(),
+                                client: Arc::clone(&self.client),
                                 publish,
                             })))
                             },
@@ -194,7 +194,7 @@ impl Input for MqttInput {
         let _ = self.close_tx.send(());
 
         // Disconnect the MQTT connection
-        let client_arc = self.client.clone();
+        let client_arc = Arc::clone(&self.client);
         let client_guard = client_arc.lock().await;
         if let Some(client) = &*client_guard {
             // Try to disconnect, but don't wait for the result
