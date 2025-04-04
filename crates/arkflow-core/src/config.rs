@@ -3,6 +3,7 @@
 //! Provide configuration management for the stream processing engine.
 
 use serde::{Deserialize, Serialize};
+
 use toml;
 
 use crate::{stream::StreamConfig, Error};
@@ -31,27 +32,20 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
     /// Whether health check is enabled
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Listening address for health check server
+    #[serde(default = "default_address")]
     pub address: String,
     /// Path for health check endpoint
+    #[serde(default = "default_path")]
     pub path: String,
     /// Path for readiness check endpoint
+    #[serde(default = "default_readiness_path")]
     pub readiness_path: String,
     /// Path for liveness check endpoint
+    #[serde(default = "default_liveness_path")]
     pub liveness_path: String,
-}
-
-impl Default for HealthCheckConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: "0.0.0.0:8080".to_string(),
-            path: "/health".to_string(),
-            readiness_path: "/readiness".to_string(),
-            liveness_path: "/liveness".to_string(),
-        }
-    }
 }
 
 /// Engine configuration
@@ -62,7 +56,8 @@ pub struct EngineConfig {
     /// Logging configuration (optional)
     pub logging: Option<LoggingConfig>,
     /// Health check configuration (optional)
-    pub health_check: Option<HealthCheckConfig>,
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
 }
 
 impl EngineConfig {
@@ -98,5 +93,35 @@ fn get_format_from_path(path: &str) -> Option<ConfigFormat> {
         Some(ConfigFormat::TOML)
     } else {
         None
+    }
+}
+
+/// Default address for health check server
+fn default_address() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_path() -> String {
+    "/health".to_string()
+}
+fn default_readiness_path() -> String {
+    "/readiness".to_string()
+}
+fn default_liveness_path() -> String {
+    "/liveness".to_string()
+}
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            address: default_address(),
+            path: default_path(),
+            readiness_path: default_readiness_path(),
+            liveness_path: default_liveness_path(),
+        }
     }
 }

@@ -1,7 +1,7 @@
 logging:
   level: info
-health_check:
-  enabled: true
+#health_check:
+#  enabled: true
 streams:
   - input:
       type: "http"

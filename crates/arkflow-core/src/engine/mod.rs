@@ -8,8 +8,11 @@ use tracing::{error, info};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::Json;
 // Import axum related dependencies
 use axum::{routing::get, Router};
+use serde::Serialize;
 
 /// Health check status
 struct HealthState {
@@ -17,6 +20,27 @@ struct HealthState {
     is_ready: AtomicBool,
     /// Whether the engine is currently running
     is_running: AtomicBool,
+}
+
+/// Readiness response structure for JSON serialization
+#[derive(Serialize)]
+struct ReadinessResponse {
+    status: String,
+    ready: bool,
+}
+
+/// Health response structure for JSON serialization
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    running: bool,
+}
+
+/// Liveness response structure for JSON serialization
+#[derive(Serialize)]
+struct LivenessResponse {
+    status: String,
+    alive: bool,
 }
 
 /// The main engine that manages stream processing flows and health checks
@@ -57,13 +81,12 @@ impl Engine {
     /// # Returns
     /// * `Ok(())` if the server started successfully or if health checks are disabled
     /// * `Err` if there was an error parsing the address or starting the server
-    async fn start_health_check_server(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.config.health_check.is_none() {
-            return Ok(());
-        }
-        let Some(health_check) = &self.config.health_check else {
-            return Ok(());
-        };
+    async fn start_health_check_server(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let health_check = &self.config.health_check;
+
         if !health_check.enabled {
             return Ok(());
         }
@@ -77,61 +100,97 @@ impl Engine {
             .route(&*health_check.liveness_path, get(Self::handle_liveness))
             .with_state(health_state);
 
-        let addr = &*health_check
-            .address
-            .parse()
+        let addr = &health_check.address;
+        let addr = addr
+            .parse::<_>()
             .map_err(|e| format!("Invalid health check address: {}", e))?;
 
         info!("Starting health check server on {}", addr);
 
         // Start the server
         tokio::spawn(async move {
-            axum::Server::bind(&addr)
-                .serve(app.into_make_service())
-                .await
-                .map_err(|e| error!("Health check server error: {}", e))
+            let server = axum::Server::bind(&addr).serve(app.into_make_service());
+
+            // Run the server with graceful shutdown
+            let graceful = server.with_graceful_shutdown(Self::shutdown_signal(cancellation_token));
+            if let Err(e) = graceful.await {
+                error!("Health check server error: {}", e);
+            } else {
+                info!("Health check server stopped");
+            }
         });
 
         Ok(())
     }
 
+    async fn shutdown_signal(cancellation_token: CancellationToken) {
+        cancellation_token.cancelled().await;
+    }
+
     /// Health check handler function that returns the overall health status
     ///
-    /// Returns OK (200) if the engine is running, otherwise SERVICE_UNAVAILABLE (503)
+    /// Returns OK (200) with JSON body if the engine is running,
+    /// otherwise SERVICE_UNAVAILABLE (503) with JSON body
     ///
     /// # Arguments
     /// * `state` - The shared health state containing running status
-    async fn handle_health(State(state): State<Arc<HealthState>>) -> StatusCode {
-        if state.is_running.load(Ordering::SeqCst) {
+    async fn handle_health(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
+        let is_running = state.is_running.load(Ordering::SeqCst);
+        let status = if is_running { "healthy" } else { "unhealthy" };
+
+        let response = HealthResponse {
+            status: status.to_string(),
+            running: is_running,
+        };
+
+        let status_code = if is_running {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
-        }
+        };
+
+        (status_code, Json(response))
     }
 
     /// Readiness check handler function that indicates if the engine is ready to process requests
     ///
-    /// Returns OK (200) if the engine is initialized and ready, otherwise SERVICE_UNAVAILABLE (503)
+    /// Returns OK (200) with JSON body if the engine is initialized and ready,
+    /// otherwise SERVICE_UNAVAILABLE (503) with JSON body
     ///
     /// # Arguments
     /// * `state` - The shared health state containing readiness status
-    async fn handle_readiness(State(state): State<Arc<HealthState>>) -> StatusCode {
-        if state.is_ready.load(Ordering::SeqCst) {
+    async fn handle_readiness(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
+        let is_ready = state.is_ready.load(Ordering::SeqCst);
+        let status = if is_ready { "ready" } else { "not ready" };
+
+        let response = ReadinessResponse {
+            status: status.to_string(),
+            ready: is_ready,
+        };
+
+        let status_code = if is_ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
-        }
+        };
+
+        (status_code, Json(response))
     }
 
     /// Liveness check handler function that indicates if the engine process is alive
     ///
-    /// Always returns OK (200) as long as the server can respond to the request
+    /// Always returns OK (200) with JSON body as long as the server can respond to the request
     ///
     /// # Arguments
     /// * `_` - Unused health state parameter
-    async fn handle_liveness(_: State<Arc<HealthState>>) -> StatusCode {
+    async fn handle_liveness(_: State<Arc<HealthState>>) -> impl IntoResponse {
         // As long as the server can respond, it is considered alive
-        StatusCode::OK
+        let response = LivenessResponse {
+            status: "alive".to_string(),
+            alive: true,
+        };
+
+        (StatusCode::OK, Json(response))
     }
     /// Run the engine and all configured streams
     ///
@@ -144,8 +203,10 @@ impl Engine {
     ///
     /// Returns an error if any part of the initialization or execution fails
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let token = CancellationToken::new();
+
         // Start the health check server
-        self.start_health_check_server().await?;
+        self.start_health_check_server(token.clone()).await?;
 
         // Create and run all flows
         let mut streams = Vec::new();
@@ -170,7 +231,6 @@ impl Engine {
         // Set up signal handlers
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
-        let token = CancellationToken::new();
         let token_clone = token.clone();
         tokio::spawn(async move {
             tokio::select! {
