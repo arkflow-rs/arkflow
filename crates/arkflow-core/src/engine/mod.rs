@@ -8,20 +8,20 @@ use tracing::{error, info};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-// 引入axum相关依赖
+// Import axum related dependencies
 use axum::{routing::get, Router};
 
-/// 健康检查状态
+/// Health check status
 struct HealthState {
-    /// 引擎是否已经初始化完成
+    /// Whether the engine has been initialized
     is_ready: AtomicBool,
-    /// 引擎是否正在运行
+    /// Whether the engine is currently running
     is_running: AtomicBool,
 }
 
 pub struct Engine {
     config: EngineConfig,
-    /// 健康检查状态
+    /// Health check status
     health_state: Arc<HealthState>,
 }
 impl Engine {
@@ -36,7 +36,7 @@ impl Engine {
         }
     }
 
-    /// 启动健康检查服务器
+    /// Start the health check server
     async fn start_health_check_server(&self) -> Result<(), Box<dyn std::error::Error>> {
         if !self.config.health_check.enabled {
             return Ok(());
@@ -44,7 +44,7 @@ impl Engine {
 
         let health_state = self.health_state.clone();
 
-        // 创建路由
+        // Create routes
         let app = Router::new()
             .route(&self.config.health_check.path, get(Self::handle_health))
             .route(
@@ -66,7 +66,7 @@ impl Engine {
 
         info!("Starting health check server on {}", addr);
 
-        // 启动服务器
+        // Start the server
         tokio::spawn(async move {
             axum::Server::bind(&addr)
                 .serve(app.into_make_service())
@@ -77,7 +77,7 @@ impl Engine {
         Ok(())
     }
 
-    /// 健康检查处理函数
+    /// Health check handler function
     async fn handle_health(State(state): State<Arc<HealthState>>) -> StatusCode {
         if state.is_running.load(Ordering::SeqCst) {
             StatusCode::OK
@@ -86,7 +86,7 @@ impl Engine {
         }
     }
 
-    /// 就绪检查处理函数
+    /// Readiness check handler function
     async fn handle_readiness(State(state): State<Arc<HealthState>>) -> StatusCode {
         if state.is_ready.load(Ordering::SeqCst) {
             StatusCode::OK
@@ -95,14 +95,14 @@ impl Engine {
         }
     }
 
-    /// 存活检查处理函数
+    /// Liveness check handler function
     async fn handle_liveness(_: State<Arc<HealthState>>) -> StatusCode {
-        // 只要服务器能响应，就认为是存活的
+        // As long as the server can respond, it is considered alive
         StatusCode::OK
     }
     /// Run the engine
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // 启动健康检查服务器
+        // Start the health check server
         self.start_health_check_server().await?;
 
         // Create and run all flows
@@ -123,7 +123,7 @@ impl Engine {
             }
         }
 
-        // 设置就绪状态
+        // Set the readiness status
         self.health_state.is_ready.store(true, Ordering::SeqCst);
         // Set up signal handlers
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
@@ -159,7 +159,7 @@ impl Engine {
             handles.push(handle);
         }
 
-        // 设置运行状态
+        // Set the running status
         self.health_state.is_running.store(true, Ordering::SeqCst);
 
         // Wait for all flows to complete
