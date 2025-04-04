@@ -32,3 +32,6 @@ clap = { workspace = true }
 colored = { workspace = true }
 
 flume = { workspace = true }
+
+# 添加健康检查所需的HTTP服务器依赖
+axum = { workspace = true }
