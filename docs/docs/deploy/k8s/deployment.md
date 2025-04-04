@@ -20,9 +20,8 @@ kind: ConfigMap
 metadata:
   name: arkflow-config
 data:
-  config.toml: |
+  config.yaml: |
     # Place your ArkFlow configuration here
-    # You can copy the configuration content from examples/config.toml
 ```
 
 ### Deployment
@@ -49,12 +48,32 @@ spec:
         image: arkflow:latest  # Replace with your image address
         ports:
         - containerPort: 8000
+          name: http
         env:
         - name: RUST_LOG
           value: "info"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
         volumeMounts:
         - name: config
-          mountPath: /app/examples
+          mountPath: /app/etc
           readOnly: true
       volumes:
       - name: config
@@ -115,14 +134,49 @@ kubectl get svc arkflow
 - **Image Configuration**: In the Deployment configuration, replace `image: arkflow:latest` with your actual image address
 - **Environment Variables**: Environment variables can be configured through the env field, currently configured with RUST_LOG=info
 - **Port Configuration**: Service exposes port 8000 by default
-- **Configuration File**: Mounted to the container's /app/examples directory via ConfigMap
+- **Configuration File**: Mounted to the container's /app/etc directory via ConfigMap
+- **Resource Limits**: Default resource requests and limits are set to prevent resource contention
+- **Health Checks**: Liveness and readiness probes are configured to ensure proper application health monitoring
 
 ## Important Notes
 
 1. Ensure the configuration file format in ConfigMap is correct
 2. Adjust the number of replicas according to actual needs
 3. Choose appropriate Service type based on your environment
-4. Recommended to use resource limits to manage container resource usage
+4. Adjust resource limits according to your application's actual resource consumption
+5. Modify health check endpoints to match your application's actual health check endpoints
+
+## Persistent Storage (Optional)
+
+If your ArkFlow deployment requires persistent storage, you can add a PersistentVolumeClaim:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arkflow-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+Then update your Deployment to use this PVC:
+
+```yaml
+# Add to the volumes section
+volumes:
+- name: data
+  persistentVolumeClaim:
+    claimName: arkflow-data
+
+# Add to the volumeMounts section of your container
+volumeMount:
+- name: data
+  mountPath: /app/data
+```
 
 ## Troubleshooting
 

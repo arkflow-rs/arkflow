@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.75-slim as builder
+FROM rust:1.85-slim as builder
 
 WORKDIR /app
 COPY . .
@@ -15,14 +15,10 @@ WORKDIR /app
 # Copy compiled binary from builder stage
 COPY --from=builder /app/target/release/arkflow /app/arkflow
 
-# Copy example configuration files
-COPY examples /app/examples
-
+ 
 # Set environment variables
 ENV RUST_LOG=info
 
-# Expose default port
-EXPOSE 8000
 
 # Set startup command
-CMD ["/app/arkflow" "--config", "/app/examples/config.toml"]
+CMD ["/app/arkflow" "--config", "/app/etc/config.yaml"]
