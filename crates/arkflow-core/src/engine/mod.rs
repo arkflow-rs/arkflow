@@ -58,7 +58,13 @@ impl Engine {
     /// * `Ok(())` if the server started successfully or if health checks are disabled
     /// * `Err` if there was an error parsing the address or starting the server
     async fn start_health_check_server(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.config.health_check.enabled {
+        if !self.config.health_check.is_none() {
+            return Ok(());
+        }
+        let Some(health_check) = &self.config.health_check else {
+            return Ok(());
+        };
+        if !health_check.enabled {
             return Ok(());
         }
 
@@ -66,20 +72,12 @@ impl Engine {
 
         // Create routes
         let app = Router::new()
-            .route(&self.config.health_check.path, get(Self::handle_health))
-            .route(
-                &self.config.health_check.readiness_path,
-                get(Self::handle_readiness),
-            )
-            .route(
-                &self.config.health_check.liveness_path,
-                get(Self::handle_liveness),
-            )
+            .route(&*health_check.path, get(Self::handle_health))
+            .route(&*health_check.readiness_path, get(Self::handle_readiness))
+            .route(&*health_check.liveness_path, get(Self::handle_liveness))
             .with_state(health_state);
 
-        let addr = self
-            .config
-            .health_check
+        let addr = &*health_check
             .address
             .parse()
             .map_err(|e| format!("Invalid health check address: {}", e))?;

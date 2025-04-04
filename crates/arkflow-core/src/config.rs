@@ -62,8 +62,7 @@ pub struct EngineConfig {
     /// Logging configuration (optional)
     pub logging: Option<LoggingConfig>,
     /// Health check configuration (optional)
-    #[serde(default)]
-    pub health_check: HealthCheckConfig,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl EngineConfig {
