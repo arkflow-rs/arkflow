@@ -31,15 +31,15 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
     /// Whether health check is enabled
-    pub enabled: bool,
+    enabled: bool,
     /// Listening address for health check server
-    pub address: String,
+    address: String,
     /// Path for health check endpoint
-    pub path: String,
+    path: String,
     /// Path for readiness check endpoint
-    pub readiness_path: String,
+    readiness_path: String,
     /// Path for liveness check endpoint
-    pub liveness_path: String,
+    liveness_path: String,
 }
 
 impl Default for HealthCheckConfig {
@@ -58,12 +58,12 @@ impl Default for HealthCheckConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     /// Streams configuration
-    pub streams: Vec<StreamConfig>,
+    streams: Vec<StreamConfig>,
     /// Logging configuration (optional)
-    pub logging: Option<LoggingConfig>,
+    logging: Option<LoggingConfig>,
     /// Health check configuration (optional)
     #[serde(default)]
-    pub health_check: HealthCheckConfig,
+    health_check: HealthCheckConfig,
 }
 
 impl EngineConfig {
