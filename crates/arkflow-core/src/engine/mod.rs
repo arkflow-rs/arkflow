@@ -19,13 +19,26 @@ struct HealthState {
     is_running: AtomicBool,
 }
 
+/// The main engine that manages stream processing flows and health checks
+///
+/// The Engine is responsible for:
+/// - Starting and managing the health check server
+/// - Initializing and running all configured streams
+/// - Handling graceful shutdown on signals
 pub struct Engine {
+    /// Engine configuration containing stream definitions and health check settings
     config: EngineConfig,
-    /// Health check status
+    /// Health check status shared between the engine and health check endpoints
     health_state: Arc<HealthState>,
 }
 impl Engine {
-    /// Create a new engine
+    /// Create a new engine with the provided configuration
+    ///
+    /// Initializes a new Engine instance with the given configuration and
+    /// sets up the health state with default values (not ready, not running).
+    ///
+    /// # Arguments
+    /// * `config` - The engine configuration containing stream definitions and settings
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
@@ -36,7 +49,14 @@ impl Engine {
         }
     }
 
-    /// Start the health check server
+    /// Start the health check server if enabled in configuration
+    ///
+    /// Sets up HTTP endpoints for health, readiness, and liveness checks.
+    /// The server runs in a separate task and doesn't block the main execution.
+    ///
+    /// # Returns
+    /// * `Ok(())` if the server started successfully or if health checks are disabled
+    /// * `Err` if there was an error parsing the address or starting the server
     async fn start_health_check_server(&self) -> Result<(), Box<dyn std::error::Error>> {
         if !self.config.health_check.enabled {
             return Ok(());
@@ -77,7 +97,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Health check handler function
+    /// Health check handler function that returns the overall health status
+    ///
+    /// Returns OK (200) if the engine is running, otherwise SERVICE_UNAVAILABLE (503)
+    ///
+    /// # Arguments
+    /// * `state` - The shared health state containing running status
     async fn handle_health(State(state): State<Arc<HealthState>>) -> StatusCode {
         if state.is_running.load(Ordering::SeqCst) {
             StatusCode::OK
@@ -86,7 +111,12 @@ impl Engine {
         }
     }
 
-    /// Readiness check handler function
+    /// Readiness check handler function that indicates if the engine is ready to process requests
+    ///
+    /// Returns OK (200) if the engine is initialized and ready, otherwise SERVICE_UNAVAILABLE (503)
+    ///
+    /// # Arguments
+    /// * `state` - The shared health state containing readiness status
     async fn handle_readiness(State(state): State<Arc<HealthState>>) -> StatusCode {
         if state.is_ready.load(Ordering::SeqCst) {
             StatusCode::OK
@@ -95,12 +125,26 @@ impl Engine {
         }
     }
 
-    /// Liveness check handler function
+    /// Liveness check handler function that indicates if the engine process is alive
+    ///
+    /// Always returns OK (200) as long as the server can respond to the request
+    ///
+    /// # Arguments
+    /// * `_` - Unused health state parameter
     async fn handle_liveness(_: State<Arc<HealthState>>) -> StatusCode {
         // As long as the server can respond, it is considered alive
         StatusCode::OK
     }
-    /// Run the engine
+    /// Run the engine and all configured streams
+    ///
+    /// This method:
+    /// 1. Starts the health check server if enabled
+    /// 2. Initializes all configured streams
+    /// 3. Sets up signal handlers for graceful shutdown
+    /// 4. Runs all streams concurrently
+    /// 5. Waits for all streams to complete
+    ///
+    /// Returns an error if any part of the initialization or execution fails
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Start the health check server
         self.start_health_check_server().await?;
