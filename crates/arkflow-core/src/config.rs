@@ -38,8 +38,8 @@ pub struct HealthCheckConfig {
     #[serde(default = "default_address")]
     pub address: String,
     /// Path for health check endpoint
-    #[serde(default = "default_path")]
-    pub path: String,
+    #[serde(default = "default_health_path")]
+    pub health_path: String,
     /// Path for readiness check endpoint
     #[serde(default = "default_readiness_path")]
     pub readiness_path: String,
@@ -101,15 +101,21 @@ fn default_address() -> String {
     "0.0.0.0:8080".to_string()
 }
 
-fn default_path() -> String {
+/// Default value for health check path
+fn default_health_path() -> String {
     "/health".to_string()
 }
+
+/// Default value for readiness path
 fn default_readiness_path() -> String {
     "/readiness".to_string()
 }
+
+/// Default value for liveness path
 fn default_liveness_path() -> String {
     "/liveness".to_string()
 }
+/// Default value for health check enabled
 fn default_enabled() -> bool {
     true
 }
@@ -119,7 +125,7 @@ impl Default for HealthCheckConfig {
         Self {
             enabled: default_enabled(),
             address: default_address(),
-            path: default_path(),
+            health_path: default_health_path(),
             readiness_path: default_readiness_path(),
             liveness_path: default_liveness_path(),
         }
