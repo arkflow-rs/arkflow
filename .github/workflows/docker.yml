@@ -1,0 +1,136 @@
+name: Docker Build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - '*docker*'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*' # Semver matching pattern with optional suffix
+
+permissions:
+  packages: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+        include:
+          - platform: linux/amd64
+            runs_on: buildjet-32vcpu-ubuntu-2204
+            arch: amd64
+          - platform: linux/arm64
+            runs_on: buildjet-32vcpu-ubuntu-2204-arm
+            arch: arm64
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ark-flow/arkflow
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          push: ${{ github.event_name != 'pull_request' }}
+          cache-from: type=registry,ref=ghcr.io/ark-flow/arkflow:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/ark-flow/arkflow:buildcache-${{ matrix.arch }}
+          # note that this is now the same as arroyo
+          target: arkflow
+          outputs: type=image,name=ghcr.io/ark-flow/arkflow,push-by-digest=true,name-canonical=true,push=true,store=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests/arkflow
+          digest="${{ steps.build-single.outputs.digest }}"
+          touch "/tmp/digests/arkflow/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: build
+    strategy:
+      matrix:
+        image_name:
+          - arkflow
+
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      -
+        name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ark-flow/${{ matrix.image_name }}
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Create manifest list and push
+        working-directory: /tmp/digests/${{ matrix.image_name }}
+        run: |          
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/ark-flow/${{ matrix.image_name }}@sha256:%s ' *)
+      -
+        name: Inspect image
+        run: |
+          docker buildx imagetools inspect ghcr.io/ark-flow/${{ matrix.image_name }}:${{ steps.meta.outputs.version }}
+      - name: Push to tip tag.
+        working-directory: /tmp/digests/${{ matrix.image_name }}
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker buildx imagetools create --tag ghcr.io/ark-flow/${{ matrix.image_name }}:tip \
+            $(printf 'ghcr.io/ark-flow/${{ matrix.image_name }}@sha256:%s ' *)
