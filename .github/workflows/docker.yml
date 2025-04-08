@@ -69,7 +69,7 @@ jobs:
       - name: Export digest
         run: |
           mkdir -p /tmp/digests/arkflow
-          digest="${{ steps.build-single.outputs.digest }}"
+          digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/arkflow/${digest#sha256:}"
 
       - name: Upload digest
