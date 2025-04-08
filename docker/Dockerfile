@@ -4,7 +4,7 @@ FROM rust:1.85-slim as builder
 WORKDIR /app
 COPY .. .
 RUN apt-get update && \
-    apt-get install -y clang perl libfindbin-libs-perl make gcc libssl-dev pkg-config
+    apt-get install -y clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config
 
 # Build project
 RUN cargo build
