@@ -3,6 +3,8 @@ FROM rust:1.85-slim as builder
 
 WORKDIR /app
 COPY .. .
+RUN apt-get update && \
+    apt-get install -y clang
 
 # Build project
 RUN cargo build --release
