@@ -8,7 +8,7 @@ COPY .. .
 RUN cargo build --release
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim as arkflow
 
 WORKDIR /app
 
@@ -21,4 +21,4 @@ ENV RUST_LOG=info
 
 
 # Set startup command
-CMD ["/app/arkflow" "--config", "/app/etc/config.yaml"]
+CMD ["/app/arkflow", "--config", "/app/etc/config.yaml"]
