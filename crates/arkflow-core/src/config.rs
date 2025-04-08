@@ -15,6 +15,7 @@ pub enum ConfigFormat {
     JSON,
     TOML,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
