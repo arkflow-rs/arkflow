@@ -4,10 +4,10 @@ FROM rust:1.85-slim as builder
 WORKDIR /app
 COPY .. .
 RUN apt-get update && \
-    apt-get install -y clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config
+    apt-get install -y clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config  build-essential libsqlite3-dev
 
 # Build project
-RUN cargo build
+RUN cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim as arkflow
