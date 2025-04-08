@@ -8,6 +8,7 @@ on:
       - '*docker*'
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*' # Semver matching pattern with optional suffix
+    pull_request:
 
 permissions:
   packages: write
@@ -36,7 +37,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
+#        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -57,7 +58,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             GIT_SHA=${{ github.sha }}
-          push: ${{ github.event_name != 'pull_request' }}
+#          push: ${{ github.event_name != 'pull_request' }}
           cache-from: type=registry,ref=ghcr.io/ark-flow/arkflow:buildcache-${{ matrix.arch }}
           cache-to: type=registry,ref=ghcr.io/ark-flow/arkflow:buildcache-${{ matrix.arch }}
           # note that this is now the same as arroyo
@@ -112,7 +113,7 @@ jobs:
             type=semver,pattern={{major}}
             type=sha
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
+#        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
