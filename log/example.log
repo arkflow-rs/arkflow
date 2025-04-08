@@ -1,0 +1,44 @@
+{"timestamp":"2025-04-08T02:56:23.772159Z","level":"INFO","fields":{"message":"Logging to file: ./log/example.log"},"target":"arkflow_core::cli"}
+{"timestamp":"2025-04-08T02:56:23.773695Z","level":"INFO","fields":{"message":"Starting health check server on 0.0.0.0:8080"},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:23.773821Z","level":"INFO","fields":{"message":"Initializing flow #1"},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:23.774487Z","level":"INFO","fields":{"message":"Starting flow #1"},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:23.774767Z","level":"INFO","fields":{"message":"Processor worker 4 started"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:23.774761Z","level":"INFO","fields":{"message":"Processor worker 2 started"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:23.774768Z","level":"INFO","fields":{"message":"Processor worker 3 started"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:23.774742Z","level":"INFO","fields":{"message":"Processor worker 1 started"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.918928Z","level":"INFO","fields":{"message":"Received SIGINT, exiting..."},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:34.919490Z","level":"INFO","fields":{"message":"Buffer stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.919660Z","level":"INFO","fields":{"message":"Input stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.919689Z","level":"INFO","fields":{"message":"Health check server stopped"},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:34.919849Z","level":"INFO","fields":{"message":"Processor worker 2 stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.919923Z","level":"INFO","fields":{"message":"Processor worker 4 stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.919869Z","level":"INFO","fields":{"message":"Processor worker 3 stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.919852Z","level":"INFO","fields":{"message":"Processor worker 1 stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.920170Z","level":"INFO","fields":{"message":"Output stopped"},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.920313Z","level":"INFO","fields":{"message":"Closing...."},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.920475Z","level":"INFO","fields":{"message":"Closed."},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.920511Z","level":"INFO","fields":{"message":"Exited."},"target":"arkflow_core::stream"}
+{"timestamp":"2025-04-08T02:56:34.920552Z","level":"INFO","fields":{"message":"Flow #1 completed successfully"},"target":"arkflow_core::engine"}
+{"timestamp":"2025-04-08T02:56:34.920712Z","level":"INFO","fields":{"message":"All flow tasks have been complete"},"target":"arkflow_core::engine"}
+[2m2025-04-08T02:56:50.591483Z[0m [32m INFO[0m [2markflow_core::cli[0m[2m:[0m Logging to file: ./log/example.log
+[2m2025-04-08T02:56:50.594653Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Starting health check server on 0.0.0.0:8080
+[2m2025-04-08T02:56:50.594785Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Initializing flow #1
+[2m2025-04-08T02:56:50.595450Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Starting flow #1
+[2m2025-04-08T02:56:50.595690Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 3 started
+[2m2025-04-08T02:56:50.595699Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 4 started
+[2m2025-04-08T02:56:50.595692Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 2 started
+[2m2025-04-08T02:56:50.595727Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 1 started
+[2m2025-04-08T02:57:01.946412Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Received SIGINT, exiting...
+[2m2025-04-08T02:57:01.946847Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Buffer stopped
+[2m2025-04-08T02:57:01.947170Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Input stopped
+[2m2025-04-08T02:57:01.947199Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Health check server stopped
+[2m2025-04-08T02:57:01.947269Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 4 stopped
+[2m2025-04-08T02:57:01.947271Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 1 stopped
+[2m2025-04-08T02:57:01.947335Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 2 stopped
+[2m2025-04-08T02:57:01.947312Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Processor worker 3 stopped
+[2m2025-04-08T02:57:01.947535Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Output stopped
+[2m2025-04-08T02:57:01.947647Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Closing....
+[2m2025-04-08T02:57:01.947805Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Closed.
+[2m2025-04-08T02:57:01.947830Z[0m [32m INFO[0m [2markflow_core::stream[0m[2m:[0m Exited.
+[2m2025-04-08T02:57:01.947861Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m Flow #1 completed successfully
+[2m2025-04-08T02:57:01.948000Z[0m [32m INFO[0m [2markflow_core::engine[0m[2m:[0m All flow tasks have been complete
