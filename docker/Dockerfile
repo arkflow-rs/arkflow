@@ -7,7 +7,7 @@ RUN apt-get update && \
     apt-get install -y clang perl libfindbin-libs-perl
 
 # Build project
-RUN cargo build --release
+RUN cargo build
 
 # Runtime stage
 FROM debian:bookworm-slim as arkflow
