@@ -45,7 +45,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
-        run: apt-get update && apt-get install -y clang
+        run: apt-get install -y clang
 
       - name: Docker meta
         id: meta
