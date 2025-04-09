@@ -1,5 +1,7 @@
 logging:
   level: info
+#  file_path: "./log/example.log"
+  format: text
 #health_check:
 #  enabled: true
 streams:

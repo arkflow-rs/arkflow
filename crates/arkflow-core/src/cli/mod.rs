@@ -1,9 +1,9 @@
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, LogFormat};
 use crate::engine::Engine;
 use clap::{Arg, Command};
 use std::process;
 use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::fmt;
 
 pub struct Cli {
     pub config: Option<EngineConfig>,
@@ -67,21 +67,69 @@ impl Cli {
     }
 }
 fn init_logging(config: &EngineConfig) -> () {
-    let log_level = if let Some(logging) = &config.logging {
-        match logging.level.as_str() {
-            "trace" => Level::TRACE,
-            "debug" => Level::DEBUG,
-            "info" => Level::INFO,
-            "warn" => Level::WARN,
-            "error" => Level::ERROR,
-            _ => Level::INFO,
-        }
-    } else {
-        Level::INFO
+    let log_level = match config.logging.level.as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO,
     };
 
-    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+    let subscriber_builder = fmt::Subscriber::builder().with_max_level(log_level);
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("You can't set a global default log subscriber");
+    // Check if we need to output logs to a file
+    if let Some(file_path) = &config.logging.file_path {
+        // Create the file and parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(file_path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        // Open the file for writing
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)
+        {
+            Ok(file) => {
+                match config.logging.format {
+                    LogFormat::JSON => {
+                        let subscriber = subscriber_builder
+                            .with_writer(std::sync::Mutex::new(file))
+                            .json()
+                            .finish();
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("You can't set a global default log subscriber");
+                    }
+                    LogFormat::TEXT => {
+                        let subscriber = subscriber_builder
+                            .with_writer(std::sync::Mutex::new(file))
+                            .finish();
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("You can't set a global default log subscriber");
+                    }
+                }
+
+                info!("Logging to file: {}", file_path);
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to open log file {}: {}", file_path, e);
+                // Fall back to console logging
+            }
+        }
+    }
+
+    match config.logging.format {
+        LogFormat::JSON => {
+            let subscriber = subscriber_builder.json().finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("You can't set a global default log subscriber");
+        }
+        LogFormat::TEXT => {
+            let subscriber = subscriber_builder.finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("You can't set a global default log subscriber");
+        }
+    }
 }

@@ -16,6 +16,13 @@ pub enum ConfigFormat {
     TOML,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    JSON,
+    TEXT,
+}
+
 /// Log configuration
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,9 +30,11 @@ pub struct LoggingConfig {
     /// Log level
     pub level: String,
     /// Output to file?
-    pub file_output: Option<bool>,
     /// Log file path
     pub file_path: Option<String>,
+    /// Log format (text or json)
+    #[serde(default = "default_log_format")]
+    pub format: LogFormat,
 }
 
 /// Health check configuration
@@ -54,7 +63,8 @@ pub struct EngineConfig {
     /// Streams configuration
     pub streams: Vec<StreamConfig>,
     /// Logging configuration (optional)
-    pub logging: Option<LoggingConfig>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// Health check configuration (optional)
     #[serde(default)]
     pub health_check: HealthCheckConfig,
@@ -128,6 +138,21 @@ impl Default for HealthCheckConfig {
             health_path: default_health_path(),
             readiness_path: default_readiness_path(),
             liveness_path: default_liveness_path(),
+        }
+    }
+}
+
+/// Default value for log format
+fn default_log_format() -> LogFormat {
+    LogFormat::TEXT
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            file_path: None,
+            format: default_log_format(),
         }
     }
 }
