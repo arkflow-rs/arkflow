@@ -2075,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.3.0"
-source = "git+https://github.com/ark-flow/datafusion-table-providers.git?branch=datafusion-46#6e1f1f5bcfcd553e8eaf722fe000c83c0853d12e"
+source = "git+https://github.com/arkflow-rs/datafusion-table-providers.git?branch=datafusion-46#6e1f1f5bcfcd553e8eaf722fe000c83c0853d12e"
 dependencies = [
  "arrow",
  "arrow-json",

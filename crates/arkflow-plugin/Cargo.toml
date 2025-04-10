@@ -26,7 +26,7 @@ tracing = { workspace = true }
 
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
-datafusion-table-providers = { git = "https://github.com/ark-flow/datafusion-table-providers.git", branch = "datafusion-46", features = ["mysql", "postgres", "duckdb", "sqlite"] }
+datafusion-table-providers = { git = "https://github.com/arkflow-rs/datafusion-table-providers.git", branch = "datafusion-46", features = ["mysql", "postgres", "duckdb", "sqlite"] }
 duckdb = "=1.2.1"
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }

@@ -3,8 +3,8 @@ version = "0.2.0-rc2"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
-repository = "https://github.com/ark-flow/arkflow"
-homepage = "https://github.com/ark-flow/arkflow"
+repository = "https://github.com/arkflow-rs/arkflow"
+homepage = "https://github.com/arkflow-rs/arkflow"
 license = "Apache-2.0"
 
 [workspace]
