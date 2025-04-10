@@ -24,7 +24,7 @@ multiple input/output sources and processors.
 
 ```bash
 # Clone the repository
-git clone https://github.com/chenquan/arkflow.git
+git clone https://github.com/arkflow-rs/arkflow.git
 cd arkflow
 
 # Build the project

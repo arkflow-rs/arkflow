@@ -23,7 +23,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/chenquan/arkflow.git
+git clone https://github.com/arkflow-rs/arkflow.git
 cd arkflow
 
 # 构建项目

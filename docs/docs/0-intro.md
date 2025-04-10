@@ -19,7 +19,7 @@ ArkFlow is a high-performance Rust stream processing engine that provides powerf
 
 ```bash
 # Clone repository
-git clone https://github.com/ark-flow/arkflow.git
+git clone https://github.com/arkflow-rs/arkflow.git
 cd arkflow
 
 # Build project
