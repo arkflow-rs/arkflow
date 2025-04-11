@@ -190,7 +190,7 @@ impl<T> KafkaOutput<T> {
             ColumnarValue::Array(v) => {
                 let v_option = v.as_any().downcast_ref::<StringArray>();
                 if let Some(v) = v_option {
-                    let x: Vec<String> = v.into_iter().map(|x| x.unwrap().to_string()).collect();
+                    let x: Vec<String> = v.into_iter().filter_map(|x|x.map(|s| s.to_string())).collect();
                     Some(x)
                 } else {
                     None
