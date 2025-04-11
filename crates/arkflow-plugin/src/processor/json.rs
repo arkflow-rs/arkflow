@@ -3,7 +3,7 @@
 //! A processor for converting between binary data and the Arrow format
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -63,7 +63,9 @@ pub struct ArrowToJsonProcessor;
 impl Processor for ArrowToJsonProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let json_data = arrow_to_json(msg_batch)?;
-        Ok(vec![MessageBatch::new_binary(vec![json_data])?])
+        // 将生成的JSON数据作为单个消息返回
+        // 每行数据已经在arrow_to_json函数中被转换为单独的JSON对象并用换行符分隔
+        Ok(vec![MessageBatch::new_binary(json_data)?])
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -140,17 +142,19 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
 }
 
 /// Convert Arrow format to JSON
-fn arrow_to_json(batch: MessageBatch) -> Result<Vec<u8>, Error> {
+fn arrow_to_json(batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
     let mut buf = Vec::new();
-    let mut writer = arrow::json::ArrayWriter::new(&mut buf);
+    let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
     writer
         .write(&batch)
         .map_err(|e| Error::Process(format!("Arrow JSON序列化错误: {}", e)))?;
     writer
         .finish()
         .map_err(|e| Error::Process(format!("Arrow JSON序列化完成错误: {}", e)))?;
+    let json_str = String::from_utf8(buf)
+        .map_err(|e| Error::Process(format!("转换为UTF-8字符串失败: {}", e)))?;
 
-    Ok(buf)
+    Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
 }
 
 pub(crate) struct JsonToArrowProcessorBuilder;
