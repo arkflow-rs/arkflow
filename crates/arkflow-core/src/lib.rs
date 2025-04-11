@@ -1,6 +1,6 @@
 //! Rust stream processing engine
 
-use datafusion::arrow::array::{ArrayRef, BinaryArray};
+use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
@@ -63,7 +63,11 @@ pub struct MessageBatch(RecordBatch);
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
-        let fields = vec![Field::new("value", DataType::Binary, false)];
+        let fields = vec![Field::new(
+            DEFAULT_BINARY_VALUE_FIELD,
+            DataType::Binary,
+            false,
+        )];
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(content.len());
 
         let bytes: Vec<_> = content.iter().map(|x| x.as_bytes()).collect();
@@ -173,3 +177,5 @@ impl DerefMut for MessageBatch {
         &mut self.0
     }
 }
+
+pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";

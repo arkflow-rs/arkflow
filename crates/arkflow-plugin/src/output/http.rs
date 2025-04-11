@@ -3,7 +3,7 @@
 //! Send the processed data to the HTTP endpoint
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use base64::Engine;
 use reqwest::{header, Client};
@@ -79,7 +79,11 @@ impl Output for HttpOutput {
     }
 
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
-        let body_field = self.config.body_field.as_deref().unwrap_or("value");
+        let body_field = self
+            .config
+            .body_field
+            .as_deref()
+            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
         let content = msg.to_binary(body_field)?;
         if content.is_empty() {
             return Ok(());
