@@ -82,7 +82,6 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
             let mut fields = Vec::new();
             let mut columns: Vec<ArrayRef> = Vec::new();
 
-            // 提取所有字段和值
             for (key, value) in obj {
                 match value {
                     Value::Null => {
@@ -142,7 +141,6 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
 
 /// Convert Arrow format to JSON
 fn arrow_to_json(batch: MessageBatch) -> Result<Vec<u8>, Error> {
-    // 使用Arrow的JSON序列化功能
     let mut buf = Vec::new();
     let mut writer = arrow::json::ArrayWriter::new(&mut buf);
     writer

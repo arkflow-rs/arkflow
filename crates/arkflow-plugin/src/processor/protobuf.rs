@@ -2,6 +2,8 @@
 //!
 //! The processor used to convert between Protobuf data and the Arrow format
 
+use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -14,14 +16,11 @@ use datafusion::parquet::data_type::AsBytes;
 use prost_reflect::prost::Message;
 use prost_reflect::prost_types::FileDescriptorSet;
 use prost_reflect::{DynamicMessage, MessageDescriptor, Value};
+use protobuf::Message as ProtobufMessage;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
-
-use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
-use protobuf::Message as ProtobufMessage;
 
 /// Protobuf format conversion processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

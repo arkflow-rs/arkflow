@@ -46,7 +46,7 @@ mod tests {
             RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![4, 0230, 21])) as _)])
                 .unwrap();
         let sql = r#" 0.9"#;
-        let result = evaluate_expr(sql, batch).unwrap();
+        let result = evaluate_expr(sql, &batch).unwrap();
         match result {
             ColumnarValue::Array(_) => {
                 panic!("unexpected scalar value");
