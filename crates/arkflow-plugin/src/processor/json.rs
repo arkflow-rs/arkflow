@@ -3,7 +3,7 @@
 //! A processor for converting between binary data and the Arrow format
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -31,7 +31,12 @@ pub struct JsonToArrowProcessor {
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let mut batches = Vec::with_capacity(msg_batch.len());
-        let result = msg_batch.to_binary(self.config.value_field.as_deref().unwrap_or("value"))?;
+        let result = msg_batch.to_binary(
+            self.config
+                .value_field
+                .as_deref()
+                .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
+        )?;
         for x in result {
             let record_batch = json_to_arrow(x)?;
             batches.push(record_batch)

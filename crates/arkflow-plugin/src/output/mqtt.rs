@@ -4,7 +4,7 @@
 
 use crate::expr::Expr;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,11 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .as_ref()
             .ok_or_else(|| Error::Connection("The MQTT client is not initialized".to_string()))?;
 
-        let value_field = self.config.value_field.as_deref().unwrap_or("value");
+        let value_field = self
+            .config
+            .value_field
+            .as_deref()
+            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
 
         // Get the message content
         let payloads = match msg.to_binary(value_field) {

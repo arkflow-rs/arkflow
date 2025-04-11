@@ -63,7 +63,11 @@ pub struct MessageBatch(RecordBatch);
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
-        let fields = vec![Field::new("value", DataType::Binary, false)];
+        let fields = vec![Field::new(
+            DEFAULT_BINARY_VALUE_FIELD,
+            DataType::Binary,
+            false,
+        )];
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(content.len());
 
         let bytes: Vec<_> = content.iter().map(|x| x.as_bytes()).collect();

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 
 use crate::expr::Expr;
 use async_trait::async_trait;
@@ -119,7 +119,11 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        let value_field = self.config.value_field.as_deref().unwrap_or("value");
+        let value_field = self
+            .config
+            .value_field
+            .as_deref()
+            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
         let payloads = msg.to_binary(value_field)?;
         if payloads.is_empty() {
             return Ok(());

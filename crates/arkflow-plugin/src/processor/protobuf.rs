@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use protobuf::Message as ProtobufMessage;
 
 /// Protobuf format conversion processor configuration
@@ -350,7 +350,11 @@ impl Processor for ProtobufProcessor {
                 }
 
                 let mut batches = Vec::with_capacity(msg.len());
-                let result = msg.to_binary(c.value_field.as_deref().unwrap_or("value"))?;
+                let result = msg.to_binary(
+                    c.value_field
+                        .as_deref()
+                        .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
+                )?;
                 for x in result {
                     // Convert Protobuf messages to Arrow format.
                     let batch = self.protobuf_to_arrow(x)?;
