@@ -8,16 +8,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Expr {
-    Expr(String),
-    String(String),
+    Expr { expr: String },
+    String { s: String },
 }
 
 impl Expr {
     pub fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue, Error> {
         match self {
-            Expr::Expr(expr) => evaluate_expr(expr, batch)
+            Expr::Expr { expr } => evaluate_expr(expr, batch)
                 .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e))),
-            Expr::String(s) => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            Expr::String { s } => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
                 s.to_string(),
             )))),
         }

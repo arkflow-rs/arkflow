@@ -1,6 +1,6 @@
 //! Rust stream processing engine
 
-use datafusion::arrow::array::{ArrayRef, BinaryArray};
+use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;

@@ -21,7 +21,6 @@ streams:
         - type: "json_to_arrow"
 
         - type: "sql"
-          # SQL查询语句，支持标准SQL语法
           query: "SELECT sum(value),avg(value) ,111 as x FROM flow  group by sensor"
 #        - type: "arrow_to_json"
 

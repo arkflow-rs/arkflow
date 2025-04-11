@@ -133,6 +133,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         if topic.is_empty() {
             return Err(Error::Process("The topic is empty".to_string()));
         }
+        let key = self.get_key(&msg)?;
 
         for (i, x) in payloads.into_iter().enumerate() {
             // Create record
@@ -141,7 +142,6 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
                 _ => FutureRecord::to(&topic[i]).payload(x),
             };
 
-            let key = self.get_key(&msg)?;
             match key.len() {
                 0 => {}
                 1 => record = record.key(&key[0]),
@@ -190,7 +190,10 @@ impl<T> KafkaOutput<T> {
             ColumnarValue::Array(v) => {
                 let v_option = v.as_any().downcast_ref::<StringArray>();
                 if let Some(v) = v_option {
-                    let x: Vec<String> = v.into_iter().filter_map(|x|x.map(|s| s.to_string())).collect();
+                    let x: Vec<String> = v
+                        .into_iter()
+                        .filter_map(|x| x.map(|s| s.to_string()))
+                        .collect();
                     Some(x)
                 } else {
                     None
@@ -383,7 +386,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -402,7 +407,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -426,7 +433,9 @@ mod tests {
         // Create a configuration with empty brokers to trigger failure
         let config = KafkaOutputConfig {
             brokers: vec![],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -446,7 +455,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -479,8 +490,12 @@ mod tests {
         // Create a configuration with a partition key
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
-            key: Some(Expr::String("test-key".to_string())),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
+            key: Some(Expr::String {
+                s: "test-key".to_string(),
+            }),
             client_id: None,
             compression: None,
             acks: None,
@@ -510,7 +525,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -537,7 +554,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -566,7 +585,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
@@ -593,7 +614,9 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String("test-topic".to_string()),
+            topic: Expr::String {
+                s: "test-topic".to_string(),
+            },
             key: None,
             client_id: None,
             compression: None,
