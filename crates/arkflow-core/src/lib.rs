@@ -173,3 +173,5 @@ impl DerefMut for MessageBatch {
         &mut self.0
     }
 }
+
+pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
