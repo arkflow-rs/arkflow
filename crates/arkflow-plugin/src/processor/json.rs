@@ -62,10 +62,35 @@ pub struct ArrowToJsonProcessor;
 #[async_trait]
 impl Processor for ArrowToJsonProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let json_data = arrow_to_json(msg_batch)?;
-        // 将生成的JSON数据作为单个消息返回
-        // 每行数据已经在arrow_to_json函数中被转换为单独的JSON对象并用换行符分隔
-        Ok(vec![MessageBatch::new_binary(json_data)?])
+        let json_data = arrow_to_json(msg_batch.clone())?;
+
+        let schema = msg_batch.schema();
+        let fields_vec: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+        let mut fields = Vec::new();
+        for field in fields_vec {
+            fields.push(field);
+        }
+
+        // 创建新的JSON列字段
+        fields.push(Arc::new(Field::new(
+            DEFAULT_BINARY_VALUE_FIELD,
+            DataType::Utf8,
+            false,
+        )));
+        let new_schema = Arc::new(Schema::new(fields));
+
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for i in 0..schema.fields().len() {
+            columns.push(msg_batch.column(i).clone());
+        }
+
+        columns.push(Arc::new(StringArray::from(json_data)));
+
+        // 创建新的RecordBatch
+        let new_batch = RecordBatch::try_new(new_schema, columns)
+            .map_err(|e| Error::Process(format!("创建新的Arrow记录批次失败: {}", e)))?;
+
+        Ok(vec![MessageBatch::new_arrow(new_batch)])
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -142,7 +167,7 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
 }
 
 /// Convert Arrow format to JSON
-fn arrow_to_json(batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+fn arrow_to_json(batch: MessageBatch) -> Result<Vec<String>, Error> {
     let mut buf = Vec::new();
     let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
     writer
@@ -154,7 +179,7 @@ fn arrow_to_json(batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
     let json_str = String::from_utf8(buf)
         .map_err(|e| Error::Process(format!("转换为UTF-8字符串失败: {}", e)))?;
 
-    Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
+    Ok(json_str.lines().map(|s| s.to_string()).collect())
 }
 
 pub(crate) struct JsonToArrowProcessorBuilder;
