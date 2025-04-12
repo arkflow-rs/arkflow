@@ -185,6 +185,7 @@ impl<T> KafkaOutput<T> {
             Err(Error::Process("The topic is empty".to_string()))
         }
     }
+
     fn get_expr_value(x: ColumnarValue) -> Option<Vec<String>> {
         match x {
             ColumnarValue::Array(v) => {
@@ -205,6 +206,7 @@ impl<T> KafkaOutput<T> {
             },
         }
     }
+
     fn get_key(&self, msg: &MessageBatch) -> Result<Vec<String>, Error> {
         let Some(v) = &self.config.key else {
             return Ok(vec![]);

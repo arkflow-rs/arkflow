@@ -12,7 +12,6 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::parquet::data_type::AsBytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -73,7 +72,6 @@ impl Processor for ArrowToJsonProcessor {
             fields.push(field);
         }
 
-        // 创建新的JSON列字段
         fields.push(Arc::new(Field::new(
             DEFAULT_BINARY_VALUE_FIELD,
             DataType::Binary,
@@ -88,9 +86,8 @@ impl Processor for ArrowToJsonProcessor {
         let binary_data: Vec<&[u8]> = json_data.iter().map(|v| v.as_slice()).collect();
         columns.push(Arc::new(BinaryArray::from(binary_data)));
 
-        // 创建新的RecordBatch
         let new_batch = RecordBatch::try_new(new_schema, columns)
-            .map_err(|e| Error::Process(format!("创建新的Arrow记录批次失败: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
 
         Ok(vec![MessageBatch::new_arrow(new_batch)])
     }
@@ -103,7 +100,7 @@ impl Processor for ArrowToJsonProcessor {
 fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
     // 解析JSON内容
     let json_value: Value = serde_json::from_slice(content)
-        .map_err(|e| Error::Process(format!("JSON解析错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("JSON parsing error: {}", e)))?;
 
     match json_value {
         Value::Object(obj) => {
@@ -164,7 +161,9 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
                 Error::Process(format!("Creating an Arrow record batch failed: {}", e))
             })
         }
-        _ => Err(Error::Process("输入必须是JSON对象".to_string())),
+        _ => Err(Error::Process(
+            "The input must be a JSON object".to_string(),
+        )),
     }
 }
 
@@ -174,19 +173,19 @@ fn arrow_to_json(batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
     let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
     writer
         .write(&batch)
-        .map_err(|e| Error::Process(format!("Arrow JSON序列化错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON Serialization error: {}", e)))?;
     writer
         .finish()
-        .map_err(|e| Error::Process(format!("Arrow JSON序列化完成错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON Serialization Complete Error: {}", e)))?;
     let json_str = String::from_utf8(buf)
-        .map_err(|e| Error::Process(format!("转换为UTF-8字符串失败: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
 
     Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
 }
 
 pub(crate) struct JsonToArrowProcessorBuilder;
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -199,7 +198,7 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
 }
 pub(crate) struct ArrowToJsonProcessorBuilder;
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
-    fn build(&self, _: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(&self, _: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         Ok(Arc::new(ArrowToJsonProcessor))
     }
 }

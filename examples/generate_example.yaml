@@ -4,7 +4,7 @@ streams:
   - input:
       type: "generate"
       context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
-      interval: 1ms
+      interval: 1s
       batch_size: 1000
 
     buffer:
@@ -22,7 +22,9 @@ streams:
 
         - type: "sql"
           query: "SELECT sum(value),avg(value) ,111 as x FROM flow  group by sensor"
-#        - type: "arrow_to_json"
+        - type: "arrow_to_json"
+        - type: "sql"
+          query: "SELECT *,cast( __value__  as string) as y FROM flow "
 
 
     output:

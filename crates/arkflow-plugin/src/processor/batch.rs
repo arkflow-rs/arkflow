@@ -41,7 +41,6 @@ impl BatchProcessor {
 
     /// Check if the batch should be refreshed
     async fn should_flush(&self) -> bool {
-        // 如果批处理已满，则刷新
         let batch = self.batch.read().await;
         if batch.len() >= self.config.count {
             return true;
