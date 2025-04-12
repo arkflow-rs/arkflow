@@ -82,6 +82,38 @@ impl MessageBatch {
 
         Ok(Self(batch))
     }
+    /// Creates a new MessageBatch by appending a binary column to the current batch.
+    ///
+    /// The method clones the existing schema and columns from the MessageBatch, then adds an additional
+    /// binary column constructed from the provided vector of byte arrays. The new binary column is assigned
+    /// the default field name defined by `DEFAULT_BINARY_VALUE_FIELD`. It returns a new MessageBatch instance
+    /// that includes both the original columns and the newly appended binary column, or an Error if the
+    /// construction of the underlying RecordBatch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use arrow::datatypes::{Field, DataType, Schema};
+    /// use arrow::array::{ArrayRef, Int32Array};
+    /// use arrow::record_batch::RecordBatch;
+    /// use arkflow_core::{MessageBatch, Bytes, DEFAULT_BINARY_VALUE_FIELD, Error};
+    ///
+    /// // Create a dummy record batch with a single integer column.
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     Arc::new(Field::new("col1", DataType::Int32, false))
+    /// ]));
+    /// let int_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+    /// let record_batch = RecordBatch::try_new(schema.clone(), vec![int_array]).unwrap();
+    /// let msg_batch = MessageBatch::new_arrow(record_batch);
+    ///
+    /// // Append a binary column using a vector of byte arrays.
+    /// let binary_values: Vec<Bytes> = vec![vec![65, 66], vec![67, 68], vec![69, 70]];
+    /// let new_msg_batch = msg_batch.new_binary_with_origin(binary_values).unwrap();
+    ///
+    /// // The new MessageBatch should have one more column than the original.
+    /// assert_eq!(new_msg_batch.num_columns(), msg_batch.num_columns() + 1);
+    /// ```
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {
         let schema = self.schema();
         let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
@@ -105,6 +137,31 @@ impl MessageBatch {
         Ok(MessageBatch::new_arrow(new_msg))
     }
 
+    /// Filters the columns of the MessageBatch to include only those with names present in the specified set.
+    ///
+    /// This method iterates over the underlying record batch and selects columns whose field names are contained in the
+    /// provided HashSet. A new MessageBatch is constructed with a schema that reflects only the filtered columns. An error
+    /// is returned if the creation of the Arrow record batch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashSet;
+    ///
+    /// // Assume `message_batch` is an existing MessageBatch with fields "id", "name", and "value".
+    /// let mut message_batch = /* initialization of MessageBatch */;
+    ///
+    /// let mut fields_to_include = HashSet::new();
+    /// fields_to_include.insert("id".to_string());
+    /// fields_to_include.insert("value".to_string());
+    ///
+    /// let filtered_batch = message_batch.filter_columns(&fields_to_include);
+    /// assert!(filtered_batch.is_ok());
+    ///
+    /// let filtered_batch = filtered_batch.unwrap();
+    /// // Verify that the filtered batch's schema contains only the specified fields.
+    /// assert_eq!(filtered_batch.schema().fields().len(), 2);
+    /// ```
     pub fn filter_columns(
         &mut self,
         field_names_to_include: &HashSet<String>,
@@ -131,6 +188,35 @@ impl MessageBatch {
         Ok(batch.into())
     }
 
+    /// Creates a MessageBatch from a serializable value by converting it to JSON bytes.
+    ///
+    /// This function serializes the provided value using `serde_json::to_vec` and then wraps
+    /// the resulting JSON byte vector into a new binary MessageBatch via `new_binary`.
+    /// Any errors during serialization or batch creation are propagated.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - A reference to a value that implements the `Serialize` trait.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the constructed MessageBatch or an `Error` if the conversion fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde::Serialize;
+    /// 
+    /// #[derive(Serialize)]
+    /// struct TestData {
+    ///     name: String,
+    ///     value: i32,
+    /// }
+    /// 
+    /// let data = TestData { name: "example".to_string(), value: 42 };
+    /// let batch = MessageBatch::from_json(&data).unwrap();
+    /// // The `batch` now contains a binary representation of the JSON-serialized data.
+    /// ```
     pub fn from_json<T: Serialize>(value: &T) -> Result<Self, Error> {
         let content = serde_json::to_vec(value)?;
         Ok(Self::new_binary(vec![content])?)

@@ -60,6 +60,41 @@ impl Processor for JsonToArrowProcessor {
 }
 
 impl JsonToArrowProcessor {
+    /// Converts a JSON-encoded byte slice representing an object into an Arrow RecordBatch.
+    ///
+    /// This method parses a JSON object and converts each key-value pair into a corresponding Arrow column:
+    /// - Null values generate a NullArray.
+    /// - Boolean values generate a BooleanArray.
+    /// - Numeric values are converted into an Int64Array, UInt64Array, or Float64Array based on the number type.
+    /// - Strings are stored in a Utf8 array.
+    /// - Arrays and nested objects are serialized to strings and stored in a Utf8 array.
+    ///
+    /// If the processor configuration specifies a set of fields to include, only keys within that set are processed.
+    /// An error is returned if JSON parsing fails, if the input is not a JSON object, or if creating the RecordBatch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::record_batch::RecordBatch;
+    /// use crate::processor::{JsonToArrowProcessor, JsonProcessorConfig};
+    ///
+    /// // A sample JSON object with multiple types.
+    /// let json_data = r#"{
+    ///     "age": 30,
+    ///     "active": true,
+    ///     "name": "Bob",
+    ///     "notes": ["note1", "note2"]
+    /// }"#;
+    ///
+    /// // Create a processor with no field filtering.
+    /// let processor = JsonToArrowProcessor {
+    ///     config: JsonProcessorConfig { fields_to_include: None },
+    /// };
+    ///
+    /// let batch = processor.json_to_arrow(json_data.as_bytes()).unwrap();
+    /// assert_eq!(batch.num_rows(), 1);
+    /// ```
     fn json_to_arrow(&self, content: &[u8]) -> Result<RecordBatch, Error> {
         let json_value: Value = serde_json::from_slice(content)
             .map_err(|e| Error::Process(format!("JSON parsing error: {}", e)))?;
@@ -153,8 +188,25 @@ impl Processor for ArrowToJsonProcessor {
 }
 
 impl ArrowToJsonProcessor {
-    /// Convert Arrow format to JSON
-    fn arrow_to_json(&self, mut batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+    /// Converts an Arrow `MessageBatch` to a vector of JSON lines represented as byte vectors.
+    /// 
+    /// If the configuration specifies a set of fields to include, the function filters the batch to retain only those columns.
+    /// It then serializes the (filtered) batch into a line-delimited JSON format using Arrow's JSON writer,
+    /// converts the resulting buffer into a UTF-8 string, and splits the string into individual JSON lines.
+    /// 
+    /// # Errors
+    ///
+    /// Returns an error if column filtering, JSON serialization, or UTF-8 conversion fails.
+    /// 
+    /// # Examples
+    ///
+    /// ```
+    /// // Assume `processor` is an instance that implements `arrow_to_json`
+    /// // and `batch` is a valid MessageBatch.
+    /// let json_lines = processor.arrow_to_json(batch)
+    ///     .expect("Failed to convert Arrow batch to JSON");
+    /// assert!(!json_lines.is_empty());
+    /// ```    fn arrow_to_json(&self, mut batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
         if let Some(ref set) = self.config.fields_to_include {
             batch = batch.filter_columns(set)?
         }
