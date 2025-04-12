@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow"
-version = "0.2.0-rc2"
+version = "0.2.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-core"
-version = "0.2.0-rc2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-plugin"
-version = "0.2.0-rc2"
+version = "0.2.0"
 dependencies = [
  "arkflow-core",
  "arrow-json",
