@@ -9,9 +9,6 @@ use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 
 use crate::expr::{EvaluateExpr, Expr, ExprResult};
 use async_trait::async_trait;
-use datafusion::arrow::array::StringArray;
-use datafusion::common::ScalarValue;
-use datafusion::logical_expr::ColumnarValue;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaResult;
 use rdkafka::message::ToBytes;
@@ -181,26 +178,26 @@ impl<T> KafkaOutput<T> {
         self.config.topic.evaluate_expr(msg)
     }
 
-    fn get_expr_value(x: ColumnarValue) -> Option<Vec<String>> {
-        match x {
-            ColumnarValue::Array(v) => {
-                let v_option = v.as_any().downcast_ref::<StringArray>();
-                if let Some(v) = v_option {
-                    let x: Vec<String> = v
-                        .into_iter()
-                        .filter_map(|x| x.map(|s| s.to_string()))
-                        .collect();
-                    Some(x)
-                } else {
-                    None
-                }
-            }
-            ColumnarValue::Scalar(v) => match v {
-                ScalarValue::Utf8(_) => Some(vec![v.to_string()]),
-                _ => None,
-            },
-        }
-    }
+    // fn get_expr_value(x: ColumnarValue) -> Option<Vec<String>> {
+    //     match x {
+    //         ColumnarValue::Array(v) => {
+    //             let v_option = v.as_any().downcast_ref::<StringArray>();
+    //             if let Some(v) = v_option {
+    //                 let x: Vec<String> = v
+    //                     .into_iter()
+    //                     .filter_map(|x| x.map(|s| s.to_string()))
+    //                     .collect();
+    //                 Some(x)
+    //             } else {
+    //                 None
+    //             }
+    //         }
+    //         ColumnarValue::Scalar(v) => match v {
+    //             ScalarValue::Utf8(_) => Some(vec![v.to_string()]),
+    //             _ => None,
+    //         },
+    //     }
+    // }
 
     fn get_key(&self, msg: &MessageBatch) -> Result<ExprResult<String>, Error> {
         let Some(v) = &self.config.key else {
@@ -378,8 +375,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -399,8 +396,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -425,8 +422,8 @@ mod tests {
         // Create a configuration with empty brokers to trigger failure
         let config = KafkaOutputConfig {
             brokers: vec![],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -447,8 +444,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -482,11 +479,11 @@ mod tests {
         // Create a configuration with a partition key
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
-            key: Some(Expr::String {
-                s: "test-key".to_string(),
+            key: Some(Expr::Value {
+                value: "test-key".to_string(),
             }),
             client_id: None,
             compression: None,
@@ -517,8 +514,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -546,8 +543,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -577,8 +574,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,
@@ -606,8 +603,8 @@ mod tests {
         // Create a basic configuration
         let config = KafkaOutputConfig {
             brokers: vec!["localhost:9092".to_string()],
-            topic: Expr::String {
-                s: "test-topic".to_string(),
+            topic: Expr::Value {
+                value: "test-topic".to_string(),
             },
             key: None,
             client_id: None,

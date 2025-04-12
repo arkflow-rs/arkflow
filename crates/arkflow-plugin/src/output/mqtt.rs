@@ -130,29 +130,32 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             }
         };
 
-        for payload in payloads {
+        let topic = self.config.topic.evaluate_expr(&msg)?;
+
+        // Determine the QoS level
+        let qos_level = match self.config.qos {
+            Some(0) => QoS::AtMostOnce,
+            Some(1) => QoS::AtLeastOnce,
+            Some(2) => QoS::ExactlyOnce,
+            _ => QoS::AtLeastOnce, // The default is QoS 1
+        };
+
+        // Decide whether to keep the message
+        let retain = self.config.retain.unwrap_or(false);
+
+        for (i, payload) in payloads.into_iter().enumerate() {
             info!(
                 "Send message: {}",
                 &String::from_utf8_lossy((&payload).as_ref())
             );
 
-            // Determine the QoS level
-            let qos_level = match self.config.qos {
-                Some(0) => QoS::AtMostOnce,
-                Some(1) => QoS::AtLeastOnce,
-                Some(2) => QoS::ExactlyOnce,
-                _ => QoS::AtLeastOnce, // The default is QoS 1
-            };
-
-            // Decide whether to keep the message
-            let retain = self.config.retain.unwrap_or(false);
-
-            &self.config.topic.evaluate_expr(&msg);
-            // Post a message
-            client
-                .publish("&self.config.topic", qos_level, retain, payload)
-                .await
-                .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
+            if let Some(topic_str) = topic.get(i) {
+                // Post a message
+                client
+                    .publish(topic_str, qos_level, retain, payload)
+                    .await
+                    .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
+            }
         }
 
         Ok(())
@@ -314,7 +317,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
-            topic: Expr::String("test/topic".to_string()),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: Some(1),
             clean_session: Some(true),
             keep_alive: Some(60),
@@ -335,7 +340,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: Expr::String("test/topic".to_string()),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -356,7 +363,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: Expr::String("test/topic".to_string()),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -388,7 +397,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: Expr::String("test/topic".to_string()),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -415,7 +426,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: Expr::String("test/topic".to_string()),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,

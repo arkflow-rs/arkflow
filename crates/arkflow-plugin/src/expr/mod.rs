@@ -9,27 +9,26 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Expr<T> {
     Expr { expr: String },
-    String { s: T },
+    Value { value: T },
 }
+
 pub enum ExprResult<T> {
     Scalar(T),
     Vec(Vec<T>),
 }
+
 pub trait EvaluateExpr<T> {
     fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<T>, Error>;
 }
 
-// impl<T> Expr<T> {
-//     pub fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue, Error> {
-//         match self {
-//             Expr::Expr { expr } => evaluate_expr(expr, batch)
-//                 .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e))),
-//             Expr::String { s } => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-//                 s.to_string(),
-//             )))),
-//         }
-//     }
-// }
+impl<T> ExprResult<T> {
+    pub fn get(&self, i: usize) -> Option<&T> {
+        match self {
+            ExprResult::Scalar(val) => Some(val),
+            ExprResult::Vec(vec) => vec.get(i),
+        }
+    }
+}
 
 impl EvaluateExpr<String> for Expr<String> {
     fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<String>, Error> {
@@ -57,7 +56,7 @@ impl EvaluateExpr<String> for Expr<String> {
                     },
                 }
             }
-            Expr::String { s } => Ok(ExprResult::Scalar(s.to_string())),
+            Expr::Value { value: s } => Ok(ExprResult::Scalar(s.to_string())),
         }
     }
 }
