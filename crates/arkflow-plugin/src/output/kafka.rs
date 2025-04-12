@@ -109,6 +109,24 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         Ok(())
     }
 
+    /// Asynchronously sends a batch of messages to the Kafka topic.
+    ///
+    /// This method converts the given message batch into binary payloads using the configured value field,
+    /// retrieves the target topic and optional partition key via evaluated expressions, and then sends each
+    /// message using the Kafka producer with a 5-second timeout. It returns an error if the producer is not
+    /// initialized or if sending any message fails. If no payloads are produced from the message batch,
+    /// the method completes without sending anything.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Assume `kafka_output` is a properly configured KafkaOutput instance and
+    /// // `batch` is a MessageBatch containing messages to be sent.
+    /// kafka_output.write(batch).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         let producer_arc = self.producer.clone();
         let producer_guard = producer_arc.read().await;
@@ -156,6 +174,21 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         Ok(())
     }
 
+    /// Closes the Kafka producer by flushing pending messages.
+    ///
+    /// This asynchronous method flushes any outstanding messages with a 30-second timeout before
+    /// closing the producer. If the flush operation fails, it returns an error with a descriptive message.
+    /// If there is no active producer (i.e., it was already closed), the function completes successfully.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Assume `output` is a properly configured and connected KafkaOutput instance.
+    /// output.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn close(&self) -> Result<(), Error> {
         // Get the producer and close
         let producer_arc = self.producer.clone();
@@ -174,6 +207,37 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
     }
 }
 impl<T> KafkaOutput<T> {
+    /// Retrieves and evaluates the topic expression from the Kafka output configuration
+    /// using the provided message batch.
+    ///
+    /// This method evaluates the configured topic expression by passing the given message batch
+    /// as context. The resulting evaluated expression is used as the Kafka topic when sending messages.
+    /// An error is returned if the evaluation fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - A batch of messages that provides context for evaluating the topic expression.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing an `EvaluateResult<String>` with the evaluated topic on success,
+    /// or an `Error` if the evaluation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use my_crate::kafka::{KafkaOutput, MessageBatch, EvaluateResult}; // adjust module paths as needed
+    /// // Assume a valid KafkaOutput instance is created with appropriate configuration.
+    /// let kafka_output = KafkaOutput::new(/* configuration */);
+    /// let msg = MessageBatch::new(); // Replace with the actual way to create a MessageBatch
+    ///
+    /// let result = kafka_output.get_topic(&msg);
+    /// match result {
+    ///     Ok(EvaluateResult::Scalar(topic)) => println!("Evaluated topic: {}", topic),
+    ///     Ok(other) => println!("Topic evaluated to a non-scalar result: {:?}", other),
+    ///     Err(e) => eprintln!("Failed to evaluate topic: {}", e),
+    /// }
+    /// ```
     fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
         self.config.topic.evaluate_expr(msg)
     }
@@ -197,7 +261,32 @@ impl<T> KafkaOutput<T> {
     //             _ => None,
     //         },
     //     }
-    // }
+    /// Evaluates the key expression against a given message batch.
+    ///
+    /// If the key is not configured, returns an empty vector wrapped in an `EvaluateResult`.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - A reference to the `MessageBatch` used for evaluating the key expression.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing an `EvaluateResult<String>` representing the evaluated key,
+    /// or an `Error` if the evaluation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use crate::output::kafka::{KafkaOutput, KafkaOutputConfig, EvaluateResult};
+    /// # use crate::MessageBatch;
+    /// // Create a KafkaOutput with no key configured.
+    /// let config = KafkaOutputConfig { key: None, ..Default::default() };
+    /// let kafka_output = KafkaOutput::new(config);
+    /// let msg_batch = MessageBatch::new();
+    ///
+    /// let key_result = kafka_output.get_key(&msg_batch).unwrap();
+    /// assert_eq!(key_result, EvaluateResult::Vec(vec![]));
+    /// ```
 
     fn get_key(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
         let Some(v) = &self.config.key else {

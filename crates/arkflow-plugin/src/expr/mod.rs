@@ -22,6 +22,26 @@ pub trait EvaluateExpr<T> {
 }
 
 impl<T> EvaluateResult<T> {
+    /// Retrieves a reference to a value from the evaluation result by index.
+    ///
+    /// If the result is a scalar, this method always returns the contained value regardless of the provided index.
+    /// If the result is a vector, it returns the element at the specified index, if it exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::expr::EvaluateResult;
+    ///
+    /// // For a scalar result, a reference to the contained value is always returned.
+    /// let scalar_result = EvaluateResult::Scalar(42);
+    /// assert_eq!(scalar_result.get(0), Some(&42));
+    /// assert_eq!(scalar_result.get(999), Some(&42)); // any index returns the scalar value
+    ///
+    /// // For a vector result, returns the element at the given index if available.
+    /// let vector_result = EvaluateResult::Vec(vec![10, 20, 30]);
+    /// assert_eq!(vector_result.get(1), Some(&20));
+    /// assert_eq!(vector_result.get(3), None);
+    /// ```
     pub fn get(&self, i: usize) -> Option<&T> {
         match self {
             EvaluateResult::Scalar(val) => Some(val),
@@ -31,6 +51,39 @@ impl<T> EvaluateResult<T> {
 }
 
 impl EvaluateExpr<String> for Expr<String> {
+    /// Evaluates the expression or literal value contained in the enum variant against a given RecordBatch.
+    /// 
+    /// For an expression variant (`Expr::Expr { expr }`), it parses and evaluates the SQL expression using DataFusion:
+    /// - If the evaluation produces an array, the method attempts to downcast it to a StringArray and returns its contents as a vector.
+    /// - If the evaluation produces a scalar, it verifies that it is a UTF-8 string and returns it as a scalar.
+    /// 
+    /// For a literal value variant (`Expr::Value { value }`), the contained string is directly returned as a scalar.
+    /// 
+    /// Any failure during expression evaluation or type conversion results in a processing error.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// # use arrow::datatypes::{DataType, Field, Schema};
+    /// # use arrow::array::{Int32Array, ArrayRef};
+    /// # use arrow::record_batch::RecordBatch;
+    /// # use std::sync::Arc;
+    /// # use your_crate::{Expr, EvaluateExpr, EvaluateResult, Error, evaluate_expr}; // adjust import paths as needed
+    /// 
+    /// // Create a dummy RecordBatch (not used in a literal value evaluation but required by the interface)
+    /// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    /// let array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+    /// let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+    /// 
+    /// // Evaluate a literal value expression.
+    /// let expr = Expr::Value { value: "hello".to_string() };
+    /// let result = expr.evaluate_expr(&batch).unwrap();
+    /// if let EvaluateResult::Scalar(val) = result {
+    ///     assert_eq!(val, "hello");
+    /// } else {
+    ///     panic!("Expected a scalar result");
+    /// }
+    /// ```
     fn evaluate_expr(&self, batch: &RecordBatch) -> Result<EvaluateResult<String>, Error> {
         match self {
             Expr::Expr { expr } => {
