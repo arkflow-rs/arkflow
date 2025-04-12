@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 
-use crate::expr::Expr;
+use crate::expr::{EvaluateExpr, Expr, ExprResult};
 use async_trait::async_trait;
 use datafusion::arrow::array::StringArray;
 use datafusion::common::ScalarValue;
@@ -48,9 +48,9 @@ pub struct KafkaOutputConfig {
     /// List of Kafka server addresses
     pub brokers: Vec<String>,
     /// Target topic
-    pub topic: Expr,
+    pub topic: Expr<String>,
     /// Partition key (optional)
-    pub key: Option<Expr>,
+    pub key: Option<Expr<String>>,
     /// Client ID
     pub client_id: Option<String>,
     /// Compression type
@@ -130,22 +130,22 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         }
 
         let topic = self.get_topic(&msg)?;
-        if topic.is_empty() {
-            return Err(Error::Process("The topic is empty".to_string()));
-        }
+
         let key = self.get_key(&msg)?;
 
         for (i, x) in payloads.into_iter().enumerate() {
             // Create record
-            let mut record = match topic.len() {
-                1 => FutureRecord::to(&topic[0]).payload(x),
-                _ => FutureRecord::to(&topic[i]).payload(x),
+            let mut record = match &topic {
+                ExprResult::Scalar(s) => FutureRecord::to(s).payload(x),
+                ExprResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x),
             };
-
-            match key.len() {
-                0 => {}
-                1 => record = record.key(&key[0]),
-                _ => record = record.key(&key[i]),
+            match &key {
+                ExprResult::Scalar(s) => record = record.key(s),
+                ExprResult::Vec(v) => {
+                    if !v.is_empty() {
+                        record = record.key(&v[i])
+                    };
+                }
             }
 
             // Get the producer and send the message
@@ -177,13 +177,8 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
     }
 }
 impl<T> KafkaOutput<T> {
-    fn get_topic(&self, msg: &MessageBatch) -> Result<Vec<String>, Error> {
-        let evaluate_res = self.config.topic.evaluate_expr(msg)?;
-        if let Some(v) = Self::get_expr_value(evaluate_res) {
-            Ok(v)
-        } else {
-            Err(Error::Process("The topic is empty".to_string()))
-        }
+    fn get_topic(&self, msg: &MessageBatch) -> Result<ExprResult<String>, Error> {
+        self.config.topic.evaluate_expr(msg)
     }
 
     fn get_expr_value(x: ColumnarValue) -> Option<Vec<String>> {
@@ -207,17 +202,12 @@ impl<T> KafkaOutput<T> {
         }
     }
 
-    fn get_key(&self, msg: &MessageBatch) -> Result<Vec<String>, Error> {
+    fn get_key(&self, msg: &MessageBatch) -> Result<ExprResult<String>, Error> {
         let Some(v) = &self.config.key else {
-            return Ok(vec![]);
+            return Ok(ExprResult::Vec(vec![]));
         };
 
-        let evaluate_res = v.evaluate_expr(msg)?;
-        if let Some(v) = Self::get_expr_value(evaluate_res) {
-            Ok(v)
-        } else {
-            Err(Error::Process("The key is empty".to_string()))
-        }
+        v.evaluate_expr(msg)
     }
 }
 

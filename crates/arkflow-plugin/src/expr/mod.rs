@@ -1,5 +1,5 @@
 use arkflow_core::Error;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::prelude::*;
@@ -7,19 +7,57 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Expr {
+pub enum Expr<T> {
     Expr { expr: String },
-    String { s: String },
+    String { s: T },
+}
+pub enum ExprResult<T> {
+    Scalar(T),
+    Vec(Vec<T>),
+}
+pub trait EvaluateExpr<T> {
+    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<T>, Error>;
 }
 
-impl Expr {
-    pub fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue, Error> {
+// impl<T> Expr<T> {
+//     pub fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue, Error> {
+//         match self {
+//             Expr::Expr { expr } => evaluate_expr(expr, batch)
+//                 .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e))),
+//             Expr::String { s } => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+//                 s.to_string(),
+//             )))),
+//         }
+//     }
+// }
+
+impl EvaluateExpr<String> for Expr<String> {
+    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<String>, Error> {
         match self {
-            Expr::Expr { expr } => evaluate_expr(expr, batch)
-                .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e))),
-            Expr::String { s } => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                s.to_string(),
-            )))),
+            Expr::Expr { expr } => {
+                let result = evaluate_expr(expr, batch)
+                    .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e)))?;
+
+                match result {
+                    ColumnarValue::Array(v) => {
+                        let v_option = v.as_any().downcast_ref::<StringArray>();
+                        if let Some(v) = v_option {
+                            let x: Vec<String> = v
+                                .into_iter()
+                                .filter_map(|x| x.map(|s| s.to_string()))
+                                .collect();
+                            Ok(ExprResult::Vec(x))
+                        } else {
+                            Err(Error::Process("Failed to evaluate expression".to_string()))
+                        }
+                    }
+                    ColumnarValue::Scalar(v) => match v {
+                        ScalarValue::Utf8(_) => Ok(ExprResult::Scalar(v.to_string())),
+                        _ => Err(Error::Process("Failed to evaluate expression".to_string())),
+                    },
+                }
+            }
+            Expr::String { s } => Ok(ExprResult::Scalar(s.to_string())),
         }
     }
 }

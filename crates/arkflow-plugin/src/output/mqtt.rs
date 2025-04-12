@@ -2,7 +2,7 @@
 //!
 //! Send the processed data to the MQTT broker
 
-use crate::expr::Expr;
+use crate::expr::{EvaluateExpr, Expr};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ pub struct MqttOutputConfig {
     /// Password (optional)
     pub password: Option<String>,
     /// Published topics
-    pub topic: Expr,
+    pub topic: Expr<String>,
     /// Quality of Service (0, 1, 2)
     pub qos: Option<u8>,
     /// Whether to use clean session
