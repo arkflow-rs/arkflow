@@ -22,7 +22,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonProcessorConfig {
     pub value_field: Option<String>,
-    pub need_convert_field: Option<HashSet<String>>,
+    pub fields_to_include: Option<HashSet<String>>,
 }
 
 pub struct JsonToArrowProcessor {
@@ -70,7 +70,7 @@ impl JsonToArrowProcessor {
                 let mut columns: Vec<ArrayRef> = Vec::new();
 
                 for (key, value) in obj {
-                    if let Some(ref set) = self.config.need_convert_field {
+                    if let Some(ref set) = self.config.fields_to_include {
                         if !set.contains(&key) {
                             continue;
                         }
@@ -155,8 +155,8 @@ impl Processor for ArrowToJsonProcessor {
 impl ArrowToJsonProcessor {
     /// Convert Arrow format to JSON
     fn arrow_to_json(&self, mut batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
-        if let Some(ref set) = self.config.need_convert_field {
-            batch.remove_columns(set)
+        if let Some(ref set) = self.config.fields_to_include {
+            batch = batch.filter_columns(set)?
         }
 
         let mut buf = Vec::new();
