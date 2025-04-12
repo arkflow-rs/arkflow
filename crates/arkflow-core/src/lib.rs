@@ -104,25 +104,22 @@ impl MessageBatch {
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
         Ok(MessageBatch::new_arrow(new_msg))
     }
+
     pub fn remove_columns(&mut self, names: &HashSet<String>) {
-        // 过滤出需要保留的列
         let schema = self.schema();
-        let mut new_columns = vec![];
+
+        let cap = schema.fields().len() - names.len();
+        let mut new_columns = Vec::with_capacity(cap);
+        let mut fields = Vec::with_capacity(cap);
+
         for (i, col) in self.columns().iter().enumerate() {
-            let name = schema.field(i).name();
+            let field = schema.field(i);
+            let name = field.name();
             if names.contains(name.as_str()) {
                 continue;
             }
-            new_columns.push(col.clone())
-        }
-
-        let mut fields = vec![];
-        for f in schema.fields() {
-            let x = f.name();
-            if names.contains(x.as_str()) {
-                continue;
-            }
-            fields.push(f.clone())
+            new_columns.push(col.clone());
+            fields.push(field.clone());
         }
 
         let new_schema: SchemaRef = SchemaRef::new(Schema::new(fields));
