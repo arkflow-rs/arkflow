@@ -12,26 +12,26 @@ pub enum Expr<T> {
     Value { value: T },
 }
 
-pub enum ExprResult<T> {
+pub enum EvaluateResult<T> {
     Scalar(T),
     Vec(Vec<T>),
 }
 
 pub trait EvaluateExpr<T> {
-    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<T>, Error>;
+    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<EvaluateResult<T>, Error>;
 }
 
-impl<T> ExprResult<T> {
+impl<T> EvaluateResult<T> {
     pub fn get(&self, i: usize) -> Option<&T> {
         match self {
-            ExprResult::Scalar(val) => Some(val),
-            ExprResult::Vec(vec) => vec.get(i),
+            EvaluateResult::Scalar(val) => Some(val),
+            EvaluateResult::Vec(vec) => vec.get(i),
         }
     }
 }
 
 impl EvaluateExpr<String> for Expr<String> {
-    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<ExprResult<String>, Error> {
+    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<EvaluateResult<String>, Error> {
         match self {
             Expr::Expr { expr } => {
                 let result = evaluate_expr(expr, batch)
@@ -45,18 +45,18 @@ impl EvaluateExpr<String> for Expr<String> {
                                 .into_iter()
                                 .filter_map(|x| x.map(|s| s.to_string()))
                                 .collect();
-                            Ok(ExprResult::Vec(x))
+                            Ok(EvaluateResult::Vec(x))
                         } else {
                             Err(Error::Process("Failed to evaluate expression".to_string()))
                         }
                     }
                     ColumnarValue::Scalar(v) => match v {
-                        ScalarValue::Utf8(_) => Ok(ExprResult::Scalar(v.to_string())),
+                        ScalarValue::Utf8(_) => Ok(EvaluateResult::Scalar(v.to_string())),
                         _ => Err(Error::Process("Failed to evaluate expression".to_string())),
                     },
                 }
             }
-            Expr::Value { value: s } => Ok(ExprResult::Scalar(s.to_string())),
+            Expr::Value { value: s } => Ok(EvaluateResult::Scalar(s.to_string())),
         }
     }
 }

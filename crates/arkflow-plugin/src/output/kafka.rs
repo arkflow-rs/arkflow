@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 
-use crate::expr::{EvaluateExpr, Expr, ExprResult};
+use crate::expr::{EvaluateExpr, EvaluateResult, Expr};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaResult;
@@ -133,12 +133,12 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
         for (i, x) in payloads.into_iter().enumerate() {
             // Create record
             let mut record = match &topic {
-                ExprResult::Scalar(s) => FutureRecord::to(s).payload(x),
-                ExprResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x),
+                EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x),
+                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x),
             };
             match &key {
-                ExprResult::Scalar(s) => record = record.key(s),
-                ExprResult::Vec(v) => {
+                EvaluateResult::Scalar(s) => record = record.key(s),
+                EvaluateResult::Vec(v) => {
                     if !v.is_empty() {
                         record = record.key(&v[i])
                     };
@@ -174,7 +174,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
     }
 }
 impl<T> KafkaOutput<T> {
-    fn get_topic(&self, msg: &MessageBatch) -> Result<ExprResult<String>, Error> {
+    fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
         self.config.topic.evaluate_expr(msg)
     }
 
@@ -199,9 +199,9 @@ impl<T> KafkaOutput<T> {
     //     }
     // }
 
-    fn get_key(&self, msg: &MessageBatch) -> Result<ExprResult<String>, Error> {
+    fn get_key(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
         let Some(v) = &self.config.key else {
-            return Ok(ExprResult::Vec(vec![]));
+            return Ok(EvaluateResult::Vec(vec![]));
         };
 
         v.evaluate_expr(msg)
