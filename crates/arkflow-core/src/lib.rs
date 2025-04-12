@@ -106,7 +106,7 @@ impl MessageBatch {
     }
 
     pub fn filter_columns(
-        &mut self,
+        &self,
         field_names_to_include: &HashSet<String>,
     ) -> Result<MessageBatch, Error> {
         let schema = self.schema();

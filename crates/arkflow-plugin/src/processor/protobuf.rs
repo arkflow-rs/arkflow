@@ -18,6 +18,7 @@ use prost_reflect::prost_types::FileDescriptorSet;
 use prost_reflect::{DynamicMessage, MessageDescriptor, Value};
 use protobuf::Message as ProtobufMessage;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
@@ -31,6 +32,7 @@ struct ProtobufProcessorConfig {
     /// Protobuf message type name
     message_type: String,
     mode: ToType,
+    fields_to_include: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,9 +357,16 @@ impl Processor for ProtobufProcessor {
         if msg.is_empty() {
             return Ok(vec![]);
         }
+
         match self._config.mode {
             ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
+                let msg = if let Some(ref fields_to_include) = self._config.fields_to_include {
+                    msg.filter_columns(fields_to_include)?
+                } else {
+                    msg
+                };
+
                 let proto_data = self.arrow_to_protobuf(&msg)?;
 
                 Ok(vec![msg.new_binary_with_origin(proto_data)?])
@@ -425,15 +434,20 @@ struct CommonProtobufProcessorConfig {
     message_type: String,
 }
 
-type ArrowToProtobufProcessorConfig = CommonProtobufProcessorConfig;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArrowToProtobufProcessorConfig {
+    c: CommonProtobufProcessorConfig,
+    fields_to_include: Option<HashSet<String>>,
+}
 
 impl From<ArrowToProtobufProcessorConfig> for ProtobufProcessorConfig {
-    fn from(config: CommonProtobufProcessorConfig) -> Self {
+    fn from(config: ArrowToProtobufProcessorConfig) -> Self {
         Self {
-            proto_inputs: config.proto_inputs,
-            proto_includes: config.proto_includes,
-            message_type: config.message_type,
+            proto_inputs: config.c.proto_inputs,
+            proto_includes: config.c.proto_includes,
+            message_type: config.c.message_type,
             mode: ToType::ArrowToProtobuf,
+            fields_to_include: config.fields_to_include,
         }
     }
 }
@@ -447,6 +461,7 @@ impl From<ProtobufToArrowProcessorConfig> for ProtobufProcessorConfig {
             mode: ToType::ProtobufToArrow(ArrowConfig {
                 value_field: config.value_field,
             }),
+            fields_to_include: None,
         }
     }
 }
