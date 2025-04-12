@@ -118,12 +118,11 @@ impl MessageBatch {
         for (i, col) in self.columns().iter().enumerate() {
             let field = schema.field(i);
             let name = field.name();
-            if !field_names_to_include.contains(name.as_str()) {
-                continue;
-            }
 
-            new_columns.push(col.clone());
-            fields.push(field.clone());
+            if field_names_to_include.contains(name.as_str()) {
+                new_columns.push(col.clone());
+                fields.push(field.clone());
+            }
         }
 
         let new_schema: SchemaRef = SchemaRef::new(Schema::new(fields));
