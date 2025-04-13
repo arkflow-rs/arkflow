@@ -367,7 +367,7 @@ mod tests {
         let path_buf = temp_dir.path().join("test_path.json");
         let path = path_buf.as_path().to_str().unwrap().to_string();
 
-        let _ = std::fs::write(path_buf, r#"{"name": "John", "age": 30}"#);
+        let _ = std::fs::write(path_buf, r#"{"name": "John", "age": 30}"#).unwrap();
         (temp_dir, path)
     }
 
@@ -399,7 +399,6 @@ mod tests {
         input.connect().await.unwrap();
 
         let (msg, ack) = input.read().await.unwrap();
-        println!("{:?}", &msg);
         let (i, _) = msg.schema().column_with_name("name").unwrap();
         let result = msg
             .column(i)
