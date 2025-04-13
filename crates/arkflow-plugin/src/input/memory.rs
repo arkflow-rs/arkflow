@@ -116,3 +116,57 @@ impl InputBuilder for MemoryInputBuilder {
 pub fn init() {
     register_input_builder("memory", Arc::new(MemoryInputBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
+
+    #[tokio::test]
+    async fn test_memory_input_connect() {
+        let config = MemoryInputConfig { messages: None };
+        let input = MemoryInput::new(config).unwrap();
+        assert!(input.connect().await.is_ok());
+        assert!(input.connected.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_memory_input_read() {
+        let config = MemoryInputConfig {
+            messages: Some(vec!["test message".to_string()]),
+        };
+        let input = MemoryInput::new(config).unwrap();
+        input.connect().await.unwrap();
+
+        let (msg, ack) = input.read().await.unwrap();
+        let result = msg.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(result.get(0).unwrap()),
+            "test message"
+        );
+        ack.ack().await;
+    }
+
+    #[tokio::test]
+    async fn test_memory_input_read_not_connected() {
+        let config = MemoryInputConfig { messages: None };
+        let input = MemoryInput::new(config).unwrap();
+
+        let result = input.read().await;
+        assert!(result.is_err());
+        if let Err(Error::Connection(err)) = result {
+            assert_eq!(err, "The input is not connected");
+        } else {
+            panic!("Expected connection error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_memory_input_close() {
+        let config = MemoryInputConfig { messages: None };
+        let input = MemoryInput::new(config).unwrap();
+        input.connect().await.unwrap();
+        assert!(input.close().await.is_ok());
+        assert!(!input.connected.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
