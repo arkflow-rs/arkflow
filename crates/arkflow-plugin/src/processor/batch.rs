@@ -135,3 +135,74 @@ impl ProcessorBuilder for BatchProcessorBuilder {
 pub fn init() {
     register_processor_builder("batch", Arc::new(BatchProcessorBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_batch_processor_size() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 2,
+            timeout_ms: 1000,
+            data_type: "arrow".to_string(),
+        })
+        .unwrap();
+
+        // First message should not trigger flush
+        let result = processor
+            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        // Second message should trigger flush due to batch size
+        let result = processor
+            .process(MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_timeout() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 5,
+            timeout_ms: 100,
+            data_type: "arrow".to_string(),
+        })
+        .unwrap();
+
+        // Add one message
+        let result = processor
+            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        // Wait for timeout
+        sleep(Duration::from_millis(150)).await;
+
+        // Next message should trigger flush due to timeout
+        let result = processor
+            .process(MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_empty() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 2,
+            timeout_ms: 1000,
+            data_type: "arrow".to_string(),
+        })
+        .unwrap();
+
+        let result = processor.flush().await.unwrap();
+        assert!(result.is_empty());
+    }
+}
