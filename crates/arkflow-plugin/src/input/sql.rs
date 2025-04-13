@@ -356,3 +356,59 @@ impl InputBuilder for SqlInputBuilder {
 pub fn init() {
     register_input_builder("sql", Arc::new(SqlInputBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::StringArray;
+    use tempfile::{tempdir, TempDir};
+    fn create_test_data() -> (TempDir, String) {
+        let temp_dir = tempdir().unwrap();
+        let path_buf = temp_dir.path().join("test_path.json");
+        let path = path_buf.as_path().to_str().unwrap().to_string();
+
+        let _ = std::fs::write(path_buf, r#"{"name": "John", "age": 30}"#);
+        (temp_dir, path)
+    }
+
+    #[tokio::test]
+    async fn test_sql_input_connect() {
+        let (_x, path) = create_test_data();
+        let config = SqlInputConfig {
+            select_sql: "SELECT * FROM test_table".to_string(),
+            input_type: InputType::Json(JsonConfig {
+                table_name: Some("test_table".to_string()),
+                path,
+            }),
+        };
+        let input = SqlInput::new(config).unwrap();
+        assert!(input.connect().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sql_input_read() {
+        let (_x, path) = create_test_data();
+        let config = SqlInputConfig {
+            select_sql: "SELECT * FROM test_table".to_string(),
+            input_type: InputType::Json(JsonConfig {
+                table_name: Some("test_table".to_string()),
+                path,
+            }),
+        };
+        let input = SqlInput::new(config).unwrap();
+        input.connect().await.unwrap();
+
+        let (msg, ack) = input.read().await.unwrap();
+        println!("{:?}", &msg);
+        let (i, _) = msg.schema().column_with_name("name").unwrap();
+        let result = msg
+            .column(i)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(result, "John");
+        ack.ack().await;
+        input.close().await.unwrap();
+    }
+}
