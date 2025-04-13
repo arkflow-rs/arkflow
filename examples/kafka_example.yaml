@@ -24,6 +24,7 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: test-topic-copy
+      topic: 
+        type: value
+        value: test-topic-copy
       client_id: rsflow-copy
-      key: xxx
