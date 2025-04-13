@@ -365,7 +365,7 @@ impl Processor for ProtobufProcessor {
                 {
                     msg.filter_columns(fields_to_include)?
                 } else {
-                    msg
+                    msg.clone()
                 };
 
                 let proto_data = self.arrow_to_protobuf(&filter_msg)?;
