@@ -102,3 +102,140 @@ impl InputBuilder for GenerateInputBuilder {
 pub fn init() {
     register_input_builder("generate", Arc::new(GenerateInputBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
+
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_basic_functionality() {
+        let config = GenerateInputConfig {
+            context: String::from("test message"),
+            interval: Duration::from_millis(100),
+            count: None,
+            batch_size: None,
+        };
+        let input = GenerateInput::new(config).unwrap();
+
+        // Test connect
+        assert!(input.connect().await.is_ok());
+
+        // Test read
+        let (msg_batch, _) = input.read().await.unwrap();
+        assert_eq!(msg_batch.len(), 1);
+        assert_eq!(
+            String::from_utf8(msg_batch.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap()[0].to_vec())
+                .unwrap(),
+            "test message"
+        );
+
+        // Test close
+        assert!(input.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_batch_size() {
+        let config = GenerateInputConfig {
+            context: String::from("test"),
+            interval: Duration::from_millis(100),
+            count: None,
+            batch_size: Some(3),
+        };
+        let input = GenerateInput::new(config).unwrap();
+
+        let (msg_batch, _) = input.read().await.unwrap();
+        assert_eq!(msg_batch.len(), 3);
+        for i in 0..3 {
+            assert_eq!(
+                String::from_utf8(
+                    msg_batch.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap()[i].to_vec()
+                )
+                .unwrap(),
+                "test"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_count_limit() {
+        let config = GenerateInputConfig {
+            context: String::from("test"),
+            interval: Duration::from_millis(100),
+            count: Some(2),
+            batch_size: Some(1),
+        };
+        let input = GenerateInput::new(config).unwrap();
+
+        // First read should succeed
+        assert!(input.read().await.is_ok());
+        // Second read should succeed
+        assert!(input.read().await.is_ok());
+        // Third read should return EOF
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+    }
+
+    #[tokio::test]
+    async fn test_count_with_batch_size() {
+        let config = GenerateInputConfig {
+            context: String::from("test"),
+            interval: Duration::from_millis(100),
+            count: Some(3),
+            batch_size: Some(2),
+        };
+        let input = GenerateInput::new(config).unwrap();
+
+        // First read should succeed (2 messages)
+        let (msg_batch, _) = input.read().await.unwrap();
+        assert_eq!(msg_batch.len(), 2);
+
+        // Second read should return EOF because next batch would exceed count
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+    }
+
+    #[tokio::test]
+    async fn test_interval_delay() {
+        let config = GenerateInputConfig {
+            context: String::from("test"),
+            interval: Duration::from_millis(100),
+            count: None,
+            batch_size: None,
+        };
+        let input = GenerateInput::new(config).unwrap();
+
+        // First read should be immediate
+        let start = std::time::Instant::now();
+        assert!(input.read().await.is_ok());
+        assert!(start.elapsed() < Duration::from_millis(50));
+
+        // Second read should wait for interval
+        let start = std::time::Instant::now();
+        assert!(input.read().await.is_ok());
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn test_builder() {
+        let config_json = serde_json::json!({
+            "context": "test",
+            "interval": "100ms",
+            "count": 1,
+            "batch_size": 1
+        });
+
+        let builder = GenerateInputBuilder;
+        let input = builder.build(&Some(config_json)).unwrap();
+
+        assert!(input.connect().await.is_ok());
+        assert!(input.read().await.is_ok());
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+    }
+
+    #[tokio::test]
+    async fn test_builder_missing_config() {
+        let builder = GenerateInputBuilder;
+        assert!(matches!(builder.build(&None), Err(Error::Config(_))));
+    }
+}

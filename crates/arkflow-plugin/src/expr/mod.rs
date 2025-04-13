@@ -87,7 +87,7 @@ fn evaluate_expr(expr_str: &str, batch: &RecordBatch) -> Result<ColumnarValue, D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::common::ScalarValue;
     use std::sync::Arc;
 
@@ -109,5 +109,71 @@ mod tests {
                 _ => panic!("unexpected scalar value"),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn test_string_expr() {
+        let batch = RecordBatch::try_from_iter([(
+            "name",
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as _,
+        )])
+        .unwrap();
+
+        // Test string expression
+        let expr = Expr::Expr {
+            expr: "concat(name, ' is here')".to_string(),
+        };
+        let result = expr.evaluate_expr(&batch).unwrap();
+        match result {
+            EvaluateResult::Vec(v) => {
+                assert_eq!(v, vec!["Alice is here", "Bob is here", "Charlie is here"]);
+            }
+            _ => panic!("Expected vector result"),
+        }
+
+        // Test direct value
+        let value_expr = Expr::Value {
+            value: "test value".to_string(),
+        };
+        let result = value_expr.evaluate_expr(&batch).unwrap();
+        match result {
+            EvaluateResult::Scalar(v) => {
+                assert_eq!(v, "test value");
+            }
+            _ => panic!("Expected scalar result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_result_get() {
+        let scalar_result = EvaluateResult::Scalar("test".to_string());
+        assert_eq!(scalar_result.get(0).map(|s| s.as_str()), Some("test"));
+        assert_eq!(scalar_result.get(1).map(|s| s.as_str()), Some("test"));
+
+        let vec_result = EvaluateResult::Vec(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(vec_result.get(0).map(|s| s.as_str()), Some("a"));
+        assert_eq!(vec_result.get(1).map(|s| s.as_str()), Some("b"));
+        assert_eq!(vec_result.get(2), None);
+    }
+
+    #[tokio::test]
+    async fn test_error_cases() {
+        let batch = RecordBatch::try_from_iter([(
+            "name",
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as _,
+        )])
+        .unwrap();
+
+        // Test invalid SQL expression
+        let expr = Expr::Expr {
+            expr: "invalid sql".to_string(),
+        };
+        assert!(expr.evaluate_expr(&batch).is_err());
+
+        // Test type mismatch
+        let expr = Expr::Expr {
+            expr: "1 + name".to_string(), // Trying to add number to string
+        };
+        assert!(expr.evaluate_expr(&batch).is_err());
     }
 }
