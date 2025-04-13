@@ -227,3 +227,75 @@ async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use serde_json::json;
+    use tower::util::ServiceExt;
+    // for `oneshot` method
+
+    #[tokio::test]
+    async fn test_handle_request_ok() {
+        let config = HttpInputConfig {
+            address: "127.0.0.1:3000".to_string(),
+            path: "/test".to_string(),
+            cors_enabled: Some(false),
+            auth: None,
+        };
+        let input = HttpInput::new(config).unwrap();
+        let app_state = Arc::new(AppStateInner {
+            sender: input.sender.as_ref().clone(),
+            auth: input.auth.clone(),
+        });
+
+        let app = Router::new()
+            .route("/test", axum::routing::post(HttpInput::handle_request))
+            .with_state(app_state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"key": "value"}).to_string()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_unauthorized() {
+        let config = HttpInputConfig {
+            address: "127.0.0.1:3000".to_string(),
+            path: "/test".to_string(),
+            cors_enabled: Some(false),
+            auth: Some(AuthType::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }),
+        };
+        let input = HttpInput::new(config).unwrap();
+        let app_state = Arc::new(AppStateInner {
+            sender: input.sender.as_ref().clone(),
+            auth: input.auth.clone(),
+        });
+
+        let app = Router::new()
+            .route("/test", axum::routing::post(HttpInput::handle_request))
+            .with_state(app_state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"key": "value"}).to_string()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
