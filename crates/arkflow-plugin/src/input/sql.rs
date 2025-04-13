@@ -410,4 +410,18 @@ mod tests {
         ack.ack().await;
         input.close().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_sql_input_invalid_query() {
+        let (_x, path) = create_test_data();
+        let config = SqlInputConfig {
+            select_sql: "SELECT invalid_column FROM test_table".to_string(),
+            input_type: InputType::Json(JsonConfig {
+                table_name: Some("test_table".to_string()),
+                path,
+            }),
+        };
+        let input = SqlInput::new(config).unwrap();
+        assert!(input.connect().await.is_err());
+    }
 }
