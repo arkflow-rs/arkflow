@@ -24,7 +24,21 @@ type: `boolean`
 
 default: `false`
 
+### **auth**
+
+Authentication configuration.
+
+type: `object`
+
+properties:
+- **type**: Authentication type (`basic` or `bearer`)
+- **username**: Username for basic authentication
+- **password**: Password for basic authentication
+- **token**: Token for bearer authentication
+
 ## Examples
+
+### Basic HTTP Server
 
 ```yaml
 - input:
@@ -32,4 +46,29 @@ default: `false`
     address: "0.0.0.0:8080"
     path: "/data"
     cors_enabled: true
+```
+
+### With Basic Authentication
+
+```yaml
+- input:
+    type: "http"
+    address: "0.0.0.0:8080"
+    path: "/data"
+    auth:
+      type: "basic"
+      username: "user"
+      password: "pass"
+```
+
+### With Bearer Token Authentication
+
+```yaml
+- input:
+    type: "http"
+    address: "0.0.0.0:8080"
+    path: "/data"
+    auth:
+      type: "bearer"
+      token: "your-token"
 ```
