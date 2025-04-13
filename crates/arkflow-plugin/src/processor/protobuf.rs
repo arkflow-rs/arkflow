@@ -361,14 +361,13 @@ impl Processor for ProtobufProcessor {
         match self._config.mode {
             ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
-                let filter_msg = if let Some(ref fields_to_include) = self._config.fields_to_include
+                let proto_data = if let Some(ref fields_to_include) = self._config.fields_to_include
                 {
-                    msg.filter_columns(fields_to_include)?
+                    let filter_msg = msg.filter_columns(fields_to_include)?;
+                    self.arrow_to_protobuf(&filter_msg)?
                 } else {
-                    msg.clone()
+                    self.arrow_to_protobuf(&msg)?
                 };
-
-                let proto_data = self.arrow_to_protobuf(&filter_msg)?;
 
                 Ok(vec![msg.new_binary_with_origin(proto_data)?])
             }
