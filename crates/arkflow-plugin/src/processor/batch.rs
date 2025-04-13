@@ -205,4 +205,27 @@ mod tests {
         let result = processor.flush().await.unwrap();
         assert!(result.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_batch_processor_close() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 5,
+            timeout_ms: 1000,
+            data_type: "arrow".to_string(),
+        })
+            .unwrap();
+
+        // Add a message to the batch
+        processor
+            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .await
+            .unwrap();
+
+        // Close the processor
+        processor.close().await.unwrap();
+
+        // Verify the batch is empty by checking that flush returns empty
+        let result = processor.flush().await.unwrap();
+        assert!(result.is_empty());
+    }
 }
