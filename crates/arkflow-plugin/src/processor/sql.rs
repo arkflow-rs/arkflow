@@ -127,3 +127,100 @@ impl ProcessorBuilder for SqlProcessorBuilder {
 pub fn init() {
     register_processor_builder("sql", Arc::new(SqlProcessorBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    #[tokio::test]
+    async fn test_sql_processor_basic_query() {
+        let processor = SqlProcessor::new(SqlProcessorConfig {
+            query: "SELECT * FROM flow".to_string(),
+            table_name: None,
+        })
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let result = processor
+            .process(MessageBatch::new_arrow(batch))
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_empty_batch() {
+        let processor = SqlProcessor::new(SqlProcessorConfig {
+            query: "SELECT * FROM flow".to_string(),
+            table_name: None,
+        })
+        .unwrap();
+
+        let result = processor
+            .process(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
+                Schema::empty(),
+            ))))
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_invalid_query() {
+        let processor = SqlProcessor::new(SqlProcessorConfig {
+            query: "INVALID SQL QUERY".to_string(),
+            table_name: None,
+        })
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+
+        let result = processor.process(MessageBatch::new_arrow(batch)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_custom_table_name() {
+        let processor = SqlProcessor::new(SqlProcessorConfig {
+            query: "SELECT * FROM custom_table".to_string(),
+            table_name: Some("custom_table".to_string()),
+        })
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
+
+        let result = processor
+            .process(MessageBatch::new_arrow(batch))
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+    }
+}
