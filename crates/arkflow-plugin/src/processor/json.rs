@@ -219,3 +219,113 @@ pub fn init() {
     register_processor_builder("arrow_to_json", Arc::new(ArrowToJsonProcessorBuilder));
     register_processor_builder("json_to_arrow", Arc::new(JsonToArrowProcessorBuilder));
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::processor::json::{ArrowToJsonProcessorBuilder, JsonToArrowProcessorBuilder};
+    use arkflow_core::processor::ProcessorBuilder;
+    use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn test_json_to_arrow_basic_types() -> Result<(), Error> {
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": null
+        }));
+        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+
+        let json_data = json!({
+            "null_field": null,
+            "bool_field": true,
+            "int_field": 42,
+            "uint_field": 18446744073709551615u64,
+            "float_field": 3.14,
+            "string_field": "hello",
+            "array_field": [1, 2, 3],
+            "object_field": {"key": "value"}
+        });
+
+        let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
+
+        let result = processor.process(msg_batch).await.unwrap();
+        assert_eq!(result.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_to_arrow_field_filtering() -> Result<(), Error> {
+        let mut fields = HashSet::new();
+        fields.insert("int_field".to_string());
+        fields.insert("string_field".to_string());
+
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": fields
+        }));
+        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+
+        let json_data = json!({
+            "int_field": 42,
+            "string_field": "hello",
+            "ignored_field": true
+        });
+
+        let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()])?;
+
+        let result = processor.process(msg_batch).await?;
+        assert_eq!(result.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_to_arrow_invalid_input() -> Result<(), Error> {
+        let config = Some(json!({
+            "value_field": "data",
+            "fields_to_include": null
+        }));
+        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+
+        let invalid_json = b"not a json object";
+        let msg_batch = MessageBatch::new_binary(vec![invalid_json.to_vec()])?;
+
+        let result = processor.process(msg_batch).await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_arrow_to_json_basic() {
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": null
+        }));
+        let json_to_arrow = JsonToArrowProcessorBuilder.build(&config).unwrap();
+        let arrow_to_json = ArrowToJsonProcessorBuilder.build(&config).unwrap();
+
+        let json_data = json!({
+            "int_field": 42,
+            "string_field": "hello"
+        });
+
+        let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
+
+        // Convert JSON to Arrow
+        let arrow_batch = json_to_arrow.process(msg_batch).await.unwrap();
+        assert_eq!(arrow_batch.len(), 1);
+
+        // Convert Arrow back to JSON
+        let json_result = arrow_to_json.process(arrow_batch[0].clone()).await.unwrap();
+        assert_eq!(json_result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_processor_missing_config() {
+        let result = JsonToArrowProcessorBuilder.build(&None);
+        assert!(result.is_err());
+
+        let result = ArrowToJsonProcessorBuilder.build(&None);
+        assert!(result.is_err());
+    }
+}
