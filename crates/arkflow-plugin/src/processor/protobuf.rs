@@ -107,7 +107,6 @@ impl ProtobufProcessor {
         }
         let proto_includes = c.proto_includes.clone().unwrap_or(c.proto_inputs.clone());
 
-        // 确保proto_inputs不为空
         if proto_inputs.is_empty() {
             return Err(Error::Config("No proto files found in the specified paths. Please ensure the paths contain valid .proto files".to_string()));
         }
@@ -578,31 +577,24 @@ message TestMessage {
 
         let processor = ProtobufProcessor::new(config.into())?;
 
-        // 创建测试Protobuf消息使用DynamicMessage
         let descriptor = processor.descriptor.clone();
         let mut test_message = DynamicMessage::new(descriptor);
 
-        // 设置字段值
         test_message.set_field_by_name("timestamp", Value::I64(1634567890));
         test_message.set_field_by_name("value", Value::F64(42.5));
         test_message.set_field_by_name("sensor", Value::String("temperature".to_string()));
 
-        // 编码消息
         let mut encoded = Vec::new();
         test_message.encode(&mut encoded).unwrap();
         let msg_batch = MessageBatch::new_binary(vec![encoded])?;
 
-        // 转换为Arrow格式
         let result = processor.process(msg_batch).await?;
         assert_eq!(result.len(), 1);
 
-        // 验证Arrow数据
         let batch = &result[0];
 
-        // 验证列数
         assert_eq!(batch.schema().fields().len(), 3);
 
-        // 验证字段名称
         let schema = batch.schema();
         let field_names: Vec<String> = schema
             .fields()
@@ -631,7 +623,6 @@ message TestMessage {
 
         let processor = ProtobufProcessor::new(config.into())?;
 
-        // 创建Arrow记录批次
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
@@ -654,20 +645,16 @@ message TestMessage {
 
         let msg_batch = MessageBatch::new_arrow(batch);
 
-        // 转换为Protobuf格式
         let result = processor.process(msg_batch).await?;
         assert_eq!(result.len(), 1);
 
-        // 验证Protobuf数据
         let binary_data = result[0].to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
         assert_eq!(binary_data.len(), 1);
 
-        // 解码Protobuf消息并验证
         let decoded_msg =
             DynamicMessage::decode(processor.descriptor.clone(), binary_data[0].as_ref())
                 .map_err(|e| Error::Process(format!("Failed to decode protobuf: {}", e)))?;
 
-        // 验证字段值
         let timestamp = decoded_msg.get_field_by_name("timestamp").unwrap();
         let value = decoded_msg.get_field_by_name("value").unwrap();
         let sensor = decoded_msg.get_field_by_name("sensor").unwrap();
@@ -694,10 +681,8 @@ message TestMessage {
 
         let processor = ProtobufProcessor::new(config.into())?;
 
-        // 创建空的消息批次
         let empty_batch = MessageBatch::new_binary(vec![])?;
 
-        // 处理空批次
         let result = processor.process(empty_batch).await?;
         assert_eq!(result.len(), 0);
 
@@ -706,14 +691,12 @@ message TestMessage {
 
     #[tokio::test]
     async fn test_processor_builder() {
-        // 测试缺少配置的情况
         let result = ProtobufToArrowProcessorBuilder.build(&None);
         assert!(result.is_err());
 
         let result = ArrowToProtobufProcessorBuilder.build(&None);
         assert!(result.is_err());
 
-        // 测试有效配置
         let (_x, proto_dir) = create_test_proto_file().unwrap();
         let config = serde_json::to_value(ProtobufToArrowProcessorConfig {
             c: CommonProtobufProcessorConfig {
