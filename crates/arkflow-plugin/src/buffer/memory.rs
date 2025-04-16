@@ -205,7 +205,6 @@ mod tests {
         buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
         buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
         buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
-        // 触发容量限制，通知应该被唤醒
         let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
         assert!(r.is_ok());
         let batch = r.unwrap().unwrap();
@@ -250,7 +249,6 @@ mod tests {
         let msg = MessageBatch::new_binary(vec![b"close".to_vec()]).unwrap();
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
         let _ = buf.close().await;
-        // close后read应被唤醒
         let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
         assert!(r.is_ok());
     }
