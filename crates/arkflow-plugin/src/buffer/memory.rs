@@ -125,15 +125,30 @@ impl Buffer for MemoryBuffer {
     }
 
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let notify = Arc::clone(&self.notify);
-        notify.notified().await;
-
+        loop {
+            {
+                let queue_arc = Arc::clone(&self.queue);
+                let queue_lock = queue_arc.read().await;
+                if !queue_lock.is_empty() {
+                    break;
+                }
+                if self.close.is_cancelled() {
+                    return Ok(None);
+                }
+            }
+            let notify = Arc::clone(&self.notify);
+            notify.notified().await;
+        }
         self.process_messages().await
     }
 
     async fn flush(&self) -> Result<(), Error> {
-        let notify = Arc::clone(&self.notify);
-        notify.notify_waiters();
+        let queue_arc = Arc::clone(&self.queue);
+        let queue_lock = queue_arc.read().await;
+        if !queue_lock.is_empty() {
+            let notify = Arc::clone(&self.notify);
+            notify.notify_waiters();
+        }
         Ok(())
     }
 
@@ -177,19 +192,93 @@ mod tests {
     use super::*;
     use arkflow_core::input::NoopAck;
 
+
     #[tokio::test]
-    async fn test_memory_buffer_new() {
-        let p = MemoryBuffer::new(MemoryBufferConfig {
+    async fn test_memory_buffer_capacity_limit() {
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 2,
+            timeout: time::Duration::from_millis(100),
+        }).unwrap();
+        let msg1 = MessageBatch::new_binary(vec![b"a".to_vec()]).unwrap();
+        let msg2 = MessageBatch::new_binary(vec![b"b".to_vec()]).unwrap();
+        let msg3 = MessageBatch::new_binary(vec![b"c".to_vec()]).unwrap();
+        buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
+        buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
+        buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
+        // 触发容量限制，通知应该被唤醒
+        let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
+        assert!(r.is_ok());
+        let batch = r.unwrap().unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_timeout_notify() {
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 10,
+            timeout: time::Duration::from_millis(100),
+        }).unwrap();
+        let msg = MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+        // 不再写入，等待超时自动唤醒
+        let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
+        assert!(r.is_ok());
+        let batch = r.unwrap().unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_flush() {
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
             capacity: 10,
             timeout: time::Duration::from_secs(10),
-        })
-        .unwrap();
+        }).unwrap();
+        let msg = MessageBatch::new_binary(vec![b"flush".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+        let _ = buf.flush().await;
+        let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
+        assert!(r.is_ok());
+        let batch = r.unwrap().unwrap();
+        assert!(batch.is_some());
+    }
 
-        let x = p
-            .write(
-                MessageBatch::new_binary(vec!["test".as_bytes().to_vec()]).unwrap(),
-                Arc::new(NoopAck),
-            )
-            .await;
+    #[tokio::test]
+    async fn test_memory_buffer_close() {
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 10,
+            timeout: time::Duration::from_secs(10),
+        }).unwrap();
+        let msg = MessageBatch::new_binary(vec![b"close".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+        let _ = buf.close().await;
+        // close后read应被唤醒
+        let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_concurrent_write_read() {
+        let buf = Arc::new(MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 100,
+            timeout: time::Duration::from_millis(100),
+        }).unwrap());
+        let buf2 = buf.clone();
+        let handle = tokio::spawn(async move {
+            for i in 0..10 {
+                let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+                buf2.write(msg, Arc::new(NoopAck)).await.unwrap();
+            }
+        });
+        let mut total = 0;
+        let mut tries = 0;
+        while total < 10 && tries < 10 {
+            let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
+            if let Ok(Ok(Some((batch, _)))) = r {
+                total += batch.len();
+            }
+            tries += 1;
+        }
+        handle.await.unwrap();
+        assert_eq!(total, 10);
     }
 }
