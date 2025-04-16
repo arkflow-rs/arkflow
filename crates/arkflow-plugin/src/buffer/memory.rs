@@ -92,7 +92,6 @@ impl MemoryBuffer {
             acks.push(ack);
         }
 
-        // 如果没有消息，返回 None
         if messages.is_empty() {
             return Ok(None);
         }
