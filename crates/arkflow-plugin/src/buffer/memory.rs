@@ -220,7 +220,6 @@ mod tests {
         }).unwrap();
         let msg = MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap();
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
-        // 不再写入，等待超时自动唤醒
         let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
         assert!(r.is_ok());
         let batch = r.unwrap().unwrap();
