@@ -110,14 +110,16 @@ fn init_logging(config: &EngineConfig) -> () {
                     LogFormat::JSON => {
                         let subscriber = subscriber_builder
                             .with_writer(std::sync::Mutex::new(file))
+                            .pretty()
                             .json()
                             .finish();
                         tracing::subscriber::set_global_default(subscriber)
                             .expect("You can't set a global default log subscriber");
                     }
-                    LogFormat::TEXT => {
+                    LogFormat::PLAIN => {
                         let subscriber = subscriber_builder
                             .with_writer(std::sync::Mutex::new(file))
+                            .pretty()
                             .finish();
                         tracing::subscriber::set_global_default(subscriber)
                             .expect("You can't set a global default log subscriber");
@@ -136,12 +138,12 @@ fn init_logging(config: &EngineConfig) -> () {
 
     match config.logging.format {
         LogFormat::JSON => {
-            let subscriber = subscriber_builder.json().finish();
+            let subscriber = subscriber_builder.pretty().json().finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("You can't set a global default log subscriber");
         }
-        LogFormat::TEXT => {
-            let subscriber = subscriber_builder.finish();
+        LogFormat::PLAIN => {
+            let subscriber = subscriber_builder.pretty().finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("You can't set a global default log subscriber");
         }

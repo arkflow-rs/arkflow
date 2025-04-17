@@ -34,7 +34,7 @@ pub enum ConfigFormat {
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     JSON,
-    TEXT,
+    PLAIN,
 }
 
 /// Log configuration
@@ -158,7 +158,7 @@ impl Default for HealthCheckConfig {
 
 /// Default value for log format
 fn default_log_format() -> LogFormat {
-    LogFormat::TEXT
+    LogFormat::PLAIN
 }
 
 impl Default for LoggingConfig {
