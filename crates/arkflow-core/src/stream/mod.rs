@@ -283,7 +283,7 @@ impl Stream {
                             }
                         }
                         Err(e) => {
-                            if let Some(error_output_sender) = error_output_sender.clone() {
+                            if let Some(ref error_output_sender) = error_output_sender{
                                 if let Err(e) =
                                     error_output_sender.send_async((vec![msg], ack)).await
                                 {
