@@ -215,18 +215,28 @@ impl Stream {
                 },
                 result = buffer.read() =>{
                     match result {
-                    Ok(v) => {
-                        if let Some(v) = v {
-                            if let Err(e) = input_sender.send_async(v).await {
+                    Ok(Some(v)) => {
+                         if let Err(e) = input_sender.send_async(v).await {
                                 error!("Failed to send input message: {}", e);
                                 break;
                             }
-                        }
                     }
                     _ => {}
                     }
                 }
             }
+        }
+        if let Err(e) = buffer.flush().await {
+            error!("Failed to flush buffer: {}", e);
+        }
+
+        match buffer.read().await {
+            Ok(Some(v)) => {
+                if let Err(e) = input_sender.send_async(v).await {
+                    error!("Failed to send input message: {}", e);
+                }
+            }
+            _ => {}
         }
         info!("Buffer stopped");
     }
