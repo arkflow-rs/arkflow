@@ -71,7 +71,7 @@ impl Stream {
             (None, None)
         } else {
             let (error_output_sender, error_output_receiver) =
-                flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(self.thread_num as usize * 4);
+                flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
             (Some(error_output_sender), Some(error_output_receiver))
         };
 
@@ -264,7 +264,7 @@ impl Stream {
         pipeline: Arc<Pipeline>,
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
         output_sender: Sender<(Vec<MessageBatch>, Arc<dyn Ack>)>,
-        error_output_sender: Option<Sender<(Vec<MessageBatch>, Arc<dyn Ack>)>>,
+        error_output_sender: Option<Sender<(MessageBatch, Arc<dyn Ack>)>>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
@@ -284,9 +284,7 @@ impl Stream {
                         }
                         Err(e) => {
                             if let Some(ref error_output_sender) = error_output_sender {
-                                if let Err(e) =
-                                    error_output_sender.send_async((vec![msg], ack)).await
-                                {
+                                if let Err(e) = error_output_sender.send_async((msg, ack)).await {
                                     error!("Failed to send error message: {}", e);
                                     break;
                                 }
@@ -313,7 +311,7 @@ impl Stream {
     }
 
     async fn do_error_output(
-        error_output_receiver: Option<Receiver<(Vec<MessageBatch>, Arc<dyn Ack>)>>,
+        error_output_receiver: Option<Receiver<(MessageBatch, Arc<dyn Ack>)>>,
         error_output: Option<Arc<dyn Output>>,
     ) {
         let Some(error_output_receiver) = error_output_receiver else {
@@ -328,22 +326,13 @@ impl Stream {
                 break;
             };
 
-            let size = &msg.0.len();
-            let mut success_cnt = 0;
-            for x in msg.0 {
-                match error_output.write(x).await {
-                    Ok(_) => {
-                        success_cnt = success_cnt + 1;
-                    }
-                    Err(e) => {
-                        error!("{}", e);
-                    }
+            match error_output.write(msg.0).await {
+                Ok(_) => {
+                    msg.1.ack().await;
                 }
-            }
-
-            // Confirm that the message has been successfully processed
-            if *size == success_cnt {
-                msg.1.ack().await;
+                Err(e) => {
+                    error!("{}", e);
+                }
             }
         }
         info!("Error output stopped")
