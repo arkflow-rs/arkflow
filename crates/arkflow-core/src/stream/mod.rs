@@ -272,7 +272,7 @@ impl Stream {
             match input_receiver.recv_async().await {
                 Ok((msg, ack)) => {
                     // Process messages through pipeline
-                    let processed = pipeline.process(msg).await;
+                    let processed = pipeline.process(msg.clone()).await;
 
                     // Process result messages
                     match processed {
