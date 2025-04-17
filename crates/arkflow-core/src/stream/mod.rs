@@ -283,7 +283,7 @@ impl Stream {
                             }
                         }
                         Err(e) => {
-                            if let Some(ref error_output_sender) = error_output_sender{
+                            if let Some(ref error_output_sender) = error_output_sender {
                                 if let Err(e) =
                                     error_output_sender.send_async((vec![msg], ack)).await
                                 {
@@ -344,9 +344,12 @@ impl Stream {
                         msg.1.ack().await;
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    break;
+                }
             }
         }
+        info!("Error output stopped")
     }
 }
 

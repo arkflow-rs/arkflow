@@ -1,7 +1,7 @@
 logging:
   level: info
 #  file_path: "./log/example.log"
-  format: text
+  format: plain
 #health_check:
 #  enabled: true
 streams:
@@ -11,10 +11,6 @@ streams:
       path: '/'
 
 
-    buffer:
-      type: "memory"
-      capacity: 10
-      timeout: 10s
     pipeline:
       thread_num: 4
       processors:
@@ -31,4 +27,6 @@ streams:
 
 
     output:
+      type: "stdout"
+    error_output:
       type: "stdout"
