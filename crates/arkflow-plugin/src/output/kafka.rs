@@ -290,8 +290,6 @@ mod tests {
 
     // Mock Kafka client for testing
     struct MockKafkaClient {
-        // Track if client is connected
-        connected: Arc<AtomicBool>,
         // Store sent messages for verification
         sent_messages: Arc<Mutex<Vec<(String, Vec<u8>, Option<String>)>>>,
         // Flag to simulate errors
@@ -301,16 +299,9 @@ mod tests {
     impl MockKafkaClient {
         fn new() -> Self {
             Self {
-                connected: Arc::new(AtomicBool::new(true)),
                 sent_messages: Arc::new(Mutex::new(Vec::new())),
                 should_fail: Arc::new(AtomicBool::new(false)),
             }
-        }
-
-        fn with_failure() -> Self {
-            let client = Self::new();
-            client.should_fail.store(true, Ordering::SeqCst);
-            client
         }
     }
 

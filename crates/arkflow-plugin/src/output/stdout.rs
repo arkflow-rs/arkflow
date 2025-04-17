@@ -125,10 +125,6 @@ mod tests {
         fn new() -> Self {
             Self(Cursor::new(Vec::new()))
         }
-
-        fn get_output(&self) -> String {
-            String::from_utf8_lossy(&self.0.get_ref()).to_string()
-        }
     }
 
     impl Write for MockWriter {
