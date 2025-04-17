@@ -190,38 +190,6 @@ impl Stream {
         info!("Input stopped");
     }
 
-    async fn do_output(
-        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>)>,
-        output: Arc<dyn Output>,
-    ) {
-        loop {
-            match output_receiver.recv_async().await {
-                Ok(msg) => {
-                    let size = &msg.0.len();
-                    let mut success_cnt = 0;
-                    for x in msg.0 {
-                        match output.write(x).await {
-                            Ok(_) => {
-                                success_cnt = success_cnt + 1;
-                            }
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        }
-                    }
-
-                    // Confirm that the message has been successfully processed
-                    if *size == success_cnt {
-                        msg.1.ack().await;
-                    }
-                }
-                Err(_) => {
-                    break;
-                }
-            }
-        }
-        info!("Output stopped")
-    }
     async fn do_buffer(
         cancellation_token: CancellationToken,
         buffer: Arc<dyn Buffer>,
@@ -259,6 +227,7 @@ impl Stream {
         }
         info!("Buffer stopped");
     }
+
     async fn do_processor(
         i: u32,
         pipeline: Arc<Pipeline>,
@@ -302,12 +271,38 @@ impl Stream {
         }
         info!("Processor worker {} stopped", i);
     }
-    async fn close(&mut self) -> Result<(), Error> {
-        // Closing order: input -> pipeline -> buffer -> output
-        self.input.close().await?;
-        self.pipeline.close().await?;
-        self.output.close().await?;
-        Ok(())
+
+    async fn do_output(
+        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>)>,
+        output: Arc<dyn Output>,
+    ) {
+        loop {
+            match output_receiver.recv_async().await {
+                Ok(msg) => {
+                    let size = &msg.0.len();
+                    let mut success_cnt = 0;
+                    for x in msg.0 {
+                        match output.write(x).await {
+                            Ok(_) => {
+                                success_cnt = success_cnt + 1;
+                            }
+                            Err(e) => {
+                                error!("{}", e);
+                            }
+                        }
+                    }
+
+                    // Confirm that the message has been successfully processed
+                    if *size == success_cnt {
+                        msg.1.ack().await;
+                    }
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+        info!("Output stopped")
     }
 
     async fn do_error_output(
@@ -336,6 +331,14 @@ impl Stream {
             }
         }
         info!("Error output stopped")
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        // Closing order: input -> pipeline -> buffer -> output
+        self.input.close().await?;
+        self.pipeline.close().await?;
+        self.output.close().await?;
+        Ok(())
     }
 }
 
