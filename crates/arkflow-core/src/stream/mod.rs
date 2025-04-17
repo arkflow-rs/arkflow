@@ -324,29 +324,26 @@ impl Stream {
         };
 
         loop {
-            match error_output_receiver.recv_async().await {
-                Ok(msg) => {
-                    let size = &msg.0.len();
-                    let mut success_cnt = 0;
-                    for x in msg.0 {
-                        match error_output.write(x).await {
-                            Ok(_) => {
-                                success_cnt = success_cnt + 1;
-                            }
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        }
-                    }
+            let Ok(msg) = error_output_receiver.recv_async().await else {
+                break;
+            };
 
-                    // Confirm that the message has been successfully processed
-                    if *size == success_cnt {
-                        msg.1.ack().await;
+            let size = &msg.0.len();
+            let mut success_cnt = 0;
+            for x in msg.0 {
+                match error_output.write(x).await {
+                    Ok(_) => {
+                        success_cnt = success_cnt + 1;
+                    }
+                    Err(e) => {
+                        error!("{}", e);
                     }
                 }
-                Err(_) => {
-                    break;
-                }
+            }
+
+            // Confirm that the message has been successfully processed
+            if *size == success_cnt {
+                msg.1.ack().await;
             }
         }
         info!("Error output stopped")
