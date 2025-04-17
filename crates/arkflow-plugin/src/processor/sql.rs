@@ -49,9 +49,7 @@ pub struct SqlProcessor {
 impl SqlProcessor {
     /// Create a new SQL processor component.
     pub fn new(config: SqlProcessorConfig) -> Result<Self, Error> {
-        let mut ctx = SessionContext::new();
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        let ctx = Self::create_session_context()?;
 
         let statement = ctx
             .state()
@@ -67,9 +65,7 @@ impl SqlProcessor {
     /// Execute SQL query
     async fn execute_query(&self, batch: MessageBatch) -> Result<RecordBatch, Error> {
         // Create a session context
-        let mut ctx = SessionContext::new();
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        let ctx = Self::create_session_context()?;
 
         let table_name = self
             .config
@@ -119,6 +115,14 @@ impl SqlProcessor {
         sql_options.verify_plan(&plan)?;
 
         ctx.execute_logical_plan(plan).await
+    }
+
+    /// Create a new session context with JSON functions registered
+    fn create_session_context() -> Result<SessionContext, Error> {
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        Ok(ctx)
     }
 }
 
