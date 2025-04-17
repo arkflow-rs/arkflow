@@ -57,6 +57,8 @@ streams:
 
     output:
       type: "stdout"
+    error_output:
+      type: "stdout"
 ```
 
 2. Run ArkFlow:
@@ -81,6 +83,8 @@ streams: # Stream definition list
     pipeline:   # Processing pipeline configuration
     # ...
     output:     # Output configuration
+    # ...
+    error_output: # Error output configuration
     # ...
     buffer:     # Buffer configuration
     # ... 
@@ -148,9 +152,32 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: output-topic
+  topic: 
+    type: value
+    value: test-topic
   client_id: arkflow-producer
 ```
+### Error Output Components
+ArkFlow supports multiple error output targets:
+- **Kafka**: Write error data to Kafka topics
+- **MQTT**: Publish error messages to MQTT topics
+- **HTTP**: Send error data via HTTP
+- **Standard Output**: Output error data to the console
+- **Drop**: Discard error data
+
+Example:
+
+```yaml
+error_output:
+  type: kafka
+  brokers:
+    - localhost:9092
+  topic: 
+    type: value
+    value: error-topic
+  client_id: error-arkflow-producer
+``` 
+
 
 ### Buffer Components
 

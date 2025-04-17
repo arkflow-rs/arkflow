@@ -56,6 +56,8 @@ streams:
 
     output:
       type: "stdout"
+    error_output:
+      type: "stdout"
 ```
 
 2. 运行ArkFlow：
@@ -81,8 +83,10 @@ streams: # 流定义列表
     # ...
     output:     # 输出配置
     # ...
+    error_output: # 错误输出配置
+    # ...
     buffer:     # 缓冲配置
-    # ... 
+    # ...
 ```
 
 ### 输入组件
