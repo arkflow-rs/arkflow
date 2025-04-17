@@ -155,6 +155,28 @@ output:
   client_id: arkflow-producer
 ```
 
+### 错误输出组件
+
+- **Kafka**：将错误数据写入 Kafka 主题
+- **MQTT**：将错误消息发布到 MQTT 主题
+- **HTTP**：通过 HTTP 发送错误数据
+- **标准输出**：将错误数据输出到控制台
+- **丢弃**：丢弃错误数据
+
+示例：
+
+```yaml
+error_output:
+  type: kafka
+  brokers:
+    - localhost:9092
+  topic: 
+    type: value
+    value: error-topic
+  client_id: error-arkflow-producer
+```
+
+
 ### 缓冲组件
 
 ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:

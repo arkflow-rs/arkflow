@@ -157,6 +157,7 @@ output:
     value: test-topic
   client_id: arkflow-producer
 ```
+
 ### Error Output Components
 ArkFlow supports multiple error output targets:
 - **Kafka**: Write error data to Kafka topics
