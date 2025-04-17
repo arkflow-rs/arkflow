@@ -217,15 +217,9 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "INVALID SQL QUERY".to_string(),
             table_name: None,
-        })
-        .unwrap();
+        });
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
-
-        let result = processor.process(MessageBatch::new_arrow(batch)).await;
-        assert!(result.is_err());
+        assert!(processor.is_err());
     }
 
     #[tokio::test]
