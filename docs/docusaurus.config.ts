@@ -97,11 +97,6 @@ const config: Config = {
         {to: '/blog', label: 'Blog', position: 'left'},
         {
           type: 'docsVersionDropdown',
-          versions: {
-            current: {label: 'Version 4.0'},
-            '3.0': {label: 'Version 3.0'},
-            '2.0': {label: 'Version 2.0'},
-          },
           position: 'right',
         },
         {
