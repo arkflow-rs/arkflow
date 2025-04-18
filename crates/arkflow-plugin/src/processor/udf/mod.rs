@@ -18,54 +18,14 @@
 /// UDFs are registered globally and then added to the SQL function registry during context initialization.
 use arkflow_core::Error;
 use datafusion::execution::FunctionRegistry;
-use std::sync::Arc;
-use tracing::log::debug;
 
 pub mod aggregate_udf;
 pub mod scalar_udf;
 pub mod window_udf;
 
-pub(crate) fn init(registry: &mut dyn FunctionRegistry) -> Result<(), Error> {
-    let scalar_udfs = crate::processor::udf::scalar_udf::UDFS
-        .read()
-        .expect("Failed to acquire read lock for scalar UDFS");
-    scalar_udfs
-        .iter()
-        .try_for_each(|udf| {
-            let existing_udf = registry.register_udf(Arc::clone(udf))?;
-            if let Some(existing_udf) = existing_udf {
-                debug!("Overwrite existing scalar UDF: {}", existing_udf.name());
-            }
-            Ok(()) as datafusion::common::Result<()>
-        })
-        .map_err(|e| Error::Config(format!("Failed to register scalar UDFs: {}", e)))?;
-
-    let aggregate_udfs = crate::processor::udf::aggregate_udf::UDFS
-        .read()
-        .expect("Failed to acquire read lock for aggregate UDFS");
-    aggregate_udfs
-        .iter()
-        .try_for_each(|udf| {
-            let existing_udf = registry.register_udaf(Arc::clone(udf))?;
-            if let Some(existing_udf) = existing_udf {
-                debug!("Overwrite existing aggregate UDF: {}", existing_udf.name());
-            }
-            Ok(()) as datafusion::common::Result<()>
-        })
-        .map_err(|e| Error::Config(format!("Failed to register aggregate UDFs: {}", e)))?;
-
-    let window_udfs = crate::processor::udf::window_udf::UDFS
-        .read()
-        .expect("Failed to acquire read lock for windows UDFS");
-    window_udfs
-        .iter()
-        .try_for_each(|udf| {
-            let existing_udf = registry.register_udwf(Arc::clone(udf))?;
-            if let Some(existing_udf) = existing_udf {
-                debug!("Overwrite existing windows UDF: {}", existing_udf.name());
-            }
-            Ok(()) as datafusion::common::Result<()>
-        })
-        .map_err(|e| Error::Config(format!("Failed to register windows UDFs: {}", e)))?;
+pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
+    aggregate_udf::init(registry)?;
+    scalar_udf::init(registry)?;
+    window_udf::init(registry)?;
     Ok(())
 }
