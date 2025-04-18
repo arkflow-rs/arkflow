@@ -18,7 +18,7 @@ lazy_static::lazy_static! {
    pub(crate) static ref UDFS: RwLock<Vec<Arc<AggregateUDF>>> = RwLock::new(Vec::new());
 }
 
-pub fn register(udf: Arc<AggregateUDF>) {
+pub fn register(udf: AggregateUDF) {
     let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
-    udfs.push(udf);
+    udfs.push(Arc::new(udf));
 }

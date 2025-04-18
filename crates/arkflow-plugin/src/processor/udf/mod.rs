@@ -11,6 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+
+/// Module for managing scalar user-defined functions (UDFs) for SQL processing.
+///
+/// This module provides functionality to register and initialize UDFs in a thread-safe manner.
+/// UDFs are registered globally and then added to the SQL function registry during context initialization.
 use arkflow_core::Error;
 use datafusion::execution::FunctionRegistry;
 use std::sync::Arc;

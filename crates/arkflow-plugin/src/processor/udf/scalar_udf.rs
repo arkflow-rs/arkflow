@@ -29,10 +29,6 @@
 use datafusion::logical_expr::ScalarUDF;
 use std::sync::{Arc, RwLock};
 
-/// Module for managing scalar user-defined functions (UDFs) for SQL processing.
-///
-/// This module provides functionality to register and initialize UDFs in a thread-safe manner.
-/// UDFs are registered globally and then added to the SQL function registry during context initialization.
 lazy_static::lazy_static! {
     pub(crate) static ref UDFS: RwLock<Vec<Arc<ScalarUDF>>> = RwLock::new(Vec::new());
 }
@@ -45,7 +41,7 @@ lazy_static::lazy_static! {
 /// # Arguments
 ///
 /// * `udf` - The UDF to register, wrapped in an Arc for shared ownership.
-pub fn register(udf: Arc<ScalarUDF>) {
+pub fn register(udf: ScalarUDF) {
     let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
-    udfs.push(udf);
+    udfs.push(Arc::new(udf));
 }
