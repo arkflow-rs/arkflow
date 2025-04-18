@@ -16,8 +16,7 @@
 //!
 //! DataFusion is used to process data with SQL queries.
 
-mod scalar_udf;
-
+use crate::processor::udf::scalar_udf;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
