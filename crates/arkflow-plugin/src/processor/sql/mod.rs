@@ -119,7 +119,7 @@ impl SqlProcessor {
         ctx.execute_logical_plan(plan).await
     }
 
-    /// Create a new session context with JSON functions registered
+    /// Create a new session context with UDFs and JSON functions registered
     fn create_session_context() -> Result<SessionContext, Error> {
         let mut ctx = SessionContext::new();
         scalar_udf::init(&mut ctx)?;
