@@ -34,7 +34,7 @@ pub fn register(udf: WindowUDF) {
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
-    let window_udfs = crate::processor::udf::window_udf::UDFS
+    let window_udfs = UDFS
         .read()
         .expect("Failed to acquire read lock for window UDFS");
     window_udfs

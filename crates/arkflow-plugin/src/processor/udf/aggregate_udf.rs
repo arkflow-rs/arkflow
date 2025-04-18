@@ -34,7 +34,7 @@ pub fn register(udf: AggregateUDF) {
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
-    let aggregate_udfs = crate::processor::udf::aggregate_udf::UDFS
+    let aggregate_udfs = UDFS
         .read()
         .expect("Failed to acquire read lock for aggregate UDFS");
     aggregate_udfs
