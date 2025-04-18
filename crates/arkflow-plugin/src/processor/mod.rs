@@ -22,7 +22,7 @@ pub mod batch;
 pub mod json;
 pub mod protobuf;
 pub mod sql;
-mod udf;
+pub mod udf;
 
 lazy_static::lazy_static! {
     static ref INITIALIZED: OnceLock<()> = OnceLock::new();

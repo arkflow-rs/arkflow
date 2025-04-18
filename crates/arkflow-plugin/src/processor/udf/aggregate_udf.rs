@@ -11,17 +11,14 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use datafusion::logical_expr::AggregateUDF;
+use std::sync::{Arc, RwLock};
 
-use arkflow_core::cli::Cli;
-use arkflow_plugin::{buffer, input, output, processor};
+lazy_static::lazy_static! {
+   pub(crate) static ref UDFS: RwLock<Vec<Arc<AggregateUDF>>> = RwLock::new(Vec::new());
+}
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    input::init();
-    output::init();
-    processor::init();
-    buffer::init();
-    let mut cli = Cli::default();
-    cli.parse()?;
-    cli.run().await
+pub fn register(udf: Arc<AggregateUDF>) {
+    let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
+    udfs.push(udf);
 }
