@@ -16,6 +16,8 @@
 //!
 //! DataFusion is used to process data with SQL queries.
 
+mod scalar_udf;
+
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
@@ -120,6 +122,7 @@ impl SqlProcessor {
     /// Create a new session context with JSON functions registered
     fn create_session_context() -> Result<SessionContext, Error> {
         let mut ctx = SessionContext::new();
+        scalar_udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
