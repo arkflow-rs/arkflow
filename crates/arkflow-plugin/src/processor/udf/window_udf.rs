@@ -21,6 +21,13 @@ lazy_static::lazy_static! {
     static ref UDFS: RwLock<Vec<Arc<WindowUDF>>> = RwLock::new(Vec::new());
 }
 
+/// Register a new window UDF (User Defined Function).
+///
+/// This function wraps the provided WindowUDF instance in an Arc and stores it in the global UDFS list,
+/// so it can later be registered with the FunctionRegistry.
+///
+/// # Arguments
+/// * `udf` - The WindowUDF instance to register.
 pub fn register(udf: WindowUDF) {
     let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
     udfs.push(Arc::new(udf));

@@ -23,6 +23,18 @@ pub mod aggregate_udf;
 pub mod scalar_udf;
 pub mod window_udf;
 
+/// Initializes and registers all user-defined functions (UDFs).
+///
+/// This function calls the `init` function of each UDF module (aggregate, scalar, window)
+/// to register their respective functions with the provided `FunctionRegistry`.
+///
+/// # Arguments
+///
+/// * `registry` - A mutable reference to a type implementing `FunctionRegistry` where the UDFs will be registered.
+///
+/// # Errors
+///
+/// Returns an `Error` if any of the underlying `init` calls fail during registration.
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
     aggregate_udf::init(registry)?;
     scalar_udf::init(registry)?;
