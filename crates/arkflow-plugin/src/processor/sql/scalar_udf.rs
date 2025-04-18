@@ -22,12 +22,12 @@ lazy_static::lazy_static! {
 }
 
 pub fn register(udf: Arc<ScalarUDF>) {
-    let mut udfs = SCALAR_UDFS.write().unwrap();
+    let mut udfs = SCALAR_UDFS.write().expect("Failed to acquire write lock for SCALAR_UDFS");
     udfs.push(udf);
 }
 
 pub(crate) fn init(registry: &mut dyn FunctionRegistry) -> Result<(), Error> {
-    let udfs = SCALAR_UDFS.read().unwrap();
+    let udfs = SCALAR_UDFS.read().expect("Failed to acquire read lock for SCALAR_UDFS");;
     udfs.iter()
         .try_for_each(|udf| {
             let existing_udf = registry.register_udf(Arc::clone(&udf))?;
