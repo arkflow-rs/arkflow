@@ -30,7 +30,9 @@ lazy_static::lazy_static! {
 /// # Arguments
 /// * `udf` - The AggregateUDF instance to register.
 pub fn register(udf: AggregateUDF) -> Result<(), Error> {
-    let mut udfs = UDFS.write().map_err(|_| {
+    let mut udfs = UDFS
+        .write()
+        .map_err(|_| {
         Error::Config("Failed to acquire write lock for aggregate UDFS".to_string())
     })?;
     let name = udf.name();
