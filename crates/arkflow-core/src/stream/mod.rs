@@ -277,7 +277,7 @@ impl Stream {
                 break;
             };
 
-            let size = msg.len();
+            let size = msg.0.len();
             let mut success_cnt = 0;
             for x in msg.0 {
                 match output.write(x).await {
