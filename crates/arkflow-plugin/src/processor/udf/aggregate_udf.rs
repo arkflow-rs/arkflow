@@ -29,19 +29,25 @@ lazy_static::lazy_static! {
 ///
 /// # Arguments
 /// * `udf` - The AggregateUDF instance to register.
-pub fn register(udf: AggregateUDF) {
-    let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
+pub fn register(udf: AggregateUDF) -> Result<(), Error> {
+    let mut udfs = UDFS.write().map_err(|_| {
+        Error::Config("Failed to acquire write lock for aggregate UDFS".to_string())
+    })?;
     let name = udf.name();
     if udfs.contains_key(name) {
-        panic!("Aggregate UDF with name '{}' already registered", name);
+        return Err(Error::Config(format!(
+            "Aggregate UDF with name '{}' already registered",
+            name
+        )));
     };
     udfs.insert(name.to_string(), Arc::new(udf));
+    Ok(())
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
     let aggregate_udfs = UDFS
         .read()
-        .expect("Failed to acquire read lock for aggregate UDFS");
+        .map_err(|_| Error::Config("Failed to acquire read lock for aggregate UDFS".to_string()))?;
     aggregate_udfs
         .iter()
         .try_for_each(|(_, udf)| {

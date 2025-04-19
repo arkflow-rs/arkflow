@@ -29,13 +29,19 @@ lazy_static::lazy_static! {
 ///
 /// # Arguments
 /// * `udf` - The WindowUDF instance to register.
-pub fn register(udf: WindowUDF) {
-    let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
+pub fn register(udf: WindowUDF) -> Result<(), Error> {
+    let mut udfs = UDFS
+        .write()
+        .map_err(|_| Error::Config("Failed to acquire write lock for window UDFS".to_string()))?;
     let name = udf.name();
     if udfs.contains_key(name) {
-        panic!("Window UDF with name '{}' already registered", name);
+        return Err(Error::Config(format!(
+            "Window UDF with name '{}' already registered",
+            name
+        )));
     };
     udfs.insert(name.to_string(), Arc::new(udf));
+    Ok(())
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {

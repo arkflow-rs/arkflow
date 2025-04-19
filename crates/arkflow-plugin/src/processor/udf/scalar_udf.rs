@@ -30,13 +30,20 @@ lazy_static::lazy_static! {
 /// # Arguments
 ///
 /// * `udf` - The UDF to register, wrapped in an Arc for shared ownership.
-pub fn register(udf: ScalarUDF) {
-    let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
+pub fn register(udf: ScalarUDF) -> Result<(), Error> {
+    let mut udfs = UDFS
+        .write()
+        .map_err(|_| Error::Config("Failed to acquire write lock for UDFS".to_string()))?;
+
     let name = udf.name();
     if udfs.contains_key(name) {
-        panic!("Scalar UDF with name '{}' already registered", name);
+        return Err(Error::Config(format!(
+            "Scalar UDF with name '{}' already registered",
+            name
+        )));
     };
     udfs.insert(name.to_string(), Arc::new(udf));
+    Ok(())
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
