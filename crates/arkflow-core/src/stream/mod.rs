@@ -238,34 +238,30 @@ impl Stream {
         let i = i + 1;
         info!("Processor worker {} started", i);
         loop {
-            match input_receiver.recv_async().await {
-                Ok((msg, ack)) => {
-                    // Process messages through pipeline
-                    let processed = pipeline.process(msg.clone()).await;
+            let Ok((msg, ack)) = input_receiver.recv_async().await else {
+                break;
+            };
+            // Process messages through pipeline
+            let processed = pipeline.process(msg.clone()).await;
 
-                    // Process result messages
-                    match processed {
-                        Ok(msgs) => {
-                            if let Err(e) = output_sender.send_async((msgs, ack)).await {
-                                error!("Failed to send processed message: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(ref error_output_sender) = error_output_sender {
-                                if let Err(e) = error_output_sender.send_async((msg, ack)).await {
-                                    error!("Failed to send error message: {}", e);
-                                    break;
-                                }
-                            } else {
-                                ack.ack().await;
-                            }
-                            error!("{}", e)
-                        }
+            // Process result messages
+            match processed {
+                Ok(msgs) => {
+                    if let Err(e) = output_sender.send_async((msgs, ack)).await {
+                        error!("Failed to send processed message: {}", e);
+                        break;
                     }
                 }
-                Err(_e) => {
-                    break;
+                Err(e) => {
+                    if let Some(ref error_output_sender) = error_output_sender {
+                        if let Err(e) = error_output_sender.send_async((msg, ack)).await {
+                            error!("Failed to send error message: {}", e);
+                            break;
+                        }
+                    } else {
+                        ack.ack().await;
+                    }
+                    error!("{}", e)
                 }
             }
         }
@@ -277,29 +273,26 @@ impl Stream {
         output: Arc<dyn Output>,
     ) {
         loop {
-            match output_receiver.recv_async().await {
-                Ok(msg) => {
-                    let size = &msg.0.len();
-                    let mut success_cnt = 0;
-                    for x in msg.0 {
-                        match output.write(x).await {
-                            Ok(_) => {
-                                success_cnt = success_cnt + 1;
-                            }
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        }
-                    }
+            let Ok(msg) = output_receiver.recv_async().await else {
+                break;
+            };
 
-                    // Confirm that the message has been successfully processed
-                    if *size == success_cnt {
-                        msg.1.ack().await;
+            let size = &msg.0.len();
+            let mut success_cnt = 0;
+            for x in msg.0 {
+                match output.write(x).await {
+                    Ok(_) => {
+                        success_cnt = success_cnt + 1;
+                    }
+                    Err(e) => {
+                        error!("{}", e);
                     }
                 }
-                Err(_) => {
-                    break;
-                }
+            }
+
+            // Confirm that the message has been successfully processed
+            if *size == success_cnt {
+                msg.1.ack().await;
             }
         }
         info!("Output stopped")
