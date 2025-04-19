@@ -199,7 +199,6 @@ dependencies = [
  "datafusion",
  "datafusion-functions-json",
  "datafusion-table-providers",
- "duckdb",
  "flume",
  "futures-util",
  "humantime",
@@ -217,6 +216,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "spiceai_duckdb_fork",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2074,8 +2074,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-table-providers"
-version = "0.3.0"
-source = "git+https://github.com/arkflow-rs/datafusion-table-providers.git?branch=datafusion-46#6e1f1f5bcfcd553e8eaf722fe000c83c0853d12e"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af80d0bcb7974b712590fbe477c64cad423e4693c9382a42fa7b60ba07994116"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -2090,7 +2091,6 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
  "fundu",
@@ -2111,6 +2111,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snafu",
+ "spiceai_duckdb_fork",
  "time",
  "tokio",
  "tokio-postgres",
@@ -2157,27 +2158,6 @@ name = "downcast"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
-
-[[package]]
-name = "duckdb"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8c35886fbb5356fe90c8a9b69da5623d509c32bdfb6eefa7f57081eb05f69b"
-dependencies = [
- "arrow",
- "cast",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink",
- "libduckdb-sys",
- "memchr",
- "num",
- "num-integer",
- "r2d2",
- "rust_decimal",
- "smallvec",
- "strum",
-]
 
 [[package]]
 name = "duct"
@@ -3284,7 +3264,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -5226,6 +5206,27 @@ checksum = "4f5fd57c80058a56cf5c777ab8a126398ece8e442983605d280a44ce79d0edef"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "spiceai_duckdb_fork"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9293086270aff32097c27af628107e8f33358de8993ebd9769fd3f72ac2250d"
+dependencies = [
+ "arrow",
+ "cast",
+ "fallible-iterator 0.3.0",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libduckdb-sys",
+ "memchr",
+ "num",
+ "num-integer",
+ "r2d2",
+ "rust_decimal",
+ "smallvec",
+ "strum",
 ]
 
 [[package]]
