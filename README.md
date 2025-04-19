@@ -244,6 +244,10 @@ streams:
       type: "stdout"
 ```
 
+## ArkFlow Plugin
+
+[ArkFlow Plugin Examples](https://github.com/arkflow-rs/arkflow-plugin-examples)
+
 ## License
 
 ArkFlow is licensed under the [Apache License 2.0](LICENSE).

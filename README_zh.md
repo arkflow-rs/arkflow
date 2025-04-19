@@ -241,6 +241,10 @@ streams:
     output:
       type: "stdout"
 ```
+## ArkFlow 插件
+
+[ArkFlow 插件示例](https://github.com/arkflow-rs/arkflow-plugin-examples)
+
 
 ## 许可证
 
