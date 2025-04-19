@@ -14,11 +14,12 @@
 use arkflow_core::Error;
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::WindowUDF;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::debug;
 
 lazy_static::lazy_static! {
-    static ref UDFS: RwLock<Vec<Arc<WindowUDF>>> = RwLock::new(Vec::new());
+    static ref UDFS: RwLock<HashMap<String,Arc<WindowUDF>>> = RwLock::new(HashMap::new());
 }
 
 /// Register a new window UDF (User Defined Function).
@@ -30,7 +31,11 @@ lazy_static::lazy_static! {
 /// * `udf` - The WindowUDF instance to register.
 pub fn register(udf: WindowUDF) {
     let mut udfs = UDFS.write().expect("Failed to acquire write lock for UDFS");
-    udfs.push(Arc::new(udf));
+    let name = udf.name();
+    if udfs.contains_key(name) {
+        panic!("Window UDF with name '{}' already registered", name);
+    };
+    udfs.insert(name.to_string(), Arc::new(udf));
 }
 
 pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
@@ -39,7 +44,7 @@ pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
         .expect("Failed to acquire read lock for window UDFS");
     window_udfs
         .iter()
-        .try_for_each(|udf| {
+        .try_for_each(|(_, udf)| {
             let existing_udf = registry.register_udwf(Arc::clone(udf))?;
             if let Some(existing_udf) = existing_udf {
                 debug!("Overwrite existing window UDF: {}", existing_udf.name());
