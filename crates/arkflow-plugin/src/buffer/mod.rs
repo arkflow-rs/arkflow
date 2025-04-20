@@ -16,5 +16,6 @@ use arkflow_core::Error;
 mod memory;
 
 pub fn init() -> Result<(), Error> {
-    memory::init()
+    memory::init()?;
+    Ok(())
 }
