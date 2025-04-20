@@ -25,7 +25,7 @@ lazy_static::lazy_static! {
 /// Register a new scalar UDF.
 ///
 /// This function adds a UDF to the global registry. The UDF will be available for use
-/// in SQL queries after the next call to `init`.
+/// in SQL queries after the next call to `register_all`.
 ///
 /// # Arguments
 ///

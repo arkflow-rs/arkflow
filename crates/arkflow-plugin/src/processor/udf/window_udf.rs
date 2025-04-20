@@ -24,8 +24,8 @@ lazy_static::lazy_static! {
 
 /// Register a new window UDF (User Defined Function).
 ///
-/// This function wraps the provided WindowUDF instance in an Arc and stores it in the global UDFS list,
-/// so it can later be registered with the FunctionRegistry.
+/// This function adds a UDF to the global registry. The UDF will be available for use
+/// in SQL queries after the next call to `register_all`.
 ///
 /// # Arguments
 /// * `udf` - The WindowUDF instance to register.

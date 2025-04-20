@@ -24,15 +24,13 @@ lazy_static::lazy_static! {
 
 /// Register a new aggregate UDF (User Defined Function).
 ///
-/// This function wraps the provided AggregateUDF instance in an Arc and stores it in the global UDFS list,
-/// so it can later be registered with the FunctionRegistry.
+/// This function adds a UDF to the global registry. The UDF will be available for use
+/// in SQL queries after the next call to `register_all`.
 ///
 /// # Arguments
 /// * `udf` - The AggregateUDF instance to register.
 pub fn register(udf: AggregateUDF) -> Result<(), Error> {
-    let mut udfs = UDFS
-        .write()
-        .map_err(|_| {
+    let mut udfs = UDFS.write().map_err(|_| {
         Error::Config("Failed to acquire write lock for aggregate UDFS".to_string())
     })?;
     let name = udf.name();
