@@ -185,8 +185,8 @@ impl InputBuilder for HttpInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("http", Arc::new(HttpInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("http", Arc::new(HttpInputBuilder))
 }
 
 async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {

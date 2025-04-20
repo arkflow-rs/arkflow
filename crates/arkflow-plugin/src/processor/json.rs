@@ -215,9 +215,10 @@ impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
     }
 }
 
-pub fn init() {
-    register_processor_builder("arrow_to_json", Arc::new(ArrowToJsonProcessorBuilder));
-    register_processor_builder("json_to_arrow", Arc::new(JsonToArrowProcessorBuilder));
+pub fn init() -> Result<(), Error> {
+    register_processor_builder("arrow_to_json", Arc::new(ArrowToJsonProcessorBuilder))?;
+    register_processor_builder("json_to_arrow", Arc::new(JsonToArrowProcessorBuilder))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -99,8 +99,8 @@ impl InputBuilder for GenerateInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("generate", Arc::new(GenerateInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("generate", Arc::new(GenerateInputBuilder))
 }
 
 #[cfg(test)]

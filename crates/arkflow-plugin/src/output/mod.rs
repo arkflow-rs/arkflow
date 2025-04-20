@@ -16,7 +16,7 @@
 //!
 //! The output component is responsible for sending the processed data to the target system.
 
-use std::sync::OnceLock;
+use arkflow_core::Error;
 
 pub mod drop;
 pub mod http;
@@ -24,16 +24,11 @@ pub mod kafka;
 pub mod mqtt;
 pub mod stdout;
 
-lazy_static::lazy_static! {
-    static ref INITIALIZED: OnceLock<()> = OnceLock::new();
-}
-
-pub fn init() {
-    INITIALIZED.get_or_init(|| {
-        drop::init();
-        http::init();
-        kafka::init();
-        mqtt::init();
-        stdout::init();
-    });
+pub fn init() -> Result<(), Error> {
+    drop::init()?;
+    http::init()?;
+    kafka::init()?;
+    mqtt::init()?;
+    stdout::init()?;
+    Ok(())
 }

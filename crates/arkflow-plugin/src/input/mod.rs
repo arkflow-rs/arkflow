@@ -16,7 +16,7 @@
 //!
 //! The input component is responsible for receiving data from various sources such as message queues, file systems, HTTP endpoints, and so on.
 
-use std::sync::OnceLock;
+use arkflow_core::Error;
 
 pub mod generate;
 pub mod http;
@@ -25,17 +25,12 @@ pub mod memory;
 pub mod mqtt;
 pub mod sql;
 
-lazy_static::lazy_static! {
-    static ref INITIALIZED: OnceLock<()> = OnceLock::new();
-}
-
-pub fn init() {
-    INITIALIZED.get_or_init(|| {
-        generate::init();
-        http::init();
-        kafka::init();
-        memory::init();
-        mqtt::init();
-        sql::init();
-    });
+pub fn init() -> Result<(), Error> {
+    generate::init()?;
+    http::init()?;
+    kafka::init()?;
+    memory::init()?;
+    mqtt::init()?;
+    sql::init()?;
+    Ok(())
 }

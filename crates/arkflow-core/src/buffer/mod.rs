@@ -64,12 +64,19 @@ impl BufferConfig {
     }
 }
 
-pub fn register_buffer_builder(type_name: &str, builder: Arc<dyn BufferBuilder>) {
+pub fn register_buffer_builder(
+    type_name: &str,
+    builder: Arc<dyn BufferBuilder>,
+) -> Result<(), Error> {
     let mut builders = BUFFER_BUILDERS.write().unwrap();
     if builders.contains_key(type_name) {
-        panic!("Buffer type already registered: {}", type_name)
+        return Err(Error::Config(format!(
+            "Buffer type already registered: {}",
+            type_name
+        )));
     }
     builders.insert(type_name.to_string(), builder);
+    Ok(())
 }
 
 pub fn get_registered_buffer_types() -> Vec<String> {

@@ -236,8 +236,8 @@ impl OutputBuilder for KafkaOutputBuilder {
     }
 }
 
-pub fn init() {
-    register_output_builder("kafka", Arc::new(KafkaOutputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_output_builder("kafka", Arc::new(KafkaOutputBuilder))
 }
 #[async_trait]
 trait KafkaClient: Send + Sync {

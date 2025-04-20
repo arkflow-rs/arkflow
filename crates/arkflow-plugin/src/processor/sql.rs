@@ -159,8 +159,8 @@ impl ProcessorBuilder for SqlProcessorBuilder {
     }
 }
 
-pub fn init() {
-    register_processor_builder("sql", Arc::new(SqlProcessorBuilder));
+pub fn init() -> Result<(), Error> {
+    register_processor_builder("sql", Arc::new(SqlProcessorBuilder))
 }
 
 #[cfg(test)]

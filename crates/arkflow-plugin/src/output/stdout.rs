@@ -105,8 +105,8 @@ impl OutputBuilder for StdoutOutputBuilder {
     }
 }
 
-pub fn init() {
-    register_output_builder("stdout", Arc::new(StdoutOutputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_output_builder("stdout", Arc::new(StdoutOutputBuilder))
 }
 
 trait StdWriter: Write + Send + Sync {}

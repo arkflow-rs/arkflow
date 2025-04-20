@@ -183,7 +183,7 @@ impl BufferBuilder for MemoryBufferBuilder {
     }
 }
 
-pub fn init() {
+pub fn init() -> Result<(), Error> {
     register_buffer_builder("memory", Arc::new(MemoryBufferBuilder))
 }
 

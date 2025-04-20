@@ -68,12 +68,19 @@ pub trait ProcessorBuilder: Send + Sync {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error>;
 }
 
-pub fn register_processor_builder(type_name: &str, builder: Arc<dyn ProcessorBuilder>) {
+pub fn register_processor_builder(
+    type_name: &str,
+    builder: Arc<dyn ProcessorBuilder>,
+) -> Result<(), Error> {
     let mut builders = PROCESSOR_BUILDERS.write().unwrap();
     if builders.contains_key(type_name) {
-        panic!("Processor type already registered: {}", type_name);
+        return Err(Error::Config(format!(
+            "Processor type already registered: {}",
+            type_name
+        )));
     }
     builders.insert(type_name.to_string(), builder);
+    Ok(())
 }
 
 pub fn get_registered_processor_types() -> Vec<String> {

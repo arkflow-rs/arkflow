@@ -50,8 +50,8 @@ impl OutputBuilder for DropOutputBuilder {
     }
 }
 
-pub fn init() {
-    register_output_builder("drop", Arc::new(DropOutputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_output_builder("drop", Arc::new(DropOutputBuilder))
 }
 
 #[cfg(test)]

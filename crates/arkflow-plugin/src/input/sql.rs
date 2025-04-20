@@ -353,8 +353,8 @@ impl InputBuilder for SqlInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("sql", Arc::new(SqlInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("sql", Arc::new(SqlInputBuilder))
 }
 
 #[cfg(test)]

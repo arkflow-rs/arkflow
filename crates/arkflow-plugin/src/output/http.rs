@@ -227,6 +227,6 @@ impl OutputBuilder for HttpOutputBuilder {
     }
 }
 
-pub fn init() {
-    register_output_builder("http", Arc::new(HttpOutputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_output_builder("http", Arc::new(HttpOutputBuilder))
 }

@@ -68,12 +68,19 @@ pub trait OutputBuilder: Send + Sync {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error>;
 }
 
-pub fn register_output_builder(type_name: &str, builder: Arc<dyn OutputBuilder>) {
+pub fn register_output_builder(
+    type_name: &str,
+    builder: Arc<dyn OutputBuilder>,
+) -> Result<(), Error> {
     let mut builders = OUTPUT_BUILDERS.write().unwrap();
     if builders.contains_key(type_name) {
-        panic!("Output type already registered: {}", type_name);
+        return Err(Error::Config(format!(
+            "Output type already registered: {}",
+            type_name
+        )));
     }
     builders.insert(type_name.to_string(), builder);
+    Ok(())
 }
 
 pub fn get_registered_output_types() -> Vec<String> {

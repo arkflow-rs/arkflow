@@ -113,8 +113,8 @@ impl InputBuilder for MemoryInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("memory", Arc::new(MemoryInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("memory", Arc::new(MemoryInputBuilder))
 }
 
 #[cfg(test)]

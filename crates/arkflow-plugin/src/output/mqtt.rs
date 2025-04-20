@@ -208,8 +208,8 @@ impl OutputBuilder for MqttOutputBuilder {
     }
 }
 
-pub fn init() {
-    register_output_builder("mqtt", Arc::new(MqttOutputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_output_builder("mqtt", Arc::new(MqttOutputBuilder))
 }
 
 #[async_trait]

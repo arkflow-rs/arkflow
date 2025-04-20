@@ -111,12 +111,19 @@ impl InputConfig {
     }
 }
 
-pub fn register_input_builder(type_name: &str, builder: Arc<dyn InputBuilder>) {
+pub fn register_input_builder(
+    type_name: &str,
+    builder: Arc<dyn InputBuilder>,
+) -> Result<(), Error> {
     let mut builders = INPUT_BUILDERS.write().unwrap();
     if builders.contains_key(type_name) {
-        panic!("Input type already registered: {}", type_name)
+        return Err(Error::Config(format!(
+            "Input type already registered: {}",
+            type_name
+        )));
     }
     builders.insert(type_name.to_string(), builder);
+    Ok(())
 }
 
 pub fn get_registered_input_types() -> Vec<String> {

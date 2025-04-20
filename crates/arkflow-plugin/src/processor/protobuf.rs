@@ -508,15 +508,16 @@ impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
     }
 }
 
-pub fn init() {
+pub fn init() -> Result<(), Error> {
     register_processor_builder(
         "arrow_to_protobuf",
         Arc::new(ArrowToProtobufProcessorBuilder),
-    );
+    )?;
     register_processor_builder(
         "protobuf_to_arrow",
         Arc::new(ProtobufToArrowProcessorBuilder),
-    );
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -132,8 +132,8 @@ impl ProcessorBuilder for BatchProcessorBuilder {
     }
 }
 
-pub fn init() {
-    register_processor_builder("batch", Arc::new(BatchProcessorBuilder));
+pub fn init() -> Result<(), Error> {
+    register_processor_builder("batch", Arc::new(BatchProcessorBuilder))
 }
 
 #[cfg(test)]
@@ -213,7 +213,7 @@ mod tests {
             timeout_ms: 1000,
             data_type: "arrow".to_string(),
         })
-            .unwrap();
+        .unwrap();
 
         // Add a message to the batch
         processor

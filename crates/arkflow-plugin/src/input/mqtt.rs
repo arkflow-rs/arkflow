@@ -251,6 +251,6 @@ impl InputBuilder for MqttInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("mqtt", Arc::new(MqttInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("mqtt", Arc::new(MqttInputBuilder))
 }

@@ -189,8 +189,8 @@ impl InputBuilder for KafkaInputBuilder {
     }
 }
 
-pub fn init() {
-    register_input_builder("kafka", Arc::new(KafkaInputBuilder));
+pub fn init() -> Result<(), Error> {
+    register_input_builder("kafka", Arc::new(KafkaInputBuilder))
 }
 
 #[cfg(test)]
