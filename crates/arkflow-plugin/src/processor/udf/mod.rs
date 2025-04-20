@@ -25,7 +25,7 @@ pub mod window_udf;
 
 /// Initializes and registers all user-defined functions (UDFs).
 ///
-/// This function calls the `register_all` function of each UDF module (aggregate, scalar, window)
+/// This function calls the `init` function of each UDF module (aggregate, scalar, window)
 /// to register their respective functions with the provided `FunctionRegistry`.
 ///
 /// # Arguments
@@ -34,8 +34,8 @@ pub mod window_udf;
 ///
 /// # Errors
 ///
-/// Returns an `Error` if any of the underlying `register_all` calls fail during registration.
-pub(crate) fn register_all<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
+/// Returns an `Error` if any of the underlying `init` calls fail during registration.
+pub(crate) fn init<T: FunctionRegistry>(registry: &mut T) -> Result<(), Error> {
     aggregate_udf::init(registry)?;
     scalar_udf::init(registry)?;
     window_udf::init(registry)?;
