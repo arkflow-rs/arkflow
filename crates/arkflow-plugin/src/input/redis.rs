@@ -65,6 +65,10 @@ impl RedisInput {
     pub fn new(config: RedisInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
+
+        if let Err(e) = redis::parse_redis_url(&config.url) {
+            return Err(Error::Config(format!("Invalid Redis URL: {}", e)));
+        }
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
