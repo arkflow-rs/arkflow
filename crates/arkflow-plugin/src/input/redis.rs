@@ -33,11 +33,17 @@ use tracing::error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisInputConfig {
     /// Redis server URL
-    pub url: String,
+    url: String,
+    #[serde(flatten)]
+    _type: Type,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Type {
     /// List of channels to subscribe to
-    pub channels: Vec<String>,
+    Channels(Vec<String>),
     /// List of patterns to subscribe to
-    pub patterns: Option<Vec<String>>,
+    PATTERNS(Vec<String>),
 }
 
 /// Redis input component
@@ -72,7 +78,7 @@ impl RedisInput {
 #[async_trait]
 impl Input for RedisInput {
     async fn connect(&self) -> Result<(), Error> {
-        let client = redis::Client::open(self.config.url.as_str())
+        let client = Client::open(self.config.url.as_str())
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
 
         let mut client_guard = self.client.lock().await;
@@ -86,39 +92,43 @@ impl Input for RedisInput {
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
-        let channels = self.config.channels.clone();
-        let patterns = self.config.patterns.clone().unwrap_or_default();
-
+        // let channels = self.config.channels.clone();
+        // let patterns = self.config.patterns.clone().unwrap_or_default();
+        let config_type = self.config._type.clone();
         tokio::spawn(async move {
             let mut pubsub = conn.into_pubsub();
-
-            // Subscribe to channels
-            for channel in channels {
-                if let Err(e) = pubsub.subscribe(&channel).await {
-                    error!("Failed to subscribe to Redis channel {}: {}", channel, e);
-                    if let Err(e) = sender_clone
-                        .send_async(RedisMsg::Err(Error::Disconnection))
-                        .await
-                    {
-                        error!("{}", e);
+            match config_type {
+                Type::Channels(ref channels) => {
+                    // Subscribe to channels
+                    for channel in channels {
+                        if let Err(e) = pubsub.subscribe(channel).await {
+                            error!("Failed to subscribe to Redis channel {}: {}", channel, e);
+                            if let Err(e) = sender_clone
+                                .send_async(RedisMsg::Err(Error::Disconnection))
+                                .await
+                            {
+                                error!("{}", e);
+                            }
+                            return;
+                        }
                     }
-                    return;
                 }
-            }
-
-            // Subscribe to patterns
-            for pattern in patterns {
-                if let Err(e) = pubsub.psubscribe(&pattern).await {
-                    error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
-                    if let Err(e) = sender_clone
-                        .send_async(RedisMsg::Err(Error::Disconnection))
-                        .await
-                    {
-                        error!("{}", e);
+                Type::PATTERNS(ref patterns) => {
+                    // Subscribe to patterns
+                    for pattern in patterns {
+                        if let Err(e) = pubsub.psubscribe(pattern).await {
+                            error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
+                            if let Err(e) = sender_clone
+                                .send_async(RedisMsg::Err(Error::Disconnection))
+                                .await
+                            {
+                                error!("{}", e);
+                            }
+                            return;
+                        }
                     }
-                    return;
                 }
-            }
+            };
 
             let mut msg_stream = pubsub.on_message();
             loop {
