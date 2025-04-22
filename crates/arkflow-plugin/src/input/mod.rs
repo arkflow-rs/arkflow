@@ -23,6 +23,7 @@ pub mod http;
 pub mod kafka;
 pub mod memory;
 pub mod mqtt;
+pub mod redis;
 pub mod sql;
 
 pub fn init() -> Result<(), Error> {
@@ -31,6 +32,7 @@ pub fn init() -> Result<(), Error> {
     kafka::init()?;
     memory::init()?;
     mqtt::init()?;
+    redis::init()?;
     sql::init()?;
     Ok(())
 }
