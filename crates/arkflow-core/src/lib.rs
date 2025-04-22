@@ -111,6 +111,7 @@ impl MessageBatch {
         for i in 0..schema.fields().len() {
             columns.push(self.column(i).clone());
         }
+
         let binary_data: Vec<&[u8]> = content.iter().map(|v| v.as_slice()).collect();
         columns.push(Arc::new(BinaryArray::from(binary_data)));
 
@@ -181,7 +182,7 @@ impl MessageBatch {
         let Some(v) = array_ref.as_any().downcast_ref::<BinaryArray>() else {
             return Err(Error::Process("not support data type".to_string()));
         };
-        let mut vec_bytes = vec![];
+        let mut vec_bytes = Vec::with_capacity(v.len());
         for x in v {
             if let Some(data) = x {
                 vec_bytes.push(data)

@@ -35,7 +35,7 @@ impl Pipeline {
     pub async fn process(&self, msg: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let mut msgs = vec![msg];
         for processor in &self.processors {
-            let mut new_msgs = Vec::new();
+            let mut new_msgs = Vec::with_capacity(msgs.len());
             for msg in msgs {
                 match processor.process(msg).await {
                     Ok(processed) => new_msgs.extend(processed),
@@ -66,7 +66,7 @@ pub struct PipelineConfig {
 impl PipelineConfig {
     /// Build pipelines based on your configuration
     pub fn build(&self) -> Result<(Pipeline, u32), Error> {
-        let mut processors = Vec::new();
+        let mut processors = Vec::with_capacity(self.processors.len());
         for processor_config in &self.processors {
             processors.push(processor_config.build()?);
         }
