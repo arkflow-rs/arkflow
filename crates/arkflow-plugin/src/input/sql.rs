@@ -167,8 +167,6 @@ impl Input for SqlInput {
         let mut stream_lock = stream_arc.lock().await;
 
         let mut ctx = self.create_session_context().await?;
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
 
         self.init_connect(&mut ctx).await?;
 
@@ -347,7 +345,6 @@ impl SqlInput {
 
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
         let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
-            let config = SessionConfig::new_with_ballista();
             SessionContext::remote(&ballista.remote_url)
                 .await
                 .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
@@ -399,11 +396,11 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT * FROM test_table".to_string(),
+            ballista: None,
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
-            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         assert!(input.connect().await.is_ok());
@@ -414,11 +411,11 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT * FROM test_table".to_string(),
+            ballista: None,
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
-            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         input.connect().await.unwrap();
@@ -441,11 +438,12 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT invalid_column FROM test_table".to_string(),
+            ballista: None,
+
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
-            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         assert!(input.connect().await.is_err());
