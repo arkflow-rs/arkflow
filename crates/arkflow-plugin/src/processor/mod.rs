@@ -22,7 +22,6 @@ pub mod batch;
 pub mod json;
 pub mod protobuf;
 pub mod sql;
-pub mod udf;
 
 pub fn init() -> Result<(), Error> {
     batch::init()?;
