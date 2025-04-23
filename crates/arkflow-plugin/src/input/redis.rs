@@ -43,7 +43,7 @@ pub enum Type {
     /// List of channels to subscribe to
     Channels(Vec<String>),
     /// List of patterns to subscribe to
-    PATTERNS(Vec<String>),
+    Patterns(Vec<String>),
 }
 
 /// Redis input component
@@ -117,7 +117,7 @@ impl Input for RedisInput {
                         }
                     }
                 }
-                Type::PATTERNS(ref patterns) => {
+                Type::Patterns(ref patterns) => {
                     // Subscribe to patterns
                     for pattern in patterns {
                         if let Err(e) = pubsub.psubscribe(pattern).await {
