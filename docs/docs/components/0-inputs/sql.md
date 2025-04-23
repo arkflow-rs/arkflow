@@ -12,6 +12,17 @@ The SQL query statement to execute.
 
 type: `string`
 
+### **ballista**
+
+Optional configuration for distributed computing using Ballista.
+
+type: `object`
+
+properties:
+- `remote_url`: Ballista server URL
+  
+  type: `string`
+
 ### **input_type**
 
 The type of input source to query from.
@@ -120,15 +131,29 @@ options:
 
 ## Examples
 
+### Basic MySQL Connection
 ```yaml
-- input:
-    type: "sql"
-    select_sql: "SELECT * FROM table"
-    input_type:
-      mysql:
-        name: "my_mysql"
-        uri: "mysql://user:password@localhost:3306/db"
-        ssl:
-          ssl_mode: "verify_identity"
-          root_cert: "/path/to/cert.pem"
+input:
+  type: "sql"
+  select_sql: "SELECT * FROM flow"
+  input_type:
+    mysql:
+      name: "my_mysql"
+      uri: "mysql://user:password@localhost:3306/db"
+      ssl:
+        ssl_mode: "verify_identity"
+        root_cert: "/path/to/cert.pem"
+```
+
+### Distributed Query with Ballista
+```yaml
+input:
+  type: "sql"
+  select_sql: "SELECT * FROM flow where id > 1000"
+  ballista:
+    remote_url: "df://localhost:50050"
+  input_type:
+    parquet:
+      table_name: "parquet_table"
+      path: "/path/to/data.parquet"
 ```
