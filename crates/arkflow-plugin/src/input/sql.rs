@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::processor::udf;
-use ballista::prelude::SessionContextExt;
+use ballista::prelude::{SessionConfigExt, SessionContextExt};
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
@@ -347,6 +347,7 @@ impl SqlInput {
 
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
         let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
+            let config = SessionConfig::new_with_ballista();
             SessionContext::remote(&ballista.remote_url)
                 .await
                 .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
