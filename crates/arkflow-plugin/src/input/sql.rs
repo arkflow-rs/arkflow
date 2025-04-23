@@ -54,20 +54,30 @@ pub struct SqlInputConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BallistaConfig {
+    /// Ballista server url
     pub remote_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "input_type", rename_all = "snake_case")]
 enum InputType {
+    /// Avro input
     Avro(AvroConfig),
+    /// Arrow input
     Arrow(ArrowConfig),
+    /// JSON input
     Json(JsonConfig),
+    /// CSV input
     Csv(CsvConfig),
+    /// Parquet input
     Parquet(ParquetConfig),
+    /// Mysql input
     Mysql(MysqlConfig),
+    /// Duckdb input
     Duckdb(DuckDBConfig),
+    /// Postgres input
     Postgres(PostgresConfig),
+    /// Sqlite input
     Sqlite(SqliteConfig),
 }
 
@@ -75,6 +85,7 @@ enum InputType {
 struct AvroConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// avro file path
     path: String,
 }
 
@@ -82,6 +93,7 @@ struct AvroConfig {
 struct ArrowConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// arrow file path
     path: String,
 }
 
@@ -89,6 +101,7 @@ struct ArrowConfig {
 struct JsonConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// json file path
     path: String,
 }
 
@@ -96,6 +109,7 @@ struct JsonConfig {
 struct CsvConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// csv file path
     path: String,
 }
 
@@ -103,51 +117,66 @@ struct CsvConfig {
 struct ParquetConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// parquet file path
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// mysql uri
     uri: String,
+    /// mysql ssl config
     ssl: MysqlSslConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlSslConfig {
+    /// mysql ssl mode
     ssl_mode: String,
+    /// mysql ssl root cert
     root_cert: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDBConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// duckdb file path
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostgresConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// postgres uri
     uri: String,
+    /// postgres ssl config
     ssl: PostgresSslConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostgresSslConfig {
+    /// postgres ssl mode
     ssl_mode: String,
+    /// postgres ssl root cert
     root_cert: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SqliteConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// sqlite file path
     path: String,
 }
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
-    pub cancellation_token: CancellationToken,
+    cancellation_token: CancellationToken,
 }
 
 impl SqlInput {
