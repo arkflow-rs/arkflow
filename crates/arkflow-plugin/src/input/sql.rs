@@ -44,7 +44,9 @@ const DEFAULT_NAME: &str = "flow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
+    /// SQL query statement
     select_sql: String,
+    /// Ballista helps us perform distributed computing
     ballista: Option<BallistaConfig>,
     #[serde(flatten)]
     input_type: InputType,
