@@ -382,8 +382,8 @@ impl SqlInput {
         } else {
             SessionContext::new()
         };
-        udf::init(&mut ctx)?;
 
+        udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
