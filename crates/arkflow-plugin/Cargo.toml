@@ -27,6 +27,7 @@ tracing = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
 datafusion-table-providers = { version = "0.4", features = ["mysql", "postgres", "duckdb", "sqlite"] }
+ballista = { git = "https://github.com/apache/datafusion-ballista", rev = "f75ec91b4e1385213329809be84787a3f7fbeab5" }
 spiceai_duckdb_fork = "=1.2.1"
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }

@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::processor::udf;
+use ballista::prelude::SessionContextExt;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
@@ -43,7 +45,7 @@ const DEFAULT_NAME: &str = "flow";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
     select_sql: String,
-
+    remote_url: Option<String>,
     #[serde(flatten)]
     input_type: InputType,
 }
@@ -159,7 +161,7 @@ impl Input for SqlInput {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
 
-        let mut ctx = SessionContext::new();
+        let mut ctx = self.create_session_context().await?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
 
@@ -337,6 +339,21 @@ impl SqlInput {
         }
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
+
+    async fn create_session_context(&self) -> Result<SessionContext, Error> {
+        let mut ctx = if let Some(remote_url) = &self.sql_config.remote_url {
+            SessionContext::remote(remote_url)
+                .await
+                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
+        } else {
+            SessionContext::new()
+        };
+
+        udf::init(&mut ctx)?;
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        Ok(ctx)
+    }
 }
 
 pub(crate) struct SqlInputBuilder;
@@ -380,6 +397,7 @@ mod tests {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
+            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         assert!(input.connect().await.is_ok());
@@ -394,6 +412,7 @@ mod tests {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
+            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         input.connect().await.unwrap();
@@ -420,6 +439,7 @@ mod tests {
                 table_name: Some("test_table".to_string()),
                 path,
             }),
+            ..Default::default()
         };
         let input = SqlInput::new(config).unwrap();
         assert!(input.connect().await.is_err());
