@@ -45,9 +45,14 @@ const DEFAULT_NAME: &str = "flow";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
     select_sql: String,
-    remote_url: Option<String>,
+    ballista: Option<BallistaConfig>,
     #[serde(flatten)]
     input_type: InputType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BallistaConfig {
+    pub remote_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,8 +346,8 @@ impl SqlInput {
     }
 
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
-        let mut ctx = if let Some(remote_url) = &self.sql_config.remote_url {
-            SessionContext::remote(remote_url)
+        let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
+            SessionContext::remote(&ballista.remote_url)
                 .await
                 .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
         } else {
