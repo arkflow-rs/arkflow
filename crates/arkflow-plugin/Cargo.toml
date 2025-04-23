@@ -56,9 +56,6 @@ sasl2-sys = { workspace = true }
 # arkflow
 arkflow-core = { workspace = true }
 
-[patch.crates-io]
-duckdb = { package = "spiceai_duckdb_fork", version = "1.2.1" }
-
 [dev-dependencies]
 tempfile = { workspace = true }
 mockall = { workspace = true }
