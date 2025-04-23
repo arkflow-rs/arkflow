@@ -38,14 +38,20 @@ pub struct RedisInputConfig {
     _type: Type,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Type {
+#[serde(tag = "subscribe_type", rename_all = "snake_case")]
+pub enum Subscribe {
     /// List of channels to subscribe to
-    Channels(Vec<String>),
+    Channels { channels: Vec<String> },
     /// List of patterns to subscribe to
-    Patterns(Vec<String>),
+    Patterns { patterns: Vec<String> },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Type {
+    Subscribe { subscribe: Subscribe },
+    List { list: Vec<String> },
+}
 /// Redis input component
 pub struct RedisInput {
     config: RedisInputConfig,
@@ -99,38 +105,52 @@ impl Input for RedisInput {
         // let channels = self.config.channels.clone();
         // let patterns = self.config.patterns.clone().unwrap_or_default();
         let config_type = self.config._type.clone();
+
         tokio::spawn(async move {
             let mut pubsub = conn.into_pubsub();
             match config_type {
-                Type::Channels(ref channels) => {
-                    // Subscribe to channels
-                    for channel in channels {
-                        if let Err(e) = pubsub.subscribe(channel).await {
-                            error!("Failed to subscribe to Redis channel {}: {}", channel, e);
-                            if let Err(e) = sender_clone
-                                .send_async(RedisMsg::Err(Error::Disconnection))
-                                .await
-                            {
-                                error!("{}", e);
+                Type::Subscribe { subscribe } => {
+                    match subscribe {
+                        Subscribe::Channels { channels } => {
+                            // Subscribe to channels
+                            for channel in channels {
+                                if let Err(e) = pubsub.subscribe(&channel).await {
+                                    error!(
+                                        "Failed to subscribe to Redis channel {}: {}",
+                                        channel, e
+                                    );
+                                    if let Err(e) = sender_clone
+                                        .send_async(RedisMsg::Err(Error::Disconnection))
+                                        .await
+                                    {
+                                        error!("{}", e);
+                                    }
+                                    return;
+                                }
                             }
-                            return;
+                        }
+                        Subscribe::Patterns { patterns } => {
+                            // Subscribe to patterns
+                            for pattern in patterns {
+                                if let Err(e) = pubsub.psubscribe(&pattern).await {
+                                    error!(
+                                        "Failed to subscribe to Redis pattern {}: {}",
+                                        pattern, e
+                                    );
+                                    if let Err(e) = sender_clone
+                                        .send_async(RedisMsg::Err(Error::Disconnection))
+                                        .await
+                                    {
+                                        error!("{}", e);
+                                    }
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
-                Type::Patterns(ref patterns) => {
-                    // Subscribe to patterns
-                    for pattern in patterns {
-                        if let Err(e) = pubsub.psubscribe(pattern).await {
-                            error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
-                            if let Err(e) = sender_clone
-                                .send_async(RedisMsg::Err(Error::Disconnection))
-                                .await
-                            {
-                                error!("{}", e);
-                            }
-                            return;
-                        }
-                    }
+                Type::List { ref list } => {
+                    todo!()
                 }
             };
 
