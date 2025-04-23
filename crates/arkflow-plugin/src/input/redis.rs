@@ -66,8 +66,8 @@ impl RedisInput {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
 
-        if let Err(e) = redis::parse_redis_url(&config.url) {
-            return Err(Error::Config(format!("Invalid Redis URL: {}", e)));
+        if let None = redis::parse_redis_url(&config.url) {
+            return Err(Error::Config(format!("Invalid Redis URL: {}", &config.url)));
         }
         Ok(Self {
             config,
