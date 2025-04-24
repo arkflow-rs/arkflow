@@ -8,11 +8,7 @@ homepage = "https://github.com/arkflow-rs/arkflow"
 license = "Apache-2.0"
 
 [workspace]
-members = [
-    "crates/arkflow-plugin",
-    "crates/arkflow-core",
-    "crates/arkflow"
-]
+members = ["crates/arkflow-plugin", "crates/arkflow-core", "crates/arkflow"]
 
 resolver = "2"
 
@@ -23,7 +19,7 @@ async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
 
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 humantime = "2.1.0"
@@ -54,12 +50,18 @@ colored = "3.0"
 
 flume = "=0.11"
 rumqttc = "0.24.0"
-
+vrl = { version = "0.23.0", features = ["value", "compiler", "stdlib"] }
 
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl-vendored", "zstd"] }
+rdkafka = { version = "0.37", features = [
+    "cmake-build",
+    "tracing",
+    "sasl",
+    "ssl-vendored",
+    "zstd",
+] }
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 

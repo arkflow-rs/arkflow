@@ -77,75 +77,7 @@ impl JsonToArrowProcessor {
     fn json_to_arrow(&self, content: &[u8]) -> Result<RecordBatch, Error> {
         let json_value: Value = serde_json::from_slice(content)
             .map_err(|e| Error::Process(format!("JSON parsing error: {}", e)))?;
-
-        match json_value {
-            Value::Object(obj) => {
-                let mut fields = Vec::new();
-                let mut columns: Vec<ArrayRef> = Vec::new();
-
-                for (key, value) in obj {
-                    if let Some(ref set) = self.config.fields_to_include {
-                        if !set.contains(&key) {
-                            continue;
-                        }
-                    }
-                    match value {
-                        Value::Null => {
-                            fields.push(Field::new(&key, DataType::Null, true));
-                            // 空值列处理
-                            columns.push(Arc::new(NullArray::new(1)));
-                        }
-                        Value::Bool(v) => {
-                            fields.push(Field::new(&key, DataType::Boolean, false));
-                            columns.push(Arc::new(BooleanArray::from(vec![v])));
-                        }
-                        Value::Number(v) => {
-                            if v.is_i64() {
-                                fields.push(Field::new(&key, DataType::Int64, false));
-                                columns.push(Arc::new(Int64Array::from(vec![v.as_i64().unwrap()])));
-                            } else if v.is_u64() {
-                                fields.push(Field::new(&key, DataType::UInt64, false));
-                                columns
-                                    .push(Arc::new(UInt64Array::from(vec![v.as_u64().unwrap()])));
-                            } else {
-                                fields.push(Field::new(&key, DataType::Float64, false));
-                                columns.push(Arc::new(Float64Array::from(vec![v
-                                    .as_f64()
-                                    .unwrap_or(0.0)])));
-                            }
-                        }
-                        Value::String(v) => {
-                            fields.push(Field::new(&key, DataType::Utf8, false));
-                            columns.push(Arc::new(StringArray::from(vec![v])));
-                        }
-                        Value::Array(v) => {
-                            fields.push(Field::new(&key, DataType::Utf8, false));
-                            if let Ok(x) = serde_json::to_string(&v) {
-                                columns.push(Arc::new(StringArray::from(vec![x])));
-                            } else {
-                                columns.push(Arc::new(StringArray::from(vec!["[]".to_string()])));
-                            }
-                        }
-                        Value::Object(v) => {
-                            fields.push(Field::new(&key, DataType::Utf8, false));
-                            if let Ok(x) = serde_json::to_string(&v) {
-                                columns.push(Arc::new(StringArray::from(vec![x])));
-                            } else {
-                                columns.push(Arc::new(StringArray::from(vec!["{}".to_string()])));
-                            }
-                        }
-                    };
-                }
-
-                let schema = Arc::new(Schema::new(fields));
-                RecordBatch::try_new(schema, columns).map_err(|e| {
-                    Error::Process(format!("Creating an Arrow record batch failed: {}", e))
-                })
-            }
-            _ => Err(Error::Process(
-                "The input must be a JSON object".to_string(),
-            )),
-        }
+        json_to_arrow_inner(json_value, self.config.fields_to_include.as_ref())
     }
 }
 
@@ -219,6 +151,79 @@ pub fn init() -> Result<(), Error> {
     register_processor_builder("arrow_to_json", Arc::new(ArrowToJsonProcessorBuilder))?;
     register_processor_builder("json_to_arrow", Arc::new(JsonToArrowProcessorBuilder))?;
     Ok(())
+}
+
+pub(crate) fn json_to_arrow_inner(
+    json_value: Value,
+    fields_to_include: Option<&HashSet<String>>,
+) -> Result<RecordBatch, Error> {
+    match json_value {
+        Value::Object(obj) => {
+            let mut fields = Vec::new();
+            let mut columns: Vec<ArrayRef> = Vec::new();
+
+            for (key, value) in obj {
+                if let Some(ref set) = fields_to_include {
+                    if !set.contains(&key) {
+                        continue;
+                    }
+                }
+                match value {
+                    Value::Null => {
+                        fields.push(Field::new(&key, DataType::Null, true));
+                        // 空值列处理
+                        columns.push(Arc::new(NullArray::new(1)));
+                    }
+                    Value::Bool(v) => {
+                        fields.push(Field::new(&key, DataType::Boolean, false));
+                        columns.push(Arc::new(BooleanArray::from(vec![v])));
+                    }
+                    Value::Number(v) => {
+                        if v.is_i64() {
+                            fields.push(Field::new(&key, DataType::Int64, false));
+                            columns.push(Arc::new(Int64Array::from(vec![v.as_i64().unwrap()])));
+                        } else if v.is_u64() {
+                            fields.push(Field::new(&key, DataType::UInt64, false));
+                            columns.push(Arc::new(UInt64Array::from(vec![v.as_u64().unwrap()])));
+                        } else {
+                            fields.push(Field::new(&key, DataType::Float64, false));
+                            columns.push(Arc::new(Float64Array::from(vec![v
+                                .as_f64()
+                                .unwrap_or(0.0)])));
+                        }
+                    }
+                    Value::String(v) => {
+                        fields.push(Field::new(&key, DataType::Utf8, false));
+                        columns.push(Arc::new(StringArray::from(vec![v])));
+                    }
+                    Value::Array(v) => {
+                        fields.push(Field::new(&key, DataType::Utf8, false));
+                        if let Ok(x) = serde_json::to_string(&v) {
+                            columns.push(Arc::new(StringArray::from(vec![x])));
+                        } else {
+                            columns.push(Arc::new(StringArray::from(vec!["[]".to_string()])));
+                        }
+                    }
+                    Value::Object(v) => {
+                        fields.push(Field::new(&key, DataType::Utf8, false));
+                        if let Ok(x) = serde_json::to_string(&v) {
+                            columns.push(Arc::new(StringArray::from(vec![x])));
+                        } else {
+                            columns.push(Arc::new(StringArray::from(vec!["{}".to_string()])));
+                        }
+                    }
+                };
+            }
+
+            let schema = Arc::new(Schema::new(fields));
+            RecordBatch::try_new(schema, columns).map_err(|e| {
+                Error::Process(format!("Creating an Arrow record batch failed: {}", e))
+            })
+        }
+        _ => Err(Error::Process(
+            "The input must be a JSON object".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,28 @@
+logging:
+  level: error
+streams:
+- input:
+    type: "generate"
+    context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+    interval: 1s
+    batch_size: 1
+
+  pipeline:
+    thread_num: 4
+    processors:
+    - type: "json_to_arrow"
+    - type: "vrl"
+      value_field: "value"
+      statement: ".v2, err = .value * 2; ."
+    - type: "arrow_to_json"
+
+  output:
+    type: "stdout"
+
+#    output:
+#      type: "mqtt"
+#      host: "localhost"
+#      port: 1883
+#      qos: 1
+#      client_id: "flow_output"
+#      topic: "flow_output"

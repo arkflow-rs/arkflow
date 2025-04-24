@@ -9,7 +9,6 @@ homepage.workspace = true
 license.workspace = true
 
 
-
 [dependencies]
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -26,7 +25,12 @@ tracing = { workspace = true }
 
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
-datafusion-table-providers = { version = "0.4", features = ["mysql", "postgres", "duckdb", "sqlite"] }
+datafusion-table-providers = { version = "0.4", features = [
+    "mysql",
+    "postgres",
+    "duckdb",
+    "sqlite",
+] }
 ballista = { git = "https://github.com/apache/datafusion-ballista", rev = "f75ec91b4e1385213329809be84787a3f7fbeab5" }
 spiceai_duckdb_fork = "=1.2.1"
 arrow-json = { workspace = true }
@@ -52,6 +56,8 @@ aws-msk-iam-sasl-signer = { workspace = true }
 rdkafka = { workspace = true }
 rdkafka-sys = { workspace = true }
 sasl2-sys = { workspace = true }
+
+vrl = { workspace = true }
 
 # arkflow
 arkflow-core = { workspace = true }
