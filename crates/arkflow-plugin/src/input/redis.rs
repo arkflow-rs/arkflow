@@ -47,7 +47,7 @@ pub enum Subscribe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "redis_type", rename_all = "snake_case")]
 pub enum Type {
     Subscribe { subscribe: Subscribe },
     List { list: Vec<String> },
@@ -102,8 +102,7 @@ impl Input for RedisInput {
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
-        // let channels = self.config.channels.clone();
-        // let patterns = self.config.patterns.clone().unwrap_or_default();
+
         let config_type = self.config._type.clone();
 
         tokio::spawn(async move {
