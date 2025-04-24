@@ -23,8 +23,6 @@ use std::sync::{Arc, RwLock};
 
 use crate::{Error, MessageBatch};
 
-mod udf;
-
 lazy_static::lazy_static! {
     static ref PROCESSOR_BUILDERS: RwLock<HashMap<String, Arc<dyn ProcessorBuilder>>> = RwLock::new(HashMap::new());
 }

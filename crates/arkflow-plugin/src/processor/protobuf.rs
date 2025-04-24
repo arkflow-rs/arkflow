@@ -152,12 +152,13 @@ impl ProtobufProcessor {
         let proto_msg = DynamicMessage::decode(self.descriptor.clone(), data)
             .map_err(|e| Error::Process(format!("Protobuf message parsing failed: {}", e)))?;
 
+        let descriptor_fields = self.descriptor.fields();
         // Building an Arrow Schema
-        let mut fields = Vec::new();
-        let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut fields = Vec::with_capacity(descriptor_fields.len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(descriptor_fields.len());
 
         // Iterate over all fields of a Protobuf message
-        for field in self.descriptor.fields() {
+        for field in descriptor_fields {
             let field_name = field.name();
 
             let field_value_opt = proto_msg.get_field_by_name(field_name);

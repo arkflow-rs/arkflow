@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::udf;
+use ballista::prelude::SessionContextExt;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
@@ -42,23 +44,40 @@ const DEFAULT_NAME: &str = "flow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlInputConfig {
+    /// SQL query statement
     select_sql: String,
-
+    /// Ballista helps us perform distributed computing
+    ballista: Option<BallistaConfig>,
     #[serde(flatten)]
     input_type: InputType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BallistaConfig {
+    /// Ballista server url
+    pub remote_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "input_type", rename_all = "snake_case")]
 enum InputType {
+    /// Avro input
     Avro(AvroConfig),
+    /// Arrow input
     Arrow(ArrowConfig),
+    /// JSON input
     Json(JsonConfig),
+    /// CSV input
     Csv(CsvConfig),
+    /// Parquet input
     Parquet(ParquetConfig),
+    /// Mysql input
     Mysql(MysqlConfig),
+    /// Duckdb input
     Duckdb(DuckDBConfig),
+    /// Postgres input
     Postgres(PostgresConfig),
+    /// Sqlite input
     Sqlite(SqliteConfig),
 }
 
@@ -66,6 +85,7 @@ enum InputType {
 struct AvroConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// avro file path
     path: String,
 }
 
@@ -73,6 +93,7 @@ struct AvroConfig {
 struct ArrowConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// arrow file path
     path: String,
 }
 
@@ -80,6 +101,7 @@ struct ArrowConfig {
 struct JsonConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// json file path
     path: String,
 }
 
@@ -87,6 +109,7 @@ struct JsonConfig {
 struct CsvConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// csv file path
     path: String,
 }
 
@@ -94,51 +117,66 @@ struct CsvConfig {
 struct ParquetConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
+    /// parquet file path
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// mysql uri
     uri: String,
+    /// mysql ssl config
     ssl: MysqlSslConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlSslConfig {
+    /// mysql ssl mode
     ssl_mode: String,
+    /// mysql ssl root cert
     root_cert: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDBConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// duckdb file path
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostgresConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// postgres uri
     uri: String,
+    /// postgres ssl config
     ssl: PostgresSslConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostgresSslConfig {
+    /// postgres ssl mode
     ssl_mode: String,
+    /// postgres ssl root cert
     root_cert: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SqliteConfig {
+    /// Table name (used in SQL queries)
     name: Option<String>,
+    /// sqlite file path
     path: String,
 }
 
 pub struct SqlInput {
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
-    pub cancellation_token: CancellationToken,
+    cancellation_token: CancellationToken,
 }
 
 impl SqlInput {
@@ -159,9 +197,7 @@ impl Input for SqlInput {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
 
-        let mut ctx = SessionContext::new();
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        let mut ctx = self.create_session_context().await?;
 
         self.init_connect(&mut ctx).await?;
 
@@ -337,6 +373,21 @@ impl SqlInput {
         }
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
+
+    async fn create_session_context(&self) -> Result<SessionContext, Error> {
+        let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
+            SessionContext::remote(&ballista.remote_url)
+                .await
+                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
+        } else {
+            SessionContext::new()
+        };
+
+        udf::init(&mut ctx)?;
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        Ok(ctx)
+    }
 }
 
 pub(crate) struct SqlInputBuilder;
@@ -376,6 +427,7 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT * FROM test_table".to_string(),
+            ballista: None,
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
@@ -390,6 +442,7 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT * FROM test_table".to_string(),
+            ballista: None,
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
@@ -416,6 +469,8 @@ mod tests {
         let (_x, path) = create_test_data();
         let config = SqlInputConfig {
             select_sql: "SELECT invalid_column FROM test_table".to_string(),
+            ballista: None,
+
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
