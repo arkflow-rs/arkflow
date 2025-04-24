@@ -16,7 +16,7 @@
 //!
 //! Receive data from Redis pub/sub channels
 
-use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
+use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch};
 
 use async_trait::async_trait;
@@ -165,8 +165,6 @@ impl Input for RedisInput {
                     }
                 }
                 Type::List { ref list } => {
-                    // 使用BLPOP命令从Redis列表中获取数据
-                    // BLPOP是阻塞式的，会等待直到列表中有数据或超时
                     let conn_result = client.get_async_connection().await;
                     if let Err(e) = conn_result {
                         error!("Failed to get Redis connection for list: {}", e);
@@ -184,7 +182,6 @@ impl Input for RedisInput {
                                 break;
                             }
                             result = async {
-                                // 使用BLPOP命令，超时设置为1秒，这样可以定期检查取消令牌
                                 let blpop_result: redis::RedisResult<Option<(String, Vec<u8>)>> = redis::cmd("BLPOP")
                                     .arg(list.clone())
                                     .arg(1) // 1秒超时
@@ -199,7 +196,6 @@ impl Input for RedisInput {
                                         }
                                     }
                                     Ok(None) => {
-                                        // 超时，继续循环
                                         continue;
                                     }
                                     Err(e) => {
@@ -207,7 +203,6 @@ impl Input for RedisInput {
                                         if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
                                             error!("{}", e);
                                         }
-                                        // 连接错误，退出循环
                                         break;
                                     }
                                 }
@@ -264,11 +259,4 @@ impl InputBuilder for RedisInputBuilder {
 /// Initialize Redis input component
 pub fn init() -> Result<(), Error> {
     register_input_builder("redis", Arc::new(RedisInputBuilder))
-}
-
-struct NoopAck;
-
-#[async_trait]
-impl Ack for NoopAck {
-    async fn ack(&self) {}
 }
