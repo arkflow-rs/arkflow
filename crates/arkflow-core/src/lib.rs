@@ -33,6 +33,7 @@ pub mod output;
 pub mod pipeline;
 pub mod processor;
 
+mod message;
 pub mod stream;
 
 /// Error in the stream processing engine

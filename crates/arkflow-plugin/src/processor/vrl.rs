@@ -2,10 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::{
-    arrow::{array::*, datatypes::DataType, record_batch::RecordBatch},
-    error,
-};
+use datafusion::arrow::{array::*, datatypes::DataType, record_batch::RecordBatch};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, warn};
