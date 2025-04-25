@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::record_batch::RecordBatch;
-use duckdb::arrow::{array::*, datatypes::DataType};
+use datafusion::{
+    arrow::{array::*, datatypes::DataType, record_batch::RecordBatch},
+    error,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::error;
+use tracing::{error, warn};
 use vrl::{
     compiler::{self, Program, TargetValue, TimeZone},
     prelude::{state::RuntimeState, Context},
@@ -58,8 +60,11 @@ impl Processor for VrlProcessor {
             let mut ctx = Context::new(&mut target, &mut state, &timezone);
             if let Ok(v) = self.program.resolve(&mut ctx) {
                 let v = vrl_value_to_json_value(v);
-                if let Ok(rb) = json_to_arrow_inner(v, None) {
-                    batches.push(MessageBatch(rb));
+                match json_to_arrow_inner(v, None) {
+                    Ok(rb) => {
+                        batches.push(MessageBatch(rb));
+                    }
+                    Err(e) => warn!("Failed to convert JSON to Arrow: {:?}", e),
                 }
             }
         }
@@ -141,10 +146,10 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                 }
             }
             DataType::Binary => {
-                if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
+                if let Some(col) = column.as_any().downcast_ref::<BinaryArray>() {
                     for i in 0..rows {
                         let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_string().into());
+                        let vrl_value = VrlValue::Bytes(value.to_vec().into());
                         vrl_values[i]
                             .as_object_mut()
                             .unwrap()
