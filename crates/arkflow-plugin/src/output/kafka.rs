@@ -135,7 +135,7 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
             .value_field
             .as_deref()
             .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-        let payloads = msg.to_binary(value_field)?;
+        let payloads = msg.to_binary()?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -189,7 +189,8 @@ impl<T: KafkaClient> Output for KafkaOutput<T> {
 }
 impl<T> KafkaOutput<T> {
     fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
-        self.config.topic.evaluate_expr(msg)
+        // self.config.topic.evaluate_expr(msg)
+        todo!()
     }
 
     // fn get_expr_value(x: ColumnarValue) -> Option<Vec<String>> {
@@ -217,8 +218,8 @@ impl<T> KafkaOutput<T> {
         let Some(v) = &self.config.key else {
             return Ok(EvaluateResult::Vec(vec![]));
         };
-
-        v.evaluate_expr(msg)
+        todo!()
+        // v.evaluate_expr(msg)
     }
 }
 

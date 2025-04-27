@@ -139,7 +139,7 @@ mod tests {
         input.connect().await.unwrap();
 
         let (msg, ack) = input.read().await.unwrap();
-        let result = msg.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap();
+        let result = msg.to_binary().unwrap();
         assert_eq!(
             String::from_utf8_lossy(result.get(0).unwrap()),
             "test message"

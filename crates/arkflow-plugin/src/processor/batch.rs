@@ -78,18 +78,19 @@ impl BatchProcessor {
             return Ok(vec![]);
         }
 
-        let schema = batch[0].schema();
-        let x: Vec<RecordBatch> = batch.iter().map(|batch| batch.clone().into()).collect();
-        let new_batch = arrow::compute::concat_batches(&schema, &x)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-        let new_batch = Ok(vec![MessageBatch::new_arrow(new_batch)]);
-
-        batch.clear();
-        let mut last_batch_time = self.last_batch_time.lock().await;
-
-        *last_batch_time = std::time::Instant::now();
-
-        new_batch
+        // let schema = batch[0].schema();
+        // let x: Vec<RecordBatch> = batch.iter().map(|batch| batch.clone().into()).collect();
+        // let new_batch = arrow::compute::concat_batches(&schema, &x)
+        //     .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+        // let new_batch = Ok(vec![MessageBatch::new_arrow(new_batch)]);
+        //
+        // batch.clear();
+        // let mut last_batch_time = self.last_batch_time.lock().await;
+        //
+        // *last_batch_time = std::time::Instant::now();
+        //
+        // new_batch
+        todo!()
     }
 }
 

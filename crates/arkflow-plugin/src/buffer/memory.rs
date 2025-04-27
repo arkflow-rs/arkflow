@@ -15,6 +15,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
+use arkflow_core::message::Message;
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use datafusion::arrow;
@@ -84,24 +85,21 @@ impl MemoryBuffer {
             return Ok(None);
         }
 
-        let mut messages = Vec::new();
+        let mut messages: Vec<Message> = Vec::new();
         let mut acks = Vec::new();
 
         while let Some((msg, ack)) = queue_lock.pop_back() {
-            messages.push(msg);
+            let x :Vec<Message>= msg.into();
+            messages.extend(x.into_iter());
             acks.push(ack);
         }
 
         if messages.is_empty() {
             return Ok(None);
         }
-        let schema = messages[0].schema();
-        let x: Vec<RecordBatch> = messages.into_iter().map(|batch| batch.into()).collect();
-        let new_batch = arrow::compute::concat_batches(&schema, &x)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
         let new_ack = Arc::new(ArrayAck(acks));
-        Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
+        Ok(Some((messages.into(), new_ack)))
     }
 }
 

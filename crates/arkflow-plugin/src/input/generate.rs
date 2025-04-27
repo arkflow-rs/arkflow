@@ -127,7 +127,7 @@ mod tests {
         let (msg_batch, _) = input.read().await.unwrap();
         assert_eq!(msg_batch.len(), 1);
         assert_eq!(
-            String::from_utf8(msg_batch.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap()[0].to_vec())
+            String::from_utf8(msg_batch.to_binary().unwrap()[0].to_vec())
                 .unwrap(),
             "test message"
         );
@@ -151,7 +151,7 @@ mod tests {
         for i in 0..3 {
             assert_eq!(
                 String::from_utf8(
-                    msg_batch.to_binary(DEFAULT_BINARY_VALUE_FIELD).unwrap()[i].to_vec()
+                    msg_batch.to_binary().unwrap()[i].to_vec()
                 )
                 .unwrap(),
                 "test"

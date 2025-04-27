@@ -137,40 +137,40 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
 
         // Get the message content
-        let payloads = match msg.to_binary(value_field) {
+        let payloads = match msg.to_binary() {
             Ok(v) => v.to_vec(),
             Err(e) => {
                 return Err(e);
             }
         };
-
-        let topic = self.config.topic.evaluate_expr(&msg)?;
-
-        // Determine the QoS level
-        let qos_level = match self.config.qos {
-            Some(0) => QoS::AtMostOnce,
-            Some(1) => QoS::AtLeastOnce,
-            Some(2) => QoS::ExactlyOnce,
-            _ => QoS::AtLeastOnce, // The default is QoS 1
-        };
-
-        // Decide whether to keep the message
-        let retain = self.config.retain.unwrap_or(false);
-
-        for (i, payload) in payloads.into_iter().enumerate() {
-            info!(
-                "Send message: {}",
-                &String::from_utf8_lossy((&payload).as_ref())
-            );
-
-            if let Some(topic_str) = topic.get(i) {
-                // Post a message
-                client
-                    .publish(topic_str, qos_level, retain, payload)
-                    .await
-                    .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
-            }
-        }
+        todo!();
+        //
+        // let topic = self.config.topic.evaluate_expr(&msg)?;
+        // // Determine the QoS level
+        // let qos_level = match self.config.qos {
+        //     Some(0) => QoS::AtMostOnce,
+        //     Some(1) => QoS::AtLeastOnce,
+        //     Some(2) => QoS::ExactlyOnce,
+        //     _ => QoS::AtLeastOnce, // The default is QoS 1
+        // };
+        //
+        // // Decide whether to keep the message
+        // let retain = self.config.retain.unwrap_or(false);
+        //
+        // for (i, payload) in payloads.into_iter().enumerate() {
+        //     info!(
+        //         "Send message: {}",
+        //         &String::from_utf8_lossy((&payload).as_ref())
+        //     );
+        //
+        //     if let Some(topic_str) = topic.get(i) {
+        //         // Post a message
+        //         client
+        //             .publish(topic_str, qos_level, retain, payload)
+        //             .await
+        //             .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
+        //     }
+        // }
 
         Ok(())
     }

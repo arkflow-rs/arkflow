@@ -16,6 +16,7 @@
 //!
 //! Outputs the processed data to standard output
 
+use arkflow_core::message::Value;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
@@ -70,24 +71,22 @@ impl<T: StdWriter> StdoutOutput<T> {
     async fn arrow_stdout(&self, message_batch: MessageBatch) -> Result<(), Error> {
         let mut writer_std = self.writer.lock().await;
 
-        // Use Arrow's JSON serialization functionality
-        let mut buf = Vec::new();
-        let mut writer = arrow::json::ArrayWriter::new(&mut buf);
-        writer
-            .write(&message_batch)
-            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
-        writer
-            .finish()
-            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
-        let s = String::from_utf8_lossy(&buf);
+        for x in message_batch.iter() {
+            match x.value {
+                Value::Bytes(ref b) => {
+                    if self.config.append_newline.unwrap_or(true) {
+                        writeln!(writer_std, "{}", String::from_utf8_lossy(b)).map_err(Error::Io)?
+                    } else {
+                        write!(writer_std, "{}", String::from_utf8_lossy(b)).map_err(Error::Io)?
+                    }
 
-        if self.config.append_newline.unwrap_or(true) {
-            writeln!(writer_std, "{}", s).map_err(Error::Io)?
-        } else {
-            write!(writer_std, "{}", s).map_err(Error::Io)?
+                    writer_std.flush().map_err(Error::Io)?;
+                }
+                Value::Object(_) => {}
+                _ => {}
+            }
         }
 
-        writer_std.flush().map_err(Error::Io)?;
         Ok(())
     }
 }

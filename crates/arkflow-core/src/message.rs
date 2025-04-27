@@ -13,21 +13,20 @@
  */
 use crate::Error;
 use bytes::Bytes;
-use clap::builder::TypedValueParser;
+use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::ToByteSlice;
-use futures::StreamExt;
 use serde_json::Number;
 use std::collections::BTreeMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Message {
     pub value: Value,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Value {
-    Bytes(Bytes),
     Null,
+    Bytes(Bytes),
     Float32(f32),
     Float64(f64),
     Int8(i8),
@@ -42,7 +41,7 @@ pub enum Value {
     Bool(bool),
     Object(BTreeMap<String, Value>),
     Array(Vec<Value>),
-    // Timestamp(DateTime<Utc>),
+    Timestamp(DateTime<Utc>),
 }
 
 impl TryInto<serde_json::Value> for Value {
@@ -82,6 +81,7 @@ impl TryInto<serde_json::Value> for Value {
                     .map(|v| v.try_into().map(|x| x))
                     .collect::<Result<Vec<serde_json::Value>, Self::Error>>()?,
             ),
+            Value::Timestamp(v) => serde_json::Value::String(v.to_rfc3339()),
         })
     }
 }
@@ -108,5 +108,11 @@ impl TryFrom<serde_json::Value> for Value {
                     .collect::<Result<_, Self::Error>>()?,
             ),
         })
+    }
+}
+
+impl Into<Message> for Value {
+    fn into(self) -> Message {
+        Message { value: self }
     }
 }

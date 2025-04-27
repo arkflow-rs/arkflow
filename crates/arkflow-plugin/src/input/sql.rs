@@ -241,7 +241,7 @@ impl Input for SqlInput {
                 let Some(x) = value else {
                     return Err(Error::EOF);
                 };
-                Ok((MessageBatch::new_arrow(x), Arc::new(NoopAck)))
+                Ok((MessageBatch::try_from(x)?, Arc::new(NoopAck)))
             }
 
         }

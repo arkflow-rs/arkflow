@@ -28,3 +28,4 @@ colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }

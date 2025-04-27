@@ -206,6 +206,7 @@ dependencies = [
  "async-trait",
  "axum 0.6.20",
  "bytes",
+ "chrono",
  "clap",
  "colored",
  "datafusion",

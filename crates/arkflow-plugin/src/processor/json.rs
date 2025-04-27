@@ -17,7 +17,7 @@
 //! A processor for converting between binary data and the Arrow format
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -47,12 +47,7 @@ pub struct JsonToArrowProcessor {
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let mut batches = Vec::with_capacity(msg_batch.len());
-        let result = msg_batch.to_binary(
-            self.config
-                .value_field
-                .as_deref()
-                .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
-        )?;
+        let result = msg_batch.to_binary()?;
         for x in result {
             let record_batch = self.json_to_arrow(x)?;
             batches.push(record_batch)
@@ -65,7 +60,7 @@ impl Processor for JsonToArrowProcessor {
         let schema = batches[0].schema();
         let batch = arrow::compute::concat_batches(&schema, &batches)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-        Ok(vec![MessageBatch::new_arrow(batch)])
+        Ok(vec![MessageBatch::try_from(batch)?])
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -100,23 +95,24 @@ impl Processor for ArrowToJsonProcessor {
 
 impl ArrowToJsonProcessor {
     /// Convert Arrow format to JSON
-    fn arrow_to_json(&self, mut batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
-        if let Some(ref set) = self.config.fields_to_include {
-            batch = batch.filter_columns(set)?
-        }
-
-        let mut buf = Vec::new();
-        let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
-        writer
-            .write(&batch)
-            .map_err(|e| Error::Process(format!("Arrow JSON Serialization error: {}", e)))?;
-        writer.finish().map_err(|e| {
-            Error::Process(format!("Arrow JSON Serialization Complete Error: {}", e))
-        })?;
-        let json_str = String::from_utf8(buf)
-            .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
-
-        Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
+    fn arrow_to_json(&self, mut batch: MessageBatch) -> Result<Vec<Vec<u8>>, Error> {
+        // if let Some(ref set) = self.config.fields_to_include {
+        //     batch = batch.filter_columns(set)?
+        // }
+        //
+        // let mut buf = Vec::new();
+        // let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
+        // writer
+        //     .write(&batch)
+        //     .map_err(|e| Error::Process(format!("Arrow JSON Serialization error: {}", e)))?;
+        // writer.finish().map_err(|e| {
+        //     Error::Process(format!("Arrow JSON Serialization Complete Error: {}", e))
+        // })?;
+        // let json_str = String::from_utf8(buf)
+        //     .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
+        //
+        // Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
+        todo!()
     }
 }
 

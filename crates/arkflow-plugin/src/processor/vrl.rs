@@ -41,7 +41,7 @@ pub struct VrlProcessor {
 impl Processor for VrlProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let mut batches = vec![];
-        let result = recordbatch_to_vrl_value(msg_batch.0);
+        let result = recordbatch_to_vrl_value(msg_batch);
 
         let mut state = RuntimeState::default();
         let timezone = TimeZone::default();
@@ -59,7 +59,7 @@ impl Processor for VrlProcessor {
                 let v = vrl_value_to_json_value(v);
                 match json_to_arrow_inner(v, None) {
                     Ok(rb) => {
-                        batches.push(MessageBatch(rb));
+                        // batches.push(MessageBatch(rb));
                     }
                     Err(e) => warn!("Failed to convert JSON to Arrow: {:?}", e),
                 }
@@ -118,221 +118,222 @@ pub(crate) fn vrl_value_to_json_value(vrl_value: VrlValue) -> Value {
     }
 }
 
-pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValue> {
-    let rows = record_batch.num_rows();
-    let mut vrl_values = Vec::with_capacity(rows);
-    for _ in 0..rows {
-        let map = BTreeMap::new();
-        vrl_values.push(VrlValue::Object(map));
-    }
-    for i in 0..record_batch.num_columns() {
-        let column = record_batch.column(i);
-        let schema = record_batch.schema();
-        let name = schema.field(i).name();
-        match column.data_type() {
-            DataType::Utf8 => {
-                if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_string().into());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Binary => {
-                if let Some(col) = column.as_any().downcast_ref::<BinaryArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_vec().into());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Boolean => {
-                if let Some(col) = column.as_any().downcast_ref::<BooleanArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Boolean(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Float64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Float64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Float32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Float32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value =
-                            VrlValue::Float((value as f64).try_into().unwrap_or_default());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Int64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Int32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Int16 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int16Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Int8 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int8Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::UInt64 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::UInt32 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::UInt16 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt16Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::UInt8 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt8Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Date32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Date32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Date64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Date64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
-                    }
-                }
-            }
-            DataType::Null => {
-                // Handle null values
-                for i in 0..rows {
-                    let vrl_value = VrlValue::Null;
-                    vrl_values[i]
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(name.to_string().into(), vrl_value);
-                }
-            }
-            _ => {
-                // Handle unsupported data types
-                for i in 0..rows {
-                    let vrl_value = VrlValue::Null;
-                    vrl_values[i]
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(name.to_string().into(), vrl_value);
-                }
-                error!("Unsupported data type: {:?}", column.data_type());
-            }
-        };
-    }
-    vrl_values
+pub(crate) fn recordbatch_to_vrl_value(record_batch: MessageBatch) -> Vec<VrlValue> {
+    // let rows = record_batch.num_rows();
+    // let mut vrl_values = Vec::with_capacity(rows);
+    // for _ in 0..rows {
+    //     let map = BTreeMap::new();
+    //     vrl_values.push(VrlValue::Object(map));
+    // }
+    // for i in 0..record_batch.num_columns() {
+    //     let column = record_batch.column(i);
+    //     let schema = record_batch.schema();
+    //     let name = schema.field(i).name();
+    //     match column.data_type() {
+    //         DataType::Utf8 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Bytes(value.to_string().into());
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Binary => {
+    //             if let Some(col) = column.as_any().downcast_ref::<BinaryArray>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Bytes(value.to_vec().into());
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Boolean => {
+    //             if let Some(col) = column.as_any().downcast_ref::<BooleanArray>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Boolean(value);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Float64 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Float64Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Float32 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Float32Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value =
+    //                         VrlValue::Float((value as f64).try_into().unwrap_or_default());
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Int64 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Int64Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Int32 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Int32Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Int16 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Int16Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Int8 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Int8Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::UInt64 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<UInt64Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::UInt32 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<UInt32Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::UInt16 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<UInt16Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::UInt8 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<UInt8Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Date32 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Date32Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value as i64);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Date64 => {
+    //             if let Some(col) = column.as_any().downcast_ref::<Date64Array>() {
+    //                 for i in 0..rows {
+    //                     let value = col.value(i);
+    //                     let vrl_value = VrlValue::Integer(value);
+    //                     vrl_values[i]
+    //                         .as_object_mut()
+    //                         .unwrap()
+    //                         .insert(name.to_string().into(), vrl_value);
+    //                 }
+    //             }
+    //         }
+    //         DataType::Null => {
+    //             // Handle null values
+    //             for i in 0..rows {
+    //                 let vrl_value = VrlValue::Null;
+    //                 vrl_values[i]
+    //                     .as_object_mut()
+    //                     .unwrap()
+    //                     .insert(name.to_string().into(), vrl_value);
+    //             }
+    //         }
+    //         _ => {
+    //             // Handle unsupported data types
+    //             for i in 0..rows {
+    //                 let vrl_value = VrlValue::Null;
+    //                 vrl_values[i]
+    //                     .as_object_mut()
+    //                     .unwrap()
+    //                     .insert(name.to_string().into(), vrl_value);
+    //             }
+    //             error!("Unsupported data type: {:?}", column.data_type());
+    //         }
+    //     };
+    // }
+    // vrl_values
+    todo!()
 }

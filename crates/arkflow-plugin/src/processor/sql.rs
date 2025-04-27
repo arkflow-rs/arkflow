@@ -73,7 +73,7 @@ impl SqlProcessor {
             .table_name
             .as_deref()
             .unwrap_or(DEFAULT_TABLE_NAME);
-        ctx.register_batch(table_name, batch.into())
+        ctx.register_batch(table_name, batch.try_into()?)
             .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
 
         // Execute the SQL query and collect the results.
@@ -138,7 +138,7 @@ impl Processor for SqlProcessor {
 
         // Execute SQL query
         let result_batch = self.execute_query(msg_batch).await?;
-        Ok(vec![MessageBatch::new_arrow(result_batch)])
+        Ok(vec![MessageBatch::try_from(result_batch)?])
     }
 
     async fn close(&self) -> Result<(), Error> {

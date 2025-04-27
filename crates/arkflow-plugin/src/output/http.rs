@@ -98,7 +98,7 @@ impl Output for HttpOutput {
             .body_field
             .as_deref()
             .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-        let content = msg.to_binary(body_field)?;
+        let content = msg.to_binary()?;
         if content.is_empty() {
             return Ok(());
         }
