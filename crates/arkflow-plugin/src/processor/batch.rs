@@ -19,8 +19,6 @@
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
-use datafusion::arrow;
-use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};

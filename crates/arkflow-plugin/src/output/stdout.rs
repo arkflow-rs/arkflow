@@ -20,7 +20,6 @@ use arkflow_core::message::Value;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
-use datafusion::arrow;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Stdout, Write};
 use std::string::String;

@@ -25,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
 
 /// MQTT output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

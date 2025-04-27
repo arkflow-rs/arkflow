@@ -18,8 +18,6 @@ use arkflow_core::input::Ack;
 use arkflow_core::message::Message;
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
-use datafusion::arrow;
-use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -89,7 +87,7 @@ impl MemoryBuffer {
         let mut acks = Vec::new();
 
         while let Some((msg, ack)) = queue_lock.pop_back() {
-            let x :Vec<Message>= msg.into();
+            let x: Vec<Message> = msg.into();
             messages.extend(x.into_iter());
             acks.push(ack);
         }

@@ -105,8 +105,6 @@ pub fn init() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
-
     use super::*;
     use std::time::Duration;
 
@@ -127,8 +125,7 @@ mod tests {
         let (msg_batch, _) = input.read().await.unwrap();
         assert_eq!(msg_batch.len(), 1);
         assert_eq!(
-            String::from_utf8(msg_batch.to_binary().unwrap()[0].to_vec())
-                .unwrap(),
+            String::from_utf8(msg_batch.to_binary().unwrap()[0].to_vec()).unwrap(),
             "test message"
         );
 
@@ -150,10 +147,7 @@ mod tests {
         assert_eq!(msg_batch.len(), 3);
         for i in 0..3 {
             assert_eq!(
-                String::from_utf8(
-                    msg_batch.to_binary().unwrap()[i].to_vec()
-                )
-                .unwrap(),
+                String::from_utf8(msg_batch.to_binary().unwrap()[i].to_vec()).unwrap(),
                 "test"
             );
         }

@@ -120,7 +120,6 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
 
     #[tokio::test]
     async fn test_memory_input_connect() {

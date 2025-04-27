@@ -19,20 +19,16 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, DurationMicrosecondArray,
     DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, Float16Array,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray,
-    NullArray, StringArray, StringViewArray, StructArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    NullArray, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
-use datafusion::arrow::datatypes::{
-    DataType, Field, Fields, Schema, SchemaRef, TimeUnit, TimestampNanosecondType,
-    TimestampSecondType,
-};
-use datafusion::arrow::ipc::Utf8Args;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use thiserror::Error;
@@ -201,25 +197,156 @@ impl TryFrom<MessageBatch> for RecordBatch {
     type Error = Error;
 
     fn try_from(value: MessageBatch) -> Result<Self, Self::Error> {
-        if value.len() == 0 {
-            return Ok(Self::new_empty(SchemaRef::new(Schema::empty())));
-        }
         let Some(message) = value.get(0) else {
             return Ok(Self::new_empty(SchemaRef::new(Schema::empty())));
         };
-        let fields: Vec<Field>;
         // let cols: Vec<ArrayRef>;
-        match message.value {
+        let (fields) = match &message.value {
             Value::Bytes(_) => {
-                todo!()
+                let mut rows: Vec<&[u8]> = Vec::with_capacity(value.len());
+                for x in value.0.into_iter() {
+                    match x.value {
+                        Value::Bytes(v) => {
+                            rows.push(v.to_vec().as_slice());
+                        }
+                        _ => {
+                            return Err(Error::Process("not support data type".to_string()));
+                        }
+                    }
+                }
+
+                let fields = vec![Field::new(
+                    DEFAULT_BINARY_VALUE_FIELD,
+                    DataType::Binary,
+                    false,
+                )];
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(fields)),
+                    vec![Arc::new(BinaryArray::from(rows))],
+                )
             }
-            Value::Object(ref obj) => {
-                todo!()
+            Value::Object(obj) => {
+                let fields = obj
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Value::Null => Field::new(k, DataType::Null, false),
+                        Value::Bytes(_) => Field::new(k, DataType::Binary, false),
+                        Value::Float32(_) => Field::new(k, DataType::Float32, false),
+                        Value::Float64(_) => Field::new(k, DataType::Float64, false),
+                        Value::Int8(_) => Field::new(k, DataType::Int8, false),
+                        Value::Int16(_) => Field::new(k, DataType::Int16, false),
+                        Value::Int32(_) => Field::new(k, DataType::Int32, false),
+                        Value::Int64(_) => Field::new(k, DataType::Int64, false),
+                        Value::Uint8(_) => Field::new(k, DataType::UInt8, false),
+                        Value::Uint16(_) => Field::new(k, DataType::UInt16, false),
+                        Value::Uint32(_) => Field::new(k, DataType::UInt32, false),
+                        Value::Uint64(_) => Field::new(k, DataType::UInt64, false),
+                        Value::String(_) => Field::new(k, DataType::Utf8, false),
+                        Value::Bool(_) => Field::new(k, DataType::Boolean, false),
+                        Value::Object(_) => {
+                            todo!()
+                        }
+                        Value::Array(_) => {
+                            todo!()
+                        }
+                        Value::Timestamp(s) => {
+                            Field::new(k, DataType::Timestamp(TimeUnit::Millisecond, None), false)
+                        }
+                    })
+                    .collect::<Vec<Field>>();
+                let fields_map = fields
+                    .iter()
+                    .map(|x| (x.name(), x.data_type()))
+                    .collect::<HashMap<&String, &DataType>>();
+
+                let mut rows: Vec<ArrayRef> = Vec::with_capacity(value.len());
+                let mut cols: HashMap<String, ArrayRef> = HashMap::with_capacity(fields.len());
+                for x in &fields {
+                    match x.data_type() {
+                        DataType::Null => {
+                            cols.insert(x.name().clone(), Arc::new(NullArray::new(value.len())));
+                        }
+                        DataType::Boolean => {
+                            cols.insert(
+                                x.name().clone(),
+                                Arc::new(BooleanArray::from(vec![false; value.len()])),
+                            );
+                        }
+                        DataType::Int8 => {
+                            cols.insert(
+                                x.name().clone(),
+                                Arc::new(Int8Array::from(vec![0; value.len()])),
+                            );
+                        }
+                        DataType::Int16 => {
+                            cols.insert(
+                                x.name().clone(),
+                                Arc::new(Int16Array::from(vec![0; value.len()])),
+                            );
+                        }
+                        DataType::Int32 => {}
+                        DataType::Int64 => {}
+                        DataType::UInt8 => {}
+                        DataType::UInt16 => {}
+                        DataType::UInt32 => {}
+                        DataType::UInt64 => {}
+                        DataType::Float16 => {}
+                        DataType::Float32 => {}
+                        DataType::Float64 => {}
+                        DataType::Timestamp(_, _) => {}
+                        DataType::Date32 => {}
+                        DataType::Date64 => {}
+                        DataType::Time32(_) => {}
+                        DataType::Time64(_) => {}
+                        DataType::Duration(_) => {}
+                        DataType::Interval(_) => {}
+                        DataType::Binary => {}
+                        DataType::FixedSizeBinary(_) => {}
+                        DataType::LargeBinary => {}
+                        DataType::BinaryView => {}
+                        DataType::Utf8 => {}
+                        DataType::LargeUtf8 => {}
+                        DataType::Utf8View => {}
+                        DataType::List(_) => {}
+                        DataType::ListView(_) => {}
+                        DataType::FixedSizeList(_, _) => {}
+                        DataType::LargeList(_) => {}
+                        DataType::LargeListView(_) => {}
+                        DataType::Struct(_) => {}
+                        DataType::Union(_, _) => {}
+                        DataType::Dictionary(_, _) => {}
+                        DataType::Decimal128(_, _) => {}
+                        DataType::Decimal256(_, _) => {}
+                        DataType::Map(_, _) => {}
+                        DataType::RunEndEncoded(_, _) => {}
+                    }
+                }
+                for x in value.0.into_iter() {
+                    match x.value {
+                        Value::Object(obj) => for (k, v) in obj {
+                            let option = cols.get_mut(&k);
+
+                        },
+                        _ => {
+                            return Err(Error::Process("not support data type".to_string()));
+                        }
+                    }
+                }
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(fields)),
+                    vec![Arc::new(BinaryArray::from(rows))],
+                )
             }
             _ => {
                 todo!()
             }
-        }
+        };
+
+        // Ok(RecordBatch::try_new(
+        //     SchemaRef::new(Schema::new(fields)),
+        //     vec![Arc::new(BinaryArray::from(vec![message.value.as_bytes()]))],
+        // )?)
+        Err(Error::Process("not support data type".to_string()))
     }
 }
 
