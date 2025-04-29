@@ -14,7 +14,7 @@
 use crate::Error;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use datafusion::arrow::datatypes::ToByteSlice;
+use datafusion::arrow::datatypes::{DataType, TimeUnit, ToByteSlice};
 use serde_json::Number;
 use std::collections::BTreeMap;
 
