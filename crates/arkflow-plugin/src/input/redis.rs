@@ -22,7 +22,7 @@ use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
-use redis::Client;
+use redis::{Client, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -165,15 +165,16 @@ impl Input for RedisInput {
                 }
                 Type::List { ref list } => {
                     let conn_result = client.get_async_connection().await;
-                    if let Err(e) = conn_result {
-                        error!("Failed to get Redis connection for list: {}", e);
-                        let _ = sender_clone
-                            .send_async(RedisMsg::Err(Error::Disconnection))
-                            .await;
-                        return;
-                    }
-
-                    let mut conn = conn_result.unwrap();
+                    let mut conn = match conn_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Failed to get Redis connection for list: {}", e);
+                            let _ = sender_clone
+                                .send_async(RedisMsg::Err(Error::Disconnection))
+                                .await;
+                            return;
+                        }
+                    };
 
                     loop {
                         tokio::select! {
@@ -181,9 +182,9 @@ impl Input for RedisInput {
                                 break;
                             }
                             result = async {
-                                let blpop_result: redis::RedisResult<Option<(String, Vec<u8>)>> = redis::cmd("BLPOP")
+                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = redis::cmd("BLPOP")
                                     .arg(list.clone())
-                                    .arg(1) // 1秒超时
+                                    .arg(1)
                                     .query_async(&mut conn)
                                     .await;
                                 blpop_result
@@ -224,15 +225,13 @@ impl Input for RedisInput {
         }
 
         match self.receiver.recv_async().await {
-            Ok(msg) => match msg {
-                RedisMsg::Message(_channel, payload) => {
-                    let msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
-                        Error::Connection(format!("Failed to create message batch: {}", e))
-                    })?;
-                    Ok((msg, Arc::new(NoopAck)))
-                }
-                RedisMsg::Err(e) => Err(e),
-            },
+            Ok(RedisMsg::Message(_channel, payload)) => {
+                let msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
+                    Error::Connection(format!("Failed to create message batch: {}", e))
+                })?;
+                Ok((msg, Arc::new(NoopAck)))
+            }
+            Ok(RedisMsg::Err(e)) => Err(e),
             Err(_) => Err(Error::EOF),
         }
     }
