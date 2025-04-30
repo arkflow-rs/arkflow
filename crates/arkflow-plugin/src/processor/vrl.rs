@@ -258,7 +258,7 @@ pub(crate) fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<Vr
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
-            DataType::Timestamp(unit, tz) => {
+            DataType::Timestamp(_unit, _tz) => {
                 if let Some(col) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
                     for i in 0..rows {
                         let value = col.value_as_datetime(i).unwrap_or_default();

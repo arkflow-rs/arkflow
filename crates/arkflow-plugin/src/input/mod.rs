@@ -25,6 +25,7 @@ pub mod memory;
 pub mod mqtt;
 pub mod redis;
 pub mod sql;
+pub mod websocket;
 
 pub fn init() -> Result<(), Error> {
     generate::init()?;
@@ -34,5 +35,6 @@ pub fn init() -> Result<(), Error> {
     mqtt::init()?;
     redis::init()?;
     sql::init()?;
+    websocket::init()?;
     Ok(())
 }
