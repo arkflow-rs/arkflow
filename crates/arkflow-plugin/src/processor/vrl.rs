@@ -119,7 +119,7 @@ pub(crate) fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<Vr
                 if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
                     for i in 0..rows {
                         let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_string().into());
+                        let vrl_value = VrlValue::from(value.to_owned());
                         insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
@@ -258,6 +258,17 @@ pub(crate) fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<Vr
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
+            DataType::Timestamp(unit, tz) => {
+                if let Some(col) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    for i in 0..rows {
+                        let value = col.value_as_datetime(i).unwrap_or_default();
+
+                        let vrl_value = VrlValue::Timestamp(value.and_utc());
+                        insert(i, &mut vrl_values, name, vrl_value);
+                    }
+                }
+            }
+
             _ => {
                 // Handle unsupported data types
                 for i in 0..rows {
