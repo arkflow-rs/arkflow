@@ -14,15 +14,12 @@ tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
-
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 humantime = { workspace = true }
-
 tracing = { workspace = true }
-
 datafusion = { workspace = true }
 datafusion-functions-json = "*"
 datafusion-table-providers = { version = "0.4", features = [
@@ -38,30 +35,38 @@ prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 protobuf-parse = { workspace = true }
 protobuf = { workspace = true }
-
 lazy_static = { workspace = true }
-
 axum = { workspace = true }
 reqwest = { workspace = true }
 tower = "0.5"
 tower-http = { version = "0.4", features = ["cors", "trace"] }
 base64 = "0.22"
-
 colored = { workspace = true }
 flume = { workspace = true }
-rumqttc = { workspace = true }
+rumqttc = "0.24.0"
 
 # Kafka
-aws-msk-iam-sasl-signer = { workspace = true }
-rdkafka = { workspace = true }
-rdkafka-sys = { workspace = true }
-sasl2-sys = { workspace = true }
-redis = { workspace = true }
+aws-msk-iam-sasl-signer = "1.0.0"
+rdkafka = { version = "0.37", features = [
+    "cmake-build",
+    "tracing",
+    "sasl",
+    "ssl-vendored",
+    "zstd",
+] }
+rdkafka-sys = "4.8.0"
+sasl2-sys = { version = "0.1.22", features = ["vendored"] }
+redis = { version = "0.24", features = ["tokio-comp", "aio"] }
 
-vrl = { workspace = true }
+# vrl https://github.com/vectordotdev/vrl
+vrl = { version = "0.23.0", features = ["value", "compiler", "stdlib"] }
+
 
 # arkflow
 arkflow-core = { workspace = true }
+
+# Websocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
