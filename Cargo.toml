@@ -69,3 +69,8 @@ arkflow-core = { path = "crates/arkflow-core", version = "0.2.0-rc2" }
 arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.2.0-rc2" }
 tempfile = "3.19.1"
 mockall = "0.12"
+
+
+[profile.release]
+codegen-units = 1
+lto = true
