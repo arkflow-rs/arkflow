@@ -205,6 +205,7 @@ dependencies = [
  "humantime",
  "lazy_static",
  "mockall",
+ "mysql_async 0.36.0",
  "prost-reflect",
  "prost-types",
  "protobuf",
@@ -2408,7 +2409,7 @@ dependencies = [
  "futures",
  "geo-types",
  "itertools 0.14.0",
- "mysql_async",
+ "mysql_async 0.35.1",
  "native-tls",
  "num-bigint",
  "pem",
@@ -3709,6 +3710,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
+dependencies = [
+ "hashbrown 0.15.2",
+]
+
+[[package]]
 name = "lru-cache"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3891,13 +3901,43 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "keyed_priority_queue",
- "lru",
- "mysql_common",
+ "lru 0.12.5",
+ "mysql_common 0.34.1",
  "native-tls",
  "pem",
  "percent-encoding",
  "pin-project",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-util",
+ "twox-hash 2.1.0",
+ "url",
+]
+
+[[package]]
+name = "mysql_async"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20d0d6385c37d331a4502565a1be2a06b23d4ada08ee5177c6374272cd8980a6"
+dependencies = [
+ "bytes",
+ "crossbeam-queue",
+ "flate2",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "keyed_priority_queue",
+ "lru 0.14.0",
+ "mysql_common 0.35.3",
+ "native-tls",
+ "pem",
+ "percent-encoding",
+ "rand 0.9.0",
  "serde",
  "serde_json",
  "socket2",
@@ -3942,6 +3982,33 @@ dependencies = [
  "time",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "mysql_common"
+version = "0.35.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4351dce0b6634a60d6f1f40fae5cfcfe0f6c6a4a1e87e8da7babe4c37c522460"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.9.0",
+ "btoi",
+ "byteorder",
+ "bytes",
+ "crc32fast",
+ "flate2",
+ "getrandom 0.3.2",
+ "mysql-common-derive",
+ "num-bigint",
+ "num-traits",
+ "regex",
+ "saturating",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.12",
+ "uuid",
 ]
 
 [[package]]
