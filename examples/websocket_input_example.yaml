@@ -5,9 +5,6 @@ streams:
       type: "websocket"
       url: "ws://localhost:8800"
 
-    
-    
-
     pipeline:
       thread_num: 4
       processors:
