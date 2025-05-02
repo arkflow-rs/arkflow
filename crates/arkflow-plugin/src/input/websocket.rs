@@ -31,7 +31,7 @@ use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, info};
 use url::Url;
 
 /// WebSocket input configuration
@@ -98,6 +98,8 @@ impl Input for WebSocketInput {
         let (ws_stream, _) = connect_result.map_err(|e| {
             Error::Connection(format!("Failed to connect to WebSocket server: {}", e))
         })?;
+
+        info!("Connected to websocket server: {}", self.config.url);
 
         // Split the WebSocket stream into reader and writer parts
         let (writer, reader) = ws_stream.split();
