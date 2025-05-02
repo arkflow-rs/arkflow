@@ -64,13 +64,24 @@ enum DbConnection {
 
 impl DbConnection {
     // Executes a SQL query without returning results
-    pub async fn execute_query(&mut self, query: &str) -> Result<(), Error> {
+    pub async fn execute_query_with_params(
+        &mut self,
+        query: String,
+        params: Vec<String>,
+    ) -> Result<(), Error> {
         match self {
-            DbConnection::Mysql(conn) => conn
-                .query_drop(query)
-                .await
-                .map_err(|e| Error::Process(format!("Failed to execute query: {}", e))),
+            DbConnection::Mysql(conn) => {
+                let mysql_params: Vec<mysql_async::Value> = params
+                    .into_iter()
+                    .map(|s| mysql_async::Value::Bytes(s.into_bytes()))
+                    .collect();
+    
+                conn.exec_drop(query, mysql_params).await.map_err(|e| {
+                    Error::Process(format!("Failed to execute query: {}", e))
+                })?;
+            }
         }
+        Ok(())
     }
     pub async fn begin_transaction(&mut self) -> Result<(), Error> {
         match self {
@@ -189,71 +200,78 @@ impl SqlOutput {
     }
     // insert_row implementation
     async fn insert_row(&self, conn: &mut DbConnection, msg: &MessageBatch) -> Result<(), Error> {
-        let table_name = self.sql_config.table_name.clone();
         let schema = msg.schema();
         let num_rows = msg.len();
         let num_columns = schema.fields().len();
 
+        let mut columns = Vec::with_capacity(num_columns);
+        for col_index in 0..num_columns {
+            let field = schema.field(col_index);
+            columns.push(field.name().clone());
+        }
+
         for row_index in 0..num_rows {
-            let mut columns = Vec::new();
-            let mut values = Vec::new();
+            let mut values = Vec::with_capacity(num_columns);
 
             for col_index in 0..num_columns {
-                let field = schema.field(col_index);
-                let column_name = field.name();
-                columns.push(column_name.clone());
-
                 let column = msg.column(col_index);
-
-                let value = &self.matching_data_type(column, row_index).await;
-
-                values.push(format!("'{}'", value));
+                let value = self.matching_data_type(column, row_index).await?;
+                values.push(value);
             }
-            let query = format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                table_name,
-                columns.join(", "),
-                values.join(", ")
-            );
 
-            conn.execute_query(&query)
-                .await
-                .map_err(|e| Error::Process(format!("Failed to insert row: {}", e)))?;
+            let query = self.generate_insert_query(&columns, num_columns).await;
+
+            conn.execute_query_with_params(query, values)
+                .await?;
         }
         Ok(())
     }
     // Convert Arrow data types to SQL-compatible string representation
-    async fn matching_data_type(&self, column: &dyn Array, row_index: usize) -> String {
+    async fn matching_data_type(&self, column: &dyn Array, row_index: usize) -> Result<String, Error> {
         // Determine the data type of the column and convert to appropriate SQL format
         let column_type = column.data_type();
         match column_type {
             DataType::Utf8 => {
                 let utf8_array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                format!("{}", utf8_array.value(row_index))
+                Ok(format!("{}", utf8_array.value(row_index)))
             }
             DataType::Int64 => {
                 let int_array = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                int_array.value(row_index).to_string()
+                Ok(int_array.value(row_index).to_string())
             }
             DataType::UInt64 => {
                 let uint_array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
-                uint_array.value(row_index).to_string()
+                Ok(uint_array.value(row_index).to_string())
             }
             DataType::Float64 => {
                 let float_array = column.as_any().downcast_ref::<Float64Array>().unwrap();
-                float_array.value(row_index).to_string()
+                Ok(float_array.value(row_index).to_string())
             }
             DataType::Boolean => {
                 let bool_array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
                 if bool_array.value(row_index) {
-                    "TRUE".to_string()
+                    Ok("TRUE".to_string())
                 } else {
-                    "FALSE".to_string()
+                    Ok("FALSE".to_string())
                 }
             }
-            DataType::Null => "NULL".to_string(),
-            _ => "NULL".to_string(),
+            _ => Err(Error::Process(format!(
+                "Unsupported data type: {:?}",
+                column_type
+            ))),
         }
+    }
+    async fn generate_insert_query(&self, columns: &Vec<String>, num_columns: usize) -> String {
+        let table_name = &self.sql_config.table_name;
+        let placeholders = match self.sql_config.output_type {
+            OutputType::Mysql(_) => vec!["?"; num_columns].join(", "),
+        };
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table_name,
+            columns.join(", "),
+            placeholders
+        )
     }
 }
 
