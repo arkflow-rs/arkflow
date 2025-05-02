@@ -80,6 +80,14 @@ impl DbConnection {
                 .map_err(|e| Error::Process(format!("Failed to begin transaction: {}", e))),
         }
     }
+    pub async fn rollback_transaction(&mut self) -> Result<(), Error> {
+        match self {
+            DbConnection::Mysql(conn) => conn
+                .query_drop("ROLLBACK")
+                .await
+                .map_err(|e| Error::Process(format!("Failed to rollback transaction: {}", e))),
+        }
+    }
     pub async fn commit_transaction(&mut self) -> Result<(), Error> {
         match self {
             DbConnection::Mysql(conn) => conn
@@ -131,8 +139,15 @@ impl Output for SqlOutput {
         let conn = guard.as_mut().expect("not connected");
 
         conn.begin_transaction().await?;
-        self.insert_row(conn, &msg).await?;
-        conn.commit_transaction().await?;
+        match self.insert_row(conn, &msg).await {
+            Ok(_) => {
+                conn.commit_transaction().await?;
+            }
+            Err(e) => {
+                conn.rollback_transaction().await?;
+                return Err(e);
+            }
+        }
 
         Ok(())
     }
