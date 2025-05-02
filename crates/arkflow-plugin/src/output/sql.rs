@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts};
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts, Statement};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlOutputConfig {
@@ -63,60 +63,38 @@ enum DbConnection {
 }
 
 impl DbConnection {
-    // Executes a SQL query without returning results
-    pub async fn execute_query_with_params(
+    pub async fn prepare_statement(&mut self, query: String) -> Result<Statement, Error> {
+        match self {
+            DbConnection::Mysql(conn) => conn
+                .prep(query)
+                .await
+                .map_err(|e| Error::Process(format!("Failed to prepare statement: {}", e))),
+        }
+    }
+
+    pub async fn execute_batch(
         &mut self,
-        query: String,
-        params: Vec<String>,
+        stmt: &Statement,
+        params: Vec<Vec<String>>,
     ) -> Result<(), Error> {
         match self {
-            DbConnection::Mysql(conn) => {
-                let mysql_params: Vec<mysql_async::Value> = params
-                    .into_iter()
-                    .map(|s| mysql_async::Value::Bytes(s.into_bytes()))
-                    .collect();
-    
-                conn.exec_drop(query, mysql_params).await.map_err(|e| {
-                    Error::Process(format!("Failed to execute query: {}", e))
-                })?;
-            }
-        }
-        Ok(())
-    }
-    pub async fn begin_transaction(&mut self) -> Result<(), Error> {
-        match self {
             DbConnection::Mysql(conn) => conn
-                .query_drop("BEGIN")
+                .exec_batch(stmt, params)
                 .await
-                .map_err(|e| Error::Process(format!("Failed to begin transaction: {}", e))),
+                .map_err(|e| Error::Process(format!("Failed to execute prepared stmt: {}", e))),
         }
     }
-    pub async fn rollback_transaction(&mut self) -> Result<(), Error> {
-        match self {
-            DbConnection::Mysql(conn) => conn
-                .query_drop("ROLLBACK")
-                .await
-                .map_err(|e| Error::Process(format!("Failed to rollback transaction: {}", e))),
-        }
-    }
-    pub async fn commit_transaction(&mut self) -> Result<(), Error> {
-        match self {
-            DbConnection::Mysql(conn) => conn
-                .query_drop("COMMIT")
-                .await
-                .map_err(|e| Error::Process(format!("Failed to commit transaction: {}", e))),
-        }
-    }
+
 }
 
 pub struct SqlOutput {
     sql_config: SqlOutputConfig,
     db_connection: Arc<Mutex<Option<DbConnection>>>,
     connected: std::sync::atomic::AtomicBool,
+    prepared_stmt: Arc<Mutex<Option<Statement>>>,
     cancellation_token: CancellationToken,
 }
 
-//수정할 생각 필요
 impl SqlOutput {
     pub fn new(sql_config: SqlOutputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
@@ -125,6 +103,7 @@ impl SqlOutput {
             sql_config,
             db_connection: Arc::new(Mutex::new(None)),
             connected: std::sync::atomic::AtomicBool::new(false),
+            prepared_stmt: Arc::new(Mutex::new(None)),
             cancellation_token,
         })
     }
@@ -149,16 +128,7 @@ impl Output for SqlOutput {
         let mut guard = self.db_connection.lock().await;
         let conn = guard.as_mut().expect("not connected");
 
-        conn.begin_transaction().await?;
-        match self.insert_row(conn, &msg).await {
-            Ok(_) => {
-                conn.commit_transaction().await?;
-            }
-            Err(e) => {
-                conn.rollback_transaction().await?;
-                return Err(e);
-            }
-        }
+        self.insert_row(conn, &msg).await?;
 
         Ok(())
     }
@@ -203,31 +173,41 @@ impl SqlOutput {
         let schema = msg.schema();
         let num_rows = msg.len();
         let num_columns = schema.fields().len();
+        let columns: Vec<String> = (0..num_columns)
+            .map(|i| schema.field(i).name().clone())
+            .collect();
+        let stmt: Statement = {
+            let mut guard = self.prepared_stmt.lock().await;
+            if guard.is_none() {
+                let query = self.generate_insert_query(&columns, num_columns).await;
+                let prepared = conn.prepare_statement(query).await?;
+                *guard = Some(prepared.clone());
+                prepared
+            } else {
+                guard.as_ref().unwrap().clone()
+            }
+        };
 
-        let mut columns = Vec::with_capacity(num_columns);
-        for col_index in 0..num_columns {
-            let field = schema.field(col_index);
-            columns.push(field.name().clone());
-        }
-
+        let mut batch_params = Vec::with_capacity(num_rows);
         for row_index in 0..num_rows {
-            let mut values = Vec::with_capacity(num_columns);
-
+            let mut row = Vec::with_capacity(num_columns);
             for col_index in 0..num_columns {
                 let column = msg.column(col_index);
                 let value = self.matching_data_type(column, row_index).await?;
-                values.push(value);
+                row.push(value);
             }
-
-            let query = self.generate_insert_query(&columns, num_columns).await;
-
-            conn.execute_query_with_params(query, values)
-                .await?;
+            batch_params.push(row);
         }
+        conn.execute_batch(&stmt, batch_params).await?;
+
         Ok(())
     }
     // Convert Arrow data types to SQL-compatible string representation
-    async fn matching_data_type(&self, column: &dyn Array, row_index: usize) -> Result<String, Error> {
+    async fn matching_data_type(
+        &self,
+        column: &dyn Array,
+        row_index: usize,
+    ) -> Result<String, Error> {
         // Determine the data type of the column and convert to appropriate SQL format
         let column_type = column.data_type();
         match column_type {
@@ -250,9 +230,9 @@ impl SqlOutput {
             DataType::Boolean => {
                 let bool_array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
                 if bool_array.value(row_index) {
-                    Ok("TRUE".to_string())
+                    Ok("true".to_string())
                 } else {
-                    Ok("FALSE".to_string())
+                    Ok("false".to_string())
                 }
             }
             _ => Err(Error::Process(format!(
@@ -263,13 +243,15 @@ impl SqlOutput {
     }
     async fn generate_insert_query(&self, columns: &Vec<String>, num_columns: usize) -> String {
         let table_name = &self.sql_config.table_name;
+
+        let escaped_columns: Vec<String> = columns.iter().map(|col| format!("`{}`", col)).collect();
         let placeholders = match self.sql_config.output_type {
             OutputType::Mysql(_) => vec!["?"; num_columns].join(", "),
         };
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
             table_name,
-            columns.join(", "),
+            escaped_columns.join(", "),
             placeholders
         )
     }
