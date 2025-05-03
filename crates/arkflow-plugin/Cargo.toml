@@ -68,7 +68,12 @@ arkflow-core = { workspace = true }
 # Websocket
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
+# NATS
+async-nats = "0.40.0"
+
 url = "2.5.4"
+futures = {workspace = true}
+tokio-stream = "0.1.17"
 [dev-dependencies]
 tempfile = { workspace = true }
 mockall = { workspace = true }
