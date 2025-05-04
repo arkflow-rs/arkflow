@@ -85,13 +85,13 @@ pub struct NatsInput {
     js_stream: Arc<RwLock<Option<Stream>>>,
     sender: Sender<NatsMsg>,
     receiver: Receiver<NatsMsg>,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    cancellation_token: CancellationToken,
 }
 
 impl NatsInput {
     /// Create a new NATS input component
     pub fn new(config: NatsInputConfig) -> Result<Self, Error> {
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<NatsMsg>(1000);
         Ok(Self {
             config,
@@ -294,11 +294,7 @@ impl Input for NatsInput {
                             NatsMsg::Regular(message) => {
                                 let payload = message.payload.to_vec();
                                 let msg_batch = MessageBatch::new_binary(vec![payload])?;
-                                let ack = NatsAck::Regular {
-                                    client: Arc::clone(&self.client),
-                                    message,
-                                };
-                                Ok((msg_batch, Arc::new(ack) as Arc<dyn Ack>))
+                                Ok((msg_batch, Arc::new(NatsAck::Regular)))
                             },
                             NatsMsg::JetStream( message) => {
                                 let payload = message.payload.to_vec();
@@ -362,10 +358,7 @@ impl InputBuilder for NatsInputBuilder {
 /// NATS message acknowledgment
 enum NatsAck {
     /// Regular NATS message acknowledgment
-    Regular {
-        client: Arc<RwLock<Option<Client>>>,
-        message: Message,
-    },
+    Regular,
     /// JetStream message acknowledgment
     JetStream {
         message: async_nats::jetstream::Message,
@@ -376,9 +369,8 @@ enum NatsAck {
 impl Ack for NatsAck {
     async fn ack(&self) {
         match self {
-            NatsAck::Regular { client, message } => {
+            NatsAck::Regular => {
                 // For regular NATS messages, there's no explicit acknowledgment
-                // But we could implement custom logic here if needed
             }
             NatsAck::JetStream { message } => {
                 // Acknowledge JetStream message
