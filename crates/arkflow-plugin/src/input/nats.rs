@@ -18,7 +18,6 @@
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch};
-use async_nats::jetstream::consumer::pull::{Batch, BatchError};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
 use async_nats::{Client, ConnectOptions, Message};
@@ -215,55 +214,55 @@ impl Input for NatsInput {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                                _ = cancellation.cancelled() => {
-                                    break;
-                                }
-                                result = consumer.fetch().max_messages(10).messages()  => {
-                                    match result {
-                                Ok(mut messages) => {
-                                    while let Some(message_result) = messages.next().await {
-                                        match message_result {
-                                            Ok(message) => {
-                                                // Send to channel with original message for later acknowledgment
-                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
-                                                {
-                                                    error!("Failed to send message to channel: {}", e);
-                                                }
+                        _ = cancellation.cancelled() => {
+                            break;
+                        }
+                        result = consumer.fetch().max_messages(10).messages()  => {
+                            match result {
+                            Ok(mut messages) => {
+                                while let Some(message_result) = messages.next().await {
+                                    match message_result {
+                                        Ok(message) => {
+                                            // Send to channel with original message for later acknowledgment
+                                            if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
+                                            {
+                                                error!("Failed to send message to channel: {}", e);
                                             }
-                                            Err(e) => {
-                                                error!("Failed to get JetStream message: {}", e);
-                                                if let Err(e) = sender
-                                                    .send_async(NatsMsg::Err(Error::Process(format!(
-                                                        "Failed to get message: {}",
-                                                        e
-                                                    ))))
-                                                    .await
-                                                {
-                                                    error!("Failed to send error to channel: {}", e);
-                                                }
-                                                // Short pause before retrying
-                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to get JetStream message: {}", e);
+                                            if let Err(e) = sender
+                                                .send_async(NatsMsg::Err(Error::Process(format!(
+                                                    "Failed to get message: {}",
+                                                    e
+                                                ))))
+                                                .await
+                                            {
+                                                error!("Failed to send error to channel: {}", e);
                                             }
+                                            // Short pause before retrying
+                                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Failed to fetch JetStream messages: {}", e);
-                                    if let Err(e) = sender
-                                        .send_async(NatsMsg::Err(Error::Process(format!(
-                                            "Failed to fetch messages: {}",
-                                            e
-                                        ))))
-                                        .await
-                                    {
-                                        error!("Failed to send error to channel: {}", e);
-                                    }
-                                    // Short pause before retrying
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                    }
-                                }
                             }
+                            Err(e) => {
+                                error!("Failed to fetch JetStream messages: {}", e);
+                                if let Err(e) = sender
+                                    .send_async(NatsMsg::Err(Error::Process(format!(
+                                        "Failed to fetch messages: {}",
+                                        e
+                                    ))))
+                                    .await
+                                {
+                                    error!("Failed to send error to channel: {}", e);
+                                }
+                                // Short pause before retrying
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                        }
+                    }
                 }
             });
         } else {
