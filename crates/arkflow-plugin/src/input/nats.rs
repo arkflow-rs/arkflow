@@ -40,7 +40,7 @@ pub struct NatsInputConfig {
     /// NATS queue group (optional)
     pub queue_group: Option<String>,
     /// JetStream configuration (optional)
-    pub jetstream: Option<JetStreamConfig>,
+    pub jet_stream: Option<JetStreamConfig>,
     /// Authentication credentials (optional)
     pub auth: Option<NatsAuth>,
 }
@@ -51,9 +51,9 @@ pub struct JetStreamConfig {
     /// Stream name
     pub stream: String,
     /// Consumer name
-    pub consumer: String,
+    pub consumer_name: String,
     /// Durable name (optional)
-    pub durable: Option<String>,
+    pub durable_name: Option<String>,
 }
 
 /// NATS authentication configuration
@@ -135,7 +135,7 @@ impl Input for NatsInput {
         let cancellation_token_clone = self.cancellation_token.clone();
 
         // Setup JetStream if configured
-        if let Some(js_config) = &self.config.jetstream {
+        if let Some(js_config) = &self.config.jet_stream {
             let jetstream = async_nats::jetstream::new(client);
 
             // Get or create stream
@@ -150,13 +150,13 @@ impl Input for NatsInput {
 
             // Get or create consumer
             let consumer_config = async_nats::jetstream::consumer::pull::Config {
-                durable_name: js_config.durable.clone(),
-                name: Some(js_config.consumer.clone()),
+                durable_name: js_config.durable_name.clone(),
+                name: Some(js_config.consumer_name.clone()),
                 ..Default::default()
             };
 
             let consumer = stream
-                .get_or_create_consumer(&js_config.consumer, consumer_config)
+                .get_or_create_consumer(&js_config.consumer_name, consumer_config)
                 .await
                 .map_err(|e| Error::Connection(format!("Failed to create consumer: {}", e)))?;
 
@@ -444,10 +444,10 @@ mod tests {
             url: "nats://localhost:4222".to_string(),
             subject: "test.subject".to_string(),
             queue_group: Some("test-group".to_string()),
-            jetstream: Some(JetStreamConfig {
+            jet_stream: Some(JetStreamConfig {
                 stream: "test-stream".to_string(),
-                consumer: "test-consumer".to_string(),
-                durable: Some("test-durable".to_string()),
+                consumer_name: "test-consumer".to_string(),
+                durable_name: Some("test-durable".to_string()),
             }),
             auth: Some(NatsAuth {
                 username: Some("user".to_string()),
