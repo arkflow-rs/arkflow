@@ -20,12 +20,15 @@ use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, Noop
 use arkflow_core::{Error, MessageBatch};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
-use async_nats::{Client, ConnectOptions};
+use async_nats::{Client, ConnectOptions, Message};
 use async_trait::async_trait;
+use flume::{Receiver, Sender};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, warn};
 
 /// NATS input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,22 +67,40 @@ pub struct NatsAuth {
     pub token: Option<String>,
 }
 
+/// NATS message type for async processing
+enum NatsMsg {
+    /// Regular NATS message
+    Regular(Message),
+    /// JetStream message
+    JetStream(Vec<u8>),
+    /// Error message
+    Err(Error),
+}
+
 /// NATS input component
 pub struct NatsInput {
     config: NatsInputConfig,
     client: Arc<RwLock<Option<Client>>>,
     js_consumer: Arc<RwLock<Option<PullConsumer>>>,
     js_stream: Arc<RwLock<Option<Stream>>>,
+    sender: Sender<NatsMsg>,
+    receiver: Receiver<NatsMsg>,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl NatsInput {
     /// Create a new NATS input component
     pub fn new(config: NatsInputConfig) -> Result<Self, Error> {
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let (sender, receiver) = flume::bounded::<NatsMsg>(1000);
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
             js_consumer: Arc::new(RwLock::new(None)),
             js_stream: Arc::new(RwLock::new(None)),
+            sender,
+            receiver,
+            cancellation_token,
         })
     }
 }
@@ -108,6 +129,10 @@ impl Input for NatsInput {
         // Store client
         let mut client_guard = self.client.write().await;
         *client_guard = Some(client.clone());
+        
+        // Clone sender for async tasks
+        let sender_clone = self.sender.clone();
+        let cancellation_token_clone = self.cancellation_token.clone();
 
         // Setup JetStream if configured
         if let Some(js_config) = &self.config.jetstream {
@@ -137,7 +162,115 @@ impl Input for NatsInput {
 
             // Store consumer reference
             let mut consumer_guard = self.js_consumer.write().await;
-            *consumer_guard = Some(consumer);
+            *consumer_guard = Some(consumer.clone());
+            
+            // Start background task for JetStream message processing
+            let sender = sender_clone.clone();
+            let cancellation = cancellation_token_clone.clone();
+            
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            break;
+                        }
+                        _ = async {
+                            // Fetch messages with timeout
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                consumer.fetch().max_messages(10).messages(),
+                            ).await {
+                                Ok(Ok(mut messages)) => {
+                                    while let Some(message_result) = messages.next().await {
+                                        match message_result {
+                                            Ok(message) => {
+                                                let payload = message.payload.to_vec();
+                                                // Acknowledge the message
+                                                if let Err(e) = message.ack().await {
+                                                    warn!("Failed to acknowledge JetStream message: {}", e);
+                                                }
+                                                
+                                                // Send to channel
+                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(payload)).await {
+                                                    error!("Failed to send message to channel: {}", e);
+                                                }
+                                            },
+                                            Err(e) => {
+                                                error!("Failed to get JetStream message: {}", e);
+                                                if let Err(e) = sender.send_async(NatsMsg::Err(Error::Process(format!("Failed to get message: {}", e)))).await {
+                                                    error!("Failed to send error to channel: {}", e);
+                                                }
+                                                // Short pause before retrying
+                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                            }
+                                        }
+                                    }
+                                },
+                                Ok(Err(e)) => {
+                                    error!("Failed to fetch JetStream messages: {}", e);
+                                    if let Err(e) = sender.send_async(NatsMsg::Err(Error::Process(format!("Failed to fetch messages: {}", e)))).await {
+                                        error!("Failed to send error to channel: {}", e);
+                                    }
+                                    // Short pause before retrying
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                },
+                                Err(_) => {
+                                    // Timeout is normal, just continue
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                        } => {}
+                    }
+                }
+            });
+        } else {
+            // Setup regular subscription
+            let subject = self.config.subject.clone();
+            let client_clone = client.clone();
+            let sender = sender_clone;
+            let cancellation = cancellation_token_clone;
+            let queue_group = self.config.queue_group.clone();
+            
+            tokio::spawn(async move {
+                // Create subscription
+                let subscription_result = if let Some(queue) = queue_group {
+                    client_clone.queue_subscribe(subject, queue).await
+                } else {
+                    client_clone.subscribe(subject).await
+                };
+                
+                match subscription_result {
+                    Ok(mut subscription) => {
+                        loop {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => {
+                                    break;
+                                }
+                                message_option = subscription.next() => {
+                                    match message_option {
+                                        Some(message) => {
+                                            if let Err(e) = sender.send_async(NatsMsg::Regular(message)).await {
+                                                error!("Failed to send message to channel: {}", e);
+                                            }
+                                        },
+                                        None => {
+                                            // Subscription ended
+                                            if let Err(e) = sender.send_async(NatsMsg::Err(Error::EOF)).await {
+                                                error!("Failed to send EOF to channel: {}", e);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to subscribe to NATS subject: {}", e);
+                        let _ = sender.send_async(NatsMsg::Err(Error::Process(format!("Failed to subscribe to NATS subject: {}", e)))).await;
+                    }
+                }
+            });
         }
 
         Ok(())
@@ -146,67 +279,48 @@ impl Input for NatsInput {
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
         // Check client connection
         let client_guard = self.client.read().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or(Error::Connection("NATS client not connected".to_string()))?;
+        if client_guard.is_none() {
+            return Err(Error::Connection("NATS client not connected".to_string()));
+        }
+        
+        // Get cancellation token for potential cancellation
+        let cancellation_token = self.cancellation_token.clone();
 
-        // Handle JetStream or regular subscription
-        if let Some(_) = &self.config.jetstream {
-            // Read from JetStream
-            let consumer_guard = self.js_consumer.read().await;
-            let consumer = consumer_guard.as_ref().ok_or(Error::Connection(
-                "JetStream consumer not initialized".to_string(),
-            ))?;
-
-            // Fetch messages with timeout
-            let mut messages = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                consumer.fetch().max_messages(1).messages(),
-            )
-            .await
-            .map_err(|_| Error::Process("Timeout while fetching messages".to_string()))?
-            .map_err(|e| Error::Process(format!("Failed to fetch messages: {}", e)))?;
-
-            if let Some(message) = messages.next().await {
-                let message =
-                    message.map_err(|e| Error::Process(format!("Failed to get message: {}", e)))?;
-                let payload = message.payload.to_vec();
-
-                // Acknowledge the message with error handling
-                message.ack().await.map_err(|e| {
-                    tracing::warn!("Failed to acknowledge JetStream message: {}", e);
-                    Error::Process(format!("Failed to acknowledge message: {}", e))
-                })?;
-
-                let msg_batch = MessageBatch::new_binary(vec![payload])?;
-                return Ok((msg_batch, Arc::new(NoopAck)));
+        // Use tokio::select to handle both message receiving and cancellation
+        tokio::select! {
+            result = self.receiver.recv_async() => {
+                match result {
+                    Ok(msg) => {
+                        match msg {
+                            NatsMsg::Regular(message) => {
+                                let payload = message.payload.to_vec();
+                                let msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                Ok((msg_batch, Arc::new(NoopAck) as Arc<dyn Ack>))
+                            },
+                            NatsMsg::JetStream(payload) => {
+                                let msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                Ok((msg_batch, Arc::new(NoopAck) as Arc<dyn Ack>))
+                            },
+                            NatsMsg::Err(e) => {
+                                Err(e)
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        Err(Error::EOF)
+                    }
+                }
+            },
+            _ = cancellation_token.cancelled() => {
+                Err(Error::EOF)
             }
-
-            return Err(Error::Process("No messages available".to_string()));
-        } else {
-            // Handle regular NATS subscription
-            let subject = self.config.subject.clone();
-            let mut subscription = if let Some(queue_group) = &self.config.queue_group {
-                client.queue_subscribe(subject, queue_group.clone()).await
-            } else {
-                client.subscribe(subject).await
-            }
-            .map_err(|e| Error::Process(format!("Failed to subscribe to NATS subject: {}", e)))?;
-
-            // Get next message with timeout
-            let message =
-                tokio::time::timeout(std::time::Duration::from_secs(5), subscription.next())
-                    .await
-                    .map_err(|_| Error::Process("Timeout while waiting for message".to_string()))?
-                    .ok_or(Error::Process("No messages available".to_string()))?;
-
-            let payload = message.payload.to_vec();
-            let msg_batch = MessageBatch::new_binary(vec![payload])?;
-            return Ok((msg_batch, Arc::new(NoopAck)));
         }
     }
 
     async fn close(&self) -> Result<(), Error> {
+        // Send cancellation signal
+        self.cancellation_token.cancel();
+        
         // Close JetStream consumer if active
         let mut js_consumer_guard = self.js_consumer.write().await;
         *js_consumer_guard = None;
