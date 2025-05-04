@@ -16,7 +16,7 @@
 //!
 //! Receive data from a NATS subject
 
-use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
+use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
@@ -69,10 +69,10 @@ pub struct NatsAuth {
 
 /// NATS message type for async processing
 enum NatsMsg {
-    /// Regular NATS message
+    /// Regular NATS message with original message for acknowledgment
     Regular(Message),
-    /// JetStream message
-    JetStream(Vec<u8>),
+    /// JetStream message with payload and original message for acknowledgment
+    JetStream(async_nats::jetstream::Message),
     /// Error message
     Err(Error),
 }
@@ -129,7 +129,7 @@ impl Input for NatsInput {
         // Store client
         let mut client_guard = self.client.write().await;
         *client_guard = Some(client.clone());
-        
+
         // Clone sender for async tasks
         let sender_clone = self.sender.clone();
         let cancellation_token_clone = self.cancellation_token.clone();
@@ -163,11 +163,11 @@ impl Input for NatsInput {
             // Store consumer reference
             let mut consumer_guard = self.js_consumer.write().await;
             *consumer_guard = Some(consumer.clone());
-            
+
             // Start background task for JetStream message processing
             let sender = sender_clone.clone();
             let cancellation = cancellation_token_clone.clone();
-            
+
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -184,14 +184,8 @@ impl Input for NatsInput {
                                     while let Some(message_result) = messages.next().await {
                                         match message_result {
                                             Ok(message) => {
-                                                let payload = message.payload.to_vec();
-                                                // Acknowledge the message
-                                                if let Err(e) = message.ack().await {
-                                                    warn!("Failed to acknowledge JetStream message: {}", e);
-                                                }
-                                                
-                                                // Send to channel
-                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(payload)).await {
+                                                // Send to channel with original message for later acknowledgment
+                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await {
                                                     error!("Failed to send message to channel: {}", e);
                                                 }
                                             },
@@ -230,7 +224,7 @@ impl Input for NatsInput {
             let sender = sender_clone;
             let cancellation = cancellation_token_clone;
             let queue_group = self.config.queue_group.clone();
-            
+
             tokio::spawn(async move {
                 // Create subscription
                 let subscription_result = if let Some(queue) = queue_group {
@@ -238,7 +232,7 @@ impl Input for NatsInput {
                 } else {
                     client_clone.subscribe(subject).await
                 };
-                
+
                 match subscription_result {
                     Ok(mut subscription) => {
                         loop {
@@ -264,10 +258,15 @@ impl Input for NatsInput {
                                 }
                             }
                         }
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to subscribe to NATS subject: {}", e);
-                        let _ = sender.send_async(NatsMsg::Err(Error::Process(format!("Failed to subscribe to NATS subject: {}", e)))).await;
+                        let _ = sender
+                            .send_async(NatsMsg::Err(Error::Process(format!(
+                                "Failed to subscribe to NATS subject: {}",
+                                e
+                            ))))
+                            .await;
                     }
                 }
             });
@@ -282,7 +281,7 @@ impl Input for NatsInput {
         if client_guard.is_none() {
             return Err(Error::Connection("NATS client not connected".to_string()));
         }
-        
+
         // Get cancellation token for potential cancellation
         let cancellation_token = self.cancellation_token.clone();
 
@@ -295,11 +294,19 @@ impl Input for NatsInput {
                             NatsMsg::Regular(message) => {
                                 let payload = message.payload.to_vec();
                                 let msg_batch = MessageBatch::new_binary(vec![payload])?;
-                                Ok((msg_batch, Arc::new(NoopAck) as Arc<dyn Ack>))
+                                let ack = NatsAck::Regular {
+                                    client: Arc::clone(&self.client),
+                                    message,
+                                };
+                                Ok((msg_batch, Arc::new(ack) as Arc<dyn Ack>))
                             },
-                            NatsMsg::JetStream(payload) => {
+                            NatsMsg::JetStream( message) => {
+                                let payload = message.payload.to_vec();
                                 let msg_batch = MessageBatch::new_binary(vec![payload])?;
-                                Ok((msg_batch, Arc::new(NoopAck) as Arc<dyn Ack>))
+                                let ack = NatsAck::JetStream {
+                                    message,
+                                };
+                                Ok((msg_batch, Arc::new(ack) as Arc<dyn Ack>))
                             },
                             NatsMsg::Err(e) => {
                                 Err(e)
@@ -320,7 +327,7 @@ impl Input for NatsInput {
     async fn close(&self) -> Result<(), Error> {
         // Send cancellation signal
         self.cancellation_token.cancel();
-        
+
         // Close JetStream consumer if active
         let mut js_consumer_guard = self.js_consumer.write().await;
         *js_consumer_guard = None;
@@ -349,6 +356,37 @@ impl InputBuilder for NatsInputBuilder {
         }
         let config: NatsInputConfig = serde_json::from_value(config.clone().unwrap())?;
         Ok(Arc::new(NatsInput::new(config)?))
+    }
+}
+
+/// NATS message acknowledgment
+enum NatsAck {
+    /// Regular NATS message acknowledgment
+    Regular {
+        client: Arc<RwLock<Option<Client>>>,
+        message: Message,
+    },
+    /// JetStream message acknowledgment
+    JetStream {
+        message: async_nats::jetstream::Message,
+    },
+}
+
+#[async_trait]
+impl Ack for NatsAck {
+    async fn ack(&self) {
+        match self {
+            NatsAck::Regular { client, message } => {
+                // For regular NATS messages, there's no explicit acknowledgment
+                // But we could implement custom logic here if needed
+            }
+            NatsAck::JetStream { message } => {
+                // Acknowledge JetStream message
+                if let Err(e) = message.ack().await {
+                    warn!("Failed to acknowledge JetStream message: {}", e);
+                }
+            }
+        }
     }
 }
 
