@@ -61,16 +61,6 @@ pub enum Mode {
         durable_name: Option<String>,
     },
 }
-/// JetStream configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JetStreamConfig {
-    /// Stream name
-    pub stream: String,
-    /// Consumer name
-    pub consumer_name: String,
-    /// Durable name (optional)
-    pub durable_name: Option<String>,
-}
 
 /// NATS authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
