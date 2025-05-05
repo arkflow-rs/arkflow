@@ -19,35 +19,48 @@
 use crate::expr::{EvaluateExpr, Expr};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
-use async_nats::jetstream::stream::Stream;
 use async_nats::jetstream::Context;
 use async_nats::{Client, ConnectOptions};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::error;
 
 /// NATS output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsOutputConfig {
     /// NATS server URL
     pub url: String,
-    /// NATS subject to publish to
-    pub subject: Expr<String>,
-    /// JetStream configuration (optional)
-    pub jet_stream: Option<JetStreamConfig>,
+    /// NATS mode
+    #[serde(flatten)]
+    pub mode: Mode,
     /// Authentication credentials (optional)
     pub auth: Option<NatsAuth>,
     /// Value field to use for message payload
     pub value_field: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Mode {
+    /// Regular NATS mode
+    Regular {
+        /// NATS subject to publish to
+        subject: Expr<String>,
+    },
+    /// JetStream mode
+    JetStream {
+        /// NATS subject to publish to
+        subject: Expr<String>,
+    },
+}
+
 /// JetStream configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JetStreamConfig {
     /// Stream name
-    pub stream: String,
+    pub stream: Expr<String>,
 }
 
 /// NATS authentication configuration
@@ -105,19 +118,15 @@ impl Output for NatsOutput {
         *client_guard = Some(client.clone());
 
         // Setup JetStream if configured
-        if let Some(js_config) = &self.config.jet_stream {
-            let jetstream = async_nats::jetstream::new(client);
-
-            // Get or create stream
-            let _ = jetstream
-                .get_stream(&js_config.stream)
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to get JetStream: {}", e)))?;
-
-            // Store stream reference
-            let mut stream_guard = self.js_stream.write().await;
-            *stream_guard = Some(jetstream);
-        }
+        match &self.config.mode {
+            Mode::Regular { .. } => {}
+            Mode::JetStream { .. } => {
+                let jetstream = async_nats::jetstream::new(client);
+                // Store stream reference
+                let mut stream_guard = self.js_stream.write().await;
+                *stream_guard = Some(jetstream);
+            }
+        };
 
         Ok(())
     }
@@ -144,31 +153,20 @@ impl Output for NatsOutput {
 
         // Clone payloads to avoid lifetime issues
         let owned_payloads: Vec<Vec<u8>> = payloads.into_iter().map(|p| p.to_vec()).collect();
-
         // Get subject
-        let subject = self.config.subject.evaluate_expr(&msg)?;
-
-        // Prepare JetStream context once (if configured)
-        let js_stream_guard = self.js_stream.read().await;
-        let jet_ctx = js_stream_guard.as_ref();
+        let subject = match &self.config.mode {
+            Mode::Regular { subject } => subject.evaluate_expr(&msg)?,
+            Mode::JetStream { subject } => subject.evaluate_expr(&msg)?,
+        };
 
         // Publish messages
         for (i, payload) in owned_payloads.into_iter().enumerate() {
-            if let Some(subject_str) = subject.get(i) {
-                info!("Publishing message to NATS subject: {}", subject_str);
-                if let Some(jetstream) = &jet_ctx {
-                    // Publish to JetStream
-                    if let Err(e) = jetstream
-                        .publish(subject_str.to_string(), payload.into())
-                        .await
-                    {
-                        error!("Failed to publish message to JetStream: {}", e);
-                        return Err(Error::Process(format!(
-                            "Failed to publish message to JetStream: {}",
-                            e
-                        )));
-                    }
-                } else {
+            let Some(subject_str) = subject.get(i) else {
+                continue;
+            };
+
+            match &self.config.mode {
+                Mode::Regular { .. } => {
                     // Publish to regular NATS
                     if let Err(e) = client
                         .publish(subject_str.to_string(), payload.into())
@@ -181,7 +179,25 @@ impl Output for NatsOutput {
                         )));
                     }
                 }
-            }
+                Mode::JetStream { .. } => {
+                    // Prepare JetStream context once (if configured)
+                    let js_stream_guard = self.js_stream.read().await;
+                    let jet_ctx = js_stream_guard.as_ref();
+                    if let Some(jetstream) = &jet_ctx {
+                        // Publish to JetStream
+                        if let Err(e) = jetstream
+                            .publish(subject_str.to_string(), payload.into())
+                            .await
+                        {
+                            error!("Failed to publish message to JetStream: {}", e);
+                            return Err(Error::Process(format!(
+                                "Failed to publish message to JetStream: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
+            };
         }
 
         Ok(())
