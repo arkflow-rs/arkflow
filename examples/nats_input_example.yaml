@@ -4,10 +4,11 @@ streams:
   - input:
       type: "nats"
       url: "nats://localhost:4222"
-      mode: jet_stream
-      stream: "test"
-      consumer_name: "test"
-      durable_name: "test"
+      mode:
+        type: jet_stream
+        stream: "test"
+        consumer_name: "test"
+        durable_name: "test"
 
     
     

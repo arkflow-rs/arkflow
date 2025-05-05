@@ -36,14 +36,13 @@ pub struct NatsInputConfig {
     /// NATS server URL
     pub url: String,
     /// NATS mode
-    #[serde(flatten)]
     pub mode: Mode,
     /// Authentication credentials (optional)
     pub auth: Option<NatsAuth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Mode {
     Regular {
         /// NATS subject to subscribe to
