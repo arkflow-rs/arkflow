@@ -56,13 +56,6 @@ pub enum Mode {
     },
 }
 
-/// JetStream configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JetStreamConfig {
-    /// Stream name
-    pub stream: Expr<String>,
-}
-
 /// NATS authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsAuth {
