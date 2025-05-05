@@ -1,0 +1,24 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 300
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+        - type: "sql"
+          query: "SELECT * FROM flow WHERE value >= 10"
+
+    output:
+      type: "sql"
+      output_type: "Mysql"
+      uri: "mysql://root:1234@34.121.134.207:3306/arkflow"
+      table_name: "arkflow_test"  
+
+    error_output:
+      type: "stdout"
