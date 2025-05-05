@@ -148,8 +148,9 @@ impl Output for NatsOutput {
         let owned_payloads: Vec<Vec<u8>> = payloads.into_iter().map(|p| p.to_vec()).collect();
         // Get subject
         let subject = match &self.config.mode {
-            Mode::Regular { subject } => subject.evaluate_expr(&msg)?,
-            Mode::JetStream { subject } => subject.evaluate_expr(&msg)?,
+            Mode::Regular { subject } | Mode::JetStream { subject } => {
+                subject.evaluate_expr(&msg)?
+            }
         };
 
         // Publish messages
