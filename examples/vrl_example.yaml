@@ -1,0 +1,19 @@
+logging:
+  level: error
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 1
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+        - type: "vrl"
+          statement: ".v2, err = .value * 2; ."
+        - type: "arrow_to_json"
+
+    output:
+      type: "stdout"

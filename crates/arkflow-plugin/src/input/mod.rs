@@ -23,7 +23,10 @@ pub mod http;
 pub mod kafka;
 pub mod memory;
 pub mod mqtt;
+pub mod nats;
+pub mod redis;
 pub mod sql;
+pub mod websocket;
 
 pub fn init() -> Result<(), Error> {
     generate::init()?;
@@ -31,6 +34,9 @@ pub fn init() -> Result<(), Error> {
     kafka::init()?;
     memory::init()?;
     mqtt::init()?;
+    nats::init()?;
+    redis::init()?;
     sql::init()?;
+    websocket::init()?;
     Ok(())
 }

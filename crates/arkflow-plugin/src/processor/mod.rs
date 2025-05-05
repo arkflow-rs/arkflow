@@ -22,11 +22,13 @@ pub mod batch;
 pub mod json;
 pub mod protobuf;
 pub mod sql;
+pub mod vrl;
 
 pub fn init() -> Result<(), Error> {
     batch::init()?;
     json::init()?;
     protobuf::init()?;
     sql::init()?;
+    vrl::init()?;
     Ok(())
 }

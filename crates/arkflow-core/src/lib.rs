@@ -74,7 +74,7 @@ pub type Bytes = Vec<u8>;
 
 /// Represents a message in a stream processing engine.
 #[derive(Clone, Debug)]
-pub struct MessageBatch(RecordBatch);
+pub struct MessageBatch(pub RecordBatch);
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
@@ -96,6 +96,7 @@ impl MessageBatch {
 
         Ok(Self(batch))
     }
+
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {
         let schema = self.schema();
         let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
