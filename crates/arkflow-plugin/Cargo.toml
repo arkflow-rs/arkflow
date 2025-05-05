@@ -55,7 +55,7 @@ sasl2-sys = { workspace = true }
 
 # arkflow
 arkflow-core = { workspace = true }
-mysql_async = { workspace = true }
+sqlx = { workspace= true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
