@@ -20,6 +20,7 @@ use crate::expr::{EvaluateExpr, Expr};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_nats::jetstream::stream::Stream;
+use async_nats::jetstream::Context;
 use async_nats::{Client, ConnectOptions};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -64,7 +65,7 @@ pub struct NatsAuth {
 pub struct NatsOutput {
     config: NatsOutputConfig,
     client: Arc<RwLock<Option<Client>>>,
-    js_stream: Arc<RwLock<Option<Stream>>>,
+    js_stream: Arc<RwLock<Option<Context>>>,
 }
 
 impl NatsOutput {
@@ -108,14 +109,14 @@ impl Output for NatsOutput {
             let jetstream = async_nats::jetstream::new(client);
 
             // Get or create stream
-            let stream = jetstream
+            let _ = jetstream
                 .get_stream(&js_config.stream)
                 .await
                 .map_err(|e| Error::Connection(format!("Failed to get JetStream: {}", e)))?;
 
             // Store stream reference
             let mut stream_guard = self.js_stream.write().await;
-            *stream_guard = Some(stream);
+            *stream_guard = Some(jetstream);
         }
 
         Ok(())
@@ -147,29 +148,25 @@ impl Output for NatsOutput {
         // Get subject
         let subject = self.config.subject.evaluate_expr(&msg)?;
 
-        // Check if using JetStream
+        // Prepare JetStream context once (if configured)
         let js_stream_guard = self.js_stream.read().await;
-        let using_jetstream = js_stream_guard.is_some();
+        let jet_ctx = js_stream_guard.as_ref();
 
         // Publish messages
         for (i, payload) in owned_payloads.into_iter().enumerate() {
             if let Some(subject_str) = subject.get(i) {
                 info!("Publishing message to NATS subject: {}", subject_str);
-
-                if using_jetstream {
+                if let Some(jetstream) = &jet_ctx {
                     // Publish to JetStream
-                    if let Some(_stream) = &*js_stream_guard {
-                        let jetstream = async_nats::jetstream::new(client.clone());
-                        if let Err(e) = jetstream
-                            .publish(subject_str.to_string(), payload.into())
-                            .await
-                        {
-                            error!("Failed to publish message to JetStream: {}", e);
-                            return Err(Error::Process(format!(
-                                "Failed to publish message to JetStream: {}",
-                                e
-                            )));
-                        }
+                    if let Err(e) = jetstream
+                        .publish(subject_str.to_string(), payload.into())
+                        .await
+                    {
+                        error!("Failed to publish message to JetStream: {}", e);
+                        return Err(Error::Process(format!(
+                            "Failed to publish message to JetStream: {}",
+                            e
+                        )));
                     }
                 } else {
                     // Publish to regular NATS
