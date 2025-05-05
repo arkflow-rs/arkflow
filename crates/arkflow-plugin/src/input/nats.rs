@@ -35,16 +35,32 @@ use tracing::{error, warn};
 pub struct NatsInputConfig {
     /// NATS server URL
     pub url: String,
-    /// NATS subject to subscribe to
-    pub subject: String,
-    /// NATS queue group (optional)
-    pub queue_group: Option<String>,
-    /// JetStream configuration (optional)
-    pub jet_stream: Option<JetStreamConfig>,
+    /// NATS mode
+    #[serde(flatten)]
+    pub mode: Mode,
     /// Authentication credentials (optional)
     pub auth: Option<NatsAuth>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Mode {
+    Regular {
+        /// NATS subject to subscribe to
+        subject: String,
+        /// NATS queue group (optional)
+        queue_group: Option<String>,
+    },
+    /// JetStream configuration
+    JetStream {
+        /// Stream name
+        stream: String,
+        /// Consumer name
+        consumer_name: String,
+        /// Durable name (optional)
+        durable_name: Option<String>,
+    },
+}
 /// JetStream configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JetStreamConfig {
@@ -134,190 +150,201 @@ impl Input for NatsInput {
         let sender_clone = self.sender.clone();
         let cancellation_token_clone = self.cancellation_token.clone();
 
-        // Setup JetStream if configured
-        if let Some(js_config) = &self.config.jet_stream {
-            let jetstream = async_nats::jetstream::new(client);
+        match &self.config.mode {
+            Mode::Regular {
+                subject,
+                queue_group,
+            } => {
+                // Setup regular subscription
+                let subject = subject.clone();
+                let client_clone = client.clone();
+                let sender = sender_clone;
+                let cancellation = cancellation_token_clone;
+                let queue_group = queue_group.clone();
 
-            // Get or create stream
-            let stream = jetstream
-                .get_stream(&js_config.stream)
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to get JetStream: {}", e)))?;
+                tokio::spawn(async move {
+                    // Create subscription
+                    let subscription_result = if let Some(queue) = queue_group {
+                        client_clone.queue_subscribe(subject, queue).await
+                    } else {
+                        client_clone.subscribe(subject).await
+                    };
 
-            // Store stream reference
-            let mut stream_guard = self.js_stream.write().await;
-            *stream_guard = Some(stream.clone());
-
-            // Get or create consumer
-            let consumer_config = async_nats::jetstream::consumer::pull::Config {
-                durable_name: js_config.durable_name.clone(),
-                name: Some(js_config.consumer_name.clone()),
-                ..Default::default()
-            };
-
-            let consumer = stream
-                .get_or_create_consumer(&js_config.consumer_name, consumer_config)
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to create consumer: {}", e)))?;
-
-            // Store consumer reference
-            let mut consumer_guard = self.js_consumer.write().await;
-            *consumer_guard = Some(consumer.clone());
-
-            // Start background task for JetStream message processing
-            let sender = sender_clone.clone();
-            let cancellation = cancellation_token_clone.clone();
-            match consumer.fetch().max_messages(10).messages().await {
-                Ok(mut messages) => {
-                    while let Some(message_result) = messages.next().await {
-                        match message_result {
-                            Ok(message) => {
-                                // Send to channel with original message for later acknowledgment
-                                if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
-                                {
-                                    error!("Failed to send message to channel: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to get JetStream message: {}", e);
-                                if let Err(e) = sender
-                                    .send_async(NatsMsg::Err(Error::Process(format!(
-                                        "Failed to get message: {}",
-                                        e
-                                    ))))
-                                    .await
-                                {
-                                    error!("Failed to send error to channel: {}", e);
-                                }
-                                // Short pause before retrying
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to fetch JetStream messages: {}", e);
-                    if let Err(e) = sender
-                        .send_async(NatsMsg::Err(Error::Process(format!(
-                            "Failed to fetch messages: {}",
-                            e
-                        ))))
-                        .await
-                    {
-                        error!("Failed to send error to channel: {}", e);
-                    }
-                    // Short pause before retrying
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {
-                            break;
-                        }
-                        result = consumer.fetch().messages()  => {
-                            match result {
-                            Ok(mut messages) => {
-                                while let Some(message_result) = messages.next().await {
-                                    match message_result {
-                                        Ok(message) => {
-                                            // Send to channel with original message for later acknowledgment
-                                            if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
-                                            {
-                                                error!("Failed to send message to channel: {}", e);
+                    match subscription_result {
+                        Ok(mut subscription) => {
+                            loop {
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => {
+                                        break;
+                                    }
+                                    message_option = subscription.next() => {
+                                        match message_option {
+                                            Some(message) => {
+                                                if let Err(e) = sender.send_async(NatsMsg::Regular(message)).await {
+                                                    error!("Failed to send message to channel: {}", e);
+                                                }
+                                            },
+                                            None => {
+                                                // Subscription ended
+                                                if let Err(e) = sender.send_async(NatsMsg::Err(Error::EOF)).await {
+                                                    error!("Failed to send EOF to channel: {}", e);
+                                                }
+                                                break;
                                             }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to get JetStream message: {}", e);
-                                            if let Err(e) = sender
-                                                .send_async(NatsMsg::Err(Error::Process(format!(
-                                                    "Failed to get message: {}",
-                                                    e
-                                                ))))
-                                                .await
-                                            {
-                                                error!("Failed to send error to channel: {}", e);
-                                            }
-                                            // Short pause before retrying
-                                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         }
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to fetch JetStream messages: {}", e);
-                                if let Err(e) = sender
-                                    .send_async(NatsMsg::Err(Error::Process(format!(
-                                        "Failed to fetch messages: {}",
-                                        e
-                                    ))))
-                                    .await
-                                {
-                                    error!("Failed to send error to channel: {}", e);
-                                }
-                                // Short pause before retrying
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
                         }
+                        Err(e) => {
+                            error!("Failed to subscribe to NATS subject: {}", e);
+                            let _ = sender
+                                .send_async(NatsMsg::Err(Error::Process(format!(
+                                    "Failed to subscribe to NATS subject: {}",
+                                    e
+                                ))))
+                                .await;
                         }
                     }
-                }
-            });
-        } else {
-            // Setup regular subscription
-            let subject = self.config.subject.clone();
-            let client_clone = client.clone();
-            let sender = sender_clone;
-            let cancellation = cancellation_token_clone;
-            let queue_group = self.config.queue_group.clone();
+                });
+            }
+            Mode::JetStream {
+                stream,
+                consumer_name,
+                durable_name,
+            } => {
+                // Setup JetStream configured
+                let jetstream = async_nats::jetstream::new(client);
 
-            tokio::spawn(async move {
-                // Create subscription
-                let subscription_result = if let Some(queue) = queue_group {
-                    client_clone.queue_subscribe(subject, queue).await
-                } else {
-                    client_clone.subscribe(subject).await
+                // Get or create stream
+                let stream = jetstream
+                    .get_stream(stream)
+                    .await
+                    .map_err(|e| Error::Connection(format!("Failed to get JetStream: {}", e)))?;
+
+                // Store stream reference
+                let mut stream_guard = self.js_stream.write().await;
+                *stream_guard = Some(stream.clone());
+
+                // Get or create consumer
+                let consumer_config = async_nats::jetstream::consumer::pull::Config {
+                    durable_name: durable_name.clone(),
+                    name: Some(consumer_name.clone()),
+                    ..Default::default()
                 };
 
-                match subscription_result {
-                    Ok(mut subscription) => {
-                        loop {
-                            tokio::select! {
-                                _ = cancellation.cancelled() => {
-                                    break;
-                                }
-                                message_option = subscription.next() => {
-                                    match message_option {
-                                        Some(message) => {
-                                            if let Err(e) = sender.send_async(NatsMsg::Regular(message)).await {
-                                                error!("Failed to send message to channel: {}", e);
-                                            }
-                                        },
-                                        None => {
-                                            // Subscription ended
-                                            if let Err(e) = sender.send_async(NatsMsg::Err(Error::EOF)).await {
-                                                error!("Failed to send EOF to channel: {}", e);
-                                            }
-                                            break;
-                                        }
+                let consumer = stream
+                    .get_or_create_consumer(consumer_name, consumer_config)
+                    .await
+                    .map_err(|e| Error::Connection(format!("Failed to create consumer: {}", e)))?;
+
+                // Store consumer reference
+                let mut consumer_guard = self.js_consumer.write().await;
+                *consumer_guard = Some(consumer.clone());
+
+                // Start background task for JetStream message processing
+                let sender = sender_clone.clone();
+                let cancellation = cancellation_token_clone.clone();
+                match consumer.fetch().max_messages(10).messages().await {
+                    Ok(mut messages) => {
+                        while let Some(message_result) = messages.next().await {
+                            match message_result {
+                                Ok(message) => {
+                                    // Send to channel with original message for later acknowledgment
+                                    if let Err(e) =
+                                        sender.send_async(NatsMsg::JetStream(message)).await
+                                    {
+                                        error!("Failed to send message to channel: {}", e);
                                     }
+                                }
+                                Err(e) => {
+                                    error!("Failed to get JetStream message: {}", e);
+                                    if let Err(e) = sender
+                                        .send_async(NatsMsg::Err(Error::Process(format!(
+                                            "Failed to get message: {}",
+                                            e
+                                        ))))
+                                        .await
+                                    {
+                                        error!("Failed to send error to channel: {}", e);
+                                    }
+                                    // Short pause before retrying
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to subscribe to NATS subject: {}", e);
-                        let _ = sender
+                        error!("Failed to fetch JetStream messages: {}", e);
+                        if let Err(e) = sender
                             .send_async(NatsMsg::Err(Error::Process(format!(
-                                "Failed to subscribe to NATS subject: {}",
+                                "Failed to fetch messages: {}",
                                 e
                             ))))
-                            .await;
+                            .await
+                        {
+                            error!("Failed to send error to channel: {}", e);
+                        }
+                        // Short pause before retrying
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
-            });
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                break;
+                            }
+                            result = consumer.fetch().messages()  => {
+                                match result {
+                                Ok(mut messages) => {
+                                    while let Some(message_result) = messages.next().await {
+                                        match message_result {
+                                            Ok(message) => {
+                                                // Send to channel with original message for later acknowledgment
+                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
+                                                {
+                                                    error!("Failed to send message to channel: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to get JetStream message: {}", e);
+                                                if let Err(e) = sender
+                                                    .send_async(NatsMsg::Err(Error::Process(format!(
+                                                        "Failed to get message: {}",
+                                                        e
+                                                    ))))
+                                                    .await
+                                                {
+                                                    error!("Failed to send error to channel: {}", e);
+                                                }
+                                                // Short pause before retrying
+                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to fetch JetStream messages: {}", e);
+                                    if let Err(e) = sender
+                                        .send_async(NatsMsg::Err(Error::Process(format!(
+                                            "Failed to fetch messages: {}",
+                                            e
+                                        ))))
+                                        .await
+                                    {
+                                        error!("Failed to send error to channel: {}", e);
+                                    }
+                                    // Short pause before retrying
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         Ok(())
