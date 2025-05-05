@@ -104,7 +104,7 @@ impl Input for RedisInput {
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 
-        let config_type = self.config._type.clone();
+        let config_type = self.config.subscribe_type.clone();
 
         tokio::spawn(async move {
             let mut pubsub = conn.into_pubsub();
