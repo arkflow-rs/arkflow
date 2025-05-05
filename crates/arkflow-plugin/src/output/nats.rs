@@ -33,7 +33,6 @@ pub struct NatsOutputConfig {
     /// NATS server URL
     pub url: String,
     /// NATS mode
-    #[serde(flatten)]
     pub mode: Mode,
     /// Authentication credentials (optional)
     pub auth: Option<NatsAuth>,
@@ -42,7 +41,7 @@ pub struct NatsOutputConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Mode {
     /// Regular NATS mode
     Regular {
