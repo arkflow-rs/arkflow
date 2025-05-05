@@ -22,6 +22,7 @@ pub mod drop;
 pub mod http;
 pub mod kafka;
 pub mod mqtt;
+pub mod nats;
 pub mod stdout;
 
 pub fn init() -> Result<(), Error> {
@@ -30,5 +31,6 @@ pub fn init() -> Result<(), Error> {
     kafka::init()?;
     mqtt::init()?;
     stdout::init()?;
+    nats::init()?;
     Ok(())
 }
