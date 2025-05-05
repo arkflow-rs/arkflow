@@ -217,7 +217,7 @@ impl Input for NatsInput {
                         _ = cancellation.cancelled() => {
                             break;
                         }
-                        result = consumer.fetch().max_messages(10).messages()  => {
+                        result = consumer.fetch().messages()  => {
                             match result {
                             Ok(mut messages) => {
                                 while let Some(message_result) = messages.next().await {

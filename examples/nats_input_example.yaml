@@ -1,0 +1,24 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "nats"
+      url: "nats://localhost:4222"
+      subject: "test"
+      queue_group: "test"
+      jet_stream:
+        stream: "test"
+        consumer_name: "test"
+        durable_name: "test"
+    
+    
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: "SELECT cast( __value__  as string) as s FROM flow"
+
+
+    output:
+      type: "stdout"
