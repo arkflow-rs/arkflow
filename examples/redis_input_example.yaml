@@ -5,10 +5,11 @@ streams:
       type: "redis"
       url: "redis://127.0.0.1:6379"
 
-      redis_type: subscribe
-      subscribe:
-        subscribe_type: channels
-        channels: ["test"]
+      redis_type:
+        type: subscribe
+        subscribe:
+          subscribe_type: channels
+          channels: [ "test" ]
 
     #      redis_type: list
     #      list:
