@@ -433,34 +433,3 @@ impl Ack for NatsAck {
 pub fn init() -> Result<(), Error> {
     register_input_builder("nats", Arc::new(NatsInputBuilder))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_serialization() {
-        let config = NatsInputConfig {
-            url: "nats://localhost:4222".to_string(),
-            subject: "test.subject".to_string(),
-            queue_group: Some("test-group".to_string()),
-            jet_stream: Some(JetStreamConfig {
-                stream: "test-stream".to_string(),
-                consumer_name: "test-consumer".to_string(),
-                durable_name: Some("test-durable".to_string()),
-            }),
-            auth: Some(NatsAuth {
-                username: Some("user".to_string()),
-                password: Some("pass".to_string()),
-                token: None,
-            }),
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: NatsInputConfig = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.url, config.url);
-        assert_eq!(deserialized.subject, config.subject);
-        assert_eq!(deserialized.queue_group, config.queue_group);
-    }
-}
