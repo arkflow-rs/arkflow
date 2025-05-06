@@ -48,7 +48,6 @@ pub struct SqlInputConfig {
     select_sql: String,
     /// Ballista helps us perform distributed computing
     ballista: Option<BallistaConfig>,
-    #[serde(flatten)]
     input_type: InputType,
 }
 
@@ -59,7 +58,7 @@ pub struct BallistaConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "input_type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum InputType {
     /// Avro input
     Avro(AvroConfig),
