@@ -2,6 +2,7 @@
 
 The SQL input component allows you to query data from various input sources using SQL. It supports both local file-based data sources and database connections, with optional distributed computing capabilities through Ballista.
 
+Reference to [SQL](../../category/sql).
 ## Configuration
 
 ### **select_sql**
