@@ -51,7 +51,11 @@ impl Processor for JsonToArrowProcessor {
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
 
-        let json_data: Vec<u8> = result.iter().flat_map(|x| x.iter().chain(b"\n")).copied().collect();
+        let json_data: Vec<u8> = result
+            .iter()
+            .flat_map(|x| x.iter().chain(b"\n"))
+            .copied()
+            .collect();
         let record_batch = self.json_to_arrow(&json_data)?;
         Ok(vec![MessageBatch::new_arrow(record_batch)])
     }
@@ -64,21 +68,32 @@ impl Processor for JsonToArrowProcessor {
 impl JsonToArrowProcessor {
     fn json_to_arrow(&self, content: &[u8]) -> Result<RecordBatch, Error> {
         let mut cursor_for_inference = Cursor::new(content);
-        let (inferred_schema, _) =
+        let (mut inferred_schema, _) =
             arrow_json::reader::infer_json_schema(&mut cursor_for_inference, Some(1))
                 .map_err(|e| Error::Process(format!("Schema inference error: {}", e)))?;
-        let inferred_schema = Arc::new(inferred_schema);
+        if let Some(ref set) = self.config.fields_to_include {
+            inferred_schema = inferred_schema
+                .project(
+                    &set.iter()
+                        .filter_map(|name| inferred_schema.index_of(name).ok())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| Error::Process(format!("Arrow JSON Projection Error: {}", e)))?;
+        }
 
+        let inferred_schema = Arc::new(inferred_schema);
         let mut decoder = ReaderBuilder::new(inferred_schema.clone())
             .build_decoder()
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
         decoder
             .decode(content)
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?;
-        Ok(decoder
+        let mut batch = decoder
             .flush()
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Flush Error: {}", e)))?
-            .unwrap_or(RecordBatch::new_empty(inferred_schema)))
+            .unwrap_or(RecordBatch::new_empty(inferred_schema));
+
+        Ok(batch)
     }
 }
 
