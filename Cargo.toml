@@ -28,6 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
 datafusion = "46"
+datafusion-functions-json="0.46.0"
 arrow-json = "54"
 prost-reflect = "0.14.7"
 prost-types = "0.13.5"
