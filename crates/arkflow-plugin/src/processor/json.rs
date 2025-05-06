@@ -21,10 +21,6 @@ use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use datafusion::arrow;
-use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, NullArray, StringArray, UInt64Array,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,8 +51,8 @@ impl Processor for JsonToArrowProcessor {
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
 
-        let json_data: &[u8] = result.join("\n");
-        let record_batch = self.json_to_arrow(json_data)?;
+        let json_data: Vec<u8> = result.iter().flat_map(|x| x.iter().chain(b"\n")).copied().collect();
+        let record_batch = self.json_to_arrow(&json_data)?;
         Ok(vec![MessageBatch::new_arrow(record_batch)])
     }
 
