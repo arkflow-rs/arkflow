@@ -51,11 +51,7 @@ impl Processor for JsonToArrowProcessor {
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
 
-        let json_data: Vec<u8> = result
-            .iter()
-            .flat_map(|x| x.iter().chain(b"\n"))
-            .copied()
-            .collect();
+        let json_data: Vec<u8> = result.join("\n".as_bytes());
         let record_batch = self.json_to_arrow(&json_data)?;
         Ok(vec![MessageBatch::new_arrow(record_batch)])
     }
@@ -88,7 +84,7 @@ impl JsonToArrowProcessor {
         decoder
             .decode(content)
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?;
-        let mut batch = decoder
+        let batch = decoder
             .flush()
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Flush Error: {}", e)))?
             .unwrap_or(RecordBatch::new_empty(inferred_schema));
