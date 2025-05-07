@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]

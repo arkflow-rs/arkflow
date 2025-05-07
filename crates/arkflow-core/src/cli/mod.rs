@@ -31,7 +31,7 @@ impl Default for Cli {
 impl Cli {
     pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let matches = Command::new("arkflow")
-            .version("0.2.1")
+            .version("0.3.0")
             .author("chenquan")
             .about("High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting multiple input/output sources and processors.")
             .arg(
