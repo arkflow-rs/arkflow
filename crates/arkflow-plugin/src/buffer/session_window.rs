@@ -62,7 +62,11 @@ impl SessionWindow {
                         notify_clone.notify_waiters();
                         break;
                     }
-                    _ = notify_clone.notified() => {}
+                    _ = notify_clone.notified() => {
+                        if close_clone.is_cancelled(){
+                            break;
+                        }
+                    }
                 }
             }
         });
