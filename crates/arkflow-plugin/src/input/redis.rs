@@ -34,11 +34,11 @@ use tracing::error;
 pub struct RedisInputConfig {
     /// Redis server URL
     url: String,
-    #[serde(flatten)]
-    _type: Type,
+    subscribe_type: Type,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "subscribe_type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Subscribe {
     /// List of channels to subscribe to
     Channels { channels: Vec<String> },
@@ -52,6 +52,7 @@ pub enum Type {
     Subscribe { subscribe: Subscribe },
     List { list: Vec<String> },
 }
+
 /// Redis input component
 pub struct RedisInput {
     config: RedisInputConfig,
@@ -103,7 +104,7 @@ impl Input for RedisInput {
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 
-        let config_type = self.config._type.clone();
+        let config_type = self.config.subscribe_type.clone();
 
         tokio::spawn(async move {
             let mut pubsub = conn.into_pubsub();

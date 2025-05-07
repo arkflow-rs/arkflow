@@ -3,13 +3,14 @@ logging:
 streams:
   - input:
       type: "sql"
-      input_type: "json"
-#      input_type: "csv"
-      path: './examples/stream_data.json'
-#      path: './examples/input_data.csv'
+      input_type:
+        type: "json"
+  #      input_type: "csv"
+        path: './examples/stream_data.json'
+  #      path: './examples/input_data.csv'
       select_sql: |
         select *,value + 999999 from flow;
-    
+
     
 
     pipeline:
