@@ -16,7 +16,7 @@ multiple input/output sources and processors.
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, and other input/output sources
 - **Powerful Processing Capabilities**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch
   processing, and other processors
-- **Extensible**: Modular design, easy to extend with new input, output, and processor components
+- **Extensible**: Modular design, easy to extend with new input, buffer, output, and processor components
 
 ## Installation
 
@@ -100,6 +100,9 @@ ArkFlow supports multiple input sources:
 - **File**: Reading data from files(Csv,Json, Parquet, Avro, Arrow) using SQL
 - **Generator**: Generate test data
 - **Database**: Query data from databases(MySQL, PostgreSQL, SQLite, Duckdb)
+- **Nats**: Subscribe to messages from Nats topics
+- **Redis**: Subscribe to messages from Redis channels or lists
+- **Websocket**: Subscribe to messages from WebSocket connections
 
 Example:
 
@@ -123,6 +126,7 @@ ArkFlow provides multiple data processors:
 - **SQL**: Process data using SQL queries
 - **Protobuf**: Protobuf encoding/decoding
 - **Batch Processing**: Process messages in batches
+- **Vrl**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
 
 Example:
 
@@ -144,6 +148,7 @@ ArkFlow supports multiple output targets:
 - **HTTP**: Send data via HTTP
 - **Standard Output**: Output data to the console
 - **Drop**: Discard data
+- **Nats**: Publish messages to Nats topics
 
 Example:
 
@@ -165,6 +170,7 @@ ArkFlow supports multiple error output targets:
 - **HTTP**: Send error data via HTTP
 - **Standard Output**: Output error data to the console
 - **Drop**: Discard error data
+- **Nats**: Publish messages to Nats topics
 
 Example:
 
