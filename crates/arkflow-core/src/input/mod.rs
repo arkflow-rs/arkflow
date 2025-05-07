@@ -55,7 +55,7 @@ impl Ack for NoopAck {
     async fn ack(&self) {}
 }
 
-pub struct VecAck(Vec<Arc<dyn Ack>>);
+pub struct VecAck(pub Vec<Arc<dyn Ack>>);
 
 #[async_trait]
 impl Ack for VecAck {
