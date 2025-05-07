@@ -25,22 +25,19 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time;
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{sleep, Instant};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TumblingWindowConfig {
-    window_size: u32,
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
 }
 
 pub struct TumblingWindow {
-    config: TumblingWindowConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     notify: Arc<Notify>,
     close: CancellationToken,
-    last_window_time: Arc<RwLock<Instant>>,
 }
 
 impl TumblingWindow {
@@ -50,7 +47,6 @@ impl TumblingWindow {
         let interval = config.interval;
         let close = CancellationToken::new();
         let close_clone = close.clone();
-        let last_window_time = Arc::new(RwLock::new(Instant::now()));
 
         tokio::spawn(async move {
             loop {
@@ -75,9 +71,7 @@ impl TumblingWindow {
         Ok(Self {
             close,
             notify,
-            config,
             queue: Arc::new(Default::default()),
-            last_window_time,
         })
     }
 
