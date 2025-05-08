@@ -1,5 +1,6 @@
 ---
 sidebar_position: 1
+logo: ./logo.svg
 ---
 
 # Introduction
@@ -8,7 +9,7 @@ ArkFlow is a high-performance Rust stream processing engine that provides powerf
 
 logo([Logo Usage Guidelines](./about-logo)）: 
 
-![logo.svg](logo.svg)
+![ArkFlow logo](logo.svg)
 
 
 ## Core Features
