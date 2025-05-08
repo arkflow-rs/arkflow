@@ -2,7 +2,9 @@
 
 [English](README.md) | 中文
 
-![logo.svg](logo.svg)
+<p align="center">
+<img align="center" width="150px" src="./logo.svg">
+<p align="center">
 
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
