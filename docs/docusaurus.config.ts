@@ -21,7 +21,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'ArkFlow',
   tagline: 'High-performance Rust stream processing engine',
-  favicon: 'img/favicon.ico',
+  favicon: 'img/favicon.svg',
 
   // Set the production url of your site here
   url: 'https://arkflow-rs.com',
