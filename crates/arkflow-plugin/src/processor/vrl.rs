@@ -28,13 +28,12 @@ pub fn init() -> Result<(), Error> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VrlProcessorConfig {
-    pub statement: String,
+    statement: String,
 }
 
-pub struct VrlProcessor {
+struct VrlProcessor {
     #[allow(unused)]
     config: VrlProcessorConfig,
-
     program: Program,
 }
 
@@ -66,10 +65,7 @@ impl Processor for VrlProcessor {
                 }
             }
         }
-        // for x in output {
-        //     let batch = vrl_values_to_message_batch(x)?;
-        //     batch
-        // }
+
         output
             .into_iter()
             .map(|x| vrl_values_to_message_batch(x))
@@ -81,7 +77,7 @@ impl Processor for VrlProcessor {
     }
 }
 
-pub(crate) struct VrlProcessorBuilder;
+struct VrlProcessorBuilder;
 impl ProcessorBuilder for VrlProcessorBuilder {
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
@@ -102,7 +98,7 @@ impl ProcessorBuilder for VrlProcessorBuilder {
     }
 }
 
-pub(crate) fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
+fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
     let rows = message_batch.num_rows();
     let mut vrl_values: Vec<ObjectMap> = Vec::with_capacity(rows);
     for _ in 0..rows {
@@ -282,9 +278,7 @@ pub(crate) fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<Vr
     vrl_values.into_iter().map(|v| v.into()).collect()
 }
 
-pub(crate) fn vrl_values_to_message_batch(
-    mut vrl_values: Vec<VrlValue>,
-) -> Result<MessageBatch, Error> {
+fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageBatch, Error> {
     if vrl_values.is_empty() {}
     let Some(first_value) = vrl_values.get(0) else {
         return Ok(MessageBatch::from(RecordBatch::new_empty(Arc::new(
@@ -414,13 +408,13 @@ pub(crate) fn vrl_values_to_message_batch(
     Ok(MessageBatch::new_arrow(result))
 }
 
-pub(crate) fn insert(i: usize, vrl_values: &mut Vec<ObjectMap>, name: &str, val: VrlValue) {
+fn insert(i: usize, vrl_values: &mut Vec<ObjectMap>, name: &str, val: VrlValue) {
     if let Some(obj) = vrl_values.get_mut(i) {
         obj.insert(name.to_string().into(), val);
     }
 }
 
-pub(crate) fn get_arrow_data_type(val: &VrlValue) -> Result<DataType, Error> {
+fn get_arrow_data_type(val: &VrlValue) -> Result<DataType, Error> {
     match val {
         VrlValue::Bytes(_) => Ok(DataType::Binary),
         VrlValue::Integer(_) => Ok(DataType::Int64),

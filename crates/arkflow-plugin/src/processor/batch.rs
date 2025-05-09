@@ -27,13 +27,11 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Batch processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchProcessorConfig {
+struct BatchProcessorConfig {
     /// Batch size
-    pub count: usize,
+    count: usize,
     /// Batch timeout (ms)
-    pub timeout_ms: u64,
-    /// Batch data type
-    pub data_type: String,
+    timeout_ms: u64,
 }
 
 /// Batch Processor Components
@@ -45,7 +43,7 @@ pub struct BatchProcessor {
 
 impl BatchProcessor {
     /// Create a new batch processor component
-    pub fn new(config: BatchProcessorConfig) -> Result<Self, Error> {
+    fn new(config: BatchProcessorConfig) -> Result<Self, Error> {
         Ok(Self {
             config: config.clone(),
             batch: Arc::new(RwLock::new(Vec::with_capacity(config.count))),
@@ -119,7 +117,7 @@ impl Processor for BatchProcessor {
     }
 }
 
-pub(crate) struct BatchProcessorBuilder;
+struct BatchProcessorBuilder;
 impl ProcessorBuilder for BatchProcessorBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
@@ -147,7 +145,6 @@ mod tests {
         let processor = BatchProcessor::new(BatchProcessorConfig {
             count: 2,
             timeout_ms: 1000,
-            data_type: "arrow".to_string(),
         })
         .unwrap();
 
@@ -171,7 +168,6 @@ mod tests {
         let processor = BatchProcessor::new(BatchProcessorConfig {
             count: 5,
             timeout_ms: 100,
-            data_type: "arrow".to_string(),
         })
         .unwrap();
 
@@ -198,7 +194,6 @@ mod tests {
         let processor = BatchProcessor::new(BatchProcessorConfig {
             count: 2,
             timeout_ms: 1000,
-            data_type: "arrow".to_string(),
         })
         .unwrap();
 
@@ -211,7 +206,6 @@ mod tests {
         let processor = BatchProcessor::new(BatchProcessorConfig {
             count: 5,
             timeout_ms: 1000,
-            data_type: "arrow".to_string(),
         })
         .unwrap();
 

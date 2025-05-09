@@ -57,7 +57,7 @@ enum ToType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArrowConfig {
-    pub value_field: Option<String>,
+    value_field: Option<String>,
 }
 /// Protobuf Format Conversion Processor
 struct ProtobufProcessor {
@@ -67,7 +67,7 @@ struct ProtobufProcessor {
 
 impl ProtobufProcessor {
     /// Create a new Protobuf format conversion processor
-    pub fn new(config: ProtobufProcessorConfig) -> Result<Self, Error> {
+    fn new(config: ProtobufProcessorConfig) -> Result<Self, Error> {
         // Check the file extension to see if it's a proto file or a binary descriptor file
         let file_descriptor_set = Self::parse_proto_file(&config)?;
 

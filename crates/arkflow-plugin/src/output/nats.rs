@@ -29,20 +29,20 @@ use tracing::error;
 
 /// NATS output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NatsOutputConfig {
+struct NatsOutputConfig {
     /// NATS server URL
-    pub url: String,
+    url: String,
     /// NATS mode
-    pub mode: Mode,
+    mode: Mode,
     /// Authentication credentials (optional)
-    pub auth: Option<NatsAuth>,
+    auth: Option<NatsAuth>,
     /// Value field to use for message payload
-    pub value_field: Option<String>,
+    value_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Mode {
+enum Mode {
     /// Regular NATS mode
     Regular {
         /// NATS subject to publish to
@@ -57,7 +57,7 @@ pub enum Mode {
 
 /// NATS authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NatsAuth {
+struct NatsAuth {
     /// Username (optional)
     pub username: Option<String>,
     /// Password (optional)
@@ -67,7 +67,7 @@ pub struct NatsAuth {
 }
 
 /// NATS output component
-pub struct NatsOutput {
+struct NatsOutput {
     config: NatsOutputConfig,
     client: Arc<RwLock<Option<Client>>>,
     js_stream: Arc<RwLock<Option<Context>>>,
@@ -75,7 +75,7 @@ pub struct NatsOutput {
 
 impl NatsOutput {
     /// Create a new NATS output component
-    pub fn new(config: NatsOutputConfig) -> Result<Self, Error> {
+    fn new(config: NatsOutputConfig) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
@@ -214,7 +214,8 @@ impl Output for NatsOutput {
     }
 }
 
-pub(crate) struct NatsOutputBuilder;
+struct NatsOutputBuilder;
+
 impl OutputBuilder for NatsOutputBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {

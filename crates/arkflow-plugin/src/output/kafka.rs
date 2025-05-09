@@ -55,21 +55,21 @@ impl std::fmt::Display for CompressionType {
 
 /// Kafka output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KafkaOutputConfig {
+struct KafkaOutputConfig {
     /// List of Kafka server addresses
-    pub brokers: Vec<String>,
+    brokers: Vec<String>,
     /// Target topic
-    pub topic: Expr<String>,
+    topic: Expr<String>,
     /// Partition key (optional)
-    pub key: Option<Expr<String>>,
+    key: Option<Expr<String>>,
     /// Client ID
-    pub client_id: Option<String>,
+    client_id: Option<String>,
     /// Compression type
-    pub compression: Option<CompressionType>,
+    compression: Option<CompressionType>,
     /// Acknowledgment level (0=no acknowledgment, 1=leader acknowledgment, all=all replica acknowledgments)
-    pub acks: Option<String>,
+    acks: Option<String>,
     /// Value type
-    pub value_field: Option<String>,
+    value_field: Option<String>,
 }
 
 /// Kafka output component

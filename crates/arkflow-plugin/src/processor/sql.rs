@@ -34,27 +34,27 @@ use std::sync::Arc;
 const DEFAULT_TABLE_NAME: &str = "flow";
 /// SQL processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SqlProcessorConfig {
+struct SqlProcessorConfig {
     /// SQL query statement
-    pub query: String,
+    query: String,
 
     /// Table name (used in SQL queries)
-    pub table_name: Option<String>,
+    table_name: Option<String>,
 
     /// Experimental: Ballista helps us perform distributed computing
     ballista: Option<crate::input::sql::BallistaConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BallistaConfig {
+struct BallistaConfig {
     /// Ballista server url
-    pub remote_url: String,
+    remote_url: String,
 }
 
 /// SQL processor component
-pub struct SqlProcessor {
+struct SqlProcessor {
     config: SqlProcessorConfig,
-    pub statement: Statement,
+    statement: Statement,
 }
 
 impl SqlProcessor {
@@ -161,7 +161,7 @@ impl Processor for SqlProcessor {
     }
 }
 
-pub(crate) struct SqlProcessorBuilder;
+struct SqlProcessorBuilder;
 impl ProcessorBuilder for SqlProcessorBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {

@@ -33,11 +33,11 @@ use std::sync::Arc;
 /// Arrow Format Conversion Processor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonProcessorConfig {
-    pub value_field: Option<String>,
-    pub fields_to_include: Option<HashSet<String>>,
+    value_field: Option<String>,
+    fields_to_include: Option<HashSet<String>>,
 }
 
-pub struct JsonToArrowProcessor {
+struct JsonToArrowProcessor {
     config: JsonProcessorConfig,
 }
 
@@ -132,7 +132,8 @@ impl ArrowToJsonProcessor {
     }
 }
 
-pub(crate) struct JsonToArrowProcessorBuilder;
+struct JsonToArrowProcessorBuilder;
+
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
@@ -145,7 +146,8 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
         Ok(Arc::new(JsonToArrowProcessor { config }))
     }
 }
-pub(crate) struct ArrowToJsonProcessorBuilder;
+struct ArrowToJsonProcessorBuilder;
+
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
