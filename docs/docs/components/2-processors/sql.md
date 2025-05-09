@@ -20,6 +20,22 @@ type: `string`
 
 default: `flow`
 
+### **ballista (experimental)**
+
+Optional configuration for distributed computing using Ballista. When configured, SQL queries will be executed in a distributed manner.
+
+type: `object`
+
+required: `false`
+
+properties:
+- `remote_url`: Ballista server URL (e.g., "df://localhost:50050")
+
+  type: `string`
+
+  required: `true`
+
+
 ## Examples
 
 ```yaml

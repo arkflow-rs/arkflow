@@ -13,7 +13,7 @@ type: `string`
 
 required: `true`
 
-### **ballista**
+### **ballista (experimental)**
 
 Optional configuration for distributed computing using Ballista. When configured, SQL queries will be executed in a distributed manner.
 
