@@ -78,18 +78,23 @@ impl JsonToArrowProcessor {
         }
 
         let inferred_schema = Arc::new(inferred_schema);
-        let mut decoder = ReaderBuilder::new(inferred_schema.clone())
-            .build_decoder()
+        let reader = ReaderBuilder::new(inferred_schema.clone())
+            .build(Cursor::new(content))
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
-        decoder
-            .decode(content)
-            .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?;
-        let batch = decoder
-            .flush()
-            .map_err(|e| Error::Process(format!("Arrow JSON Reader Flush Error: {}", e)))?
-            .unwrap_or(RecordBatch::new_empty(inferred_schema));
 
-        Ok(batch)
+        let result = reader
+            .map(|batch| {
+                Ok(batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?)
+            })
+            .collect::<Result<Vec<RecordBatch>, Error>>()?;
+        if result.is_empty() {
+            return Ok(RecordBatch::new_empty(inferred_schema));
+        }
+
+        let new_batch = arrow::compute::concat_batches(&inferred_schema, &result)
+            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+
+        Ok(new_batch)
     }
 }
 
