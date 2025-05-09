@@ -164,7 +164,9 @@ output:
     - localhost:9092
   topic: 
     type: value
-    value: test-topic
+    value:
+      type: value
+      value: test-topic
   client_id: arkflow-producer
 ```
 
@@ -231,7 +233,9 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: processed-topic
+      topic: 
+        type: value
+        value: test-topic
 ```
 
 ### Generate Test Data and Process

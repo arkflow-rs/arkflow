@@ -159,7 +159,9 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: output-topic
+  topic: 
+    type: value
+    value: output-topic
   client_id: arkflow-producer
 ```
 
@@ -227,7 +229,9 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: processed-topic
+      topic: 
+        type: value
+        value: processed-topic
 ```
 
 ### 生成测试数据并处理
