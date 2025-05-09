@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg" class="logo-svg">
+ <g class="layer">
+  <title>Layer 1</title>
+  <g id="svg_1">{/* Group and rotate all elements -90 degrees around center (75,75) */}
+        {/* Original fountain paths, their coordinates are relative to the unrotated state */}
+   <path d="m97.5,112.5q0,-40 -15,-60" fill="none" id="svg_2" stroke="#2563eb" stroke-linecap="round" stroke-width="12" transform="rotate(-90 90 82.5)"/>
+   <path d="m82.5,97.5q0,-40 15,-60" fill="none" id="svg_3" stroke="#3b82f6" stroke-linecap="round" stroke-width="12" transform="rotate(-90 90 67.5)"/>
+   <path d="m110,110q-10,-30 -25,-45" fill="none" id="svg_4" opacity="0.8" stroke="#60a5fa" stroke-linecap="round" stroke-width="10" transform="rotate(-90 97.5 87.5)"/>
+   <path d="m85,85q10,-30 25,-45" fill="none" id="svg_5" opacity="0.8" stroke="#93c5fd" stroke-linecap="round" stroke-width="10" transform="rotate(-90 97.5 62.5)"/>
+   <circle class="rust-accent" cx="50" cy="75" fill="#ff7f00" id="svg_6" r="7" transform="rotate(-90 50 75)"/></g>
+ </g>
+</svg>

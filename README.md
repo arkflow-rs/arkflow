@@ -1,6 +1,11 @@
 # ArkFlow
 
+<p align="center">
+<img align="center" width="150px" src="./logo.svg">
+<p align="center">
+
 English | [中文](README_zh.md)
+
 
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -159,7 +164,9 @@ output:
     - localhost:9092
   topic: 
     type: value
-    value: test-topic
+    value:
+      type: value
+      value: test-topic
   client_id: arkflow-producer
 ```
 
@@ -190,7 +197,10 @@ error_output:
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation
+- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
+- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
+- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide size.
+- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
 
 Example:
 
@@ -226,7 +236,9 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: processed-topic
+      topic: 
+        type: value
+        value: test-topic
 ```
 
 ### Generate Test Data and Process
