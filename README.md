@@ -197,7 +197,10 @@ error_output:
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation
+- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
+- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
+- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide size.
+- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
 
 Example:
 
