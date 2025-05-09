@@ -20,6 +20,7 @@ use crate::udf;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
+use ballista::prelude::SessionContextExt;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -39,6 +40,15 @@ pub struct SqlProcessorConfig {
 
     /// Table name (used in SQL queries)
     pub table_name: Option<String>,
+
+    /// Experimental: Ballista helps us perform distributed computing
+    ballista: Option<crate::input::sql::BallistaConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BallistaConfig {
+    /// Ballista server url
+    pub remote_url: String,
 }
 
 /// SQL processor component
@@ -50,8 +60,7 @@ pub struct SqlProcessor {
 impl SqlProcessor {
     /// Create a new SQL processor component.
     pub fn new(config: SqlProcessorConfig) -> Result<Self, Error> {
-        let ctx = Self::create_session_context()?;
-
+        let ctx = SessionContext::new();
         let statement = ctx
             .state()
             .sql_to_statement(
@@ -66,7 +75,7 @@ impl SqlProcessor {
     /// Execute SQL query
     async fn execute_query(&self, batch: MessageBatch) -> Result<RecordBatch, Error> {
         // Create a session context
-        let ctx = Self::create_session_context()?;
+        let ctx = self.create_session_context().await?;
 
         let table_name = self
             .config
@@ -119,8 +128,14 @@ impl SqlProcessor {
     }
 
     /// Create a new session context with UDFs and JSON functions registered
-    fn create_session_context() -> Result<SessionContext, Error> {
-        let mut ctx = SessionContext::new();
+    async fn create_session_context(&self) -> Result<SessionContext, Error> {
+        let mut ctx = if let Some(ballista) = &self.config.ballista {
+            SessionContext::remote(&ballista.remote_url)
+                .await
+                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
+        } else {
+            SessionContext::new()
+        };
         udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
@@ -174,6 +189,7 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "SELECT * FROM flow".to_string(),
             table_name: None,
+            ballista: None,
         })
         .unwrap();
 
@@ -205,6 +221,7 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "SELECT * FROM flow".to_string(),
             table_name: None,
+            ballista: None,
         })
         .unwrap();
 
@@ -223,6 +240,7 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "INVALID SQL QUERY".to_string(),
             table_name: None,
+            ballista: None,
         });
 
         assert!(processor.is_err());
@@ -233,6 +251,7 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "SELECT * FROM custom_table".to_string(),
             table_name: Some("custom_table".to_string()),
+            ballista: None,
         })
         .unwrap();
 
