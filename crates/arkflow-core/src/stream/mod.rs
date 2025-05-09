@@ -213,6 +213,7 @@ impl Stream {
                 }
             }
         }
+
         if let Err(e) = buffer.flush().await {
             error!("Failed to flush buffer: {}", e);
         }

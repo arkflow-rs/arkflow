@@ -29,13 +29,15 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryBufferConfig {
+struct MemoryBufferConfig {
+    /// Buffer capacity
     capacity: u32,
+    /// Buffer timeout
     #[serde(deserialize_with = "deserialize_duration")]
     timeout: time::Duration,
 }
 
-pub struct MemoryBuffer {
+struct MemoryBuffer {
     config: MemoryBufferConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     notify: Arc<Notify>,

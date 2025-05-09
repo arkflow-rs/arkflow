@@ -29,12 +29,12 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionWindowConfig {
+struct SessionWindowConfig {
     #[serde(deserialize_with = "deserialize_duration")]
     gap: time::Duration,
 }
 
-pub struct SessionWindow {
+struct SessionWindow {
     config: SessionWindowConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     notify: Arc<Notify>,

@@ -28,13 +28,16 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+/// Tumbling Window Buffer
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TumblingWindowConfig {
+struct TumblingWindowConfig {
+    /// Window interval
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
 }
 
-pub struct TumblingWindow {
+struct TumblingWindow {
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     notify: Arc<Notify>,
     close: CancellationToken,

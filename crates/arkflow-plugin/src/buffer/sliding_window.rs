@@ -29,14 +29,17 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlidingWindowConfig {
+struct SlidingWindowConfig {
+    /// Window size
     window_size: u32,
+    /// Interval between windows
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
+    /// Slide size
     slide_size: u32,
 }
 
-pub struct SlidingWindow {
+struct SlidingWindow {
     config: SlidingWindowConfig,
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
     notify: Arc<Notify>,
