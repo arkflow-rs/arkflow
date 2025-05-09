@@ -48,7 +48,7 @@ const FeatureList: FeatureItem[] = [
         description: (
             <>
                 Built-in SQL queries, JSON processing, Protobuf encoding/decoding,
-                batch processing, and other processors.
+                batch, VRL processing, and other processors.
             </>
         ),
     },

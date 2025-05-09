@@ -7,6 +7,16 @@ logo: ./logo.svg
 
 ArkFlow is a high-performance Rust stream processing engine that provides powerful data stream processing capabilities, supporting various input/output sources and processors.
 
+:::tip
+Currently, ArkFlow is **stateless**, but it can still help you solve most data engineering problems. It implements transaction-based resilience and features backpressure. 
+
+Therefore, when connected to input and output sources that provide at-least-once semantics, it can guarantee at-least-once delivery without needing to retain messages in transit.
+
+In the future, we will gradually improve the functions of ArkFlow to enable it to have transactional and state management capabilities, so as to better meet various data processing needs.
+
+:::
+
+
 logo([Logo Usage Guidelines](./about-logo)）: 
 
 ![ArkFlow logo](logo.svg)
