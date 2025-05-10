@@ -180,8 +180,6 @@ impl Input for RedisInput {
                                         debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
                                         if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
                                             error!("Failed to send Redis list message: {}", e);
-                                        }else{
-                                            debug!("Sent Redis list message to channel");
                                         }
                                     }
                                     Ok(None) => {
@@ -215,11 +213,6 @@ impl Input for RedisInput {
 
         match self.receiver.recv_async().await {
             Ok(RedisMsg::Message(_channel, payload)) => {
-                debug!(
-                    "Received Redis message: {}",
-                    String::from_utf8_lossy(&payload)
-                );
-
                 let msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
                     Error::Connection(format!("Failed to create message batch: {}", e))
                 })?;
