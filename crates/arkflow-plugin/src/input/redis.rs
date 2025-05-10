@@ -22,7 +22,8 @@ use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
-use redis::{Client, RedisResult};
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Client, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -106,52 +107,35 @@ impl Input for RedisInput {
 
         let config_type = self.config.subscribe_type.clone();
 
-        tokio::spawn(async move {
-            // let mut pubsub = conn.into_pubsub();
-            match config_type {
-                Type::Subscribe { subscribe } => {
-                    let mut publish_conn = client.get_multiplexed_async_connection().await?;
-                    let mut pubsub_conn = client.get_async_pubsub().await?;
+        match config_type {
+            Type::Subscribe { subscribe } => {
+                let mut pubsub_conn = client.get_async_pubsub().await.map_err(|e| {
+                    Error::Connection(format!("Failed to get Redis connection: {}", e))
+                })?;
 
-                    match subscribe {
-                        Subscribe::Channels { channels } => {
-                            // Subscribe to channels
-                            for channel in channels {
-                                if let Err(e) = pubsub_conn.subscribe(&channel).await {
-                                    error!(
-                                        "Failed to subscribe to Redis channel {}: {}",
-                                        channel, e
-                                    );
-                                    if let Err(e) = sender_clone
-                                        .send_async(RedisMsg::Err(Error::Disconnection))
-                                        .await
-                                    {
-                                        error!("{}", e);
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        Subscribe::Patterns { patterns } => {
-                            // Subscribe to patterns
-                            for pattern in patterns {
-                                if let Err(e) = pubsub_conn.psubscribe(&pattern).await {
-                                    error!(
-                                        "Failed to subscribe to Redis pattern {}: {}",
-                                        pattern, e
-                                    );
-                                    if let Err(e) = sender_clone
-                                        .send_async(RedisMsg::Err(Error::Disconnection))
-                                        .await
-                                    {
-                                        error!("{}", e);
-                                    }
-                                    return;
-                                }
+                match subscribe {
+                    Subscribe::Channels { channels } => {
+                        // Subscribe to channels
+                        for channel in channels {
+                            if let Err(e) = pubsub_conn.subscribe(&channel).await {
+                                error!("Failed to subscribe to Redis channel {}: {}", channel, e);
+                                return Err(Error::Disconnection);
                             }
                         }
                     }
+                    Subscribe::Patterns { patterns } => {
+                        // Subscribe to patterns
+                        for pattern in patterns {
+                            if let Err(e) = pubsub_conn.psubscribe(&pattern).await {
+                                error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
+                                return Err(Error::Disconnection);
+                            }
+                        }
+                    }
+                }
+                tokio::spawn(async move {
                     let mut msg_stream = pubsub_conn.on_message();
+
                     loop {
                         tokio::select! {
                             Some(msg_result) = msg_stream.next() => {
@@ -166,56 +150,51 @@ impl Input for RedisInput {
                             }
                         }
                     }
-                }
-                Type::List { ref list } => {
-                    let conn_result = client.get_async_connection().await;
-                    let mut conn = match conn_result {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Failed to get Redis connection for list: {}", e);
-                            let _ = sender_clone
-                                .send_async(RedisMsg::Err(Error::Disconnection))
-                                .await;
-                            return;
-                        }
-                    };
+                });
+            }
+            Type::List { ref list } => {
+                let result = ConnectionManager::new(client).await;
+                let mut manager = match result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(Error::Connection(format!(
+                            "Failed to connect to Redis server: {}",
+                            e
+                        )))
+                    }
+                };
 
-                    loop {
-                        tokio::select! {
-                            _ = cancellation_token.cancelled() => {
-                                break;
-                            }
-                            result = async {
-                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = redis::cmd("BLPOP")
-                                    .arg(list.clone())
-                                    .arg(1)
-                                    .query_async(&mut conn)
-                                    .await;
-                                blpop_result
-                            } => {
-                                match result {
-                                    Ok(Some((list_name, payload))) => {
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
-                                            error!("Failed to send Redis list message: {}", e);
-                                        }
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            break;
+                        }
+                        result = async {
+                            let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = manager.blpop(list.clone(), 1f64).await;
+                            blpop_result
+                        } => {
+                            match result {
+                                Ok(Some((list_name, payload))) => {
+                                    if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                        error!("Failed to send Redis list message: {}", e);
                                     }
-                                    Ok(None) => {
-                                        continue;
+                                }
+                                Ok(None) => {
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("Error retrieving from Redis list: {}", e);
+                                    if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                        error!("{}", e);
                                     }
-                                    Err(e) => {
-                                        error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
-                                            error!("{}", e);
-                                        }
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                         }
                     }
                 }
-            };
-        });
+            }
+        };
 
         Ok(())
     }
