@@ -96,10 +96,10 @@ impl Input for RedisInput {
         *client_guard = Some(client.clone());
         drop(client_guard);
 
-        let conn = client
-            .get_async_connection()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to get Redis connection: {}", e)))?;
+        // let conn = client
+        //     .get_connection()
+        //     .await
+        //     .map_err(|e| Error::Connection(format!("Failed to get Redis connection: {}", e)))?;
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
@@ -107,14 +107,17 @@ impl Input for RedisInput {
         let config_type = self.config.subscribe_type.clone();
 
         tokio::spawn(async move {
-            let mut pubsub = conn.into_pubsub();
+            // let mut pubsub = conn.into_pubsub();
             match config_type {
                 Type::Subscribe { subscribe } => {
+                    let mut publish_conn = client.get_multiplexed_async_connection().await?;
+                    let mut pubsub_conn = client.get_async_pubsub().await?;
+
                     match subscribe {
                         Subscribe::Channels { channels } => {
                             // Subscribe to channels
                             for channel in channels {
-                                if let Err(e) = pubsub.subscribe(&channel).await {
+                                if let Err(e) = pubsub_conn.subscribe(&channel).await {
                                     error!(
                                         "Failed to subscribe to Redis channel {}: {}",
                                         channel, e
@@ -132,7 +135,7 @@ impl Input for RedisInput {
                         Subscribe::Patterns { patterns } => {
                             // Subscribe to patterns
                             for pattern in patterns {
-                                if let Err(e) = pubsub.psubscribe(&pattern).await {
+                                if let Err(e) = pubsub_conn.psubscribe(&pattern).await {
                                     error!(
                                         "Failed to subscribe to Redis pattern {}: {}",
                                         pattern, e
@@ -148,7 +151,7 @@ impl Input for RedisInput {
                             }
                         }
                     }
-                    let mut msg_stream = pubsub.on_message();
+                    let mut msg_stream = pubsub_conn.on_message();
                     loop {
                         tokio::select! {
                             Some(msg_result) = msg_stream.next() => {
