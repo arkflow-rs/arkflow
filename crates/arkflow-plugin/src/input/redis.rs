@@ -28,14 +28,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{debug, error};
 
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisInputConfig {
     /// Redis server URL
     url: String,
-    subscribe_type: Type,
+    redis_type: Type,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +48,7 @@ pub enum Subscribe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "redis_type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Type {
     Subscribe { subscribe: Subscribe },
     List { list: Vec<String> },
@@ -105,7 +105,7 @@ impl Input for RedisInput {
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 
-        let config_type = self.config.subscribe_type.clone();
+        let config_type = self.config.redis_type.clone();
 
         match config_type {
             Type::Subscribe { subscribe } => {
@@ -164,35 +164,41 @@ impl Input for RedisInput {
                     }
                 };
 
-                loop {
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            break;
-                        }
-                        result = async {
-                            let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = manager.blpop(list.clone(), 1f64).await;
-                            blpop_result
-                        } => {
-                            match result {
-                                Ok(Some((list_name, payload))) => {
-                                    if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
-                                        error!("Failed to send Redis list message: {}", e);
+                let list = list.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => {
+                                break;
+                            }
+                            result = async {
+                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = manager.blpop(&list, 1f64).await;
+                                blpop_result
+                            } => {
+                                match result {
+                                    Ok(Some((list_name, payload))) => {
+                                        debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                            error!("Failed to send Redis list message: {}", e);
+                                        }else{
+                                            debug!("Sent Redis list message to channel");
+                                        }
                                     }
-                                }
-                                Ok(None) => {
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!("Error retrieving from Redis list: {}", e);
-                                    if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
-                                        error!("{}", e);
+                                    Ok(None) => {
+                                        continue;
                                     }
-                                    break;
+                                    Err(e) => {
+                                        error!("Error retrieving from Redis list: {}", e);
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                            error!("{}", e);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                });
             }
         };
 
@@ -209,6 +215,11 @@ impl Input for RedisInput {
 
         match self.receiver.recv_async().await {
             Ok(RedisMsg::Message(_channel, payload)) => {
+                debug!(
+                    "Received Redis message: {}",
+                    String::from_utf8_lossy(&payload)
+                );
+
                 let msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
                     Error::Connection(format!("Failed to create message batch: {}", e))
                 })?;
