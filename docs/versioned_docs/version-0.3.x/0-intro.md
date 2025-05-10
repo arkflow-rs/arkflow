@@ -115,6 +115,9 @@ ArkFlow supports multiple input sources:
 - **File**: Reading data from files(Csv,Json, Parquet, Avro, Arrow) using SQL
 - **Generator**: Generate test data
 - **Database**: Query data from databases(MySQL, PostgreSQL, SQLite, Duckdb)
+- **Nats**: Subscribe to messages from Nats topics
+- **Redis**: Subscribe to messages from Redis channels or lists
+- **Websocket**: Subscribe to messages from WebSocket connections
 
 Example:
 
@@ -138,6 +141,7 @@ ArkFlow provides multiple data processors:
 - **SQL**: Process data using SQL queries
 - **Protobuf**: Protobuf encoding/decoding
 - **Batch Processing**: Process messages in batches
+- **Vrl**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
 
 Example:
 
@@ -159,6 +163,7 @@ ArkFlow supports multiple output targets:
 - **HTTP**: Send data via HTTP
 - **Standard Output**: Output data to the console
 - **Drop**: Discard data
+- **Nats**: Publish messages to Nats topics
 
 Example:
 
@@ -179,6 +184,7 @@ ArkFlow supports multiple error output targets:
 - **HTTP**: Send error data via HTTP
 - **Standard Output**: Output error data to the console
 - **Drop**: Discard error data
+- **Nats**: Publish messages to Nats topics
 
 Example:
 
@@ -198,7 +204,10 @@ error_output:
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation
+- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
+- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
+- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide size.
+- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
 
 Example:
 
