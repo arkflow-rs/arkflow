@@ -39,7 +39,7 @@ lazy_static = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 tower = "0.5"
-tower-http = { version = "0.4", features = ["cors", "trace"] }
+tower-http = { version = "0.6.4", features = ["cors", "trace"] }
 base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
