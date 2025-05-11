@@ -23,9 +23,9 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
-use redis::cluster::ClusterClient;
+use redis::cluster::{ClusterClient, ClusterClientBuilder};
 use redis::cluster_async::ClusterConnection;
-use redis::{AsyncCommands, Client, RedisResult};
+use redis::{AsyncCommands, Client, FromRedisValue, PushKind, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -43,16 +43,8 @@ pub struct RedisInputConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ModeConfig {
-    Cluster {
-        urls: Vec<String>,
-        username: Option<String>,
-        password: Option<String>,
-    },
-    Single {
-        url: String,
-        username: Option<String>,
-        password: Option<String>,
-    },
+    Cluster { urls: Vec<String> },
+    Single { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,20 +112,128 @@ impl RedisInput {
 
     async fn cluster_connect(&self, urls: Vec<String>) -> Result<(), Error> {
         let mut cli_guard = self.client.lock().await;
-        let client = ClusterClient::new(urls)
-            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
-
-        let result = client
-            .get_async_connection()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
-        cli_guard.replace(Cli::Cluster(result));
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 
         let config_type = self.config.redis_type.clone();
+        match config_type {
+            Type::Subscribe { subscribe } => {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let client = ClusterClientBuilder::new(urls)
+                    .push_sender(async move |msg| {
+                        // match msg.kind {
 
+                        // PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
+                        //     if msg.data.len() < 2 {
+                        //         return Ok(());
+                        //     }
+                        //     // let mut iter = msg.data.into_iter();
+                        //     // let channel: String =
+                        //     //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                        //     // let payload =
+                        //     //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                        //     //
+                        //     // if let Err(e) = sender_clone
+                        //     //     .send_async(RedisMsg::Message(channel, payload))
+                        //     //     .await
+                        //     // {
+                        //     //     error!("{}", e);
+                        //     // }
+                        // }
+                        //
+                        // _ => {}
+                        // }
+                        match msg.kind {
+                            PushKind::Message | PushKind::SMessage => {
+                                if msg.data.len() < 2 {
+                                    return Ok(());
+                                }
+                                let mut iter = msg.data.into_iter();
+                                let channel: String =
+                                    FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                                let message =
+                                    FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                                // Ok(Some((channel, message)))
+                                if let Err(e) = sender_clone
+                                    .send_async(RedisMsg::Message(channel, message))
+                                    .await
+                                {
+                                    error!("{}", e);
+                                }
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                        .expect("TODO: panic message");
+                        Ok(())
+                    })
+                    .build()
+                    .map_err(|e| {
+                        Error::Connection(format!("Failed to connect to Redis cluster: {}", e))
+                    })?;
+
+                let mut result = client.get_async_connection().await.map_err(|e| {
+                    Error::Connection(format!("Failed to connect to Redis cluster: {}", e))
+                })?;
+
+                match subscribe {
+                    Subscribe::Channels { channels } => {
+                        // Subscribe to channels
+                        for channel in channels {
+                            if let Err(e) = result.subscribe(&channel).await {
+                                error!("Failed to subscribe to Redis channel {}: {}", channel, e);
+                                return Err(Error::Disconnection);
+                            }
+                        }
+                    }
+                    Subscribe::Patterns { patterns } => {
+                        // Subscribe to patterns
+                        for pattern in patterns {
+                            if let Err(e) = result.psubscribe(&pattern).await {
+                                error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
+                                return Err(Error::Disconnection);
+                            }
+                        }
+                    }
+                }
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            Some(msg) = rx.recv() => {
+                                 match msg.kind {
+                                    PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
+                                        if msg.data.len() < 2 {
+                                            continue;
+                                        }
+                                        // let mut iter = msg.data.into_iter();
+                                        // let channel: String =
+                                        //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                                        // let payload =
+                                        //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                                        //
+                                        // if let Err(e) = sender_clone
+                                        //     .send_async(RedisMsg::Message(channel, payload))
+                                        //     .await
+                                        // {
+                                        //     error!("{}", e);
+                                        // }
+                                    }
+
+                                    _ => {}
+                                }
+                            }
+                            _ = cancellation_token.cancelled() => {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Type::List { .. } => {}
+        }
+        // cli_guard.replace(Cli::Cluster(result));
         Ok(())
     }
 
@@ -141,32 +241,9 @@ impl RedisInput {
         let mut cli_guard = self.client.lock().await;
         let client = Client::open(url)
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
-        let manager = ConnectionManager::new(client);
-        cli_guard.replace(Cli::Single(manager));
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Input for RedisInput {
-    async fn connect(&self) -> Result<(), Error> {
-        match &self.config.mode {
-            ModeConfig::Cluster {
-                urls,
-                username,
-                password,
-            } => {}
-            ModeConfig::Single {
-                url,
-                username,
-                password,
-            } => {}
-        }
-        let client = Client::open(self.config.url.as_str())
+        let manager = ConnectionManager::new(client.clone())
+            .await
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
-        let mut client_guard = self.client.lock().await;
-        *client_guard = Some(client.clone());
-        drop(client_guard);
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
@@ -219,18 +296,8 @@ impl Input for RedisInput {
                 });
             }
             Type::List { ref list } => {
-                let result = ConnectionManager::new(client).await;
-                let mut manager = match result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Err(Error::Connection(format!(
-                            "Failed to connect to Redis server: {}",
-                            e
-                        )))
-                    }
-                };
-
                 let list = list.clone();
+                let mut manager = manager.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -266,7 +333,21 @@ impl Input for RedisInput {
             }
         };
 
+        cli_guard.replace(Cli::Single(manager));
+
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Input for RedisInput {
+    async fn connect(&self) -> Result<(), Error> {
+        match &self.config.mode {
+            ModeConfig::Cluster { urls } => {
+                self.cluster_connect(urls.iter().cloned().collect()).await
+            }
+            ModeConfig::Single { url } => self.single_connect(url.clone()).await,
+        }
     }
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
