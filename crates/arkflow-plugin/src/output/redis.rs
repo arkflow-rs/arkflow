@@ -38,7 +38,7 @@ struct RedisOutputConfig {
 pub enum Type {
     Publish { channel: Expr<String> },
     List { key: Expr<String> },
-    Hashes { key: Vec<String> },
+    Hashes { key: Expr<String> },
     Strings { key: Expr<String> },
 }
 
@@ -134,6 +134,12 @@ impl Output for RedisOutput {
                     }
                 }
                 Type::Hashes { key } => {
+                    let Some(key) = key.evaluate_expr(&msg) else {
+                        return Err(Error::Process(
+                            "Failed to evaluate key expression".to_string(),
+                        ));
+                    };
+
                     for payload in data {
                         let payload_str = String::from_utf8(payload)?;
                         let fields: Vec<&str> = payload_str.split(',').collect();
