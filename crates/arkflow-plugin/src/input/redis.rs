@@ -23,6 +23,8 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
+use redis::cluster::ClusterClient;
+use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, Client, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -34,13 +36,28 @@ use tracing::{debug, error};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisInputConfig {
     /// Redis server URL
-    url: String,
+    mode: ModeConfig,
     redis_type: Type,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Subscribe {
+enum ModeConfig {
+    Cluster {
+        urls: Vec<String>,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Single {
+        url: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Subscribe {
     /// List of channels to subscribe to
     Channels { channels: Vec<String> },
     /// List of patterns to subscribe to
@@ -49,18 +66,22 @@ pub enum Subscribe {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Type {
+enum Type {
     Subscribe { subscribe: Subscribe },
     List { list: Vec<String> },
 }
 
 /// Redis input component
-pub struct RedisInput {
+struct RedisInput {
     config: RedisInputConfig,
-    client: Arc<Mutex<Option<Client>>>,
+    client: Arc<Mutex<Option<Cli>>>,
     sender: Sender<RedisMsg>,
     receiver: Receiver<RedisMsg>,
     cancellation_token: CancellationToken,
+}
+enum Cli {
+    Single(ConnectionManager),
+    Cluster(ClusterConnection),
 }
 
 enum RedisMsg {
@@ -70,13 +91,24 @@ enum RedisMsg {
 
 impl RedisInput {
     /// Create a new Redis input component
-    pub fn new(config: RedisInputConfig) -> Result<Self, Error> {
+    fn new(config: RedisInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
+        match &config.mode {
+            ModeConfig::Cluster { urls, .. } => {
+                for url in urls {
+                    if let None = redis::parse_redis_url(&url) {
+                        return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
+                    }
+                }
+            }
+            ModeConfig::Single { url, .. } => {
+                if let None = redis::parse_redis_url(&url) {
+                    return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
+                }
+            }
+        };
 
-        if let None = redis::parse_redis_url(&config.url) {
-            return Err(Error::Config(format!("Invalid Redis URL: {}", &config.url)));
-        }
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
@@ -85,22 +117,56 @@ impl RedisInput {
             cancellation_token,
         })
     }
+
+    async fn cluster_connect(&self, urls: Vec<String>) -> Result<(), Error> {
+        let mut cli_guard = self.client.lock().await;
+        let client = ClusterClient::new(urls)
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
+
+        let result = client
+            .get_async_connection()
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
+        cli_guard.replace(Cli::Cluster(result));
+
+        let sender_clone = Sender::clone(&self.sender);
+        let cancellation_token = self.cancellation_token.clone();
+
+        let config_type = self.config.redis_type.clone();
+
+        Ok(())
+    }
+
+    async fn single_connect(&self, url: String) -> Result<(), Error> {
+        let mut cli_guard = self.client.lock().await;
+        let client = Client::open(url)
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
+        let manager = ConnectionManager::new(client);
+        cli_guard.replace(Cli::Single(manager));
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Input for RedisInput {
     async fn connect(&self) -> Result<(), Error> {
+        match &self.config.mode {
+            ModeConfig::Cluster {
+                urls,
+                username,
+                password,
+            } => {}
+            ModeConfig::Single {
+                url,
+                username,
+                password,
+            } => {}
+        }
         let client = Client::open(self.config.url.as_str())
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
-
         let mut client_guard = self.client.lock().await;
         *client_guard = Some(client.clone());
         drop(client_guard);
-
-        // let conn = client
-        //     .get_connection()
-        //     .await
-        //     .map_err(|e| Error::Connection(format!("Failed to get Redis connection: {}", e)))?;
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
