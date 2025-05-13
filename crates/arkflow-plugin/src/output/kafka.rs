@@ -124,7 +124,7 @@ impl InnerKafkaOutput {
         let mut send_futures = self.send_futures.lock().await;
         for future in send_futures.drain(..) {
             if let Err((e, _)) = future.await.unwrap() {
-                error!("Kafka producer shut down: {:?}", e);
+                error!("Kafka delivery error during shutdown: {:?}", e);
             }
         }
     }
@@ -198,9 +198,7 @@ impl Output for KafkaOutput {
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
                 Some(EvaluateResult::Vec(v)) => {
-                    if !v.is_empty() {
-                        record = record.key(&v[i])
-                    };
+                    record = record.key(&v[i]);
                 }
                 None => {}
             }
@@ -223,7 +221,7 @@ impl Output for KafkaOutput {
                         record = f;
                     }
                     Err((e, _)) => {
-                        panic!("Failed to write to kafka: {:?}", e);
+                        return Err(Error::Connection(format!("Failed to write to Kafka: {e}")));
                     }
                 };
 
