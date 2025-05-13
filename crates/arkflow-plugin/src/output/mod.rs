@@ -24,6 +24,7 @@ pub mod kafka;
 pub mod mqtt;
 pub mod nats;
 pub mod stdout;
+mod redis;
 
 pub fn init() -> Result<(), Error> {
     drop::init()?;

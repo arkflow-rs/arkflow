@@ -97,11 +97,6 @@ impl Input for RedisInput {
         *client_guard = Some(client.clone());
         drop(client_guard);
 
-        // let conn = client
-        //     .get_connection()
-        //     .await
-        //     .map_err(|e| Error::Connection(format!("Failed to get Redis connection: {}", e)))?;
-
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 

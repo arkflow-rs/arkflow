@@ -11,13 +11,13 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-
 use arkflow_core::Error;
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
