@@ -197,10 +197,10 @@ impl Output for KafkaOutput {
             // Add key if available
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
-                Some(EvaluateResult::Vec(v)) => {
+                Some(EvaluateResult::Vec(v)) if i < v.len() => {
                     record = record.key(&v[i]);
                 }
-                None => {}
+                _ => {}
             }
 
             // Send the record
