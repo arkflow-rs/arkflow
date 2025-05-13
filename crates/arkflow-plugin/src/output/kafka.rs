@@ -31,6 +31,8 @@ use rdkafka_sys::RDKafkaErrorCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -75,6 +77,11 @@ struct KafkaOutputConfig {
 /// Kafka output component
 struct KafkaOutput {
     config: KafkaOutputConfig,
+    inner_kafka_output: Arc<InnerKafkaOutput>,
+    cancellation_token: CancellationToken,
+}
+
+struct InnerKafkaOutput {
     producer: Arc<RwLock<Option<FutureProducer>>>,
     send_futures: Arc<Mutex<Vec<DeliveryFuture>>>,
 }
@@ -82,11 +89,44 @@ struct KafkaOutput {
 impl KafkaOutput {
     /// Create a new Kafka output component
     pub fn new(config: KafkaOutputConfig) -> Result<Self, Error> {
-        Ok(Self {
-            config,
+        let cancellation_token = CancellationToken::new();
+        let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
             send_futures: Arc::new(Mutex::new(vec![])),
+        });
+
+        let output_p = Arc::clone(&inner_kafka_output);
+        let cancellation_token_clone = CancellationToken::clone(&cancellation_token);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = time::sleep(Duration::from_secs(1)) => {
+                        output_p.flush().await;
+                        debug!("Kafka output flushed");
+                    },
+                    _ = cancellation_token_clone.cancelled()=>{
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            config,
+            inner_kafka_output,
+            cancellation_token,
         })
+    }
+}
+
+impl InnerKafkaOutput {
+    async fn flush(&self) {
+        let mut send_futures = self.send_futures.lock().await;
+        for future in send_futures.drain(..) {
+            if let Err((e, _)) = future.await.unwrap() {
+                error!("Kafka producer shut down: {:?}", e);
+            }
+        }
     }
 }
 
@@ -109,7 +149,9 @@ impl Output for KafkaOutput {
         }
 
         // Set the confirmation level (default to "all" for reliability)
-        client_config.set("acks", self.config.acks.as_deref().unwrap_or("all"));
+        if let Some(acks) = &self.config.acks {
+            client_config.set("acks", acks);
+        }
 
         // Create a producer
         let producer = client_config
@@ -117,7 +159,7 @@ impl Output for KafkaOutput {
             .map_err(|e| Error::Connection(format!("A Kafka producer cannot be created: {}", e)))?;
 
         // Save the producer instance
-        let producer_arc = self.producer.clone();
+        let producer_arc = self.inner_kafka_output.producer.clone();
         let mut producer_guard = producer_arc.write().await;
         *producer_guard = Some(producer);
 
@@ -125,7 +167,7 @@ impl Output for KafkaOutput {
     }
 
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
-        let producer_arc = self.producer.clone();
+        let producer_arc = self.inner_kafka_output.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {
             Error::Connection("The Kafka producer is not initialized".to_string())
@@ -140,7 +182,6 @@ impl Output for KafkaOutput {
         if payloads.is_empty() {
             return Ok(());
         }
-        // self.config.timestamp_field
 
         let topic = self.get_topic(&msg)?;
         let key = self.get_key(&msg)?;
@@ -170,7 +211,11 @@ impl Output for KafkaOutput {
             loop {
                 match producer.send_result(record) {
                     Ok(future) => {
-                        self.send_futures.lock().await.push(future);
+                        self.inner_kafka_output
+                            .send_futures
+                            .lock()
+                            .await
+                            .push(future);
                         debug!("Kafka record sent");
                         break;
                     }
@@ -192,13 +237,14 @@ impl Output for KafkaOutput {
     }
 
     async fn close(&self) -> Result<(), Error> {
+        self.cancellation_token.cancel();
         // Get the producer and close
-        let producer_arc = self.producer.clone();
+        let producer_arc = self.inner_kafka_output.producer.clone();
         let mut producer_guard = producer_arc.write().await;
 
         if let Some(producer) = producer_guard.take() {
             producer.poll(Timeout::After(Duration::ZERO));
-            for future in self.send_futures.lock().await.drain(..) {
+            for future in self.inner_kafka_output.send_futures.lock().await.drain(..) {
                 if let Err((e, _)) = future.await.unwrap() {
                     error!("Kafka producer shut down: {:?}", e);
                 }
