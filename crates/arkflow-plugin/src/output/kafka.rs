@@ -123,8 +123,14 @@ impl InnerKafkaOutput {
     async fn flush(&self) {
         let mut send_futures = self.send_futures.lock().await;
         for future in send_futures.drain(..) {
-            if let Err((e, _)) = future.await.unwrap() {
-                error!("Kafka delivery error during shutdown: {:?}", e);
+            match future.await {
+                Ok(Ok(_)) => {} // Success
+                Ok(Err((e, _))) => {
+                    error!("Kafka producer shut down: {:?}", e);
+                }
+                Err(e) => {
+                    error!("Future error during Kafka shutdown: {:?}", e);
+                }
             }
         }
     }
@@ -243,8 +249,14 @@ impl Output for KafkaOutput {
         if let Some(producer) = producer_guard.take() {
             producer.poll(Timeout::After(Duration::ZERO));
             for future in self.inner_kafka_output.send_futures.lock().await.drain(..) {
-                if let Err((e, _)) = future.await.unwrap() {
-                    error!("Kafka producer shut down: {:?}", e);
+                match future.await {
+                    Ok(Ok(_)) => {} // Success
+                    Ok(Err((e, _))) => {
+                        error!("Kafka producer shut down: {:?}", e);
+                    }
+                    Err(e) => {
+                        error!("Future error during Kafka shutdown: {:?}", e);
+                    }
                 }
             }
 
