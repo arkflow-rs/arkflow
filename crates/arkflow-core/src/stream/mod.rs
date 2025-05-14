@@ -298,6 +298,7 @@ impl Stream {
                 let Some((current_seq, _)) = tree_map.first_key_value() else {
                     break;
                 };
+
                 if next_seq != *current_seq {
                     break;
                 }
