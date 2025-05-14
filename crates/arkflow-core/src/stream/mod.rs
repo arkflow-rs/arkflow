@@ -37,8 +37,9 @@ pub struct Stream {
     buffer: Option<Arc<dyn Buffer>>,
     sequence_counter: Arc<AtomicU64>,
 }
-enum Data {
-    Err(Vec<MessageBatch>),
+
+enum ProcessorData {
+    Err(Vec<MessageBatch>, Error),
     Ok(Vec<MessageBatch>),
 }
 
@@ -75,7 +76,7 @@ impl Stream {
         let (input_sender, input_receiver) =
             flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
-            flume::bounded::<(Data, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
+            flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
 
         let tracker = TaskTracker::new();
 
@@ -236,7 +237,7 @@ impl Stream {
         i: u32,
         pipeline: Arc<Pipeline>,
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
-        output_sender: Sender<(Data, Arc<dyn Ack>, u64)>,
+        output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
     ) {
         let i = i + 1;
@@ -253,14 +254,17 @@ impl Stream {
             // Process result messages
             match processed {
                 Ok(msgs) => {
-                    if let Err(e) = output_sender.send_async((Data::Ok(msgs), ack, seq)).await {
+                    if let Err(e) = output_sender
+                        .send_async((ProcessorData::Ok(msgs), ack, seq))
+                        .await
+                    {
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
                 }
                 Err(e) => {
                     if let Err(e) = output_sender
-                        .send_async((Data::Err(vec![msg]), ack, seq))
+                        .send_async((ProcessorData::Err(vec![msg], e), ack, seq))
                         .await
                     {
                         error!("Failed to send processed message: {}", e);
@@ -274,21 +278,13 @@ impl Stream {
     }
 
     async fn do_output(
-        output_receiver: Receiver<(Data, Arc<dyn Ack>, u64)>,
+        output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
     ) {
-        Self::do_output_common(output_receiver, output, err_output).await;
-        info!("Output stopped")
-    }
-
-    async fn do_output_common(
-        output_receiver: Receiver<(Data, Arc<dyn Ack>, u64)>,
-        output: Arc<dyn Output>,
-        err_output: Option<Arc<dyn Output>>,
-    ) {
-        let mut tree_map: BTreeMap<u64, (Data, Arc<dyn Ack>)> = BTreeMap::new();
+        let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
         let mut next_seq = 0u64;
+
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
                 for (_, (data, x)) in tree_map {
@@ -300,6 +296,7 @@ impl Stream {
             tree_map.insert(new_seq, (data, new_ack));
 
             loop {
+
                 if Self::output_with(next_seq, &mut tree_map, &output, err_output.as_ref()).await {
                     next_seq += 1;
                 } else {
@@ -307,11 +304,13 @@ impl Stream {
                 }
             }
         }
+
+        info!("Output stopped")
     }
 
     async fn output_with(
         next_seq: u64,
-        tree_map: &mut BTreeMap<u64, (Data, Arc<dyn Ack>)>,
+        tree_map: &mut BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
     ) -> bool {
@@ -329,20 +328,23 @@ impl Stream {
 
         true
     }
+
     async fn output(
-        data: Data,
+        data: ProcessorData,
         ack: Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
     ) {
         match data {
-            Data::Err(msgs) => {
+            ProcessorData::Err(msgs, e) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
                 for x in msgs {
                     success_cnt = success_cnt + 1;
                     match err_output {
-                        None => {}
+                        None => {
+                            error!("{e}")
+                        }
                         Some(err_output) => match err_output.write(x).await {
                             Ok(_) => {}
                             Err(e) => {
@@ -356,7 +358,7 @@ impl Stream {
                     ack.ack().await;
                 }
             }
-            Data::Ok(msgs) => {
+            ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
                 for x in msgs {
