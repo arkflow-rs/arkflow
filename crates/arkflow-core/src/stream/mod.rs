@@ -270,7 +270,6 @@ impl Stream {
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
-                    error!("{}", e)
                 }
             }
         }
@@ -296,37 +295,23 @@ impl Stream {
             tree_map.insert(new_seq, (data, new_ack));
 
             loop {
-
-                if Self::output_with(next_seq, &mut tree_map, &output, err_output.as_ref()).await {
-                    next_seq += 1;
-                } else {
+                let Some((current_seq, _)) = tree_map.first_key_value() else {
+                    break;
+                };
+                if next_seq != *current_seq {
                     break;
                 }
+
+                let Some((data, ack)) = tree_map.remove(&next_seq) else {
+                    break;
+                };
+
+                Self::output(data, Arc::clone(&ack), &output, err_output.as_ref()).await;
+                next_seq += 1;
             }
         }
 
         info!("Output stopped")
-    }
-
-    async fn output_with(
-        next_seq: u64,
-        tree_map: &mut BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)>,
-        output: &Arc<dyn Output>,
-        err_output: Option<&Arc<dyn Output>>,
-    ) -> bool {
-        let Some((current_seq, _)) = tree_map.first_key_value() else {
-            return false;
-        };
-
-        if next_seq != *current_seq {
-            return false;
-        }
-
-        if let Some((data, ack)) = tree_map.remove(&next_seq) {
-            Self::output(data, Arc::clone(&ack), &output, err_output).await;
-        }
-
-        true
     }
 
     async fn output(
