@@ -322,19 +322,20 @@ impl Stream {
         err_output: Option<&Arc<dyn Output>>,
     ) {
         match data {
-            ProcessorData::Err(msg, e) => match err_output {
-                None => {
-                    error!("{e}")
+            ProcessorData::Err(msg, e) => {
+                match err_output {
+                    None => {
+                        error!("{e}")
+                    }
+                    Some(err_output) => match err_output.write(msg).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("{}", e);
+                        }
+                    },
                 }
-                Some(err_output) => match err_output.write(msg).await {
-                    Ok(_) => {
-                        ack.ack().await;
-                    }
-                    Err(e) => {
-                        error!("{}", e);
-                    }
-                },
-            },
+                ack.ack().await;
+            }
             ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
