@@ -35,7 +35,6 @@ pub struct Stream {
     error_output: Option<Arc<dyn Output>>,
     thread_num: u32,
     buffer: Option<Arc<dyn Buffer>>,
-    // 序列号计数器，用于跟踪消息顺序
     sequence_counter: Arc<AtomicU64>,
 }
 enum Data {
