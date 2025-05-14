@@ -27,3 +27,4 @@ clap = { workspace = true }
 colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
+dashmap = "6"

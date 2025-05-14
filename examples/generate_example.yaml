@@ -4,12 +4,13 @@ streams:
   - input:
       type: "generate"
       context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
-      interval: 1s
-      batch_size: 1000
+      interval: 1ns
+      batch_size: 1
+      count: 5
 
     buffer:
       type: "memory"
-      capacity: 10
+      capacity: 1
       timeout: 10s
     pipeline:
       thread_num: 4
