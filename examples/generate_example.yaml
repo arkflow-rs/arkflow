@@ -8,10 +8,10 @@ streams:
       batch_size: 1
       count: 5
 
-    buffer:
-      type: "memory"
-      capacity: 1
-      timeout: 10s
+#    buffer:
+#      type: "memory"
+#      capacity: 1
+#      timeout: 10s
     pipeline:
       thread_num: 4
       processors:

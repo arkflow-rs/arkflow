@@ -28,3 +28,4 @@ colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
 dashmap = "6"
+log = "0.4.27"

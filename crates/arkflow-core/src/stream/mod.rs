@@ -19,8 +19,8 @@
 use crate::buffer::Buffer;
 use crate::input::Ack;
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch};
-use dashmap::DashMap;
 use flume::{Receiver, Sender};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -37,8 +37,10 @@ pub struct Stream {
     buffer: Option<Arc<dyn Buffer>>,
     // 序列号计数器，用于跟踪消息顺序
     sequence_counter: Arc<AtomicU64>,
-    next_sequence: Arc<AtomicU64>,
-    out_data: Arc<DashMap<u64, (Vec<MessageBatch>, Arc<dyn Ack>)>>,
+}
+enum Data {
+    Err(Vec<MessageBatch>),
+    Ok(Vec<MessageBatch>),
 }
 
 impl Stream {
@@ -59,8 +61,6 @@ impl Stream {
             buffer,
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
-            next_sequence: Arc::new(AtomicU64::new(1)),
-            out_data: Arc::new(DashMap::new()),
         }
     }
 
@@ -76,16 +76,7 @@ impl Stream {
         let (input_sender, input_receiver) =
             flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
-            flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
-        let (error_output_sender, error_output_receiver) = if self.error_output.is_none() {
-            (None, None)
-        } else {
-            let (error_output_sender, error_output_receiver) =
-                flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>(
-                    self.thread_num as usize * 4,
-                );
-            (Some(error_output_sender), Some(error_output_receiver))
-        };
+            flume::bounded::<(Data, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
 
         let tracker = TaskTracker::new();
 
@@ -115,28 +106,21 @@ impl Stream {
                 self.pipeline.clone(),
                 input_receiver.clone(),
                 output_sender.clone(),
-                error_output_sender.clone(),
                 self.sequence_counter.clone(),
             ));
         }
 
         // Close the output sender to notify all workers
         drop(output_sender);
-        drop(error_output_sender);
+        // drop(error_output_sender);
 
         // Output
         tracker.spawn(Self::do_output(
-            Arc::clone(&self.next_sequence),
-            Arc::clone(&self.out_data),
             output_receiver,
             self.output.clone(),
-        ));
-        tracker.spawn(Self::do_error_output(
-            Arc::clone(&self.next_sequence),
-            Arc::clone(&self.out_data),
-            error_output_receiver,
             self.error_output.clone(),
         ));
+
         tracker.close();
         tracker.wait().await;
 
@@ -253,8 +237,7 @@ impl Stream {
         i: u32,
         pipeline: Arc<Pipeline>,
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
-        output_sender: Sender<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>,
-        error_output_sender: Option<Sender<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>>,
+        output_sender: Sender<(Data, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
     ) {
         let i = i + 1;
@@ -271,20 +254,18 @@ impl Stream {
             // Process result messages
             match processed {
                 Ok(msgs) => {
-                    if let Err(e) = output_sender.send_async((msgs, ack, seq)).await {
+                    if let Err(e) = output_sender.send_async((Data::Ok(msgs), ack, seq)).await {
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
                 }
                 Err(e) => {
-                    if let Some(ref error_output_sender) = error_output_sender {
-                        if let Err(e) = error_output_sender.send_async((vec![msg], ack, seq)).await
-                        {
-                            error!("Failed to send error message: {}", e);
-                            break;
-                        }
-                    } else {
-                        ack.ack().await;
+                    if let Err(e) = output_sender
+                        .send_async((Data::Err(vec![msg]), ack, seq))
+                        .await
+                    {
+                        error!("Failed to send processed message: {}", e);
+                        break;
                     }
                     error!("{}", e)
                 }
@@ -294,95 +275,106 @@ impl Stream {
     }
 
     async fn do_output(
-        next_sequence: Arc<AtomicU64>,
-        out_data: Arc<DashMap<u64, (Vec<MessageBatch>, Arc<dyn Ack>)>>,
-        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>,
+        output_receiver: Receiver<(Data, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
+        err_output: Option<Arc<dyn Output>>,
     ) {
-        Self::do_output_common(next_sequence, out_data, output_receiver, output).await;
+        Self::do_output_common(output_receiver, output, err_output).await;
         info!("Output stopped")
     }
 
     async fn do_output_common(
-        next_sequence: Arc<AtomicU64>,
-        out_data: Arc<DashMap<u64, (Vec<MessageBatch>, Arc<dyn Ack>)>>,
-        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>,
+        output_receiver: Receiver<(Data, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
+        err_output: Option<Arc<dyn Output>>,
     ) {
+        let mut tree_map: BTreeMap<u64, (Data, Arc<dyn Ack>)> = BTreeMap::new();
+        let mut next_seq = 0u64;
         loop {
-            let Ok((new_msgs, new_ack, new_seq)) = output_receiver.recv_async().await else {
-                Self::output_with(
-                    Arc::clone(&next_sequence),
-                    Arc::clone(&out_data),
-                    Arc::clone(&output),
-                )
-                .await;
+            let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
+                for (_, (data, x)) in tree_map {
+                    Self::output(data, x, &output, err_output.as_ref()).await;
+                }
                 break;
             };
-            out_data.insert(new_seq, (new_msgs, new_ack));
-            Self::output_with(
-                Arc::clone(&next_sequence),
-                Arc::clone(&out_data),
-                Arc::clone(&output),
-            )
-            .await
+
+            tree_map.insert(new_seq, (data, new_ack));
+
+            loop {
+                if Self::output_with(next_seq, &mut tree_map, &output, err_output.as_ref()).await {
+                    next_seq += 1;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
     async fn output_with(
-        next_sequence: Arc<AtomicU64>,
-        out_data: Arc<DashMap<u64, (Vec<MessageBatch>, Arc<dyn Ack>)>>,
-        output: Arc<dyn Output>,
-    ) {
-        let current_seq = next_sequence.load(Ordering::SeqCst);
-        info!("current_seq:{current_seq}");
-        info!("out_data:{}", out_data.len());
+        next_seq: u64,
+        tree_map: &mut BTreeMap<u64, (Data, Arc<dyn Ack>)>,
+        output: &Arc<dyn Output>,
+        err_output: Option<&Arc<dyn Output>>,
+    ) -> bool {
+        let Some((current_seq, _)) = tree_map.first_key_value() else {
+            return false;
+        };
 
-        if let Some((_seq, (msgs, ack))) = out_data.remove(&current_seq) {
-            Self::output(msgs, Arc::clone(&ack), Arc::clone(&output)).await;
-
-            let current_seq = next_sequence.fetch_add(1, Ordering::SeqCst);
-            loop {
-                let Some((_seq, (msgs, ack))) = out_data.remove(&current_seq) else {
-                    break;
-                };
-                Self::output(msgs, Arc::clone(&ack), Arc::clone(&output)).await;
-                next_sequence.fetch_add(1, Ordering::SeqCst);
-            }
+        if next_seq != *current_seq {
+            return false;
         }
+
+        if let Some((data, ack)) = tree_map.remove(&next_seq) {
+            Self::output(data, Arc::clone(&ack), &output, err_output).await;
+        }
+
+        true
     }
-    async fn output(msgs: Vec<MessageBatch>, ack: Arc<dyn Ack>, output: Arc<dyn Output>) {
-        let size = msgs.len();
-        let mut success_cnt = 0;
-        for x in msgs {
-            match output.write(x).await {
-                Ok(_) => {
+    async fn output(
+        data: Data,
+        ack: Arc<dyn Ack>,
+        output: &Arc<dyn Output>,
+        err_output: Option<&Arc<dyn Output>>,
+    ) {
+        match data {
+            Data::Err(msgs) => {
+                let size = msgs.len();
+                let mut success_cnt = 0;
+                for x in msgs {
                     success_cnt = success_cnt + 1;
+                    match err_output {
+                        None => {}
+                        Some(err_output) => match err_output.write(x).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!("{}", e);
+                            }
+                        },
+                    }
                 }
-                Err(e) => {
-                    error!("{}", e);
+
+                if size == success_cnt {
+                    ack.ack().await;
+                }
+            }
+            Data::Ok(msgs) => {
+                let size = msgs.len();
+                let mut success_cnt = 0;
+                for x in msgs {
+                    match output.write(x).await {
+                        Ok(_) => {
+                            success_cnt = success_cnt + 1;
+                        }
+                        Err(e) => {
+                            error!("{}", e);
+                        }
+                    }
+                }
+                if size == success_cnt {
+                    ack.ack().await;
                 }
             }
         }
-        if size == success_cnt {
-            ack.ack().await;
-        }
-    }
-    async fn do_error_output(
-        next_sequence: Arc<AtomicU64>,
-        out_data: Arc<DashMap<u64, (Vec<MessageBatch>, Arc<dyn Ack>)>>,
-        error_output_receiver: Option<Receiver<(Vec<MessageBatch>, Arc<dyn Ack>, u64)>>,
-        error_output: Option<Arc<dyn Output>>,
-    ) {
-        let Some(error_output_receiver) = error_output_receiver else {
-            return;
-        };
-        let Some(error_output) = error_output else {
-            return;
-        };
-
-        Self::do_output_common(next_sequence, out_data, error_output_receiver, error_output).await;
-        info!("Error output stopped")
     }
 
     async fn close(&mut self) -> Result<(), Error> {
