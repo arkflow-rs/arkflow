@@ -39,7 +39,7 @@ pub struct Stream {
 }
 
 enum ProcessorData {
-    Err(Vec<MessageBatch>, Error),
+    Err(MessageBatch, Error),
     Ok(Vec<MessageBatch>),
 }
 
@@ -264,7 +264,7 @@ impl Stream {
                 }
                 Err(e) => {
                     if let Err(e) = output_sender
-                        .send_async((ProcessorData::Err(vec![msg], e), ack, seq))
+                        .send_async((ProcessorData::Err(msg, e), ack, seq))
                         .await
                     {
                         error!("Failed to send processed message: {}", e);
@@ -322,28 +322,19 @@ impl Stream {
         err_output: Option<&Arc<dyn Output>>,
     ) {
         match data {
-            ProcessorData::Err(msgs, e) => {
-                let size = msgs.len();
-                let mut success_cnt = 0;
-                for x in msgs {
-                    success_cnt = success_cnt + 1;
-                    match err_output {
-                        None => {
-                            error!("{e}")
-                        }
-                        Some(err_output) => match err_output.write(x).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        },
+            ProcessorData::Err(msg, e) => match err_output {
+                None => {
+                    error!("{e}")
+                }
+                Some(err_output) => match err_output.write(msg).await {
+                    Ok(_) => {
+                        ack.ack().await;
                     }
-                }
-
-                if size == success_cnt {
-                    ack.ack().await;
-                }
-            }
+                    Err(e) => {
+                        error!("{}", e);
+                    }
+                },
+            },
             ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
