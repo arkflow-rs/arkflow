@@ -287,7 +287,7 @@ impl Stream {
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
                 for (_, (data, x)) in tree_map {
-                    Self::output(data, x, &output, err_output.as_ref()).await;
+                    Self::output(data, &x, &output, err_output.as_ref()).await;
                 }
                 break;
             };
@@ -307,7 +307,7 @@ impl Stream {
                     break;
                 };
 
-                Self::output(data, Arc::clone(&ack), &output, err_output.as_ref()).await;
+                Self::output(data, &ack, &output, err_output.as_ref()).await;
                 next_seq += 1;
             }
         }
@@ -317,7 +317,7 @@ impl Stream {
 
     async fn output(
         data: ProcessorData,
-        ack: Arc<dyn Ack>,
+        ack: &Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
     ) {
