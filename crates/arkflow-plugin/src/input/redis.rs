@@ -35,7 +35,6 @@ use tracing::{debug, error};
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisInputConfig {
-    /// Redis server URL
     mode: ModeConfig,
     redis_type: Type,
 }
