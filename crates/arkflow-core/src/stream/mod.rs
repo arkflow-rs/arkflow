@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
 
-const BACKPRESSURE_THRESHOLD: u64 = 1024 * 2;
+const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
 /// A stream structure, containing input, pipe, output, and an optional buffer.
 pub struct Stream {
