@@ -267,7 +267,7 @@ impl Stream {
 
             // Process messages through pipeline
             let processed = pipeline.process(msg.clone()).await;
-            let seq = sequence_counter.fetch_add(1, Ordering::Relaxed);
+            let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
 
             // Process result messages
             match processed {
