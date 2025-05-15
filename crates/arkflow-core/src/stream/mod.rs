@@ -152,7 +152,7 @@ impl Stream {
                                     break;
                                 }
                             } else {
-                                if let Err(e) = input_sender.send_async((msg.0, msg.1)).await {
+                                if let Err(e) = input_sender.send_async(msg).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
@@ -207,7 +207,7 @@ impl Stream {
                 result = buffer.read() =>{
                     match result {
                     Ok(Some(v)) => {
-                         if let Err(e) = input_sender.send_async((v.0, v.1)).await {
+                         if let Err(e) = input_sender.send_async(v).await {
                                 error!("Failed to send input message: {}", e);
                                 break;
                             }
@@ -224,7 +224,7 @@ impl Stream {
 
         match buffer.read().await {
             Ok(Some(v)) => {
-                if let Err(e) = input_sender.send_async((v.0, v.1)).await {
+                if let Err(e) = input_sender.send_async(v).await {
                     error!("Failed to send input message: {}", e);
                 }
             }
