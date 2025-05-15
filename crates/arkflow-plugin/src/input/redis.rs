@@ -22,10 +22,10 @@ use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
-use redis::aio::ConnectionManager;
+use redis::aio::{AsyncPushSender, ConnectionManager, SendError};
 use redis::cluster::{ClusterClient, ClusterClientBuilder};
 use redis::cluster_async::ClusterConnection;
-use redis::{AsyncCommands, Client, FromRedisValue, PushKind, RedisResult};
+use redis::{AsyncCommands, Client, FromRedisValue, PushInfo, PushKind, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -117,35 +117,13 @@ impl RedisInput {
         let cancellation_token = self.cancellation_token.clone();
 
         let config_type = self.config.redis_type.clone();
+
         match config_type {
             Type::Subscribe { subscribe } => {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 let client = ClusterClientBuilder::new(urls)
-                    .push_sender(async move |msg| {
-                        // match msg.kind {
-
-                        // PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
-                        //     if msg.data.len() < 2 {
-                        //         return Ok(());
-                        //     }
-                        //     // let mut iter = msg.data.into_iter();
-                        //     // let channel: String =
-                        //     //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                        //     // let payload =
-                        //     //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                        //     //
-                        //     // if let Err(e) = sender_clone
-                        //     //     .send_async(RedisMsg::Message(channel, payload))
-                        //     //     .await
-                        //     // {
-                        //     //     error!("{}", e);
-                        //     // }
-                        // }
-                        //
-                        // _ => {}
-                        // }
+                    .push_sender(move |msg: PushInfo| {
                         match msg.kind {
-                            PushKind::Message | PushKind::SMessage => {
+                            PushKind::Message | PushKind::PMessage => {
                                 if msg.data.len() < 2 {
                                     return Ok(());
                                 }
@@ -154,19 +132,17 @@ impl RedisInput {
                                     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
                                 let message =
                                     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                                // Ok(Some((channel, message)))
-                                if let Err(e) = sender_clone
-                                    .send_async(RedisMsg::Message(channel, message))
-                                    .await
+                                if let Err(e) =
+                                    sender_clone.send(RedisMsg::Message(channel, message))
                                 {
                                     error!("{}", e);
                                 }
-                                Ok(())
+                                Ok(()) as RedisResult<()>
                             }
-                            _ => Ok(()),
-                        }
-                        .expect("TODO: panic message");
-                        Ok(())
+                            _ => Ok(()) as RedisResult<()>,
+                        }?;
+
+                        Ok(()) as RedisResult<()>
                     })
                     .build()
                     .map_err(|e| {
@@ -197,39 +173,6 @@ impl RedisInput {
                         }
                     }
                 }
-
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            Some(msg) = rx.recv() => {
-                                 match msg.kind {
-                                    PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
-                                        if msg.data.len() < 2 {
-                                            continue;
-                                        }
-                                        // let mut iter = msg.data.into_iter();
-                                        // let channel: String =
-                                        //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                                        // let payload =
-                                        //     FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                                        //
-                                        // if let Err(e) = sender_clone
-                                        //     .send_async(RedisMsg::Message(channel, payload))
-                                        //     .await
-                                        // {
-                                        //     error!("{}", e);
-                                        // }
-                                    }
-
-                                    _ => {}
-                                }
-                            }
-                            _ = cancellation_token.cancelled() => {
-                                break;
-                            }
-                        }
-                    }
-                });
             }
             Type::List { .. } => {}
         }
