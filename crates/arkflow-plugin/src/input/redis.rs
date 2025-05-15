@@ -315,6 +315,7 @@ impl Input for RedisInput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
+        self.client.lock().await.take();
         Ok(())
     }
 }
