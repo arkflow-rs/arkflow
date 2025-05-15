@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
 
+const BACKPRESSURE_THRESHOLD: u64 = 1024 * 2;
+
 /// A stream structure, containing input, pipe, output, and an optional buffer.
 pub struct Stream {
     input: Arc<dyn Input>,
@@ -36,6 +38,7 @@ pub struct Stream {
     thread_num: u32,
     buffer: Option<Arc<dyn Buffer>>,
     sequence_counter: Arc<AtomicU64>,
+    next_seq: Arc<AtomicU64>,
 }
 
 enum ProcessorData {
@@ -61,6 +64,7 @@ impl Stream {
             buffer,
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
+            next_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -107,6 +111,7 @@ impl Stream {
                 input_receiver.clone(),
                 output_sender.clone(),
                 self.sequence_counter.clone(),
+                self.next_seq.clone(),
             ));
         }
 
@@ -116,6 +121,7 @@ impl Stream {
 
         // Output
         tracker.spawn(Self::do_output(
+            self.next_seq.clone(),
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
@@ -239,17 +245,29 @@ impl Stream {
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
         output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
+        next_seq: Arc<AtomicU64>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
         loop {
+            let pending_messages =
+                sequence_counter.load(Ordering::Acquire) - next_seq.load(Ordering::Acquire);
+            if pending_messages > BACKPRESSURE_THRESHOLD {
+                let wait_time = std::cmp::min(
+                    500,
+                    100 + (pending_messages as u64 - BACKPRESSURE_THRESHOLD) / 100 * 10,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait_time)).await;
+                continue;
+            }
+
             let Ok((msg, ack)) = input_receiver.recv_async().await else {
                 break;
             };
 
-            let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
             // Process messages through pipeline
             let processed = pipeline.process(msg.clone()).await;
+            let seq = sequence_counter.fetch_add(1, Ordering::Relaxed);
 
             // Process result messages
             match processed {
@@ -277,12 +295,12 @@ impl Stream {
     }
 
     async fn do_output(
+        next_seq: Arc<AtomicU64>,
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
     ) {
         let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
-        let mut next_seq = 0u64;
 
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
@@ -298,17 +316,17 @@ impl Stream {
                 let Some((current_seq, _)) = tree_map.first_key_value() else {
                     break;
                 };
-
-                if next_seq != *current_seq {
+                let next_seq_val = next_seq.load(Ordering::Acquire);
+                if next_seq_val != *current_seq {
                     break;
                 }
 
-                let Some((data, ack)) = tree_map.remove(&next_seq) else {
+                let Some((data, ack)) = tree_map.remove(&next_seq_val) else {
                     break;
                 };
 
                 Self::output(data, &ack, &output, err_output.as_ref()).await;
-                next_seq += 1;
+                next_seq.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -350,7 +368,7 @@ impl Stream {
                     }
                 }
 
-                if size >= success_cnt {
+                if success_cnt >= size {
                     ack.ack().await;
                 }
             }
