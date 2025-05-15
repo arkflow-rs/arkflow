@@ -73,7 +73,7 @@ struct RedisInput {
 }
 enum Cli {
     Single(ConnectionManager),
-    Cluster(ClusterConnection),
+    Cluster(ClusterClient),
 }
 
 enum RedisMsg {
@@ -113,46 +113,49 @@ impl RedisInput {
     async fn cluster_connect(&self, urls: Vec<String>) -> Result<(), Error> {
         let mut cli_guard = self.client.lock().await;
 
-        let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
 
         let config_type = self.config.redis_type.clone();
 
+        let mut client_builder = ClusterClientBuilder::new(urls);
+
+        let client_builder = match config_type {
+            Type::Subscribe { .. } => {
+                let sender_clone = Sender::clone(&self.sender);
+                client_builder.push_sender(move |msg: PushInfo| {
+                    match msg.kind {
+                        PushKind::Message | PushKind::PMessage => {
+                            if msg.data.len() < 2 {
+                                return Ok(());
+                            }
+                            let mut iter = msg.data.into_iter();
+                            let channel: String =
+                                FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                            let message =
+                                FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                            if let Err(e) = sender_clone.send(RedisMsg::Message(channel, message)) {
+                                error!("{}", e);
+                            }
+                            Ok(()) as RedisResult<()>
+                        }
+                        _ => Ok(()) as RedisResult<()>,
+                    }?;
+
+                    Ok(()) as RedisResult<()>
+                })
+            }
+            Type::List { .. } => client_builder,
+        };
+
+        let cluster_client = client_builder
+            .build()
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
+        let mut result = cluster_client
+            .get_async_connection()
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
         match config_type {
             Type::Subscribe { subscribe } => {
-                let client = ClusterClientBuilder::new(urls)
-                    .push_sender(move |msg: PushInfo| {
-                        match msg.kind {
-                            PushKind::Message | PushKind::PMessage => {
-                                if msg.data.len() < 2 {
-                                    return Ok(());
-                                }
-                                let mut iter = msg.data.into_iter();
-                                let channel: String =
-                                    FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                                let message =
-                                    FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                                if let Err(e) =
-                                    sender_clone.send(RedisMsg::Message(channel, message))
-                                {
-                                    error!("{}", e);
-                                }
-                                Ok(()) as RedisResult<()>
-                            }
-                            _ => Ok(()) as RedisResult<()>,
-                        }?;
-
-                        Ok(()) as RedisResult<()>
-                    })
-                    .build()
-                    .map_err(|e| {
-                        Error::Connection(format!("Failed to connect to Redis cluster: {}", e))
-                    })?;
-
-                let mut result = client.get_async_connection().await.map_err(|e| {
-                    Error::Connection(format!("Failed to connect to Redis cluster: {}", e))
-                })?;
-
                 match subscribe {
                     Subscribe::Channels { channels } => {
                         // Subscribe to channels
@@ -174,9 +177,43 @@ impl RedisInput {
                     }
                 }
             }
-            Type::List { .. } => {}
+            Type::List { list } => {
+                let sender_clone = Sender::clone(&self.sender);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => {
+                                break;
+                            }
+                            result = async {
+                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = result.blpop(&list, 1f64).await;
+                                blpop_result
+                            } => {
+                                match result {
+                                    Ok(Some((list_name, payload))) => {
+                                        debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                            error!("Failed to send Redis list message: {}", e);
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        error!("Error retrieving from Redis list: {}", e);
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                            error!("{}", e);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
-        // cli_guard.replace(Cli::Cluster(result));
+        cli_guard.replace(Cli::Cluster(cluster_client));
         Ok(())
     }
 
@@ -315,7 +352,7 @@ impl Input for RedisInput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
-        self.client.lock().await.take();
+        if let Some(_cli) = self.client.lock().await.take() {}
         Ok(())
     }
 }
