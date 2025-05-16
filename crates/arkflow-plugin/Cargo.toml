@@ -21,7 +21,7 @@ toml = { workspace = true }
 humantime = { workspace = true }
 tracing = { workspace = true }
 datafusion = { workspace = true }
-datafusion-functions-json = "*"
+datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { version = "0.4", features = [
     "mysql",
     "postgres",
@@ -66,6 +66,7 @@ vrl = { version = "0.23.0", features = ["value", "compiler", "stdlib"] }
 
 # arkflow
 arkflow-core = { workspace = true }
+sqlx = { workspace= true }
 
 # Websocket
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
