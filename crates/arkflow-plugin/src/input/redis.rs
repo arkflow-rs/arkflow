@@ -268,7 +268,9 @@ impl RedisInput {
                         tokio::select! {
                             Some(msg_result) = msg_stream.next() => {
                                 let channel: String = msg_result.get_channel_name().to_string();
-                                let payload: Vec<u8> = msg_result.get_payload().unwrap_or_default();
+                                let Ok(payload )=   msg_result.get_payload() else {
+                                       continue;
+                                };
                                 if let Err(e) = sender_clone.send_async(RedisMsg::Message(channel, payload)).await {
                                     error!("{}", e);
                                 }
