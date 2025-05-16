@@ -22,8 +22,8 @@ use arkflow_core::{Error, MessageBatch};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
-use redis::aio::{AsyncPushSender, ConnectionManager, SendError};
-use redis::cluster::{ClusterClient, ClusterClientBuilder};
+use redis::aio::ConnectionManager;
+use redis::cluster::ClusterClientBuilder;
 use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, Client, FromRedisValue, PushInfo, PushKind, RedisResult};
 use serde::{Deserialize, Serialize};
@@ -70,9 +70,10 @@ struct RedisInput {
     receiver: Receiver<RedisMsg>,
     cancellation_token: CancellationToken,
 }
+
 enum Cli {
     Single(ConnectionManager),
-    Cluster(ClusterClient),
+    Cluster(ClusterConnection),
 }
 
 enum RedisMsg {
@@ -116,7 +117,7 @@ impl RedisInput {
 
         let config_type = self.config.redis_type.clone();
 
-        let mut client_builder = ClusterClientBuilder::new(urls);
+        let client_builder = ClusterClientBuilder::new(urls);
 
         let client_builder = match config_type {
             Type::Subscribe { .. } => {
@@ -149,7 +150,7 @@ impl RedisInput {
         let cluster_client = client_builder
             .build()
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
-        let mut result = cluster_client
+        let mut cluster_conn = cluster_client
             .get_async_connection()
             .await
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
@@ -159,7 +160,7 @@ impl RedisInput {
                     Subscribe::Channels { channels } => {
                         // Subscribe to channels
                         for channel in channels {
-                            if let Err(e) = result.subscribe(&channel).await {
+                            if let Err(e) = cluster_conn.subscribe(&channel).await {
                                 error!("Failed to subscribe to Redis channel {}: {}", channel, e);
                                 return Err(Error::Disconnection);
                             }
@@ -168,7 +169,7 @@ impl RedisInput {
                     Subscribe::Patterns { patterns } => {
                         // Subscribe to patterns
                         for pattern in patterns {
-                            if let Err(e) = result.psubscribe(&pattern).await {
+                            if let Err(e) = cluster_conn.psubscribe(&pattern).await {
                                 error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
                                 return Err(Error::Disconnection);
                             }
@@ -178,6 +179,7 @@ impl RedisInput {
             }
             Type::List { list } => {
                 let sender_clone = Sender::clone(&self.sender);
+                let mut cluster_connection = cluster_conn.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -185,7 +187,7 @@ impl RedisInput {
                                 break;
                             }
                             result = async {
-                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = result.blpop(&list, 1f64).await;
+                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = cluster_connection.blpop(&list, 1f64).await;
                                 blpop_result
                             } => {
                                 match result {
@@ -212,7 +214,7 @@ impl RedisInput {
                 });
             }
         }
-        cli_guard.replace(Cli::Cluster(cluster_client));
+        cli_guard.replace(Cli::Cluster(cluster_conn));
         Ok(())
     }
 
@@ -351,7 +353,52 @@ impl Input for RedisInput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
-        if let Some(_cli) = self.client.lock().await.take() {}
+        if let Some(cli) = self.client.lock().await.take() {
+            match cli {
+                Cli::Single(mut c) => match self.config.redis_type {
+                    Type::Subscribe { ref subscribe } => match subscribe {
+                        Subscribe::Channels { channels } => {
+                            match c.unsubscribe(channels).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis channel: {}", e);
+                                }
+                            };
+                        }
+                        Subscribe::Patterns { patterns } => {
+                            match c.punsubscribe(patterns).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                }
+                            };
+                        }
+                    },
+                    _ => {}
+                },
+                Cli::Cluster(mut c) => match self.config.redis_type {
+                    Type::Subscribe { ref subscribe } => match subscribe {
+                        Subscribe::Channels { channels } => {
+                            match c.unsubscribe(channels).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis channel: {}", e);
+                                }
+                            };
+                        }
+                        Subscribe::Patterns { patterns } => {
+                            match c.punsubscribe(patterns).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                }
+                            };
+                        }
+                    },
+                    _ => {}
+                },
+            }
+        }
         Ok(())
     }
 }
