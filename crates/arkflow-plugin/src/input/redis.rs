@@ -124,22 +124,26 @@ impl RedisInput {
                 let sender_clone = Sender::clone(&self.sender);
                 client_builder.push_sender(move |msg: PushInfo| {
                     match msg.kind {
-                        PushKind::Message | PushKind::PMessage => {
+                        PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
                             if msg.data.len() < 2 {
                                 return Ok(());
                             }
                             let mut iter = msg.data.into_iter();
-                            let channel: String =
-                                FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
-                            let message =
-                                FromRedisValue::from_owned_redis_value(iter.next().unwrap())?;
+                            let channel: String = match iter.next() {
+                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
+                                None => return Ok(()),
+                            };
+                            let message = match iter.next() {
+                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
+                                None => return Ok(()),
+                            };
+
                             if let Err(e) = sender_clone.send(RedisMsg::Message(channel, message)) {
                                 error!("{}", e);
                             }
-                            Ok(()) as RedisResult<()>
                         }
-                        _ => Ok(()) as RedisResult<()>,
-                    }?;
+                        _ => {}
+                    };
 
                     Ok(()) as RedisResult<()>
                 })
