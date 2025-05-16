@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 /// Standard output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StdoutOutputConfig {
+struct StdoutOutputConfig {
     /// Whether to add a line break after each message
     pub append_newline: Option<bool>,
 }
@@ -66,6 +66,7 @@ where
         Ok(())
     }
 }
+
 impl<T: StdWriter> StdoutOutput<T> {
     async fn arrow_stdout(&self, message_batch: MessageBatch) -> Result<(), Error> {
         let mut writer_std = self.writer.lock().await;
@@ -92,7 +93,8 @@ impl<T: StdWriter> StdoutOutput<T> {
     }
 }
 
-pub(crate) struct StdoutOutputBuilder;
+struct StdoutOutputBuilder;
+
 impl OutputBuilder for StdoutOutputBuilder {
     fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {

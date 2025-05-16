@@ -1,0 +1,8 @@
+{
+  "label": "Inputs",
+  "link": {
+    "title": "Inputs",
+    "type": "generated-index",
+    "description": "Input components are responsible for consuming data from various sources such as Kafka, MQTT, HTTP, and Memory. Each input component has its own configuration options that can be customized according to your needs."
+  }
+}

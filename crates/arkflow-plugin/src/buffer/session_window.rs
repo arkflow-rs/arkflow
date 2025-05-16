@@ -12,6 +12,13 @@
  *    limitations under the License.
  */
 
+//! Session Window Buffer Implementation
+//!
+//! This module implements a session window buffer that groups messages into sessions
+//! based on a configurable gap duration. Messages are considered part of the same session
+//! if they arrive within the gap duration of each other. When the gap duration elapses
+//! without new messages, the session is closed and all accumulated messages are emitted.
+
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
@@ -28,21 +35,38 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// Configuration for the session window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionWindowConfig {
+struct SessionWindowConfig {
+    /// The maximum time gap between messages in a session
+    /// If no new messages arrive within this duration, the session is considered complete
     #[serde(deserialize_with = "deserialize_duration")]
     gap: time::Duration,
 }
 
-pub struct SessionWindow {
+/// Session window buffer implementation
+/// Groups messages into sessions based on timing gaps between messages
+struct SessionWindow {
+    /// Configuration parameters for the session window
     config: SessionWindowConfig,
+    /// Thread-safe queue to store message batches and their acknowledgments
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
+    /// Token for cancellation of background tasks
     close: CancellationToken,
+    /// Timestamp of the last received message, used to determine session boundaries
     last_message_time: Arc<RwLock<Instant>>,
 }
 
 impl SessionWindow {
+    /// Creates a new session window buffer with the given configuration
+    ///
+    /// # Arguments
+    /// * `config` - Configuration parameters for the session window
+    ///
+    /// # Returns
+    /// * `Result<Self, Error>` - A new session window instance or an error
     fn new(config: SessionWindowConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
@@ -80,6 +104,11 @@ impl SessionWindow {
         })
     }
 
+    /// Processes the current session by merging all accumulated messages
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the queue is empty
     async fn process_session(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let mut queue_lock = self.queue.write().await;
         if queue_lock.is_empty() {
@@ -116,13 +145,28 @@ impl SessionWindow {
 
 #[async_trait]
 impl Buffer for SessionWindow {
+    /// Writes a message batch to the session window buffer
+    ///
+    /// # Arguments
+    /// * `msg` - The message batch to write
+    /// * `ack` - The acknowledgment for the message batch
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let mut queue_lock = self.queue.write().await;
         queue_lock.push_front((msg, ack));
+        // Update the last message timestamp to track session activity
         *self.last_message_time.write().await = Instant::now();
         Ok(())
     }
 
+    /// Reads a message batch from the session window buffer
+    /// Waits until either the session gap has elapsed or the buffer is closed
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         loop {
             {
@@ -130,6 +174,7 @@ impl Buffer for SessionWindow {
                 let queue_lock = queue_arc.read().await;
                 if !queue_lock.is_empty() {
                     let last_time = *self.last_message_time.read().await;
+                    // Check if the session gap has elapsed since the last message
                     if last_time.elapsed() >= self.config.gap {
                         break;
                     }
@@ -138,23 +183,34 @@ impl Buffer for SessionWindow {
                 }
             }
 
+            // Wait for notification from timer or write operation
             let notify = Arc::clone(&self.notify);
             notify.notified().await;
         }
+        // Process and return the current session
         self.process_session().await
     }
 
+    /// Flushes the buffer by cancelling the background task and notifying waiters
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
         self.close.cancel();
         let queue_arc = Arc::clone(&self.queue);
         let queue_lock = queue_arc.read().await;
         if !queue_lock.is_empty() {
+            // Notify any waiting readers to process remaining messages
             let notify = Arc::clone(&self.notify);
             notify.notify_waiters();
         }
         Ok(())
     }
 
+    /// Closes the buffer by cancelling the background task
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
         self.close.cancel();
         Ok(())
@@ -164,6 +220,13 @@ impl Buffer for SessionWindow {
 struct SessionWindowBuilder;
 
 impl BufferBuilder for SessionWindowBuilder {
+    /// Builds a session window buffer from the provided configuration
+    ///
+    /// # Arguments
+    /// * `config` - JSON configuration for the session window
+    ///
+    /// # Returns
+    /// * `Result<Arc<dyn Buffer>, Error>` - A new session window buffer instance or an error
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -176,6 +239,10 @@ impl BufferBuilder for SessionWindowBuilder {
     }
 }
 
+/// Initializes the session window buffer by registering its builder
+///
+/// # Returns
+/// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("session_window", Arc::new(SessionWindowBuilder))
 }

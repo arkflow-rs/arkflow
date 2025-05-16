@@ -33,11 +33,11 @@ use std::sync::Arc;
 /// Arrow Format Conversion Processor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonProcessorConfig {
-    pub value_field: Option<String>,
-    pub fields_to_include: Option<HashSet<String>>,
+    value_field: Option<String>,
+    fields_to_include: Option<HashSet<String>>,
 }
 
-pub struct JsonToArrowProcessor {
+struct JsonToArrowProcessor {
     config: JsonProcessorConfig,
 }
 
@@ -78,18 +78,23 @@ impl JsonToArrowProcessor {
         }
 
         let inferred_schema = Arc::new(inferred_schema);
-        let mut decoder = ReaderBuilder::new(inferred_schema.clone())
-            .build_decoder()
+        let reader = ReaderBuilder::new(inferred_schema.clone())
+            .build(Cursor::new(content))
             .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
-        decoder
-            .decode(content)
-            .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?;
-        let batch = decoder
-            .flush()
-            .map_err(|e| Error::Process(format!("Arrow JSON Reader Flush Error: {}", e)))?
-            .unwrap_or(RecordBatch::new_empty(inferred_schema));
 
-        Ok(batch)
+        let result = reader
+            .map(|batch| {
+                Ok(batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?)
+            })
+            .collect::<Result<Vec<RecordBatch>, Error>>()?;
+        if result.is_empty() {
+            return Ok(RecordBatch::new_empty(inferred_schema));
+        }
+
+        let new_batch = arrow::compute::concat_batches(&inferred_schema, &result)
+            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+
+        Ok(new_batch)
     }
 }
 
@@ -132,7 +137,8 @@ impl ArrowToJsonProcessor {
     }
 }
 
-pub(crate) struct JsonToArrowProcessorBuilder;
+struct JsonToArrowProcessorBuilder;
+
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
@@ -145,7 +151,8 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
         Ok(Arc::new(JsonToArrowProcessor { config }))
     }
 }
-pub(crate) struct ArrowToJsonProcessorBuilder;
+struct ArrowToJsonProcessorBuilder;
+
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {

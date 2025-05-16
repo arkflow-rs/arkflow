@@ -12,6 +12,12 @@
  *    limitations under the License.
  */
 
+//! Memory Buffer Implementation
+//!
+//! This module implements a memory-based buffer that accumulates messages until
+//! either a capacity threshold is reached or a timeout occurs. When either condition
+//! is met, the buffer releases all accumulated messages as a single batch.
+
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
@@ -28,21 +34,37 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+/// Configuration for the memory buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryBufferConfig {
+struct MemoryBufferConfig {
+    /// Maximum number of messages to accumulate before releasing
     capacity: u32,
+    /// Maximum time to wait before releasing accumulated messages
     #[serde(deserialize_with = "deserialize_duration")]
     timeout: time::Duration,
 }
 
-pub struct MemoryBuffer {
+/// Memory buffer implementation
+/// Accumulates messages in memory until capacity or timeout conditions are met
+struct MemoryBuffer {
+    /// Configuration parameters for the memory buffer
     config: MemoryBufferConfig,
+    /// Thread-safe queue to store message batches and their acknowledgments
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
+    /// Token for cancellation of background tasks
     close: CancellationToken,
 }
 
 impl MemoryBuffer {
+    /// Creates a new memory buffer with the given configuration
+    ///
+    /// # Arguments
+    /// * `config` - Configuration parameters for the memory buffer
+    ///
+    /// # Returns
+    /// * `Result<Self, Error>` - A new memory buffer instance or an error
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
@@ -76,6 +98,11 @@ impl MemoryBuffer {
         })
     }
 
+    /// Processes accumulated messages by merging them into a single batch
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the queue is empty
     async fn process_messages(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let queue_arc = Arc::clone(&self.queue);
         let mut queue_lock = queue_arc.write().await;
@@ -107,15 +134,27 @@ impl MemoryBuffer {
 
 #[async_trait]
 impl Buffer for MemoryBuffer {
+    /// Writes a message batch to the memory buffer
+    ///
+    /// # Arguments
+    /// * `msg` - The message batch to write
+    /// * `arc` - The acknowledgment for the message batch
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
         let queue_arc = Arc::clone(&self.queue);
 
         let mut queue_lock = queue_arc.write().await;
         queue_lock.push_front((msg, arc));
+
+        // Calculate the total number of messages in the buffer
         let cnt = queue_lock.iter().map(|x| x.0.len()).reduce(|acc, x| {
             return acc + x;
         });
         let cnt = cnt.unwrap_or(0);
+
+        // If capacity threshold is reached, notify readers to process the batch
         if cnt >= self.config.capacity as usize {
             let notify = self.notify.clone();
             notify.notify_waiters();
@@ -123,44 +162,67 @@ impl Buffer for MemoryBuffer {
         Ok(())
     }
 
+    /// Reads a message batch from the memory buffer
+    /// Waits until either messages are available or the buffer is closed
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         loop {
             {
                 let queue_arc = Arc::clone(&self.queue);
                 let queue_lock = queue_arc.read().await;
+                // If there are messages available, break the loop and process them
                 if !queue_lock.is_empty() {
                     break;
                 }
+                // If the buffer is closed, return None
                 if self.close.is_cancelled() {
                     return Ok(None);
                 }
             }
+            // Wait for notification from timer, write operation, or close
             let notify = Arc::clone(&self.notify);
             notify.notified().await;
         }
+        // Process and return the accumulated messages
         self.process_messages().await
     }
 
+    /// Flushes the buffer by cancelling the background task and notifying waiters
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
         self.close.cancel();
 
         let queue_arc = Arc::clone(&self.queue);
         let queue_lock = queue_arc.read().await;
         if !queue_lock.is_empty() {
+            // Notify any waiting readers to process remaining messages
             let notify = Arc::clone(&self.notify);
             notify.notify_waiters();
         }
         Ok(())
     }
 
+    /// Closes the buffer by cancelling the background task
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
         self.close.cancel();
         Ok(())
     }
 }
+/// Acknowledgment implementation that combines multiple acknowledgments
+/// When acknowledged, it acknowledges all contained acknowledgments
 struct ArrayAck(Vec<Arc<dyn Ack>>);
+
 #[async_trait]
 impl Ack for ArrayAck {
+    /// Acknowledges all contained acknowledgments
     async fn ack(&self) {
         for ack in self.0.iter() {
             ack.ack().await;
@@ -171,6 +233,13 @@ impl Ack for ArrayAck {
 struct MemoryBufferBuilder;
 
 impl BufferBuilder for MemoryBufferBuilder {
+    /// Builds a memory buffer from the provided configuration
+    ///
+    /// # Arguments
+    /// * `config` - JSON configuration for the memory buffer
+    ///
+    /// # Returns
+    /// * `Result<Arc<dyn Buffer>, Error>` - A new memory buffer instance or an error
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -183,6 +252,10 @@ impl BufferBuilder for MemoryBufferBuilder {
     }
 }
 
+/// Initializes the memory buffer by registering its builder
+///
+/// # Returns
+/// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("memory", Arc::new(MemoryBufferBuilder))
 }

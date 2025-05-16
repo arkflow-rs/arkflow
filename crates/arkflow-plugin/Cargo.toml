@@ -39,7 +39,7 @@ lazy_static = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 tower = "0.5"
-tower-http = { version = "0.4", features = ["cors", "trace"] }
+tower-http = { version = "0.6.4", features = ["cors", "trace"] }
 base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
@@ -56,7 +56,9 @@ rdkafka = { version = "0.37", features = [
 ] }
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
-redis = { version = "0.24", features = ["tokio-comp", "aio"] }
+
+# redis
+redis = { version = "0.31", features = ["tokio-comp", "aio","connection-manager"] }
 
 # vrl https://github.com/vectordotdev/vrl
 vrl = { version = "0.23.0", features = ["value", "compiler", "stdlib"] }
@@ -72,9 +74,11 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # NATS
 async-nats = "0.40.0"
 
-url = "2.5.4"
+
 futures = {workspace = true}
 tokio-stream = "0.1.17"
+url = "2.5.4"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 mockall = { workspace = true }

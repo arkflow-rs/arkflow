@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1000" height="600" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景和标题 -->
+  <rect width="1000" height="600" fill="#f8f9fa" />
+  <text x="400" y="40" font-family="Arial, sans-serif" font-size="24" font-weight="bold" text-anchor="middle" fill="#333">ArkFlow 架构图</text>
+  
+  <!-- 输入组件 -->
+  <g transform="translate(100, 100)">
+    <rect width="150" height="200" rx="10" ry="10" fill="#e6f7ff" stroke="#1890ff" stroke-width="2" />
+    <text x="75" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#333">输入组件</text>
+    <rect x="20" y="45" width="110" height="25" rx="5" ry="5" fill="#91d5ff" stroke="#1890ff" stroke-width="1" />
+    <text x="75" y="62" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">Kafka</text>
+    <rect x="20" y="80" width="110" height="25" rx="5" ry="5" fill="#91d5ff" stroke="#1890ff" stroke-width="1" />
+    <text x="75" y="97" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">MQTT</text>
+    <rect x="20" y="115" width="110" height="25" rx="5" ry="5" fill="#91d5ff" stroke="#1890ff" stroke-width="1" />
+    <text x="75" y="132" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">HTTP</text>
+    <rect x="20" y="150" width="110" height="25" rx="5" ry="5" fill="#91d5ff" stroke="#1890ff" stroke-width="1" />
+    <text x="75" y="167" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">文件</text>
+    <rect x="20" y="185" width="110" height="25" rx="5" ry="5" fill="#91d5ff" stroke="#1890ff" stroke-width="1" />
+    <text x="75" y="202" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">数据库</text>
+  </g>
+  
+  <!-- 缓冲区组件 -->
+  <g transform="translate(300, 150)">
+    <rect width="150" height="100" rx="10" ry="10" fill="#f6ffed" stroke="#52c41a" stroke-width="2" />
+    <text x="75" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#333">缓冲区组件</text>
+    <rect x="20" y="45" width="110" height="25" rx="5" ry="5" fill="#b7eb8f" stroke="#52c41a" stroke-width="1" />
+    <text x="75" y="62" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">内存缓冲区</text>
+  </g>
+  
+  <!-- 处理管道 -->
+  <g transform="translate(500, 100)">
+    <rect width="150" height="200" rx="10" ry="10" fill="#fff7e6" stroke="#fa8c16" stroke-width="2" />
+    <text x="75" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#333">处理管道</text>
+    <rect x="20" y="45" width="110" height="25" rx="5" ry="5" fill="#ffe7ba" stroke="#fa8c16" stroke-width="1" />
+    <text x="75" y="62" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">JSON处理</text>
+    <rect x="20" y="80" width="110" height="25" rx="5" ry="5" fill="#ffe7ba" stroke="#fa8c16" stroke-width="1" />
+    <text x="75" y="97" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">SQL查询</text>
+    <rect x="20" y="115" width="110" height="25" rx="5" ry="5" fill="#ffe7ba" stroke="#fa8c16" stroke-width="1" />
+    <text x="75" y="132" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">Protobuf处理</text>
+    <rect x="20" y="150" width="110" height="25" rx="5" ry="5" fill="#ffe7ba" stroke="#fa8c16" stroke-width="1" />
+    <text x="75" y="167" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">批处理</text>
+  </g>
+  
+  <!-- 输出组件 -->
+  <g transform="translate(700, 100)">
+    <rect width="150" height="200" rx="10" ry="10" fill="#f9f0ff" stroke="#722ed1" stroke-width="2" />
+    <text x="75" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#333">输出组件</text>
+    <rect x="20" y="45" width="110" height="25" rx="5" ry="5" fill="#d3adf7" stroke="#722ed1" stroke-width="1" />
+    <text x="75" y="62" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">Kafka</text>
+    <rect x="20" y="80" width="110" height="25" rx="5" ry="5" fill="#d3adf7" stroke="#722ed1" stroke-width="1" />
+    <text x="75" y="97" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">MQTT</text>
+    <rect x="20" y="115" width="110" height="25" rx="5" ry="5" fill="#d3adf7" stroke="#722ed1" stroke-width="1" />
+    <text x="75" y="132" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">HTTP</text>
+    <rect x="20" y="150" width="110" height="25" rx="5" ry="5" fill="#d3adf7" stroke="#722ed1" stroke-width="1" />
+    <text x="75" y="167" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">标准输出</text>
+    <rect x="20" y="185" width="110" height="25" rx="5" ry="5" fill="#d3adf7" stroke="#722ed1" stroke-width="1" />
+    <text x="75" y="202" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">丢弃</text>
+  </g>
+  
+  <!-- 错误输出组件 -->
+  <g transform="translate(700, 350)">
+    <rect width="150" height="100" rx="10" ry="10" fill="#fff1f0" stroke="#f5222d" stroke-width="2" />
+    <text x="75" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#333">错误输出组件</text>
+    <rect x="20" y="45" width="110" height="25" rx="5" ry="5" fill="#ffa39e" stroke="#f5222d" stroke-width="1" />
+    <text x="75" y="62" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">错误处理</text>
+  </g>
+  
+  <!-- 连接箭头 -->
+  <!-- 输入到缓冲区 -->
+  <path d="M 250 200 L 300 200" stroke="#333" stroke-width="2" fill="none" marker-end="url(#arrowhead)" />
+  <!-- 缓冲区到处理管道 -->
+  <path d="M 450 200 L 500 200" stroke="#333" stroke-width="2" fill="none" marker-end="url(#arrowhead)" />
+  <!-- 处理管道到输出 -->
+  <path d="M 650 200 L 700 200" stroke="#333" stroke-width="2" fill="none" marker-end="url(#arrowhead)" />
+  <!-- 处理管道到错误输出 -->
+  <path d="M 575 300 L 575 400 L 700 400" stroke="#333" stroke-width="2" fill="none" marker-end="url(#arrowhead)" />
+  
+  <!-- 箭头标记定义 -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+  </defs>
+  
+  <!-- 底部说明 -->
+  <text x="400" y="500" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#333">ArkFlow 特性</text>
+  <text x="400" y="525" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">高性能: 基于Rust和Tokio异步运行时</text>
+  <text x="400" y="545" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">多数据源: 支持Kafka、MQTT、HTTP、文件等输入/输出源</text>
+  <text x="400" y="565" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">强大处理能力: 内置SQL查询、JSON处理、Protobuf编解码等</text>
+  <text x="400" y="585" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#333">可扩展性: 模块化设计，易于扩展新的输入、输出和处理器组件</text>
+</svg>

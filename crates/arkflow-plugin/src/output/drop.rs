@@ -26,7 +26,7 @@ use std::sync::Arc;
 ///
 /// This component implements the `Output` trait but doesn't perform any actual
 /// output operations. All messages sent to this output are simply discarded.
-pub struct DropOutput;
+struct DropOutput;
 
 #[async_trait]
 impl Output for DropOutput {
@@ -43,7 +43,7 @@ impl Output for DropOutput {
     }
 }
 
-pub(crate) struct DropOutputBuilder;
+struct DropOutputBuilder;
 impl OutputBuilder for DropOutputBuilder {
     fn build(&self, _: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
         Ok(Arc::new(DropOutput))

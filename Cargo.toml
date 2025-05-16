@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.2.1"
+version = "0.3.1"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
@@ -36,7 +36,7 @@ protobuf-parse = "3.7.2"
 protobuf = "3.7.2"
 toml = "0.8"
 lazy_static = "1.4"
-axum = "0.6"
+axum = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
@@ -51,8 +51,8 @@ aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl-vendored", "zstd"] }
 rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
+tempfile = "3.20.0"
 
-tempfile = "3.19.1"
 mockall = "0.12"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }

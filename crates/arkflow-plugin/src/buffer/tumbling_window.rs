@@ -12,6 +12,13 @@
  *    limitations under the License.
  */
 
+//! Tumbling Window Buffer Implementation
+//!
+//! This module implements a tumbling window buffer that groups messages into fixed-size,
+//! non-overlapping time windows. Each window has a fixed duration, and when the window
+//! period elapses, all accumulated messages are emitted as a single batch and a new
+//! window begins immediately.
+
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
@@ -28,19 +35,34 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+/// Configuration for the tumbling window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TumblingWindowConfig {
+struct TumblingWindowConfig {
+    /// The fixed duration of each window period
+    /// When this interval elapses, all accumulated messages are emitted
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
 }
 
-pub struct TumblingWindow {
+/// Tumbling window buffer implementation
+/// Groups messages into fixed-size, non-overlapping time windows
+struct TumblingWindow {
+    /// Thread-safe queue to store message batches and their acknowledgments
     queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
+    /// Token for cancellation of background tasks
     close: CancellationToken,
 }
 
 impl TumblingWindow {
+    /// Creates a new tumbling window buffer with the given configuration
+    ///
+    /// # Arguments
+    /// * `config` - Configuration parameters for the tumbling window
+    ///
+    /// # Returns
+    /// * `Result<Self, Error>` - A new tumbling window instance or an error
     fn new(config: TumblingWindowConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
@@ -75,6 +97,11 @@ impl TumblingWindow {
         })
     }
 
+    /// Processes the current window by merging all accumulated messages
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the queue is empty
     async fn process_window(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         let mut queue_lock = self.queue.write().await;
         if queue_lock.is_empty() {
@@ -105,41 +132,68 @@ impl TumblingWindow {
 
 #[async_trait]
 impl Buffer for TumblingWindow {
+    /// Writes a message batch to the tumbling window buffer
+    ///
+    /// # Arguments
+    /// * `msg` - The message batch to write
+    /// * `ack` - The acknowledgment for the message batch
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let mut queue_lock = self.queue.write().await;
         queue_lock.push_front((msg, ack));
         Ok(())
     }
 
+    /// Reads a message batch from the tumbling window buffer
+    /// Waits until either messages are available or the buffer is closed
+    ///
+    /// # Returns
+    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         loop {
             {
                 let queue_arc = Arc::clone(&self.queue);
                 let queue_lock = queue_arc.read().await;
+                // If there are messages available, break the loop and process them
                 if !queue_lock.is_empty() {
                     break;
                 }
+                // If the buffer is closed, return None
                 if self.close.is_cancelled() {
                     return Ok(None);
                 }
             }
+            // Wait for notification from timer, write operation, or close
             let notify = Arc::clone(&self.notify);
             notify.notified().await;
         }
+        // Process and return the current window
         self.process_window().await
     }
 
+    /// Flushes the buffer by cancelling the background task and notifying waiters
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
         self.close.cancel();
         let queue_arc = Arc::clone(&self.queue);
         let queue_lock = queue_arc.read().await;
         if !queue_lock.is_empty() {
+            // Notify any waiting readers to process remaining messages
             let notify = Arc::clone(&self.notify);
             notify.notify_waiters();
         }
         Ok(())
     }
 
+    /// Closes the buffer by cancelling the background task
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
         self.close.cancel();
         Ok(())
@@ -149,6 +203,13 @@ impl Buffer for TumblingWindow {
 struct TumblingWindowBuilder;
 
 impl BufferBuilder for TumblingWindowBuilder {
+    /// Builds a tumbling window buffer from the provided configuration
+    ///
+    /// # Arguments
+    /// * `config` - JSON configuration for the tumbling window
+    ///
+    /// # Returns
+    /// * `Result<Arc<dyn Buffer>, Error>` - A new tumbling window buffer instance or an error
     fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -161,6 +222,10 @@ impl BufferBuilder for TumblingWindowBuilder {
     }
 }
 
+/// Initializes the tumbling window buffer by registering its builder
+///
+/// # Returns
+/// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("tumbling_window", Arc::new(TumblingWindowBuilder))
 }
