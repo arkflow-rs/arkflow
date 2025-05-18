@@ -1,0 +1,49 @@
+logging:
+  level: debug
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10.0, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 1
+
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+        - type: "sql"
+          query: "SELECT * FROM flow"
+        - type: "arrow_to_json"
+
+    output:
+      type: "redis"
+      mode:
+        type: "single"
+        url: "redis://127.0.0.1:6379/1"
+#      redis_type:
+#        type: list
+#        key:
+#          type: value
+#          value: 'test'
+
+#      redis_type:
+#        type: publish
+#        channel:
+#          type: value
+#          value: 'test'
+
+#      redis_type:
+#        type: hashes
+#        key:
+#          type: value
+#          value: 'test_hash'
+#        field:
+#          type: expr
+#          expr: 'sensor'
+
+      redis_type:
+        type: strings
+        key:
+          type: expr
+          expr: concat("sensor",'_xx')
