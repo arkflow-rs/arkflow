@@ -21,7 +21,7 @@ toml = { workspace = true }
 humantime = { workspace = true }
 tracing = { workspace = true }
 datafusion = { workspace = true }
-datafusion-functions-json = "0.46"
+datafusion-functions-json = "0.47"
 datafusion-table-providers = { version = "0.4", features = [
     "mysql",
     "postgres",
