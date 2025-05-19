@@ -11,7 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use crate::expr::{EvaluateExpr, Expr};
+use crate::expr::Expr;
 use arkflow_core::output::{Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
@@ -142,7 +142,7 @@ impl Output for RedisOutput {
 
         match &self.config.redis_type {
             Type::Publish { channel } => {
-                let key_result = channel.evaluate_expr(&msg).map_err(|e| {
+                let key_result = channel.evaluate_expr(&msg).await.map_err(|e| {
                     Error::Process(format!("Failed to evaluate channel expression: {}", e))
                 })?;
 
@@ -165,7 +165,7 @@ impl Output for RedisOutput {
                 }
             }
             Type::List { key } => {
-                let key_result = key.evaluate_expr(&msg).map_err(|e| {
+                let key_result = key.evaluate_expr(&msg).await.map_err(|e| {
                     Error::Process(format!("Failed to evaluate key expression: {}", e))
                 })?;
 
@@ -188,11 +188,11 @@ impl Output for RedisOutput {
                 }
             }
             Type::Hashes { key, field } => {
-                let key_result = key.evaluate_expr(&msg).map_err(|e| {
+                let key_result = key.evaluate_expr(&msg).await.map_err(|e| {
                     Error::Process(format!("Failed to evaluate key expression: {}", e))
                 })?;
 
-                let field_result = field.evaluate_expr(&msg).map_err(|e| {
+                let field_result = field.evaluate_expr(&msg).await.map_err(|e| {
                     Error::Process(format!("Failed to evaluate field expression: {}", e))
                 })?;
 
@@ -224,7 +224,7 @@ impl Output for RedisOutput {
                 }
             }
             Type::Strings { key } => {
-                let key_result = key.evaluate_expr(&msg).map_err(|e| {
+                let key_result = key.evaluate_expr(&msg).await.map_err(|e| {
                     Error::Process(format!("Failed to evaluate key expression: {}", e))
                 })?;
                 for (x, payload) in data.into_iter().enumerate() {

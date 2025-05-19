@@ -16,7 +16,7 @@
 //!
 //! Send the processed data to the MQTT broker
 
-use crate::expr::{EvaluateExpr, Expr};
+use crate::expr::Expr;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
@@ -144,7 +144,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             }
         };
 
-        let topic = self.config.topic.evaluate_expr(&msg)?;
+        let topic = self.config.topic.evaluate_expr(&msg).await?;
 
         // Determine the QoS level
         let qos_level = match self.config.qos {

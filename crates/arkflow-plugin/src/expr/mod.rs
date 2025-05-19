@@ -15,9 +15,17 @@ use arkflow_core::Error;
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::*;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+static EXPR_CACHE: Lazy<RwLock<HashMap<String, Arc<dyn PhysicalExpr>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -31,10 +39,6 @@ pub enum EvaluateResult<T> {
     Vec(Vec<T>),
 }
 
-pub trait EvaluateExpr<T> {
-    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<EvaluateResult<T>, Error>;
-}
-
 impl<T> EvaluateResult<T> {
     pub fn get(&self, i: usize) -> Option<&T> {
         match self {
@@ -44,11 +48,15 @@ impl<T> EvaluateResult<T> {
     }
 }
 
-impl EvaluateExpr<String> for Expr<String> {
-    fn evaluate_expr(&self, batch: &RecordBatch) -> Result<EvaluateResult<String>, Error> {
+impl Expr<String> {
+    pub async fn evaluate_expr(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<EvaluateResult<String>, Error> {
         match self {
             Expr::Expr { expr } => {
                 let result = evaluate_expr(expr, batch)
+                    .await
                     .map_err(|e| Error::Process(format!("Failed to evaluate expression: {}", e)))?;
 
                 match result {
@@ -65,22 +73,48 @@ impl EvaluateExpr<String> for Expr<String> {
                         }
                     }
                     ColumnarValue::Scalar(v) => match v {
-                        ScalarValue::Utf8(_) => Ok(EvaluateResult::Scalar(v.to_string())),
-                        _ => Err(Error::Process("Failed to evaluate expression".to_string())),
+                        ScalarValue::Utf8(Some(s)) => Ok(EvaluateResult::Scalar(s.clone())),
+                        ScalarValue::Utf8(None) => {
+                            Err(Error::Process("Null string value".to_string()))
+                        }
+                        _ => Err(Error::Process(format!(
+                            "Unsupported scalar type: {}",
+                            v.data_type()
+                        ))),
                     },
                 }
             }
-            Expr::Value { value: s } => Ok(EvaluateResult::Scalar(s.to_string())),
+            Expr::Value { value } => Ok(EvaluateResult::Scalar(value.clone())),
         }
     }
 }
 
-fn evaluate_expr(expr_str: &str, batch: &RecordBatch) -> Result<ColumnarValue, DataFusionError> {
+async fn evaluate_expr(
+    expr_str: &str,
+    batch: &RecordBatch,
+) -> Result<ColumnarValue, DataFusionError> {
     let df_schema = DFSchema::try_from(batch.schema())?;
 
-    let context = SessionContext::new();
-    let expr = context.parse_sql_expr(expr_str, &df_schema)?;
-    let physical_expr = context.create_physical_expr(expr, &df_schema)?;
+    {
+        if let Some(expr) = EXPR_CACHE.read().await.get(expr_str) {
+            return expr.evaluate(&batch);
+        }
+    }
+
+    let physical_expr = {
+        let mut cache = EXPR_CACHE.write().await;
+        if let Some(expr) = cache.get(expr_str) {
+            expr.clone()
+        } else {
+            // TODO: Maybe you can reuse session_context?
+            let session_context = SessionContext::new();
+            let expr = session_context.parse_sql_expr(expr_str, &df_schema)?;
+            let physical_expr = session_context.create_physical_expr(expr, &df_schema)?;
+            cache.insert(expr_str.to_string(), physical_expr.clone());
+            physical_expr
+        }
+    };
+
     physical_expr.evaluate(&batch)
 }
 
@@ -97,7 +131,7 @@ mod tests {
             RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![4, 0230, 21])) as _)])
                 .unwrap();
         let sql = r#" 0.9"#;
-        let result = evaluate_expr(sql, &batch).unwrap();
+        let result = evaluate_expr(sql, &batch).await.unwrap();
         match result {
             ColumnarValue::Array(_) => {
                 panic!("unexpected scalar value");
@@ -123,7 +157,7 @@ mod tests {
         let expr = Expr::Expr {
             expr: "concat(name, ' is here')".to_string(),
         };
-        let result = expr.evaluate_expr(&batch).unwrap();
+        let result = expr.evaluate_expr(&batch).await.unwrap();
         match result {
             EvaluateResult::Vec(v) => {
                 assert_eq!(v, vec!["Alice is here", "Bob is here", "Charlie is here"]);
@@ -135,7 +169,7 @@ mod tests {
         let value_expr = Expr::Value {
             value: "test value".to_string(),
         };
-        let result = value_expr.evaluate_expr(&batch).unwrap();
+        let result = value_expr.evaluate_expr(&batch).await.unwrap();
         match result {
             EvaluateResult::Scalar(v) => {
                 assert_eq!(v, "test value");
@@ -168,12 +202,12 @@ mod tests {
         let expr = Expr::Expr {
             expr: "invalid sql".to_string(),
         };
-        assert!(expr.evaluate_expr(&batch).is_err());
+        assert!(expr.evaluate_expr(&batch).await.is_err());
 
         // Test type mismatch
         let expr = Expr::Expr {
             expr: "1 + name".to_string(), // Trying to add number to string
         };
-        assert!(expr.evaluate_expr(&batch).is_err());
+        assert!(expr.evaluate_expr(&batch).await.is_err());
     }
 }

@@ -74,6 +74,8 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 async-nats = "0.40.0"
 
 
+once_cell = "1.19.0"
+
 futures = { workspace = true }
 tokio-stream = "0.1.17"
 url = "2.5.4"

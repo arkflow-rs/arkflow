@@ -16,7 +16,7 @@
 //!
 //! Send data to a NATS subject
 
-use crate::expr::{EvaluateExpr, Expr};
+use crate::expr::Expr;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_nats::jetstream::Context;
@@ -148,7 +148,7 @@ impl Output for NatsOutput {
         // Get subject
         let subject = match &self.config.mode {
             Mode::Regular { subject } | Mode::JetStream { subject } => {
-                subject.evaluate_expr(&msg)?
+                subject.evaluate_expr(&msg).await?
             }
         };
 

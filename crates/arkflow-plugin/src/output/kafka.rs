@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 
-use crate::expr::{EvaluateExpr, EvaluateResult, Expr};
+use crate::expr::{EvaluateResult, Expr};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
@@ -189,8 +189,8 @@ impl Output for KafkaOutput {
             return Ok(());
         }
 
-        let topic = self.get_topic(&msg)?;
-        let key = self.get_key(&msg)?;
+        let topic = self.get_topic(&msg).await?;
+        let key = self.get_key(&msg).await?;
 
         // Prepare all records for sending
         for (i, x) in payloads.into_iter().enumerate() {
@@ -272,16 +272,16 @@ impl Output for KafkaOutput {
     }
 }
 impl KafkaOutput {
-    fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
-        self.config.topic.evaluate_expr(msg)
+    async fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
+        self.config.topic.evaluate_expr(msg).await
     }
 
-    fn get_key(&self, msg: &MessageBatch) -> Result<Option<EvaluateResult<String>>, Error> {
+    async fn get_key(&self, msg: &MessageBatch) -> Result<Option<EvaluateResult<String>>, Error> {
         let Some(v) = &self.config.key else {
             return Ok(None);
         };
 
-        Ok(Some(v.evaluate_expr(msg)?))
+        Ok(Some(v.evaluate_expr(msg).await?))
     }
 }
 

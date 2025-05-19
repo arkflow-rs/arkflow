@@ -251,6 +251,7 @@ dependencies = [
  "humantime",
  "lazy_static",
  "mockall",
+ "once_cell",
  "prost-reflect",
  "prost-types",
  "protobuf",
