@@ -5,7 +5,7 @@ streams:
       type: "generate"
       context: '{ "timestamp": 1625000000000, "value": 10.0, "sensor": "temp_1" }'
       interval: 1s
-      batch_size: 1
+      batch_size: 10
 
 
     pipeline:
@@ -46,4 +46,4 @@ streams:
         type: strings
         key:
           type: expr
-          expr: concat("sensor",'_xx')
+          expr: concat("sensor",cast(random() as string))

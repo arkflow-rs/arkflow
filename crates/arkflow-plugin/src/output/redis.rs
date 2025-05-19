@@ -15,10 +15,10 @@ use crate::expr::{EvaluateExpr, Expr};
 use arkflow_core::output::{Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionLike, ConnectionManager};
 use redis::cluster::ClusterClient;
 use redis::cluster_async::ClusterConnection;
-use redis::{AsyncCommands, Client};
+use redis::{Client, Cmd, Pipeline, RedisFuture, Value};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -140,27 +140,17 @@ impl Output for RedisOutput {
             ));
         };
 
+        let mut cli = cli.clone();
+        let mut pipeline = Pipeline::with_capacity(data.len());
+
         match &self.config.redis_type {
             Type::Publish { channel } => {
                 let key_result = channel.evaluate_expr(&msg).map_err(|e| {
                     Error::Process(format!("Failed to evaluate channel expression: {}", e))
                 })?;
-
                 for (i, payload) in data.iter().enumerate() {
                     if let Some(channel) = key_result.get(i) {
-                        let cli = cli.clone();
-                        match cli {
-                            Cli::Single(mut c) => {
-                                c.publish::<_, _, ()>(channel, payload).await.map_err(|e| {
-                                    Error::Process(format!("Failed to publish message: {}", e))
-                                })?;
-                            }
-                            Cli::Cluster(mut c) => {
-                                c.publish::<_, _, ()>(channel, payload).await.map_err(|e| {
-                                    Error::Process(format!("Failed to publish message: {}", e))
-                                })?;
-                            }
-                        };
+                        pipeline.publish::<_, _>(channel, payload);
                     }
                 }
             }
@@ -168,22 +158,11 @@ impl Output for RedisOutput {
                 let key_result = key.evaluate_expr(&msg).map_err(|e| {
                     Error::Process(format!("Failed to evaluate key expression: {}", e))
                 })?;
+                let mut pipeline = Pipeline::with_capacity(data.len());
 
                 for (i, payload) in data.iter().enumerate() {
                     if let Some(key) = key_result.get(i) {
-                        let cli = cli.clone();
-                        match cli {
-                            Cli::Single(mut c) => {
-                                c.rpush::<_, _, ()>(key, payload).await.map_err(|e| {
-                                    Error::Process(format!("Failed to push to list: {}", e))
-                                })?;
-                            }
-                            Cli::Cluster(mut c) => {
-                                c.rpush::<_, _, ()>(key, payload).await.map_err(|e| {
-                                    Error::Process(format!("Failed to push to list: {}", e))
-                                })?;
-                            }
-                        };
+                        pipeline.rpush::<_, _>(key, payload);
                     }
                 }
             }
@@ -204,23 +183,7 @@ impl Output for RedisOutput {
                         continue;
                     };
 
-                    let cli = cli.clone();
-                    match cli {
-                        Cli::Single(mut c) => {
-                            c.hset::<_, _, _, ()>(key, field, payload)
-                                .await
-                                .map_err(|e| {
-                                    Error::Process(format!("Failed to set hash field: {}", e))
-                                })?;
-                        }
-                        Cli::Cluster(mut c) => {
-                            c.hset::<_, _, _, ()>(key, field, payload)
-                                .await
-                                .map_err(|e| {
-                                    Error::Process(format!("Failed to set hash field: {}", e))
-                                })?;
-                        }
-                    };
+                    pipeline.hset::<_, _, _>(key, field, payload);
                 }
             }
             Type::Strings { key } => {
@@ -231,24 +194,15 @@ impl Output for RedisOutput {
                     let Some(key) = key_result.get(x) else {
                         continue;
                     };
-
-                    let cli = cli.clone();
-                    match cli {
-                        Cli::Single(mut c) => {
-                            c.set::<_, _, ()>(key, payload).await.map_err(|e| {
-                                Error::Process(format!("Failed to set string: {}", e))
-                            })?;
-                        }
-                        Cli::Cluster(mut c) => {
-                            c.set::<_, _, ()>(key, payload).await.map_err(|e| {
-                                Error::Process(format!("Failed to set string: {}", e))
-                            })?;
-                        }
-                    };
+                    pipeline.set::<_, _>(key, payload);
                 }
             }
         }
 
+        pipeline
+            .query_async::<()>(&mut cli)
+            .await
+            .map_err(|e| Error::Process(format!("Failed to publish to Redis: {}", e)))?;
         Ok(())
     }
 
@@ -261,6 +215,34 @@ impl Output for RedisOutput {
         let mut conn_manager_guard = self.connection_manager.lock().await;
         *conn_manager_guard = None;
         Ok(())
+    }
+}
+
+impl ConnectionLike for Cli {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        match self {
+            Cli::Single(c) => c.req_packed_command(cmd),
+            Cli::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        match self {
+            Cli::Single(c) => c.req_packed_commands(cmd, offset, count),
+            Cli::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Cli::Single(c) => c.get_db(),
+            Cli::Cluster(c) => c.get_db(),
+        }
     }
 }
 
