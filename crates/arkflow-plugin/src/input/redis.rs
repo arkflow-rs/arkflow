@@ -23,7 +23,9 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client, RedisResult};
+use redis::cluster::ClusterClientBuilder;
+use redis::cluster_async::ClusterConnection;
+use redis::{AsyncCommands, Client, FromRedisValue, PushInfo, PushKind, RedisResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -33,14 +35,20 @@ use tracing::{debug, error};
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisInputConfig {
-    /// Redis server URL
-    url: String,
+    mode: ModeConfig,
     redis_type: Type,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Subscribe {
+enum ModeConfig {
+    Cluster { urls: Vec<String> },
+    Single { url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Subscribe {
     /// List of channels to subscribe to
     Channels { channels: Vec<String> },
     /// List of patterns to subscribe to
@@ -49,18 +57,23 @@ pub enum Subscribe {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Type {
+enum Type {
     Subscribe { subscribe: Subscribe },
     List { list: Vec<String> },
 }
 
 /// Redis input component
-pub struct RedisInput {
+struct RedisInput {
     config: RedisInputConfig,
-    client: Arc<Mutex<Option<Client>>>,
+    client: Arc<Mutex<Option<Cli>>>,
     sender: Sender<RedisMsg>,
     receiver: Receiver<RedisMsg>,
     cancellation_token: CancellationToken,
+}
+
+enum Cli {
+    Single(ConnectionManager),
+    Cluster(ClusterConnection),
 }
 
 enum RedisMsg {
@@ -70,13 +83,24 @@ enum RedisMsg {
 
 impl RedisInput {
     /// Create a new Redis input component
-    pub fn new(config: RedisInputConfig) -> Result<Self, Error> {
+    fn new(config: RedisInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
+        match &config.mode {
+            ModeConfig::Cluster { urls, .. } => {
+                for url in urls {
+                    if let None = redis::parse_redis_url(&url) {
+                        return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
+                    }
+                }
+            }
+            ModeConfig::Single { url, .. } => {
+                if let None = redis::parse_redis_url(&url) {
+                    return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
+                }
+            }
+        };
 
-        if let None = redis::parse_redis_url(&config.url) {
-            return Err(Error::Config(format!("Invalid Redis URL: {}", &config.url)));
-        }
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
@@ -85,22 +109,126 @@ impl RedisInput {
             cancellation_token,
         })
     }
-}
 
-#[async_trait]
-impl Input for RedisInput {
-    async fn connect(&self) -> Result<(), Error> {
-        let client = Client::open(self.config.url.as_str())
+    async fn cluster_connect(&self, urls: Vec<String>) -> Result<(), Error> {
+        let mut cli_guard = self.client.lock().await;
+
+        let cancellation_token = self.cancellation_token.clone();
+
+        let config_type = self.config.redis_type.clone();
+
+        let client_builder = ClusterClientBuilder::new(urls);
+
+        let client_builder = match config_type {
+            Type::Subscribe { .. } => {
+                let sender_clone = Sender::clone(&self.sender);
+                client_builder.push_sender(move |msg: PushInfo| {
+                    match msg.kind {
+                        PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
+                            if msg.data.len() < 2 {
+                                return Ok(());
+                            }
+                            let mut iter = msg.data.into_iter();
+                            let channel: String = match iter.next() {
+                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
+                                None => return Ok(()),
+                            };
+                            let message = match iter.next() {
+                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
+                                None => return Ok(()),
+                            };
+
+                            if let Err(e) = sender_clone.send(RedisMsg::Message(channel, message)) {
+                                error!("{}", e);
+                            }
+                        }
+                        _ => {}
+                    };
+
+                    Ok(()) as RedisResult<()>
+                })
+            }
+            Type::List { .. } => client_builder,
+        };
+
+        let cluster_client = client_builder
+            .build()
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
+        let mut cluster_conn = cluster_client
+            .get_async_connection()
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
+        match config_type {
+            Type::Subscribe { subscribe } => {
+                match subscribe {
+                    Subscribe::Channels { channels } => {
+                        // Subscribe to channels
+                        for channel in channels {
+                            if let Err(e) = cluster_conn.subscribe(&channel).await {
+                                error!("Failed to subscribe to Redis channel {}: {}", channel, e);
+                                return Err(Error::Disconnection);
+                            }
+                        }
+                    }
+                    Subscribe::Patterns { patterns } => {
+                        // Subscribe to patterns
+                        for pattern in patterns {
+                            if let Err(e) = cluster_conn.psubscribe(&pattern).await {
+                                error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
+                                return Err(Error::Disconnection);
+                            }
+                        }
+                    }
+                }
+            }
+            Type::List { list } => {
+                let sender_clone = Sender::clone(&self.sender);
+                let mut cluster_connection = cluster_conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => {
+                                break;
+                            }
+                            result = async {
+                                let blpop_result: RedisResult<Option<(String, Vec<u8>)>> = cluster_connection.blpop(&list, 1f64).await;
+                                blpop_result
+                            } => {
+                                match result {
+                                    Ok(Some((list_name, payload))) => {
+                                        debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                            error!("Failed to send Redis list message: {}", e);
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        error!("Error retrieving from Redis list: {}", e);
+                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                            error!("{}", e);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        cli_guard.replace(Cli::Cluster(cluster_conn));
+        Ok(())
+    }
+
+    async fn single_connect(&self, url: String) -> Result<(), Error> {
+        let mut cli_guard = self.client.lock().await;
+        let client = Client::open(url)
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
-
-        let mut client_guard = self.client.lock().await;
-        *client_guard = Some(client.clone());
-        drop(client_guard);
-
-        // let conn = client
-        //     .get_connection()
-        //     .await
-        //     .map_err(|e| Error::Connection(format!("Failed to get Redis connection: {}", e)))?;
+        let manager = ConnectionManager::new(client.clone())
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
 
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
@@ -140,7 +268,9 @@ impl Input for RedisInput {
                         tokio::select! {
                             Some(msg_result) = msg_stream.next() => {
                                 let channel: String = msg_result.get_channel_name().to_string();
-                                let payload: Vec<u8> = msg_result.get_payload().unwrap_or_default();
+                                let Ok(payload )=   msg_result.get_payload() else {
+                                       continue;
+                                };
                                 if let Err(e) = sender_clone.send_async(RedisMsg::Message(channel, payload)).await {
                                     error!("{}", e);
                                 }
@@ -153,18 +283,8 @@ impl Input for RedisInput {
                 });
             }
             Type::List { ref list } => {
-                let result = ConnectionManager::new(client).await;
-                let mut manager = match result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Err(Error::Connection(format!(
-                            "Failed to connect to Redis server: {}",
-                            e
-                        )))
-                    }
-                };
-
                 let list = list.clone();
+                let mut manager = manager.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -200,7 +320,21 @@ impl Input for RedisInput {
             }
         };
 
+        cli_guard.replace(Cli::Single(manager));
+
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Input for RedisInput {
+    async fn connect(&self) -> Result<(), Error> {
+        match &self.config.mode {
+            ModeConfig::Cluster { urls } => {
+                self.cluster_connect(urls.iter().cloned().collect()).await
+            }
+            ModeConfig::Single { url } => self.single_connect(url.clone()).await,
+        }
     }
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
@@ -225,6 +359,52 @@ impl Input for RedisInput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
+        if let Some(cli) = self.client.lock().await.take() {
+            match cli {
+                Cli::Single(mut c) => match self.config.redis_type {
+                    Type::Subscribe { ref subscribe } => match subscribe {
+                        Subscribe::Channels { channels } => {
+                            match c.unsubscribe(channels).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis channel: {}", e);
+                                }
+                            };
+                        }
+                        Subscribe::Patterns { patterns } => {
+                            match c.punsubscribe(patterns).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                }
+                            };
+                        }
+                    },
+                    _ => {}
+                },
+                Cli::Cluster(mut c) => match self.config.redis_type {
+                    Type::Subscribe { ref subscribe } => match subscribe {
+                        Subscribe::Channels { channels } => {
+                            match c.unsubscribe(channels).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis channel: {}", e);
+                                }
+                            };
+                        }
+                        Subscribe::Patterns { patterns } => {
+                            match c.punsubscribe(patterns).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                }
+                            };
+                        }
+                    },
+                    _ => {}
+                },
+            }
+        }
         Ok(())
     }
 }
