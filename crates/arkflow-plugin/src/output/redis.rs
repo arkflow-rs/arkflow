@@ -142,7 +142,6 @@ impl Output for RedisOutput {
 
         let mut cli = cli.clone();
         let mut pipeline = Pipeline::with_capacity(data.len());
-
         match &self.config.redis_type {
             Type::Publish { channel } => {
                 let key_result = channel.evaluate_expr(&msg).map_err(|e| {
@@ -158,8 +157,6 @@ impl Output for RedisOutput {
                 let key_result = key.evaluate_expr(&msg).map_err(|e| {
                     Error::Process(format!("Failed to evaluate key expression: {}", e))
                 })?;
-                let mut pipeline = Pipeline::with_capacity(data.len());
-
                 for (i, payload) in data.iter().enumerate() {
                     if let Some(key) = key_result.get(i) {
                         pipeline.rpush::<_, _>(key, payload);
