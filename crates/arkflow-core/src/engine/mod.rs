@@ -27,6 +27,7 @@ use axum::response::Json;
 // Import axum related dependencies
 use axum::{routing::get, Router};
 use serde::Serialize;
+use tokio::net::TcpListener;
 
 /// Health check status
 struct HealthState {
@@ -115,15 +116,15 @@ impl Engine {
             .with_state(health_state);
 
         let addr = &health_check.address;
-        let addr = addr
-            .parse::<_>()
-            .map_err(|e| format!("Invalid health check address: {}", e))?;
-
-        info!("Starting health check server on {}", addr);
+        let addr = addr.clone();
+        info!("Starting health check server on {}", &addr);
 
         // Start the server
         tokio::spawn(async move {
-            let server = axum::Server::bind(&addr).serve(app.into_make_service());
+            let server = axum::serve(
+                TcpListener::bind(addr).await.expect("bind error"),
+                app.into_make_service(),
+            );
 
             // Run the server with graceful shutdown
             let graceful = server.with_graceful_shutdown(Self::shutdown_signal(cancellation_token));

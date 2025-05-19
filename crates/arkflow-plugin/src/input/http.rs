@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
@@ -134,8 +135,11 @@ impl Input for HttpInput {
             .map_err(|e| Error::Config(format!("Invalid address {}: {}", address, e)))?;
 
         let server_handle = tokio::spawn(async move {
-            axum::Server::bind(&addr)
-                .serve(app.into_make_service())
+            let server = axum::serve(
+                TcpListener::bind(&addr).await.expect("bind error"),
+                app.into_make_service(),
+            );
+            server
                 .await
                 .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)))
         });

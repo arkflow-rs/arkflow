@@ -59,6 +59,7 @@ impl Pipeline {
 /// Pipeline configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
+    #[serde(default = "default_thread_num")]
     pub thread_num: u32,
     pub processors: Vec<crate::processor::ProcessorConfig>,
 }
@@ -72,4 +73,8 @@ impl PipelineConfig {
         }
         Ok((Pipeline::new(processors), self.thread_num))
     }
+}
+
+fn default_thread_num() -> u32 {
+    num_cpus::get() as u32
 }
