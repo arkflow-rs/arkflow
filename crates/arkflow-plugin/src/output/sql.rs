@@ -42,6 +42,7 @@ pub enum SqlValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum DatabaseType {
     Mysql,
     Postgres,
