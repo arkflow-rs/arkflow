@@ -23,7 +23,7 @@ pub mod http;
 pub mod kafka;
 pub mod mqtt;
 pub mod nats;
-mod redis;
+pub mod redis;
 pub mod stdout;
 
 pub fn init() -> Result<(), Error> {
