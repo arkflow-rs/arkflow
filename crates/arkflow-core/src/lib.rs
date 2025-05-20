@@ -34,6 +34,7 @@ pub mod pipeline;
 pub mod processor;
 
 pub mod stream;
+mod temporary;
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
