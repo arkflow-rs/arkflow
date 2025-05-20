@@ -69,7 +69,7 @@ arkflow-core = { workspace = true }
 sqlx = { workspace= true }
 
 # Websocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # NATS
 async-nats = "0.41.0"

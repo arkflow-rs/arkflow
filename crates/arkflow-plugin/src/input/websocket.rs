@@ -139,8 +139,8 @@ impl Input for WebSocketInput {
                         match msg {
                             WebSocketMsg::Message(message) => {
                                 let payload = match message {
-                                    Message::Text(text) => text.into_bytes(),
-                                    Message::Binary(binary) => binary,
+                                    Message::Text(text) => Vec::from(text.as_bytes()),
+                                    Message::Binary(binary) => Vec::from(binary),
                                     Message::Ping(_) | Message::Pong(_) => {
                                         // Skip control messages and wait for the next data message
                                         return self.read().await;
