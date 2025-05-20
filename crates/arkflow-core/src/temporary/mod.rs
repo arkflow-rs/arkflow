@@ -27,7 +27,7 @@ lazy_static::lazy_static! {
 
 #[async_trait]
 pub trait Temporary: Send + Sync {
-    async fn init(&self) -> Result<(), Error>;
+    async fn connect(&self) -> Result<(), Error>;
     async fn refresh(&self) -> Result<MessageBatch, Error>;
     async fn close(&self) -> Result<(), Error>;
 }
