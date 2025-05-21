@@ -13,7 +13,7 @@
  */
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -391,7 +391,11 @@ impl SqlInput {
 
 pub(crate) struct SqlInputBuilder;
 impl InputBuilder for SqlInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "SQL input configuration is missing".to_string(),

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatch};
+use crate::{Error, MessageBatch, Resource};
 
 lazy_static::lazy_static! {
     static ref PROCESSOR_BUILDERS: RwLock<HashMap<String, Arc<dyn ProcessorBuilder>>> = RwLock::new(HashMap::new());
@@ -48,11 +48,11 @@ pub struct ProcessorConfig {
 
 impl ProcessorConfig {
     /// Build the processor components according to the configuration
-    pub fn build(&self) -> Result<Arc<dyn Processor>, Error> {
+    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Processor>, Error> {
         let builders = PROCESSOR_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.processor_type) {
-            builder.build(&self.config)
+            builder.build(&self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown processor type: {}",
@@ -63,7 +63,11 @@ impl ProcessorConfig {
 }
 
 pub trait ProcessorBuilder: Send + Sync {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error>;
+    fn build(
+        &self,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error>;
 }
 
 pub fn register_processor_builder(

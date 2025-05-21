@@ -44,6 +44,7 @@ base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
 rumqttc = "0.24.0"
+dashmap = "6.1.0"
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"

@@ -242,6 +242,7 @@ dependencies = [
  "ballista",
  "base64 0.22.1",
  "colored",
+ "dashmap",
  "datafusion",
  "datafusion-functions-json",
  "datafusion-table-providers",

@@ -89,7 +89,7 @@ impl Expr<String> {
     }
 }
 
-async fn evaluate_expr(
+pub async fn evaluate_expr(
     expr_str: &str,
     batch: &RecordBatch,
 ) -> Result<ColumnarValue, DataFusionError> {

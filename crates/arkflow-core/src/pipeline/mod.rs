@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{processor::Processor, Error, MessageBatch};
+use crate::{processor::Processor, Error, MessageBatch, Resource};
 
 pub struct Pipeline {
     processors: Vec<Arc<dyn Processor>>,
@@ -66,10 +66,10 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     /// Build pipelines based on your configuration
-    pub fn build(&self) -> Result<(Pipeline, u32), Error> {
+    pub fn build(&self, resource: &Resource) -> Result<(Pipeline, u32), Error> {
         let mut processors = Vec::with_capacity(self.processors.len());
         for processor_config in &self.processors {
-            processors.push(processor_config.build()?);
+            processors.push(processor_config.build(resource)?);
         }
         Ok((Pipeline::new(processors), self.thread_num))
     }

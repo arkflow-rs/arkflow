@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatch};
+use crate::{Error, MessageBatch, Resource};
 
 lazy_static::lazy_static! {
     static ref OUTPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn OutputBuilder>>> = RwLock::new(HashMap::new());
@@ -44,13 +44,14 @@ pub trait Output: Send + Sync {
 pub struct OutputConfig {
     #[serde(rename = "type")]
     pub output_type: String,
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
 
 impl OutputConfig {
     /// Build the output component according to the configuration
-    pub fn build(&self) -> Result<Arc<dyn Output>, Error> {
+    pub fn build(&self, _resource: &Resource) -> Result<Arc<dyn Output>, Error> {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
