@@ -47,6 +47,7 @@ struct DropOutputBuilder;
 impl OutputBuilder for DropOutputBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         _: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {

@@ -55,7 +55,7 @@ impl OutputConfig {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
-            builder.build(&self.config, resource)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown output type: {}",
@@ -68,6 +68,7 @@ impl OutputConfig {
 pub trait OutputBuilder: Send + Sync {
     fn build(
         &self,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error>;
