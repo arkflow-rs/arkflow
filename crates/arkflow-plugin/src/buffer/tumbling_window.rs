@@ -212,6 +212,7 @@ impl BufferBuilder for TumblingWindowBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new tumbling window buffer instance or an error
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {

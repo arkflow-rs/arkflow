@@ -89,6 +89,7 @@ pub(crate) struct GenerateInputBuilder;
 impl InputBuilder for GenerateInputBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {

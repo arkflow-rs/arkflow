@@ -84,8 +84,3 @@ pub fn register_processor_builder(
     builders.insert(type_name.to_string(), builder);
     Ok(())
 }
-
-pub fn get_registered_processor_types() -> Vec<String> {
-    let builders = PROCESSOR_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
-}

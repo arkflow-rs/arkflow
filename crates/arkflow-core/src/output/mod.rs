@@ -87,8 +87,3 @@ pub fn register_output_builder(
     builders.insert(type_name.to_string(), builder);
     Ok(())
 }
-
-pub fn get_registered_output_types() -> Vec<String> {
-    let builders = OUTPUT_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
-}

@@ -229,6 +229,7 @@ impl BufferBuilder for SessionWindowBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new session window buffer instance or an error
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {

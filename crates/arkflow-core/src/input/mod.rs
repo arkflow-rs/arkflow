@@ -30,6 +30,7 @@ lazy_static::lazy_static! {
 pub trait InputBuilder: Send + Sync {
     fn build(
         &self,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error>;
@@ -106,7 +107,7 @@ impl InputConfig {
         let builders = INPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.input_type) {
-            builder.build(&self.config, resource)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown input type: {}",
@@ -129,9 +130,4 @@ pub fn register_input_builder(
     }
     builders.insert(type_name.to_string(), builder);
     Ok(())
-}
-
-pub fn get_registered_input_types() -> Vec<String> {
-    let builders = INPUT_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
 }

@@ -242,6 +242,7 @@ impl BufferBuilder for MemoryBufferBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new memory buffer instance or an error
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
