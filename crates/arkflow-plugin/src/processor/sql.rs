@@ -157,7 +157,9 @@ impl SqlProcessor {
             return Ok(());
         };
 
-        for (_, (temporary, config)) in temporary_map {
+        use futures::future::join_all;
+        
+        let futures = temporary_map.iter().map(|(_, (temporary, config))| async {
             let columnar_value = match &config.key {
                 Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
                     .await
@@ -173,8 +175,13 @@ impl SqlProcessor {
                         Error::Process(format!("Register temporary message batch failed: {}", e))
                     })?;
             }
-        }
+            Ok::<_, Error>(())
+        });
 
+        let results = join_all(futures).await;
+        for result in results {
+            result?;
+        }
         Ok(())
     }
 
@@ -267,7 +274,7 @@ mod tests {
                 query: "SELECT * FROM flow".to_string(),
                 table_name: None,
                 ballista: None,
-                temporary: None,
+                temporary_list: None,
             },
             &Resource {
                 temporary: HashMap::new(),
@@ -305,7 +312,7 @@ mod tests {
                 query: "SELECT * FROM flow".to_string(),
                 table_name: None,
                 ballista: None,
-                temporary: None,
+                temporary_list: None,
             },
             &Resource {
                 temporary: HashMap::new(),
@@ -330,7 +337,7 @@ mod tests {
                 query: "INVALID SQL QUERY".to_string(),
                 table_name: None,
                 ballista: None,
-                temporary: None,
+                temporary_list: None,
             },
             &Resource {
                 temporary: HashMap::new(),
@@ -347,7 +354,7 @@ mod tests {
                 query: "SELECT * FROM custom_table".to_string(),
                 table_name: Some("custom_table".to_string()),
                 ballista: None,
-                temporary: None,
+                temporary_list: None,
             },
             &Resource {
                 temporary: HashMap::new(),
