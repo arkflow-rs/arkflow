@@ -234,6 +234,7 @@ mod tests {
         let builder = GenerateInputBuilder;
         let input = builder
             .build(
+                None,
                 &Some(config_json),
                 &Resource {
                     temporary: HashMap::new(),
@@ -251,6 +252,7 @@ mod tests {
         let builder = GenerateInputBuilder;
         assert!(matches!(
             builder.build(
+                None,
                 &None,
                 &Resource {
                     temporary: HashMap::new(),

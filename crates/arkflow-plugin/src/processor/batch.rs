@@ -121,6 +121,7 @@ struct BatchProcessorBuilder;
 impl ProcessorBuilder for BatchProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {

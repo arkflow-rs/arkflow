@@ -486,6 +486,7 @@ struct ProtobufToArrowProcessorBuilder;
 impl ProcessorBuilder for ProtobufToArrowProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -503,6 +504,7 @@ struct ArrowToProtobufProcessorBuilder;
 impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -703,6 +705,7 @@ message TestMessage {
     #[tokio::test]
     async fn test_processor_builder() {
         let result = ProtobufToArrowProcessorBuilder.build(
+            None,
             &None,
             &Resource {
                 temporary: HashMap::new(),
@@ -711,6 +714,7 @@ message TestMessage {
         assert!(result.is_err());
 
         let result = ArrowToProtobufProcessorBuilder.build(
+            None,
             &None,
             &Resource {
                 temporary: HashMap::new(),
@@ -730,6 +734,7 @@ message TestMessage {
         .unwrap();
 
         let result = ProtobufToArrowProcessorBuilder.build(
+            None,
             &Some(config),
             &Resource {
                 temporary: HashMap::new(),

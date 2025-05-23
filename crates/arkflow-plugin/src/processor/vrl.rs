@@ -81,6 +81,7 @@ struct VrlProcessorBuilder;
 impl ProcessorBuilder for VrlProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {

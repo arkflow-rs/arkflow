@@ -110,6 +110,7 @@ struct JsonToArrowProcessorBuilder;
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -128,6 +129,7 @@ struct ArrowToJsonProcessorBuilder;
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -163,6 +165,7 @@ mod tests {
             "fields_to_include": null
         }));
         let processor = JsonToArrowProcessorBuilder.build(
+            None,
             &config,
             &Resource {
                 temporary: HashMap::new(),
@@ -198,6 +201,7 @@ mod tests {
             "fields_to_include": fields
         }));
         let processor = JsonToArrowProcessorBuilder.build(
+            None,
             &config,
             &Resource {
                 temporary: HashMap::new(),
@@ -224,6 +228,7 @@ mod tests {
             "fields_to_include": null
         }));
         let processor = JsonToArrowProcessorBuilder.build(
+            None,
             &config,
             &Resource {
                 temporary: HashMap::new(),
@@ -246,6 +251,7 @@ mod tests {
         }));
         let json_to_arrow = JsonToArrowProcessorBuilder
             .build(
+                None,
                 &config,
                 &Resource {
                     temporary: HashMap::new(),
@@ -254,6 +260,7 @@ mod tests {
             .unwrap();
         let arrow_to_json = ArrowToJsonProcessorBuilder
             .build(
+                None,
                 &config,
                 &Resource {
                     temporary: HashMap::new(),
@@ -280,6 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_processor_missing_config() {
         let result = JsonToArrowProcessorBuilder.build(
+            None,
             &None,
             &Resource {
                 temporary: HashMap::new(),
@@ -288,6 +296,7 @@ mod tests {
         assert!(result.is_err());
 
         let result = ArrowToJsonProcessorBuilder.build(
+            None,
             &None,
             &Resource {
                 temporary: HashMap::new(),

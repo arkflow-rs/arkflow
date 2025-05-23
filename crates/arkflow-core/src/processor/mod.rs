@@ -42,6 +42,7 @@ pub trait Processor: Send + Sync {
 pub struct ProcessorConfig {
     #[serde(rename = "type")]
     pub processor_type: String,
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
@@ -52,7 +53,7 @@ impl ProcessorConfig {
         let builders = PROCESSOR_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.processor_type) {
-            builder.build(&self.config, resource)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown processor type: {}",
@@ -65,6 +66,7 @@ impl ProcessorConfig {
 pub trait ProcessorBuilder: Send + Sync {
     fn build(
         &self,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error>;

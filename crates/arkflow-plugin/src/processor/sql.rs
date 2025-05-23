@@ -222,6 +222,7 @@ struct SqlProcessorBuilder;
 impl ProcessorBuilder for SqlProcessorBuilder {
     fn build(
         &self,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
