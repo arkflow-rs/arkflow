@@ -33,6 +33,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::parser::Statement;
 use expr::Expr;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DEFAULT_TABLE_NAME: &str = "flow";
@@ -47,7 +48,7 @@ struct SqlProcessorConfig {
 
     /// Experimental: Ballista helps us perform distributed computing
     ballista: Option<crate::input::sql::BallistaConfig>,
-    temporary: Option<TemporaryConfig>,
+    temporary_list: Option<Vec<TemporaryConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +68,7 @@ struct BallistaConfig {
 struct SqlProcessor {
     config: SqlProcessorConfig,
     statement: Statement,
-    temporary: Option<(Arc<dyn Temporary>, TemporaryConfig)>,
+    temporary: Option<HashMap<String, (Arc<dyn Temporary>, TemporaryConfig)>>,
     // expr: expr::Expr<String>,
 }
 
@@ -75,14 +76,19 @@ impl SqlProcessor {
     /// Create a new SQL processor component.
     pub fn new(config: SqlProcessorConfig, resource: &Resource) -> Result<Self, Error> {
         let temporary = {
-            if let Some(temporary) = config.temporary.as_ref() {
-                let Some(t) = resource.temporary.get(&temporary.name) else {
-                    return Err(Error::Process(format!(
-                        "Temporary {} not found",
-                        temporary.name
-                    )));
-                };
-                Some((t.clone(), temporary.clone()))
+            if let Some(temporary_list) = config.temporary_list.as_ref() {
+                let mut temporary_map = HashMap::with_capacity(temporary_list.len());
+                for temporary in temporary_list {
+                    let Some(t) = resource.temporary.get(&temporary.name) else {
+                        return Err(Error::Process(format!(
+                            "Temporary {} not found",
+                            temporary.name
+                        )));
+                    };
+                    temporary_map.insert(temporary.name.clone(), (t.clone(), temporary.clone()));
+                }
+
+                Some(temporary_map)
             } else {
                 None
             }
@@ -147,22 +153,28 @@ impl SqlProcessor {
         ctx: &SessionContext,
         batch: &RecordBatch,
     ) -> Result<(), Error> {
-        let Some((temporary, config)) = &self.temporary else {
+        let Some(temporary_map) = &self.temporary else {
             return Ok(());
         };
 
-        let columnar_value = match &config.key {
-            Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
-                .await
-                .map_err(|e| Error::Process(format!("Evaluate expression failed: {}", e)))?,
-            Expr::Value { value } => ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.clone()))),
-        };
-        if let Some(data) = temporary.get(&vec![columnar_value]).await? {
-            ctx.register_batch(&config.table_name, data.into())
-                .map_err(|e| {
-                    Error::Process(format!("Register temporary message batch failed: {}", e))
-                })?;
+        for (_, (temporary, config)) in temporary_map {
+            let columnar_value = match &config.key {
+                Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
+                    .await
+                    .map_err(|e| Error::Process(format!("Evaluate expression failed: {}", e)))?,
+                Expr::Value { value } => {
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.clone())))
+                }
+            };
+
+            if let Some(data) = temporary.get(&vec![columnar_value]).await? {
+                ctx.register_batch(&config.table_name, data.into())
+                    .map_err(|e| {
+                        Error::Process(format!("Register temporary message batch failed: {}", e))
+                    })?;
+            }
         }
+
         Ok(())
     }
 
