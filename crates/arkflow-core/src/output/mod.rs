@@ -51,11 +51,11 @@ pub struct OutputConfig {
 
 impl OutputConfig {
     /// Build the output component according to the configuration
-    pub fn build(&self, _resource: &Resource) -> Result<Arc<dyn Output>, Error> {
+    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Output>, Error> {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
-            builder.build(&self.config)
+            builder.build(&self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown output type: {}",
@@ -66,7 +66,11 @@ impl OutputConfig {
 }
 
 pub trait OutputBuilder: Send + Sync {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error>;
+    fn build(
+        &self,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error>;
 }
 
 pub fn register_output_builder(

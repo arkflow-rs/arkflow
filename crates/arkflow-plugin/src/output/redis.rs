@@ -14,7 +14,7 @@
 use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
 use arkflow_core::output::{Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::Pipeline;
@@ -173,7 +173,11 @@ impl Output for RedisOutput {
 struct RedisOutputBuilder;
 
 impl OutputBuilder for RedisOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Redis output configuration is missing".to_string(),

@@ -116,9 +116,7 @@ impl Temporary for RedisTemporary {
             .collect::<Vec<_>>();
         let json_data: Vec<u8> = data.join(b"\n" as &[u8]);
 
-        component::json::try_to_arrow(&json_data, None)
-            .map(|v| Some(v.into()))
-            .map_err(|e| e)
+        component::json::try_to_arrow(&json_data, None).map(|v| Some(v.into()))
     }
 
     async fn close(&self) -> Result<(), Error> {
