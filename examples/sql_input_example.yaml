@@ -7,10 +7,18 @@ streams:
         type: "json"
   #      input_type: "csv"
         path: './examples/stream_data.json'
+        object_store:
+          type: s3
+          endpoint: "https://s3.example.com"  # 可选
+          region: "us-west-1"
+          bucket_name: "my-bucket"
+          access_key_id: "your-access-key"
+          secret_access_key: "your-secret-key"
+          allow_http: false
   #      path: './examples/input_data.csv'
       select_sql: |
         select *,value + 999999 from flow;
-
+      
     
 
     pipeline:
