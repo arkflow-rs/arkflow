@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::error;
 use url::Url;
 
 const DEFAULT_NAME: &str = "flow";
