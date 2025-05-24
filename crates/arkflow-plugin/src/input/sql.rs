@@ -423,6 +423,7 @@ impl SqlInput {
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
 
+    /// Create a session context
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
         let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
             SessionContext::remote(&ballista.remote_url)
@@ -438,6 +439,7 @@ impl SqlInput {
         Ok(ctx)
     }
 
+    /// Create an object store
     async fn object_store(
         &self,
         ctx: &SessionContext,
@@ -447,6 +449,8 @@ impl SqlInput {
             ObjectStore::S3(aws_s3_config) => self.aws_s3_object_store(ctx, aws_s3_config).await,
         }
     }
+
+    /// Create an AWS S3 object store
     async fn aws_s3_object_store(
         &self,
         ctx: &SessionContext,
