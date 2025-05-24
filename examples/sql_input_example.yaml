@@ -12,8 +12,8 @@ streams:
           endpoint: "http://localhost:9000"
           region: "us-east-1"
           bucket_name: "test"
-#          access_key_id: "XlmP2GPWWIyppydCmtb7"
-#          secret_access_key: "7wDf9WyuLGtz5LsWHtO5BkGdqU0HqIhRpvNuL9ui"
+          access_key_id: "XlmP2GPWWIyppydCmtb7"
+          secret_access_key: "7wDf9WyuLGtz5LsWHtO5BkGdqU0HqIhRpvNuL9ui"
           allow_http: true
       #      path: './examples/input_data.csv'
       select_sql: |
