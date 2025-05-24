@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 use crate::udf;
 use ballista::prelude::SessionContextExt;
+use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
@@ -33,12 +34,15 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
+use object_store::aws::AmazonS3Builder;
+use object_store::signer::Signer;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+use url::Url;
 
 const DEFAULT_NAME: &str = "flow";
 
@@ -86,6 +90,7 @@ struct AvroConfig {
     table_name: Option<String>,
     /// avro file path
     path: String,
+    s3: Option<AwsS3Config>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +167,17 @@ struct PostgresSslConfig {
     ssl_mode: String,
     /// postgres ssl root cert
     root_cert: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsS3Config {
+    endpoint: Option<String>,
+    region: String,
+    bucket_name: String,
+    access_key_id: String,
+    secret_access_key: String,
+    #[serde(default = "default_allow_http")]
+    allow_http: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +273,27 @@ impl SqlInput {
         match self.sql_config.input_type {
             InputType::Avro(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(s3Config) = &c.s3 {
+                    let mut s3_builder = AmazonS3Builder::new()
+                        .with_region(&s3Config.region)
+                        .with_bucket_name(&s3Config.bucket_name)
+                        .with_access_key_id(&s3Config.access_key_id)
+                        .with_secret_access_key(&s3Config.secret_access_key)
+                        .with_allow_http(s3Config.allow_http);
+
+                    if let Some(s) = s3Config.endpoint.as_ref() {
+                        s3_builder = s3_builder.with_endpoint(s);
+                    }
+
+                    let s3 = s3_builder
+                        .build()
+                        .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
+                    let s3_object_store_url = ObjectStoreUrl::parse("s3://")
+                        .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
+                    let url: &Url = s3_object_store_url.as_ref();
+                    ctx.register_object_store(url, Arc::new(s3));
+                }
+
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
@@ -410,6 +447,10 @@ impl InputBuilder for SqlInputBuilder {
 
 pub fn init() -> Result<(), Error> {
     register_input_builder("sql", Arc::new(SqlInputBuilder))
+}
+
+fn default_allow_http() -> bool {
+    false
 }
 
 #[cfg(test)]

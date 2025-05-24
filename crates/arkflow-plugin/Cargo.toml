@@ -72,6 +72,7 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # NATS
 async-nats = "0.41.0"
+object_store= "0.11.2"
 
 
 once_cell = "1.19.0"
