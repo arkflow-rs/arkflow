@@ -187,7 +187,7 @@ struct AwsS3Config {
     /// S3 endpoint URL (optional, uses AWS default if not specified)
     endpoint: Option<String>,
     /// AWS region
-    region: String,
+    region: Option<String>,
     /// S3 bucket name
     bucket_name: String,
     /// AWS access key ID
@@ -216,7 +216,6 @@ pub struct SqlInput {
 impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        info!("SqlInput::new:{:?}", sql_config);
         Ok(Self {
             sql_config,
             stream: Arc::new(Mutex::new(None)),
@@ -457,7 +456,6 @@ impl SqlInput {
         aws_s3_config: &AwsS3Config,
     ) -> Result<(), Error> {
         let mut s3_builder = AmazonS3Builder::new()
-            .with_region(&aws_s3_config.region)
             .with_bucket_name(&aws_s3_config.bucket_name)
             .with_access_key_id(&aws_s3_config.access_key_id)
             .with_secret_access_key(&aws_s3_config.secret_access_key)
@@ -466,12 +464,17 @@ impl SqlInput {
         if let Some(endpoint) = aws_s3_config.endpoint.as_ref() {
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
+        if let Some(region) = aws_s3_config.region.as_ref() {
+            s3_builder = s3_builder.with_region(region);
+        }
 
         let s3 = s3_builder
             .build()
             .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
-        let s3_object_store_url = ObjectStoreUrl::parse("s3://")
-            .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
+
+        let s3_object_store_url =
+            ObjectStoreUrl::parse(format!("s3://{}", &aws_s3_config.bucket_name))
+                .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
         let url: &Url = s3_object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(s3));
         Ok(())

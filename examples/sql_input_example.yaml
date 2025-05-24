@@ -6,15 +6,15 @@ streams:
       input_type:
         type: "json"
         #      input_type: "csv"
-        path: './examples/stream_data.json'
+        path: 's3://test/stream_data.json'
         object_store:
           type: s3
-          endpoint: "https://s3.example.com"
-          region: "us-west-1"
-          bucket_name: "my-bucket"
-          access_key_id: "your-access-key"
-          secret_access_key: "your-secret-key"
-          allow_http: false
+          endpoint: "http://localhost:9090"
+          region: "us-east-1"
+          bucket_name: "test"
+          access_key_id: "XlmP2GPWWIyppydCmtb7"
+          secret_access_key: "7wDf9WyuLGtz5LsWHtO5BkGdqU0HqIhRpvNuL9ui"
+          allow_http: true
       #      path: './examples/input_data.csv'
       select_sql: |
         select *,value + 999999 from flow;
