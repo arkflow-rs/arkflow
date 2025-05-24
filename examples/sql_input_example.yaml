@@ -9,7 +9,7 @@ streams:
         path: 's3://test/stream_data.json'
         object_store:
           type: s3
-          endpoint: "http://localhost:9090"
+          endpoint: "http://localhost:9000"
           region: "us-east-1"
           bucket_name: "test"
           access_key_id: "XlmP2GPWWIyppydCmtb7"
