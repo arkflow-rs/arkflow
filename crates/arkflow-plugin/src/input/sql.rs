@@ -191,9 +191,9 @@ struct AwsS3Config {
     /// S3 bucket name
     bucket_name: String,
     /// AWS access key ID
-    access_key_id: String,
+    access_key_id: Option<String>,
     /// AWS secret access key
-    secret_access_key: String,
+    secret_access_key: Option<String>,
     /// Allow HTTP connections (defaults to false for security)
     #[serde(default = "default_allow_http")]
     allow_http: bool,
@@ -457,8 +457,6 @@ impl SqlInput {
     ) -> Result<(), Error> {
         let mut s3_builder = AmazonS3Builder::new()
             .with_bucket_name(&aws_s3_config.bucket_name)
-            .with_access_key_id(&aws_s3_config.access_key_id)
-            .with_secret_access_key(&aws_s3_config.secret_access_key)
             .with_allow_http(aws_s3_config.allow_http);
 
         if let Some(endpoint) = aws_s3_config.endpoint.as_ref() {
@@ -466,6 +464,12 @@ impl SqlInput {
         }
         if let Some(region) = aws_s3_config.region.as_ref() {
             s3_builder = s3_builder.with_region(region);
+        }
+        if let Some(access_key_id) = aws_s3_config.access_key_id.as_ref() {
+            s3_builder = s3_builder.with_access_key_id(access_key_id);
+        }
+        if let Some(secret_access_key) = aws_s3_config.secret_access_key.as_ref() {
+            s3_builder = s3_builder.with_secret_access_key(secret_access_key);
         }
 
         let s3 = s3_builder
