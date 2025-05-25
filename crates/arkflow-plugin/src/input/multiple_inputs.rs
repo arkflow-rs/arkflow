@@ -47,11 +47,9 @@ impl Input for MultipleInputs {
             input.connect().await?;
         }
 
-        // let tracker = TaskTracker::new();
         for input in &self.inputs {
             let input = Arc::clone(input);
             let sender = self.sender.clone();
-            // let task_tracker = Arc::clone(&self.task_tracker);
             let cancellation_token = self.cancellation_token.clone();
             self.task_tracker.spawn(async move {
                 tokio::select! {
