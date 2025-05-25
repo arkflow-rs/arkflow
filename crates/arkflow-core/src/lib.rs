@@ -37,7 +37,6 @@ pub mod stream;
 pub mod temporary;
 
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
-pub const DEFAULT_INPUT_NAME_FIELD: &str = "__input_name__";
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
