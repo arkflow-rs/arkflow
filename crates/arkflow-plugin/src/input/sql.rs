@@ -37,6 +37,7 @@ use futures_util::stream::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::http::HttpBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,6 +186,7 @@ enum ObjectStore {
     S3(AwsS3Config),
     GS(GoogleCloudStorageConfig),
     AZ(MicrosoftAzureConfig),
+    Http(HttpConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +229,11 @@ struct MicrosoftAzureConfig {
     access_key: Option<String>,
     /// Azure container name
     container_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HttpConfig {
+    url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,14 +482,15 @@ impl SqlInput {
         object_store: &ObjectStore,
     ) -> Result<(), Error> {
         match object_store {
-            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config).await,
-            ObjectStore::GS(config) => self.google_cloud_storage(ctx, config).await,
-            ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config).await,
+            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
+            ObjectStore::GS(config) => self.google_cloud_storage(ctx, config),
+            ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config),
+            ObjectStore::Http(config) => self.http_store(ctx, config),
         }
     }
 
     /// Create an AWS S3 object store
-    async fn aws_s3_object_store(
+    fn aws_s3_object_store(
         &self,
         ctx: &SessionContext,
         aws_s3_config: &AwsS3Config,
@@ -512,7 +520,7 @@ impl SqlInput {
         Ok(())
     }
 
-    async fn google_cloud_storage(
+    fn google_cloud_storage(
         &self,
         ctx: &SessionContext,
         config: &GoogleCloudStorageConfig,
@@ -551,7 +559,7 @@ impl SqlInput {
         Ok(())
     }
 
-    async fn microsoft_azure_store(
+    fn microsoft_azure_store(
         &self,
         ctx: &SessionContext,
         config: &MicrosoftAzureConfig,
@@ -580,6 +588,18 @@ impl SqlInput {
             .map_err(|e| Error::Config(format!("Failed to parse AZ URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(azure_storage));
+        Ok(())
+    }
+
+    fn http_store(&self, ctx: &SessionContext, config: &HttpConfig) -> Result<(), Error> {
+        let http_builder = HttpBuilder::new().with_url(&config.url);
+        let http_storage = http_builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
+        let object_store_url = ObjectStoreUrl::parse(&config.url)
+            .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
+        let url: &Url = object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(http_storage));
         Ok(())
     }
 }
