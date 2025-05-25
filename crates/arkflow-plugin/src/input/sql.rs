@@ -507,6 +507,10 @@ impl SqlInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create GCS client: {}", e)))?;
 
+        let s3_object_store_url = ObjectStoreUrl::parse(format!("gs://{}", &config.bucket_name))
+            .map_err(|e| Error::Config(format!("Failed to parse GCS URL: {}", e)))?;
+        let url: &Url = s3_object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(google_cloud_storage));
         Ok(())
     }
 }
