@@ -518,9 +518,8 @@ impl SqlInput {
         ctx: &SessionContext,
         config: &GoogleCloudStorageConfig,
     ) -> Result<(), Error> {
-        let mut google_cloud_storage_builder = GoogleCloudStorageBuilder::new();
-        google_cloud_storage_builder =
-            google_cloud_storage_builder.with_bucket_name(&config.bucket_name);
+        let mut google_cloud_storage_builder =
+            GoogleCloudStorageBuilder::new().with_bucket_name(&config.bucket_name);
         if let Some(url) = &config.url {
             google_cloud_storage_builder = google_cloud_storage_builder.with_url(url);
         }
@@ -558,8 +557,7 @@ impl SqlInput {
         ctx: &SessionContext,
         config: &MicrosoftAzureConfig,
     ) -> Result<(), Error> {
-        let mut azure_builder = MicrosoftAzureBuilder::new();
-        azure_builder = azure_builder
+        let mut azure_builder = MicrosoftAzureBuilder::new()
             .with_account(&config.account)
             .with_container_name(&config.container_name);
 
