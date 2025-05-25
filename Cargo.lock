@@ -1118,7 +1118,8 @@ dependencies = [
 [[package]]
 name = "ballista"
 version = "46.0.0"
-source = "git+https://github.com/apache/datafusion-ballista?rev=f75ec91b4e1385213329809be84787a3f7fbeab5#f75ec91b4e1385213329809be84787a3f7fbeab5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "324d267a080bf7a4241269f4847706657ac711402402adfd8b575ca10f5bf78c"
 dependencies = [
  "async-trait",
  "ballista-core",
@@ -1133,7 +1134,8 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "46.0.0"
-source = "git+https://github.com/apache/datafusion-ballista?rev=f75ec91b4e1385213329809be84787a3f7fbeab5#f75ec91b4e1385213329809be84787a3f7fbeab5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8d70da181ad8f3f926613aa4aa0ab379cf4507d66f717b714c53b4f58da2e0b"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -1166,7 +1168,8 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "46.0.0"
-source = "git+https://github.com/apache/datafusion-ballista?rev=f75ec91b4e1385213329809be84787a3f7fbeab5#f75ec91b4e1385213329809be84787a3f7fbeab5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d344fc9504f87960211f6be783c337bb9c374a6a0a5d4f441a2de55947c329f4"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1195,7 +1198,8 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "46.0.0"
-source = "git+https://github.com/apache/datafusion-ballista?rev=f75ec91b4e1385213329809be84787a3f7fbeab5#f75ec91b4e1385213329809be84787a3f7fbeab5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e430fb1422c6c66f0fd850f9de5a343f92a9dd8d90ce205d54e3abb3268dd368"
 dependencies = [
  "arrow-flight",
  "async-trait",
