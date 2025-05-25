@@ -204,10 +204,14 @@ struct AwsS3Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GoogleCloudStorageConfig {
+    /// GCS bucket to connect to
     bucket_name: String,
-    url: String,
-    service_account_path: String,
-    service_account_key: String,
+    /// Optional custom endpoint (defaults to GCS public endpoint if `None`)
+    url: Option<String>,
+    /// Path to a service account JSON key file
+    service_account_path: Option<String>,
+    /// Raw JSON key contents
+    service_account_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,11 +501,28 @@ impl SqlInput {
         config: &GoogleCloudStorageConfig,
     ) -> Result<(), Error> {
         let mut google_cloud_storage_builder = GoogleCloudStorageBuilder::new();
-        google_cloud_storage_builder = google_cloud_storage_builder
-            .with_bucket_name(&config.bucket_name)
-            .with_url(&config.url)
-            .with_service_account_path(&config.service_account_path)
-            .with_service_account_key(&config.service_account_key);
+        google_cloud_storage_builder =
+            google_cloud_storage_builder.with_bucket_name(&config.bucket_name);
+        if let Some(url) = &config.url {
+            google_cloud_storage_builder = google_cloud_storage_builder.with_url(url);
+        }
+
+        match (&config.service_account_path, &config.service_account_key) {
+            (Some(path), None) => {
+                google_cloud_storage_builder =
+                    google_cloud_storage_builder.with_service_account_path(path)
+            }
+            (None, Some(key)) => {
+                google_cloud_storage_builder =
+                    google_cloud_storage_builder.with_service_account_key(key)
+            }
+            (None, None) => return Err(Error::Config("GCS auth is missing".into())),
+            (Some(_), Some(_)) => {
+                return Err(Error::Config(
+                    "Specify either service_account_path or service_account_key, not both".into(),
+                ))
+            }
+        };
 
         let google_cloud_storage = google_cloud_storage_builder
             .build()
