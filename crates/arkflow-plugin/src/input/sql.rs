@@ -329,7 +329,7 @@ impl SqlInput {
             InputType::Avro(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
@@ -337,7 +337,7 @@ impl SqlInput {
             InputType::Arrow(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
@@ -345,7 +345,7 @@ impl SqlInput {
             InputType::Json(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
@@ -353,7 +353,7 @@ impl SqlInput {
             InputType::Csv(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
@@ -361,7 +361,7 @@ impl SqlInput {
             InputType::Parquet(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
@@ -476,11 +476,7 @@ impl SqlInput {
     }
 
     /// Create an object store
-    async fn object_store(
-        &self,
-        ctx: &SessionContext,
-        object_store: &ObjectStore,
-    ) -> Result<(), Error> {
+    fn object_store(&self, ctx: &SessionContext, object_store: &ObjectStore) -> Result<(), Error> {
         match object_store {
             ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
             ObjectStore::GS(config) => self.google_cloud_storage(ctx, config),
