@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arkflow_core::{
     processor::{register_processor_builder, Processor, ProcessorBuilder},
-    Error, MessageBatch,
+    Error, MessageBatch, Resource,
 };
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
@@ -79,7 +79,12 @@ impl Processor for VrlProcessor {
 
 struct VrlProcessorBuilder;
 impl ProcessorBuilder for VrlProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),

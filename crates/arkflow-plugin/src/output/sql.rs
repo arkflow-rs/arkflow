@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -394,7 +394,12 @@ impl SqlOutput {
 
 pub(crate) struct SqlOutputBuilder;
 impl OutputBuilder for SqlOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "SQL output configuration is missing".to_string(),

@@ -16,16 +16,15 @@
 //!
 //! A processor for converting between binary data and the Arrow format
 
+use crate::component;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
-use arrow_json::ReaderBuilder;
+use arkflow_core::{Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::sync::Arc;
 
 /// Arrow format conversion processor configuration
@@ -63,38 +62,7 @@ impl Processor for JsonToArrowProcessor {
 
 impl JsonToArrowProcessor {
     fn json_to_arrow(&self, content: &[u8]) -> Result<RecordBatch, Error> {
-        let mut cursor_for_inference = Cursor::new(content);
-        let (mut inferred_schema, _) =
-            arrow_json::reader::infer_json_schema(&mut cursor_for_inference, Some(1))
-                .map_err(|e| Error::Process(format!("Schema inference error: {}", e)))?;
-        if let Some(ref set) = self.config.fields_to_include {
-            inferred_schema = inferred_schema
-                .project(
-                    &set.iter()
-                        .filter_map(|name| inferred_schema.index_of(name).ok())
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|e| Error::Process(format!("Arrow JSON Projection Error: {}", e)))?;
-        }
-
-        let inferred_schema = Arc::new(inferred_schema);
-        let reader = ReaderBuilder::new(inferred_schema.clone())
-            .build(Cursor::new(content))
-            .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
-
-        let result = reader
-            .map(|batch| {
-                Ok(batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?)
-            })
-            .collect::<Result<Vec<RecordBatch>, Error>>()?;
-        if result.is_empty() {
-            return Ok(RecordBatch::new_empty(inferred_schema));
-        }
-
-        let new_batch = arrow::compute::concat_batches(&inferred_schema, &result)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-
-        Ok(new_batch)
+        component::json::try_to_arrow(content, self.config.fields_to_include.as_ref())
     }
 }
 
@@ -140,7 +108,12 @@ impl ArrowToJsonProcessor {
 struct JsonToArrowProcessorBuilder;
 
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -154,7 +127,12 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
 struct ArrowToJsonProcessorBuilder;
 
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -176,9 +154,9 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use crate::processor::json::{ArrowToJsonProcessorBuilder, JsonToArrowProcessorBuilder};
     use arkflow_core::processor::ProcessorBuilder;
-    use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+    use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[tokio::test]
     async fn test_json_to_arrow_basic_types() -> Result<(), Error> {
@@ -186,7 +164,13 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": null
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )?;
 
         let json_data = json!({
             "null_field": null,
@@ -216,7 +200,13 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": fields
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )?;
 
         let json_data = json!({
             "int_field": 42,
@@ -237,7 +227,13 @@ mod tests {
             "value_field": "data",
             "fields_to_include": null
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )?;
 
         let invalid_json = b"not a json object";
         let msg_batch = MessageBatch::new_binary(vec![invalid_json.to_vec()])?;
@@ -253,8 +249,24 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": null
         }));
-        let json_to_arrow = JsonToArrowProcessorBuilder.build(&config).unwrap();
-        let arrow_to_json = ArrowToJsonProcessorBuilder.build(&config).unwrap();
+        let json_to_arrow = JsonToArrowProcessorBuilder
+            .build(
+                None,
+                &config,
+                &Resource {
+                    temporary: HashMap::new(),
+                },
+            )
+            .unwrap();
+        let arrow_to_json = ArrowToJsonProcessorBuilder
+            .build(
+                None,
+                &config,
+                &Resource {
+                    temporary: HashMap::new(),
+                },
+            )
+            .unwrap();
 
         let json_data = json!({
             "int_field": 42,
@@ -274,10 +286,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_processor_missing_config() {
-        let result = JsonToArrowProcessorBuilder.build(&None);
+        let result = JsonToArrowProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        );
         assert!(result.is_err());
 
-        let result = ArrowToJsonProcessorBuilder.build(&None);
+        let result = ArrowToJsonProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        );
         assert!(result.is_err());
     }
 }

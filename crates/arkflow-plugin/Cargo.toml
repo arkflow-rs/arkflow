@@ -44,7 +44,6 @@ base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
 rumqttc = "0.24.0"
-
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.37", features = [
@@ -66,13 +65,14 @@ vrl = { version = "0.24.0", features = ["value", "compiler", "stdlib"] }
 
 # arkflow
 arkflow-core = { workspace = true }
-sqlx = { workspace= true }
+sqlx = { workspace = true }
 
 # Websocket
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # NATS
 async-nats = "0.41.0"
+object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
 
 
 once_cell = "1.19.0"

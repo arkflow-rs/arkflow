@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 
 use crate::expr::{EvaluateResult, Expr};
 use async_trait::async_trait;
@@ -287,7 +287,12 @@ impl KafkaOutput {
 
 pub(crate) struct KafkaOutputBuilder;
 impl OutputBuilder for KafkaOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Kafka output configuration is missing".to_string(),

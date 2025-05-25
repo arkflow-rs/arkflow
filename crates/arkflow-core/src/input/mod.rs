@@ -16,7 +16,7 @@
 //!
 //! The input component is responsible for receiving data from various sources such as message queues, file systems, HTTP endpoints, and so on.
 
-use crate::{Error, MessageBatch};
+use crate::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,7 +28,12 @@ lazy_static::lazy_static! {
 }
 
 pub trait InputBuilder: Send + Sync {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error>;
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error>;
 }
 
 #[async_trait]
@@ -91,17 +96,18 @@ impl From<Arc<dyn Ack>> for VecAck {
 pub struct InputConfig {
     #[serde(rename = "type")]
     pub input_type: String,
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
 
 impl InputConfig {
     /// Building input components
-    pub fn build(&self) -> Result<Arc<dyn Input>, Error> {
+    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Input>, Error> {
         let builders = INPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.input_type) {
-            builder.build(&self.config)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown input type: {}",
@@ -124,9 +130,4 @@ pub fn register_input_builder(
     }
     builders.insert(type_name.to_string(), builder);
     Ok(())
-}
-
-pub fn get_registered_input_types() -> Vec<String> {
-    let builders = INPUT_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
 }

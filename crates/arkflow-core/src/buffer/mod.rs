@@ -13,7 +13,7 @@
  */
 
 use crate::input::Ack;
-use crate::{Error, MessageBatch};
+use crate::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,7 +36,12 @@ pub trait Buffer: Send + Sync {
 
 /// Buffer builder
 pub trait BufferBuilder: Send + Sync {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Buffer>, Error>;
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Buffer>, Error>;
 }
 
 /// Buffer configuration
@@ -44,17 +49,18 @@ pub trait BufferBuilder: Send + Sync {
 pub struct BufferConfig {
     #[serde(rename = "type")]
     pub buffer_type: String,
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
 
 impl BufferConfig {
     /// Building buffer components
-    pub fn build(&self) -> Result<Arc<dyn Buffer>, Error> {
+    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Buffer>, Error> {
         let builders = BUFFER_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.buffer_type) {
-            builder.build(&self.config)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown buffer type: {}",
@@ -77,9 +83,4 @@ pub fn register_buffer_builder(
     }
     builders.insert(type_name.to_string(), builder);
     Ok(())
-}
-
-pub fn get_registered_buffer_types() -> Vec<String> {
-    let builders = BUFFER_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
 }

@@ -1,0 +1,43 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 5s
+      batch_size: 2
+
+    temporary:
+      - name: redis_temporary
+        type: "redis"
+        mode:
+          type: single
+          url: redis://127.0.0.1:6379
+        redis_type:
+          #          type: list
+          type: string
+
+
+    pipeline:
+      thread_num: 10
+      processors:
+        - type: "json_to_arrow"
+
+        - type: "sql"
+          query: "SELECT * FROM flow right join redis_table on (flow.sensor = redis_table.x)"
+          temporary_list:
+            - name: redis_temporary
+              table_name: redis_table
+              key:
+                type: value
+                value: 'test'
+
+    #        - type: "arrow_to_json"
+    #        - type: "sql"
+    #          query: "SELECT *,cast( __value__  as string) as y FROM flow "
+
+
+    output:
+      type: "stdout"
+#    error_output:
+#      type: "stdout"

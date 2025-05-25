@@ -17,7 +17,7 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -178,7 +178,12 @@ impl Ack for KafkaAck {
 
 pub(crate) struct KafkaInputBuilder;
 impl InputBuilder for KafkaInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Kafka input configuration is missing".to_string(),

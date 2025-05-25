@@ -17,7 +17,7 @@
 //! Send the processed data to the HTTP endpoint
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use base64::Engine;
 use reqwest::{header, Client};
@@ -215,7 +215,12 @@ impl HttpOutput {
 }
 pub(crate) struct HttpOutputBuilder;
 impl OutputBuilder for HttpOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "HTTP output configuration is missing".to_string(),

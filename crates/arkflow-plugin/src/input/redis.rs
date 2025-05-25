@@ -17,7 +17,7 @@
 //! Receive data from Redis pub/sub channels
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -413,7 +413,12 @@ impl Input for RedisInput {
 pub struct RedisInputBuilder;
 
 impl InputBuilder for RedisInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         let config: RedisInputConfig =
             serde_json::from_value(config.clone().unwrap_or_default())
                 .map_err(|e| Error::Config(format!("Invalid Redis input config: {}", e)))?;

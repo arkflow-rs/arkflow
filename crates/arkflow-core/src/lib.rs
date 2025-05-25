@@ -14,12 +14,13 @@
 
 //! Rust stream processing engine
 
+use crate::temporary::Temporary;
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,8 +33,10 @@ pub mod input;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
-
 pub mod stream;
+pub mod temporary;
+
+pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
@@ -68,6 +71,10 @@ pub enum Error {
 
     #[error("EOF")]
     EOF,
+}
+
+pub struct Resource {
+    pub temporary: HashMap<String, Arc<dyn Temporary>>,
 }
 
 pub type Bytes = Vec<u8>;
@@ -242,5 +249,3 @@ impl DerefMut for MessageBatch {
         &mut self.0
     }
 }
-
-pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";

@@ -17,7 +17,7 @@
 //! Receive data from the MQTT broker
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -239,7 +239,12 @@ impl Ack for MqttAck {
 
 pub(crate) struct MqttInputBuilder;
 impl InputBuilder for MqttInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "MQTT input configuration is missing".to_string(),

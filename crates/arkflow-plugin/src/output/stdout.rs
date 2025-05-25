@@ -17,7 +17,7 @@
 //! Outputs the processed data to standard output
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,12 @@ impl<T: StdWriter> StdoutOutput<T> {
 struct StdoutOutputBuilder;
 
 impl OutputBuilder for StdoutOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Stdout output configuration is missing".to_string(),

@@ -21,7 +21,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -240,7 +240,12 @@ impl BufferBuilder for MemoryBufferBuilder {
     ///
     /// # Returns
     /// * `Result<Arc<dyn Buffer>, Error>` - A new memory buffer instance or an error
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Buffer>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Memory buffer configuration is missing".to_string(),

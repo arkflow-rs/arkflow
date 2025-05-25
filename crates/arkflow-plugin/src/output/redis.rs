@@ -11,14 +11,13 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
 use arkflow_core::output::{Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
-use redis::aio::{ConnectionLike, ConnectionManager};
-use redis::cluster::ClusterClient;
-use redis::cluster_async::ClusterConnection;
-use redis::{Client, Cmd, Pipeline, RedisFuture, Value};
+use redis::aio::ConnectionManager;
+use redis::Pipeline;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -30,13 +29,6 @@ struct RedisOutputConfig {
     redis_type: Type,
     /// Value field to use for message payload
     value_field: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Mode {
-    Cluster { urls: Vec<String> },
-    Single { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +56,7 @@ struct RedisOutput {
     cancellation_token: CancellationToken,
 }
 
-#[derive(Clone)]
-enum Cli {
-    Single(ConnectionManager),
-    Cluster(ClusterConnection),
-}
+type Cli = Connection;
 
 impl RedisOutput {
     /// Create a new Redis input component
@@ -82,47 +70,14 @@ impl RedisOutput {
             cancellation_token,
         })
     }
-
-    async fn single_connect(&self, url: String) -> Result<(), Error> {
-        let client = Client::open(url)
-            .map_err(|e| Error::Connection(format!("Failed to connect to Redis server: {}", e)))?;
-        let client = client
-            .get_connection_manager()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to get connection manager: {}", e)))?;
-
-        let mut client_guard = self.client.lock().await;
-        client_guard.replace(Cli::Single(client));
-        Ok(())
-    }
-
-    async fn cluster_connect(&self, urls: Vec<String>) -> Result<(), Error> {
-        let client = ClusterClient::new(urls)
-            .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
-        let client = client.get_async_connection().await.map_err(|e| {
-            Error::Connection(format!(
-                "Failed to get connection from Redis cluster: {}",
-                e
-            ))
-        })?;
-
-        let mut client_guard = self.client.lock().await;
-        client_guard.replace(Cli::Cluster(client));
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl Output for RedisOutput {
     async fn connect(&self) -> Result<(), Error> {
-        match self.config.mode {
-            Mode::Cluster { ref urls } => {
-                self.cluster_connect(urls.clone()).await?;
-            }
-            Mode::Single { ref url } => {
-                self.single_connect(url.clone()).await?;
-            }
-        }
+        let mut client_guard = self.client.lock().await;
+        let c = Connection::connect(&self.config.mode).await?;
+        client_guard.replace(c);
         Ok(())
     }
 
@@ -215,38 +170,15 @@ impl Output for RedisOutput {
     }
 }
 
-impl ConnectionLike for Cli {
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        match self {
-            Cli::Single(c) => c.req_packed_command(cmd),
-            Cli::Cluster(c) => c.req_packed_command(cmd),
-        }
-    }
-
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> RedisFuture<'a, Vec<Value>> {
-        match self {
-            Cli::Single(c) => c.req_packed_commands(cmd, offset, count),
-            Cli::Cluster(c) => c.req_packed_commands(cmd, offset, count),
-        }
-    }
-
-    fn get_db(&self) -> i64 {
-        match self {
-            Cli::Single(c) => c.get_db(),
-            Cli::Cluster(c) => c.get_db(),
-        }
-    }
-}
-
 struct RedisOutputBuilder;
 
 impl OutputBuilder for RedisOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Redis output configuration is missing".to_string(),

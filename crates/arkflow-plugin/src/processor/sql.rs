@@ -16,19 +16,24 @@
 //!
 //! DataFusion is used to process data with SQL queries.
 
-use crate::udf;
+use crate::{expr, udf};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::temporary::Temporary;
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use ballista::prelude::SessionContextExt;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::logical_expr::ColumnarValue;
 use datafusion::optimizer::OptimizerConfig;
 use datafusion::prelude::*;
+use datafusion::scalar::ScalarValue;
 use datafusion::sql::parser::Statement;
+use expr::Expr;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DEFAULT_TABLE_NAME: &str = "flow";
@@ -43,6 +48,14 @@ struct SqlProcessorConfig {
 
     /// Experimental: Ballista helps us perform distributed computing
     ballista: Option<crate::input::sql::BallistaConfig>,
+    temporary_list: Option<Vec<TemporaryConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TemporaryConfig {
+    name: String,
+    table_name: String,
+    key: Expr<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,11 +68,32 @@ struct BallistaConfig {
 struct SqlProcessor {
     config: SqlProcessorConfig,
     statement: Statement,
+    temporary: Option<HashMap<String, (Arc<dyn Temporary>, TemporaryConfig)>>,
+    // expr: expr::Expr<String>,
 }
 
 impl SqlProcessor {
     /// Create a new SQL processor component.
-    pub fn new(config: SqlProcessorConfig) -> Result<Self, Error> {
+    pub fn new(config: SqlProcessorConfig, resource: &Resource) -> Result<Self, Error> {
+        let temporary = {
+            if let Some(temporary_list) = config.temporary_list.as_ref() {
+                let mut temporary_map = HashMap::with_capacity(temporary_list.len());
+                for temporary in temporary_list {
+                    let Some(t) = resource.temporary.get(&temporary.name) else {
+                        return Err(Error::Process(format!(
+                            "Temporary {} not found",
+                            temporary.name
+                        )));
+                    };
+                    temporary_map.insert(temporary.name.clone(), (t.clone(), temporary.clone()));
+                }
+
+                Some(temporary_map)
+            } else {
+                None
+            }
+        };
+
         let ctx = SessionContext::new();
         let statement = ctx
             .state()
@@ -68,8 +102,13 @@ impl SqlProcessor {
                 ctx.state().options().sql_parser.dialect.as_str(),
             )
             .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
-
-        Ok(Self { config, statement })
+        Ok(Self {
+            config,
+            statement,
+            temporary,
+            // temporary: Arc::new(()),
+            // expr: expr::Expr::new(),
+        })
     }
 
     /// Execute SQL query
@@ -82,9 +121,9 @@ impl SqlProcessor {
             .table_name
             .as_deref()
             .unwrap_or(DEFAULT_TABLE_NAME);
+        self.get_temporary_message_batch(&ctx, &batch).await?;
         ctx.register_batch(table_name, batch.into())
             .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
-
         // Execute the SQL query and collect the results.
         let df = self
             .execute_query_with_statement(ctx)
@@ -107,6 +146,43 @@ impl SqlProcessor {
             arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
                 .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
+    }
+
+    async fn get_temporary_message_batch(
+        &self,
+        ctx: &SessionContext,
+        batch: &RecordBatch,
+    ) -> Result<(), Error> {
+        let Some(temporary_map) = &self.temporary else {
+            return Ok(());
+        };
+
+        use futures::future::join_all;
+        
+        let futures = temporary_map.iter().map(|(_, (temporary, config))| async {
+            let columnar_value = match &config.key {
+                Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
+                    .await
+                    .map_err(|e| Error::Process(format!("Evaluate expression failed: {}", e)))?,
+                Expr::Value { value } => {
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.clone())))
+                }
+            };
+
+            if let Some(data) = temporary.get(&vec![columnar_value]).await? {
+                ctx.register_batch(&config.table_name, data.into())
+                    .map_err(|e| {
+                        Error::Process(format!("Register temporary message batch failed: {}", e))
+                    })?;
+            }
+            Ok::<_, Error>(())
+        });
+
+        let results = join_all(futures).await;
+        for result in results {
+            result?;
+        }
+        Ok(())
     }
 
     async fn execute_query_with_statement(
@@ -163,14 +239,20 @@ impl Processor for SqlProcessor {
 
 struct SqlProcessorBuilder;
 impl ProcessorBuilder for SqlProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Batch processor configuration is missing".to_string(),
             ));
         }
         let config: SqlProcessorConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SqlProcessor::new(config)?))
+
+        Ok(Arc::new(SqlProcessor::new(config, resource)?))
     }
 }
 
@@ -183,14 +265,21 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_sql_processor_basic_query() {
-        let processor = SqlProcessor::new(SqlProcessorConfig {
-            query: "SELECT * FROM flow".to_string(),
-            table_name: None,
-            ballista: None,
-        })
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT * FROM flow".to_string(),
+                table_name: None,
+                ballista: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )
         .unwrap();
 
         let schema = Arc::new(Schema::new(vec![
@@ -218,11 +307,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_processor_empty_batch() {
-        let processor = SqlProcessor::new(SqlProcessorConfig {
-            query: "SELECT * FROM flow".to_string(),
-            table_name: None,
-            ballista: None,
-        })
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT * FROM flow".to_string(),
+                table_name: None,
+                ballista: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )
         .unwrap();
 
         let result = processor
@@ -237,22 +332,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_processor_invalid_query() {
-        let processor = SqlProcessor::new(SqlProcessorConfig {
-            query: "INVALID SQL QUERY".to_string(),
-            table_name: None,
-            ballista: None,
-        });
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "INVALID SQL QUERY".to_string(),
+                table_name: None,
+                ballista: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        );
 
         assert!(processor.is_err());
     }
 
     #[tokio::test]
     async fn test_sql_processor_custom_table_name() {
-        let processor = SqlProcessor::new(SqlProcessorConfig {
-            query: "SELECT * FROM custom_table".to_string(),
-            table_name: Some("custom_table".to_string()),
-            ballista: None,
-        })
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT * FROM custom_table".to_string(),
+                table_name: Some("custom_table".to_string()),
+                ballista: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: HashMap::new(),
+            },
+        )
         .unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new(

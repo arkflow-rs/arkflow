@@ -14,7 +14,7 @@
 
 use crate::time::deserialize_duration;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -87,7 +87,12 @@ impl Input for GenerateInput {
 
 pub(crate) struct GenerateInputBuilder;
 impl InputBuilder for GenerateInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Generate input configuration is missing".to_string(),
@@ -106,6 +111,7 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
+    use std::collections::HashMap;
 
     use super::*;
     use std::time::Duration;
@@ -226,7 +232,15 @@ mod tests {
         });
 
         let builder = GenerateInputBuilder;
-        let input = builder.build(&Some(config_json)).unwrap();
+        let input = builder
+            .build(
+                None,
+                &Some(config_json),
+                &Resource {
+                    temporary: HashMap::new(),
+                },
+            )
+            .unwrap();
 
         assert!(input.connect().await.is_ok());
         assert!(input.read().await.is_ok());
@@ -236,6 +250,15 @@ mod tests {
     #[tokio::test]
     async fn test_builder_missing_config() {
         let builder = GenerateInputBuilder;
-        assert!(matches!(builder.build(&None), Err(Error::Config(_))));
+        assert!(matches!(
+            builder.build(
+                None,
+                &None,
+                &Resource {
+                    temporary: HashMap::new(),
+                },
+            ),
+            Err(Error::Config(_))
+        ));
     }
 }

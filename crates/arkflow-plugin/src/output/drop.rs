@@ -18,7 +18,7 @@
 //! It's useful for testing or when you want to intentionally discard data.
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -45,7 +45,12 @@ impl Output for DropOutput {
 
 struct DropOutputBuilder;
 impl OutputBuilder for DropOutputBuilder {
-    fn build(&self, _: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        _: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         Ok(Arc::new(DropOutput))
     }
 }

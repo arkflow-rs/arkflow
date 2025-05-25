@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatch};
+use crate::{Error, MessageBatch, Resource};
 
 lazy_static::lazy_static! {
     static ref OUTPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn OutputBuilder>>> = RwLock::new(HashMap::new());
@@ -44,17 +44,18 @@ pub trait Output: Send + Sync {
 pub struct OutputConfig {
     #[serde(rename = "type")]
     pub output_type: String,
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
 
 impl OutputConfig {
     /// Build the output component according to the configuration
-    pub fn build(&self) -> Result<Arc<dyn Output>, Error> {
+    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Output>, Error> {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
-            builder.build(&self.config)
+            builder.build(self.name.as_ref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown output type: {}",
@@ -65,7 +66,12 @@ impl OutputConfig {
 }
 
 pub trait OutputBuilder: Send + Sync {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error>;
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error>;
 }
 
 pub fn register_output_builder(
@@ -81,9 +87,4 @@ pub fn register_output_builder(
     }
     builders.insert(type_name.to_string(), builder);
     Ok(())
-}
-
-pub fn get_registered_output_types() -> Vec<String> {
-    let builders = OUTPUT_BUILDERS.read().unwrap();
-    builders.keys().cloned().collect()
 }

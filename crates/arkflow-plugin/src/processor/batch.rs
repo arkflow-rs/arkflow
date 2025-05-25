@@ -17,7 +17,7 @@
 //! Batch multiple messages into one or more messages
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -119,7 +119,12 @@ impl Processor for BatchProcessor {
 
 struct BatchProcessorBuilder;
 impl ProcessorBuilder for BatchProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Batch processor configuration is missing".to_string(),

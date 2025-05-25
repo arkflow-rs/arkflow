@@ -18,9 +18,9 @@
 
 use crate::buffer::Buffer;
 use crate::input::Ack;
-use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch};
+use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
 use flume::{Receiver, Sender};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,7 @@ pub struct Stream {
     error_output: Option<Arc<dyn Output>>,
     thread_num: u32,
     buffer: Option<Arc<dyn Buffer>>,
+    resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
 }
@@ -54,6 +55,7 @@ impl Stream {
         output: Arc<dyn Output>,
         error_output: Option<Arc<dyn Output>>,
         buffer: Option<Arc<dyn Buffer>>,
+        resource: Resource,
         thread_num: u32,
     ) -> Self {
         Self {
@@ -62,6 +64,7 @@ impl Stream {
             output,
             error_output,
             buffer,
+            resource,
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
@@ -75,6 +78,9 @@ impl Stream {
         self.output.connect().await?;
         if let Some(ref error_output) = self.error_output {
             error_output.connect().await?;
+        }
+        for (_, temporary) in &self.resource.temporary {
+            temporary.connect().await?
         }
 
         let (input_sender, input_receiver) =
@@ -412,21 +418,40 @@ pub struct StreamConfig {
     pub output: crate::output::OutputConfig,
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
+    pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
 }
 
 impl StreamConfig {
     /// Build stream based on configuration
     pub fn build(&self) -> Result<Stream, Error> {
-        let input = self.input.build()?;
-        let (pipeline, thread_num) = self.pipeline.build()?;
-        let output = self.output.build()?;
+        let mut resource = Resource {
+            temporary: HashMap::new(),
+        };
+        let temporary = if let Some(temporary_configs) = &self.temporary {
+            let mut temporary_map = HashMap::with_capacity(temporary_configs.len());
+            for temporary_config in temporary_configs {
+                temporary_map.insert(
+                    temporary_config.name.clone(),
+                    temporary_config.build(&resource)?,
+                );
+            }
+            temporary_map
+        } else {
+            HashMap::new()
+        };
+
+        resource.temporary = temporary;
+
+        let input = self.input.build(&resource)?;
+        let (pipeline, thread_num) = self.pipeline.build(&resource)?;
+        let output = self.output.build(&resource)?;
         let error_output = if let Some(error_output_config) = &self.error_output {
-            Some(error_output_config.build()?)
+            Some(error_output_config.build(&resource)?)
         } else {
             None
         };
         let buffer = if let Some(buffer_config) = &self.buffer {
-            Some(buffer_config.build()?)
+            Some(buffer_config.build(&resource)?)
         } else {
             None
         };
@@ -437,6 +462,7 @@ impl StreamConfig {
             output,
             error_output,
             buffer,
+            resource,
             thread_num,
         ))
     }

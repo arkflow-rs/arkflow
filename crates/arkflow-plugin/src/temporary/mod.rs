@@ -11,13 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+mod redis;
 
-pub mod buffer;
-pub mod component;
-pub mod expr;
-pub mod input;
-pub mod output;
-pub mod processor;
-pub mod temporary;
-pub mod time;
-pub mod udf;
+use arkflow_core::Error;
+
+pub fn init() -> Result<(), Error> {
+    redis::init()?;
+    Ok(())
+}

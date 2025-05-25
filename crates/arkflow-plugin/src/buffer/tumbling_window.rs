@@ -22,7 +22,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -210,7 +210,12 @@ impl BufferBuilder for TumblingWindowBuilder {
     ///
     /// # Returns
     /// * `Result<Arc<dyn Buffer>, Error>` - A new tumbling window buffer instance or an error
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Buffer>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Tumbling window configuration is missing".to_string(),
