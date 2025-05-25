@@ -35,6 +35,7 @@ use datafusion_table_providers::{
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -183,6 +184,7 @@ struct PostgresSslConfig {
 enum ObjectStore {
     S3(AwsS3Config),
     GS(GoogleCloudStorageConfig),
+    AZ(MicrosoftAzureConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +214,20 @@ struct GoogleCloudStorageConfig {
     service_account_path: Option<String>,
     /// Raw JSON key contents
     service_account_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MicrosoftAzureConfig {
+    /// Azure blob endpoint URL (optional, uses Azure default if not specified)
+    url: Option<String>,
+    endpoint: Option<String>,
+    /// Azure storage account name
+    account: String,
+    /// Azure shared access key
+    access_key: Option<String>,
+    /// Azure container name
+    container_name: String,
+    sas_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,8 +476,9 @@ impl SqlInput {
         object_store: &ObjectStore,
     ) -> Result<(), Error> {
         match object_store {
-            ObjectStore::S3(aws_s3_config) => self.aws_s3_object_store(ctx, aws_s3_config).await,
+            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config).await,
             ObjectStore::GS(config) => self.google_cloud_storage(ctx, config).await,
+            ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config).await,
         }
     }
 
@@ -488,13 +505,14 @@ impl SqlInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
 
-        let s3_object_store_url =
+        let object_store_url =
             ObjectStoreUrl::parse(format!("s3://{}", &aws_s3_config.bucket_name))
                 .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
-        let url: &Url = s3_object_store_url.as_ref();
+        let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(s3));
         Ok(())
     }
+
     async fn google_cloud_storage(
         &self,
         ctx: &SessionContext,
@@ -528,10 +546,43 @@ impl SqlInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create GCS client: {}", e)))?;
 
-        let s3_object_store_url = ObjectStoreUrl::parse(format!("gs://{}", &config.bucket_name))
+        let object_store_url = ObjectStoreUrl::parse(format!("gs://{}", &config.bucket_name))
             .map_err(|e| Error::Config(format!("Failed to parse GCS URL: {}", e)))?;
-        let url: &Url = s3_object_store_url.as_ref();
+        let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(google_cloud_storage));
+        Ok(())
+    }
+
+    async fn microsoft_azure_store(
+        &self,
+        ctx: &SessionContext,
+        config: &MicrosoftAzureConfig,
+    ) -> Result<(), Error> {
+        let mut azure_builder = MicrosoftAzureBuilder::new();
+        azure_builder = azure_builder
+            .with_account(&config.account)
+            .with_container_name(&config.container_name);
+
+        if let Some(access_key) = &config.access_key {
+            azure_builder = azure_builder.with_access_key(access_key);
+        }
+        if let Some(url) = &config.url {
+            azure_builder = azure_builder.with_url(url);
+        }
+        if let Some(endpoint) = &config.endpoint {
+            azure_builder = azure_builder
+                .with_endpoint(endpoint.clone())
+                .with_allow_http(true);
+        }
+
+        let azure_storage = azure_builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create AZ client: {}", e)))?;
+
+        let object_store_url = ObjectStoreUrl::parse(format!("az://{}", &config.container_name))
+            .map_err(|e| Error::Config(format!("Failed to parse AZ URL: {}", e)))?;
+        let url: &Url = object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(azure_storage));
         Ok(())
     }
 }
