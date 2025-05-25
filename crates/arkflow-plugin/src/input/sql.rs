@@ -186,7 +186,7 @@ enum ObjectStore {
     S3(AwsS3Config),
     GS(GoogleCloudStorageConfig),
     AZ(MicrosoftAzureConfig),
-    Http(HttpConfig),
+    HTTP(HttpConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,7 +485,7 @@ impl SqlInput {
             ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
             ObjectStore::GS(config) => self.google_cloud_storage(ctx, config),
             ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config),
-            ObjectStore::Http(config) => self.http_store(ctx, config),
+            ObjectStore::HTTP(config) => self.http_store(ctx, config),
         }
     }
 
