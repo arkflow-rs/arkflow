@@ -52,7 +52,8 @@ impl Input for MultipleInputs {
             let sender = self.sender.clone();
             let cancellation_token = self.cancellation_token.clone();
             self.task_tracker.spawn(async move {
-                tokio::select! {
+                loop {
+                    tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         return;
                     }
@@ -79,6 +80,7 @@ impl Input for MultipleInputs {
                         }
                     }
 
+                }
                 }
             });
         }

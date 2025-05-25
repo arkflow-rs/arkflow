@@ -359,7 +359,9 @@ impl Input for NatsInput {
                         match msg {
                             NatsMsg::Regular(message) => {
                                 let payload = message.payload.to_vec();
-                                let msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                msg_batch.set_input_name(self.input_name.clone());
+
                                 Ok((msg_batch, Arc::new(NatsAck::Regular)))
                             },
                             NatsMsg::JetStream( message) => {
