@@ -35,6 +35,7 @@ use datafusion_table_providers::{
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,7 +182,9 @@ struct PostgresSslConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ObjectStore {
     S3(AwsS3Config),
+    GoogleCloudStorage(GoogleCloudStorageConfig),
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AwsS3Config {
     /// S3 endpoint URL (optional, uses AWS default if not specified)
@@ -197,6 +200,14 @@ struct AwsS3Config {
     /// Allow HTTP connections (defaults to false for security)
     #[serde(default = "default_allow_http")]
     allow_http: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleCloudStorageConfig {
+    bucket_name: String,
+    url: String,
+    service_account_path: String,
+    service_account_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +457,7 @@ impl SqlInput {
     ) -> Result<(), Error> {
         match object_store {
             ObjectStore::S3(aws_s3_config) => self.aws_s3_object_store(ctx, aws_s3_config).await,
+            ObjectStore::GoogleCloudStorage(config) => self.google_cloud_storage(ctx, config).await,
         }
     }
 
@@ -477,6 +489,24 @@ impl SqlInput {
                 .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
         let url: &Url = s3_object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(s3));
+        Ok(())
+    }
+    async fn google_cloud_storage(
+        &self,
+        ctx: &SessionContext,
+        config: &GoogleCloudStorageConfig,
+    ) -> Result<(), Error> {
+        let mut google_cloud_storage_builder = GoogleCloudStorageBuilder::new();
+        google_cloud_storage_builder = google_cloud_storage_builder
+            .with_bucket_name(&config.bucket_name)
+            .with_url(&config.url)
+            .with_service_account_path(&config.service_account_path)
+            .with_service_account_key(&config.service_account_key);
+
+        let google_cloud_storage = google_cloud_storage_builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create GCS client: {}", e)))?;
+
         Ok(())
     }
 }
