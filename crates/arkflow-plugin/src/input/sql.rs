@@ -182,7 +182,7 @@ struct PostgresSslConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ObjectStore {
     S3(AwsS3Config),
-    GoogleCloudStorage(GoogleCloudStorageConfig),
+    GS(GoogleCloudStorageConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,7 +461,7 @@ impl SqlInput {
     ) -> Result<(), Error> {
         match object_store {
             ObjectStore::S3(aws_s3_config) => self.aws_s3_object_store(ctx, aws_s3_config).await,
-            ObjectStore::GoogleCloudStorage(config) => self.google_cloud_storage(ctx, config).await,
+            ObjectStore::GS(config) => self.google_cloud_storage(ctx, config).await,
         }
     }
 
