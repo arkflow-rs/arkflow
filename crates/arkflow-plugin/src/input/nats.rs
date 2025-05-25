@@ -84,6 +84,7 @@ enum NatsMsg {
 
 /// NATS input component
 pub struct NatsInput {
+    input_name: Option<String>,
     config: NatsInputConfig,
     client: Arc<RwLock<Option<Client>>>,
     js_consumer: Arc<RwLock<Option<PullConsumer>>>,
@@ -95,10 +96,11 @@ pub struct NatsInput {
 
 impl NatsInput {
     /// Create a new NATS input component
-    pub fn new(config: NatsInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: NatsInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<NatsMsg>(1000);
         Ok(Self {
+            input_name: name.cloned(),
             config,
             client: Arc::new(RwLock::new(None)),
             js_consumer: Arc::new(RwLock::new(None)),
@@ -362,7 +364,9 @@ impl Input for NatsInput {
                             },
                             NatsMsg::JetStream( message) => {
                                 let payload = message.payload.to_vec();
-                                let msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
+                                msg_batch.set_input_name(self.input_name.clone());
+
                                 let ack = NatsAck::JetStream {
                                     message,
                                 };
@@ -410,7 +414,7 @@ pub(crate) struct NatsInputBuilder;
 impl InputBuilder for NatsInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -420,7 +424,7 @@ impl InputBuilder for NatsInputBuilder {
             ));
         }
         let config: NatsInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(NatsInput::new(config)?))
+        Ok(Arc::new(NatsInput::new(name, config)?))
     }
 }
 

@@ -23,6 +23,7 @@ pub mod http;
 pub mod kafka;
 pub mod memory;
 pub mod mqtt;
+mod multiple_inputs;
 pub mod nats;
 pub mod redis;
 pub mod sql;
@@ -38,5 +39,6 @@ pub fn init() -> Result<(), Error> {
     redis::init()?;
     sql::init()?;
     websocket::init()?;
+    multiple_inputs::init()?;
     Ok(())
 }

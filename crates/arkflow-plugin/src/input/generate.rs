@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerateInputConfig {
+struct GenerateInputConfig {
     context: String,
     #[serde(deserialize_with = "deserialize_duration")]
     interval: Duration,
@@ -30,16 +30,18 @@ pub struct GenerateInputConfig {
     batch_size: Option<usize>,
 }
 
-pub struct GenerateInput {
+struct GenerateInput {
+    input_name: Option<String>,
     config: GenerateInputConfig,
     count: AtomicI64,
     batch_size: usize,
     first: AtomicBool,
 }
 impl GenerateInput {
-    pub fn new(config: GenerateInputConfig) -> Result<Self, Error> {
+    fn new(name: Option<&String>, config: GenerateInputConfig) -> Result<Self, Error> {
         let batch_size = config.batch_size.unwrap_or(1);
         Ok(Self {
+            input_name: name.cloned(),
             config,
             count: AtomicI64::new(0),
             batch_size,
@@ -77,8 +79,9 @@ impl Input for GenerateInput {
 
         self.count
             .fetch_add(self.batch_size as i64, Ordering::SeqCst);
-
-        Ok((MessageBatch::new_binary(msgs)?, Arc::new(NoopAck)))
+        let mut message_batch = MessageBatch::new_binary(msgs)?;
+        message_batch.set_input_name(self.input_name.clone());
+        Ok((message_batch, Arc::new(NoopAck)))
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
@@ -89,7 +92,7 @@ pub(crate) struct GenerateInputBuilder;
 impl InputBuilder for GenerateInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -100,7 +103,7 @@ impl InputBuilder for GenerateInputBuilder {
         }
         let config: GenerateInputConfig =
             serde_json::from_value::<GenerateInputConfig>(config.clone().unwrap())?;
-        Ok(Arc::new(GenerateInput::new(config)?))
+        Ok(Arc::new(GenerateInput::new(name, config)?))
     }
 }
 
@@ -124,7 +127,7 @@ mod tests {
             count: None,
             batch_size: None,
         };
-        let input = GenerateInput::new(config).unwrap();
+        let input = GenerateInput::new(None, config).unwrap();
 
         // Test connect
         assert!(input.connect().await.is_ok());
@@ -150,7 +153,7 @@ mod tests {
             count: None,
             batch_size: Some(3),
         };
-        let input = GenerateInput::new(config).unwrap();
+        let input = GenerateInput::new(None, config).unwrap();
 
         let (msg_batch, _) = input.read().await.unwrap();
         assert_eq!(msg_batch.len(), 3);
@@ -173,7 +176,7 @@ mod tests {
             count: Some(2),
             batch_size: Some(1),
         };
-        let input = GenerateInput::new(config).unwrap();
+        let input = GenerateInput::new(None, config).unwrap();
 
         // First read should succeed
         assert!(input.read().await.is_ok());
@@ -191,7 +194,7 @@ mod tests {
             count: Some(3),
             batch_size: Some(2),
         };
-        let input = GenerateInput::new(config).unwrap();
+        let input = GenerateInput::new(None, config).unwrap();
 
         // First read should succeed (2 messages)
         let (msg_batch, _) = input.read().await.unwrap();
@@ -209,7 +212,7 @@ mod tests {
             count: None,
             batch_size: None,
         };
-        let input = GenerateInput::new(config).unwrap();
+        let input = GenerateInput::new(None, config).unwrap();
 
         // First read should be immediate
         let start = std::time::Instant::now();

@@ -55,6 +55,7 @@ pub struct HttpInputConfig {
 
 /// HTTP input component
 pub struct HttpInput {
+    input_name: Option<String>,
     config: HttpInputConfig,
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
     sender: Arc<Sender<MessageBatch>>,
@@ -71,11 +72,12 @@ struct AppStateInner {
 type AppState = Arc<AppStateInner>;
 
 impl HttpInput {
-    pub fn new(config: HttpInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: HttpInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
         let auth = config.auth.clone();
 
         Ok(Self {
+            input_name: name.cloned(),
             config,
             server_handle: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
@@ -157,7 +159,8 @@ impl Input for HttpInput {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
 
-        if let Ok(msg) = self.receiver.recv_async().await {
+        if let Ok(mut msg) = self.receiver.recv_async().await {
+            msg.set_input_name(self.input_name.clone());
             Ok((msg, Arc::new(NoopAck)))
         } else {
             Err(Error::Process("The queue is empty".to_string()))
@@ -179,7 +182,7 @@ pub(crate) struct HttpInputBuilder;
 impl InputBuilder for HttpInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -190,7 +193,7 @@ impl InputBuilder for HttpInputBuilder {
         }
 
         let config: HttpInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(HttpInput::new(config)?))
+        Ok(Arc::new(HttpInput::new(name, config)?))
     }
 }
 
@@ -255,7 +258,7 @@ mod tests {
             cors_enabled: Some(false),
             auth: None,
         };
-        let input = HttpInput::new(config).unwrap();
+        let input = HttpInput::new(None, config).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),
@@ -287,7 +290,7 @@ mod tests {
                 password: "pass".to_string(),
             }),
         };
-        let input = HttpInput::new(config).unwrap();
+        let input = HttpInput::new(None, config).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),

@@ -245,15 +245,17 @@ struct SqliteConfig {
 }
 
 pub struct SqlInput {
+    input_name: Option<String>,
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
 }
 
 impl SqlInput {
-    pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
+            input_name: name.cloned(),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
@@ -311,7 +313,10 @@ impl Input for SqlInput {
                 let Some(x) = value else {
                     return Err(Error::EOF);
                 };
-                Ok((MessageBatch::new_arrow(x), Arc::new(NoopAck)))
+                let mut msg = MessageBatch::new_arrow(x);
+                msg.set_input_name(self.input_name.clone());
+
+                Ok((msg, Arc::new(NoopAck)))
             }
 
         }
@@ -604,7 +609,7 @@ pub(crate) struct SqlInputBuilder;
 impl InputBuilder for SqlInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -615,7 +620,7 @@ impl InputBuilder for SqlInputBuilder {
         }
 
         let config: SqlInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SqlInput::new(config)?))
+        Ok(Arc::new(SqlInput::new(name, config)?))
     }
 }
 
@@ -653,7 +658,7 @@ mod tests {
                 object_store: None,
             }),
         };
-        let input = SqlInput::new(config).unwrap();
+        let input = SqlInput::new(None, config).unwrap();
         assert!(input.connect().await.is_ok());
     }
 
@@ -669,7 +674,7 @@ mod tests {
                 object_store: None,
             }),
         };
-        let input = SqlInput::new(config).unwrap();
+        let input = SqlInput::new(None, config).unwrap();
         input.connect().await.unwrap();
 
         let (msg, ack) = input.read().await.unwrap();
@@ -698,7 +703,7 @@ mod tests {
                 object_store: None,
             }),
         };
-        let input = SqlInput::new(config).unwrap();
+        let input = SqlInput::new(None, config).unwrap();
         assert!(input.connect().await.is_err());
     }
 }

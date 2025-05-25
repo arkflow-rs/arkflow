@@ -64,6 +64,7 @@ enum Type {
 
 /// Redis input component
 struct RedisInput {
+    input_name: Option<String>,
     config: RedisInputConfig,
     client: Arc<Mutex<Option<Cli>>>,
     sender: Sender<RedisMsg>,
@@ -83,7 +84,7 @@ enum RedisMsg {
 
 impl RedisInput {
     /// Create a new Redis input component
-    fn new(config: RedisInputConfig) -> Result<Self, Error> {
+    fn new(name: Option<&String>, config: RedisInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
@@ -102,6 +103,7 @@ impl RedisInput {
         };
 
         Ok(Self {
+            input_name: name.cloned(),
             config,
             client: Arc::new(Mutex::new(None)),
             sender,
@@ -347,9 +349,11 @@ impl Input for RedisInput {
 
         match self.receiver.recv_async().await {
             Ok(RedisMsg::Message(_channel, payload)) => {
-                let msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
+                let mut msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
                     Error::Connection(format!("Failed to create message batch: {}", e))
                 })?;
+                msg.set_input_name(self.input_name.clone());
+
                 Ok((msg, Arc::new(NoopAck)))
             }
             Ok(RedisMsg::Err(e)) => Err(e),
@@ -415,14 +419,14 @@ pub struct RedisInputBuilder;
 impl InputBuilder for RedisInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config: RedisInputConfig =
             serde_json::from_value(config.clone().unwrap_or_default())
                 .map_err(|e| Error::Config(format!("Invalid Redis input config: {}", e)))?;
-        Ok(Arc::new(RedisInput::new(config)?))
+        Ok(Arc::new(RedisInput::new(name, config)?))
     }
 }
 

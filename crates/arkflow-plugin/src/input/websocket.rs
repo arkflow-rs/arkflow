@@ -53,6 +53,8 @@ enum WebSocketMsg {
 
 /// WebSocket input component
 pub struct WebSocketInput {
+    #[allow(unused)]
+    input_name: Option<String>,
     config: WebSocketInputConfig,
     sender: Sender<WebSocketMsg>,
     receiver: Receiver<WebSocketMsg>,
@@ -62,10 +64,11 @@ pub struct WebSocketInput {
 
 impl WebSocketInput {
     /// Create a new WebSocket input component
-    pub fn new(config: WebSocketInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: WebSocketInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<WebSocketMsg>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
+            input_name: name.cloned(),
             config,
             sender,
             receiver,
@@ -154,7 +157,9 @@ impl Input for WebSocketInput {
                                     }
                                 };
 
-                                let msg = MessageBatch::new_binary(vec![payload])?;
+                                let mut msg = MessageBatch::new_binary(vec![payload])?;
+                                msg.set_input_name(self.input_name.clone());
+
                                 Ok((msg, Arc::new(NoopAck)))
                             },
                             WebSocketMsg::Err(e) => {
@@ -234,7 +239,7 @@ pub(crate) struct WebSocketInputBuilder;
 impl InputBuilder for WebSocketInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -245,7 +250,7 @@ impl InputBuilder for WebSocketInputBuilder {
         }
 
         let config: WebSocketInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(WebSocketInput::new(config)?))
+        Ok(Arc::new(WebSocketInput::new(name, config)?))
     }
 }
 

@@ -36,13 +36,14 @@ pub struct MemoryInputConfig {
 
 /// Memory input component
 pub struct MemoryInput {
+    input_name: Option<String>,
     queue: Arc<Mutex<VecDeque<MessageBatch>>>,
     connected: AtomicBool,
 }
 
 impl MemoryInput {
     /// Create a new memory input component
-    pub fn new(config: MemoryInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: MemoryInputConfig) -> Result<Self, Error> {
         let mut queue = VecDeque::new();
 
         // If there is an initial message in the configuration, it is added to the queue
@@ -53,6 +54,7 @@ impl MemoryInput {
         }
 
         Ok(Self {
+            input_name: name.cloned(),
             queue: Arc::new(Mutex::new(queue)),
             connected: AtomicBool::new(false),
         })
@@ -86,7 +88,9 @@ impl Input for MemoryInput {
             msg_option = queue.pop_front();
         }
 
-        if let Some(msg) = msg_option {
+        if let Some(mut msg) = msg_option {
+            msg.set_input_name(self.input_name.clone());
+
             Ok((msg, Arc::new(NoopAck)))
         } else {
             Err(Error::EOF)
@@ -104,7 +108,7 @@ pub(crate) struct MemoryInputBuilder;
 impl InputBuilder for MemoryInputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        name: Option<&String>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
@@ -114,7 +118,7 @@ impl InputBuilder for MemoryInputBuilder {
             ));
         }
         let config: MemoryInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MemoryInput::new(config)?))
+        Ok(Arc::new(MemoryInput::new(name, config)?))
     }
 }
 
@@ -130,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_connect() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(config).unwrap();
+        let input = MemoryInput::new(None, config).unwrap();
         assert!(input.connect().await.is_ok());
         assert!(input.connected.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -140,7 +144,7 @@ mod tests {
         let config = MemoryInputConfig {
             messages: Some(vec!["test message".to_string()]),
         };
-        let input = MemoryInput::new(config).unwrap();
+        let input = MemoryInput::new(None, config).unwrap();
         input.connect().await.unwrap();
 
         let (msg, ack) = input.read().await.unwrap();
@@ -155,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_read_not_connected() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(config).unwrap();
+        let input = MemoryInput::new(None, config).unwrap();
 
         let result = input.read().await;
         assert!(result.is_err());
@@ -169,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_close() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(config).unwrap();
+        let input = MemoryInput::new(None, config).unwrap();
         input.connect().await.unwrap();
         assert!(input.close().await.is_ok());
         assert!(!input.connected.load(std::sync::atomic::Ordering::SeqCst));

@@ -37,6 +37,7 @@ pub mod stream;
 pub mod temporary;
 
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
+pub const DEFAULT_INPUT_NAME_FIELD: &str = "__input_name__";
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
@@ -81,7 +82,10 @@ pub type Bytes = Vec<u8>;
 
 /// Represents a message in a stream processing engine.
 #[derive(Clone, Debug)]
-pub struct MessageBatch(pub RecordBatch);
+pub struct MessageBatch {
+    record_batch: RecordBatch,
+    input_name: Option<String>,
+}
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
@@ -101,7 +105,14 @@ impl MessageBatch {
         let batch = RecordBatch::try_new(schema, columns)
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
 
-        Ok(Self(batch))
+        Ok(Self {
+            record_batch: batch,
+            input_name: None,
+        })
+    }
+
+    pub fn set_input_name(&mut self, input_name: Option<String>) {
+        self.input_name = input_name;
     }
 
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {
@@ -160,7 +171,10 @@ impl MessageBatch {
     }
 
     pub fn new_arrow(content: RecordBatch) -> Self {
-        Self(content)
+        Self {
+            record_batch: content,
+            input_name: None,
+        }
     }
 
     /// Create a message from a string.
@@ -173,11 +187,11 @@ impl MessageBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.0.num_rows()
+        self.record_batch.num_rows()
     }
 
     pub fn to_binary(&self, name: &str) -> Result<Vec<&[u8]>, Error> {
-        let Some(array_ref) = self.0.column_by_name(name) else {
+        let Some(array_ref) = self.record_batch.column_by_name(name) else {
             return Err(Error::Process("not found column".to_string()));
         };
 
@@ -204,19 +218,22 @@ impl Deref for MessageBatch {
     type Target = RecordBatch;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.record_batch
     }
 }
 
 impl From<RecordBatch> for MessageBatch {
     fn from(batch: RecordBatch) -> Self {
-        Self(batch)
+        Self {
+            record_batch: batch,
+            input_name: None,
+        }
     }
 }
 
 impl From<MessageBatch> for RecordBatch {
     fn from(batch: MessageBatch) -> Self {
-        batch.0
+        batch.record_batch
     }
 }
 
@@ -246,6 +263,6 @@ impl TryFrom<Vec<&str>> for MessageBatch {
 
 impl DerefMut for MessageBatch {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.record_batch
     }
 }
