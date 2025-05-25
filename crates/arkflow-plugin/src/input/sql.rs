@@ -227,7 +227,6 @@ struct MicrosoftAzureConfig {
     access_key: Option<String>,
     /// Azure container name
     container_name: String,
-    sas_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
