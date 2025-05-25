@@ -184,9 +184,9 @@ struct PostgresSslConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ObjectStore {
     S3(AwsS3Config),
-    GS(GoogleCloudStorageConfig),
-    AZ(MicrosoftAzureConfig),
-    HTTP(HttpConfig),
+    Gs(GoogleCloudStorageConfig),
+    Az(MicrosoftAzureConfig),
+    Http(HttpConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,9 +479,9 @@ impl SqlInput {
     fn object_store(&self, ctx: &SessionContext, object_store: &ObjectStore) -> Result<(), Error> {
         match object_store {
             ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
-            ObjectStore::GS(config) => self.google_cloud_storage(ctx, config),
-            ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config),
-            ObjectStore::HTTP(config) => self.http_store(ctx, config),
+            ObjectStore::Gs(config) => self.google_cloud_storage(ctx, config),
+            ObjectStore::Az(config) => self.microsoft_azure_store(ctx, config),
+            ObjectStore::Http(config) => self.http_store(ctx, config),
         }
     }
 
