@@ -40,6 +40,8 @@ struct TumblingWindowConfig {
     /// When this interval elapses, all accumulated messages are emitted
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
+    /// Optional join configuration for SQL join operations on message batches
+    /// When specified, allows joining multiple message sources using SQL queries
     join: Option<JoinConfig>,
 }
 

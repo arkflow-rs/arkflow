@@ -41,6 +41,8 @@ struct SessionWindowConfig {
     /// If no new messages arrive within this duration, the session is considered complete
     #[serde(deserialize_with = "deserialize_duration")]
     gap: time::Duration,
+    /// Optional join configuration for SQL join operations on message batches
+    /// When specified, allows joining multiple message sources using SQL queries
     join: Option<JoinConfig>,
 }
 
