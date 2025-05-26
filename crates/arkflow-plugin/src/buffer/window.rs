@@ -89,7 +89,7 @@ impl BaseWindow {
             let size = queue_lock.len();
             let mut messages = Vec::with_capacity(size);
             let mut acks = Vec::with_capacity(size);
-            while let Some((msg, ack)) = queue_lock.pop_back() {
+            while let Some((msg, ack)) = queue_lock.pop_front() {
                 messages.push(msg);
                 acks.push(ack);
             }
@@ -155,13 +155,13 @@ impl BaseWindow {
         if !queue_arc.is_empty() {
             false
         } else {
-            let mut cnt = 0u64;
             for (_, q) in queue_arc.iter() {
                 let q = Arc::clone(&q);
-                cnt += q.read().await.len() as u64;
+                if !q.read().await.is_empty() {
+                    return false;
+                };
             }
-
-            cnt != 0
+            true
         }
     }
 
