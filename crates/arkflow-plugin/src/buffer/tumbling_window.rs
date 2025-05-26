@@ -104,7 +104,7 @@ impl Buffer for TumblingWindow {
         loop {
             {
                 // If there are messages available, break the loop and process them
-                if !!self.base_window.queue_is_empty().await {
+                if !self.base_window.queue_is_empty().await {
                     break;
                 }
                 // If the buffer is closed, return None
