@@ -44,12 +44,6 @@ struct SessionWindowConfig {
     join: Option<JoinConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InputSourceConfig {
-    input_name: String,
-    table_name: String,
-}
-
 /// Session window buffer implementation
 /// Groups messages into sessions based on timing gaps between messages
 struct SessionWindow {
