@@ -11,7 +11,14 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use crate::udf;
+use arkflow_core::Error;
+use datafusion::prelude::SessionContext;
 
-pub mod json;
-pub mod redis;
-pub mod sql;
+pub(crate) fn create_session_context() -> Result<SessionContext, Error> {
+    let mut ctx = SessionContext::new();
+    udf::init(&mut ctx)?;
+    datafusion_functions_json::register_all(&mut ctx)
+        .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+    Ok(ctx)
+}

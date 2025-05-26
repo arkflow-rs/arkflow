@@ -76,7 +76,7 @@ object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
 
 
 once_cell = "1.19.0"
-
+dashmap = "6.1.0"
 futures = { workspace = true }
 tokio-stream = "0.1.17"
 url = "2.5.4"

@@ -27,6 +27,7 @@ struct MultipleInputsConfig {
 }
 
 struct MultipleInputs {
+    #[allow(unused)]
     input_name: Option<String>,
     inputs: Vec<Arc<dyn Input>>,
     sender: Sender<Msg>,

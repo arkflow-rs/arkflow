@@ -19,20 +19,18 @@
 //! period elapses, all accumulated messages are emitted as a single batch and a new
 //! window begins immediately.
 
+use crate::buffer::join::JoinConfig;
+use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
-use arkflow_core::input::{Ack, VecAck};
+use arkflow_core::input::Ack;
 use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow;
-use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time;
-use tokio::sync::{Notify, RwLock};
-use tokio::time::sleep;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// Configuration for the tumbling window buffer
@@ -42,13 +40,14 @@ struct TumblingWindowConfig {
     /// When this interval elapses, all accumulated messages are emitted
     #[serde(deserialize_with = "deserialize_duration")]
     interval: time::Duration,
+    join: Option<JoinConfig>,
 }
 
 /// Tumbling window buffer implementation
 /// Groups messages into fixed-size, non-overlapping time windows
 struct TumblingWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
-    queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    base_window: BaseWindow,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -69,64 +68,13 @@ impl TumblingWindow {
         let interval = config.interval;
         let close = CancellationToken::new();
         let close_clone = close.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let timer = sleep(interval);
-                tokio::select! {
-                    _ = timer => {
-                        notify_clone.notify_waiters();
-                    }
-                    _ = close_clone.cancelled() => {
-                        notify_clone.notify_waiters();
-                        break;
-                    }
-                    _ = notify_clone.notified() => {
-                        if close_clone.is_cancelled(){
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        let base_window = BaseWindow::new(config.join.clone(), notify_clone, close_clone, interval);
 
         Ok(Self {
             close,
             notify,
-            queue: Arc::new(Default::default()),
+            base_window,
         })
-    }
-
-    /// Processes the current window by merging all accumulated messages
-    ///
-    /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
-    ///   or None if the queue is empty
-    async fn process_window(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
-        let mut queue_lock = self.queue.write().await;
-        if queue_lock.is_empty() {
-            return Ok(None);
-        }
-        let size = queue_lock.len();
-        let mut messages = Vec::with_capacity(size);
-        let mut acks = Vec::with_capacity(size);
-
-        while let Some((msg, ack)) = queue_lock.pop_back() {
-            messages.push(msg);
-            acks.push(ack);
-        }
-
-        if messages.is_empty() {
-            return Ok(None);
-        }
-
-        let schema = messages[0].schema();
-        let batches: Vec<RecordBatch> = messages.into_iter().map(|batch| batch.into()).collect();
-        let new_batch = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-
-        let new_ack = Arc::new(VecAck(acks));
-        Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
     }
 }
 
@@ -141,9 +89,7 @@ impl Buffer for TumblingWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
-        let mut queue_lock = self.queue.write().await;
-        queue_lock.push_front((msg, ack));
-        Ok(())
+        self.base_window.write(msg, ack).await
     }
 
     /// Reads a message batch from the tumbling window buffer
@@ -155,10 +101,8 @@ impl Buffer for TumblingWindow {
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
         loop {
             {
-                let queue_arc = Arc::clone(&self.queue);
-                let queue_lock = queue_arc.read().await;
                 // If there are messages available, break the loop and process them
-                if !queue_lock.is_empty() {
+                if !!self.base_window.queue_is_empty().await {
                     break;
                 }
                 // If the buffer is closed, return None
@@ -171,7 +115,7 @@ impl Buffer for TumblingWindow {
             notify.notified().await;
         }
         // Process and return the current window
-        self.process_window().await
+        self.base_window.process_window().await
     }
 
     /// Flushes the buffer by cancelling the background task and notifying waiters
@@ -179,15 +123,7 @@ impl Buffer for TumblingWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
-        self.close.cancel();
-        let queue_arc = Arc::clone(&self.queue);
-        let queue_lock = queue_arc.read().await;
-        if !queue_lock.is_empty() {
-            // Notify any waiting readers to process remaining messages
-            let notify = Arc::clone(&self.notify);
-            notify.notify_waiters();
-        }
-        Ok(())
+        self.base_window.flush().await
     }
 
     /// Closes the buffer by cancelling the background task
@@ -195,8 +131,7 @@ impl Buffer for TumblingWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
-        self.close.cancel();
-        Ok(())
+        self.base_window.close().await
     }
 }
 

@@ -114,6 +114,10 @@ impl MessageBatch {
         self.input_name = input_name;
     }
 
+    pub fn get_input_name(&self) -> Option<String> {
+        self.input_name.clone()
+    }
+
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {
         let schema = self.schema();
         let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
