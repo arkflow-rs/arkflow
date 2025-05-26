@@ -57,7 +57,7 @@ impl JoinConfig {
         }
 
         Ok(
-            arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
+            arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
                 .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
     }
