@@ -183,3 +183,62 @@ impl BufferBuilder for SessionWindowBuilder {
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("session_window", Arc::new(SessionWindowBuilder))
 }
+
+/// 生成测试用的Arrow数据
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::input::NoopAck;
+    use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::time::Duration;
+    use tracing::info;
+    use std::io::Write;
+
+    fn generate_arrow_data(n: String) -> Result<RecordBatch, Error> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec![
+            format!("Alice{}", &n),
+            format!("Bob{}", &n),
+            format!("Charlie{}", &n),
+        ]);
+
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
+            .map_err(|e| Error::Process(e.to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_session_window_buffer() {
+        let window = SessionWindow::new(SessionWindowConfig {
+            gap: Duration::from_secs(5),
+            join: Some(JoinConfig {
+                query: "SELECT  * FROM input1 JOIN input2 ON input1.id = input2.id".to_string(),
+            }),
+        })
+        .unwrap();
+        let mut message_batch1 =
+            MessageBatch::new_arrow(generate_arrow_data("1".to_string()).unwrap());
+        message_batch1.set_input_name(Some("input1".to_string()));
+        window
+            .write(message_batch1, Arc::new(NoopAck))
+            .await
+            .unwrap();
+
+        let mut message_batch2 =
+            MessageBatch::new_arrow(generate_arrow_data("2".to_string()).unwrap());
+        message_batch2.set_input_name(Some("input2".to_string()));
+        window
+            .write(message_batch2, Arc::new(NoopAck))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (batch, _) = window.read().await.unwrap().unwrap();
+
+    }
+}
