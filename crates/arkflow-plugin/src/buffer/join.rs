@@ -20,6 +20,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinConfig {
@@ -41,6 +42,8 @@ impl JoinOperation {
         ctx: &SessionContext,
         table_sources: Vec<MessageBatch>,
     ) -> Result<RecordBatch, Error> {
+        info!("Join operation ====> 1");
+
         let table_sources = stream::iter(table_sources)
             .map(|x| self.decode_batch(x))
             .buffer_unordered(num_cpus::get())
@@ -57,14 +60,30 @@ impl JoinOperation {
                 .map_err(|e| Error::Process(format!("Failed to register table source: {}", e)))?;
         }
 
-        let df = ctx
-            .sql(&self.query)
-            .await
-            .map_err(|e| Error::Process(format!("Failed to execute SQL query: {}", e)))?;
+        info!("Join operation ====> 2");
+
+        // let df = ctx
+        //     .sql(&self.query)
+        //     .await
+        //     .map_err(|e| Error::Process(format!("Failed to execute SQL query: {}", e)))?;
+
+        let df = match ctx.sql(&self.query).await {
+            Ok(df) => df,
+            Err(e) => {
+                info!(
+                    "Join operation ====> 2  ===> Failed to execute SQL query ,{}",
+                    e
+                );
+                return Err(Error::Process("Failed to execute SQL query".to_string()));
+            }
+        };
+
         let result_batches = df
             .collect()
             .await
             .map_err(|e| Error::Process(format!("Failed to collect query result: {}", e)))?;
+        info!("Join operation ====> 3  ===> {}", result_batches.is_empty());
+
         if result_batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
@@ -81,6 +100,9 @@ impl JoinOperation {
 
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
         let codec = Arc::clone(&self.codec);
-        codec.decode(batch)
+        let option = batch.get_input_name();
+        let mut result = codec.decode(batch)?;
+        result.set_input_name(option);
+        Ok(result)
     }
 }

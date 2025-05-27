@@ -126,13 +126,6 @@ impl Buffer for SessionWindow {
                     // Check if the session gap has elapsed since the last message
                     let duration = last_time.elapsed();
                     if duration >= self.config.gap {
-                        writeln!(
-                            std::io::stdout(),
-                            "======> last_time.elapsed(), {:?} duration: {:?}",
-                            last_time,
-                            duration
-                        )
-                        .unwrap();
                         break;
                     }
                 } else if self.close.is_cancelled() {

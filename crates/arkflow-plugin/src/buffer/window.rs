@@ -23,6 +23,7 @@ use std::time;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 pub(crate) struct BaseWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
@@ -137,6 +138,8 @@ impl BaseWindow {
                 Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
             }
             Some(join_config) => {
+                info!("Join operation");
+
                 let ctx = component::sql::create_session_context()?;
                 let new_batch = join_config.join_operation(&ctx, all_messages).await?;
                 Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
