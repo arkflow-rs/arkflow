@@ -28,12 +28,12 @@ use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use std::sync::Arc;
 use std::time;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-
 /// Configuration for the session window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionWindowConfig {
@@ -116,7 +116,15 @@ impl Buffer for SessionWindow {
                 if !self.base_window.queue_is_empty().await {
                     let last_time = *self.last_message_time.read().await;
                     // Check if the session gap has elapsed since the last message
-                    if last_time.elapsed() >= self.config.gap {
+                    let duration = last_time.elapsed();
+                    if duration >= self.config.gap {
+                        writeln!(
+                            std::io::stdout(),
+                            "======> last_time.elapsed(), {:?} duration: {:?}",
+                            last_time,
+                            duration
+                        )
+                        .unwrap();
                         break;
                     }
                 } else if self.close.is_cancelled() {
@@ -193,8 +201,6 @@ mod tests {
     use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::time::Duration;
-    use tracing::info;
-    use std::io::Write;
 
     fn generate_arrow_data(n: String) -> Result<RecordBatch, Error> {
         let schema = Arc::new(Schema::new(vec![
@@ -215,10 +221,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_window_buffer() {
+        let start_time = Instant::now();
         let window = SessionWindow::new(SessionWindowConfig {
             gap: Duration::from_secs(5),
             join: Some(JoinConfig {
-                query: "SELECT  * FROM input1 JOIN input2 ON input1.id = input2.id".to_string(),
+                query: "SELECT input1.id, input1.name AS name1, input2.name AS name2 FROM input1 JOIN input2 ON input1.id = input2.id".to_string(),
             }),
         })
         .unwrap();
@@ -237,8 +244,9 @@ mod tests {
             .write(message_batch2, Arc::new(NoopAck))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_secs(6)).await;
         let (batch, _) = window.read().await.unwrap().unwrap();
-
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 3);
+        assert!(start_time.elapsed() < Duration::from_secs(6));
     }
 }
