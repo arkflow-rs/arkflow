@@ -4,26 +4,27 @@ streams:
   - input:
       type: "multiple_inputs"
       inputs:
-        - type: "mqtt"
+        - type: "generate"
           name: "flow_input1"
-          host: "broker.emqx.io"
-          port: 1883
-          qos: 1
-          client_id: "flow_input1"
-          topics: [ "flow_input1/#" ]
-        - type: "mqtt"
+          context: '{ "id": 1625000000000, "value": 10, "sensor": "temp_1" }'
+          interval: 1ns
+          batch_size: 1
+          count: 10
+        - type: "generate"
           name: "flow_input2"
-          host: "broker.emqx.io"
-          port: 1883
-          qos: 1
-          client_id: "flow_input2"
-          topics: [ "flow_input2/#" ]
+          context: '{ "id": 1625000000000, "value": 20, "sensor": "temp_2" }'
+          interval: 1ns
+          batch_size: 1
+          count: 10
+
 
       buffer:
         type: "session_window"
         gap: 5s
         join:
           query: "SELECT * FROM flow_input1 join flow_input2 on (flow_input1.id = flow_input2.id)"
+          codec:
+            type: "json"
     pipeline:
       processors:
         - type: "json_to_arrow"

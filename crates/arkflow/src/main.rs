@@ -13,7 +13,7 @@
  */
 
 use arkflow_core::cli::Cli;
-use arkflow_plugin::{buffer, input, output, processor, temporary};
+use arkflow_plugin::{buffer, codec, input, output, processor, temporary};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     processor::init()?;
     buffer::init()?;
     temporary::init()?;
-
+    codec::init()?;
     let mut cli = Cli::default();
     cli.parse()?;
     cli.run().await

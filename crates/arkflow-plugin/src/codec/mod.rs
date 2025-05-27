@@ -11,4 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::Error;
+
 mod json;
+
+pub fn init() -> Result<(), Error> {
+    json::init()?;
+    Ok(())
+}

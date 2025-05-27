@@ -12,9 +12,13 @@
  *    limitations under the License.
  */
 use crate::component;
-use arkflow_core::codec::Codec;
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::codec::{Codec, CodecBuilder};
+use arkflow_core::{codec, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonCodecConfig {
     value_field: Option<String>,
 }
@@ -40,4 +44,34 @@ impl Codec for JsonCodec {
         let arrow = component::json::try_to_arrow(&json_data, None)?;
         Ok(MessageBatch::new_arrow(arrow))
     }
+}
+
+impl JsonCodec {
+    fn new(config: JsonCodecConfig) -> Result<Self, Error> {
+        Ok(JsonCodec { config })
+    }
+}
+
+struct JsonCodecBuilder;
+impl CodecBuilder for JsonCodecBuilder {
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<Value>,
+        resource: &Resource,
+    ) -> Result<Arc<dyn Codec>, Error> {
+        if config.is_none() {
+            return Err(Error::Config(
+                "Json codec configuration is missing".to_string(),
+            ));
+        }
+
+        let config: JsonCodecConfig = serde_json::from_value(config.clone().unwrap())?;
+        Ok(Arc::new(JsonCodec::new(config)?))
+    }
+}
+
+pub(crate) fn init() -> Result<(), Error> {
+    codec::register_codec_builder("json", Arc::new(JsonCodecBuilder))?;
+    Ok(())
 }
