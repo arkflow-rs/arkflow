@@ -383,29 +383,40 @@ impl Stream {
 
     async fn close(&mut self) -> Result<(), Error> {
         // Closing order: input -> pipeline -> buffer -> output -> error output
+        info!("input close...");
         if let Err(e) = self.input.close().await {
             error!("Failed to close input: {}", e);
         }
+        info!("input closed");
 
-        if let Err(e) = self.pipeline.close().await {
-            error!("Failed to close pipeline: {}", e);
-        }
-
+        info!("buffer close...");
         if let Some(buffer) = &self.buffer {
             if let Err(e) = buffer.close().await {
                 error!("Failed to close buffer: {}", e);
             }
         }
+        info!("buffer closed");
 
+        info!("pipeline close...");
+        if let Err(e) = self.pipeline.close().await {
+            error!("Failed to close pipeline: {}", e);
+        }
+        info!("pipeline closed");
+
+        info!("output close...");
         if let Err(e) = self.output.close().await {
             error!("Failed to close output: {}", e);
         }
+        info!("output closed");
 
+        info!("error output close...");
         if let Some(error_output) = &self.error_output {
             if let Err(e) = error_output.close().await {
                 error!("Failed to close error output: {}", e);
             }
         }
+        info!("error output closed");
+
         Ok(())
     }
 }

@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-
+use tracing::info;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipleInputsConfig {
     inputs: Vec<InputConfig>,
@@ -55,36 +55,39 @@ impl Input for MultipleInputs {
             self.task_tracker.spawn(async move {
                 loop {
                     tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        return;
-                    }
-                    result = input.read() => {
-                        match result {
-                            Ok((batch, ack)) => {
-                                if let Err(_) = sender.send_async(Msg::Message(batch, ack)).await {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                match e {
-                                    Error::Disconnection => {
-                                        let _ = sender.send_async(Msg::Err(e)).await;
+                        _ = cancellation_token.cancelled() => {
+                            info!("MultipleInputs input disconnected");
+                            return;
+                        }
+                        result = input.read() => {
+                            match result {
+                                Ok((batch, ack)) => {
+                                    if let Err(_) = sender.send_async(Msg::Message(batch, ack)).await {
                                         return;
                                     }
-                                    _ => {
-                                        if let Err(_) = sender.send_async(Msg::Err(e)).await {
+                                }
+                                Err(e) => {
+                                    match e {
+                                        Error::Disconnection => {
+                                            let _ = sender.send_async(Msg::Err(e)).await;
                                             return;
+                                        }
+                                        _ => {
+                                            if let Err(_) = sender.send_async(Msg::Err(e)).await {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                }
+                    }
                 }
             });
         }
+
+        self.task_tracker.close();
 
         Ok(())
     }
@@ -106,10 +109,11 @@ impl Input for MultipleInputs {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
-        self.task_tracker.wait().await;
         for input in &self.inputs {
             input.close().await?;
         }
+        // self.task_tracker.wait().await;
+
         Ok(())
     }
 }
