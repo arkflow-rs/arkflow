@@ -64,13 +64,19 @@ impl TumblingWindow {
     ///
     /// # Returns
     /// * `Result<Self, Error>` - A new tumbling window instance or an error
-    fn new(config: TumblingWindowConfig) -> Result<Self, Error> {
+    fn new(config: TumblingWindowConfig, resource: &Resource) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
         let interval = config.interval;
         let close = CancellationToken::new();
         let close_clone = close.clone();
-        let base_window = BaseWindow::new(config.join.clone(), notify_clone, close_clone, interval);
+        let base_window = BaseWindow::new(
+            config.join.clone(),
+            notify_clone,
+            close_clone,
+            interval,
+            resource,
+        )?;
 
         Ok(Self {
             close,
@@ -151,7 +157,7 @@ impl BufferBuilder for TumblingWindowBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<Value>,
-        _resource: &Resource,
+        resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -160,7 +166,7 @@ impl BufferBuilder for TumblingWindowBuilder {
         }
 
         let config: TumblingWindowConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(TumblingWindow::new(config)?))
+        Ok(Arc::new(TumblingWindow::new(config, resource)?))
     }
 }
 

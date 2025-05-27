@@ -11,26 +11,43 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::codec::{Codec, CodecConfig};
 use arkflow_core::{Error, MessageBatch};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::prelude::SessionContext;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinConfig {
     pub(crate) query: String,
+    pub(crate) codec: CodecConfig,
 }
 
-impl JoinConfig {
+pub struct JoinOperation {
+    query: String,
+    codec: Arc<dyn Codec>,
+}
+impl JoinOperation {
+    pub fn new(query: String, codec: Arc<dyn Codec>) -> Result<Self, Error> {
+        Ok(Self { query, codec })
+    }
+
     pub async fn join_operation(
+        &self,
         ctx: &SessionContext,
-        query: &str,
         table_sources: Vec<MessageBatch>,
     ) -> Result<RecordBatch, Error> {
+        let table_sources = stream::iter(table_sources)
+            .map(|x| self.decode_batch(x))
+            .buffer_unordered(num_cpus::get())
+            .collect::<Vec<Result<MessageBatch, Error>>>()
+            .await;
         for x in table_sources {
+            let x = x?;
             let input_name_opt = x.get_input_name();
             let Some(input_name) = input_name_opt else {
                 continue;
@@ -41,7 +58,7 @@ impl JoinConfig {
         }
 
         let df = ctx
-            .sql(query)
+            .sql(&self.query)
             .await
             .map_err(|e| Error::Process(format!("Failed to execute SQL query: {}", e)))?;
         let result_batches = df
@@ -60,5 +77,10 @@ impl JoinConfig {
             arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
                 .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
+    }
+
+    async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
+        let codec = Arc::clone(&self.codec);
+        codec.decode(batch)
     }
 }

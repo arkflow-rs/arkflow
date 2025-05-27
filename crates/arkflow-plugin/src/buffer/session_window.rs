@@ -23,6 +23,7 @@ use crate::buffer::join::JoinConfig;
 use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
+use arkflow_core::codec::CodecConfig;
 use arkflow_core::input::Ack;
 use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ use std::time;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
 /// Configuration for the session window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionWindowConfig {
@@ -68,14 +70,20 @@ impl SessionWindow {
     ///
     /// # Returns
     /// * `Result<Self, Error>` - A new session window instance or an error
-    fn new(config: SessionWindowConfig) -> Result<Self, Error> {
+    fn new(config: SessionWindowConfig, resource: &Resource) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
         let gap = config.gap;
         let close = CancellationToken::new();
         let close_clone = close.clone();
         let last_message_time = Arc::new(RwLock::new(Instant::now()));
-        let base_window = BaseWindow::new(config.join.clone(), notify_clone, close_clone, gap);
+        let base_window = BaseWindow::new(
+            config.join.clone(),
+            notify_clone,
+            close_clone,
+            gap,
+            resource,
+        )?;
 
         Ok(Self {
             close,
@@ -171,7 +179,7 @@ impl BufferBuilder for SessionWindowBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<Value>,
-        _resource: &Resource,
+        resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -180,7 +188,7 @@ impl BufferBuilder for SessionWindowBuilder {
         }
 
         let config: SessionWindowConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SessionWindow::new(config)?))
+        Ok(Arc::new(SessionWindow::new(config, resource)?))
     }
 }
 
@@ -226,8 +234,13 @@ mod tests {
             gap: Duration::from_secs(5),
             join: Some(JoinConfig {
                 query: "SELECT input1.id, input1.name AS name1, input2.name AS name2 FROM input1 JOIN input2 ON input1.id = input2.id".to_string(),
+                codec: CodecConfig {
+                    codec_type: "json".to_string(),
+                    name: None,
+                    config: None,
+                },
             }),
-        })
+        }, &Resource { temporary: Default::default() })
         .unwrap();
         let mut message_batch1 =
             MessageBatch::new_arrow(generate_arrow_data("1".to_string()).unwrap());

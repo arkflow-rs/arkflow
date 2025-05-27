@@ -27,6 +27,7 @@ use thiserror::Error;
 
 pub mod buffer;
 pub mod cli;
+pub mod codec;
 pub mod config;
 pub mod engine;
 pub mod input;

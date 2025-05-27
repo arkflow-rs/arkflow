@@ -11,10 +11,10 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use crate::buffer::join::JoinConfig;
+use crate::buffer::join::{JoinConfig, JoinOperation};
 use crate::component;
 use arkflow_core::input::{Ack, VecAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use std::collections::{HashMap, VecDeque};
@@ -31,7 +31,8 @@ pub(crate) struct BaseWindow {
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
     close: CancellationToken,
-    join_config: Option<JoinConfig>,
+    // join_config: Option<JoinConfig>,
+    join_operation: Option<JoinOperation>,
 }
 impl BaseWindow {
     pub(crate) fn new(
@@ -39,7 +40,8 @@ impl BaseWindow {
         notify: Arc<Notify>,
         close: CancellationToken,
         gap: time::Duration,
-    ) -> Self {
+        resource: &Resource,
+    ) -> Result<Self, Error> {
         let notify_clone = Arc::clone(&notify);
         let close_clone = close.clone();
         tokio::spawn(async move {
@@ -62,12 +64,19 @@ impl BaseWindow {
             }
         });
 
-        Self {
-            join_config,
+        let join_operation = join_config
+            .map(|config| {
+                let codec = config.codec.build(resource)?;
+                JoinOperation::new(config.query, codec)
+            })
+            .transpose()?;
+
+        Ok(Self {
+            join_operation,
             queue: Arc::new(RwLock::new(HashMap::new())),
             notify,
             close,
-        }
+        })
     }
 
     pub(crate) async fn process_window(
@@ -112,7 +121,7 @@ impl BaseWindow {
 
         let new_ack = Arc::new(VecAck(all_acks));
 
-        match &self.join_config {
+        match &self.join_operation {
             None => {
                 let schema = all_messages[0].schema();
                 let batches: Vec<RecordBatch> =
@@ -129,8 +138,7 @@ impl BaseWindow {
             }
             Some(join_config) => {
                 let ctx = component::sql::create_session_context()?;
-                let new_batch =
-                    JoinConfig::join_operation(&ctx, &join_config.query, all_messages).await?;
+                let new_batch = join_config.join_operation(&ctx, all_messages).await?;
                 Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
             }
         }

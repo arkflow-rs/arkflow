@@ -1,0 +1,34 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "multiple_inputs"
+      inputs:
+        - type: "mqtt"
+          name: "flow_input1"
+          host: "broker.emqx.io"
+          port: 1883
+          qos: 1
+          client_id: "flow_input1"
+          topics: [ "flow_input1/#" ]
+        - type: "mqtt"
+          name: "flow_input2"
+          host: "broker.emqx.io"
+          port: 1883
+          qos: 1
+          client_id: "flow_input2"
+          topics: [ "flow_input2/#" ]
+
+      buffer:
+        type: "session_window"
+        gap: 5s
+        join:
+          query: "SELECT * FROM flow_input1 join flow_input2 on (flow_input1.id = flow_input2.id)"
+    pipeline:
+      processors:
+        - type: "json_to_arrow"
+
+
+
+    output:
+      type: "stdout"
