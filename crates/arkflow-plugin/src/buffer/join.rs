@@ -21,6 +21,7 @@ use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::trace;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinConfig {
@@ -64,8 +65,7 @@ impl JoinOperation {
             let Some(input_name) = input_name_opt else {
                 continue;
             };
-            let x1 = x.into();
-            ctx.register_batch(&input_name, x1)
+            ctx.register_batch(&input_name, x.into())
                 .map_err(|e| Error::Process(format!("Failed to register table source: {}", e)))?;
             current_input_names.push(input_name);
         }
@@ -75,6 +75,7 @@ impl JoinOperation {
             .iter()
             .all(|x| current_input_names.contains(x))
         {
+            trace!("Data ignored, data table missing, SQL unable to execute",);
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         };
 

@@ -129,6 +129,11 @@ impl MultipleInputs {
         let mut input_names_mut = resource.input_names.borrow_mut();
         for x in config.inputs {
             if let Some(name) = &x.name {
+                if name.is_empty() {
+                    return Err(Error::Config(
+                        "Multiple-inputs input configuration has empty input name".to_string(),
+                    ));
+                }
                 input_names_mut.push(name.clone());
             }
             inputs.push(x.build(resource)?);
