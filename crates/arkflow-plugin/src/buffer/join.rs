@@ -37,7 +37,7 @@ pub struct JoinOperation {
 impl JoinOperation {
     pub fn new(
         query: String,
-        codec: Arc<dyn Codec>,
+        codec: Arc<dyn Decoder>,
         input_names: HashSet<String>,
     ) -> Result<Self, Error> {
         Ok(Self {
