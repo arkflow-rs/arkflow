@@ -167,17 +167,17 @@ impl BaseWindow {
     pub(crate) async fn queue_is_empty(&self) -> bool {
         let queue_arc = Arc::clone(&self.queue);
         let queue_arc = queue_arc.read().await;
-        if !queue_arc.is_empty() {
-            false
-        } else {
-            for (_, q) in queue_arc.iter() {
-                let q = Arc::clone(&q);
-                if !q.read().await.is_empty() {
-                    return false;
-                };
-            }
-            true
+        if queue_arc.is_empty() {
+            return true;
         }
+
+        for (_, q) in queue_arc.iter() {
+            let q = Arc::clone(&q);
+            if !q.read().await.is_empty() {
+                return false;
+            };
+        }
+        true
     }
 
     pub(crate) async fn flush(&self) -> Result<(), Error> {
