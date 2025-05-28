@@ -20,10 +20,18 @@ lazy_static::lazy_static! {
     static ref CODEC_BUILDERS: RwLock<HashMap<String, Arc<dyn CodecBuilder>>> = RwLock::new(HashMap::new());
 }
 
-pub trait Codec: Send + Sync {
+pub trait Encoder: Send + Sync {
     fn encode(&self, b: MessageBatch) -> Result<MessageBatch, Error>;
+}
+
+pub trait Decoder: Send + Sync {
     fn decode(&self, b: MessageBatch) -> Result<MessageBatch, Error>;
 }
+
+pub trait Codec: Encoder + Decoder {}
+
+// Implement the Codec trait for any type that implements Encoder and Decoder
+impl<T> Codec for T where T: Encoder + Decoder {}
 
 pub trait CodecBuilder: Send + Sync {
     fn build(

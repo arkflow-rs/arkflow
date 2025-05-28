@@ -12,8 +12,9 @@
  *    limitations under the License.
  */
 use crate::component;
-use arkflow_core::codec::{Codec, CodecBuilder};
-use arkflow_core::{codec, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
+use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use datafusion::arrow;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -22,16 +23,33 @@ use std::sync::Arc;
 struct JsonCodecConfig {
     value_field: Option<String>,
 }
+
 struct JsonCodec {
     config: JsonCodecConfig,
 }
 
-impl Codec for JsonCodec {
-    fn encode(&self, _b: MessageBatch) -> Result<MessageBatch, Error> {
-        // let json_data = component::json(&b)?;
-        todo!()
-    }
+impl Encoder for JsonCodec {
+    fn encode(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
+        let mut buf = Vec::new();
+        let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
+        writer
+            .write(&batch)
+            .map_err(|e| Error::Process(format!("Arrow JSON Serialization error: {}", e)))?;
+        writer.finish().map_err(|e| {
+            Error::Process(format!("Arrow JSON Serialization Complete Error: {}", e))
+        })?;
+        let json_str = String::from_utf8(buf)
+            .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
+        let new_batch: Vec<Bytes> = json_str.lines().map(|s| s.as_bytes().to_vec()).collect();
 
+        Ok(MessageBatch::new_binary_with_field_name(
+            new_batch,
+            self.config.value_field.as_deref(),
+        )?)
+    }
+}
+
+impl Decoder for JsonCodec {
     fn decode(&self, b: MessageBatch) -> Result<MessageBatch, Error> {
         let result = b.to_binary(
             self.config

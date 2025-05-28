@@ -92,8 +92,14 @@ pub struct MessageBatch {
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
+        Self::new_binary_with_field_name(content, None)
+    }
+    pub fn new_binary_with_field_name(
+        content: Vec<Bytes>,
+        field_name: Option<&str>,
+    ) -> Result<Self, Error> {
         let fields = vec![Field::new(
-            DEFAULT_BINARY_VALUE_FIELD,
+            field_name.unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
             DataType::Binary,
             false,
         )];

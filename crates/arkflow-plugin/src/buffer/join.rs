@@ -11,7 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use arkflow_core::codec::{Codec, CodecConfig};
+use arkflow_core::codec::{Codec, CodecConfig, Decoder};
 use arkflow_core::{Error, MessageBatch};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -30,7 +30,7 @@ pub(crate) struct JoinConfig {
 
 pub struct JoinOperation {
     query: String,
-    codec: Arc<dyn Codec>,
+    codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
 }
 impl JoinOperation {
@@ -104,6 +104,7 @@ impl JoinOperation {
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
         let codec = Arc::clone(&self.codec);
         let option = batch.get_input_name();
+
         let mut result = codec.decode(batch)?;
         result.set_input_name(option);
         Ok(result)
