@@ -11,7 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use arkflow_core::codec::{Codec, CodecConfig, Decoder};
+use arkflow_core::codec::{CodecConfig, Decoder};
 use arkflow_core::{Error, MessageBatch};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
