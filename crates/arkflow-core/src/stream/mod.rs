@@ -20,6 +20,7 @@ use crate::buffer::Buffer;
 use crate::input::Ack;
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
 use flume::{Receiver, Sender};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -218,13 +219,16 @@ impl Stream {
                 },
                 result = buffer.read() =>{
                     match result {
-                    Ok(Some(v)) => {
-                         if let Err(e) = input_sender.send_async(v).await {
-                                error!("Failed to send input message: {}", e);
-                                break;
-                            }
-                    }
-                    _ => {}
+                        Ok(Some(v)) => {
+                             if let Err(e) = input_sender.send_async(v).await {
+                                    error!("Failed to send input message: {}", e);
+                                    break;
+                                }
+                        }
+                        Err(e) => {
+                            error!("Failed to read buffer:{}", e);
+                        }
+                        _=>{}
                     }
                 }
             }
@@ -437,21 +441,18 @@ impl StreamConfig {
     pub fn build(&self) -> Result<Stream, Error> {
         let mut resource = Resource {
             temporary: HashMap::new(),
+            input_names: RefCell::default(),
         };
-        let temporary = if let Some(temporary_configs) = &self.temporary {
-            let mut temporary_map = HashMap::with_capacity(temporary_configs.len());
+
+        if let Some(temporary_configs) = &self.temporary {
+            resource.temporary = HashMap::with_capacity(temporary_configs.len());
             for temporary_config in temporary_configs {
-                temporary_map.insert(
+                resource.temporary.insert(
                     temporary_config.name.clone(),
                     temporary_config.build(&resource)?,
                 );
             }
-            temporary_map
-        } else {
-            HashMap::new()
         };
-
-        resource.temporary = temporary;
 
         let input = self.input.build(&resource)?;
         let (pipeline, thread_num) = self.pipeline.build(&resource)?;

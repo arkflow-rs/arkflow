@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::info;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipleInputsConfig {
     inputs: Vec<InputConfig>,
@@ -56,7 +56,6 @@ impl Input for MultipleInputs {
                 loop {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
-                            info!("MultipleInputs input disconnected");
                             return;
                         }
                         result = input.read() => {
@@ -68,7 +67,7 @@ impl Input for MultipleInputs {
                                 }
                                 Err(e) => {
                                     match e {
-                                        Error::Disconnection => {
+                                        Error::Disconnection|  Error::EOF => {
                                             let _ = sender.send_async(Msg::Err(e)).await;
                                             return;
                                         }
@@ -93,9 +92,10 @@ impl Input for MultipleInputs {
     }
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+        let cancellation_token = self.cancellation_token.clone();
         tokio::select! {
-            _ = self.cancellation_token.cancelled() => {
-                Err(Error::Disconnection)
+            _ = cancellation_token.cancelled() => {
+                Err(Error::EOF)
             }
             result = self.receiver.recv_async() => {
                 match result {
@@ -109,10 +109,10 @@ impl Input for MultipleInputs {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
+        self.task_tracker.wait().await;
         for input in &self.inputs {
             input.close().await?;
         }
-        // self.task_tracker.wait().await;
 
         Ok(())
     }
@@ -126,9 +126,19 @@ impl MultipleInputs {
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::unbounded();
         let mut inputs = Vec::with_capacity(config.inputs.len());
+        let mut input_names_mut = resource.input_names.borrow_mut();
         for x in config.inputs {
+            if let Some(name) = &x.name {
+                input_names_mut.push(name.clone());
+            }
             inputs.push(x.build(resource)?);
         }
+        let input_names_hash_set = input_names_mut.iter().cloned().collect::<HashSet<String>>();
+        if input_names_hash_set.len() != input_names_mut.len() {
+            return Err(Error::Config(
+                "Multiple-inputs input configuration has duplicate input names".to_string(),
+            ));
+        };
 
         Ok(Self {
             input_name: name.cloned(),

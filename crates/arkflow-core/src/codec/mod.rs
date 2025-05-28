@@ -11,7 +11,6 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use crate::buffer::Buffer;
 use crate::{Error, MessageBatch, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

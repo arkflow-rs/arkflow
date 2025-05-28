@@ -19,8 +19,8 @@ use datafusion::arrow::datatypes::Schema;
 use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinConfig {
@@ -31,10 +31,19 @@ pub(crate) struct JoinConfig {
 pub struct JoinOperation {
     query: String,
     codec: Arc<dyn Codec>,
+    input_names: HashSet<String>,
 }
 impl JoinOperation {
-    pub fn new(query: String, codec: Arc<dyn Codec>) -> Result<Self, Error> {
-        Ok(Self { query, codec })
+    pub fn new(
+        query: String,
+        codec: Arc<dyn Codec>,
+        input_names: HashSet<String>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            query,
+            codec,
+            input_names,
+        })
     }
 
     pub async fn join_operation(
@@ -42,13 +51,13 @@ impl JoinOperation {
         ctx: &SessionContext,
         table_sources: Vec<MessageBatch>,
     ) -> Result<RecordBatch, Error> {
-        info!("Join operation ====> 1");
-
         let table_sources = stream::iter(table_sources)
             .map(|x| self.decode_batch(x))
             .buffer_unordered(num_cpus::get())
             .collect::<Vec<Result<MessageBatch, Error>>>()
             .await;
+
+        let mut current_input_names = Vec::with_capacity(table_sources.len());
         for x in table_sources {
             let x = x?;
             let input_name_opt = x.get_input_name();
@@ -58,31 +67,25 @@ impl JoinOperation {
             let x1 = x.into();
             ctx.register_batch(&input_name, x1)
                 .map_err(|e| Error::Process(format!("Failed to register table source: {}", e)))?;
+            current_input_names.push(input_name);
         }
 
-        info!("Join operation ====> 2");
-
-        // let df = ctx
-        //     .sql(&self.query)
-        //     .await
-        //     .map_err(|e| Error::Process(format!("Failed to execute SQL query: {}", e)))?;
-
-        let df = match ctx.sql(&self.query).await {
-            Ok(df) => df,
-            Err(e) => {
-                info!(
-                    "Join operation ====> 2  ===> Failed to execute SQL query ,{}",
-                    e
-                );
-                return Err(Error::Process("Failed to execute SQL query".to_string()));
-            }
+        if !self
+            .input_names
+            .iter()
+            .all(|x| current_input_names.contains(x))
+        {
+            return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         };
 
+        let df = ctx
+            .sql(&self.query)
+            .await
+            .map_err(|e| Error::Process(format!("Failed to execute SQL query: {}", e)))?;
         let result_batches = df
             .collect()
             .await
             .map_err(|e| Error::Process(format!("Failed to collect query result: {}", e)))?;
-        info!("Join operation ====> 3  ===> {}", result_batches.is_empty());
 
         if result_batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));

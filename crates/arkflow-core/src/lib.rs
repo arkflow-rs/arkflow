@@ -20,6 +20,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -74,8 +75,10 @@ pub enum Error {
     EOF,
 }
 
+#[derive(Clone)]
 pub struct Resource {
     pub temporary: HashMap<String, Arc<dyn Temporary>>,
+    pub input_names: RefCell<Vec<String>>,
 }
 
 pub type Bytes = Vec<u8>;

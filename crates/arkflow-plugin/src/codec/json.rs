@@ -27,7 +27,7 @@ struct JsonCodec {
 }
 
 impl Codec for JsonCodec {
-    fn encode(&self, b: MessageBatch) -> Result<MessageBatch, Error> {
+    fn encode(&self, _b: MessageBatch) -> Result<MessageBatch, Error> {
         // let json_data = component::json(&b)?;
         todo!()
     }
@@ -56,9 +56,9 @@ struct JsonCodecBuilder;
 impl CodecBuilder for JsonCodecBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        _name: Option<&String>,
         config: &Option<Value>,
-        resource: &Resource,
+        _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {
         if config.is_none() {
             return Err(Error::Config(

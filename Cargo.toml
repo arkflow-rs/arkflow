@@ -28,7 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
 datafusion = "46"
-datafusion-functions-json="0.46.0"
+datafusion-functions-json = "0.46.0"
 arrow-json = "54"
 prost-reflect = "0.14.7"
 prost-types = "0.13.5"
@@ -44,7 +44,7 @@ flume = "=0.11"
 rumqttc = "0.24.0"
 
 # Sql
-sqlx = { version = "0.8", features = [ "mysql","postgres","runtime-tokio", "tls-native-tls" ] }
+sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"

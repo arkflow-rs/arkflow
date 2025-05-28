@@ -23,13 +23,11 @@ use crate::buffer::join::JoinConfig;
 use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
-use arkflow_core::codec::CodecConfig;
 use arkflow_core::input::Ack;
 use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
 use std::sync::Arc;
 use std::time;
 use tokio::sync::{Notify, RwLock};
@@ -198,9 +196,11 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkflow_core::codec::CodecConfig;
     use arkflow_core::input::NoopAck;
     use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::cell::RefCell;
     use std::time::Duration;
 
     fn generate_arrow_data(n: String) -> Result<RecordBatch, Error> {
@@ -233,7 +233,7 @@ mod tests {
                     config: None,
                 },
             }),
-        }, &Resource { temporary: Default::default() })
+        }, &Resource { temporary: Default::default(), input_names: RefCell::new(Default::default()) })
         .unwrap();
         let mut message_batch1 =
             MessageBatch::new_arrow(generate_arrow_data("1".to_string()).unwrap());
