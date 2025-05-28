@@ -175,6 +175,10 @@ impl Buffer for SlidingWindow {
     /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+        if self.close.is_cancelled() {
+            return Ok(None);
+        }
+
         loop {
             {
                 let queue_arc = Arc::clone(&self.queue);
@@ -184,9 +188,6 @@ impl Buffer for SlidingWindow {
                     break;
                 }
                 // If the buffer is closed, return None
-                if self.close.is_cancelled() {
-                    return Ok(None);
-                }
             }
             // Wait for notification from timer, write operation, or close
             let notify = Arc::clone(&self.notify);

@@ -238,6 +238,8 @@ impl Stream {
             error!("Failed to flush buffer: {}", e);
         }
 
+        info!("Buffer flushed=====>");
+
         match buffer.read().await {
             Ok(Some(v)) => {
                 if let Err(e) = input_sender.send_async(v).await {

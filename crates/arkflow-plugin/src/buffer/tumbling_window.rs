@@ -107,15 +107,16 @@ impl Buffer for TumblingWindow {
     /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+        // If the buffer is closed, return None
+        if self.close.is_cancelled() {
+            return Ok(None);
+        }
+
         loop {
             {
                 // If there are messages available, break the loop and process them
                 if !self.base_window.queue_is_empty().await {
                     break;
-                }
-                // If the buffer is closed, return None
-                if self.close.is_cancelled() {
-                    return Ok(None);
                 }
             }
             // Wait for notification from timer, write operation, or close

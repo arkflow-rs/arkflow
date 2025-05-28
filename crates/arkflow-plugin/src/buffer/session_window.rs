@@ -117,6 +117,10 @@ impl Buffer for SessionWindow {
     /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+        if self.close.is_cancelled() {
+            return Ok(None);
+        }
+
         loop {
             {
                 if !self.base_window.queue_is_empty().await {
@@ -126,8 +130,6 @@ impl Buffer for SessionWindow {
                     if duration >= self.config.gap {
                         break;
                     }
-                } else if self.close.is_cancelled() {
-                    return Ok(None);
                 }
             }
 
