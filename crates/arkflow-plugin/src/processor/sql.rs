@@ -158,7 +158,7 @@ impl SqlProcessor {
         };
 
         use futures::future::join_all;
-        
+
         let futures = temporary_map.iter().map(|(_, (temporary, config))| async {
             let columnar_value = match &config.key {
                 Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
-    use std::collections::HashMap;
+    use std::cell::RefCell;
 
     #[tokio::test]
     async fn test_sql_processor_basic_query() {
@@ -277,7 +277,8 @@ mod tests {
                 temporary_list: None,
             },
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )
         .unwrap();
@@ -315,7 +316,8 @@ mod tests {
                 temporary_list: None,
             },
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )
         .unwrap();
@@ -340,7 +342,8 @@ mod tests {
                 temporary_list: None,
             },
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
 
@@ -357,7 +360,8 @@ mod tests {
                 temporary_list: None,
             },
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )
         .unwrap();

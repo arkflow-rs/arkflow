@@ -156,7 +156,8 @@ mod tests {
     use arkflow_core::processor::ProcessorBuilder;
     use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn test_json_to_arrow_basic_types() -> Result<(), Error> {
@@ -168,7 +169,8 @@ mod tests {
             None,
             &config,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )?;
 
@@ -204,7 +206,8 @@ mod tests {
             None,
             &config,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )?;
 
@@ -231,7 +234,8 @@ mod tests {
             None,
             &config,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         )?;
 
@@ -254,7 +258,8 @@ mod tests {
                 None,
                 &config,
                 &Resource {
-                    temporary: HashMap::new(),
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
                 },
             )
             .unwrap();
@@ -263,7 +268,8 @@ mod tests {
                 None,
                 &config,
                 &Resource {
-                    temporary: HashMap::new(),
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
                 },
             )
             .unwrap();
@@ -290,7 +296,8 @@ mod tests {
             None,
             &None,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
         assert!(result.is_err());
@@ -299,7 +306,8 @@ mod tests {
             None,
             &None,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
         assert!(result.is_err());

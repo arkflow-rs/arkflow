@@ -114,7 +114,7 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use arkflow_core::DEFAULT_BINARY_VALUE_FIELD;
-    use std::collections::HashMap;
+    use std::cell::RefCell;
 
     use super::*;
     use std::time::Duration;
@@ -240,7 +240,8 @@ mod tests {
                 None,
                 &Some(config_json),
                 &Resource {
-                    temporary: HashMap::new(),
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
                 },
             )
             .unwrap();
@@ -258,7 +259,8 @@ mod tests {
                 None,
                 &None,
                 &Resource {
-                    temporary: HashMap::new(),
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
                 },
             ),
             Err(Error::Config(_))

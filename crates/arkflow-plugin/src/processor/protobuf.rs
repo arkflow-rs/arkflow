@@ -538,7 +538,7 @@ mod tests {
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use std::collections::HashMap;
+    use std::cell::RefCell;
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
@@ -708,7 +708,8 @@ message TestMessage {
             None,
             &None,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
         assert!(result.is_err());
@@ -717,7 +718,8 @@ message TestMessage {
             None,
             &None,
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
         assert!(result.is_err());
@@ -737,7 +739,8 @@ message TestMessage {
             None,
             &Some(config),
             &Resource {
-                temporary: HashMap::new(),
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
             },
         );
         assert!(result.is_ok());
