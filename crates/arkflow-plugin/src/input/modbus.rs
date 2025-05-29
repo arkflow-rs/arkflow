@@ -15,11 +15,9 @@
 use arkflow_core::input::{Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{input, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{BooleanArray, RecordBatch, UInt16Array};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, ListArray, RecordBatch, UInt16Array};
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::Schema;
-use duckdb::arrow::array::{ArrayRef, ListArray};
-use duckdb::arrow::datatypes::{DataType, Field};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
