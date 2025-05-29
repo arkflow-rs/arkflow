@@ -175,42 +175,33 @@ impl Input for ModbusInput {
     }
 }
 
+macro_rules! impl_list_array {
+    ($name:ident, $data_type:expr, $array_type:ty, $rust_type:ty) => {
+        fn $name(name: &str, data: Vec<$rust_type>) -> Result<(Field, ArrayRef), Error> {
+            let field = Field::new(
+                name,
+                DataType::List(Arc::new(Field::new_list_field($data_type, false))),
+                false,
+            );
+            let list_array = ListArray::try_new(
+                Arc::new(Field::new_list_field($data_type, false)),
+                Self::new_offset_buffer(data.len()),
+                Arc::new(<$array_type>::from(data)),
+                None,
+            )
+            .map_err(|e| Error::Process(format!("Failed to create list array:{}", e)))?;
+            Ok((field, Arc::new(list_array)))
+        }
+    };
+}
+
 impl ModbusInput {
     fn new_offset_buffer(n: usize) -> OffsetBuffer<i32> {
         OffsetBuffer::<i32>::from_lengths([n])
     }
 
-    fn new_bool_list_array(name: &str, data: Vec<bool>) -> Result<(Field, ArrayRef), Error> {
-        let field = Field::new(
-            name,
-            DataType::List(Arc::new(Field::new_list_field(DataType::Boolean, false))),
-            false,
-        );
-        let list_array = ListArray::try_new(
-            Arc::new(Field::new_list_field(DataType::Boolean, false)),
-            Self::new_offset_buffer(data.len()),
-            Arc::new(BooleanArray::from(data)),
-            None,
-        )
-        .map_err(|e| Error::Process(format!("Failed to create list array:{}", e)))?;
-        Ok((field, Arc::new(list_array)))
-    }
-
-    fn new_u16_list_array(name: &str, data: Vec<u16>) -> Result<(Field, ArrayRef), Error> {
-        let field = Field::new(
-            name,
-            DataType::List(Arc::new(Field::new_list_field(DataType::UInt16, false))),
-            false,
-        );
-        let list_array = ListArray::try_new(
-            Arc::new(Field::new_list_field(DataType::UInt16, false)),
-            Self::new_offset_buffer(data.len()),
-            Arc::new(UInt16Array::from(data)),
-            None,
-        )
-        .map_err(|e| Error::Process(format!("Failed to create list array:{}", e)))?;
-        Ok((field, Arc::new(list_array)))
-    }
+    impl_list_array!(new_bool_list_array, DataType::Boolean, BooleanArray, bool);
+    impl_list_array!(new_u16_list_array, DataType::UInt16, UInt16Array, u16);
 }
 
 struct ModbusInputBuilder;
