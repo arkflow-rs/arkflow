@@ -91,11 +91,11 @@ impl Input for ModbusInput {
             return Err(Error::Disconnection);
         };
 
-        if !self.first_read.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .first_read
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             tokio::time::sleep(self.config.read_interval).await;
-        } else {
-            self.first_read
-                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         let mut fields = Vec::with_capacity(self.config.points.len());
