@@ -18,18 +18,20 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, ListArray, RecordBatch, UInt16Array};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio_modbus::prelude::{tcp, Reader};
-use tokio_modbus::{Address, Quantity};
+use tokio_modbus::prelude::{tcp, Client, Reader, SlaveContext};
+use tokio_modbus::{Address, Quantity, SlaveId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModbusInputConfig {
     addr: String,
+    #[serde(deserialize_with = "deserialize_u8")]
+    slave_id: SlaveId,
     points: Vec<Point>,
     read_interval: Duration,
 }
@@ -48,7 +50,9 @@ struct Point {
     #[serde(rename = "type")]
     point_type: PointType,
     name: String,
+    #[serde(deserialize_with = "deserialize_u16")]
     address: Address,
+    #[serde(deserialize_with = "deserialize_u16")]
     quantity: Quantity,
 }
 
@@ -80,7 +84,8 @@ impl Input for ModbusInput {
             .parse()
             .map_err(|_| Error::Process("Failed to parse socket address".to_string()))?;
 
-        let ctx = tcp::connect(socket_addr).await?;
+        let mut ctx = tcp::connect(socket_addr).await?;
+        ctx.set_slave(self.config.slave_id.into());
         cli_lock.replace(ctx);
         Ok(())
     }
@@ -168,7 +173,11 @@ impl Input for ModbusInput {
 
     async fn close(&self) -> Result<(), Error> {
         let mut cli_lock = self.client.lock().await;
-        let _ = cli_lock.take();
+        if let Some(mut ctx) = cli_lock.take() {
+            ctx.disconnect()
+                .await
+                .map_err(|e| Error::Process(format!("Failed to disconnect:{}", e)))?;
+        }
         Ok(())
     }
 }
@@ -223,4 +232,20 @@ impl InputBuilder for ModbusInputBuilder {
 pub fn init() -> Result<(), Error> {
     input::register_input_builder("modbus", Arc::new(ModbusInputBuilder))?;
     Ok(())
+}
+
+pub fn deserialize_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    u16::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    u8::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
 }
