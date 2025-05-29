@@ -26,6 +26,7 @@ pub mod sql;
 pub mod nats;
 pub mod redis;
 pub mod stdout;
+pub mod s3;
 
 pub fn init() -> Result<(), Error> {
     drop::init()?;
@@ -36,5 +37,6 @@ pub fn init() -> Result<(), Error> {
     sql::init()?;
     nats::init()?;
     redis::init()?;
+    s3::init()?;
     Ok(())
 }
