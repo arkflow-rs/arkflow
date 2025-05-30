@@ -1,0 +1,18 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1ns
+      batch_size: 1
+      count: 10
+
+    pipeline:
+      thread_num: 10
+      processors:
+        - type: "python"
+
+
+    output:
+      type: "stdout"
