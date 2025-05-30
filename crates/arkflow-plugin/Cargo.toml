@@ -75,7 +75,7 @@ async-nats = "0.41.0"
 object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
 
 # modbus
-tokio-modbus = "0.16"
+tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
 
 once_cell = "1.19.0"
 futures = { workspace = true }

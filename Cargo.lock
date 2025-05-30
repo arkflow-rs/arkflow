@@ -7528,7 +7528,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "log",
- "smallvec",
  "thiserror 2.0.12",
  "tokio",
  "tokio-util",
