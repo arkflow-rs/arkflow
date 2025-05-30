@@ -6,7 +6,6 @@
 
 English | [中文](README_zh.md)
 
-
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/arkflow-rs/arkflow)
@@ -109,6 +108,7 @@ ArkFlow supports multiple input sources:
 - **Nats**: Subscribe to messages from Nats topics
 - **Redis**: Subscribe to messages from Redis channels or lists
 - **Websocket**: Subscribe to messages from WebSocket connections
+- **Modbus**: Read data from Modbus devices
 
 Example:
 
@@ -163,7 +163,7 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value:
       type: value
@@ -172,7 +172,9 @@ output:
 ```
 
 ### Error Output Components
+
 ArkFlow supports multiple error output targets:
+
 - **Kafka**: Write error data to Kafka topics
 - **MQTT**: Publish error messages to MQTT topics
 - **HTTP**: Send error data via HTTP
@@ -187,21 +189,25 @@ error_output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: error-topic
   client_id: error-arkflow-producer
 ``` 
-
 
 ### Buffer Components
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
 - **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
-- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
-- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide size.
-- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
+- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where
+  messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of
+  inactivity.
+- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing
+  message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide
+  size.
+- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism
+  for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
 
 Example:
 
@@ -237,7 +243,7 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: 
+      topic:
         type: value
         value: test-topic
 ```
@@ -267,7 +273,6 @@ streams:
 
 - Conalog(Country: South Korea)
 
-
 ## ArkFlow Plugin
 
 [ArkFlow Plugin Examples](https://github.com/arkflow-rs/arkflow-plugin-examples)
@@ -276,12 +281,8 @@ streams:
 
 ArkFlow is licensed under the [Apache License 2.0](LICENSE).
 
-
 ## Community
 
 Discord: https://discord.gg/CwKhzb8pux
-
-
-
 
 If you like or are using this project to learn or start your solution, please give it a star⭐. Thanks!

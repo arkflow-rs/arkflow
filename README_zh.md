@@ -106,6 +106,7 @@ ArkFlow支持多种输入源：
 - **Nats**: 订阅来自 Nats 主题的消息
 - **Redis**: 订阅来自 Redis 频道或列表的消息
 - **Websocket**: 订阅来自 WebSocket 连接的消息
+- **Modbus**: 从 Modbus 设备读取数据
 
 示例：
 
@@ -160,7 +161,7 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: output-topic
   client_id: arkflow-producer
@@ -182,12 +183,11 @@ error_output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: error-topic
   client_id: error-arkflow-producer
 ```
-
 
 ### 缓冲组件
 
@@ -206,7 +206,6 @@ buffer:
   capacity: 10000  # Maximum number of messages to buffer
   timeout: 10s  # Maximum time to buffer messages
 ```
-
 
 ## 示例
 
@@ -233,7 +232,7 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: 
+      topic:
         type: value
         value: processed-topic
 ```
@@ -263,11 +262,9 @@ streams:
 
 - Conalog(国家: 韩国)
 
-
 ## ArkFlow 插件
 
 [ArkFlow 插件示例](https://github.com/arkflow-rs/arkflow-plugin-examples)
-
 
 ## 许可证
 
@@ -276,6 +273,5 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
-
 
 如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！
