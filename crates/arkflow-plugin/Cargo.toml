@@ -75,7 +75,7 @@ async-nats = "0.41.0"
 
 # Object Store
 object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
-hdfs-native-object-store = "0.14.2"
+hdfs-native-object-store = "0.13"
 
 once_cell = "1.19.0"
 futures = { workspace = true }
