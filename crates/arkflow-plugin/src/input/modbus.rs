@@ -11,14 +11,14 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-
+use crate::time::deserialize_duration;
 use arkflow_core::input::{Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{input, Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, ListArray, RecordBatch, UInt16Array};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -32,7 +32,8 @@ struct ModbusInputConfig {
     addr: String,
     slave_id: SlaveId,
     points: Vec<Point>,
-    read_interval: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    interval: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +98,7 @@ impl Input for ModbusInput {
             .first_read
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            tokio::time::sleep(self.config.read_interval).await;
+            tokio::time::sleep(self.config.interval).await;
         }
 
         let mut fields = Vec::with_capacity(self.config.points.len());
@@ -229,12 +230,4 @@ impl InputBuilder for ModbusInputBuilder {
 pub fn init() -> Result<(), Error> {
     input::register_input_builder("modbus", Arc::new(ModbusInputBuilder))?;
     Ok(())
-}
-
-pub fn deserialize_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    u16::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
 }

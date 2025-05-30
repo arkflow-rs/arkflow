@@ -41,5 +41,6 @@ pub fn init() -> Result<(), Error> {
     sql::init()?;
     websocket::init()?;
     multiple_inputs::init()?;
+    modbus::init()?;
     Ok(())
 }

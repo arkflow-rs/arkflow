@@ -58,48 +58,20 @@ example: `"1s"`, `"500ms"`, `"1m"`
 
 ## Examples
 
-### Basic Example
 
 ```yaml
 - input:
     type: "modbus"
     addr: "192.168.1.100:502"
-    slave_id: "1"
+    slave_id: 1
     read_interval: "1s"
     points:
       - type: "holding_registers"
         name: "temperature"
-        address: "100"
-        quantity: "2"
+        address: 100
+        quantity: 2
       - type: "coils"
         name: "status_flags"
-        address: "200"
-        quantity: "8"
-```
-
-### Multiple Register Types Example
-
-```yaml
-- input:
-    type: "modbus"
-    addr: "plc.example.com:502"
-    slave_id: "10"
-    read_interval: "500ms"
-    points:
-      - type: "holding_registers"
-        name: "pressure"
-        address: "1000"
-        quantity: "2"
-      - type: "input_registers"
-        name: "flow_rate"
-        address: "2000"
-        quantity: "4"
-      - type: "discrete_inputs"
-        name: "alarm_bits"
-        address: "3000"
-        quantity: "16"
-      - type: "coils"
-        name: "control_bits"
-        address: "4000"
-        quantity: "8"
+        address: 200
+        quantity: 2
 ```
