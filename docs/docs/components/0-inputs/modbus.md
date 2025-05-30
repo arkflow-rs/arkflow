@@ -8,13 +8,13 @@ The Modbus input component receives data from Modbus TCP devices, supporting var
 
 Modbus TCP server address in the format `host:port`.
 
-type: `string`
+type: `integer`
 
 ### **slave_id** (required)
 
 Modbus slave ID.
 
-type: `string` (parsed as integer)
+type: `integer`
 
 ### **points** (required)
 
@@ -40,13 +40,13 @@ type: `string`
 
 Modbus register address to read from.
 
-type: `string` (parsed as integer)
+type: `integer`
 
 ##### **quantity** (required)
 
 Number of registers to read.
 
-type: `string` (parsed as integer)
+type: `integer`
 
 ### **read_interval** (required)
 

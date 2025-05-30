@@ -30,7 +30,6 @@ use tokio_modbus::{Address, Quantity, SlaveId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModbusInputConfig {
     addr: String,
-    #[serde(deserialize_with = "deserialize_u8")]
     slave_id: SlaveId,
     points: Vec<Point>,
     read_interval: Duration,
@@ -50,9 +49,7 @@ struct Point {
     #[serde(rename = "type")]
     point_type: PointType,
     name: String,
-    #[serde(deserialize_with = "deserialize_u16")]
     address: Address,
-    #[serde(deserialize_with = "deserialize_u16")]
     quantity: Quantity,
 }
 
@@ -240,12 +237,4 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     u16::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
-}
-
-pub fn deserialize_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    u8::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
 }
