@@ -241,6 +241,7 @@ struct HttpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HdfsConfig {
     url: String,
+    ha_config: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,8 +614,14 @@ impl SqlInput {
     }
 
     fn hdfs_store(&self, ctx: &SessionContext, config: &HdfsConfig) -> Result<(), Error> {
-        let hdfs_storage = HdfsObjectStore::with_url(&config.url)
+        let hdfs_storage_result = if let Some(ha_config) = &config.ha_config {
+            HdfsObjectStore::with_config(&config.url, ha_config.clone())
+        } else {
+            HdfsObjectStore::with_url(&config.url)
+        };
+        let hdfs_storage = hdfs_storage_result
             .map_err(|e| Error::Config(format!("Failed to create HDFS client: {}", e)))?;
+
         let object_store_url = ObjectStoreUrl::parse(&config.url)
             .map_err(|e| Error::Config(format!("Failed to parse HDFS URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
