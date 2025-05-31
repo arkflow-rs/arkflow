@@ -248,6 +248,7 @@ dependencies = [
  "flume",
  "futures",
  "futures-util",
+ "hdfs-native-object-store",
  "humantime",
  "lazy_static",
  "mockall",
@@ -2825,6 +2826,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3297,6 +3307,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "g2gen"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a7e0eb46f83a20260b850117d204366674e85d3a908d90865c78df9a6b1dfc"
+dependencies = [
+ "g2poly",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
+name = "g2p"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "539e2644c030d3bf4cd208cb842d2ce2f80e82e6e8472390bcef83ceba0d80ad"
+dependencies = [
+ "g2gen",
+ "g2poly",
+]
+
+[[package]]
+name = "g2poly"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "312d2295c7302019c395cfb90dacd00a82a2eabd700429bba9c7a3f38dbbe11b"
+
+[[package]]
 name = "generator"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3476,6 +3514,62 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.3",
+]
+
+[[package]]
+name = "hdfs-native"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe9a986a98854573dfbc130f42f81e92f6d4581e23060708842fede6edef0f1f"
+dependencies = [
+ "aes",
+ "base64 0.22.1",
+ "bitflags 2.9.1",
+ "bytes",
+ "cbc",
+ "chrono",
+ "cipher",
+ "crc",
+ "ctr",
+ "des",
+ "dns-lookup",
+ "futures",
+ "g2p",
+ "hex",
+ "hmac",
+ "libc",
+ "libloading",
+ "log",
+ "md-5",
+ "num-traits",
+ "once_cell",
+ "prost",
+ "prost-types",
+ "rand 0.8.5",
+ "regex",
+ "roxmltree",
+ "socket2",
+ "thiserror 2.0.12",
+ "tokio",
+ "url",
+ "uuid",
+ "whoami",
+]
+
+[[package]]
+name = "hdfs-native-object-store"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f2ed9304bed0023daf452b8017efd2f663d7e693f8b7f29a54e6c1c3d9aefd9"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hdfs-native",
+ "object_store",
+ "thiserror 2.0.12",
+ "tokio",
 ]
 
 [[package]]

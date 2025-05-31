@@ -34,6 +34,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
+use hdfs_native_object_store::HdfsObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -187,6 +188,7 @@ enum ObjectStore {
     Gs(GoogleCloudStorageConfig),
     Az(MicrosoftAzureConfig),
     Http(HttpConfig),
+    Hdfs(HdfsConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +236,12 @@ struct MicrosoftAzureConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HttpConfig {
     url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HdfsConfig {
+    url: String,
+    ha_config: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +495,7 @@ impl SqlInput {
             ObjectStore::Gs(config) => self.google_cloud_storage(ctx, config),
             ObjectStore::Az(config) => self.microsoft_azure_store(ctx, config),
             ObjectStore::Http(config) => self.http_store(ctx, config),
+            ObjectStore::Hdfs(config) => self.hdfs_store(ctx, config),
         }
     }
 
@@ -601,6 +610,22 @@ impl SqlInput {
             .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(http_storage));
+        Ok(())
+    }
+
+    fn hdfs_store(&self, ctx: &SessionContext, config: &HdfsConfig) -> Result<(), Error> {
+        let hdfs_storage_result = if let Some(ha_config) = &config.ha_config {
+            HdfsObjectStore::with_config(&config.url, ha_config.clone())
+        } else {
+            HdfsObjectStore::with_url(&config.url)
+        };
+        let hdfs_storage = hdfs_storage_result
+            .map_err(|e| Error::Config(format!("Failed to create HDFS client: {}", e)))?;
+
+        let object_store_url = ObjectStoreUrl::parse(&config.url)
+            .map_err(|e| Error::Config(format!("Failed to parse HDFS URL: {}", e)))?;
+        let url: &Url = object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(hdfs_storage));
         Ok(())
     }
 }
