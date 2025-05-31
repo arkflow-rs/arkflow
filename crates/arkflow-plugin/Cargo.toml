@@ -78,7 +78,7 @@ async-nats = "0.41.0"
 tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
 
 # Object Store
-object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.12.1", features = ["aws", "azure", "gcp"] }
 hdfs-native-object-store = "0.13"
 
 
