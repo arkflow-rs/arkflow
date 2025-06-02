@@ -79,7 +79,7 @@ tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] 
 
 # Object Store
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
-hdfs-native-object-store = "0.13"
+hdfs-native-object-store = "0.14"
 
 # python
 pyo3 = { version = "0.24.0", features = ["auto-initialize", "serde"] }
