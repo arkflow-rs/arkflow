@@ -17,6 +17,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+serde_with = { workspace = true }
 toml = { workspace = true }
 humantime = { workspace = true }
 tracing = { workspace = true }
@@ -31,10 +32,12 @@ datafusion-table-providers = { version = "0.4", features = [
 ballista = { version = "46" }
 spiceai_duckdb_fork = "=1.2.1"
 arrow-json = { workspace = true }
+arrow-csv = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 protobuf-parse = { workspace = true }
 protobuf = { workspace = true }
+parquet = "54"
 lazy_static = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
@@ -44,6 +47,7 @@ base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
 rumqttc = "0.24.0"
+chrono= "0.4"
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.37", features = [
@@ -73,6 +77,9 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 # NATS
 async-nats = "0.41.0"
 
+# Compressor
+bzip2= "0.5"
+flate2= "1.0"
 
 # modbus
 tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
