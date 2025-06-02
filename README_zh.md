@@ -8,7 +8,7 @@
 
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/arkflow-rs/arkflow)
+
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
@@ -106,6 +106,7 @@ ArkFlow支持多种输入源：
 - **Nats**: 订阅来自 Nats 主题的消息
 - **Redis**: 订阅来自 Redis 频道或列表的消息
 - **Websocket**: 订阅来自 WebSocket 连接的消息
+- **Modbus**: 从 Modbus 设备读取数据
 
 示例：
 
@@ -160,7 +161,7 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: output-topic
   client_id: arkflow-producer
@@ -182,12 +183,11 @@ error_output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: error-topic
   client_id: error-arkflow-producer
 ```
-
 
 ### 缓冲组件
 
@@ -206,7 +206,6 @@ buffer:
   capacity: 10000  # Maximum number of messages to buffer
   timeout: 10s  # Maximum time to buffer messages
 ```
-
 
 ## 示例
 
@@ -233,7 +232,7 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: 
+      topic:
         type: value
         value: processed-topic
 ```
@@ -263,11 +262,9 @@ streams:
 
 - Conalog(国家: 韩国)
 
-
 ## ArkFlow 插件
 
 [ArkFlow 插件示例](https://github.com/arkflow-rs/arkflow-plugin-examples)
-
 
 ## 许可证
 
@@ -276,6 +273,5 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
-
 
 如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！
