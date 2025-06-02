@@ -27,9 +27,9 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
-datafusion = "46"
-datafusion-functions-json = "0.46.0"
-arrow-json = "54"
+datafusion = { version = "47", features = ["avro", "pyarrow"] }
+datafusion-functions-json = "0.47.0"
+arrow-json = "55"
 prost-reflect = "0.14.7"
 prost-types = "0.13.5"
 protobuf-parse = "3.7.2"
@@ -61,3 +61,7 @@ arkflow-plugin = { path = "crates/arkflow-plugin" }
 codegen-units = 1
 lto = true
 opt-level = 3
+
+
+[patch.crates-io]
+#datafusion-table-providers = { git = "https://github.com/arkflow-rs/datafusion-table-providers", rev = "d39b1d3606de395d97d35d684bca955d253dd1fc" }

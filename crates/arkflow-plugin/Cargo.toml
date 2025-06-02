@@ -22,14 +22,14 @@ humantime = { workspace = true }
 tracing = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
-datafusion-table-providers = { version = "0.4", features = [
+datafusion-table-providers = { git = "https://github.com/arkflow-rs/datafusion-table-providers", rev = "e29bf21bbcd3f197f8c1e0675f9fab0b4ad48825", features = [
     "mysql",
     "postgres",
     "duckdb",
     "sqlite",
 ] }
-ballista = { version = "46" }
-spiceai_duckdb_fork = "=1.2.1"
+ballista = { git = "https://github.com/apache/datafusion-ballista", rev = "97c919274d9de496b630e66c12ad29c3fccd110b" }
+duckdb = { git = "https://github.com/arkflow-rs/duckdb-rs.git", rev = "d13c0cd133199db580742339c3edeafd1d780b81" } # Forked to add support for duckdb_scan_arrow, pending: https://github.com/duckdb/duckdb-rs/pull/488
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
@@ -72,7 +72,7 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # NATS
 async-nats = "0.41.0"
-object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
 
 # python
 pyo3 = { version = "0.24.0", features = ["auto-initialize", "serde"] }
