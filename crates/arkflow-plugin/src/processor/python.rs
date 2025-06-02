@@ -14,6 +14,7 @@
 use arkflow_core::processor::{Processor, ProcessorBuilder};
 use arkflow_core::{processor, Error, MessageBatch, Resource};
 use async_trait::async_trait;
+use datafusion::arrow::pyarrow::ToPyArrow;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -27,27 +28,29 @@ struct PythonProcessor {}
 #[async_trait]
 impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        Python::with_gil(|py| {
-            Python::with_gil(|py| {
-                let locals = PyDict::new(py);
-                py.run(
-                    c_str!(
-                        r#"
+        Python::with_gil(|py| -> Result<(), Error> {
+            let py_batch = batch.to_pyarrow(py).map_err(|_| {
+                Error::Process("Failed to convert MessageBatch to PyArrow".to_string())
+            })?;
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
 import base64 
 s = 'Hello Rust!'
 ret = base64.b64encode(s. encode('utf-8'))
 "#
-                    ),
-                    None,
-                    Some(&locals),
-                )
-                .unwrap();
-                let ret = locals.get_item("ret").unwrap().unwrap();
-                let b64 = ret.downcast::<PyBytes>().unwrap();
-                assert_eq!(b64.as_bytes(), b"SGVsbG8gUnVzdCE=");
-                info!("{:?}", String::from_utf8_lossy(b64.as_bytes()))
-            });
-        });
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let ret = locals.get_item("ret").unwrap().unwrap();
+            let b64 = ret.downcast::<PyBytes>().unwrap();
+            assert_eq!(b64.as_bytes(), b"SGVsbG8gUnVzdCE=");
+            info!("{:?}", String::from_utf8_lossy(b64.as_bytes()));
+            Ok(())
+        })?;
         Ok(vec![])
     }
 
