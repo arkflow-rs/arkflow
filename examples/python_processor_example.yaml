@@ -12,6 +12,11 @@ streams:
       thread_num: 10
       processors:
         - type: "python"
+          script: |
+            def process_batch(batch):
+              return [batch]
+          function: "process_batch"
+          python_path: ["./examples/python"]
 
 
     output:

@@ -250,6 +250,8 @@ impl From<MessageBatch> for RecordBatch {
     }
 }
 
+
+
 impl TryFrom<Vec<Bytes>> for MessageBatch {
     type Error = Error;
 

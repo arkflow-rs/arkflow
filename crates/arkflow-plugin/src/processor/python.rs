@@ -14,44 +14,103 @@
 use arkflow_core::processor::{Processor, ProcessorBuilder};
 use arkflow_core::{processor, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::pyarrow::ToPyArrow;
-use pyo3::ffi::c_str;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyList;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ffi::CString;
+use std::str::FromStr;
 use std::sync::Arc;
-use tracing::info;
 
-struct PythonProcessorConfig {}
-struct PythonProcessor {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PythonProcessorConfig {
+    /// Python code to execute
+    script: Option<String>,
+    /// Python module to import
+    module: Option<String>,
+    /// Function name to call for processing
+    function: String,
+    /// Additional Python paths
+    python_path: Vec<String>,
+}
+
+struct PythonProcessor {
+    config: PythonProcessorConfig,
+}
 
 #[async_trait]
 impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        Python::with_gil(|py| -> Result<(), Error> {
-            let py_batch = batch.to_pyarrow(py).map_err(|_| {
-                Error::Process("Failed to convert MessageBatch to PyArrow".to_string())
+        Python::with_gil(|py| -> Result<Vec<MessageBatch>, Error> {
+            let sys = py
+                .import("sys")
+                .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
+            let binding = sys
+                .getattr("path")
+                .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
+            let mut path = binding
+                .downcast::<PyList>()
+                .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
+            self.config
+                .python_path
+                .iter()
+                .for_each(|p| path.set_item(0, p).unwrap());
+            path.insert(0, ".").unwrap();
+
+            // Get the Python module either from the script or from an imported module
+            let py_module = if let Some(module_name) = &self.config.module {
+                py.import(module_name).map_err(|e| {
+                    Error::Process(format!("Failed to import module {}: {}", module_name, e))
+                })?
+            } else {
+                // If no module specified, use __main__
+                py.import("__main__")
+                    .map_err(|_| Error::Process("Failed to import __main__ module".to_string()))?
+            };
+
+            if let Some(script) = &self.config.script {
+                let string = CString::new(script.clone())
+                    .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
+                py.run(&string, None, None)
+                    .map_err(|_| Error::Process("Failed to run Python script".to_string()))?;
+            }
+
+            // Convert MessageBatch to PyArrow
+            let py_batch = batch.to_pyarrow(py).map_err(|e| {
+                Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
             })?;
-            let locals = PyDict::new(py);
-            py.run(
-                c_str!(
-                    r#"
-import base64 
-s = 'Hello Rust!'
-ret = base64.b64encode(s. encode('utf-8'))
-"#
-                ),
-                None,
-                Some(&locals),
-            )
-            .unwrap();
-            let ret = locals.get_item("ret").unwrap().unwrap();
-            let b64 = ret.downcast::<PyBytes>().unwrap();
-            assert_eq!(b64.as_bytes(), b"SGVsbG8gUnVzdCE=");
-            info!("{:?}", String::from_utf8_lossy(b64.as_bytes()));
-            Ok(())
-        })?;
-        Ok(vec![])
+
+            // Get the processing function
+            let func = py_module.getattr(&self.config.function).map_err(|e| {
+                Error::Process(format!(
+                    "Failed to get function '{}': {}",
+                    self.config.function, e
+                ))
+            })?;
+
+            // Call the Python function with the batch
+            let result = func
+                .call1((py_batch,))
+                .map_err(|e| Error::Process(format!("Failed to call Python function: {}", e)))?;
+            let py_list = result.downcast::<PyList>().map_err(|_| {
+                Error::Process("Failed to downcast Python result to PyList".to_string())
+            })?;
+            let vec_rb = py_list
+                .into_iter()
+                .map(|item| {
+                    RecordBatch::from_pyarrow_bound(&item).map_err(|e| {
+                        Error::Process(format!("Failed to convert PyArrow to RecordBatch: {}", e))
+                    })
+                })
+                .collect::<Result<Vec<RecordBatch>, Error>>()?;
+            let vec_mb = vec_rb
+                .into_iter()
+                .map(|rb| MessageBatch::new_arrow(rb))
+                .collect::<Vec<_>>();
+            Ok(vec_mb)
+        })
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -67,7 +126,10 @@ impl ProcessorBuilder for PythonProcessorBuilder {
         config: &Option<Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
-        Ok(Arc::new(PythonProcessor {}))
+        Ok(Arc::new(PythonProcessor {
+            config: serde_json::from_value::<PythonProcessorConfig>(config.clone().unwrap())
+                .map_err(|_| Error::Process("Failed to parse PythonProcessorConfig".to_string()))?,
+        }))
     }
 }
 
