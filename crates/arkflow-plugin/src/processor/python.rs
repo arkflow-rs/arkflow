@@ -77,7 +77,7 @@ impl Processor for PythonProcessor {
             })
         })
         .await
-        .map_err(|_| Error::Process("Failed to spawn blocking task".to_string()))?;
+        .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))?;
         result
     }
 
@@ -111,12 +111,13 @@ impl PythonProcessor {
                 })?
             } else {
                 // If no module specified, use __main__
-                py.import("__main__")
-                    .map_err(|_| Error::Process("Failed to import __main__ module".to_string()))?
+                py.import("__main__").map_err(|e| {
+                    Error::Process(format!("Failed to import __main__ module: {}", e))
+                })?
             };
 
             if let Some(script) = &config.script {
-                let string = CString::new(script.clone())
+                let string = CString::new(script.as_str())
                     .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
                 py.run(&string, None, None)
                     .map_err(|e| Error::Process(format!("Failed to run Python script: {}", e)))?;

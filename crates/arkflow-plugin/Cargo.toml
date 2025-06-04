@@ -44,6 +44,7 @@ base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
 rumqttc = "0.24.0"
+
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.37", features = [
@@ -60,7 +61,8 @@ sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 redis = { version = "0.31", features = ["tokio-native-tls-comp", "aio", "connection-manager", "cluster-async"] }
 
 # vrl https://github.com/vectordotdev/vrl
-vrl = { version = "0.24.0", features = ["value", "compiler", "stdlib"] }
+vrl = { version = "0.24", features = ["value", "compiler", "stdlib"] }
+
 
 
 # arkflow
@@ -71,7 +73,7 @@ sqlx = { workspace = true }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # NATS
-async-nats = "0.41.0"
+async-nats = "0.41"
 
 
 # modbus
@@ -82,7 +84,7 @@ object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
 hdfs-native-object-store = "0.14"
 
 # python
-pyo3 = { version = "0.24.0", features = ["auto-initialize", "serde"] }
+pyo3 = { version = "0.24", features = ["auto-initialize", "serde"] }
 
 once_cell = "1.19.0"
 futures = { workspace = true }

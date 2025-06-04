@@ -41,18 +41,11 @@ reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
 flume = "=0.11"
-rumqttc = "0.24.0"
 
 # Sql
 sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
-# Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = ["cmake-build", "tracing", "sasl", "ssl-vendored", "zstd"] }
-rdkafka-sys = "4.8.0"
-sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 tempfile = "3.20.0"
-
 mockall = "0.12"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
@@ -61,7 +54,3 @@ arkflow-plugin = { path = "crates/arkflow-plugin" }
 codegen-units = 1
 lto = true
 opt-level = 3
-
-
-[patch.crates-io]
-#datafusion-table-providers = { git = "https://github.com/arkflow-rs/datafusion-table-providers", rev = "d39b1d3606de395d97d35d684bca955d253dd1fc" }
