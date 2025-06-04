@@ -74,7 +74,7 @@ impl Processor for PythonProcessor {
                 let string = CString::new(script.clone())
                     .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
                 py.run(&string, None, None)
-                    .map_err(|_| Error::Process("Failed to run Python script".to_string()))?;
+                    .map_err(|e| Error::Process(format!("Failed to run Python script: {}", e)))?;
             }
 
             // Convert MessageBatch to PyArrow
