@@ -54,11 +54,11 @@ impl Processor for PythonProcessor {
                 let path = binding
                     .downcast::<PyList>()
                     .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
+                path.insert(0, ".").unwrap();
                 let _ = &config
                     .python_path
                     .iter()
-                    .for_each(|p| path.set_item(0, p).unwrap());
-                path.insert(0, ".").unwrap();
+                    .for_each(|p| path.insert(0, p).unwrap());
 
                 // Get the Python module either from the script or from an imported module
                 let py_module = if let Some(module_name) = &config.module {
