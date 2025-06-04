@@ -15,7 +15,7 @@ FROM debian:bookworm-slim as arkflow
 WORKDIR /app
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y libsqlite3-0 protobuf && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libsqlite3-0 python && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled binary from builder stage
 COPY --from=builder /app/target/release/arkflow /app/arkflow
