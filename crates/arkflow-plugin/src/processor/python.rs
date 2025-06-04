@@ -36,67 +36,25 @@ struct PythonProcessorConfig {
 }
 
 struct PythonProcessor {
-    config: PythonProcessorConfig,
+    func: PyObject, // Stores the Python function to be called
 }
 
 #[async_trait]
 impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let config = self.config.clone();
+        let func_to_call = Python::with_gil(|py| self.func.clone_ref(py));
+
         let result = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> Result<Vec<MessageBatch>, Error> {
-                let sys = py
-                    .import("sys")
-                    .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
-                let binding = sys
-                    .getattr("path")
-                    .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
-                let path = binding
-                    .downcast::<PyList>()
-                    .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
-                path.insert(0, ".").unwrap();
-                let _ = &config
-                    .python_path
-                    .iter()
-                    .for_each(|p| path.insert(0, p).unwrap());
-
-                // Get the Python module either from the script or from an imported module
-                let py_module = if let Some(module_name) = &config.module {
-                    py.import(module_name).map_err(|e| {
-                        Error::Process(format!("Failed to import module {}: {}", module_name, e))
-                    })?
-                } else {
-                    // If no module specified, use __main__
-                    py.import("__main__").map_err(|_| {
-                        Error::Process("Failed to import __main__ module".to_string())
-                    })?
-                };
-
-                if let Some(script) = &config.script {
-                    let string = CString::new(script.clone())
-                        .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
-                    py.run(&string, None, None).map_err(|e| {
-                        Error::Process(format!("Failed to run Python script: {}", e))
-                    })?;
-                }
-
                 // Convert MessageBatch to PyArrow
                 let py_batch = batch.to_pyarrow(py).map_err(|e| {
                     Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
                 })?;
 
-                // Get the processing function
-                let func = py_module.getattr(&config.function).map_err(|e| {
-                    Error::Process(format!(
-                        "Failed to get function '{}': {}",
-                        &config.function, e
-                    ))
-                })?;
-
-                // Call the Python function with the batch
-                let result = func.call1((py_batch,)).map_err(|e| {
-                    Error::Process(format!("Failed to call Python function: {}", e))
-                })?;
+                let func_bound = func_to_call.bind(py);
+                let result = func_bound
+                    .call1((py_batch,))
+                    .map_err(|e| Error::Process(format!("Python function call failed: {}", e)))?;
                 let py_list = result.downcast::<PyList>().map_err(|_| {
                     Error::Process("Failed to downcast Python result to PyList".to_string())
                 })?;
@@ -128,6 +86,57 @@ impl Processor for PythonProcessor {
     }
 }
 
+impl PythonProcessor {
+    fn new(config: PythonProcessorConfig) -> Result<Self, Error> {
+        Python::with_gil(|py| -> Result<Self, Error> {
+            let sys = py
+                .import("sys")
+                .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
+            let binding = sys
+                .getattr("path")
+                .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
+            let path = binding
+                .downcast::<PyList>()
+                .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
+            path.insert(0, ".").unwrap();
+            let _ = &config
+                .python_path
+                .iter()
+                .for_each(|p| path.insert(0, p).unwrap());
+
+            // Get the Python module either from the script or from an imported module
+            let py_module = if let Some(module_name) = &config.module {
+                py.import(module_name).map_err(|e| {
+                    Error::Process(format!("Failed to import module {}: {}", module_name, e))
+                })?
+            } else {
+                // If no module specified, use __main__
+                py.import("__main__")
+                    .map_err(|_| Error::Process("Failed to import __main__ module".to_string()))?
+            };
+
+            if let Some(script) = &config.script {
+                let string = CString::new(script.clone())
+                    .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
+                py.run(&string, None, None)
+                    .map_err(|e| Error::Process(format!("Failed to run Python script: {}", e)))?;
+            }
+
+            // Get the processing function
+            let func = py_module.getattr(&config.function).map_err(|e| {
+                Error::Process(format!(
+                    "Failed to get function '{}': {}",
+                    &config.function, e
+                ))
+            })?;
+
+            // Convert the bound function reference to a PyObject for storage.
+            let func_obj: PyObject = func.into_any().unbind();
+            Ok(PythonProcessor { func: func_obj })
+        })
+    }
+}
+
 struct PythonProcessorBuilder;
 impl ProcessorBuilder for PythonProcessorBuilder {
     fn build(
@@ -143,7 +152,7 @@ impl ProcessorBuilder for PythonProcessorBuilder {
         }
 
         let config: PythonProcessorConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(PythonProcessor { config }))
+        Ok(Arc::new(PythonProcessor::new(config)?))
     }
 }
 
