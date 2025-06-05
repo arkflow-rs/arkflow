@@ -8,12 +8,20 @@ English | [中文](README_zh.md)
 
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow)
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
 High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting
 multiple input/output sources and processors.
+
+##  Cloud Native Landscape
+
+<p float="left">
+<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="./cncf-landscape-logo.svg" width="150"/>
+</p>
+
+ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow).
 
 ## Features
 
@@ -268,15 +276,6 @@ streams:
     output:
       type: "stdout"
 ```
-
-##  Cloud Native Landscape
-
-<p float="left">
-<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
-<img src="./cncf-landscape-logo.svg" width="150"/>
-</p>
-
-ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow).
 
 ## Users
 
