@@ -265,7 +265,7 @@ streams:
 <img src="./cncf-landscape-logo.svg" width="150"/>
 </p>
 
-ArkFlow 收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?selected=ArkFlow)。
+ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?selected=ArkFlow)中。
 
 ## 用户
 
