@@ -275,7 +275,7 @@ streams:
 <img src="./cncf-landscape-logo.svg" width="150"/>
 </p>
 
-ArkFLow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?selected=ArkFlow).
+ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?selected=ArkFlow).
 
 ## Users
 
