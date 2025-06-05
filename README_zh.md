@@ -257,6 +257,15 @@ streams:
     output:
       type: "stdout"
 ```
+##  CNCF 云原生技术全景图
+
+<p float="left">
+<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="./cncf-landscape-logo.svg" width="150"/>
+</p>
+
+ArkFlow 收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?selected=ArkFlow)。
+
 
 ## 用户
 
