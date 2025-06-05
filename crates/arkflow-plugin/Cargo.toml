@@ -22,14 +22,14 @@ humantime = { workspace = true }
 tracing = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
-datafusion-table-providers = { git = "https://github.com/arkflow-rs/datafusion-table-providers", rev = "e29bf21bbcd3f197f8c1e0675f9fab0b4ad48825", features = [
+datafusion-table-providers = { version = "0.5", features = [
     "mysql",
     "postgres",
     "duckdb",
     "sqlite",
 ] }
 ballista = { git = "https://github.com/apache/datafusion-ballista", rev = "97c919274d9de496b630e66c12ad29c3fccd110b" }
-duckdb = { git = "https://github.com/arkflow-rs/duckdb-rs.git", rev = "d13c0cd133199db580742339c3edeafd1d780b81" } # Forked to add support for duckdb_scan_arrow, pending: https://github.com/duckdb/duckdb-rs/pull/488
+duckdb = { version = "=1.3.0", package = "spiceai_duckdb_fork" }
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
