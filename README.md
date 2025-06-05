@@ -267,12 +267,14 @@ streams:
     output:
       type: "stdout"
 ```
+
 ##  Cloud Native Landscape
 
 <p float="left">
 <img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
 <img src="./cncf-landscape-logo.svg" width="150"/>
 </p>
+
 ArkFLow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?selected=ArkFlow).
 
 ## Users
