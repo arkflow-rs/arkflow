@@ -2,24 +2,61 @@ logging:
   level: info
 streams:
   - input:
-      type: "generate"
-      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
-      interval: 1ns
-      batch_size: 1
-      count: 10
+      type: "memory"
+      messages:
+        - '{ "timestamp": 1625000005000, "value": 10, "sensor": "temp_1" }'
+        - '{ "timestamp": 1625000006000, "value": 19, "sensor": "temp_1" }'
+        - '{ "timestamp": 1625000007000, "value": 11, "sensor": "temp_2" }'
+        - '{ "timestamp": 1625000008000, "value": 11, "sensor": "temp_2" }'
+
 
     pipeline:
       thread_num: 10
       processors:
+        - type: "json_to_arrow"
         - type: "python"
-#          script: |
-#            from example1 import add
-#            def process_batch(batch):
-#              print(add(1,1))
-#              return [batch]
-          function: "process_batch"
-          module: example1
-          python_path: ["./examples/python"]
+          script: |
+            def transform_data(batch):
+                import pyarrow as pa
+                import pyarrow.compute as pc
+
+                # Get the value field in the batch
+                value_array = batch.column('value')
+
+                # Do math on the values
+                doubled_values = pc.multiply(value_array, 2)
+                squared_values = pc.power(value_array, 2)
+
+                # Create a new field
+                new_fields = [
+                    # Leave the original fields
+                    pa.field('timestamp', pa.int64()),
+                    pa.field('value', pa.int64()),
+                    pa.field('sensor', pa.string()),
+                    # Add a new field
+                    pa.field('value_doubled', pa.int64()),
+                    pa.field('value_squared', pa.int64())
+                ]
+
+                # Create a new schema
+                new_schema = pa.schema(new_fields)
+
+                # Create a new batch of records
+                new_batch = pa.RecordBatch.from_arrays(
+                    [
+                        batch.column('timestamp'),
+                        batch.column('value'),
+                        batch.column('sensor'),
+                        doubled_values,
+                        squared_values
+                    ],
+                    schema=new_schema
+                )
+
+                return [new_batch]
+          function: "transform_data"
+#          module: example1
+          python_path: []
 
 
     output:
