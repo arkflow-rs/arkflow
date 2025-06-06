@@ -1,0 +1,26 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1ns
+      batch_size: 1
+      count: 10
+
+    pipeline:
+      thread_num: 10
+      processors:
+        - type: "python"
+#          script: |
+#            from example1 import add
+#            def process_batch(batch):
+#              print(add(1,1))
+#              return [batch]
+          function: "process_batch"
+          module: example1
+          python_path: ["./examples/python"]
+
+
+    output:
+      type: "stdout"

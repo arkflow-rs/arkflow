@@ -9,16 +9,24 @@
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
 高性能Rust流处理引擎，提供强大的数据流处理能力，支持多种输入输出源和处理器。
+
+##  CNCF 云原生技术全景图
+
+<p float="left">
+<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="./cncf-landscape-logo.svg" width="150"/>
+</p>
+
+ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow)中。
 
 ## 特性
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
 - **多种数据源**：支持Kafka、MQTT、HTTP、文件等多种输入输出源
-- **强大的处理能力**：内置SQL查询、JSON处理、Protobuf编解码、批处理等多种处理器
+- **强大的处理能力**：内置SQL查询、Python脚本、JSON处理、Protobuf编解码、批处理等多种处理器
 - **可扩展**：模块化设计，易于扩展新的输入、缓冲区、输出和处理器组件
 
 ## 安装
