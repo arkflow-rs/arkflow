@@ -26,7 +26,7 @@ ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landsc
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
 - **多种数据源**：支持Kafka、MQTT、HTTP、文件等多种输入输出源
-- **强大的处理能力**：内置SQL查询、JSON处理、Protobuf编解码、批处理等多种处理器
+- **强大的处理能力**：内置SQL查询、Python脚本、JSON处理、Protobuf编解码、批处理等多种处理器
 - **可扩展**：模块化设计，易于扩展新的输入、缓冲区、输出和处理器组件
 
 ## 安装

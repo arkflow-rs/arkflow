@@ -27,7 +27,7 @@ ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/
 
 - **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, and other input/output sources
-- **Powerful Processing Capabilities**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch
+- **Powerful Processing Capabilities**: Built-in SQL queries, Python script, JSON processing, Protobuf encoding/decoding, batch
   processing, and other processors
 - **Extensible**: Modular design, easy to extend with new input, buffer, output, and processor components
 
