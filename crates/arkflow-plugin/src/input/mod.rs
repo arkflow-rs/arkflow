@@ -18,6 +18,7 @@
 
 use arkflow_core::Error;
 
+mod file;
 pub mod generate;
 pub mod http;
 pub mod kafka;
@@ -42,5 +43,6 @@ pub fn init() -> Result<(), Error> {
     websocket::init()?;
     multiple_inputs::init()?;
     modbus::init()?;
+    file::init()?;
     Ok(())
 }

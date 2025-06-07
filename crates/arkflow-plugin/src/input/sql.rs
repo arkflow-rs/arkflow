@@ -20,8 +20,6 @@ use async_trait::async_trait;
 
 use crate::udf;
 use ballista::prelude::SessionContextExt;
-use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -34,18 +32,12 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
-use hdfs_native_object_store::HdfsObjectStore;
-use object_store::aws::AmazonS3Builder;
-use object_store::azure::MicrosoftAzureBuilder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::http::HttpBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use url::Url;
 
 const DEFAULT_NAME: &str = "flow";
 
@@ -67,16 +59,6 @@ pub struct BallistaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum InputType {
-    /// Avro input
-    Avro(AvroConfig),
-    /// Arrow input
-    Arrow(ArrowConfig),
-    /// JSON input
-    Json(JsonConfig),
-    /// CSV input
-    Csv(CsvConfig),
-    /// Parquet input
-    Parquet(ParquetConfig),
     /// Mysql input
     Mysql(MysqlConfig),
     /// Duckdb input
@@ -85,56 +67,6 @@ enum InputType {
     Postgres(PostgresConfig),
     /// Sqlite input
     Sqlite(SqliteConfig),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AvroConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// avro file path
-    path: String,
-    /// object store config
-    object_store: Option<ObjectStore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArrowConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// arrow file path
-    path: String,
-    /// object store config
-    object_store: Option<ObjectStore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// json file path
-    path: String,
-    /// object store config
-    object_store: Option<ObjectStore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CsvConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// csv file path
-    path: String,
-    /// object store config
-    object_store: Option<ObjectStore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ParquetConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// parquet file path
-    path: String,
-    /// object store config
-    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,69 +111,6 @@ struct PostgresSslConfig {
     ssl_mode: String,
     /// postgres ssl root cert
     root_cert: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ObjectStore {
-    S3(AwsS3Config),
-    Gs(GoogleCloudStorageConfig),
-    Az(MicrosoftAzureConfig),
-    Http(HttpConfig),
-    Hdfs(HdfsConfig),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AwsS3Config {
-    /// S3 endpoint URL (optional, uses AWS default if not specified)
-    endpoint: Option<String>,
-    /// AWS region
-    region: Option<String>,
-    /// S3 bucket name
-    bucket_name: String,
-    /// AWS access key ID
-    access_key_id: String,
-    /// AWS secret access key
-    secret_access_key: String,
-    /// Allow HTTP connections (defaults to false for security)
-    #[serde(default = "default_allow_http")]
-    allow_http: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GoogleCloudStorageConfig {
-    /// GCS bucket to connect to
-    bucket_name: String,
-    /// Optional custom endpoint (defaults to GCS public endpoint if `None`)
-    url: Option<String>,
-    /// Path to a service account JSON key file
-    service_account_path: Option<String>,
-    /// Raw JSON key contents
-    service_account_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MicrosoftAzureConfig {
-    /// Azure blob endpoint URL (optional, uses Azure default if not specified)
-    url: Option<String>,
-    endpoint: Option<String>,
-    /// Azure storage account name
-    account: String,
-    /// Azure shared access key
-    access_key: Option<String>,
-    /// Azure container name
-    container_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HttpConfig {
-    url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HdfsConfig {
-    url: String,
-    ha_config: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,46 +208,6 @@ impl Input for SqlInput {
 impl SqlInput {
     async fn init_connect(&self, ctx: &mut SessionContext) -> Result<(), Error> {
         match self.sql_config.input_type {
-            InputType::Avro(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
-                    .await
-            }
-            InputType::Arrow(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
-                    .await
-            }
-            InputType::Json(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
-                    .await
-            }
-            InputType::Csv(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
-                    .await
-            }
-            InputType::Parquet(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
-                    .await
-            }
             InputType::Mysql(ref c) => {
                 let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 let mut params = HashMap::from([
@@ -469,7 +298,6 @@ impl SqlInput {
                 Ok(())
             }
         }
-        .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
 
     /// Create a session context
@@ -486,147 +314,6 @@ impl SqlInput {
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
-    }
-
-    /// Create an object store
-    fn object_store(&self, ctx: &SessionContext, object_store: &ObjectStore) -> Result<(), Error> {
-        match object_store {
-            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
-            ObjectStore::Gs(config) => self.google_cloud_storage(ctx, config),
-            ObjectStore::Az(config) => self.microsoft_azure_store(ctx, config),
-            ObjectStore::Http(config) => self.http_store(ctx, config),
-            ObjectStore::Hdfs(config) => self.hdfs_store(ctx, config),
-        }
-    }
-
-    /// Create an AWS S3 object store
-    fn aws_s3_object_store(
-        &self,
-        ctx: &SessionContext,
-        aws_s3_config: &AwsS3Config,
-    ) -> Result<(), Error> {
-        let mut s3_builder = AmazonS3Builder::new()
-            .with_bucket_name(&aws_s3_config.bucket_name)
-            .with_access_key_id(&aws_s3_config.access_key_id)
-            .with_secret_access_key(&aws_s3_config.secret_access_key)
-            .with_allow_http(aws_s3_config.allow_http);
-
-        if let Some(endpoint) = aws_s3_config.endpoint.as_ref() {
-            s3_builder = s3_builder.with_endpoint(endpoint);
-        }
-        if let Some(region) = aws_s3_config.region.as_ref() {
-            s3_builder = s3_builder.with_region(region);
-        }
-
-        let s3 = s3_builder
-            .build()
-            .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
-
-        let object_store_url =
-            ObjectStoreUrl::parse(format!("s3://{}", &aws_s3_config.bucket_name))
-                .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
-        let url: &Url = object_store_url.as_ref();
-        ctx.register_object_store(url, Arc::new(s3));
-        Ok(())
-    }
-
-    fn google_cloud_storage(
-        &self,
-        ctx: &SessionContext,
-        config: &GoogleCloudStorageConfig,
-    ) -> Result<(), Error> {
-        let mut google_cloud_storage_builder =
-            GoogleCloudStorageBuilder::new().with_bucket_name(&config.bucket_name);
-        if let Some(url) = &config.url {
-            google_cloud_storage_builder = google_cloud_storage_builder.with_url(url);
-        }
-
-        match (&config.service_account_path, &config.service_account_key) {
-            (Some(path), None) => {
-                google_cloud_storage_builder =
-                    google_cloud_storage_builder.with_service_account_path(path)
-            }
-            (None, Some(key)) => {
-                google_cloud_storage_builder =
-                    google_cloud_storage_builder.with_service_account_key(key)
-            }
-            (None, None) => return Err(Error::Config("GCS auth is missing".into())),
-            (Some(_), Some(_)) => {
-                return Err(Error::Config(
-                    "Specify either service_account_path or service_account_key, not both".into(),
-                ))
-            }
-        };
-
-        let google_cloud_storage = google_cloud_storage_builder
-            .build()
-            .map_err(|e| Error::Config(format!("Failed to create GCS client: {}", e)))?;
-
-        let object_store_url = ObjectStoreUrl::parse(format!("gs://{}", &config.bucket_name))
-            .map_err(|e| Error::Config(format!("Failed to parse GCS URL: {}", e)))?;
-        let url: &Url = object_store_url.as_ref();
-        ctx.register_object_store(url, Arc::new(google_cloud_storage));
-        Ok(())
-    }
-
-    fn microsoft_azure_store(
-        &self,
-        ctx: &SessionContext,
-        config: &MicrosoftAzureConfig,
-    ) -> Result<(), Error> {
-        let mut azure_builder = MicrosoftAzureBuilder::new()
-            .with_account(&config.account)
-            .with_container_name(&config.container_name);
-
-        if let Some(access_key) = &config.access_key {
-            azure_builder = azure_builder.with_access_key(access_key);
-        }
-        if let Some(url) = &config.url {
-            azure_builder = azure_builder.with_url(url);
-        }
-        if let Some(endpoint) = &config.endpoint {
-            azure_builder = azure_builder
-                .with_endpoint(endpoint.clone())
-                .with_allow_http(true);
-        }
-
-        let azure_storage = azure_builder
-            .build()
-            .map_err(|e| Error::Config(format!("Failed to create AZ client: {}", e)))?;
-
-        let object_store_url = ObjectStoreUrl::parse(format!("az://{}", &config.container_name))
-            .map_err(|e| Error::Config(format!("Failed to parse AZ URL: {}", e)))?;
-        let url: &Url = object_store_url.as_ref();
-        ctx.register_object_store(url, Arc::new(azure_storage));
-        Ok(())
-    }
-
-    fn http_store(&self, ctx: &SessionContext, config: &HttpConfig) -> Result<(), Error> {
-        let http_builder = HttpBuilder::new().with_url(&config.url);
-        let http_storage = http_builder
-            .build()
-            .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
-        let object_store_url = ObjectStoreUrl::parse(&config.url)
-            .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
-        let url: &Url = object_store_url.as_ref();
-        ctx.register_object_store(url, Arc::new(http_storage));
-        Ok(())
-    }
-
-    fn hdfs_store(&self, ctx: &SessionContext, config: &HdfsConfig) -> Result<(), Error> {
-        let hdfs_storage_result = if let Some(ha_config) = &config.ha_config {
-            HdfsObjectStore::with_config(&config.url, ha_config.clone())
-        } else {
-            HdfsObjectStore::with_url(&config.url)
-        };
-        let hdfs_storage = hdfs_storage_result
-            .map_err(|e| Error::Config(format!("Failed to create HDFS client: {}", e)))?;
-
-        let object_store_url = ObjectStoreUrl::parse(&config.url)
-            .map_err(|e| Error::Config(format!("Failed to parse HDFS URL: {}", e)))?;
-        let url: &Url = object_store_url.as_ref();
-        ctx.register_object_store(url, Arc::new(hdfs_storage));
-        Ok(())
     }
 }
 
@@ -651,84 +338,4 @@ impl InputBuilder for SqlInputBuilder {
 
 pub fn init() -> Result<(), Error> {
     register_input_builder("sql", Arc::new(SqlInputBuilder))
-}
-
-fn default_allow_http() -> bool {
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::array::StringArray;
-    use tempfile::{tempdir, TempDir};
-    fn create_test_data() -> (TempDir, String) {
-        let temp_dir = tempdir().unwrap();
-        let path_buf = temp_dir.path().join("test_path.json");
-        let path = path_buf.as_path().to_str().unwrap().to_string();
-
-        let _ = std::fs::write(path_buf, r#"{"name": "John", "age": 30}"#).unwrap();
-        (temp_dir, path)
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_connect() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT * FROM test_table".to_string(),
-            ballista: None,
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-                object_store: None,
-            }),
-        };
-        let input = SqlInput::new(None, config).unwrap();
-        assert!(input.connect().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_read() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT * FROM test_table".to_string(),
-            ballista: None,
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-                object_store: None,
-            }),
-        };
-        let input = SqlInput::new(None, config).unwrap();
-        input.connect().await.unwrap();
-
-        let (msg, ack) = input.read().await.unwrap();
-        let (i, _) = msg.schema().column_with_name("name").unwrap();
-        let result = msg
-            .column(i)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0);
-        assert_eq!(result, "John");
-        ack.ack().await;
-        input.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_invalid_query() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT invalid_column FROM test_table".to_string(),
-            ballista: None,
-
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-                object_store: None,
-            }),
-        };
-        let input = SqlInput::new(None, config).unwrap();
-        assert!(input.connect().await.is_err());
-    }
 }
