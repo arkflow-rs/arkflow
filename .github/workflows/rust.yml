@@ -21,7 +21,7 @@ jobs:
     - name: Set PROTOC Environment Variable
       run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
     - name: Setup sccache
-      uses: mozilla/sccache-action@v0.0.5
+      uses: mozilla/sccache-action@v0.0.8
     - name: Build
       run: cargo build --verbose
     - name: Run tests
