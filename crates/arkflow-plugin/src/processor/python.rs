@@ -47,7 +47,7 @@ impl Processor for PythonProcessor {
         let func_to_call = Python::with_gil(|py| self.func.clone_ref(py));
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> Result<Vec<MessageBatch>, Error> {
+            Python::with_gil(|py| -> Result<Vec<RecordBatch>, Error> {
                 // Convert MessageBatch to PyArrow
                 let py_batch = batch.to_pyarrow(py).map_err(|e| {
                     Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
@@ -57,6 +57,7 @@ impl Processor for PythonProcessor {
                 let result = func_bound
                     .call1((py_batch,))
                     .map_err(|e| Error::Process(format!("Python function call failed: {}", e)))?;
+
                 let py_list = result.downcast::<PyList>().map_err(|_| {
                     Error::Process("Failed to downcast Python result to PyList".to_string())
                 })?;
@@ -71,16 +72,17 @@ impl Processor for PythonProcessor {
                         })
                     })
                     .collect::<Result<Vec<RecordBatch>, Error>>()?;
-                let vec_mb = vec_rb
-                    .into_iter()
-                    .map(|rb| MessageBatch::new_arrow(rb))
-                    .collect::<Vec<_>>();
-                Ok(vec_mb)
+                Ok(vec_rb)
             })
         })
         .await
-        .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))?;
-        result
+        .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))??;
+
+        let vec_mb = result
+            .into_iter()
+            .map(|rb| MessageBatch::new_arrow(rb))
+            .collect::<Vec<_>>();
+        Ok(vec_mb)
     }
 
     async fn close(&self) -> Result<(), Error> {
