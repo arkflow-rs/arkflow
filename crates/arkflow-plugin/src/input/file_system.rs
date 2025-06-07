@@ -68,7 +68,7 @@ enum InputType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileFormatConfig {
-    /// avro file path
+    /// file path
     path: String,
     /// object store config
     object_store: Option<ObjectStore>,
