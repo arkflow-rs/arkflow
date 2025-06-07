@@ -107,9 +107,9 @@ impl PythonProcessor {
                 .for_each(|p| path.insert(0, p).unwrap());
 
             // Get the Python module either from the script or from an imported module
-            let py_module = py
-                .import(&config.module)
-                .map_err(|e| Error::Process(format!("Failed to import __main__ module: {}", e)))?;
+            let py_module = py.import(&config.module).map_err(|e| {
+                Error::Process(format!("Failed to import {} module: {}", &config.module, e))
+            })?;
 
             if let Some(script) = &config.script {
                 let string = CString::new(script.as_str())
