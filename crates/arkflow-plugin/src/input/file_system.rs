@@ -81,8 +81,6 @@ enum InputType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AvroConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
     /// avro file path
     path: String,
     /// object store config
@@ -91,8 +89,6 @@ struct AvroConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArrowConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
     /// arrow file path
     path: String,
     /// object store config
@@ -101,8 +97,6 @@ struct ArrowConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
     /// json file path
     path: String,
     /// object store config
@@ -111,8 +105,6 @@ struct JsonConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CsvConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
     /// csv file path
     path: String,
     /// object store config
@@ -121,8 +113,6 @@ struct CsvConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ParquetConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
     /// parquet file path
     path: String,
     /// object store config
@@ -459,6 +449,7 @@ impl Input for FileSystemInput {
 }
 
 struct FileSystemBuilder;
+
 impl InputBuilder for FileSystemBuilder {
     fn build(
         &self,
