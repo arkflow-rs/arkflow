@@ -28,10 +28,12 @@ struct PythonProcessorConfig {
     /// Python code to execute
     script: Option<String>,
     /// Python module to import
-    module: Option<String>,
+    #[serde(default = "default_module")]
+    module: String,
     /// Function name to call for processing
     function: String,
     /// Additional Python paths
+    #[serde(default = "default_python_path")]
     python_path: Vec<String>,
 }
 
@@ -105,16 +107,9 @@ impl PythonProcessor {
                 .for_each(|p| path.insert(0, p).unwrap());
 
             // Get the Python module either from the script or from an imported module
-            let py_module = if let Some(module_name) = &config.module {
-                py.import(module_name).map_err(|e| {
-                    Error::Process(format!("Failed to import module {}: {}", module_name, e))
-                })?
-            } else {
-                // If no module specified, use __main__
-                py.import("__main__").map_err(|e| {
-                    Error::Process(format!("Failed to import __main__ module: {}", e))
-                })?
-            };
+            let py_module = py
+                .import(&config.module)
+                .map_err(|e| Error::Process(format!("Failed to import __main__ module: {}", e)))?;
 
             if let Some(script) = &config.script {
                 let string = CString::new(script.as_str())
@@ -155,6 +150,15 @@ impl ProcessorBuilder for PythonProcessorBuilder {
         let config: PythonProcessorConfig = serde_json::from_value(config.clone().unwrap())?;
         Ok(Arc::new(PythonProcessor::new(config)?))
     }
+}
+
+fn default_python_path() -> Vec<String> {
+    vec![]
+}
+
+fn default_module() -> String {
+    // If no module specified, use __main__
+    "__main__".to_string()
 }
 
 pub fn init() -> Result<(), Error> {
