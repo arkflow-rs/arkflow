@@ -18,7 +18,7 @@
 
 use arkflow_core::Error;
 
-mod file;
+pub mod file;
 pub mod generate;
 pub mod http;
 pub mod kafka;
