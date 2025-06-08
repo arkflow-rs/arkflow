@@ -361,7 +361,7 @@ impl Input for FileInput {
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| Error::Process(format!("Failed to execute select_table_sql: {}", e)))?;
+            .map_err(|e| Error::Process(format!("Failed to execute file stream: {}", e)))?;
         stream_lock.replace(stream);
         Ok(())
     }
@@ -415,13 +415,13 @@ impl InputBuilder for FileBuilder {
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
-                "FileSystem input configuration is missing".to_string(),
+                "File input configuration is missing".to_string(),
             ));
         }
 
         let config: FileInputConfig =
             serde_json::from_value(config.clone().unwrap()).map_err(|e| {
-                Error::Config(format!("Failed to parse FileSystem input config: {}", e))
+                Error::Config(format!("Failed to parse File input config: {}", e))
             })?;
         Ok(Arc::new(FileInput::new(name, config)?))
     }
