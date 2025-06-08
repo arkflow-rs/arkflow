@@ -40,7 +40,7 @@ use tracing::error;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileSystemInputConfig {
+struct FileInputConfig {
     store: Option<Store>,
     input_type: InputType,
     ballista: Option<BallistaConfig>,
@@ -138,15 +138,15 @@ struct HdfsConfig {
     ha_config: Option<HashMap<String, String>>,
 }
 
-struct FileSystemInput {
+struct FileInput {
     input_name: Option<String>,
-    config: FileSystemInputConfig,
+    config: FileInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
 }
 
-impl FileSystemInput {
-    fn new(name: Option<&String>, config: FileSystemInputConfig) -> Result<Self, Error> {
+impl FileInput {
+    fn new(name: Option<&String>, config: FileInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
@@ -351,7 +351,7 @@ impl FileSystemInput {
 }
 
 #[async_trait]
-impl Input for FileSystemInput {
+impl Input for FileInput {
     async fn connect(&self) -> Result<(), Error> {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
@@ -404,9 +404,9 @@ impl Input for FileSystemInput {
     }
 }
 
-struct FileSystemBuilder;
+struct FileBuilder;
 
-impl InputBuilder for FileSystemBuilder {
+impl InputBuilder for FileBuilder {
     fn build(
         &self,
         name: Option<&String>,
@@ -419,16 +419,16 @@ impl InputBuilder for FileSystemBuilder {
             ));
         }
 
-        let config: FileSystemInputConfig = serde_json::from_value(config.clone().unwrap())
-            .map_err(|e| {
+        let config: FileInputConfig =
+            serde_json::from_value(config.clone().unwrap()).map_err(|e| {
                 Error::Config(format!("Failed to parse FileSystem input config: {}", e))
             })?;
-        Ok(Arc::new(FileSystemInput::new(name, config)?))
+        Ok(Arc::new(FileInput::new(name, config)?))
     }
 }
 
 pub fn init() -> Result<(), Error> {
-    input::register_input_builder("file", Arc::new(FileSystemBuilder))?;
+    input::register_input_builder("file", Arc::new(FileBuilder))?;
     Ok(())
 }
 
