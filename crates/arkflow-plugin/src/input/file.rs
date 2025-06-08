@@ -41,7 +41,6 @@ use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileInputConfig {
-    store: Option<Store>,
     input_type: InputType,
     ballista: Option<BallistaConfig>,
 }
@@ -98,7 +97,7 @@ struct AwsS3Config {
     /// AWS secret access key
     secret_access_key: String,
     /// Allow HTTP connections (defaults to false for security)
-    #[serde(default = "default_allow_http")]
+    #[serde(default = "default_disallow_http")]
     allow_http: bool,
 }
 
@@ -157,35 +156,25 @@ impl FileInput {
     }
 
     async fn read_df(&self, ctx: &mut SessionContext) -> Result<DataFrame, Error> {
+        // Register object store if configured
+        let store = match &self.config.input_type {
+            InputType::Avro(c)
+            | InputType::Arrow(c)
+            | InputType::Json(c)
+            | InputType::Csv(c)
+            | InputType::Parquet(c) => &c.store,
+        };
+
+        if let Some(object_store) = store {
+            self.object_store(ctx, object_store)?;
+        }
+
         match self.config.input_type {
-            InputType::Avro(ref c) => {
-                if let Some(object_store) = &c.store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.read_avro(&c.path, AvroReadOptions::default()).await
-            }
-            InputType::Arrow(ref c) => {
-                if let Some(object_store) = &c.store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.read_arrow(&c.path, ArrowReadOptions::default()).await
-            }
-            InputType::Json(ref c) => {
-                if let Some(object_store) = &c.store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.read_json(&c.path, NdJsonReadOptions::default()).await
-            }
-            InputType::Csv(ref c) => {
-                if let Some(object_store) = &c.store {
-                    self.object_store(ctx, object_store)?;
-                }
-                ctx.read_csv(&c.path, CsvReadOptions::default()).await
-            }
+            InputType::Avro(ref c) => ctx.read_avro(&c.path, AvroReadOptions::default()).await,
+            InputType::Arrow(ref c) => ctx.read_arrow(&c.path, ArrowReadOptions::default()).await,
+            InputType::Json(ref c) => ctx.read_json(&c.path, NdJsonReadOptions::default()).await,
+            InputType::Csv(ref c) => ctx.read_csv(&c.path, CsvReadOptions::default()).await,
             InputType::Parquet(ref c) => {
-                if let Some(object_store) = &c.store {
-                    self.object_store(ctx, object_store)?;
-                }
                 ctx.read_parquet(&c.path, ParquetReadOptions::default())
                     .await
             }
@@ -419,10 +408,8 @@ impl InputBuilder for FileBuilder {
             ));
         }
 
-        let config: FileInputConfig =
-            serde_json::from_value(config.clone().unwrap()).map_err(|e| {
-                Error::Config(format!("Failed to parse File input config: {}", e))
-            })?;
+        let config: FileInputConfig = serde_json::from_value(config.clone().unwrap())
+            .map_err(|e| Error::Config(format!("Failed to parse File input config: {}", e)))?;
         Ok(Arc::new(FileInput::new(name, config)?))
     }
 }
@@ -432,6 +419,6 @@ pub fn init() -> Result<(), Error> {
     Ok(())
 }
 
-fn default_allow_http() -> bool {
+fn default_disallow_http() -> bool {
     false
 }
