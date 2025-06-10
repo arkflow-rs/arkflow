@@ -24,7 +24,7 @@ example: `1ms`, `1s`, `1m`, `1h`, `1d`
 
 ### **slide_size**
 
-The number of messages to slide the window forward by when processing completes.
+The number of messages to remove from the window after each emission. This determines how much the window "slides" forward with each processing cycle. Must be greater than 0 and less than or equal to window_size.
 
 type: `integer`
 
@@ -33,11 +33,14 @@ required: `true`
 ## Internal Mechanism
 
 - Messages are stored in a thread-safe queue using `RwLock<VecDeque>`
-- A background timer periodically checks the interval condition to trigger window slides
-- When the total message count reaches the configured window_size, the buffer triggers message processing
-- After processing, the window slides forward by slide_size messages
-- Messages are batched and concatenated during processing for better performance
+- A background timer triggers window processing at the configured interval using Tokio's async runtime
+- When triggered, the buffer processes up to `window_size` messages from the queue
+- Messages are merged and concatenated using Arrow's concat_batches for efficient processing
+- After processing, the window slides forward by removing `slide_size` messages from the front of the queue
+- Acknowledgments are combined using VecAck to ensure proper message acknowledgment
+- Uses cancellation tokens for graceful shutdown and resource cleanup
 - Implements proper backpressure handling to prevent memory overflow
+- The sliding mechanism allows for overlapping windows when slide_size < window_size
 
 ## Examples
 
