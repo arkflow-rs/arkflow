@@ -16,14 +16,11 @@
 //!
 //! A processor for converting between binary data and the Arrow format
 
+use crate::component;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
-use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, NullArray, StringArray, UInt64Array,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,37 +32,27 @@ use std::sync::Arc;
 /// Arrow Format Conversion Processor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonProcessorConfig {
-    pub value_field: Option<String>,
-    pub fields_to_include: Option<HashSet<String>>,
+    value_field: Option<String>,
+    fields_to_include: Option<HashSet<String>>,
 }
 
-pub struct JsonToArrowProcessor {
+struct JsonToArrowProcessor {
     config: JsonProcessorConfig,
 }
 
 #[async_trait]
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let mut batches = Vec::with_capacity(msg_batch.len());
         let result = msg_batch.to_binary(
             self.config
                 .value_field
                 .as_deref()
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
-        for x in result {
-            let record_batch = self.json_to_arrow(x)?;
-            batches.push(record_batch)
-        }
 
-        if batches.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let schema = batches[0].schema();
-        let batch = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-        Ok(vec![MessageBatch::new_arrow(batch)])
+        let json_data: Vec<u8> = result.join(b"\n" as &[u8]);
+        let record_batch = self.json_to_arrow(&json_data)?;
+        Ok(vec![MessageBatch::new_arrow(record_batch)])
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -75,9 +62,7 @@ impl Processor for JsonToArrowProcessor {
 
 impl JsonToArrowProcessor {
     fn json_to_arrow(&self, content: &[u8]) -> Result<RecordBatch, Error> {
-        let json_value: Value = serde_json::from_slice(content)
-            .map_err(|e| Error::Process(format!("JSON parsing error: {}", e)))?;
-        json_to_arrow_inner(json_value, self.config.fields_to_include.as_ref())
+        component::json::try_to_arrow(content, self.config.fields_to_include.as_ref())
     }
 }
 
@@ -120,9 +105,15 @@ impl ArrowToJsonProcessor {
     }
 }
 
-pub(crate) struct JsonToArrowProcessorBuilder;
+struct JsonToArrowProcessorBuilder;
+
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -133,9 +124,15 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
         Ok(Arc::new(JsonToArrowProcessor { config }))
     }
 }
-pub(crate) struct ArrowToJsonProcessorBuilder;
+struct ArrowToJsonProcessorBuilder;
+
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -153,85 +150,13 @@ pub fn init() -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn json_to_arrow_inner(
-    json_value: Value,
-    fields_to_include: Option<&HashSet<String>>,
-) -> Result<RecordBatch, Error> {
-    match json_value {
-        Value::Object(obj) => {
-            let mut fields = Vec::new();
-            let mut columns: Vec<ArrayRef> = Vec::new();
-
-            for (key, value) in obj {
-                if let Some(ref set) = fields_to_include {
-                    if !set.contains(&key) {
-                        continue;
-                    }
-                }
-                match value {
-                    Value::Null => {
-                        fields.push(Field::new(&key, DataType::Null, true));
-                        // 空值列处理
-                        columns.push(Arc::new(NullArray::new(1)));
-                    }
-                    Value::Bool(v) => {
-                        fields.push(Field::new(&key, DataType::Boolean, false));
-                        columns.push(Arc::new(BooleanArray::from(vec![v])));
-                    }
-                    Value::Number(v) => {
-                        if v.is_i64() {
-                            fields.push(Field::new(&key, DataType::Int64, false));
-                            columns.push(Arc::new(Int64Array::from(vec![v.as_i64().unwrap()])));
-                        } else if v.is_u64() {
-                            fields.push(Field::new(&key, DataType::UInt64, false));
-                            columns.push(Arc::new(UInt64Array::from(vec![v.as_u64().unwrap()])));
-                        } else {
-                            fields.push(Field::new(&key, DataType::Float64, false));
-                            columns.push(Arc::new(Float64Array::from(vec![v
-                                .as_f64()
-                                .unwrap_or(0.0)])));
-                        }
-                    }
-                    Value::String(v) => {
-                        fields.push(Field::new(&key, DataType::Utf8, false));
-                        columns.push(Arc::new(StringArray::from(vec![v])));
-                    }
-                    Value::Array(v) => {
-                        fields.push(Field::new(&key, DataType::Utf8, false));
-                        if let Ok(x) = serde_json::to_string(&v) {
-                            columns.push(Arc::new(StringArray::from(vec![x])));
-                        } else {
-                            columns.push(Arc::new(StringArray::from(vec!["[]".to_string()])));
-                        }
-                    }
-                    Value::Object(v) => {
-                        fields.push(Field::new(&key, DataType::Utf8, false));
-                        if let Ok(x) = serde_json::to_string(&v) {
-                            columns.push(Arc::new(StringArray::from(vec![x])));
-                        } else {
-                            columns.push(Arc::new(StringArray::from(vec!["{}".to_string()])));
-                        }
-                    }
-                };
-            }
-
-            let schema = Arc::new(Schema::new(fields));
-            RecordBatch::try_new(schema, columns).map_err(|e| {
-                Error::Process(format!("Creating an Arrow record batch failed: {}", e))
-            })
-        }
-        _ => Err(Error::Process(
-            "The input must be a JSON object".to_string(),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::processor::json::{ArrowToJsonProcessorBuilder, JsonToArrowProcessorBuilder};
     use arkflow_core::processor::ProcessorBuilder;
-    use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+    use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
     use serde_json::json;
+    use std::cell::RefCell;
     use std::collections::HashSet;
 
     #[tokio::test]
@@ -240,7 +165,14 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": null
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )?;
 
         let json_data = json!({
             "null_field": null,
@@ -270,7 +202,14 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": fields
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )?;
 
         let json_data = json!({
             "int_field": 42,
@@ -291,7 +230,14 @@ mod tests {
             "value_field": "data",
             "fields_to_include": null
         }));
-        let processor = JsonToArrowProcessorBuilder.build(&config)?;
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )?;
 
         let invalid_json = b"not a json object";
         let msg_batch = MessageBatch::new_binary(vec![invalid_json.to_vec()])?;
@@ -307,8 +253,26 @@ mod tests {
             "value_field": DEFAULT_BINARY_VALUE_FIELD,
             "fields_to_include": null
         }));
-        let json_to_arrow = JsonToArrowProcessorBuilder.build(&config).unwrap();
-        let arrow_to_json = ArrowToJsonProcessorBuilder.build(&config).unwrap();
+        let json_to_arrow = JsonToArrowProcessorBuilder
+            .build(
+                None,
+                &config,
+                &Resource {
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
+                },
+            )
+            .unwrap();
+        let arrow_to_json = ArrowToJsonProcessorBuilder
+            .build(
+                None,
+                &config,
+                &Resource {
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
+                },
+            )
+            .unwrap();
 
         let json_data = json!({
             "int_field": 42,
@@ -328,10 +292,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_processor_missing_config() {
-        let result = JsonToArrowProcessorBuilder.build(&None);
+        let result = JsonToArrowProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        );
         assert!(result.is_err());
 
-        let result = ArrowToJsonProcessorBuilder.build(&None);
+        let result = ArrowToJsonProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        );
         assert!(result.is_err());
     }
 }

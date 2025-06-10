@@ -12,7 +12,8 @@
  *    limitations under the License.
  */
 
-use serde::{Deserialize, Deserializer};
+use serde::de::Unexpected;
+use serde::{de, Deserialize, Deserializer};
 use std::time::Duration;
 
 pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -20,5 +21,7 @@ where
     D: Deserializer<'de>,
 {
     let s: String = Deserialize::deserialize(deserializer)?;
-    humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+    humantime::parse_duration(&s).map_err(|_| {
+        de::Error::invalid_value(Unexpected::Str(&s), &"a duration like '10ms' or '1s'")
+    })
 }

@@ -1,0 +1,37 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "multiple_inputs"
+      inputs:
+        - type: "generate"
+          name: "flow_input1"
+          context: '{ "id": 1625000000000, "value": 10, "sensor": "temp_1" }'
+          interval: 1s
+          batch_size: 1
+          count: 10
+        - type: "generate"
+          name: "flow_input2"
+          context: '{ "id": 1625000000000, "value": 20, "sensor": "temp_2" }'
+          interval: 1s
+          batch_size: 1
+          count: 10
+
+
+    buffer:
+      type: "session_window"
+      gap: 1s
+      join:
+        query: "SELECT * FROM flow_input1 join flow_input2 on (flow_input1.id = flow_input2.id)"
+#        query: "SELECT * FROM flow_input1"
+        codec:
+          type: "json"
+    pipeline:
+      processors:
+#        - type: "json_to_arrow"
+
+
+
+    output:
+      type: "stdout"
+

@@ -17,7 +17,7 @@
 //! The processor used to convert between Protobuf data and the Arrow format
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -57,7 +57,7 @@ enum ToType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArrowConfig {
-    pub value_field: Option<String>,
+    value_field: Option<String>,
 }
 /// Protobuf Format Conversion Processor
 struct ProtobufProcessor {
@@ -67,7 +67,7 @@ struct ProtobufProcessor {
 
 impl ProtobufProcessor {
     /// Create a new Protobuf format conversion processor
-    pub fn new(config: ProtobufProcessorConfig) -> Result<Self, Error> {
+    fn new(config: ProtobufProcessorConfig) -> Result<Self, Error> {
         // Check the file extension to see if it's a proto file or a binary descriptor file
         let file_descriptor_set = Self::parse_proto_file(&config)?;
 
@@ -484,7 +484,12 @@ impl From<ProtobufToArrowProcessorConfig> for ProtobufProcessorConfig {
 
 struct ProtobufToArrowProcessorBuilder;
 impl ProcessorBuilder for ProtobufToArrowProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "ProtobufToArrow processor configuration is missing".to_string(),
@@ -497,7 +502,12 @@ impl ProcessorBuilder for ProtobufToArrowProcessorBuilder {
 }
 struct ArrowToProtobufProcessorBuilder;
 impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "ArrowToProtobuf processor configuration is missing".to_string(),
@@ -528,6 +538,7 @@ mod tests {
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use std::cell::RefCell;
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
@@ -693,10 +704,24 @@ message TestMessage {
 
     #[tokio::test]
     async fn test_processor_builder() {
-        let result = ProtobufToArrowProcessorBuilder.build(&None);
+        let result = ProtobufToArrowProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        );
         assert!(result.is_err());
 
-        let result = ArrowToProtobufProcessorBuilder.build(&None);
+        let result = ArrowToProtobufProcessorBuilder.build(
+            None,
+            &None,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        );
         assert!(result.is_err());
 
         let (_x, proto_dir) = create_test_proto_file().unwrap();
@@ -710,7 +735,14 @@ message TestMessage {
         })
         .unwrap();
 
-        let result = ProtobufToArrowProcessorBuilder.build(&Some(config));
+        let result = ProtobufToArrowProcessorBuilder.build(
+            None,
+            &Some(config),
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        );
         assert!(result.is_ok());
     }
 }

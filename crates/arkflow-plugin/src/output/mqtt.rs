@@ -16,9 +16,9 @@
 //!
 //! Send the processed data to the MQTT broker
 
-use crate::expr::{EvaluateExpr, Expr};
+use crate::expr::Expr;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
@@ -29,29 +29,29 @@ use tracing::info;
 
 /// MQTT output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MqttOutputConfig {
+struct MqttOutputConfig {
     /// MQTT broker address
-    pub host: String,
+    host: String,
     /// MQTT broker port
-    pub port: u16,
+    port: u16,
     /// Client ID
-    pub client_id: String,
+    client_id: String,
     /// Username (optional)
-    pub username: Option<String>,
+    username: Option<String>,
     /// Password (optional)
-    pub password: Option<String>,
+    password: Option<String>,
     /// Published topics
-    pub topic: Expr<String>,
+    topic: Expr<String>,
     /// Quality of Service (0, 1, 2)
-    pub qos: Option<u8>,
+    qos: Option<u8>,
     /// Whether to use clean session
-    pub clean_session: Option<bool>,
+    clean_session: Option<bool>,
     /// Keep alive interval (seconds)
-    pub keep_alive: Option<u64>,
+    keep_alive: Option<u64>,
     /// Whether to retain the message
-    pub retain: Option<bool>,
+    retain: Option<bool>,
     /// Value type
-    pub value_field: Option<String>,
+    value_field: Option<String>,
 }
 
 /// MQTT output component
@@ -64,7 +64,7 @@ struct MqttOutput<T: MqttClient> {
 
 impl<T: MqttClient> MqttOutput<T> {
     /// Create a new MQTT output component
-    pub fn new(config: MqttOutputConfig) -> Result<Self, Error> {
+    fn new(config: MqttOutputConfig) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
@@ -144,7 +144,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             }
         };
 
-        let topic = self.config.topic.evaluate_expr(&msg)?;
+        let topic = self.config.topic.evaluate_expr(&msg).await?;
 
         // Determine the QoS level
         let qos_level = match self.config.qos {
@@ -195,9 +195,14 @@ impl<T: MqttClient> Output for MqttOutput<T> {
     }
 }
 
-pub(crate) struct MqttOutputBuilder;
+struct MqttOutputBuilder;
 impl OutputBuilder for MqttOutputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Output>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "HTTP output configuration is missing".to_string(),

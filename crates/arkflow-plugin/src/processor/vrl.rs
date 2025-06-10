@@ -1,27 +1,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use datafusion::{
-    arrow::{array::*, datatypes::DataType, record_batch::RecordBatch},
-    error,
+use arkflow_core::{
+    processor::{register_processor_builder, Processor, ProcessorBuilder},
+    Error, MessageBatch, Resource,
 };
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
+use datafusion::arrow::{array::*, datatypes::DataType};
+use datafusion::parquet::data_type::AsBytes;
+use duckdb::arrow::datatypes::FieldRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
+use vrl::prelude::ObjectMap;
 use vrl::{
     compiler::{self, Program, TargetValue, TimeZone},
     prelude::{state::RuntimeState, Context},
     stdlib,
     value::{Secrets, Value as VrlValue},
 };
-
-use arkflow_core::{
-    processor::{register_processor_builder, Processor, ProcessorBuilder},
-    Error, MessageBatch,
-};
-
-use super::json::json_to_arrow_inner;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("vrl", Arc::new(VrlProcessorBuilder))?;
@@ -30,24 +28,24 @@ pub fn init() -> Result<(), Error> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VrlProcessorConfig {
-    pub statement: String,
+    statement: String,
 }
 
-pub struct VrlProcessor {
+struct VrlProcessor {
     #[allow(unused)]
     config: VrlProcessorConfig,
-
     program: Program,
 }
 
 #[async_trait]
 impl Processor for VrlProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let mut batches = vec![];
-        let result = recordbatch_to_vrl_value(msg_batch.0);
+        let result = message_batch_to_vrl_values(msg_batch);
 
         let mut state = RuntimeState::default();
         let timezone = TimeZone::default();
+        let mut output: Vec<Vec<VrlValue>> = Vec::with_capacity(result.len());
+
         for x in result {
             let mut target = TargetValue {
                 value: x,
@@ -59,17 +57,19 @@ impl Processor for VrlProcessor {
 
             let mut ctx = Context::new(&mut target, &mut state, &timezone);
             if let Ok(v) = self.program.resolve(&mut ctx) {
-                let v = vrl_value_to_json_value(v);
-                match json_to_arrow_inner(v, None) {
-                    Ok(rb) => {
-                        batches.push(MessageBatch(rb));
+                match v {
+                    VrlValue::Array(vv) => {
+                        output.push(vv);
                     }
-                    Err(e) => warn!("Failed to convert JSON to Arrow: {:?}", e),
+                    _ => output.push(vec![v]),
                 }
             }
         }
 
-        Ok(batches)
+        output
+            .into_iter()
+            .map(|x| vrl_values_to_message_batch(x))
+            .collect::<Result<Vec<MessageBatch>, Error>>()
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -77,9 +77,14 @@ impl Processor for VrlProcessor {
     }
 }
 
-pub(crate) struct VrlProcessorBuilder;
+struct VrlProcessorBuilder;
 impl ProcessorBuilder for VrlProcessorBuilder {
-    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(
+        &self,
+        _name: Option<&String>,
+        config: &Option<Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -98,50 +103,25 @@ impl ProcessorBuilder for VrlProcessorBuilder {
     }
 }
 
-pub(crate) fn vrl_value_to_json_value(vrl_value: VrlValue) -> Value {
-    match vrl_value {
-        VrlValue::Null => Value::Null,
-        VrlValue::Boolean(b) => Value::Bool(b),
-        VrlValue::Float(n) => Value::Number(serde_json::Number::from_f64(*n).unwrap()),
-        VrlValue::Integer(n) => Value::Number(serde_json::Number::from(n)),
-        VrlValue::Bytes(s) => Value::String(String::from_utf8_lossy(&s).to_string()),
-        VrlValue::Regex(s) => Value::String(s.to_string()),
-        VrlValue::Timestamp(s) => Value::String(s.to_string()),
-        VrlValue::Array(arr) => {
-            let arr: Vec<Value> = arr.into_iter().map(vrl_value_to_json_value).collect();
-            Value::Array(arr)
-        }
-        VrlValue::Object(obj) => {
-            let obj: BTreeMap<String, Value> = obj
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), vrl_value_to_json_value(v)))
-                .collect();
-            Value::Object(serde_json::Map::from_iter(obj))
-        }
-    }
-}
-
-pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValue> {
-    let rows = record_batch.num_rows();
-    let mut vrl_values = Vec::with_capacity(rows);
+fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
+    let rows = message_batch.num_rows();
+    let mut vrl_values: Vec<ObjectMap> = Vec::with_capacity(rows);
     for _ in 0..rows {
-        let map = BTreeMap::new();
-        vrl_values.push(VrlValue::Object(map));
+        vrl_values.push(BTreeMap::new());
     }
-    for i in 0..record_batch.num_columns() {
-        let column = record_batch.column(i);
-        let schema = record_batch.schema();
+
+    let schema = message_batch.schema();
+    let num_columns = message_batch.num_columns();
+    for i in 0..num_columns {
+        let column = message_batch.column(i);
         let name = schema.field(i).name();
         match column.data_type() {
             DataType::Utf8 => {
                 if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
                     for i in 0..rows {
                         let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_string().into());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        let vrl_value = VrlValue::from(value.to_owned());
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -150,10 +130,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Bytes(value.to_vec().into());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -162,10 +139,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Boolean(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -174,10 +148,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -187,10 +158,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                         let value = col.value(i);
                         let vrl_value =
                             VrlValue::Float((value as f64).try_into().unwrap_or_default());
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -199,10 +167,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -211,10 +176,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -223,10 +185,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -235,10 +194,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -247,10 +203,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -259,10 +212,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -271,10 +221,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -283,10 +230,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -295,10 +239,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value as i64);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -307,10 +248,7 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                     for i in 0..rows {
                         let value = col.value(i);
                         let vrl_value = VrlValue::Integer(value);
-                        vrl_values[i]
-                            .as_object_mut()
-                            .unwrap()
-                            .insert(name.to_string().into(), vrl_value);
+                        insert(i, &mut vrl_values, name, vrl_value)
                     }
                 }
             }
@@ -318,24 +256,177 @@ pub(crate) fn recordbatch_to_vrl_value(record_batch: RecordBatch) -> Vec<VrlValu
                 // Handle null values
                 for i in 0..rows {
                     let vrl_value = VrlValue::Null;
-                    vrl_values[i]
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(name.to_string().into(), vrl_value);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
+            DataType::Timestamp(_unit, _tz) => {
+                if let Some(col) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    for i in 0..rows {
+                        let value = col.value_as_datetime(i).unwrap_or_default();
+
+                        let vrl_value = VrlValue::Timestamp(value.and_utc());
+                        insert(i, &mut vrl_values, name, vrl_value);
+                    }
+                }
+            }
+
             _ => {
                 // Handle unsupported data types
                 for i in 0..rows {
                     let vrl_value = VrlValue::Null;
-                    vrl_values[i]
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(name.to_string().into(), vrl_value);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
                 error!("Unsupported data type: {:?}", column.data_type());
             }
         };
     }
-    vrl_values
+    vrl_values.into_iter().map(|v| v.into()).collect()
+}
+
+fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageBatch, Error> {
+    if vrl_values.is_empty() {}
+    let Some(first_value) = vrl_values.get(0) else {
+        return Ok(MessageBatch::from(RecordBatch::new_empty(Arc::new(
+            Schema::empty(),
+        ))));
+    };
+
+    let fields = match first_value {
+        VrlValue::Object(obj) => obj
+            .iter()
+            .map(|(k, v)| match get_arrow_data_type(v) {
+                Ok(data_type) => Ok(FieldRef::new(Field::new(k.to_string(), data_type, true))),
+                Err(e) => Err(e),
+            })
+            .collect::<Result<Vec<FieldRef>, Error>>()?,
+        _ => {
+            return Ok(MessageBatch::from(RecordBatch::new_empty(Arc::new(
+                Schema::empty(),
+            ))));
+        }
+    };
+
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    for field in fields.iter() {
+        let field_name = field.name();
+        let data_type = field.data_type();
+        let array: ArrayRef = match data_type {
+            DataType::Null => Arc::new(NullArray::new(vrl_values.len())),
+            DataType::Boolean => {
+                let mut cols = Vec::with_capacity(vrl_values.len());
+                for vrl_value in vrl_values.iter_mut() {
+                    match vrl_value {
+                        VrlValue::Object(obj) => {
+                            if let Some(VrlValue::Boolean(v)) = obj.remove(field_name.as_str()) {
+                                cols.push(Some(v));
+                            } else {
+                                cols.push(None)
+                            }
+                        }
+                        _ => cols.push(None),
+                    }
+                }
+                Arc::new(BooleanArray::from(cols))
+            }
+
+            DataType::Int64 => {
+                let mut cols = Vec::with_capacity(vrl_values.len());
+                for vrl_value in vrl_values.iter_mut() {
+                    match vrl_value {
+                        VrlValue::Object(obj) => {
+                            if let Some(VrlValue::Integer(v)) = obj.remove(field_name.as_str()) {
+                                cols.push(Some(v));
+                            } else {
+                                cols.push(None)
+                            }
+                        }
+                        _ => cols.push(None),
+                    }
+                }
+                Arc::new(Int64Array::from(cols))
+            }
+
+            DataType::Float64 => {
+                let mut cols = Vec::with_capacity(vrl_values.len());
+                for vrl_value in vrl_values.iter_mut() {
+                    match vrl_value {
+                        VrlValue::Object(obj) => {
+                            if let Some(VrlValue::Float(v)) = obj.remove(field_name.as_str()) {
+                                cols.push(Some(v.into_inner()));
+                            } else {
+                                cols.push(None)
+                            }
+                        }
+                        _ => cols.push(None),
+                    }
+                }
+                Arc::new(Float64Array::from(cols))
+            }
+            DataType::Timestamp(_, _) => {
+                let mut cols = Vec::with_capacity(vrl_values.len());
+                for vrl_value in vrl_values.iter_mut() {
+                    match vrl_value {
+                        VrlValue::Object(obj) => {
+                            if let Some(VrlValue::Timestamp(v)) = obj.remove(field_name.as_str()) {
+                                cols.push(
+                                    v.timestamp_nanos_opt().map_or_else(|| None, |v| Some(v)),
+                                );
+                            } else {
+                                cols.push(None)
+                            }
+                        }
+                        _ => cols.push(None),
+                    }
+                }
+                Arc::new(TimestampNanosecondArray::from(cols))
+            }
+
+            DataType::Binary => {
+                let mut cols = Vec::with_capacity(vrl_values.len());
+                for vrl_value in vrl_values.iter_mut() {
+                    match vrl_value {
+                        VrlValue::Object(obj) => {
+                            if let Some(VrlValue::Bytes(v)) = obj.get(field_name.as_str()) {
+                                cols.push(Some(v.as_bytes()));
+                            } else {
+                                cols.push(None)
+                            }
+                        }
+                        _ => cols.push(None),
+                    }
+                }
+                Arc::new(BinaryArray::from(cols))
+            }
+
+            _ => {
+                return Err(Error::Config(format!(
+                    "Unsupported data type: {:?}",
+                    data_type
+                )));
+            }
+        };
+        cols.push(array);
+    }
+    let result = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+        .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
+
+    Ok(MessageBatch::new_arrow(result))
+}
+
+fn insert(i: usize, vrl_values: &mut Vec<ObjectMap>, name: &str, val: VrlValue) {
+    if let Some(obj) = vrl_values.get_mut(i) {
+        obj.insert(name.to_string().into(), val);
+    }
+}
+
+fn get_arrow_data_type(val: &VrlValue) -> Result<DataType, Error> {
+    match val {
+        VrlValue::Bytes(_) => Ok(DataType::Binary),
+        VrlValue::Integer(_) => Ok(DataType::Int64),
+        VrlValue::Float(_) => Ok(DataType::Float64),
+        VrlValue::Boolean(_) => Ok(DataType::Boolean),
+        VrlValue::Timestamp(_) => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        VrlValue::Null => Ok(DataType::Null),
+        _ => Err(Error::Config("Unsupported data type".to_string())),
+    }
 }

@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.2.1"
+version = "0.3.1"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
@@ -18,54 +18,39 @@ tokio-util = "0.7.15"
 async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
-
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 humantime = "2.1.0"
-
 thiserror = "2.0"
 anyhow = "1.0"
-
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
-
-datafusion = "46"
-arrow-json = "54"
+datafusion = { version = "47", features = ["avro", "pyarrow"] }
+datafusion-functions-json = "0.47.0"
+arrow-json = "55"
 prost-reflect = "0.14.7"
 prost-types = "0.13.5"
 protobuf-parse = "3.7.2"
 protobuf = "3.7.2"
-
-
 toml = "0.8"
 lazy_static = "1.4"
-
-axum = "0.6"
+axum = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
-
 clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
-
 flume = "=0.11"
-rumqttc = "0.24.0"
-vrl = { version = "0.23.0", features = ["value", "compiler", "stdlib"] }
 
+# Sql
+sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
-# Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = [
-    "cmake-build",
-    "tracing",
-    "sasl",
-    "ssl-vendored",
-    "zstd",
-] }
-rdkafka-sys = "4.8.0"
-sasl2-sys = { version = "0.1.22", features = ["vendored"] }
-
-arkflow-core = { path = "crates/arkflow-core", version = "0.2.0-rc2" }
-arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.2.0-rc2" }
-tempfile = "3.19.1"
+tempfile = "3.20.0"
 mockall = "0.12"
+arkflow-core = { path = "crates/arkflow-core" }
+arkflow-plugin = { path = "crates/arkflow-plugin" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3

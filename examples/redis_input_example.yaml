@@ -1,0 +1,34 @@
+logging:
+  level: debug
+streams:
+  - input:
+      type: "redis"
+      mode:
+        type: single
+        url: redis://127.0.0.1:6379
+
+      redis_type:
+        type: subscribe
+        subscribe:
+          type: channels
+          channels: [ "test" ]
+
+#      redis_type:
+#        type: subscribe
+#        subscribe:
+#          type: patterns
+#          patterns: [ "test" ]
+#
+#      redis_type:
+#        type: list
+#        list: [ "test" ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: "SELECT cast( __value__  as string) as s FROM flow"
+
+
+    output:
+      type: "stdout"

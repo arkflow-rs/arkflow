@@ -17,7 +17,7 @@
 //! Receive data from the MQTT broker
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -52,6 +52,7 @@ pub struct MqttInputConfig {
 
 /// MQTT input component
 pub struct MqttInput {
+    input_name: Option<String>,
     config: MqttInputConfig,
     client: Arc<Mutex<Option<AsyncClient>>>,
     sender: Sender<MqttMsg>,
@@ -66,10 +67,11 @@ enum MqttMsg {
 
 impl MqttInput {
     /// Create a new MQTT input component
-    pub fn new(config: MqttInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: MqttInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
+            input_name: name.cloned(),
             config,
             client: Arc::new(Mutex::new(None)),
             sender,
@@ -183,7 +185,9 @@ impl Input for MqttInput {
                         match msg{
                             MqttMsg::Publish(publish) => {
                                  let payload = publish.payload.to_vec();
-                            let msg = MessageBatch::new_binary(vec![payload])?;
+                            let mut msg = MessageBatch::new_binary(vec![payload])?;
+                            msg.set_input_name(self.input_name.clone());
+
                             Ok((msg, Arc::new(MqttAck {
                                 client: Arc::clone(&self.client),
                                 publish,
@@ -239,7 +243,12 @@ impl Ack for MqttAck {
 
 pub(crate) struct MqttInputBuilder;
 impl InputBuilder for MqttInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "MQTT input configuration is missing".to_string(),
@@ -247,7 +256,7 @@ impl InputBuilder for MqttInputBuilder {
         }
 
         let config: MqttInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MqttInput::new(config)?))
+        Ok(Arc::new(MqttInput::new(name, config)?))
     }
 }
 

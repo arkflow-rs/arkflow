@@ -17,7 +17,7 @@
 //! Receive data from HTTP endpoints
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use axum::http::header;
 use axum::http::header::HeaderMap;
@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
@@ -54,6 +55,7 @@ pub struct HttpInputConfig {
 
 /// HTTP input component
 pub struct HttpInput {
+    input_name: Option<String>,
     config: HttpInputConfig,
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
     sender: Arc<Sender<MessageBatch>>,
@@ -70,11 +72,12 @@ struct AppStateInner {
 type AppState = Arc<AppStateInner>;
 
 impl HttpInput {
-    pub fn new(config: HttpInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: HttpInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
         let auth = config.auth.clone();
 
         Ok(Self {
+            input_name: name.cloned(),
             config,
             server_handle: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
@@ -134,8 +137,11 @@ impl Input for HttpInput {
             .map_err(|e| Error::Config(format!("Invalid address {}: {}", address, e)))?;
 
         let server_handle = tokio::spawn(async move {
-            axum::Server::bind(&addr)
-                .serve(app.into_make_service())
+            let server = axum::serve(
+                TcpListener::bind(&addr).await.expect("bind error"),
+                app.into_make_service(),
+            );
+            server
                 .await
                 .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)))
         });
@@ -153,7 +159,8 @@ impl Input for HttpInput {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
 
-        if let Ok(msg) = self.receiver.recv_async().await {
+        if let Ok(mut msg) = self.receiver.recv_async().await {
+            msg.set_input_name(self.input_name.clone());
             Ok((msg, Arc::new(NoopAck)))
         } else {
             Err(Error::Process("The queue is empty".to_string()))
@@ -173,7 +180,12 @@ impl Input for HttpInput {
 
 pub(crate) struct HttpInputBuilder;
 impl InputBuilder for HttpInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Http input configuration is missing".to_string(),
@@ -181,7 +193,7 @@ impl InputBuilder for HttpInputBuilder {
         }
 
         let config: HttpInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(HttpInput::new(config)?))
+        Ok(Arc::new(HttpInput::new(name, config)?))
     }
 }
 
@@ -246,7 +258,7 @@ mod tests {
             cors_enabled: Some(false),
             auth: None,
         };
-        let input = HttpInput::new(config).unwrap();
+        let input = HttpInput::new(None, config).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),
@@ -278,7 +290,7 @@ mod tests {
                 password: "pass".to_string(),
             }),
         };
-        let input = HttpInput::new(config).unwrap();
+        let input = HttpInput::new(None, config).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),

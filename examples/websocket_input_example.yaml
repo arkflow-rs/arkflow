@@ -1,0 +1,16 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "websocket"
+      url: "ws://localhost:8800"
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: "SELECT cast( __value__  as string) as s, * FROM flow"
+
+
+    output:
+      type: "stdout"

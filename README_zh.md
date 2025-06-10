@@ -1,21 +1,35 @@
 # ArkFlow
 
-[English](README.md) | 中文
+<p align="center">
+<img align="center" width="150px" src="./logo.svg">
+<p align="center">
 
+[English](README.md) | 中文
 
 [![Rust](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/arkflow-rs/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
+[最新版文档](https://arkflow-rs.com/docs/intro) | [开发版文档](https://arkflow-rs.com/docs/next/intro)
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
 高性能Rust流处理引擎，提供强大的数据流处理能力，支持多种输入输出源和处理器。
 
+##  CNCF 云原生技术全景图
+
+<p float="left">
+<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="./cncf-landscape-logo.svg" width="150"/>
+</p>
+
+ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow)中。
+
 ## 特性
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
 - **多种数据源**：支持Kafka、MQTT、HTTP、文件等多种输入输出源
-- **强大的处理能力**：内置SQL查询、JSON处理、Protobuf编解码、批处理等多种处理器
-- **可扩展**：模块化设计，易于扩展新的输入、输出和处理器组件
+- **强大的处理能力**：内置SQL查询、Python脚本、JSON处理、Protobuf编解码、批处理等多种处理器
+- **可扩展**：模块化设计，易于扩展新的输入、缓冲区、输出和处理器组件
 
 ## 安装
 
@@ -99,6 +113,10 @@ ArkFlow支持多种输入源：
 - **文件**：使用SQL从文件(Csv、Json、Parquet、Avro、Arrow)读取数据
 - **生成器**：生成测试数据
 - **数据库**：从数据库(MySQL、PostgreSQL、SQLite、Duckdb)查询数据
+- **Nats**: 订阅来自 Nats 主题的消息
+- **Redis**: 订阅来自 Redis 频道或列表的消息
+- **Websocket**: 订阅来自 WebSocket 连接的消息
+- **Modbus**: 从 Modbus 设备读取数据
 
 示例：
 
@@ -122,6 +140,7 @@ ArkFlow提供多种数据处理器：
 - **SQL**：使用SQL查询处理数据
 - **Protobuf**：Protobuf编解码
 - **批处理**：将消息批量处理
+- **Vrl**: 使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
 
 示例：
 
@@ -143,6 +162,7 @@ ArkFlow支持多种输出目标：
 - **HTTP**：通过HTTP发送数据
 - **标准输出**：将数据输出到控制台
 - **Drop**: 丢弃数据
+- **Nats**: 将消息发布到 Nats 主题
 
 示例：
 
@@ -151,7 +171,9 @@ output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: output-topic
+  topic:
+    type: value
+    value: output-topic
   client_id: arkflow-producer
 ```
 
@@ -162,6 +184,7 @@ output:
 - **HTTP**：通过 HTTP 发送错误数据
 - **标准输出**：将错误数据输出到控制台
 - **丢弃**：丢弃错误数据
+- **Nats**: 将消息发布到 Nats 主题
 
 示例：
 
@@ -170,18 +193,20 @@ error_output:
   type: kafka
   brokers:
     - localhost:9092
-  topic: 
+  topic:
     type: value
     value: error-topic
   client_id: error-arkflow-producer
 ```
 
-
 ### 缓冲组件
 
 ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:
 
-- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合
+- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合。
+- **会话窗口 (Session Window)**：会话窗口缓冲组件提供了一种基于会话的消息分组机制，其中消息根据活动间隙进行分组。它实现了一个会话窗口，在可配置的非活动期后关闭。
+- **滑动窗口 (Sliding Window)**：滑动窗口缓冲组件提供了一种基于时间的分批处理消息的窗口机制。它实现了一种滑动窗口算法，具有可配置的窗口大小、滑动间隔和滑动大小。
+- **滚动窗口 (Tumbling Window)**：滚动窗口缓冲组件提供了一种固定大小、不重叠的批处理消息的窗口机制。它实现了一种滚动窗口算法，具有可配置的间隔设置。
 
 示例：
 
@@ -191,7 +216,6 @@ buffer:
   capacity: 10000  # Maximum number of messages to buffer
   timeout: 10s  # Maximum time to buffer messages
 ```
-
 
 ## 示例
 
@@ -218,7 +242,9 @@ streams:
       type: kafka
       brokers:
         - localhost:9092
-      topic: processed-topic
+      topic:
+        type: value
+        value: processed-topic
 ```
 
 ### 生成测试数据并处理
@@ -242,10 +268,13 @@ streams:
       type: "stdout"
 ```
 
+## 用户
+
+- Conalog(国家: 韩国)
+
 ## ArkFlow 插件
 
 [ArkFlow 插件示例](https://github.com/arkflow-rs/arkflow-plugin-examples)
-
 
 ## 许可证
 
@@ -254,6 +283,5 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
-
 
 如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！

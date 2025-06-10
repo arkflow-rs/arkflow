@@ -13,9 +13,12 @@
  */
 
 pub mod buffer;
+pub mod codec;
+pub mod component;
 pub mod expr;
 pub mod input;
 pub mod output;
 pub mod processor;
+pub mod temporary;
 pub mod time;
 pub mod udf;

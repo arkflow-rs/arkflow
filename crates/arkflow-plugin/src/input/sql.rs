@@ -13,14 +13,13 @@
  */
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 
 use crate::udf;
 use ballista::prelude::SessionContextExt;
-use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -48,7 +47,6 @@ pub struct SqlInputConfig {
     select_sql: String,
     /// Ballista helps us perform distributed computing
     ballista: Option<BallistaConfig>,
-    #[serde(flatten)]
     input_type: InputType,
 }
 
@@ -59,18 +57,8 @@ pub struct BallistaConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "input_type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum InputType {
-    /// Avro input
-    Avro(AvroConfig),
-    /// Arrow input
-    Arrow(ArrowConfig),
-    /// JSON input
-    Json(JsonConfig),
-    /// CSV input
-    Csv(CsvConfig),
-    /// Parquet input
-    Parquet(ParquetConfig),
     /// Mysql input
     Mysql(MysqlConfig),
     /// Duckdb input
@@ -79,46 +67,6 @@ enum InputType {
     Postgres(PostgresConfig),
     /// Sqlite input
     Sqlite(SqliteConfig),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AvroConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// avro file path
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArrowConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// arrow file path
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// json file path
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CsvConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// csv file path
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ParquetConfig {
-    /// Table name (used in SQL queries)
-    table_name: Option<String>,
-    /// parquet file path
-    path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,16 +122,17 @@ struct SqliteConfig {
 }
 
 pub struct SqlInput {
+    input_name: Option<String>,
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
 }
 
 impl SqlInput {
-    pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-
         Ok(Self {
+            input_name: name.cloned(),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
@@ -241,7 +190,10 @@ impl Input for SqlInput {
                 let Some(x) = value else {
                     return Err(Error::EOF);
                 };
-                Ok((MessageBatch::new_arrow(x), Arc::new(NoopAck)))
+                let mut msg = MessageBatch::new_arrow(x);
+                msg.set_input_name(self.input_name.clone());
+
+                Ok((msg, Arc::new(NoopAck)))
             }
 
         }
@@ -256,31 +208,6 @@ impl Input for SqlInput {
 impl SqlInput {
     async fn init_connect(&self, ctx: &mut SessionContext) -> Result<(), Error> {
         match self.sql_config.input_type {
-            InputType::Avro(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
-                    .await
-            }
-            InputType::Arrow(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
-                    .await
-            }
-            InputType::Json(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
-                    .await
-            }
-            InputType::Csv(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
-                    .await
-            }
-            InputType::Parquet(ref c) => {
-                let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
-                ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
-                    .await
-            }
             InputType::Mysql(ref c) => {
                 let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 let mut params = HashMap::from([
@@ -371,9 +298,9 @@ impl SqlInput {
                 Ok(())
             }
         }
-        .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
 
+    /// Create a session context
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
         let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
             SessionContext::remote(&ballista.remote_url)
@@ -392,7 +319,12 @@ impl SqlInput {
 
 pub(crate) struct SqlInputBuilder;
 impl InputBuilder for SqlInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "SQL input configuration is missing".to_string(),
@@ -400,83 +332,10 @@ impl InputBuilder for SqlInputBuilder {
         }
 
         let config: SqlInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SqlInput::new(config)?))
+        Ok(Arc::new(SqlInput::new(name, config)?))
     }
 }
 
 pub fn init() -> Result<(), Error> {
     register_input_builder("sql", Arc::new(SqlInputBuilder))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::array::StringArray;
-    use tempfile::{tempdir, TempDir};
-    fn create_test_data() -> (TempDir, String) {
-        let temp_dir = tempdir().unwrap();
-        let path_buf = temp_dir.path().join("test_path.json");
-        let path = path_buf.as_path().to_str().unwrap().to_string();
-
-        let _ = std::fs::write(path_buf, r#"{"name": "John", "age": 30}"#).unwrap();
-        (temp_dir, path)
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_connect() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT * FROM test_table".to_string(),
-            ballista: None,
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-            }),
-        };
-        let input = SqlInput::new(config).unwrap();
-        assert!(input.connect().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_read() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT * FROM test_table".to_string(),
-            ballista: None,
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-            }),
-        };
-        let input = SqlInput::new(config).unwrap();
-        input.connect().await.unwrap();
-
-        let (msg, ack) = input.read().await.unwrap();
-        let (i, _) = msg.schema().column_with_name("name").unwrap();
-        let result = msg
-            .column(i)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0);
-        assert_eq!(result, "John");
-        ack.ack().await;
-        input.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sql_input_invalid_query() {
-        let (_x, path) = create_test_data();
-        let config = SqlInputConfig {
-            select_sql: "SELECT invalid_column FROM test_table".to_string(),
-            ballista: None,
-
-            input_type: InputType::Json(JsonConfig {
-                table_name: Some("test_table".to_string()),
-                path,
-            }),
-        };
-        let input = SqlInput::new(config).unwrap();
-        assert!(input.connect().await.is_err());
-    }
 }

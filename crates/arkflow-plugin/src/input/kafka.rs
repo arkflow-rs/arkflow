@@ -17,7 +17,7 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -43,14 +43,16 @@ pub struct KafkaInputConfig {
 
 /// Kafka input component
 pub struct KafkaInput {
+    input_name: Option<String>,
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
 }
 
 impl KafkaInput {
     /// Create a new Kafka input component
-    pub fn new(config: KafkaInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, config: KafkaInputConfig) -> Result<Self, Error> {
         Ok(Self {
+            input_name: name.cloned(),
             config,
             consumer: Arc::new(RwLock::new(None)),
         })
@@ -121,7 +123,8 @@ impl Input for KafkaInput {
 
                 let mut binary_data = Vec::new();
                 binary_data.push(payload.to_vec());
-                let msg_batch = MessageBatch::new_binary(binary_data)?;
+                let mut msg_batch = MessageBatch::new_binary(binary_data)?;
+                msg_batch.set_input_name(self.input_name.clone());
 
                 // Create acknowledgment object
                 let topic = kafka_message.topic().to_string();
@@ -178,14 +181,19 @@ impl Ack for KafkaAck {
 
 pub(crate) struct KafkaInputBuilder;
 impl InputBuilder for KafkaInputBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Input>, Error> {
+    fn build(
+        &self,
+        name: Option<&String>,
+        config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Kafka input configuration is missing".to_string(),
             ));
         }
         let config: KafkaInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(KafkaInput::new(config)?))
+        Ok(Arc::new(KafkaInput::new(name, config)?))
     }
 }
 
@@ -207,7 +215,7 @@ mod tests {
             start_from_latest: false,
         };
 
-        let input = KafkaInput::new(config);
+        let input = KafkaInput::new(None, config);
         assert!(input.is_ok());
         let input = input.unwrap();
         assert_eq!(input.config.brokers, vec!["localhost:9092".to_string()]);
@@ -227,7 +235,7 @@ mod tests {
             start_from_latest: true,
         };
 
-        let input = KafkaInput::new(config).unwrap();
+        let input = KafkaInput::new(None, config).unwrap();
         // Try to read in unconnected state, should return error
         let result = input.read().await;
         assert!(result.is_err());
@@ -249,7 +257,7 @@ mod tests {
             start_from_latest: true,
         };
 
-        let input = KafkaInput::new(config).unwrap();
+        let input = KafkaInput::new(None, config).unwrap();
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             topic: "test-topic".to_string(),

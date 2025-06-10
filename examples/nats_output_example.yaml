@@ -1,0 +1,28 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 1
+    
+    
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: "SELECT cast( __value__  as string) as s,* FROM flow"
+
+
+    output:
+      type: "nats"
+      url: "nats://localhost:4222"
+
+      mode:
+        type: regular
+        subject:
+          type: "value"
+          value: "test"
+
