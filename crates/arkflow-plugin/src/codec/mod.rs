@@ -18,5 +18,6 @@ pub mod protobuf;
 
 pub fn init() -> Result<(), Error> {
     json::init()?;
+    protobuf::init()?;
     Ok(())
 }
