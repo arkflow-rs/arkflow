@@ -10,6 +10,8 @@ streams:
     temporary:
       - name: redis_temporary
         type: "redis"
+        codec:
+          type: json
         mode:
           type: single
           url: redis://127.0.0.1:6379

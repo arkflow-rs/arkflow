@@ -11,7 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use crate::{Error, MessageBatch, Resource};
+use crate::{Bytes, Error, MessageBatch, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -21,11 +21,11 @@ lazy_static::lazy_static! {
 }
 
 pub trait Encoder: Send + Sync {
-    fn encode(&self, b: MessageBatch) -> Result<MessageBatch, Error>;
+    fn encode(&self, b: MessageBatch) -> Result<Vec<Bytes>, Error>;
 }
 
 pub trait Decoder: Send + Sync {
-    fn decode(&self, b: MessageBatch) -> Result<MessageBatch, Error>;
+    fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error>;
 }
 
 pub trait Codec: Encoder + Decoder {}

@@ -13,23 +13,15 @@
  */
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
-use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
 use datafusion::arrow;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonCodecConfig {
-    value_field: Option<String>,
-}
-
-struct JsonCodec {
-    config: JsonCodecConfig,
-}
+struct JsonCodec;
 
 impl Encoder for JsonCodec {
-    fn encode(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
+    fn encode(&self, batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
         let mut buf = Vec::new();
         let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
         writer
@@ -41,32 +33,16 @@ impl Encoder for JsonCodec {
         let json_str = String::from_utf8(buf)
             .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
         let new_batch: Vec<Bytes> = json_str.lines().map(|s| s.as_bytes().to_vec()).collect();
-
-        Ok(MessageBatch::new_binary_with_field_name(
-            new_batch,
-            self.config.value_field.as_deref(),
-        )?)
+        Ok(new_batch)
     }
 }
 
 impl Decoder for JsonCodec {
-    fn decode(&self, b: MessageBatch) -> Result<MessageBatch, Error> {
-        let result = b.to_binary(
-            self.config
-                .value_field
-                .as_deref()
-                .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
-        )?;
-        let json_data: Vec<u8> = result.join(b"\n" as &[u8]);
+    fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
+        let json_data: Vec<u8> = b.join(b"\n" as &[u8]);
 
         let arrow = component::json::try_to_arrow(&json_data, None)?;
         Ok(MessageBatch::new_arrow(arrow))
-    }
-}
-
-impl JsonCodec {
-    fn new(config: JsonCodecConfig) -> Result<Self, Error> {
-        Ok(JsonCodec { config })
     }
 }
 
@@ -75,17 +51,10 @@ impl CodecBuilder for JsonCodecBuilder {
     fn build(
         &self,
         _name: Option<&String>,
-        config: &Option<Value>,
+        _config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Json codec configuration is missing".to_string(),
-            ));
-        }
-
-        let config: JsonCodecConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(JsonCodec::new(config)?))
+        Ok(Arc::new(JsonCodec))
     }
 }
 

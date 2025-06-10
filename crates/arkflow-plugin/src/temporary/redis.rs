@@ -13,6 +13,7 @@
  */
 use crate::component;
 use crate::component::redis::Connection;
+use arkflow_core::codec::{Codec, CodecConfig};
 use arkflow_core::temporary::{Temporary, TemporaryBuilder};
 use arkflow_core::{temporary, Error, MessageBatch, Resource};
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ use tokio::sync::RwLock;
 struct RedisTemporaryConfig {
     mode: component::redis::Mode,
     redis_type: RedisType,
+    codec: CodecConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,7 @@ enum RedisType {
 struct RedisTemporary {
     config: RedisTemporaryConfig,
     cli: Arc<RwLock<Option<Connection>>>,
+    codec: Arc<dyn Codec>,
 }
 
 #[async_trait]
@@ -108,15 +111,13 @@ impl Temporary for RedisTemporary {
                 vec![array]
             }
         };
-
         let data = data
             .iter()
             .flatten()
-            .map(|s| s.as_bytes())
+            .map(|s| s.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        let json_data: Vec<u8> = data.join(b"\n" as &[u8]);
-
-        component::json::try_to_arrow(&json_data, None).map(|v| Some(v.into()))
+        let result = self.codec.decode(data)?;
+        Ok(Some(result))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -126,9 +127,10 @@ impl Temporary for RedisTemporary {
 }
 
 impl RedisTemporary {
-    fn new(config: RedisTemporaryConfig) -> Result<Self, Error> {
+    fn new(config: RedisTemporaryConfig, codec: Arc<dyn Codec>) -> Result<Self, Error> {
         Ok(RedisTemporary {
             config,
+            codec,
             cli: Arc::new(RwLock::new(None)),
         })
     }
@@ -158,15 +160,17 @@ impl TemporaryBuilder for RedisTemporaryBuilder {
     fn build(
         &self,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        resource: &Resource,
     ) -> Result<Arc<dyn Temporary>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Batch processor configuration is missing".to_string(),
             ));
         }
+
         let config: RedisTemporaryConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(RedisTemporary::new(config)?))
+        let codec = config.codec.build(resource)?;
+        Ok(Arc::new(RedisTemporary::new(config, codec)?))
     }
 }
 

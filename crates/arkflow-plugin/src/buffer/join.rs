@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::{CodecConfig, Decoder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
@@ -26,22 +26,26 @@ use tracing::trace;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinConfig {
     pub(crate) query: String,
+    pub(crate) value_field: Option<String>,
     pub(crate) codec: CodecConfig,
 }
 
 pub struct JoinOperation {
     query: String,
+    value_field: Option<String>,
     codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
 }
 impl JoinOperation {
     pub fn new(
         query: String,
+        value_field: Option<String>,
         codec: Arc<dyn Decoder>,
         input_names: HashSet<String>,
     ) -> Result<Self, Error> {
         Ok(Self {
             query,
+            value_field,
             codec,
             input_names,
         })
@@ -105,8 +109,13 @@ impl JoinOperation {
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
         let codec = Arc::clone(&self.codec);
         let option = batch.get_input_name();
-
-        let mut result = codec.decode(batch)?;
+        let result = batch.to_binary(
+            self.value_field
+                .as_deref()
+                .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
+        )?;
+        let mut result =
+            codec.decode(result.into_iter().map(|x| x.to_vec()).collect::<Vec<_>>())?;
         result.set_input_name(option);
         Ok(result)
     }

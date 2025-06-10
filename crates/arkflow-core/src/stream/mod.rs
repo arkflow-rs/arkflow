@@ -238,7 +238,7 @@ impl Stream {
             error!("Failed to flush buffer: {}", e);
         }
 
-        info!("Buffer flushed=====>");
+        info!("Buffer flushed");
 
         match buffer.read().await {
             Ok(Some(v)) => {
