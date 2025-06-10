@@ -58,7 +58,7 @@ rdkafka-sys = "4.8.0"
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 
 # redis
-redis = { version = "0.31", features = ["tokio-native-tls-comp", "aio", "connection-manager", "cluster-async"] }
+redis = { version = "0.32", features = ["tokio-native-tls-comp", "aio", "connection-manager", "cluster-async"] }
 
 # vrl https://github.com/vectordotdev/vrl
 vrl = { version = "0.24", features = ["value", "compiler", "stdlib"] }
