@@ -13,7 +13,8 @@
  */
 use arkflow_core::Error;
 
-mod json;
+pub mod json;
+pub mod protobuf;
 
 pub fn init() -> Result<(), Error> {
     json::init()?;
