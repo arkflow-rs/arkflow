@@ -30,14 +30,15 @@ pub(crate) struct JoinConfig {
     pub(crate) codec: CodecConfig,
 }
 
-pub struct JoinOperation {
+pub(crate) struct JoinOperation {
     query: String,
     value_field: Option<String>,
     codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
 }
+
 impl JoinOperation {
-    pub fn new(
+    pub(crate) fn new(
         query: String,
         value_field: Option<String>,
         codec: Arc<dyn Decoder>,
@@ -51,7 +52,7 @@ impl JoinOperation {
         })
     }
 
-    pub async fn join_operation(
+    pub(crate) async fn join_operation(
         &self,
         ctx: &SessionContext,
         table_sources: Vec<MessageBatch>,
