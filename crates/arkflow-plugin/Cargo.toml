@@ -75,6 +75,9 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 # NATS
 async-nats = "0.41"
 
+# RabbitMQ
+lapin = "2.5"
+
 
 # modbus
 tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
