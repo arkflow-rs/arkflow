@@ -13,8 +13,10 @@ English | [中文](README_zh.md)
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
-High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting
-multiple input/output sources and processors.
+High performance Rust stream processing engine seamlessly integrates AI capabilities, 
+providing powerful real-time data processing and intelligent analysis. 
+It not only supports multiple input/output sources and processors, but also enables easy loading and execution of machine learning models, 
+enabling streaming data and inference, anomaly detection, and complex event processing.
 
 ##  Cloud Native Landscape
 
