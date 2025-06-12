@@ -85,8 +85,8 @@ impl JoinOperation {
             } else {
                 Arc::new(Schema::empty())
             };
-
-            let provider = MemTable::try_new(schema, vec![batches.collect()])
+            let batches = batches.map(|b| vec![b]).collect::<Vec<_>>();
+            let provider = MemTable::try_new(schema, batches)
                 .map_err(|e| Error::Process(format!("Failed to create MemTable: {}", e)))?;
 
             ctx.register_table(
