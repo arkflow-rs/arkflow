@@ -31,7 +31,7 @@ pub(crate) struct JoinConfig {
     pub(crate) value_field: Option<String>,
     pub(crate) codec: CodecConfig,
     #[serde(default = "default_thread_num")]
-    pub(crate) thead_num: usize,
+    pub(crate) thread_num: usize,
 }
 
 pub(crate) struct JoinOperation {
@@ -39,21 +39,21 @@ pub(crate) struct JoinOperation {
     value_field: Option<String>,
     codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
-    thead_num: usize,
+    thread_num: usize,
 }
 
 impl JoinOperation {
     pub(crate) fn new(
         query: String,
         value_field: Option<String>,
-        thead_num: usize,
+        thread_num: usize,
         codec: Arc<dyn Decoder>,
         input_names: HashSet<String>,
     ) -> Result<Self, Error> {
         Ok(Self {
             query,
             value_field,
-            thead_num,
+            thread_num,
             codec,
             input_names,
         })
@@ -78,7 +78,7 @@ impl JoinOperation {
                 continue;
             };
 
-            let vec_rb = self.split_batch(&msg_batch, self.thead_num);
+            let vec_rb = self.split_batch(&msg_batch, self.thread_num);
             let mut batches = vec_rb.into_iter().peekable();
             let schema = if let Some(batch) = batches.peek() {
                 batch.schema()
