@@ -132,6 +132,7 @@ impl JoinOperation {
     }
 
     fn split_batch(&self, batch_to_split: &RecordBatch, size: usize) -> Vec<RecordBatch> {
+        let size = size.max(1);
         let total_rows = batch_to_split.num_rows();
         if total_rows <= size {
             return vec![batch_to_split.clone()];
