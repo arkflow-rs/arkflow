@@ -138,18 +138,13 @@ impl JoinOperation {
         }
 
         let chunk_size = total_rows.div_ceil(size);
-        let mut chunks = Vec::new();
-
+        let mut chunks = Vec::with_capacity(size);
         let mut offset = 0;
         while offset < total_rows {
-            // 计算当前 chunk 的长度，确保不会超出总行数
             let length = std::cmp::min(chunk_size, total_rows - offset);
 
-            // 使用 slice() 方法创建切片，这是一个高效的零拷贝操作
             let slice = batch_to_split.slice(offset, length);
             chunks.push(slice);
-
-            // 更新下一次切片的起始位置
             offset += length;
         }
 
