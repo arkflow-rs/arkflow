@@ -287,7 +287,8 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 Discord: https://discord.gg/CwKhzb8pux
 
 微信社区群：
-![微信二维码](./images/wx-group.png)
+
+<img src="./images/wx-group.png" alt="wx" width="300" />
 
 您可以在群内提出任何需要改进的地方，我们会考虑合理性并尽快修改。
 如果您发现 bug 请及时提 [issue](https://github.com/arkflow-rs/arkflow/issues/new?template=bug_report.md)，我们会尽快确认并修改。
