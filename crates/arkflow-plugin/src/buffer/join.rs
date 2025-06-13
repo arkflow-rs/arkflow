@@ -12,7 +12,9 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::{CodecConfig, Decoder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    split_batch, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD, DEFAULT_RECORD_BATCH,
+};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
@@ -78,7 +80,7 @@ impl JoinOperation {
                 continue;
             };
 
-            let vec_rb = self.split_batch(&msg_batch, self.thread_num);
+            let vec_rb = split_batch(msg_batch.into(), self.thread_num);
             let mut batches = vec_rb.into_iter().peekable();
             let schema = if let Some(batch) = batches.peek() {
                 batch.schema()
@@ -129,27 +131,6 @@ impl JoinOperation {
             arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
                 .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
-    }
-
-    fn split_batch(&self, batch_to_split: &RecordBatch, size: usize) -> Vec<RecordBatch> {
-        let size = size.max(1);
-        let total_rows = batch_to_split.num_rows();
-        if total_rows <= size {
-            return vec![batch_to_split.clone()];
-        }
-
-        let chunk_size = total_rows.div_ceil(size);
-        let mut chunks = Vec::with_capacity(size);
-        let mut offset = 0;
-        while offset < total_rows {
-            let length = std::cmp::min(chunk_size, total_rows - offset);
-
-            let slice = batch_to_split.slice(offset, length);
-            chunks.push(slice);
-            offset += length;
-        }
-
-        chunks
     }
 
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
