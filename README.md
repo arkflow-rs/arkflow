@@ -1,7 +1,7 @@
 # ArkFlow
 
 <p align="center">
-<img align="center" width="150px" src="./logo.svg">
+<img align="center" width="150px" src="images/logo.svg">
 <p align="center">
 
 English | [中文](README_zh.md)
@@ -21,8 +21,8 @@ enabling streaming data and inference, anomaly detection, and complex event proc
 ##  Cloud Native Landscape
 
 <p float="left">
-<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
-<img src="./cncf-landscape-logo.svg" width="150"/>
+<img src="images/cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="images/cncf-landscape-logo.svg" width="150"/>
 </p>
 
 ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow).

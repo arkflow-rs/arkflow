@@ -1,7 +1,7 @@
 # ArkFlow
 
 <p align="center">
-<img align="center" width="150px" src="./logo.svg">
+<img align="center" width="150px" src="images/logo.svg">
 <p align="center">
 
 [English](README.md) | 中文
@@ -19,8 +19,8 @@
 ##  CNCF 云原生技术全景图
 
 <p float="left">
-<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
-<img src="./cncf-landscape-logo.svg" width="150"/>
+<img src="images/cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="images/cncf-landscape-logo.svg" width="150"/>
 </p>
 
 ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow)中。
@@ -285,5 +285,11 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
+
+微信社区群：
+![微信二维码](./images/wx-group.png)
+
+您可以在群内提出任何需要改进的地方，我们会考虑合理性并尽快修改。
+如果您发现 bug 请及时提 [issue](https://github.com/arkflow-rs/arkflow/issues/new?template=bug_report.md)，我们会尽快确认并修改。
 
 如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！
