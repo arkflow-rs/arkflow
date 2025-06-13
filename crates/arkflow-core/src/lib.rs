@@ -282,7 +282,7 @@ impl DerefMut for MessageBatch {
 }
 
 pub fn split_batch(batch_to_split: RecordBatch, size: usize) -> Vec<RecordBatch> {
-    let mut size = size.max(1);
+    let size = size.max(1);
     let total_rows = batch_to_split.num_rows();
     if total_rows <= DEFAULT_RECORD_BATCH {
         return vec![batch_to_split];

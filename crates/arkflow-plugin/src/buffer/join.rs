@@ -12,9 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::{CodecConfig, Decoder};
-use arkflow_core::{
-    split_batch, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD, DEFAULT_RECORD_BATCH,
-};
+use arkflow_core::{split_batch, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
