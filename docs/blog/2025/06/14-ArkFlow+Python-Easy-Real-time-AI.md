@@ -1,3 +1,5 @@
+# ArkFlow+Python: Easy Real-time AI
+
 Today, with great excitement, we proudly introduce a revolutionary update to the ArkFlow stream processing engine: full support for Python processors! This is not just a simple feature iteration; it marks a solid step towards more intelligent, user-friendly, and powerful real-time data processing. We are keenly aware of Python's immense influence and its vast ecosystem in the fields of artificial intelligence and machine learning. Now, with ArkFlow, you can seamlessly integrate all of this into high-performance, real-time stream processing pipelines.
 
 <!-- truncate -->
