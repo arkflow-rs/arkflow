@@ -18,13 +18,14 @@
 
 use arkflow_core::Error;
 
+pub mod amqp09;
 pub mod drop;
 pub mod http;
 pub mod kafka;
 pub mod mqtt;
-pub mod sql;
 pub mod nats;
 pub mod redis;
+pub mod sql;
 pub mod stdout;
 
 pub fn init() -> Result<(), Error> {
@@ -32,9 +33,10 @@ pub fn init() -> Result<(), Error> {
     http::init()?;
     kafka::init()?;
     mqtt::init()?;
-    stdout::init()?;
-    sql::init()?;
     nats::init()?;
+    amqp09::init()?;
     redis::init()?;
+    sql::init()?;
+    stdout::init()?;
     Ok(())
 }

@@ -18,6 +18,7 @@
 
 use arkflow_core::Error;
 
+pub mod amqp09;
 pub mod file;
 pub mod generate;
 pub mod http;
@@ -38,6 +39,7 @@ pub fn init() -> Result<(), Error> {
     memory::init()?;
     mqtt::init()?;
     nats::init()?;
+    amqp09::init()?;
     redis::init()?;
     sql::init()?;
     websocket::init()?;
