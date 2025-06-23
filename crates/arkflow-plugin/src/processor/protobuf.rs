@@ -259,6 +259,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
+    use prost_reflect::prost::Message;
     use tempfile::{tempdir, TempDir};
 
     fn create_test_proto_file() -> Result<(TempDir, PathBuf), Error> {
