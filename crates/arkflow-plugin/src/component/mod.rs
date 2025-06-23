@@ -12,6 +12,8 @@
  *    limitations under the License.
  */
 
-pub mod json;
-pub mod redis;
-pub mod sql;
+pub(crate) mod json;
+pub(crate) mod protobuf;
+pub(crate) mod redis;
+pub(crate) mod sql;
+
