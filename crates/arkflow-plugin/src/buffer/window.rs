@@ -74,7 +74,13 @@ impl BaseWindow {
                     .map(|name| name.clone())
                     .collect::<HashSet<String>>();
 
-                JoinOperation::new(config.query, config.value_field, codec, input_names)
+                JoinOperation::new(
+                    config.query,
+                    config.value_field,
+                    config.thread_num,
+                    codec,
+                    input_names,
+                )
             })
             .transpose()?;
 

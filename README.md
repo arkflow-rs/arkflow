@@ -1,7 +1,7 @@
 # ArkFlow
 
 <p align="center">
-<img align="center" width="150px" src="./logo.svg">
+<img align="center" width="150px" src="images/logo.svg">
 <p align="center">
 
 English | [中文](README_zh.md)
@@ -13,14 +13,16 @@ English | [中文](README_zh.md)
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
-High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting
-multiple input/output sources and processors.
+High performance Rust stream processing engine seamlessly integrates AI capabilities, 
+providing powerful real-time data processing and intelligent analysis. 
+It not only supports multiple input/output sources and processors, but also enables easy loading and execution of machine learning models, 
+enabling streaming data and inference, anomaly detection, and complex event processing.
 
 ##  Cloud Native Landscape
 
 <p float="left">
-<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
-<img src="./cncf-landscape-logo.svg" width="150"/>
+<img src="images/cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="images/cncf-landscape-logo.svg" width="150"/>
 </p>
 
 ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow).

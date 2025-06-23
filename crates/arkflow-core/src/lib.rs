@@ -39,6 +39,7 @@ pub mod stream;
 pub mod temporary;
 
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
+pub const DEFAULT_RECORD_BATCH: usize = 8192;
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
@@ -250,8 +251,6 @@ impl From<MessageBatch> for RecordBatch {
     }
 }
 
-
-
 impl TryFrom<Vec<Bytes>> for MessageBatch {
     type Error = Error;
 
@@ -280,4 +279,32 @@ impl DerefMut for MessageBatch {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.record_batch
     }
+}
+
+pub fn split_batch(batch_to_split: RecordBatch, size: usize) -> Vec<RecordBatch> {
+    let size = size.max(1);
+    let total_rows = batch_to_split.num_rows();
+    if total_rows <= DEFAULT_RECORD_BATCH {
+        return vec![batch_to_split];
+    }
+
+    let (chunk_size, capacity) = if size * DEFAULT_RECORD_BATCH < total_rows {
+        (total_rows.div_ceil(size), size)
+    } else {
+        (
+            DEFAULT_RECORD_BATCH,
+            total_rows.div_ceil(DEFAULT_RECORD_BATCH),
+        )
+    };
+
+    let mut chunks = Vec::with_capacity(capacity);
+    let mut offset = 0;
+    while offset < total_rows {
+        let length = std::cmp::min(chunk_size, total_rows - offset);
+        let slice = batch_to_split.slice(offset, length);
+        chunks.push(slice);
+        offset += length;
+    }
+
+    chunks
 }

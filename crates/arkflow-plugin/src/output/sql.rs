@@ -32,7 +32,7 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Connection, MySqlConnection, PgConnection, QueryBuilder};
 
 #[derive(Debug, Clone)]
-pub enum SqlValue {
+enum SqlValue {
     String(String),
     Int64(i64),
     UInt64(u64),
@@ -43,21 +43,23 @@ pub enum SqlValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum DatabaseType {
-    Mysql,
-    Postgres,
+enum DatabaseType {
+    Mysql(MysqlConfig),
+    Postgres(PostgresConfig),
     // Sqlite,
 }
-pub enum DatabaseConnection {
+
+enum DatabaseConnection {
     Mysql(MySqlConnection),
     Postgres(PgConnection),
     // Sqlite(SqliteConnection),
 }
+
 impl DatabaseConnection {
     /// Executes an INSERT query with the given columns and rows
     /// Handles type conversion and proper escaping for different database types
     /// Returns a Result indicating success or detailed error information
-    pub async fn execute_insert(
+    async fn execute_insert(
         &mut self,
         output_config: &SqlOutputConfig,
         columns: Vec<String>,
@@ -132,26 +134,36 @@ impl DatabaseConnection {
 
 /// Configuration for SQL output
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SqlOutputConfig {
+struct SqlOutputConfig {
     /// SQL query statement
     output_type: DatabaseType,
     table_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MysqlConfig {
     uri: String,
     ssl: Option<SslConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SslConfig {
+struct PostgresConfig {
+    uri: String,
+    ssl: Option<SslConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SslConfig {
     ssl_mode: String,
     root_cert: Option<String>,
     client_cert: Option<String>,
     client_key: Option<String>,
 }
+
 impl SslConfig {
     pub async fn generate_mysql_ssl_opts(
         &self,
-        output_config: &SqlOutputConfig,
+        config: &MysqlConfig,
     ) -> Result<MySqlConnectOptions, Error> {
         let ssl_mode = match self.ssl_mode.to_lowercase().as_str() {
             "disable" => MySqlSslMode::Disabled,
@@ -161,7 +173,7 @@ impl SslConfig {
             "verify_full" => MySqlSslMode::VerifyIdentity,
             _ => return Err(Error::Config("Invalid SSL mode".to_string())),
         };
-        let mut opts = MySqlConnectOptions::from_str(&output_config.uri)
+        let mut opts = MySqlConnectOptions::from_str(&config.uri)
             .map_err(|e| Error::Config(format!("Invalid MySQL URI: {}", e)))?;
         opts = opts.ssl_mode(ssl_mode);
 
@@ -181,9 +193,10 @@ impl SslConfig {
         }
         Ok(opts)
     }
+
     async fn generate_postgres_ssl_opts(
         &self,
-        output_config: &SqlOutputConfig,
+        config: &PostgresConfig,
     ) -> Result<PgConnectOptions, Error> {
         let ssl_mode = match self.ssl_mode.to_lowercase().as_str() {
             "disable" => PgSslMode::Disable,
@@ -193,7 +206,7 @@ impl SslConfig {
             "verify_full" => PgSslMode::VerifyFull,
             _ => return Err(Error::Config("Invalid SSL mode".to_string())),
         };
-        let mut opts = PgConnectOptions::from_str(&output_config.uri)
+        let mut opts = PgConnectOptions::from_str(&config.uri)
             .map_err(|e| Error::Config(format!("Invalid PostgreSQL URI: {}", e)))?;
         opts = opts.ssl_mode(ssl_mode);
 
@@ -215,45 +228,37 @@ impl SslConfig {
     }
 }
 
-pub struct SqlOutput {
+struct SqlOutput {
     sql_config: SqlOutputConfig,
-    connected: std::sync::atomic::AtomicBool,
     conn_lock: Arc<Mutex<Option<DatabaseConnection>>>,
     cancellation_token: CancellationToken,
 }
 
 impl SqlOutput {
-    pub fn new(sql_config: SqlOutputConfig) -> Result<Self, Error> {
+    fn new(sql_config: SqlOutputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
 
         Ok(Self {
             sql_config,
-            connected: std::sync::atomic::AtomicBool::new(false),
             conn_lock: Arc::new(Mutex::new(None)),
             cancellation_token,
         })
     }
 }
+
 #[async_trait]
 impl Output for SqlOutput {
     async fn connect(&self) -> Result<(), Error> {
-        if self.connected.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
-        }
-
         let conn = self.init_connect().await?;
         let mut conn_guard = self.conn_lock.lock().await;
         *conn_guard = Some(conn);
-        self.connected
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
+
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
-        let conn = conn_guard
-            .as_mut()
-            .ok_or_else(|| Error::Process("Database connection is not initialized".to_string()))?;
+        let conn = conn_guard.as_mut().ok_or_else(|| Error::Disconnection)?;
 
         self.insert_row(conn, &msg).await?;
         Ok(())
@@ -264,16 +269,18 @@ impl Output for SqlOutput {
         Ok(())
     }
 }
+
 impl SqlOutput {
     /// Initialize a new DB connection.  
     /// If `ssl` is configured, apply root certificates to the SSL options.
     async fn init_connect(&self) -> Result<DatabaseConnection, Error> {
-        let conn = match self.sql_config.output_type {
-            DatabaseType::Mysql => self.generate_mysql_conn().await?,
-            DatabaseType::Postgres => self.generate_postgres_conn().await?,
+        let conn = match &self.sql_config.output_type {
+            DatabaseType::Mysql(config) => self.generate_mysql_conn(config).await?,
+            DatabaseType::Postgres(config) => self.generate_postgres_conn(config).await?,
         };
         Ok(conn)
     }
+
     /// Processes a batch of Arrow data and inserts it into the database
     /// 1. Extracts schema and column names
     /// 2. Converts each row to SQL-compatible values
@@ -307,6 +314,7 @@ impl SqlOutput {
         conn.execute_insert(&self.sql_config, columns, rows).await?;
         Ok(())
     }
+
     // Convert Arrow data types to SQL-compatible string representation
     async fn matching_data_type(
         &self,
@@ -362,29 +370,34 @@ impl SqlOutput {
             ))),
         }
     }
+
     /// Generates MySQL SSL connection options based on configuration
     /// Validates SSL mode and sets up certificates if provided
-    async fn generate_mysql_conn(&self) -> Result<DatabaseConnection, Error> {
-        let mysql_conn = if let Some(ssl) = &self.sql_config.ssl {
-            let opts = ssl.generate_mysql_ssl_opts(&self.sql_config).await?;
+    async fn generate_mysql_conn(&self, config: &MysqlConfig) -> Result<DatabaseConnection, Error> {
+        let mysql_conn = if let Some(ssl) = &config.ssl {
+            let opts = ssl.generate_mysql_ssl_opts(config).await?;
             MySqlConnection::connect_with(&opts)
                 .await
                 .map_err(|e| Error::Config(format!("Failed to connect to MySQL with SSL: {}", e)))?
         } else {
-            MySqlConnection::connect(&self.sql_config.uri)
+            MySqlConnection::connect(&config.uri)
                 .await
                 .map_err(|e| Error::Config(format!("Failed to connect to MySQL: {}", e)))?
         };
         Ok(DatabaseConnection::Mysql(mysql_conn))
     }
-    async fn generate_postgres_conn(&self) -> Result<DatabaseConnection, Error> {
-        let postgres_conn = if let Some(ssl) = &self.sql_config.ssl {
-            let opts = ssl.generate_postgres_ssl_opts(&self.sql_config).await?;
+
+    async fn generate_postgres_conn(
+        &self,
+        config: &PostgresConfig,
+    ) -> Result<DatabaseConnection, Error> {
+        let postgres_conn = if let Some(ssl) = &config.ssl {
+            let opts = ssl.generate_postgres_ssl_opts(config).await?;
             PgConnection::connect_with(&opts).await.map_err(|e| {
                 Error::Config(format!("Failed to connect to PostgreSQL with SSL: {}", e))
             })?
         } else {
-            PgConnection::connect(&self.sql_config.uri)
+            PgConnection::connect(&config.uri)
                 .await
                 .map_err(|e| Error::Config(format!("Failed to connect to PostgreSQL: {}", e)))?
         };
@@ -392,7 +405,8 @@ impl SqlOutput {
     }
 }
 
-pub(crate) struct SqlOutputBuilder;
+struct SqlOutputBuilder;
+
 impl OutputBuilder for SqlOutputBuilder {
     fn build(
         &self,
@@ -410,6 +424,7 @@ impl OutputBuilder for SqlOutputBuilder {
         Ok(Arc::new(SqlOutput::new(config)?))
     }
 }
+
 pub fn init() -> Result<(), Error> {
     register_output_builder("sql", Arc::new(SqlOutputBuilder))
 }

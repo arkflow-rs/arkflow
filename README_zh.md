@@ -1,7 +1,7 @@
 # ArkFlow
 
 <p align="center">
-<img align="center" width="150px" src="./logo.svg">
+<img align="center" width="150px" src="images/logo.svg">
 <p align="center">
 
 [English](README.md) | 中文
@@ -13,13 +13,14 @@
 
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
-高性能Rust流处理引擎，提供强大的数据流处理能力，支持多种输入输出源和处理器。
+高性能Rust流处理引擎，无缝集成AI能力，提供强大的实时数据处理与智能分析。
+它不仅支持多种输入/输出源和处理器，更能轻松加载和执行机器学习模型，实现流式数据和推理、异常检测和复杂事件处理。
 
 ##  CNCF 云原生技术全景图
 
 <p float="left">
-<img src="./cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
-<img src="./cncf-landscape-logo.svg" width="150"/>
+<img src="images/cncf-logo.svg" width="200"/>&nbsp;&nbsp;&nbsp;
+<img src="images/cncf-landscape-logo.svg" width="150"/>
 </p>
 
 ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landscape.cncf.io/?item=app-definition-and-development--streaming-messaging--arkflow)中。
@@ -27,6 +28,7 @@ ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landsc
 ## 特性
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
+- **智能分析**：无缝集成AI模型，提供强大的智能分析功能
 - **多种数据源**：支持Kafka、MQTT、HTTP、文件等多种输入输出源
 - **强大的处理能力**：内置SQL查询、Python脚本、JSON处理、Protobuf编解码、批处理等多种处理器
 - **可扩展**：模块化设计，易于扩展新的输入、缓冲区、输出和处理器组件
@@ -283,5 +285,12 @@ ArkFlow 使用 [Apache License 2.0](LICENSE) 许可证。
 ## 社区
 
 Discord: https://discord.gg/CwKhzb8pux
+
+微信社区群：
+
+<img src="./images/wx-group.png" alt="wx" width="300" />
+
+您可以在群内提出任何需要改进的地方，我们会考虑合理性并尽快修改。
+如果您发现 bug 请及时提 [issue](https://github.com/arkflow-rs/arkflow/issues/new?template=bug_report.md)，我们会尽快确认并修改。
 
 如果你喜欢或正在使用这个项目来学习或开始你的解决方案，请给它一个star⭐。谢谢！

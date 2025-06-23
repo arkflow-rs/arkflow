@@ -12,10 +12,12 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::{CodecConfig, Decoder};
-use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{split_batch, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::common::TableReference;
+use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,8 @@ pub(crate) struct JoinConfig {
     pub(crate) query: String,
     pub(crate) value_field: Option<String>,
     pub(crate) codec: CodecConfig,
+    #[serde(default = "default_thread_num")]
+    pub(crate) thread_num: usize,
 }
 
 pub(crate) struct JoinOperation {
@@ -35,18 +39,21 @@ pub(crate) struct JoinOperation {
     value_field: Option<String>,
     codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
+    thread_num: usize,
 }
 
 impl JoinOperation {
     pub(crate) fn new(
         query: String,
         value_field: Option<String>,
+        thread_num: usize,
         codec: Arc<dyn Decoder>,
         input_names: HashSet<String>,
     ) -> Result<Self, Error> {
         Ok(Self {
             query,
             value_field,
+            thread_num,
             codec,
             input_names,
         })
@@ -65,13 +72,30 @@ impl JoinOperation {
 
         let mut current_input_names = Vec::with_capacity(table_sources.len());
         for x in table_sources {
-            let x = x?;
-            let input_name_opt = x.get_input_name();
+            let msg_batch = x?;
+            let input_name_opt = msg_batch.get_input_name();
             let Some(input_name) = input_name_opt else {
                 continue;
             };
-            ctx.register_batch(&input_name, x.into())
-                .map_err(|e| Error::Process(format!("Failed to register table source: {}", e)))?;
+
+            let vec_rb = split_batch(msg_batch.into(), self.thread_num);
+            let mut batches = vec_rb.into_iter().peekable();
+            let schema = if let Some(batch) = batches.peek() {
+                batch.schema()
+            } else {
+                Arc::new(Schema::empty())
+            };
+            let batches = batches.map(|b| vec![b]).collect::<Vec<_>>();
+            let provider = MemTable::try_new(schema, batches)
+                .map_err(|e| Error::Process(format!("Failed to create MemTable: {}", e)))?;
+
+            ctx.register_table(
+                TableReference::Bare {
+                    table: input_name.clone().into(),
+                },
+                Arc::new(provider),
+            )
+            .map_err(|e| Error::Process(format!("Failed to register table source: {}", e)))?;
             current_input_names.push(input_name);
         }
 
@@ -120,4 +144,8 @@ impl JoinOperation {
         result.set_input_name(option);
         Ok(result)
     }
+}
+
+fn default_thread_num() -> usize {
+    num_cpus::get()
 }
