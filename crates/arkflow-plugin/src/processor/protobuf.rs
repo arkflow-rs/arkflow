@@ -16,15 +16,14 @@
 //!
 //! The processor used to convert between Protobuf data and the Arrow format
 
+use crate::component::protobuf::{
+    arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
+};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
-use crate::component::protobuf::{arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig};
 use datafusion::arrow;
-use datafusion::arrow::datatypes::Schema;
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::parquet::data_type::AsBytes;
-use prost_reflect::{DynamicMessage, MessageDescriptor, Value};
+use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -48,10 +47,6 @@ impl ProtobufConfig for ProtobufProcessorConfig {
 
     fn proto_includes(&self) -> &Option<Vec<String>> {
         &self.proto_includes
-    }
-
-    fn message_type(&self) -> &String {
-        &self.message_type
     }
 }
 
@@ -96,8 +91,6 @@ impl ProtobufProcessor {
             descriptor: message_descriptor,
         })
     }
-
-
 }
 
 #[async_trait]
@@ -149,8 +142,6 @@ impl Processor for ProtobufProcessor {
         Ok(())
     }
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProtobufToArrowProcessorConfig {
@@ -255,11 +246,12 @@ mod tests {
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use prost_reflect::prost::Message;
+    use prost_reflect::{DynamicMessage, Value};
     use std::cell::RefCell;
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
-    use prost_reflect::prost::Message;
     use tempfile::{tempdir, TempDir};
 
     fn create_test_proto_file() -> Result<(TempDir, PathBuf), Error> {

@@ -16,13 +16,15 @@
 //!
 //! The codec used to convert between Protobuf data and the Arrow format
 
+use crate::component::protobuf::{
+    arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
+};
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
-use crate::component::protobuf::{arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig};
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
-use prost_reflect::{MessageDescriptor};
+use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::Arc;
@@ -46,15 +48,10 @@ impl ProtobufConfig for ProtobufCodecConfig {
     fn proto_includes(&self) -> &Option<Vec<String>> {
         &self.proto_includes
     }
-
-    fn message_type(&self) -> &String {
-        &self.message_type
-    }
 }
 
 /// Protobuf Codec
 struct ProtobufCodec {
-    config: ProtobufCodecConfig,
     descriptor: MessageDescriptor,
 }
 
@@ -78,11 +75,9 @@ impl ProtobufCodec {
             })?;
 
         Ok(Self {
-            config,
             descriptor: message_descriptor,
         })
     }
-
 }
 
 impl Encoder for ProtobufCodec {
@@ -133,8 +128,6 @@ impl CodecBuilder for ProtobufCodecBuilder {
         Ok(Arc::new(ProtobufCodec::new(config)?))
     }
 }
-
-
 
 pub(crate) fn init() -> Result<(), Error> {
     codec::register_codec_builder("protobuf", Arc::new(ProtobufCodecBuilder))?;

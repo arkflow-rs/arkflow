@@ -36,7 +36,6 @@ use std::{fs, io};
 pub trait ProtobufConfig {
     fn proto_inputs(&self) -> &Vec<String>;
     fn proto_includes(&self) -> &Option<Vec<String>>;
-    fn message_type(&self) -> &String;
 }
 
 /// List all files in a directory
@@ -68,7 +67,10 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
                 .collect::<Vec<_>>(),
         )
     }
-    let proto_includes = config.proto_includes().clone().unwrap_or(config.proto_inputs().clone());
+    let proto_includes = config
+        .proto_includes()
+        .clone()
+        .unwrap_or(config.proto_inputs().clone());
 
     if proto_inputs.is_empty() {
         return Err(Error::Config("No proto files found in the specified paths. Please ensure the paths contain valid .proto files".to_string()));
@@ -111,7 +113,10 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
 }
 
 /// Convert Protobuf data to Arrow format
-pub fn protobuf_to_arrow(descriptor: &MessageDescriptor, data: &[u8]) -> Result<RecordBatch, Error> {
+pub fn protobuf_to_arrow(
+    descriptor: &MessageDescriptor,
+    data: &[u8],
+) -> Result<RecordBatch, Error> {
     let proto_msg = DynamicMessage::decode(descriptor.clone(), data)
         .map_err(|e| Error::Process(format!("Protobuf message parsing failed: {}", e)))?;
 
@@ -186,7 +191,10 @@ pub fn protobuf_to_arrow(descriptor: &MessageDescriptor, data: &[u8]) -> Result<
 }
 
 /// Convert Arrow format to Protobuf
-pub fn arrow_to_protobuf(descriptor: &MessageDescriptor, batch: &MessageBatch) -> Result<Vec<Bytes>, Error> {
+pub fn arrow_to_protobuf(
+    descriptor: &MessageDescriptor,
+    batch: &MessageBatch,
+) -> Result<Vec<Bytes>, Error> {
     // Create a new dynamic message
     let mut vec = Vec::with_capacity(batch.len());
     let len = batch.len();
@@ -329,4 +337,3 @@ pub fn arrow_to_protobuf(descriptor: &MessageDescriptor, batch: &MessageBatch) -
         })
         .collect::<Result<Vec<_>, Error>>()?)
 }
-
