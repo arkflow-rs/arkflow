@@ -1379,7 +1379,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -8413,9 +8413,9 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "ua-parser"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7176a413a0b7e94926d11a2054c6db5ac7fa42bf4ebe7e9571152e3f024ddfd"
+checksum = "5c06b979bd5606d182759ff9cd3dda2b034b584a1ed41116407cb92abf3c995a"
 dependencies = [
  "regex",
  "regex-filtered",
