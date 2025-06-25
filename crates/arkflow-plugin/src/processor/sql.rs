@@ -21,7 +21,6 @@ use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBu
 use arkflow_core::temporary::Temporary;
 use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use ballista::prelude::SessionContextExt;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -46,8 +45,6 @@ struct SqlProcessorConfig {
     /// Table name (used in SQL queries)
     table_name: Option<String>,
 
-    /// Experimental: Ballista helps us perform distributed computing
-    ballista: Option<crate::input::sql::BallistaConfig>,
     temporary_list: Option<Vec<TemporaryConfig>>,
 }
 
@@ -69,7 +66,6 @@ struct SqlProcessor {
     config: SqlProcessorConfig,
     statement: Statement,
     temporary: Option<HashMap<String, (Arc<dyn Temporary>, TemporaryConfig)>>,
-    // expr: expr::Expr<String>,
 }
 
 impl SqlProcessor {
@@ -106,8 +102,6 @@ impl SqlProcessor {
             config,
             statement,
             temporary,
-            // temporary: Arc::new(()),
-            // expr: expr::Expr::new(),
         })
     }
 
@@ -205,13 +199,7 @@ impl SqlProcessor {
 
     /// Create a new session context with UDFs and JSON functions registered
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
-        let mut ctx = if let Some(ballista) = &self.config.ballista {
-            SessionContext::remote(&ballista.remote_url)
-                .await
-                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
-        } else {
-            SessionContext::new()
-        };
+        let mut ctx = SessionContext::new();
         udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
@@ -273,7 +261,6 @@ mod tests {
             SqlProcessorConfig {
                 query: "SELECT * FROM flow".to_string(),
                 table_name: None,
-                ballista: None,
                 temporary_list: None,
             },
             &Resource {
@@ -312,7 +299,6 @@ mod tests {
             SqlProcessorConfig {
                 query: "SELECT * FROM flow".to_string(),
                 table_name: None,
-                ballista: None,
                 temporary_list: None,
             },
             &Resource {
@@ -338,7 +324,6 @@ mod tests {
             SqlProcessorConfig {
                 query: "INVALID SQL QUERY".to_string(),
                 table_name: None,
-                ballista: None,
                 temporary_list: None,
             },
             &Resource {
@@ -356,7 +341,6 @@ mod tests {
             SqlProcessorConfig {
                 query: "SELECT * FROM custom_table".to_string(),
                 table_name: Some("custom_table".to_string()),
-                ballista: None,
                 temporary_list: None,
             },
             &Resource {
