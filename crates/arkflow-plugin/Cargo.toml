@@ -28,7 +28,7 @@ datafusion-table-providers = { version = "0.5", features = [
     "duckdb",
     "sqlite",
 ] }
-ballista = { git = "https://github.com/apache/datafusion-ballista", rev = "97c919274d9de496b630e66c12ad29c3fccd110b" }
+ballista = { version = "47.0.0" }
 duckdb = { version = "=1.3.0", package = "spiceai_duckdb_fork" }
 arrow-json = { workspace = true }
 prost-reflect = { workspace = true }
