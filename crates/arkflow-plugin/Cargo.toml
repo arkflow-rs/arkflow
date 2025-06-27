@@ -61,7 +61,7 @@ sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 redis = { version = "0.32", features = ["tokio-native-tls-comp", "aio", "connection-manager", "cluster-async"] }
 
 # vrl https://github.com/vectordotdev/vrl
-vrl = { version = "0.24", features = ["value", "compiler", "stdlib"] }
+vrl = { version = "0.25", features = ["value", "compiler", "stdlib"] }
 
 
 
