@@ -1,5 +1,5 @@
 logging:
-  level: info
+  level: debug
 streams:
   - input:
       type: "generate"
@@ -16,16 +16,15 @@ streams:
 
     output:
       type: "s3"  
-      provider: "aws"  # /aws/gcp
+      provider: "aws"  # /aws/gcp/
       bucket: "arkflow"
       region: "ap-northeast-2"
       credentials:
         access_key_id: "your access key id"
-        secret_access_key: "your secret access key"
-      path: "test"  
-      prefix: "arkflow" 
-      format: "JSON"         #json/csv/parquet  
-      compression: "gzip"   #/gzip/bzip2
-
+        secret_access_key: "secret access key"
+      format: "csv" #json/csv/parquet  
+      prefix_pattern: "data/{year}/{month}/{day}/{timestamp}"
+      format_options: 
+        compression: "gzip"
     error_output:
       type: "stdout"

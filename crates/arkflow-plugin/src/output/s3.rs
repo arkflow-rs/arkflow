@@ -15,30 +15,24 @@ use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, Resource};
 
 use async_trait::async_trait;
-
+use datafusion::common::parsers::CompressionTypeVariant;
+use datafusion::config::{CsvOptions, JsonOptions, ParquetOptions, TableParquetOptions};
+use datafusion::dataframe::DataFrameWriteOptions;
+use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_with::DeserializeFromStr;
 
+use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::ObjectStore;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::{path::Path, ObjectStore};
-
-use arrow_csv::WriterBuilder;
-use arrow_json::LineDelimitedWriter;
-use parquet::arrow::ArrowWriter;
-
 use chrono::Local;
-
-use bzip2::write::BzEncoder;
-use bzip2::Compression as BzCompression;
-use flate2::write::GzEncoder;
-use flate2::Compression as GzCompression;
-use std::io::{Cursor, Write};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", untagged)]
@@ -59,7 +53,7 @@ pub struct GcpCredentials {
     service_account_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeFromStr)]
+#[derive(Debug, Clone, Serialize, DeserializeFromStr, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum S3OutputFormat {
     Json,
@@ -78,23 +72,6 @@ impl FromStr for S3OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, DeserializeFromStr)]
-#[serde(rename_all = "snake_case")]
-pub enum S3Compression {
-    Gzip,
-    Bzip2,
-}
-impl FromStr for S3Compression {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "gzip" => Ok(Self::Gzip),
-            "bzip2" => Ok(Self::Bzip2),
-            _ => Err(format!("Invalid compression type: {}", s)),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct S3OutputConfig {
@@ -102,27 +79,53 @@ pub struct S3OutputConfig {
     bucket: String,
     region: String,
     credentials: ProviderCredentials,
-    path: String,
-    prefix: Option<String>,
+    prefix_pattern: Option<String>,
     format: S3OutputFormat,
-    compression: Option<S3Compression>,
+    format_options: Option<FormatOptions>,
+}
+
+#[derive(Debug, Clone)]
+enum WriterOptions {
+    Csv(CsvOptions),
+    Json(JsonOptions),
+    Parquet(TableParquetOptions),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+struct FormatOptions {
+    compression: Option<String>,
+    //csv
+    delimiter: Option<u8>,
+    header: Option<bool>,
+    escape: Option<u8>,
+    //parquet
+    skip_arrow_metadata: Option<bool>,
+    max_row_group_size: Option<usize>,
+    dictionary_enabled: Option<bool>,
+    statistics_enabled: Option<String>,
 }
 
 pub struct S3Output {
     config: S3OutputConfig,
     s3_client: Arc<dyn ObjectStore>,
     cancellation_token: CancellationToken,
+    ctx: Arc<SessionContext>,
+    writer_options: Arc<Mutex<Option<WriterOptions>>>,
 }
 
 impl S3Output {
     pub fn new(config: S3OutputConfig) -> Result<Self, Error> {
         let builder = Self::create_storage_client(&config)?;
         let cancellation_token = CancellationToken::new();
+        let ctx = Arc::new(SessionContext::new());
 
         Ok(Self {
             config,
             s3_client: builder,
             cancellation_token,
+            ctx,
+            writer_options: Arc::new(Mutex::new(None)),
         })
     }
     fn create_storage_client(config: &S3OutputConfig) -> Result<Arc<dyn ObjectStore>, Error> {
@@ -175,50 +178,82 @@ impl S3Output {
 #[async_trait]
 impl Output for S3Output {
     async fn connect(&self) -> Result<(), Error> {
-        info!(
-            "S3 client for bucket '{}' initialized. Performing a lightweight connection check (e.g., listing root).",
-            self.config.bucket
-        );
+        let url = self.get_url().await?;
+        info!("Connecting to S3 at URL: {}", url);
+        self.ctx.register_object_store(&url, self.s3_client.clone());
+        let writer_options = self.get_writer_options().await?;
+        *self.writer_options.lock().unwrap() = Some(writer_options);
         Ok(())
     }
     async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
-        let s3_client_clone = Arc::clone(&self.s3_client);
-        let config_clone = self.config.clone();
-        let timestamp = Local::now().timestamp();
+        self.ctx
+            .register_batch("batch", msg.into())
+            .map_err(|e| Error::Process(format!("Failed to register batch: {}", e)))?;
 
-        let (object_key, data) =
-            tokio::task::spawn_blocking(move || -> Result<(Path, Vec<u8>), Error> {
-                let serialized_data = match config_clone.format {
-                    S3OutputFormat::Json => S3Output::batch_to_json(&msg)?,
-                    S3OutputFormat::Csv => S3Output::batch_to_csv(&msg)?,
-                    S3OutputFormat::Parquet => S3Output::batch_to_parquet(&msg)?,
-                };
-
-                let processed_data = if let Some(compression) = config_clone.compression {
-                    S3Output::compress_data(serialized_data, &compression)?
-                } else {
-                    serialized_data
-                };
-                let extension = S3Output::get_file_extension_from_config(&config_clone);
-
-                let filename_prefix_part = config_clone
-                    .prefix
-                    .as_ref()
-                    .map_or_else(|| "".to_string(), |p| format!("{}_", p.trim_matches('/')));
-                let filename = format!("{}{}.{}", filename_prefix_part, timestamp, extension);
-                let base_path_trimmed = config_clone.path.trim_matches('/');
-                let path = format!("{}/{}", base_path_trimmed, filename);
-                let object_key = Path::from(path);
-
-                Ok((object_key, processed_data))
-            })
+        let df = self
+            .ctx
+            .sql("SELECT * FROM batch")
             .await
-            .map_err(|e| Error::Process(format!("Data processing task failed: {}", e)))??;
+            .map_err(|e| Error::Process(format!("Failed to execute SQL: {}", e)))?;
 
-        s3_client_clone
-            .put(&object_key, data.into())
-            .await
-            .map_err(|e| Error::Process(format!("Failed to write to S3: {}", e)))?;
+        let writer_options = match self.writer_options.lock().unwrap().as_ref() {
+            Some(options) => options.clone(),
+            None => {
+                // writer_options가 없으면 기본값으로 생성
+                match self.config.format {
+                    S3OutputFormat::Csv => WriterOptions::Csv(CsvOptions::default()),
+                    S3OutputFormat::Json => WriterOptions::Json(JsonOptions::default()),
+                    S3OutputFormat::Parquet => WriterOptions::Parquet(TableParquetOptions::new()),
+                }
+            }
+        };
+
+        let prefix = self.format_prefix_with_datetime().await;
+        let url = self.get_url().await?;
+        let save_path = url
+            .join(&prefix)
+            .map_err(|e| Error::Process(format!("Failed to join URL with prefix: {}", e)))?
+            .to_string();
+        let dataframe_options = DataFrameWriteOptions::new();
+
+        match self.config.format {
+            S3OutputFormat::Csv => match writer_options {
+                WriterOptions::Csv(csv_options) => {
+                    df.write_csv(&save_path, dataframe_options, Some(csv_options.clone()))
+                        .await
+                        .map_err(|e| Error::Process(format!("Failed to write CSV: {}", e)))?;
+                    info!("Writing CSV to S3 at path: {}", save_path);
+                }
+                _ => {
+                    return Err(Error::Process("Invalid options for CSV format".to_string()));
+                }
+            },
+            S3OutputFormat::Json => match writer_options {
+                WriterOptions::Json(json_options) => {
+                    df.write_json(&save_path, dataframe_options, Some(json_options.clone()))
+                        .await
+                        .map_err(|e| Error::Process(format!("Failed to write JSON: {}", e)))?;
+                }
+                _ => {
+                    return Err(Error::Process(
+                        "Invalid options for JSON format".to_string(),
+                    ));
+                }
+            },
+            S3OutputFormat::Parquet => match writer_options {
+                WriterOptions::Parquet(parquet_options) => {
+                    df.write_parquet(&save_path, dataframe_options, Some(parquet_options.clone()))
+                        .await
+                        .map_err(|e| Error::Process(format!("Failed to write Parquet: {}", e)))?;
+                }
+                _ => {
+                    return Err(Error::Process(
+                        "Invalid options for Parquet format".to_string(),
+                    ));
+                }
+            },
+        };
+        let _ = self.ctx.deregister_table("batch");
         Ok(())
     }
 
@@ -228,84 +263,159 @@ impl Output for S3Output {
     }
 }
 impl S3Output {
-    fn batch_to_json(msg: &MessageBatch) -> Result<Vec<u8>, Error> {
-        let buf = Vec::new();
-        let mut json_writer = LineDelimitedWriter::new(buf);
-
-        json_writer
-            .write_batches(&[msg])
-            .map_err(|e| Error::Process(format!("Failed to write JSON: {}", e)))?;
-
-        json_writer
-            .finish()
-            .map_err(|e| Error::Process(format!("Failed to finish JSON writer: {}", e)))?;
-
-        Ok(json_writer.into_inner())
-    }
-    fn batch_to_csv(msg: &MessageBatch) -> Result<Vec<u8>, Error> {
-
-        let buf = Vec::new();
-        let cursor = Cursor::new(buf);
-        let mut csv_writer = WriterBuilder::new().with_header(true).build(cursor);
-
-        csv_writer
-            .write(msg)
-            .map_err(|e| Error::Process(format!("Failed to write CSV: {}", e)))?;
-
-        let cursor = csv_writer.into_inner();
-        Ok(cursor.into_inner())
-    }
-    fn batch_to_parquet(msg: &MessageBatch) -> Result<Vec<u8>, Error> {
-
-        let mut parquet_buffer = Vec::new();
-
-        let schema = msg.schema();
-        let mut writer = ArrowWriter::try_new(&mut parquet_buffer, schema, None)
-            .map_err(|e| Error::Process(format!("Failed to create ArrowWriter: {}", e)))?;
-
-        writer.write(msg).map_err(|e| {
-            Error::Process(format!("Failed to write RecordBatch to Parquet: {}", e))
-        })?;
-
-        writer
-            .close()
-            .map_err(|e| Error::Process(format!("Failed to close Parquet writer: {}", e)))?;
-
-        Ok(parquet_buffer)
-    }
-    fn compress_data(data: Vec<u8>, compression: &S3Compression) -> Result<Vec<u8>, Error> {
-        match compression {
-            S3Compression::Gzip => {
-                let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-                encoder
-                    .write_all(&data)
-                    .map_err(|e| Error::Process(format!("Gzip write_all failed: {}", e)))?; // 에러 메시지 구체화
-                encoder
-                    .finish()
-                    .map_err(|e| Error::Process(format!("Gzip finish failed: {}", e)))
+    async fn get_writer_options(&self) -> Result<WriterOptions, Error> {
+        match self.config.format {
+            S3OutputFormat::Csv => {
+                let csv_options = self.build_csv_options().await?;
+                Ok(WriterOptions::Csv(csv_options))
             }
-            S3Compression::Bzip2 => {
-                let mut encoder = BzEncoder::new(Vec::new(), BzCompression::default());
-                encoder
-                    .write_all(&data)
-                    .map_err(|e| Error::Process(format!("Bzip2 write_all failed: {}", e)))?; // 에러 메시지 구체화
-                encoder
-                    .finish()
-                    .map_err(|e| Error::Process(format!("Bzip2 finish failed: {}", e)))
+            S3OutputFormat::Json => {
+                let json_options = self.build_json_options().await?;
+                Ok(WriterOptions::Json(json_options))
+            }
+            S3OutputFormat::Parquet => {
+                let parquet_options = self.build_parquet_options().await?;
+                Ok(WriterOptions::Parquet(parquet_options))
             }
         }
     }
 
-    fn get_file_extension_from_config(config: &S3OutputConfig) -> &'static str {
-        match (&config.format, &config.compression) {
-            (S3OutputFormat::Json, Some(S3Compression::Gzip)) => "json.gz",
-            (S3OutputFormat::Csv, Some(S3Compression::Gzip)) => "csv.gz",
-            (S3OutputFormat::Json, Some(S3Compression::Bzip2)) => "json.bz2",
-            (S3OutputFormat::Csv, Some(S3Compression::Bzip2)) => "csv.bz2",
-            (S3OutputFormat::Json, None) => "json",
-            (S3OutputFormat::Csv, None) => "csv",
-            (S3OutputFormat::Parquet, _) => "parquet",
+    async fn build_csv_options(&self) -> Result<CsvOptions, Error> {
+        let mut csv_options = CsvOptions::default();
+
+        if let Some(format_options) = &self.config.format_options {
+            if let Some(delimiter) = format_options.delimiter {
+                csv_options = csv_options.with_delimiter(delimiter);
+            }
+            if let Some(header) = format_options.header {
+                csv_options = csv_options.with_has_header(header);
+            }
+            if let Some(compression_str) = &format_options.compression {
+                // 문자열을 CompressionTypeVariant enum으로 변환
+                let compression_type = match compression_str.to_lowercase().as_str() {
+                    "gzip" => CompressionTypeVariant::GZIP,
+                    "bzip2" => CompressionTypeVariant::BZIP2,
+                    "xz" => CompressionTypeVariant::XZ,
+                    "zstd" => CompressionTypeVariant::ZSTD,
+                    unsupported => {
+                        return Err(Error::Config(format!(
+                            "Unsupported compression type: {}",
+                            unsupported
+                        )));
+                    }
+                };
+                csv_options = csv_options.with_compression(compression_type);
+            }
+            if let Some(escape) = format_options.escape {
+                csv_options = csv_options.with_escape(Some(escape));
+            }
         }
+        Ok(csv_options)
+    }
+    async fn build_json_options(&self) -> Result<JsonOptions, Error> {
+        let mut json_options = JsonOptions::default();
+
+        if let Some(format_options) = &self.config.format_options {
+            if let Some(compression_str) = &format_options.compression {
+                // 문자열을 CompressionTypeVariant enum으로 변환
+                let compression_type = match compression_str.to_lowercase().as_str() {
+                    "gzip" => CompressionTypeVariant::GZIP,
+                    "bzip2" => CompressionTypeVariant::BZIP2,
+                    "xz" => CompressionTypeVariant::XZ,
+                    "zstd" => CompressionTypeVariant::ZSTD,
+                    unsupported => {
+                        return Err(Error::Config(format!(
+                            "Unsupported compression type: {}",
+                            unsupported
+                        )));
+                    }
+                };
+                json_options.compression = compression_type;
+            }
+        }
+        Ok(json_options)
+    }
+    async fn build_parquet_options(&self) -> Result<TableParquetOptions, Error> {
+        let mut parquet_table_options = TableParquetOptions::new();
+        let mut parquet_options = ParquetOptions::default();
+
+        if let Some(format_options) = &self.config.format_options {
+            if let Some(compression_str) = &format_options.compression {
+                parquet_options.compression = Some(compression_str.clone());
+            }
+            if let Some(skip_arrow_metadata) = format_options.skip_arrow_metadata {
+                parquet_options.skip_arrow_metadata = skip_arrow_metadata;
+            }
+            if let Some(max_row_group_size) = format_options.max_row_group_size {
+                parquet_options.max_row_group_size = max_row_group_size;
+            }
+            if let Some(dictionary_enabled) = format_options.dictionary_enabled {
+                parquet_options.dictionary_enabled = Some(dictionary_enabled);
+            }
+            if let Some(statistics_enabled) = &format_options.statistics_enabled {
+                parquet_options.statistics_enabled = Some(statistics_enabled.clone());
+            }
+        }
+
+        parquet_table_options.global = parquet_options;
+
+        Ok(parquet_table_options)
+    }
+    async fn format_prefix_with_datetime(&self) -> String {
+        let datetime = Local::now();
+        let path = if let Some(prefix_pattern) = &self.config.prefix_pattern {
+            prefix_pattern
+                .replace("{year}", &datetime.format("%Y").to_string())
+                .replace("{month}", &datetime.format("%m").to_string())
+                .replace("{day}", &datetime.format("%d").to_string())
+                .replace("{hour}", &datetime.format("%H").to_string())
+                .replace("{minute}", &datetime.format("%M").to_string())
+                .replace("{second}", &datetime.format("%S").to_string())
+                .replace("{timestamp}", &datetime.timestamp().to_string())
+        } else {
+            datetime.timestamp().to_string()
+        };
+
+        let extension = match self.config.format {
+            S3OutputFormat::Json => "json",
+            S3OutputFormat::Csv => "csv",
+            S3OutputFormat::Parquet => "parquet",
+        };
+        let mut file_path = format!("{}.{}", path, extension);
+
+        if self.config.format != S3OutputFormat::Parquet {
+            if let Some(format_options) = &self.config.format_options {
+                if let Some(compression) = &format_options.compression {
+                    let compression_ext = match compression.to_lowercase().as_str() {
+                        "gzip" => ".gz",
+                        "bzip2" => ".bz2",
+                        "xz" => ".xz",
+                        "zstd" => ".zst",
+                        _ => "",
+                    };
+                    if !compression_ext.is_empty() {
+                        file_path = format!("{}{}", file_path, compression_ext);
+                    }
+                }
+            }
+        }
+
+        file_path
+    }
+
+    async fn get_url(&self) -> Result<Url, Error> {
+        let url_str = match self.config.provider.to_lowercase().as_str() {
+            "aws" => format!("s3://{}", self.config.bucket),
+            "gcp" => format!("gs://{}", self.config.bucket),
+            provider => {
+                return Err(Error::Config(format!(
+                    "Unsupported storage provider: {}",
+                    provider
+                )))
+            }
+        };
+        info!("S3 Output URL: {}", url_str);
+        Url::parse(&url_str).map_err(|e| Error::Config(format!("Invalid URL: {}", e)))
     }
 }
 
