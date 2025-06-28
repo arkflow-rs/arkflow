@@ -269,6 +269,7 @@ name = "arkflow-plugin"
 version = "0.4.0-rc1"
 dependencies = [
  "arkflow-core",
+ "arrow-csv",
  "arrow-json",
  "async-nats",
  "async-trait",
@@ -278,10 +279,13 @@ dependencies = [
  "base64 0.22.1",
  "bzip2 0.5.2",
  "chrono",
+ "bzip2 0.5.2",
+ "chrono",
  "colored",
  "datafusion",
  "datafusion-functions-json",
  "datafusion-table-providers",
+ "flate2",
  "flate2",
  "flume",
  "futures",
@@ -293,6 +297,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "once_cell",
+ "parquet 54.3.1",
  "parquet 54.3.1",
  "prost-reflect",
  "prost-types",
@@ -307,6 +312,7 @@ dependencies = [
  "sasl2-sys",
  "serde",
  "serde_json",
+ "serde_with",
  "serde_with",
  "serde_yaml",
  "spiceai_duckdb_fork",
@@ -4686,7 +4692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.53.0",
 ]
 
 [[package]]
