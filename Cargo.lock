@@ -3620,9 +3620,9 @@ checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
 
 [[package]]
 name = "grok"
-version = "2.1.0"
+version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c52724b609896f661a3f4641dd3a44dc602958ef615857c12d00756b4e9355b"
+checksum = "71644bbce1040587eead1dddb22ff2ffc45bbc5e9d13e32b75a28ad539fb24ca"
 dependencies = [
  "glob",
  "onig",
