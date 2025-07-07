@@ -24,24 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wasmtime::{Engine, Instance, Memory, Module, Store};
 
-pub fn init() -> Result<(), Error> {
-    register_processor_builder("wasm", Arc::new(WasmProcessorBuilder))?;
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WasmProcessorConfig {
     /// WASM module path or inline WASM bytes (base64 encoded)
     module: String,
     /// Function name to call in the WASM module
     function: String,
-    /// Whether the module field contains a file path or base64 encoded bytes
-    #[serde(default = "default_is_file")]
-    is_file: bool,
-}
-
-fn default_is_file() -> bool {
-    true
 }
 
 struct WasmProcessor {
@@ -120,20 +108,13 @@ impl WasmProcessor {
         let engine = Engine::default();
 
         // Load WASM module
-        let module_data = if config.is_file {
-            // Load from file
+        let module_data =   // Load from file
             std::fs::read(&config.module).map_err(|e| {
                 Error::Config(format!(
                     "Failed to read WASM file '{}': {}",
                     config.module, e
                 ))
-            })?
-        } else {
-            // Decode from base64
-            base64::engine::general_purpose::STANDARD
-                .decode(&config.module)
-                .map_err(|e| Error::Config(format!("Failed to decode base64 WASM data: {}", e)))?
-        };
+            })?;
 
         // Compile the module
         let module = Module::new(&engine, &module_data)
@@ -218,6 +199,11 @@ impl ProcessorBuilder for WasmProcessorBuilder {
         let processor = WasmProcessor::new(wasm_config)?;
         Ok(Arc::new(processor))
     }
+}
+
+pub fn init() -> Result<(), Error> {
+    register_processor_builder("wasm", Arc::new(WasmProcessorBuilder))?;
+    Ok(())
 }
 
 #[cfg(test)]
