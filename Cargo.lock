@@ -1394,7 +1394,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -1899,7 +1899,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3727,9 +3727,9 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe9a986a98854573dfbc130f42f81e92f6d4581e23060708842fede6edef0f1f"
+checksum = "2b4cabd42d46aac490d01b80596dfd930a8316b4ee3e8b0c94a7cba888791c0f"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -3754,7 +3754,7 @@ dependencies = [
  "once_cell",
  "prost",
  "prost-types",
- "rand 0.8.5",
+ "rand 0.9.1",
  "regex",
  "roxmltree",
  "socket2",
@@ -5851,7 +5851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "once_cell",
@@ -5871,7 +5871,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.101",
@@ -8932,7 +8932,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
