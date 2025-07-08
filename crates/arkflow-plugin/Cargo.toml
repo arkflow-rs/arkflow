@@ -47,7 +47,7 @@ rumqttc = "0.24.0"
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = [
+rdkafka = { version = "0.38", features = [
     "cmake-build",
     "tracing",
     "sasl",
