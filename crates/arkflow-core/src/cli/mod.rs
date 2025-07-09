@@ -58,21 +58,21 @@ impl Cli {
             .subcommand(
                 Command::new("remote")
                 .arg(
-                Arg::new("remote-config-url")
-                    .long("remote-config-url")
+                Arg::new("config-url")
+                    .long("config-url")
                     .value_name("URL")
                     .help("Remote configuration API endpoint URL for automatic pipeline management.")
             )
                 .arg(
-                    Arg::new("remote-config-interval")
-                        .long("remote-config-interval")
+                    Arg::new("config-interval")
+                        .long("config-interval")
                         .value_name("SECONDS")
                         .help("Interval in seconds for polling remote configuration (default: 30).")
                         .default_value("30"),
                 )
                 .arg(
-                    Arg::new("remote-config-token")
-                        .long("remote-config-token")
+                    Arg::new("config-token")
+                        .long("config-token")
                         .value_name("TOKEN")
                         .help("Authentication token for remote configuration API."),
                 ))
@@ -83,11 +83,13 @@ impl Cli {
             // Initialize remote configuration manager
             matches.subcommand_matches("remote");
             let interval = remote
-                .get_one::<String>("remote-config-interval")
+                .get_one::<String>("config-interval")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
-            let token = remote.get_one::<String>("remote-config-token").cloned();
-            let remote_url = remote.get_one::<String>("remote-config-url").expect("Remote configuration URL not found");
+            let token = remote.get_one::<String>("config-token").cloned();
+            let remote_url = remote
+                .get_one::<String>("config-url")
+                .expect("Remote configuration URL not found");
 
             let remote_manager = RemoteConfigManager::new(remote_url.clone(), interval, token);
 
