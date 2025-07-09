@@ -40,42 +40,42 @@ impl Cli {
         let matches = Command::new("arkflow")
             .version("0.4.0-rc1")
             .author("chenquan")
-            .about("High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting multiple input/output sources and processors.")
+            .about("High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting multiple input/output sources and processors")
             .arg(
                 Arg::new("config")
                     .short('c')
                     .long("config")
                     .value_name("FILE")
-                    .help("Specify the profile path.")
+                    .help("Specify the profile path")
             )
             .arg(
                 Arg::new("validate")
                     .short('v')
                     .long("validate")
-                    .help("Only the profile is verified, not the engine is started.")
+                    .help("Only the profile is verified, not the engine is started")
                     .action(clap::ArgAction::SetTrue),
             )
             .subcommand(
-                Command::new("remote").about("Use remote configuration for automatic stream management.")
+                Command::new("remote").about("Use remote configuration for automatic stream management")
                 .arg(
                 Arg::new("url")
                     .long("url")
                     .value_name("URL")
-                    .help("Remote configuration API endpoint URL for automatic stream management.")
+                    .help("Remote configuration API endpoint URL for automatic stream management")
                     .required( true)
             )
                 .arg(
                     Arg::new("interval")
                         .long("interval")
                         .value_name("SECONDS")
-                        .help("Interval in seconds for polling remote configuration.")
+                        .help("Interval in seconds for polling remote configuration")
                         .default_value("30"),
                 )
                 .arg(
                     Arg::new("token")
                         .long("token")
                         .value_name("TOKEN")
-                        .help("Authentication token for remote configuration API.")
+                        .help("Authentication token for remote configuration API")
                         .required( true),
                 ))
             .get_matches();
