@@ -107,7 +107,7 @@ impl RemoteConfigManager {
     }
 
     /// Start the remote configuration management loop
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&self, token: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting remote configuration manager");
         info!("Polling interval: {} seconds", self.poll_interval);
         info!("API endpoint: {}", self.api_url);
@@ -118,11 +118,19 @@ impl RemoteConfigManager {
         let mut interval_timer = interval(Duration::from_secs(self.poll_interval));
 
         loop {
-            if let Err(e) = self.fetch_and_update_config().await {
-                error!("Failed to fetch remote configuration: {}", e);
+            tokio::select! {
+                _ = token.cancelled() => {
+                        info!("Shutting down remote configuration manager");
+                        break;
+                }
+                _ = interval_timer.tick() => {
+                        if let Err(e) = self.fetch_and_update_config().await {
+                            error!("Failed to fetch remote configuration: {}", e);
+                        }
+                }
             }
-            interval_timer.tick().await;
         }
+        Ok(())
     }
 
     /// Initialize default logging configuration

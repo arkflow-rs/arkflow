@@ -17,6 +17,8 @@ use crate::engine::Engine;
 use crate::remote_config::RemoteConfigManager;
 use clap::{Arg, Command};
 use std::process;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
@@ -81,8 +83,7 @@ impl Cli {
             // Initialize remote configuration manager
             let interval = matches
                 .get_one::<String>("remote-config-interval")
-                .unwrap()
-                .parse::<u64>()
+                .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
             let token = matches.get_one::<String>("remote-config-token").cloned();
 
@@ -92,7 +93,9 @@ impl Cli {
             info!("Using remote configuration from: {}", remote_url);
         } else {
             // Use local configuration file
-            let config_path = matches.get_one::<String>("config").unwrap();
+            let config_path = matches
+                .get_one::<String>("config")
+                .ok_or("Configuration not found")?;
 
             let config = match EngineConfig::from_file(config_path) {
                 Ok(config) => config,
@@ -113,20 +116,39 @@ impl Cli {
         Ok(())
     }
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let token = CancellationToken::new();
+
         if let Some(remote_manager) = &self.remote_config_manager {
             // Run with remote configuration management
-            remote_manager.run().await?;
+            remote_manager.run(token.clone()).await?;
         } else {
             // Run with local configuration
             let config = self.config.clone().unwrap();
             init_logging(&config);
             let engine = Engine::new(config);
-            engine.run().await?;
+            engine.run(token.clone()).await?;
         }
+
+        // Set up signal handlers
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, exiting...");
+
+                },
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, exiting...");
+                }
+            }
+            token.cancel();
+        });
         Ok(())
     }
 }
-pub fn init_logging(config: &EngineConfig) -> () {
+pub(crate) fn init_logging(config: &EngineConfig) -> () {
     let log_level = match config.logging.level.as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
