@@ -14,6 +14,7 @@
 
 use crate::config::{EngineConfig, LogFormat};
 use crate::engine::Engine;
+use crate::remote_config::RemoteConfigManager;
 use clap::{Arg, Command};
 use std::process;
 use tracing::{info, Level};
@@ -21,10 +22,14 @@ use tracing_subscriber::fmt;
 
 pub struct Cli {
     pub config: Option<EngineConfig>,
+    pub remote_config_manager: Option<RemoteConfigManager>,
 }
 impl Default for Cli {
     fn default() -> Self {
-        Self { config: None }
+        Self {
+            config: None,
+            remote_config_manager: None,
+        }
     }
 }
 
@@ -40,7 +45,7 @@ impl Cli {
                     .long("config")
                     .value_name("FILE")
                     .help("Specify the profile path.")
-                    .required(true),
+                    .required_unless_present("remote-config-url"),
             )
             .arg(
                 Arg::new("validate")
@@ -49,38 +54,79 @@ impl Cli {
                     .help("Only the profile is verified, not the engine is started.")
                     .action(clap::ArgAction::SetTrue),
             )
+            .arg(
+                Arg::new("remote-config-url")
+                    .long("remote-config-url")
+                    .value_name("URL")
+                    .help("Remote configuration API endpoint URL for automatic pipeline management.")
+                    .required_unless_present("config"),
+            )
+            .arg(
+                Arg::new("remote-config-interval")
+                    .long("remote-config-interval")
+                    .value_name("SECONDS")
+                    .help("Interval in seconds for polling remote configuration (default: 30).")
+                    .default_value("30"),
+            )
+            .arg(
+                Arg::new("remote-config-token")
+                    .long("remote-config-token")
+                    .value_name("TOKEN")
+                    .help("Authentication token for remote configuration API."),
+            )
             .get_matches();
 
-        // Get the profile path
-        let config_path = matches.get_one::<String>("config").unwrap();
+        // Check if using remote configuration
+        if let Some(remote_url) = matches.get_one::<String>("remote-config-url") {
+            // Initialize remote configuration manager
+            let interval = matches
+                .get_one::<String>("remote-config-interval")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap_or(30);
+            let token = matches.get_one::<String>("remote-config-token").cloned();
 
-        // Get the profile path
-        let config = match EngineConfig::from_file(config_path) {
-            Ok(config) => config,
-            Err(e) => {
-                println!("Failed to load configuration file: {}", e);
-                process::exit(1);
+            let remote_manager = RemoteConfigManager::new(remote_url.clone(), interval, token);
+
+            self.remote_config_manager = Some(remote_manager);
+            info!("Using remote configuration from: {}", remote_url);
+        } else {
+            // Use local configuration file
+            let config_path = matches.get_one::<String>("config").unwrap();
+
+            let config = match EngineConfig::from_file(config_path) {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("Failed to load configuration file: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            // If you just verify the configuration, exit it
+            if matches.get_flag("validate") {
+                info!("The config is validated.");
+                return Ok(());
             }
-        };
 
-        // If you just verify the configuration, exit it
-        if matches.get_flag("validate") {
-            info!("The config is validated.");
-            return Ok(());
+            self.config = Some(config);
         }
-        self.config = Some(config);
         Ok(())
     }
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Initialize the logging system
-        let config = self.config.clone().unwrap();
-        init_logging(&config);
-        let engine = Engine::new(config);
-        engine.run().await?;
+        if let Some(remote_manager) = &self.remote_config_manager {
+            // Run with remote configuration management
+            remote_manager.run().await?;
+        } else {
+            // Run with local configuration
+            let config = self.config.clone().unwrap();
+            init_logging(&config);
+            let engine = Engine::new(config);
+            engine.run().await?;
+        }
         Ok(())
     }
 }
-fn init_logging(config: &EngineConfig) -> () {
+pub fn init_logging(config: &EngineConfig) -> () {
     let log_level = match config.logging.level.as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
