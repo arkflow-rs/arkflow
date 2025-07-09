@@ -56,32 +56,33 @@ impl Cli {
                     .action(clap::ArgAction::SetTrue),
             )
             .subcommand(
-                Command::new("remote")
+                Command::new("remote").about("Use remote configuration for automatic stream management.")
                 .arg(
                 Arg::new("config-url")
                     .long("config-url")
                     .value_name("URL")
-                    .help("Remote configuration API endpoint URL for automatic pipeline management.")
+                    .help("Remote configuration API endpoint URL for automatic stream management.")
+                    .required( true)
             )
                 .arg(
                     Arg::new("config-interval")
                         .long("config-interval")
                         .value_name("SECONDS")
-                        .help("Interval in seconds for polling remote configuration (default: 30).")
+                        .help("Interval in seconds for polling remote configuration.")
                         .default_value("30"),
                 )
                 .arg(
                     Arg::new("config-token")
                         .long("config-token")
                         .value_name("TOKEN")
-                        .help("Authentication token for remote configuration API."),
+                        .help("Authentication token for remote configuration API.")
+                        .required( true),
                 ))
             .get_matches();
 
         // Check if using remote configuration
         if let Some(remote) = matches.subcommand_matches("remote") {
             // Initialize remote configuration manager
-            matches.subcommand_matches("remote");
             let interval = remote
                 .get_one::<String>("config-interval")
                 .and_then(|s| s.parse::<u64>().ok())
@@ -93,7 +94,7 @@ impl Cli {
 
             let remote_manager = RemoteConfigManager::new(remote_url.clone(), interval, token);
 
-            self.remote_config_manager = Some(remote_manager);
+            self.remote_config_manager.replace(remote_manager);
             info!("Using remote configuration from: {}", remote_url);
         } else {
             // Use local configuration file
