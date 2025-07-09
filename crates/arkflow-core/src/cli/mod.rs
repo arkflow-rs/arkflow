@@ -47,7 +47,6 @@ impl Cli {
                     .long("config")
                     .value_name("FILE")
                     .help("Specify the profile path.")
-                    .required_unless_present("remote-config-url"),
             )
             .arg(
                 Arg::new("validate")
@@ -56,36 +55,39 @@ impl Cli {
                     .help("Only the profile is verified, not the engine is started.")
                     .action(clap::ArgAction::SetTrue),
             )
-            .arg(
+            .subcommand(
+                Command::new("remote")
+                .arg(
                 Arg::new("remote-config-url")
                     .long("remote-config-url")
                     .value_name("URL")
                     .help("Remote configuration API endpoint URL for automatic pipeline management.")
-                    .required_unless_present("config"),
             )
-            .arg(
-                Arg::new("remote-config-interval")
-                    .long("remote-config-interval")
-                    .value_name("SECONDS")
-                    .help("Interval in seconds for polling remote configuration (default: 30).")
-                    .default_value("30"),
-            )
-            .arg(
-                Arg::new("remote-config-token")
-                    .long("remote-config-token")
-                    .value_name("TOKEN")
-                    .help("Authentication token for remote configuration API."),
-            )
+                .arg(
+                    Arg::new("remote-config-interval")
+                        .long("remote-config-interval")
+                        .value_name("SECONDS")
+                        .help("Interval in seconds for polling remote configuration (default: 30).")
+                        .default_value("30"),
+                )
+                .arg(
+                    Arg::new("remote-config-token")
+                        .long("remote-config-token")
+                        .value_name("TOKEN")
+                        .help("Authentication token for remote configuration API."),
+                ))
             .get_matches();
 
         // Check if using remote configuration
-        if let Some(remote_url) = matches.get_one::<String>("remote-config-url") {
+        if let Some(remote) = matches.subcommand_matches("remote") {
             // Initialize remote configuration manager
-            let interval = matches
+            matches.subcommand_matches("remote");
+            let interval = remote
                 .get_one::<String>("remote-config-interval")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
-            let token = matches.get_one::<String>("remote-config-token").cloned();
+            let token = remote.get_one::<String>("remote-config-token").cloned();
+            let remote_url = remote.get_one::<String>("remote-config-url").expect("Remote configuration URL not found");
 
             let remote_manager = RemoteConfigManager::new(remote_url.clone(), interval, token);
 
