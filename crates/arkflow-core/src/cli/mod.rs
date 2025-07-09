@@ -58,22 +58,22 @@ impl Cli {
             .subcommand(
                 Command::new("remote").about("Use remote configuration for automatic stream management.")
                 .arg(
-                Arg::new("config-url")
-                    .long("config-url")
+                Arg::new("url")
+                    .long("url")
                     .value_name("URL")
                     .help("Remote configuration API endpoint URL for automatic stream management.")
                     .required( true)
             )
                 .arg(
-                    Arg::new("config-interval")
-                        .long("config-interval")
+                    Arg::new("interval")
+                        .long("interval")
                         .value_name("SECONDS")
                         .help("Interval in seconds for polling remote configuration.")
                         .default_value("30"),
                 )
                 .arg(
-                    Arg::new("config-token")
-                        .long("config-token")
+                    Arg::new("token")
+                        .long("token")
                         .value_name("TOKEN")
                         .help("Authentication token for remote configuration API.")
                         .required( true),
@@ -84,12 +84,12 @@ impl Cli {
         if let Some(remote) = matches.subcommand_matches("remote") {
             // Initialize remote configuration manager
             let interval = remote
-                .get_one::<String>("config-interval")
+                .get_one::<String>("interval")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
-            let token = remote.get_one::<String>("config-token").cloned();
+            let token = remote.get_one::<String>("token").cloned();
             let remote_url = remote
-                .get_one::<String>("config-url")
+                .get_one::<String>("url")
                 .expect("Remote configuration URL not found");
 
             let remote_manager = RemoteConfigManager::new(remote_url.clone(), interval, token);
