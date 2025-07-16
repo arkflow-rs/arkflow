@@ -47,13 +47,13 @@ struct FileInputConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BallistaConfig {
+struct BallistaConfig {
     /// Ballista server url
-    pub remote_url: String,
+    remote_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryConfig {
+struct QueryConfig {
     query: String,
     table: String,
 }
