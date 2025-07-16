@@ -55,6 +55,7 @@ struct BallistaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueryConfig {
     query: String,
+    #[serde(default = "default_table")]
     table: String,
 }
 
@@ -480,4 +481,8 @@ pub fn init() -> Result<(), Error> {
 
 fn default_disallow_http() -> bool {
     false
+}
+
+fn default_table() -> String {
+    "flow".to_string()
 }
