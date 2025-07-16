@@ -21,7 +21,7 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::{
-    AvroReadOptions, CsvReadOptions, DataFrame, NdJsonReadOptions, ParquetReadOptions,
+    AvroReadOptions, CsvReadOptions, DataFrame, NdJsonReadOptions, ParquetReadOptions, SQLOptions,
     SessionContext,
 };
 use futures_util::TryStreamExt;
@@ -43,12 +43,19 @@ use url::Url;
 struct FileInputConfig {
     input_type: InputType,
     ballista: Option<BallistaConfig>,
+    query: Option<QueryConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BallistaConfig {
     /// Ballista server url
     pub remote_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    query: String,
+    table: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,14 +176,61 @@ impl FileInput {
             self.object_store(ctx, object_store)?;
         }
 
+        let sql_options = SQLOptions::default()
+            .with_allow_dml(false)
+            .with_allow_ddl(false);
+
         match self.config.input_type {
-            InputType::Avro(ref c) => ctx.read_avro(&c.path, AvroReadOptions::default()).await,
-            InputType::Arrow(ref c) => ctx.read_arrow(&c.path, ArrowReadOptions::default()).await,
-            InputType::Json(ref c) => ctx.read_json(&c.path, NdJsonReadOptions::default()).await,
-            InputType::Csv(ref c) => ctx.read_csv(&c.path, CsvReadOptions::default()).await,
+            InputType::Avro(ref c) => {
+                if let Some(ref query) = self.config.query {
+                    ctx.register_avro(&query.table, &c.path, AvroReadOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("Read input failed: {}", e)))?;
+                    ctx.sql_with_options(&query.query, sql_options).await
+                } else {
+                    ctx.read_avro(&c.path, AvroReadOptions::default()).await
+                }
+            }
+            InputType::Arrow(ref c) => {
+                if let Some(ref query) = self.config.query {
+                    ctx.register_arrow(&query.table, &c.path, ArrowReadOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("Read input failed: {}", e)))?;
+                    ctx.sql_with_options(&query.query, sql_options).await
+                } else {
+                    ctx.read_arrow(&c.path, ArrowReadOptions::default()).await
+                }
+            }
+            InputType::Json(ref c) => {
+                if let Some(ref query) = self.config.query {
+                    ctx.register_json(&query.table, &c.path, NdJsonReadOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("Read input failed: {}", e)))?;
+                    ctx.sql_with_options(&query.query, sql_options).await
+                } else {
+                    ctx.read_json(&c.path, NdJsonReadOptions::default()).await
+                }
+            }
+            InputType::Csv(ref c) => {
+                if let Some(ref query) = self.config.query {
+                    ctx.register_csv(&query.table, &c.path, CsvReadOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("Read input failed: {}", e)))?;
+                    ctx.sql_with_options(&query.query, sql_options).await
+                } else {
+                    ctx.read_csv(&c.path, CsvReadOptions::default()).await
+                }
+            }
             InputType::Parquet(ref c) => {
-                ctx.read_parquet(&c.path, ParquetReadOptions::default())
-                    .await
+                if let Some(ref query) = self.config.query {
+                    ctx.register_parquet(&query.table, &c.path, ParquetReadOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("Read input failed: {}", e)))?;
+                    ctx.sql_with_options(&query.query, sql_options).await
+                } else {
+                    ctx.read_parquet(&c.path, ParquetReadOptions::default())
+                        .await
+                }
             }
         }
         .map_err(|e| Error::Process(format!("Read input failed: {}", e)))
