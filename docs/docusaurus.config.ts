@@ -92,7 +92,7 @@ const config: Config = {
           type: 'docSidebar',
           sidebarId: 'tutorialSidebar',
           position: 'left',
-          label: 'Doc',
+          label: 'Docs',
         },
         {to: '/blog', label: 'Blog', position: 'left'},
         {
@@ -150,14 +150,6 @@ const config: Config = {
     },
   } satisfies Preset.ThemeConfig,
   themes: [
-    [
-      "@easyops-cn/docusaurus-search-local",
-      {
-        hashed: true,
-        language: ["en"],
-        highlightSearchTermsOnTargetPage: true
-      }
-    ]
   ]
 };
 
