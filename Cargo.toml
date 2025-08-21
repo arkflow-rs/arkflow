@@ -31,7 +31,7 @@ datafusion = { version = "47", features = ["avro", "pyarrow"] }
 datafusion-functions-json = "0.47.0"
 arrow-json = "55"
 prost-reflect = "0.14.7"
-prost-types = "0.13.5"
+prost-types = "0.14.1"
 protobuf-parse = "3.7.2"
 protobuf = "3.7.2"
 toml = "0.8"
