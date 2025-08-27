@@ -28,3 +28,12 @@ colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
 num_cpus = "1.17.0"
+uuid = { version = "1.10", features = ["v4"] }
+object_store = { version = "0.12", features = ["aws"] }
+futures-util = { workspace = true }
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+lru = "0.12"
+bytes = "1.7"
+prometheus = "0.13"
+parking_lot = "0.12"
+

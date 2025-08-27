@@ -35,6 +35,7 @@ pub mod input;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
+pub mod state;
 pub mod stream;
 pub mod temporary;
 
@@ -74,6 +75,9 @@ pub enum Error {
 
     #[error("EOF")]
     EOF,
+
+    #[error("Object store error: {0}")]
+    ObjectStore(String),
 }
 
 #[derive(Clone)]
@@ -152,7 +156,21 @@ impl MessageBatch {
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
         Ok(MessageBatch::new_arrow(new_msg))
     }
+}
 
+impl From<object_store::Error> for Error {
+    fn from(err: object_store::Error) -> Self {
+        Error::ObjectStore(format!("{}", err))
+    }
+}
+
+impl From<prometheus::Error> for Error {
+    fn from(err: prometheus::Error) -> Self {
+        Error::Process(format!("Prometheus error: {}", err))
+    }
+}
+
+impl MessageBatch {
     pub fn filter_columns(
         &self,
         field_names_to_include: &HashSet<String>,
@@ -307,4 +325,28 @@ pub fn split_batch(batch_to_split: RecordBatch, size: usize) -> Vec<RecordBatch>
     }
 
     chunks
+}
+
+impl MessageBatch {
+    /// Extract metadata from the batch
+    pub fn metadata(&self) -> Option<state::Metadata> {
+        state::Metadata::extract_from_batch(self)
+    }
+
+    /// Create a new batch with embedded metadata
+    pub fn with_metadata(self, metadata: state::Metadata) -> Result<Self, Error> {
+        metadata.embed_to_batch(self)
+    }
+
+    /// Get transaction context from batch metadata
+    pub fn transaction_context(&self) -> Option<state::transaction::TransactionContext> {
+        self.metadata().and_then(|m| m.transaction)
+    }
+
+    /// Check if batch contains a checkpoint barrier
+    pub fn is_checkpoint_barrier(&self) -> bool {
+        self.transaction_context()
+            .map(|tx| tx.is_checkpoint())
+            .unwrap_or(false)
+    }
 }
