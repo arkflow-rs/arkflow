@@ -82,6 +82,9 @@ pub struct EngineConfig {
     /// Health check configuration (optional)
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// State management configuration (optional)
+    #[serde(default)]
+    pub state_management: StateManagementConfig,
 }
 
 impl EngineConfig {
@@ -167,6 +170,120 @@ impl Default for LoggingConfig {
             level: "info".to_string(),
             file_path: None,
             format: default_log_format(),
+        }
+    }
+}
+
+/// State management configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateManagementConfig {
+    /// Enable state management
+    #[serde(default = "default_state_enabled")]
+    pub enabled: bool,
+    /// State backend type
+    #[serde(default = "default_state_backend")]
+    pub backend_type: StateBackendType,
+    /// S3 configuration (if using S3 backend)
+    pub s3_config: Option<S3StateBackendConfig>,
+    /// Checkpoint interval in milliseconds
+    #[serde(default = "default_checkpoint_interval")]
+    pub checkpoint_interval_ms: u64,
+    /// Number of checkpoints to retain
+    #[serde(default = "default_retained_checkpoints")]
+    pub retained_checkpoints: usize,
+    /// Enable exactly-once semantics
+    #[serde(default = "default_exactly_once")]
+    pub exactly_once: bool,
+    /// State timeout in milliseconds
+    #[serde(default = "default_state_timeout")]
+    pub state_timeout_ms: u64,
+}
+
+/// State backend types
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum StateBackendType {
+    Memory,
+    S3,
+    Hybrid,
+}
+
+/// S3 state backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3StateBackendConfig {
+    /// S3 bucket name
+    pub bucket: String,
+    /// AWS region
+    pub region: String,
+    /// Key prefix for state storage
+    #[serde(default = "default_s3_prefix")]
+    pub prefix: String,
+    /// AWS access key ID (optional, uses default credentials if not provided)
+    pub access_key_id: Option<String>,
+    /// AWS secret access key (optional, uses default credentials if not provided)
+    pub secret_access_key: Option<String>,
+    /// Endpoint URL (for S3-compatible storage)
+    pub endpoint_url: Option<String>,
+}
+
+/// Stream-level state configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStateConfig {
+    /// Operator identifier for this stream
+    pub operator_id: String,
+    /// Enable state for this stream
+    #[serde(default = "default_stream_state_enabled")]
+    pub enabled: bool,
+    /// State timeout in milliseconds (overrides global setting)
+    pub state_timeout_ms: Option<u64>,
+    /// Custom state keys to track
+    pub custom_keys: Option<Vec<String>>,
+}
+
+// Default implementations for state management
+
+fn default_state_enabled() -> bool {
+    false
+}
+
+fn default_state_backend() -> StateBackendType {
+    StateBackendType::Memory
+}
+
+fn default_checkpoint_interval() -> u64 {
+    60000 // 1 minute
+}
+
+fn default_retained_checkpoints() -> usize {
+    5
+}
+
+fn default_exactly_once() -> bool {
+    false
+}
+
+fn default_state_timeout() -> u64 {
+    86400000 // 24 hours
+}
+
+fn default_s3_prefix() -> String {
+    "arkflow-state/".to_string()
+}
+
+fn default_stream_state_enabled() -> bool {
+    true
+}
+
+impl Default for StateManagementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_state_enabled(),
+            backend_type: default_state_backend(),
+            s3_config: None,
+            checkpoint_interval_ms: default_checkpoint_interval(),
+            retained_checkpoints: default_retained_checkpoints(),
+            exactly_once: default_exactly_once(),
+            state_timeout_ms: default_state_timeout(),
         }
     }
 }

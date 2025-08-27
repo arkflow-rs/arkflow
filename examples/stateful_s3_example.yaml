@@ -1,0 +1,177 @@
+# Stateful stream processing with S3 backend example
+# This example shows production-ready configuration with S3 state backend
+
+logging:
+  level: info
+  format: json
+  file_path: "./logs/arkflow.log"
+
+health_check:
+  enabled: true
+  address: "0.0.0.0:8080"
+
+# State management with S3 backend for production
+state_management:
+  enabled: true
+  backend_type: s3
+  checkpoint_interval_ms: 60000  # 1 minute checkpoints
+  retained_checkpoints: 10  # Keep last 10 checkpoints
+  exactly_once: true  # Enable exactly-once processing
+  state_timeout_ms: 2592000000  # 30 days
+  
+  # S3 configuration for state persistence
+  s3_config:
+    bucket: "my-company-arkflow-state"
+    region: "us-west-2"
+    prefix: "production/checkpoints/"
+    # For production, use IAM roles or environment variables
+    # Only provide credentials if not using AWS credential chain
+    # access_key_id: "${AWS_ACCESS_KEY_ID}"
+    # secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+    # For alternative S3-compatible storage (e.g., MinIO)
+    # endpoint_url: "https://minio.example.com"
+
+streams:
+  # Customer order processing with exactly-once guarantee
+  - input:
+      type: kafka
+      brokers: ["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+      topics: ["orders"]
+      consumer_group: "order-processor"
+      ack_wait_ms: 5000
+    pipeline:
+      thread_num: 8
+      processors:
+        # Parse and validate order
+        - type: json
+        - type: python
+          script: |
+            import json
+            from datetime import datetime
+            
+            def process(messages):
+                results = []
+                for msg in messages:
+                    try:
+                        order = json.loads(msg.decode('utf-8'))
+                        # Add processing metadata
+                        order['processed_at'] = datetime.utcnow().isoformat()
+                        order['status'] = 'processed'
+                        results.append(json.dumps(order).encode())
+                    except Exception as e:
+                        # Log error but continue processing
+                        error_msg = {
+                            'error': str(e),
+                            'original_message': msg.decode('utf-8', errors='ignore'),
+                            'timestamp': datetime.utcnow().isoformat()
+                        }
+                        results.append(json.dumps(error_msg).encode())
+                return results
+                
+        # Enrich with customer data
+        - type: sql
+          query: |
+            SELECT 
+              o.*,
+              c.name as customer_name,
+              c.tier as customer_tier
+            FROM flow o
+            LEFT JOIN customers c ON o.customer_id = c.id
+              
+    output:
+      type: kafka
+      brokers: ["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+      topic: "processed-orders"
+      ack_wait_ms: 5000
+    error_output:
+      type: s3
+      bucket: "my-company-arkflow-errors"
+      prefix: "orders/"
+      region: "us-west-2"
+    state:
+      operator_id: "order-processor"
+      enabled: true
+      state_timeout_ms: 604800000  # 7 days
+
+  # Real-time analytics with sliding windows
+  - input:
+      type: http
+      address: "0.0.0.0:8081"
+      path: "/events"
+      method: "POST"
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json
+        - type: sql
+          query: |
+            SELECT
+              event_type,
+              COUNT(*) as event_count,
+              AVG(value) as avg_value,
+              MIN(timestamp) as first_seen,
+              MAX(timestamp) as last_seen
+            FROM flow
+            GROUP BY event_type
+    buffer:
+      type: sliding
+      size_ms: 300000  # 5 minute sliding window
+      emit_ms: 60000   # Emit every minute
+    output:
+      type: prometheus
+      metrics:
+        - name: "events_total"
+          labels: ["event_type"]
+          value: "event_count"
+        - name: "event_avg_value"
+          labels: ["event_type"]
+          value: "avg_value"
+    state:
+      operator_id: "analytics-processor"
+      enabled: true
+      custom_keys:
+        - "hourly_stats"
+        - "daily_aggregates"
+
+  # IoT device monitoring with stateful alerts
+  - input:
+      type: mqtt
+      broker: "ssl://mqtt.example.com:8883"
+      topic: "devices/+/telemetry"
+      client_id: "arkflow-monitor"
+      username: "${MQTT_USERNAME}"
+      password: "${MQTT_PASSWORD}"
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: json
+        - type: vrl
+          script: |
+            # Calculate anomaly score
+            .anomaly_score = if .temperature > .threshold_temp { 1.0 } else { 0.0 }
+            
+            # Generate alert if anomaly detected
+            if .anomaly_score > 0.5 {
+              .alert = {
+                "severity": "warning",
+                "message": "Temperature threshold exceeded",
+                "device_id": .device_id
+              }
+            }
+    output:
+      type: http
+      url: "https://alerts.example.com/api/v2/events"
+      method: "POST"
+      headers:
+        Authorization: "Bearer ${ALERT_API_KEY}"
+        Content-Type: "application/json"
+    error_output:
+      type: elasticsearch
+      hosts: ["https://elasticsearch.example.com:9200"]
+      index: "arkflow-errors"
+      username: "${ES_USERNAME}"
+      password: "${ES_PASSWORD}"
+    state:
+      operator_id: "iot-monitor"
+      enabled: true
+      state_timeout_ms: 604800000  # 7 days

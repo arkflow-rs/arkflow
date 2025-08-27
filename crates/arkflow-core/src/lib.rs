@@ -31,6 +31,7 @@ pub mod cli;
 pub mod codec;
 pub mod config;
 pub mod engine;
+pub mod engine_builder;
 pub mod input;
 pub mod output;
 pub mod pipeline;

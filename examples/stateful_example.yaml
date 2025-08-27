@@ -1,0 +1,115 @@
+# Stateful stream processing example with ArkFlow
+# This example demonstrates how to configure state management with checkpointing
+
+logging:
+  level: info
+  format: plain
+
+# Global state management configuration
+state_management:
+  enabled: true
+  backend_type: memory  # Options: memory, s3, hybrid
+  checkpoint_interval_ms: 30000  # 30 seconds
+  retained_checkpoints: 3
+  exactly_once: true
+  state_timeout_ms: 3600000  # 1 hour
+  
+  # S3 configuration (if backend_type is 's3' or 'hybrid')
+  s3_config:
+    bucket: "arkflow-state-bucket"
+    region: "us-east-1"
+    prefix: "checkpoints/"
+    # Optional: provide credentials if not using default AWS credential chain
+    # access_key_id: "YOUR_ACCESS_KEY"
+    # secret_access_key: "YOUR_SECRET_KEY"
+    # endpoint_url: "https://s3.amazonaws.com"  # For S3-compatible storage
+
+streams:
+  # Word count stream with state
+  - input:
+      type: file
+      path: "./examples/data/words.txt"
+      format: text
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: python
+          script: |
+            import json
+            import re
+            
+            def process(messages):
+                results = []
+                for msg in messages:
+                    text = msg.decode('utf-8')
+                    words = re.findall(r'\w+', text.lower())
+                    for word in words:
+                        results.append(json.dumps({"word": word, "count": 1}).encode())
+                return results
+    output:
+      type: stdout
+      format: json
+    # State configuration for this stream
+    state:
+      operator_id: "word-counter"
+      enabled: true
+      custom_keys:
+        - "word_counts"
+        - "total_words"
+
+  # Session window aggregation stream
+  - input:
+      type: kafka
+      brokers: ["localhost:9092"]
+      topics: ["user-events"]
+      consumer_group: "session-aggregator"
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: sql
+          query: |
+            SELECT 
+              user_id,
+              event_type,
+              COUNT(*) as event_count,
+              SUM(value) as total_value
+            FROM flow 
+            GROUP BY user_id, event_type
+    buffer:
+      type: session
+      gap_ms: 5000  # 5 second session gap
+    output:
+      type: kafka
+      brokers: ["localhost:9092"]
+      topic: "session-results"
+    state:
+      operator_id: "session-aggregator"
+      enabled: true
+      state_timeout_ms: 86400000  # 24 hours
+
+  # Tumbling window with state
+  - input:
+      type: mqtt
+      broker: "tcp://localhost:1883"
+      topic: "sensor/+/temperature"
+    pipeline:
+      thread_num: 1
+      processors:
+        - type: json
+        - type: vrl
+          script: |
+            .avg_temp = math::round(.temperature, 2)
+            .timestamp = now()
+    buffer:
+      type: tumbling
+      size_ms: 60000  # 1 minute windows
+    output:
+      type: file
+      path: "./output/temperature_stats.txt"
+      format: json
+    error_output:
+      type: file
+      path: "./errors/temperature_errors.txt"
+    state:
+      operator_id: "temperature-processor"
+      enabled: true

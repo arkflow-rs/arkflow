@@ -17,13 +17,16 @@
 //! A stream is a complete data processing unit, containing input, pipeline, and output.
 
 use crate::buffer::Buffer;
+use crate::config::StateManagementConfig;
 use crate::input::Ack;
+use crate::state::enhanced::EnhancedStateManager;
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
 use flume::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
@@ -41,6 +44,7 @@ pub struct Stream {
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
+    state_manager: Option<Arc<RwLock<EnhancedStateManager>>>,
 }
 
 enum ProcessorData {
@@ -58,6 +62,7 @@ impl Stream {
         buffer: Option<Arc<dyn Buffer>>,
         resource: Resource,
         thread_num: u32,
+        state_manager: Option<Arc<RwLock<EnhancedStateManager>>>,
     ) -> Self {
         Self {
             input,
@@ -69,6 +74,7 @@ impl Stream {
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
+            state_manager,
         }
     }
 
@@ -436,11 +442,13 @@ pub struct StreamConfig {
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
+    pub state: Option<crate::config::StreamStateConfig>,
 }
 
 impl StreamConfig {
     /// Build stream based on configuration
     pub fn build(&self) -> Result<Stream, Error> {
+        // For backward compatibility, build without state management
         let mut resource = Resource {
             temporary: HashMap::new(),
             input_names: RefCell::default(),
@@ -478,6 +486,104 @@ impl StreamConfig {
             buffer,
             resource,
             thread_num,
+            None,
+        ))
+    }
+
+    /// Build stream with state management support
+    pub async fn build_with_state(
+        &self,
+        state_config: Option<&StateManagementConfig>,
+    ) -> Result<Stream, Error> {
+        let mut resource = Resource {
+            temporary: HashMap::new(),
+            input_names: RefCell::default(),
+        };
+
+        if let Some(temporary_configs) = &self.temporary {
+            resource.temporary = HashMap::with_capacity(temporary_configs.len());
+            for temporary_config in temporary_configs {
+                resource.temporary.insert(
+                    temporary_config.name.clone(),
+                    temporary_config.build(&resource)?,
+                );
+            }
+        };
+
+        let input = self.input.build(&resource)?;
+        let (pipeline, thread_num) = self.pipeline.build(&resource)?;
+        let output = self.output.build(&resource)?;
+        let error_output = if let Some(error_output_config) = &self.error_output {
+            Some(error_output_config.build(&resource)?)
+        } else {
+            None
+        };
+        let buffer = if let Some(buffer_config) = &self.buffer {
+            Some(buffer_config.build(&resource)?)
+        } else {
+            None
+        };
+
+        // Apply state management if enabled
+        let state_manager =
+            if let (Some(state_config), Some(stream_state)) = (state_config, &self.state) {
+                if state_config.enabled && stream_state.enabled {
+                    // Convert state config to enhanced state config
+                    let enhanced_config = crate::state::enhanced::EnhancedStateConfig {
+                        enabled: true,
+                        backend_type: match state_config.backend_type {
+                            crate::config::StateBackendType::Memory => {
+                                crate::state::enhanced::StateBackendType::Memory
+                            }
+                            crate::config::StateBackendType::S3 => {
+                                crate::state::enhanced::StateBackendType::S3
+                            }
+                            crate::config::StateBackendType::Hybrid => {
+                                crate::state::enhanced::StateBackendType::Hybrid
+                            }
+                        },
+                        s3_config: state_config.s3_config.as_ref().map(|config| {
+                            crate::state::s3_backend::S3StateBackendConfig {
+                                bucket: config.bucket.clone(),
+                                region: config.region.clone(),
+                                endpoint: config.endpoint_url.clone(),
+                                access_key_id: config.access_key_id.clone(),
+                                secret_access_key: config.secret_access_key.clone(),
+                                prefix: Some(config.prefix.clone()),
+                                use_ssl: true,
+                            }
+                        }),
+                        checkpoint_interval_ms: state_config.checkpoint_interval_ms,
+                        retained_checkpoints: state_config.retained_checkpoints,
+                        exactly_once: state_config.exactly_once,
+                        state_timeout_ms: stream_state
+                            .state_timeout_ms
+                            .unwrap_or(state_config.state_timeout_ms),
+                    };
+
+                    // Create state manager
+                    let state_manager = EnhancedStateManager::new(enhanced_config).await?;
+                    let state_manager_arc = Arc::new(RwLock::new(state_manager));
+
+                    // Note: Exactly-once processor would need to be integrated differently
+                    // since it consumes the pipeline. For now, we just create the state manager
+                    Some(state_manager_arc)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        Ok(Stream::new(
+            input,
+            pipeline,
+            output,
+            error_output,
+            buffer,
+            resource,
+            thread_num,
+            state_manager,
         ))
     }
 }
