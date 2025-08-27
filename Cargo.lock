@@ -868,9 +868,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.83.0"
+version = "1.84.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5468593c47efc31fdbe6c902d1a5fde8d9c82f78a3f8ccfe907b1e9434748cb"
+checksum = "91abcdbfb48c38a0419eb75e0eac772a4783a96750392680e4f3c25a8a0535b9"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1902,7 +1902,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4640,7 +4640,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.2",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -9114,7 +9114,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0978bf7171b3d90bac376700cb56d606feb40f251a475a5d6634613564460b22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
