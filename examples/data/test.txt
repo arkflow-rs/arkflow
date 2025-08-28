@@ -1,0 +1,6 @@
+Hello World
+This is a test message
+State management is working
+Another message
+Testing checkpoint barriers
+Final message

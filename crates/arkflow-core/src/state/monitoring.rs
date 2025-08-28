@@ -1,11 +1,11 @@
-//! Monitoring and metrics for state operations
+//! 状态操作的监控和指标
 //!
-//! This module provides comprehensive monitoring capabilities for state operations:
-//! - Operation metrics (latency, throughput, error rates)
-//! - State size monitoring
-//! - Checkpoint metrics
-//! - Performance alerts
-//! - Prometheus integration
+//! 此模块为状态操作提供全面的监控能力：
+//! - 操作指标（延迟、吞吐量、错误率）
+//! - 状态大小监控
+//! - 检查点指标
+//! - 性能告警
+//! - Prometheus 集成
 
 use crate::state::{EnhancedStateManager, StateBackendType};
 use crate::Error;
@@ -16,87 +16,98 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-/// State operation metrics
+/// 状态操作指标
 #[derive(Debug, Clone)]
 pub struct StateMetrics {
-    /// Operation counters
+    /// 操作计数器
     pub operations_total: Counter,
+    /// 成功操作总数
     pub operations_success_total: Counter,
+    /// 失败操作总数
     pub operations_failed_total: Counter,
 
-    /// Operation latency histogram
+    /// 操作延迟直方图
     pub operation_duration_seconds: Histogram,
 
-    /// State size gauge
+    /// 状态大小仪表
     pub state_size_bytes: Gauge,
+    /// 检查点大小仪表
     pub checkpoint_size_bytes: Gauge,
 
-    /// Checkpoint metrics
+    /// 检查点指标
     pub checkpoints_total: Counter,
+    /// 检查点持续时间直方图
     pub checkpoint_duration_seconds: Histogram,
+    /// 成功检查点总数
     pub checkpoint_success_total: Counter,
+    /// 失败检查点总数
     pub checkpoint_failed_total: Counter,
 
-    /// Active transactions
+    /// 活跃事务
     pub active_transactions: Gauge,
+    /// 事务持续时间直方图
     pub transaction_duration_seconds: Histogram,
 
-    /// Cache metrics (if applicable)
+    /// 缓存指标（如果适用）
     pub cache_hits_total: Counter,
+    /// 缓存未命中总数
     pub cache_misses_total: Counter,
+    /// 缓存大小仪表
     pub cache_size_bytes: Gauge,
 
-    /// Backend-specific metrics
+    /// 后端特定指标
     pub s3_operations_total: Counter,
+    /// S3 操作持续时间直方图
     pub s3_operation_duration_seconds: Histogram,
+    /// S3 错误总数
     pub s3_errors_total: Counter,
 }
 
 impl StateMetrics {
-    /// Create new metrics with default registry
+    /// 使用默认注册表创建新指标
     pub fn new() -> Result<(Self, Registry), Error> {
         let registry = Registry::new();
         let metrics = Self::new_with_registry(&registry)?;
         Ok((metrics, registry))
     }
 
-    /// Create new metrics with custom registry
+    /// 使用自定义注册表创建新指标
     pub fn new_with_registry(registry: &Registry) -> Result<Self, Error> {
-        // Operation metrics
+        // 操作指标
         let operations_total = Counter::with_opts(Opts::new(
             "arkflow_state_operations_total",
-            "Total number of state operations",
+            "状态操作总数",
         ))
-        .map_err(|e| Error::Process(format!("Failed to create counter: {}", e)))?;
+        .map_err(|e| Error::Process(format!("创建计数器失败: {}", e)))?;
 
         let operations_success_total = Counter::with_opts(Opts::new(
             "arkflow_state_operations_success_total",
-            "Total number of successful state operations",
+            "成功状态操作总数",
         ))
-        .map_err(|e| Error::Process(format!("Failed to create counter: {}", e)))?;
+        .map_err(|e| Error::Process(format!("创建计数器失败: {}", e)))?;
 
         let operations_failed_total = Counter::with_opts(Opts::new(
             "arkflow_state_operations_failed_total",
-            "Total number of failed state operations",
+            "失败状态操作总数",
         ))
-        .map_err(|e| Error::Process(format!("Failed to create counter: {}", e)))?;
+        .map_err(|e| Error::Process(format!("创建计数器失败: {}", e)))?;
 
         let operation_duration_seconds = Histogram::with_opts(HistogramOpts::new(
             "arkflow_state_operation_duration_seconds",
-            "Duration of state operations in seconds",
+            "状态操作持续时间（秒）",
         ))
-        .map_err(|e| Error::Process(format!("Failed to create histogram: {}", e)))?;
+        .map_err(|e| Error::Process(format!("创建直方图失败: {}", e)))?;
 
-        // State size metrics
+        // 状态大小指标
         let state_size_bytes = Gauge::with_opts(Opts::new(
             "arkflow_state_size_bytes",
-            "Current size of state in bytes",
+            "当前状态大小（字节）",
         ))
-        .map_err(|e| Error::Process(format!("Failed to create gauge: {}", e)))?;
+        .map_err(|e| Error::Process(format!("创建仪表失败: {}", e)))?;
 
         let checkpoint_size_bytes = Gauge::with_opts(Opts::new(
             "arkflow_state_checkpoint_size_bytes",
-            "Size of the latest checkpoint in bytes",
+            "最新检查点大小（字节）",
         ))
         .map_err(|e| Error::Process(format!("Failed to create gauge: {}", e)))?;
 

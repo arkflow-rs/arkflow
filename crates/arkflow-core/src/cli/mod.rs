@@ -73,7 +73,7 @@ impl Cli {
     }
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Initialize the logging system
-        let config = self.config.clone().unwrap();
+        let config = self.config.clone().ok_or("No configuration loaded")?;
         init_logging(&config);
         let engine = Engine::new(config);
         engine.run().await?;

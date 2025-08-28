@@ -19,34 +19,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Transaction context for exactly-once processing
+/// 用于精确一次处理的事务上下文
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactionContext {
-    /// Unique transaction identifier
+    /// 唯一事务标识符
     pub transaction_id: String,
-    /// Checkpoint identifier
+    /// 检查点标识符
     pub checkpoint_id: u64,
-    /// Barrier type
+    /// 屏障类型
     pub barrier_type: BarrierType,
-    /// Timestamp when the transaction was created
+    /// 事务创建时的时间戳
     pub timestamp: u64,
 }
 
-/// Barrier type for checkpoint alignment
+/// 用于检查点对齐的屏障类型
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum BarrierType {
-    /// Normal processing
+    /// 普通处理
     None,
-    /// Checkpoint barrier - triggers state snapshot
+    /// 检查点屏障 - 触发状态快照
     Checkpoint,
-    /// Savepoint barrier - manual triggered checkpoint
+    /// 保存点屏障 - 手动触发的检查点
     Savepoint,
-    /// Aligned barrier - waits for all messages to be processed
+    /// 对齐屏障 - 等待所有消息处理完成
     AlignedCheckpoint,
 }
 
 impl TransactionContext {
-    /// Create new transaction context
+    /// 创建新的事务上下文
     pub fn new(checkpoint_id: u64, barrier_type: BarrierType) -> Self {
         Self {
             transaction_id: Uuid::new_v4().to_string(),
@@ -59,22 +59,22 @@ impl TransactionContext {
         }
     }
 
-    /// Create checkpoint barrier
+    /// 创建检查点屏障
     pub fn checkpoint(checkpoint_id: u64) -> Self {
         Self::new(checkpoint_id, BarrierType::Checkpoint)
     }
 
-    /// Create aligned checkpoint barrier
+    /// 创建对齐检查点屏障
     pub fn aligned_checkpoint(checkpoint_id: u64) -> Self {
         Self::new(checkpoint_id, BarrierType::AlignedCheckpoint)
     }
 
-    /// Create savepoint barrier
+    /// 创建保存点屏障
     pub fn savepoint(checkpoint_id: u64) -> Self {
         Self::new(checkpoint_id, BarrierType::Savepoint)
     }
 
-    /// Check if this is a checkpoint barrier
+    /// 检查是否是检查点屏障
     pub fn is_checkpoint(&self) -> bool {
         matches!(
             self.barrier_type,
@@ -82,39 +82,44 @@ impl TransactionContext {
         )
     }
 
-    /// Check if alignment is required
+    /// 检查是否需要对齐
     pub fn requires_alignment(&self) -> bool {
         self.barrier_type == BarrierType::AlignedCheckpoint
     }
 }
 
-/// Transaction coordinator for managing two-phase commit
+/// 用于管理两阶段提交的事务协调器
 pub struct TransactionCoordinator {
-    /// Next checkpoint ID
+    /// 下一个检查点 ID
     next_checkpoint_id: AtomicU64,
-    /// Active transactions
+    /// 活跃事务
     active_transactions: Arc<tokio::sync::RwLock<HashMap<String, TransactionInfo>>>,
-    /// Checkpoint interval in milliseconds
+    /// 检查点间隔（毫秒）
     checkpoint_interval: u64,
 }
 
-/// Transaction participant
+/// 事务参与者
 #[derive(Debug, Clone)]
 pub struct TransactionParticipant {
+    /// 参与者 ID
     pub id: String,
+    /// 参与者状态
     pub state: ParticipantState,
 }
 
-/// Participant state in two-phase commit
+/// 两阶段提交中的参与者状态
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParticipantState {
+    /// 已准备
     Prepared,
+    /// 已提交
     Committed,
+    /// 已中止
     Aborted,
 }
 
 impl TransactionCoordinator {
-    /// Create new transaction coordinator
+    /// 创建新的事务协调器
     pub fn new(checkpoint_interval_ms: u64) -> Self {
         Self {
             next_checkpoint_id: AtomicU64::new(1),
@@ -123,12 +128,12 @@ impl TransactionCoordinator {
         }
     }
 
-    /// Get next checkpoint ID
+    /// 获取下一个检查点 ID
     pub fn next_checkpoint_id(&self) -> u64 {
         self.next_checkpoint_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Start a new transaction
+    /// 开始新事务
     pub async fn begin_transaction(&self, barrier_type: BarrierType) -> TransactionContext {
         let checkpoint_id = self.next_checkpoint_id();
         let tx_ctx = TransactionContext::new(checkpoint_id, barrier_type);
@@ -147,7 +152,7 @@ impl TransactionCoordinator {
         tx_ctx
     }
 
-    /// Register a participant for the transaction
+    /// 为事务注册参与者
     pub async fn register_participant(
         &self,
         transaction_id: &str,
@@ -159,13 +164,13 @@ impl TransactionCoordinator {
             Ok(())
         } else {
             Err(crate::Error::Process(format!(
-                "Transaction {} not found",
+                "未找到事务 {}",
                 transaction_id
             )))
         }
     }
 
-    /// Complete the transaction (commit or abort)
+    /// 完成事务（提交或中止）
     pub async fn complete_transaction(
         &self,
         transaction_id: &str,
@@ -173,31 +178,33 @@ impl TransactionCoordinator {
     ) -> Result<(), crate::Error> {
         let mut transactions = self.active_transactions.write().await;
         if let Some(_tx_info) = transactions.remove(transaction_id) {
-            // Transaction completed - all participants are just strings now
-            // In a real implementation, you would notify each participant
+            // 事务已完成 - 所有参与者现在只是字符串
+            // 在实际实现中，你会通知每个参与者
             Ok(())
         } else {
             Err(crate::Error::Process(format!(
-                "Transaction {} not found",
+                "未找到事务 {}",
                 transaction_id
             )))
         }
     }
 
-    /// Get checkpoint interval
+    /// 获取检查点间隔
     pub fn checkpoint_interval(&self) -> u64 {
         self.checkpoint_interval
     }
 }
 
-/// Barrier injector for inserting barriers into the stream
+/// 用于向流中插入屏障的屏障注入器
 pub struct BarrierInjector {
+    /// 事务协调器
     coordinator: Arc<TransactionCoordinator>,
+    /// 上次检查点时间
     last_checkpoint_time: Arc<tokio::sync::RwLock<std::time::Instant>>,
 }
 
 impl BarrierInjector {
-    /// Create new barrier injector
+    /// 创建新的屏障注入器
     pub fn new(coordinator: Arc<TransactionCoordinator>) -> Self {
         Self {
             coordinator,
@@ -205,11 +212,12 @@ impl BarrierInjector {
         }
     }
 
-    /// Check if a barrier should be injected
+    /// 检查是否应该注入屏障
     pub async fn should_inject_barrier(&self) -> Option<TransactionContext> {
         let last_time = *self.last_checkpoint_time.read().await;
         let elapsed = last_time.elapsed();
 
+        // 如果距离上次检查点的时间超过了间隔，则注入屏障
         if elapsed.as_millis() as u64 >= self.coordinator.checkpoint_interval() {
             let tx_ctx = self
                 .coordinator
@@ -222,16 +230,18 @@ impl BarrierInjector {
         }
     }
 
-    /// Inject barrier into message batch metadata
+    /// 将屏障注入到消息批次元数据中
     pub async fn inject_into_batch(
         &self,
         batch: &crate::MessageBatch,
     ) -> Option<(crate::MessageBatch, TransactionContext)> {
         if let Some(tx_ctx) = self.should_inject_barrier().await {
+            // 从批次中提取或创建元数据
             let mut metadata =
                 crate::state::Metadata::extract_from_batch(batch).unwrap_or_default();
             metadata.transaction = Some(tx_ctx.clone());
 
+            // 将元数据嵌入到批次中
             match metadata.embed_to_batch(batch.clone()) {
                 Ok(new_batch) => Some((new_batch, tx_ctx)),
                 Err(_) => None,

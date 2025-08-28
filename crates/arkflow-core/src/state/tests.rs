@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! Tests for state management and transaction features
+//! 状态管理和事务功能的测试
 
 #[cfg(test)]
 mod tests {
@@ -29,10 +29,10 @@ mod tests {
     async fn test_metadata_embed_and_extract() {
         let batch = MessageBatch::from_string("test message").unwrap();
 
-        // Create simple metadata
+        // 创建简单元数据
         let metadata = Metadata::new();
 
-        // Test embedding and extracting
+        // 测试嵌入和提取
         let batch_with_metadata = metadata.embed_to_batch(batch).unwrap();
         let extracted_metadata = batch_with_metadata.metadata();
         assert!(extracted_metadata.is_some());
@@ -42,12 +42,12 @@ mod tests {
     fn test_simple_memory_state_operations() {
         let mut state = SimpleMemoryState::new();
 
-        // Test basic operations
+        // 测试基本操作
         state.put_typed("string_key", "hello".to_string()).unwrap();
         state.put_typed("number_key", 42u64).unwrap();
         state.put_typed("bool_key", true).unwrap();
 
-        // Test retrieval
+        // 测试检索
         let string_val: Option<String> = state.get_typed("string_key").unwrap();
         assert_eq!(string_val, Some("hello".to_string()));
 
@@ -57,7 +57,7 @@ mod tests {
         let bool_val: Option<bool> = state.get_typed("bool_key").unwrap();
         assert_eq!(bool_val, Some(true));
 
-        // Test non-existent key
+        // 测试不存在的键
         let missing: Option<String> = state.get_typed("missing_key").unwrap();
         assert_eq!(missing, None);
     }
@@ -66,22 +66,22 @@ mod tests {
     async fn test_state_monitoring() {
         let monitor = StateMonitor::new().unwrap();
 
-        // Test basic monitoring operations
+        // 测试基本监控操作
         monitor.update_state_size(1024);
         monitor.update_checkpoint_size(512);
         monitor.update_active_transactions(3);
 
-        // Test cache operations
+        // 测试缓存操作
         monitor.record_cache_hit();
         monitor.record_cache_miss();
 
-        // Test health status
+        // 测试健康状态
         let health = monitor.health_status();
         assert!(health.healthy);
         assert_eq!(health.state_size, 1024);
         assert_eq!(health.active_transactions, 3);
 
-        // Test metrics export
+        // 测试指标导出
         let metrics_export = monitor.export_metrics().unwrap();
         assert!(!metrics_export.is_empty());
         assert!(metrics_export.contains("arkflow_state"));

@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! S3-based state backend implementation
+//! 基于 S3 的状态后端实现
 
 use crate::state::helper::SimpleMemoryState;
 use crate::Error;
@@ -24,22 +24,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// S3 state backend configuration
+/// S3 状态后端配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3StateBackendConfig {
-    /// S3 bucket name
+    /// S3 存储桶名称
     pub bucket: String,
-    /// S3 region
+    /// S3 区域
     pub region: String,
-    /// S3 endpoint (for non-AWS S3)
+    /// S3 端点（用于非 AWS S3）
     pub endpoint: Option<String>,
-    /// Access key ID
+    /// 访问密钥 ID
     pub access_key_id: Option<String>,
-    /// Secret access key
+    /// 秘密访问密钥
     pub secret_access_key: Option<String>,
-    /// Path prefix for state storage
+    /// 状态存储的路径前缀
     pub prefix: Option<String>,
-    /// Enable SSL
+    /// 是否启用 SSL
     pub use_ssl: bool,
 }
 
@@ -57,22 +57,27 @@ impl Default for S3StateBackendConfig {
     }
 }
 
-/// S3-based state backend
+/// 基于 S3 的状态后端
 pub struct S3StateBackend {
+    /// 配置
     config: S3StateBackendConfig,
+    /// S3 客户端
     pub client: Arc<dyn ObjectStore>,
+    /// 本地缓存
     local_cache: HashMap<String, SimpleMemoryState>,
+    /// 检查点基础路径
     checkpoint_base_path: Path,
 }
 
 impl S3StateBackend {
-    /// Create new S3 state backend
+    /// 创建新的 S3 状态后端
     pub async fn new(config: S3StateBackendConfig) -> Result<Self, Error> {
-        // Build S3 client
+        // 构建 S3 客户端
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region);
 
+        // 设置可选配置
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
         }
@@ -91,7 +96,7 @@ impl S3StateBackend {
 
         let client = Arc::new(builder.build()?);
 
-        // Determine base path
+        // 确定基础路径
         let checkpoint_base_path = config
             .prefix
             .clone()
@@ -106,13 +111,13 @@ impl S3StateBackend {
         })
     }
 
-    /// Get S3 path for checkpoint
+    /// 获取检查点的 S3 路径
     fn checkpoint_path(&self, checkpoint_id: u64) -> Path {
         self.checkpoint_base_path
             .child(format!("chk-{:020}", checkpoint_id))
     }
 
-    /// Get S3 path for state file
+    /// 获取状态文件的 S3 路径
     pub fn state_path(&self, checkpoint_id: u64, operator_id: &str, state_name: &str) -> Path {
         self.checkpoint_path(checkpoint_id)
             .child("state")
@@ -120,20 +125,20 @@ impl S3StateBackend {
             .child(format!("{}.json", state_name))
     }
 
-    /// Get S3 path for metadata
+    /// 获取元数据的 S3 路径
     fn metadata_path(&self, checkpoint_id: u64) -> Path {
         self.checkpoint_path(checkpoint_id).child("_metadata.json")
     }
 
-    /// List all checkpoints
+    /// 列出所有检查点
     async fn list_checkpoints(&self) -> Result<Vec<u64>, Error> {
         let mut checkpoints = Vec::new();
 
-        // List objects in checkpoint directory
+        // 列出检查点目录中的对象
         let mut stream = self.client.list(Some(&self.checkpoint_base_path));
 
         while let Some(object) = stream.try_next().await? {
-            // Extract checkpoint ID from path
+            // 从路径中提取检查点 ID
             if let Some(name) = object.location.filename() {
                 if let Some(rest) = name.strip_prefix("chk-") {
                     if let Ok(id) = rest.parse::<u64>() {
@@ -143,12 +148,12 @@ impl S3StateBackend {
             }
         }
 
-        // Sort in descending order (newest first)
+        // 按降序排序（最新的在前）
         checkpoints.sort_by(|a: &u64, b: &u64| b.cmp(a));
         Ok(checkpoints)
     }
 
-    /// Save state to S3
+    /// 保存状态到 S3
     async fn save_state(
         &self,
         checkpoint_id: u64,
@@ -158,19 +163,19 @@ impl S3StateBackend {
     ) -> Result<(), Error> {
         let path = self.state_path(checkpoint_id, operator_id, state_name);
 
-        // Serialize state
+        // 序列化状态
         let state_data = serde_json::to_vec(state).map_err(|e| Error::Serialization(e))?;
 
-        // Upload to S3
+        // 上传到 S3
         self.client
             .put(&path, state_data.into())
             .await
-            .map_err(|e| Error::Process(format!("Failed to save state to S3: {}", e)))?;
+            .map_err(|e| Error::Process(format!("保存状态到 S3 失败: {}", e)))?;
 
         Ok(())
     }
 
-    /// Load state from S3
+    /// 从 S3 加载状态
     async fn load_state(
         &self,
         checkpoint_id: u64,
@@ -179,7 +184,7 @@ impl S3StateBackend {
     ) -> Result<Option<SimpleMemoryState>, Error> {
         let path = self.state_path(checkpoint_id, operator_id, state_name);
 
-        // Try to get from S3
+        // 尝试从 S3 获取
         match self.client.get(&path).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
@@ -191,13 +196,13 @@ impl S3StateBackend {
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(Error::Process(format!(
-                "Failed to load state from S3: {}",
+                "从 S3 加载状态失败: {}",
                 e
             ))),
         }
     }
 
-    /// Save checkpoint metadata
+    /// 保存检查点元数据
     async fn save_metadata(
         &self,
         checkpoint_id: u64,
@@ -210,7 +215,7 @@ impl S3StateBackend {
         self.client
             .put(&path, metadata_data.into())
             .await
-            .map_err(|e| Error::Process(format!("Failed to save metadata to S3: {}", e)))?;
+            .map_err(|e| Error::Process(format!("保存元数据到 S3 失败: {}", e)))?;
 
         Ok(())
     }
@@ -254,37 +259,52 @@ impl S3StateBackend {
     }
 }
 
-/// Checkpoint metadata
+/// 检查点元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {
+    /// 检查点 ID
     pub checkpoint_id: u64,
+    /// 时间戳
     pub timestamp: u64,
+    /// 操作符列表
     pub operators: Vec<OperatorStateInfo>,
+    /// 状态
     pub status: CheckpointStatus,
 }
 
-/// Operator state information
+/// 操作符状态信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorStateInfo {
+    /// 操作符 ID
     pub operator_id: String,
+    /// 状态名称列表
     pub state_names: Vec<String>,
+    /// 字节大小
     pub byte_size: u64,
 }
 
-/// Checkpoint status
+/// 检查点状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CheckpointStatus {
+    /// 进行中
     InProgress,
+    /// 已完成
     Completed,
+    /// 失败
     Failed,
 }
 
-/// S3 state store
+/// S3 状态存储
 pub struct S3StateStore {
+    /// 后端
     backend: Arc<S3StateBackend>,
+    /// 操作符 ID
     operator_id: String,
+    /// 状态名称
     state_name: String,
+    /// 本地状态
     local_state: SimpleMemoryState,
+    /// 当前检查点 ID
     current_checkpoint_id: Option<u64>,
 }
 
@@ -352,29 +372,36 @@ impl crate::state::StateHelper for S3StateStore {
     }
 }
 
-/// S3 checkpoint coordinator
+/// S3 检查点协调器
 pub struct S3CheckpointCoordinator {
+    /// 后端
     backend: Arc<S3StateBackend>,
+    /// 活跃检查点
     active_checkpoints: HashMap<u64, CheckpointInProgress>,
+    /// 检查点超时时间
     checkpoint_timeout: std::time::Duration,
 }
 
-/// Checkpoint in progress
+/// 进行中的检查点
 #[derive(Debug)]
 struct CheckpointInProgress {
+    /// 检查点 ID
     pub checkpoint_id: u64,
+    /// 开始时间
     pub start_time: std::time::Instant,
+    /// 参与者列表
     pub participants: Vec<String>,
+    /// 已完成的参与者列表
     pub completed_participants: Vec<String>,
 }
 
 impl S3CheckpointCoordinator {
-    /// Create new S3 checkpoint coordinator
+    /// 创建新的 S3 检查点协调器
     pub fn new(backend: Arc<S3StateBackend>) -> Self {
         Self {
             backend,
             active_checkpoints: HashMap::new(),
-            checkpoint_timeout: std::time::Duration::from_secs(300), // 5 minutes
+            checkpoint_timeout: std::time::Duration::from_secs(300), // 5 分钟
         }
     }
 

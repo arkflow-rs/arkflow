@@ -13,6 +13,7 @@
  */
 
 use crate::config::EngineConfig;
+use crate::engine_builder::EngineBuilder;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -223,23 +224,19 @@ impl Engine {
         // Start the health check server
         self.start_health_check_server(token.clone()).await?;
 
-        // Create and run all flows
-        let mut streams = Vec::new();
-        let mut handles = Vec::new();
-
-        for (i, stream_config) in self.config.streams.iter().enumerate() {
-            info!("Initializing flow #{}", i + 1);
-
-            match stream_config.build() {
-                Ok(stream) => {
-                    streams.push(stream);
-                }
-                Err(e) => {
-                    error!("Initializing flow #{} error: {}", i + 1, e);
-                    process::exit(1);
-                }
+        // Create engine builder and build streams with state management support
+        let mut engine_builder = EngineBuilder::new(self.config.clone());
+        info!("Building streams with state management support...");
+        
+        let mut streams = match engine_builder.build_streams().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                error!("Failed to build streams: {}", e);
+                process::exit(1);
             }
-        }
+        };
+        
+        let mut handles = Vec::new();
 
         // Set the readiness status
         self.health_state.is_ready.store(true, Ordering::SeqCst);
@@ -282,6 +279,12 @@ impl Engine {
         // Wait for all flows to complete
         for handle in handles {
             handle.await?;
+        }
+
+        // Shutdown state managers
+        info!("Shutting down state managers...");
+        if let Err(e) = engine_builder.shutdown().await {
+            error!("Failed to shutdown state managers: {}", e);
         }
 
         info!("All flow tasks have been complete");

@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! Integration tests for enhanced state management and S3 backend
+//! 增强状态管理和 S3 后端的集成测试
 
 #[cfg(test)]
 mod tests {
@@ -35,7 +35,7 @@ mod tests {
 
         let mut state_manager = EnhancedStateManager::new(config).await.unwrap();
 
-        // Test basic state operations
+        // 测试基本状态操作
         state_manager
             .set_state_value("test_op", &"counter", 42u64)
             .await
@@ -46,11 +46,11 @@ mod tests {
             .unwrap();
         assert_eq!(counter, Some(42));
 
-        // Test checkpoint creation
+        // 测试检查点创建
         let checkpoint_id = state_manager.create_checkpoint().await.unwrap();
         assert!(checkpoint_id > 0);
 
-        // Test state stats
+        // 测试状态统计
         let stats = state_manager.get_state_stats().await;
         assert!(stats.enabled);
         assert_eq!(stats.backend_type, StateBackendType::Memory);
@@ -60,14 +60,14 @@ mod tests {
     fn test_simple_memory_state() {
         let mut state = SimpleMemoryState::new();
 
-        // Test put and get operations
+        // 测试 put 和 get 操作
         state
             .put_typed("test_key", "test_value".to_string())
             .unwrap();
         let value: Option<String> = state.get_typed("test_key").unwrap();
         assert_eq!(value, Some("test_value".to_string()));
 
-        // Test with numbers
+        // 测试数字
         state.put_typed("number", 123u64).unwrap();
         let number: Option<u64> = state.get_typed("number").unwrap();
         assert_eq!(number, Some(123));

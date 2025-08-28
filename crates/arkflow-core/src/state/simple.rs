@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! Basic state management example without complex trait modifications
+//! 无需修改 trait 签名的基本状态管理示例
 
 use super::enhanced::{TransactionLogEntry, TransactionStatus};
 use crate::{Error, MessageBatch};
@@ -23,16 +23,16 @@ use std::sync::{
     Arc,
 };
 
-/// Example processor that maintains state without modifying trait signatures
+/// 示例处理器，无需修改 trait 签名即可维护状态
 pub struct StatefulExampleProcessor {
-    /// Internal state storage
+    /// 内部状态存储
     state: Arc<tokio::sync::RwLock<HashMap<String, serde_json::Value>>>,
-    /// Processor name
+    /// 处理器名称
     name: String,
 }
 
 impl StatefulExampleProcessor {
-    /// Create new stateful processor
+    /// 创建新的有状态处理器
     pub fn new(name: String) -> Self {
         Self {
             state: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -40,17 +40,17 @@ impl StatefulExampleProcessor {
         }
     }
 
-    /// Process messages with state access
+    /// 处理带有状态访问的消息
     pub async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        // Check for transaction context in metadata
+        // 检查元数据中的事务上下文
         if let Some(tx_ctx) = batch.transaction_context() {
             println!(
-                "Processing batch with transaction: checkpoint_id={}",
+                "处理带有事务的批次: checkpoint_id={}",
                 tx_ctx.checkpoint_id
             );
         }
 
-        // Example: Count messages by input source
+        // 示例：按输入源统计消息数量
         if let Some(input_name) = batch.get_input_name() {
             let count_key = format!("count_{}", input_name);
 
@@ -64,36 +64,38 @@ impl StatefulExampleProcessor {
             );
 
             println!(
-                "Processor {}: Updated count for {} to {}",
+                "处理器 {}: 更新 {} 的计数为 {}",
                 self.name, input_name, new_count
             );
         }
 
-        // Process the batch (normally you'd do actual transformation here)
+        // 处理批次（通常在这里进行实际转换）
         Ok(vec![batch])
     }
 
-    /// Get current count for an input
+    /// 获取输入的当前计数
     pub async fn get_count(&self, input_name: &str) -> Result<u64, Error> {
         let state = self.state.read().await;
         let count_key = format!("count_{}", input_name);
         Ok(state.get(&count_key).and_then(|v| v.as_u64()).unwrap_or(0))
     }
 
-    /// Get all current state (for debugging/monitoring)
+    /// 获取所有当前状态（用于调试/监控）
     pub async fn get_state_snapshot(&self) -> HashMap<String, serde_json::Value> {
         self.state.read().await.clone()
     }
 }
 
-/// Transaction-aware wrapper for existing Output implementations
+/// 事务感知的现有输出实现包装器
 pub struct TransactionalOutputWrapper<O> {
+    /// 内部输出
     inner: O,
+    /// 事务日志
     transaction_log: Arc<tokio::sync::RwLock<Vec<TransactionLogEntry>>>,
 }
 
 impl<O> TransactionalOutputWrapper<O> {
-    /// Create new transactional output wrapper
+    /// 创建新的事务输出包装器
     pub fn new(inner: O) -> Self {
         Self {
             inner,
@@ -101,14 +103,14 @@ impl<O> TransactionalOutputWrapper<O> {
         }
     }
 
-    /// Write with transaction support
+    /// 带有事务支持的写入
     pub async fn write(&self, msg: MessageBatch) -> Result<(), Error>
     where
         O: crate::output::Output,
     {
-        // Check if this is a transactional batch
+        // 检查这是否是事务批次
         if let Some(tx_ctx) = msg.transaction_context() {
-            // Log the transaction
+            // 记录事务
             let log_entry = TransactionLogEntry {
                 transaction_id: tx_ctx.transaction_id.clone(),
                 checkpoint_id: tx_ctx.checkpoint_id,
@@ -119,36 +121,39 @@ impl<O> TransactionalOutputWrapper<O> {
 
             self.transaction_log.write().await.push(log_entry);
 
-            // Write to the actual output
+            // 写入实际输出
             self.inner.write(msg).await?;
 
-            // Mark as committed
+            // 标记为已提交
             if let Some(entry) = self.transaction_log.write().await.last_mut() {
                 entry.status = TransactionStatus::Committed;
             }
         } else {
-            // Non-transactional write
+            // 非事务写入
             self.inner.write(msg).await?;
         }
 
         Ok(())
     }
 
-    /// Get transaction log
+    /// 获取事务日志
     pub async fn get_transaction_log(&self) -> Vec<TransactionLogEntry> {
         self.transaction_log.read().await.clone()
     }
 }
 
-/// Barrier injector for inserting checkpoints into the stream
+/// 用于向流中插入检查点的屏障注入器
 pub struct SimpleBarrierInjector {
+    /// 间隔
     interval: std::time::Duration,
+    /// 上次注入时间
     last_injection: Arc<tokio::sync::RwLock<std::time::Instant>>,
+    /// 下一个检查点 ID
     next_checkpoint_id: Arc<AtomicU64>,
 }
 
 impl SimpleBarrierInjector {
-    /// Create new barrier injector
+    /// 创建新的屏障注入器
     pub fn new(interval_ms: u64) -> Self {
         Self {
             interval: std::time::Duration::from_millis(interval_ms),
@@ -157,26 +162,26 @@ impl SimpleBarrierInjector {
         }
     }
 
-    /// Check if barrier should be injected
+    /// 检查是否应该注入屏障
     pub async fn should_inject(&self) -> bool {
         let last = *self.last_injection.read().await;
         last.elapsed() >= self.interval
     }
 
-    /// Inject barrier into a batch if needed
+    /// 如果需要，将屏障注入到批次中
     pub async fn maybe_inject_barrier(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
         if self.should_inject().await {
             let checkpoint_id = self.next_checkpoint_id.fetch_add(1, Ordering::SeqCst);
 
-            // Create transaction context
+            // 创建事务上下文
             let tx_ctx =
                 crate::state::transaction::TransactionContext::aligned_checkpoint(checkpoint_id);
 
-            // Create metadata with transaction
+            // 创建带有事务的元数据
             let mut metadata = crate::state::Metadata::new();
             metadata.transaction = Some(tx_ctx);
 
-            // Embed metadata into batch
+            // 将元数据嵌入到批次中
             *self.last_injection.write().await = std::time::Instant::now();
             batch.with_metadata(metadata)
         } else {
@@ -185,14 +190,14 @@ impl SimpleBarrierInjector {
     }
 }
 
-/// Configuration for state management
+/// 状态管理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleStateConfig {
-    /// Enable state management features
+    /// 启用状态管理功能
     pub enabled: bool,
-    /// Checkpoint interval in milliseconds
+    /// 检查点间隔（毫秒）
     pub checkpoint_interval_ms: u64,
-    /// Enable transactional outputs
+    /// 启用事务输出
     pub transactional_outputs: bool,
 }
 
@@ -200,29 +205,29 @@ impl Default for SimpleStateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            checkpoint_interval_ms: 60000, // 1 minute
+            checkpoint_interval_ms: 60000, // 1 分钟
             transactional_outputs: false,
         }
     }
 }
 
-/// Example usage
+/// 使用示例
 pub async fn example_usage() -> Result<(), Error> {
-    // Create configuration
+    // 创建配置
     let config = SimpleStateConfig {
         enabled: true,
-        checkpoint_interval_ms: 5000, // 5 seconds for demo
+        checkpoint_interval_ms: 5000, // 演示用 5 秒
         transactional_outputs: true,
     };
 
     if config.enabled {
-        // Create stateful processor
+        // 创建有状态处理器
         let processor = StatefulExampleProcessor::new("example_processor".to_string());
 
-        // Create barrier injector
+        // 创建屏障注入器
         let barrier_injector = SimpleBarrierInjector::new(config.checkpoint_interval_ms);
 
-        // Process some messages
+        // 处理一些消息
         let batch1 = MessageBatch::from_string("hello")?;
         let batch1_with_barrier = barrier_injector.maybe_inject_barrier(batch1).await?;
         let _result = processor.process(batch1_with_barrier).await?;
@@ -231,13 +236,13 @@ pub async fn example_usage() -> Result<(), Error> {
         let batch2_with_barrier = barrier_injector.maybe_inject_barrier(batch2).await?;
         let _result = processor.process(batch2_with_barrier).await?;
 
-        // Check counts
+        // 检查计数
         let count = processor.get_count("unknown").await?;
-        println!("Total messages processed: {}", count);
+        println!("处理的消息总数: {}", count);
 
-        // Show state snapshot
+        // 显示状态快照
         let snapshot = processor.get_state_snapshot().await;
-        println!("Current state: {:?}", snapshot);
+        println!("当前状态: {:?}", snapshot);
     }
 
     Ok(())

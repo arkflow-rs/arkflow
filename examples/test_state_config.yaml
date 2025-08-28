@@ -1,0 +1,29 @@
+# Simple test for state management
+logging:
+  level: info
+
+# Enable state management globally
+state_management:
+  enabled: true
+  backend_type: memory
+  checkpoint_interval_ms: 5000
+  retained_checkpoints: 2
+  exactly_once: true
+  state_timeout_ms: 300000
+
+streams:
+  - input:
+      type: file
+      path: "./examples/data/test.txt"
+      format: text
+    pipeline:
+      thread_num: 1
+      processors: []
+    output:
+      type: stdout
+    # Enable state for this stream
+    state:
+      operator_id: "test-operator"
+      enabled: true
+      custom_keys:
+        - "processed_count"

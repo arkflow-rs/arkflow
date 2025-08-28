@@ -1,11 +1,11 @@
-//! Performance optimizations for S3 state backend
+//! S3 状态后端的性能优化
 //!
-//! This module provides various optimizations to improve S3 backend performance:
-//! - Batch operations
-//! - Compression
-//! - Local caching
-//! - Async operations
-//! - Connection pooling
+//! 此模块提供各种优化来改善 S3 后端性能：
+//! - 批量操作
+//! - 压缩
+//! - 本地缓存
+//! - 异步操作
+//! - 连接池
 
 use crate::state::helper::SimpleMemoryState;
 use crate::state::s3_backend::{S3StateBackend, S3StateBackendConfig};
@@ -26,28 +26,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
-/// Performance configuration for S3 backend
+/// S3 后端的性能配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
-    /// Enable batch operations
+    /// 启用批量操作
     pub enable_batching: bool,
-    /// Batch size in bytes
+    /// 批量大小（字节）
     pub batch_size_bytes: usize,
-    /// Batch timeout in milliseconds
+    /// 批量超时（毫秒）
     pub batch_timeout_ms: u64,
-    /// Enable compression
+    /// 启用压缩
     pub enable_compression: bool,
-    /// Compression level (1-21, higher = better compression)
+    /// 压缩级别（1-21，更高 = 更好压缩）
     pub compression_level: i32,
-    /// Local cache size (number of entries)
+    /// 本地缓存大小（条目数）
     pub local_cache_size: usize,
-    /// Cache TTL in milliseconds
+    /// 缓存 TTL（毫秒）
     pub cache_ttl_ms: u64,
-    /// Enable async operations
+    /// 启用异步操作
     pub enable_async: bool,
-    /// Max concurrent operations
+    /// 最大并发操作数
     pub max_concurrent_ops: usize,
-    /// Connection pool size
+    /// 连接池大小
     pub connection_pool_size: usize,
 }
 
@@ -68,30 +68,37 @@ impl Default for PerformanceConfig {
     }
 }
 
-/// Optimized S3 backend with performance enhancements
+/// 带有性能增强的优化 S3 后端
 pub struct OptimizedS3Backend {
+    /// 内部后端
     inner: Arc<S3StateBackend>,
+    /// 配置
     config: PerformanceConfig,
-    /// Batch buffer for writes
+    /// 写入的批量缓冲区
     batch_buffer: Arc<Mutex<BatchBuffer>>,
-    /// Local LRU cache
+    /// 本地 LRU 缓存
     local_cache: Arc<RwLock<LruCache<String, CacheEntry>>>,
-    /// Async operation pool
+    /// 异步操作池
     async_pool: Arc<AsyncOperationPool>,
 }
 
-/// Batch buffer for collecting operations
+/// 用于收集操作的批量缓冲区
 #[derive(Debug)]
 struct BatchBuffer {
+    /// 操作列表
     operations: Vec<BatchOperation>,
+    /// 大小（字节）
     size_bytes: usize,
+    /// 上次刷新时间
     last_flush: Instant,
 }
 
-/// Batch operation type
+/// 批量操作类型
 #[derive(Debug)]
 enum BatchOperation {
+    /// 放入操作
     Put { path: Path, data: Bytes },
+    /// 删除操作
     Delete { path: Path },
 }
 

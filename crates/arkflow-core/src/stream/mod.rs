@@ -28,6 +28,76 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+/// 带有状态管理支持的 Pipeline 包装器
+#[derive(Clone)]
+pub struct StatefulPipeline {
+    /// 内部 pipeline
+    inner: Arc<Pipeline>,
+    /// 状态管理器
+    state_manager: Option<Arc<RwLock<EnhancedStateManager>>>,
+    /// 操作符 ID
+    operator_id: Option<String>,
+}
+
+impl StatefulPipeline {
+    /// 创建新的状态感知 pipeline
+    pub fn new(
+        pipeline: Arc<Pipeline>,
+        state_manager: Option<Arc<RwLock<EnhancedStateManager>>>,
+        operator_id: Option<String>,
+    ) -> Self {
+        Self {
+            inner: pipeline,
+            state_manager,
+            operator_id,
+        }
+    }
+
+    /// 处理消息批次，带有状态管理支持
+    pub async fn process(&self, msg: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+        // 如果没有状态管理器，直接处理
+        if let Some(ref state_manager) = self.state_manager {
+            // 使用状态管理器处理批次（处理检查点屏障等）
+            let mut manager = state_manager.write().await;
+            let processed_batches = manager.process_batch(msg.clone()).await?;
+            drop(manager);
+
+            // 处理每个批次
+            let mut results = Vec::new();
+            for batch in processed_batches {
+                // 检查是否是检查点屏障
+                if batch.is_checkpoint_barrier() {
+                    // 检查点屏障直接传递，不经过处理器
+                    results.push(batch);
+                } else {
+                    // 正常处理
+                    let processed = self.inner.process(batch).await?;
+                    results.extend(processed);
+                }
+            }
+            Ok(results)
+        } else {
+            // 没有状态管理，直接处理
+            self.inner.process(msg).await
+        }
+    }
+
+    /// 关闭 pipeline
+    pub async fn close(&self) -> Result<(), Error> {
+        self.inner.close().await
+    }
+
+    /// 获取内部 pipeline
+    pub fn inner(&self) -> &Arc<Pipeline> {
+        &self.inner
+    }
+
+    /// 获取状态管理器
+    pub fn state_manager(&self) -> Option<&Arc<RwLock<EnhancedStateManager>>> {
+        self.state_manager.as_ref()
+    }
+}
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
 
@@ -37,6 +107,7 @@ const BACKPRESSURE_THRESHOLD: u64 = 1024;
 pub struct Stream {
     input: Arc<dyn Input>,
     pipeline: Arc<Pipeline>,
+    stateful_pipeline: Option<StatefulPipeline>,
     output: Arc<dyn Output>,
     error_output: Option<Arc<dyn Output>>,
     thread_num: u32,
@@ -64,9 +135,15 @@ impl Stream {
         thread_num: u32,
         state_manager: Option<Arc<RwLock<EnhancedStateManager>>>,
     ) -> Self {
+        let pipeline_arc = Arc::new(pipeline);
+        let stateful_pipeline = state_manager.clone().map(|sm| {
+            StatefulPipeline::new(pipeline_arc.clone(), Some(sm), None)
+        });
+
         Self {
             input,
-            pipeline: Arc::new(pipeline),
+            pipeline: pipeline_arc,
+            stateful_pipeline,
             output,
             error_output,
             buffer,
@@ -121,6 +198,7 @@ impl Stream {
             tracker.spawn(Self::do_processor(
                 i,
                 self.pipeline.clone(),
+                self.stateful_pipeline.clone(),
                 input_receiver.clone(),
                 output_sender.clone(),
                 self.sequence_counter.clone(),
@@ -260,6 +338,7 @@ impl Stream {
     async fn do_processor(
         i: u32,
         pipeline: Arc<Pipeline>,
+        stateful_pipeline: Option<StatefulPipeline>,
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
         output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
@@ -283,8 +362,12 @@ impl Stream {
                 break;
             };
 
-            // Process messages through pipeline
-            let processed = pipeline.process(msg.clone()).await;
+            // Process messages through pipeline (with or without state management)
+            let processed = if let Some(ref stateful_pipe) = stateful_pipeline {
+                stateful_pipe.process(msg.clone()).await
+            } else {
+                pipeline.process(msg.clone()).await
+            };
             let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
 
             // Process result messages
@@ -585,5 +668,77 @@ impl StreamConfig {
             thread_num,
             state_manager,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::Pipeline;
+    use crate::processor::Processor;
+    use crate::state::enhanced::{EnhancedStateManager, EnhancedStateConfig, StateBackendType};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    
+    #[tokio::test]
+    async fn test_stateful_pipeline() {
+        // 创建测试处理器
+        struct TestProcessor;
+        #[async_trait::async_trait]
+        impl Processor for TestProcessor {
+            async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+                Ok(vec![batch])
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        
+        // 创建状态管理器
+        let state_config = EnhancedStateConfig {
+            enabled: true,
+            backend_type: StateBackendType::Memory,
+            ..Default::default()
+        };
+        let state_manager = Arc::new(RwLock::new(EnhancedStateManager::new(state_config).await.unwrap()));
+        
+        // 创建 pipeline
+        let pipeline = Pipeline::new(vec![Arc::new(TestProcessor)]);
+        let pipeline_arc = Arc::new(pipeline);
+        
+        // 创建状态感知 pipeline
+        let stateful_pipeline = StatefulPipeline::new(pipeline_arc, Some(state_manager), None);
+        
+        // 测试处理
+        let batch = MessageBatch::from_string("test").unwrap();
+        let result = stateful_pipeline.process(batch).await;
+        assert!(result.is_ok());
+    }
+    
+    #[tokio::test]
+    async fn test_stateful_pipeline_without_state() {
+        // 创建测试处理器
+        struct TestProcessor;
+        #[async_trait::async_trait]
+        impl Processor for TestProcessor {
+            async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+                Ok(vec![batch])
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        
+        // 创建没有状态的 pipeline
+        let pipeline = Pipeline::new(vec![Arc::new(TestProcessor)]);
+        let pipeline_arc = Arc::new(pipeline);
+        
+        // 创建状态感知 pipeline（没有状态管理器）
+        let stateful_pipeline = StatefulPipeline::new(pipeline_arc, None, None);
+        
+        // 测试处理
+        let batch = MessageBatch::from_string("test").unwrap();
+        let result = stateful_pipeline.process(batch).await;
+        assert!(result.is_ok());
     }
 }

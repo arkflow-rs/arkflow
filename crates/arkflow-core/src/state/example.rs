@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! Simplified state management example
+//! 简化的状态管理示例
 
 use crate::state::SimpleMemoryState;
 use crate::state::StateHelper;
@@ -21,16 +21,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Example of using state management in a processor
+/// 在处理器中使用状态管理的示例
 pub struct CountingProcessor {
-    /// State for counting events per key
+    /// 用于按键计数事件的状态
     count_state: Arc<tokio::sync::RwLock<SimpleMemoryState>>,
-    /// Operator ID for this processor
+    /// 此处理器的操作符 ID
     operator_id: String,
 }
 
 impl CountingProcessor {
-    /// Create new counting processor
+    /// 创建新的计数处理器
     pub fn new(operator_id: String) -> Self {
         Self {
             count_state: Arc::new(tokio::sync::RwLock::new(SimpleMemoryState::new())),
@@ -38,17 +38,17 @@ impl CountingProcessor {
         }
     }
 
-    /// Process a batch and count events
+    /// 处理批次并计数事件
     pub async fn process_batch(&self, batch: &crate::MessageBatch) -> Result<(), Error> {
-        // Extract transaction context if present
+        // 如果存在，提取事务上下文
         if let Some(tx_ctx) = batch.transaction_context() {
             println!(
-                "Processing batch in transaction: checkpoint_id={}",
+                "在事务中处理批次: checkpoint_id={}",
                 tx_ctx.checkpoint_id
             );
         }
 
-        // Example: Count messages by input source
+        // 示例：按输入源计数消息
         if let Some(input_name) = batch.get_input_name() {
             let key = format!("count_{}", input_name);
 
@@ -57,20 +57,20 @@ impl CountingProcessor {
             let new_count = current_count.unwrap_or(0) + batch.len() as u64;
             state.put_typed(&key, new_count)?;
 
-            println!("Updated count for {}: {}", input_name, new_count);
+            println!("更新 {} 的计数: {}", input_name, new_count);
         }
 
         Ok(())
     }
 
-    /// Get current count for an input source
+    /// 获取输入源的当前计数
     pub async fn get_count(&self, input_name: &str) -> Result<u64, Error> {
         let key = format!("count_{}", input_name);
         let state = self.count_state.read().await;
         state.get_typed(&key)?.unwrap_or(0)
     }
 
-    /// Example of keyed state processing
+    /// 键控状态处理的示例
     pub async fn process_keyed_batch<K, V>(
         &self,
         batch: &crate::MessageBatch,
@@ -80,15 +80,15 @@ impl CountingProcessor {
         K: for<'de> Deserialize<'de> + Send + Sync + 'static + ToString,
         V: for<'de> Deserialize<'de> + Send + Sync + 'static,
     {
-        // This is a simplified example - in practice you'd extract keys from the batch
-        // For now, we'll just demonstrate the pattern
+        // 这是一个简化的示例 - 实际上你会从批次中提取键
+        // 现在，我们只是演示模式
 
-        // Simulate extracting keys and values from the batch
+        // 模拟从批次中提取键和值
         let mut state = self.count_state.write().await;
 
-        // Example: Process each row in the batch
+        // 示例：处理批次中的每一行
         for _ in 0..batch.len() {
-            // In a real implementation, you'd extract actual key-value pairs from the batch
+            // 在实际实现中，你会从批次中提取实际的键值对
             let dummy_key = "example_key".to_string();
             let dummy_value: u64 = 42;
 
@@ -102,16 +102,16 @@ impl CountingProcessor {
     }
 }
 
-/// Example configuration for state management
+/// 状态管理的示例配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
-    /// Whether state management is enabled
+    /// 是否启用状态管理
     pub enabled: bool,
-    /// State backend type
+    /// 状态后端类型
     pub backend: StateBackendType,
-    /// Checkpoint interval in milliseconds
+    /// 检查点间隔（毫秒）
     pub checkpoint_interval_ms: u64,
-    /// State TTL in milliseconds (0 = no expiration)
+    /// 状态 TTL（毫秒，0 = 不过期）
     pub state_ttl_ms: u64,
 }
 
@@ -120,33 +120,37 @@ impl Default for StateConfig {
         Self {
             enabled: false,
             backend: StateBackendType::Memory,
-            checkpoint_interval_ms: 60000, // 1 minute
-            state_ttl_ms: 0,               // No expiration
+            checkpoint_interval_ms: 60000, // 1 分钟
+            state_ttl_ms: 0,               // 不过期
         }
     }
 }
 
-/// State backend types
+/// 状态后端类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StateBackendType {
-    /// In-memory state backend
+    /// 内存状态后端
     Memory,
-    /// File system state backend
+    /// 文件系统状态后端
     FileSystem,
-    /// S3 state backend
+    /// S3 状态后端
     S3,
 }
 
-/// Example of using state management with configuration
+/// 使用配置的状态管理示例
 pub struct StatefulProcessor<T> {
+    /// 内部处理器
     inner: T,
+    /// 状态存储
     state: Arc<tokio::sync::RwLock<SimpleMemoryState>>,
+    /// 配置
     config: StateConfig,
+    /// 操作符 ID
     operator_id: String,
 }
 
 impl<T> StatefulProcessor<T> {
-    /// Create new stateful processor wrapper
+    /// 创建新的有状态处理器包装器
     pub fn new(inner: T, config: StateConfig, operator_id: String) -> Self {
         Self {
             inner,
@@ -156,32 +160,32 @@ impl<T> StatefulProcessor<T> {
         }
     }
 
-    /// Get access to the state
+    /// 获取状态访问权限
     pub fn state(&self) -> Arc<tokio::sync::RwLock<SimpleMemoryState>> {
         self.state.clone()
     }
 
-    /// Get configuration
+    /// 获取配置
     pub fn config(&self) -> &StateConfig {
         &self.config
     }
 }
 
-/// Example usage
+/// 使用示例
 #[tokio::main]
 async fn example_usage() -> Result<(), Error> {
-    // Create a counting processor
+    // 创建计数处理器
     let processor = CountingProcessor::new("counter_1".to_string());
 
-    // Create a sample message batch
+    // 创建示例消息批次
     let batch = crate::MessageBatch::from_string("hello world")?;
 
-    // Process the batch
+    // 处理批次
     processor.process_batch(&batch).await?;
 
-    // Get the count
+    // 获取计数
     let count = processor.get_count("unknown").await?;
-    println!("Total count: {}", count);
+    println!("总计数: {}", count);
 
     Ok(())
 }

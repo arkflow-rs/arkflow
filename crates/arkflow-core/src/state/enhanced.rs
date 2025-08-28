@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 
-//! Enhanced state manager with S3 backend and exactly-once semantics
+//! 带有 S3 后端和精确一次语义的增强状态管理器
 
 use crate::state::helper::SimpleMemoryState;
 use crate::state::helper::StateHelper;
@@ -28,49 +28,53 @@ use std::sync::{
 };
 use tokio::sync::RwLock;
 
-/// Enhanced state manager with persistence and exactly-once guarantees
+/// 增强状态管理器，支持持久化和精确一次保证
 pub struct EnhancedStateManager {
-    /// S3 backend for state persistence
+    /// S3 后端，用于状态持久化
     s3_backend: Option<Arc<S3StateBackend>>,
-    /// Checkpoint coordinator
+    /// 检查点协调器
     checkpoint_coordinator: Option<S3CheckpointCoordinator>,
-    /// Local state cache
+    /// 本地状态缓存
     local_states: HashMap<String, SimpleMemoryState>,
-    /// Barrier injector
+    /// 屏障注入器
     barrier_injector: Arc<SimpleBarrierInjector>,
-    /// Configuration
+    /// 配置
     config: EnhancedStateConfig,
-    /// Current checkpoint ID
+    /// 当前检查点 ID
     current_checkpoint_id: Arc<AtomicU64>,
-    /// Active transactions
+    /// 活跃事务
     active_transactions: Arc<RwLock<HashMap<String, TransactionInfo>>>,
 }
 
-/// Transaction information
+/// 事务信息
 #[derive(Debug, Clone)]
 pub struct TransactionInfo {
+    /// 事务 ID
     pub transaction_id: String,
+    /// 检查点 ID
     pub checkpoint_id: u64,
+    /// 参与者列表
     pub participants: Vec<String>,
+    /// 创建时间
     pub created_at: std::time::SystemTime,
 }
 
-/// Enhanced state configuration
+/// 增强状态配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancedStateConfig {
-    /// Enable state management
+    /// 是否启用状态管理
     pub enabled: bool,
-    /// State backend type
+    /// 状态后端类型
     pub backend_type: StateBackendType,
-    /// S3 configuration (if using S3 backend)
+    /// S3 配置（如果使用 S3 后端）
     pub s3_config: Option<S3StateBackendConfig>,
-    /// Checkpoint interval in milliseconds
+    /// 检查点间隔（毫秒）
     pub checkpoint_interval_ms: u64,
-    /// Number of checkpoints to retain
+    /// 保留的检查点数量
     pub retained_checkpoints: usize,
-    /// Enable exactly-once semantics
+    /// 是否启用精确一次语义
     pub exactly_once: bool,
-    /// State timeout in milliseconds
+    /// 状态超时时间（毫秒）
     pub state_timeout_ms: u64,
 }
 
@@ -88,32 +92,39 @@ impl Default for EnhancedStateConfig {
     }
 }
 
-/// State backend types
+/// 状态后端类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StateBackendType {
+    /// 内存后端
     Memory,
+    /// S3 后端
     S3,
+    /// 混合后端
     Hybrid,
 }
 
 impl EnhancedStateManager {
-    /// Create new enhanced state manager
+    /// 创建新的增强状态管理器
     pub async fn new(config: EnhancedStateConfig) -> Result<Self, Error> {
+        // 如果启用了状态管理且不是内存后端，则初始化 S3 后端
         let (s3_backend, checkpoint_coordinator) =
             if config.enabled && config.backend_type != StateBackendType::Memory {
                 if let Some(s3_config) = &config.s3_config {
+                    // 创建 S3 后端
                     let backend = Arc::new(S3StateBackend::new(s3_config.clone()).await?);
+                    // 创建检查点协调器
                     let coordinator = S3CheckpointCoordinator::new(backend.clone());
                     (Some(backend), Some(coordinator))
                 } else {
                     return Err(Error::Config(
-                        "S3 configuration required for S3 backend".to_string(),
+                        "使用 S3 后端需要提供 S3 配置".to_string(),
                     ));
                 }
             } else {
                 (None, None)
             };
 
+        // 创建屏障注入器
         let barrier_injector = Arc::new(SimpleBarrierInjector::new(config.checkpoint_interval_ms));
 
         Ok(Self {
@@ -127,44 +138,47 @@ impl EnhancedStateManager {
         })
     }
 
-    /// Process a message batch with state management
+    /// 处理带有状态管理的消息批次
     pub async fn process_batch(&mut self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+        // 如果未启用状态管理，直接返回原始批次
         if !self.config.enabled {
             return Ok(vec![batch]);
         }
 
-        // Inject barrier if needed
+        // 如果需要，注入屏障
         let processed_batch = self.barrier_injector.maybe_inject_barrier(batch).await?;
 
-        // Check for transaction context
+        // 检查是否有事务上下文
         if let Some(tx_ctx) = processed_batch.transaction_context() {
+            // 处理事务批次
             self.process_transactional_batch(processed_batch, tx_ctx)
                 .await
         } else {
+            // 非事务批次，直接返回
             Ok(vec![processed_batch])
         }
     }
 
-    /// Process a transactional batch
+    /// 处理事务批次
     async fn process_transactional_batch(
         &mut self,
         batch: MessageBatch,
         tx_ctx: TransactionContext,
     ) -> Result<Vec<MessageBatch>, Error> {
-        // Register transaction
+        // 注册事务
         self.register_transaction(&tx_ctx).await?;
 
-        // If this is a checkpoint barrier, trigger checkpoint
+        // 如果这是检查点屏障，触发检查点
         if tx_ctx.is_checkpoint() {
             self.trigger_checkpoint(tx_ctx.checkpoint_id).await?;
         }
 
-        // Process the batch (return as-is for now)
-        // In a real implementation, you'd apply transformations here
+        // 处理批次（目前原样返回）
+        // 在实际实现中，这里会应用状态转换
         Ok(vec![batch])
     }
 
-    /// Register a new transaction
+    /// 注册新事务
     async fn register_transaction(&self, tx_ctx: &TransactionContext) -> Result<(), Error> {
         let mut transactions = self.active_transactions.write().await;
         transactions.insert(
@@ -179,19 +193,19 @@ impl EnhancedStateManager {
         Ok(())
     }
 
-    /// Trigger a checkpoint
+    /// 触发检查点
     async fn trigger_checkpoint(&mut self, checkpoint_id: u64) -> Result<(), Error> {
         if let Some(ref mut coordinator) = self.checkpoint_coordinator {
-            // Start checkpoint
+            // 开始检查点
             coordinator.start_checkpoint().await?;
 
-            // In a real implementation, you would:
-            // 1. Notify all operators to prepare checkpoint
-            // 2. Collect state from all operators
-            // 3. Persist state to S3
-            // 4. Complete checkpoint
+            // 在实际实现中，你需要：
+            // 1. 通知所有操作符准备检查点
+            // 2. 从所有操作符收集状态
+            // 3. 将状态持久化到 S3
+            // 4. 完成检查点
 
-            // For now, just save the current local states
+            // 目前，只保存当前的本地状态
             for (operator_id, state) in &self.local_states {
                 coordinator
                     .complete_participant(
@@ -202,7 +216,7 @@ impl EnhancedStateManager {
                     .await?;
             }
 
-            // Cleanup old checkpoints
+            // 清理旧检查点
             coordinator
                 .cleanup_old_checkpoints(self.config.retained_checkpoints)
                 .await?;
@@ -211,14 +225,14 @@ impl EnhancedStateManager {
         Ok(())
     }
 
-    /// Get or create state for an operator
+    /// 获取或创建操作符的状态
     pub fn get_operator_state(&mut self, operator_id: &str) -> &mut SimpleMemoryState {
         self.local_states
             .entry(operator_id.to_string())
             .or_insert_with(SimpleMemoryState::new)
     }
 
-    /// Get state value
+    /// 获取状态值
     pub async fn get_state_value<K, V>(
         &self,
         operator_id: &str,
@@ -235,7 +249,7 @@ impl EnhancedStateManager {
         }
     }
 
-    /// Set state value
+    /// 设置状态值
     pub async fn set_state_value<K, V>(
         &mut self,
         operator_id: &str,
@@ -251,27 +265,27 @@ impl EnhancedStateManager {
         Ok(())
     }
 
-    /// Create a checkpoint manually
+    /// 手动创建检查点
     pub async fn create_checkpoint(&mut self) -> Result<u64, Error> {
         let checkpoint_id = self.current_checkpoint_id.fetch_add(1, Ordering::SeqCst);
         self.trigger_checkpoint(checkpoint_id).await?;
         Ok(checkpoint_id)
     }
 
-    /// Recover from the latest checkpoint
+    /// 从最新检查点恢复
     pub async fn recover_from_latest_checkpoint(&mut self) -> Result<Option<u64>, Error> {
         if let Some(ref coordinator) = self.checkpoint_coordinator {
             if let Some(checkpoint_id) = coordinator.get_latest_checkpoint().await? {
-                // Load states from checkpoint
-                // In a real implementation, you would restore all operator states
-                println!("Recovered from checkpoint: {}", checkpoint_id);
+                // 从检查点加载状态
+                // 在实际实现中，你会恢复所有操作符状态
+                println!("从检查点恢复: {}", checkpoint_id);
                 return Ok(Some(checkpoint_id));
             }
         }
         Ok(None)
     }
 
-    /// Get current state statistics
+    /// 获取当前状态统计信息
     pub async fn get_state_stats(&self) -> StateStats {
         let transactions = self.active_transactions.read().await;
         StateStats {
@@ -283,14 +297,14 @@ impl EnhancedStateManager {
         }
     }
 
-    /// Get backend type
+    /// 获取后端类型
     pub fn get_backend_type(&self) -> StateBackendType {
         self.config.backend_type.clone()
     }
 
-    /// Shutdown state manager
+    /// 关闭状态管理器
     pub async fn shutdown(&mut self) -> Result<(), Error> {
-        // Create final checkpoint if enabled
+        // 如果启用，创建最终检查点
         if self.config.enabled {
             self.create_checkpoint().await?;
         }
@@ -298,28 +312,36 @@ impl EnhancedStateManager {
     }
 }
 
-/// State statistics
+/// 状态统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateStats {
+    /// 活跃事务数量
     pub active_transactions: usize,
+    /// 本地状态数量
     pub local_states_count: usize,
+    /// 当前检查点 ID
     pub current_checkpoint_id: u64,
+    /// 后端类型
     pub backend_type: StateBackendType,
+    /// 是否启用
     pub enabled: bool,
 }
 
-/// Exactly-once processor wrapper
+/// 精确一次处理器包装器
 pub struct ExactlyOnceProcessor<P> {
+    /// 内部处理器
     inner: P,
-    state_manager: Arc<tokio::sync::RwLock<EnhancedStateManager>>,
+    /// 状态管理器
+    state_manager: Arc<RwLock<EnhancedStateManager>>,
+    /// 操作符 ID
     operator_id: String,
 }
 
 impl<P> ExactlyOnceProcessor<P> {
-    /// Create new exactly-once processor wrapper
+    /// 创建新的精确一次处理器包装器
     pub fn new(
         inner: P,
-        state_manager: Arc<tokio::sync::RwLock<EnhancedStateManager>>,
+        state_manager: Arc<RwLock<EnhancedStateManager>>,
         operator_id: String,
     ) -> Self {
         Self {
@@ -329,24 +351,24 @@ impl<P> ExactlyOnceProcessor<P> {
         }
     }
 
-    /// Process with exactly-once guarantee
+    /// 带有精确一次保证的处理
     pub async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error>
     where
         P: crate::processor::Processor,
     {
-        // Let state manager handle barriers and transactions
+        // 让状态管理器处理屏障和事务
         let mut state_manager = self.state_manager.write().await;
         let processed_batches = state_manager.process_batch(batch).await?;
 
-        // Apply actual processing
+        // 应用实际处理
         let mut results = Vec::new();
         for batch in processed_batches {
-            // Process with inner processor
+            // 使用内部处理器处理
             let inner_results = self.inner.process(batch.clone()).await?;
 
-            // Update state if needed
+            // 如果需要，更新状态
             if let Some(tx_ctx) = batch.transaction_context() {
-                // Example: Update processed count
+                // 示例：更新处理计数
                 let state_key = format!("processed_count_{}", tx_ctx.checkpoint_id);
                 let mut state_manager = self.state_manager.write().await;
                 state_manager
@@ -360,7 +382,7 @@ impl<P> ExactlyOnceProcessor<P> {
         Ok(results)
     }
 
-    /// Get state value
+    /// 获取状态值
     pub async fn get_state<K, V>(&self, key: &K) -> Result<Option<V>, Error>
     where
         K: ToString + Send + Sync,
@@ -370,7 +392,7 @@ impl<P> ExactlyOnceProcessor<P> {
         state_manager.get_state_value(&self.operator_id, key).await
     }
 
-    /// Set state value
+    /// 设置状态值
     pub async fn set_state<K, V>(&self, key: &K, value: V) -> Result<(), Error>
     where
         K: ToString + Send + Sync,
@@ -383,16 +405,20 @@ impl<P> ExactlyOnceProcessor<P> {
     }
 }
 
-/// Two-phase commit output wrapper
+/// 两阶段提交输出包装器
 pub struct TwoPhaseCommitOutput<O> {
+    /// 内部输出
     inner: O,
+    /// 状态管理器
     state_manager: Arc<tokio::sync::RwLock<EnhancedStateManager>>,
+    /// 事务日志
     transaction_log: Arc<RwLock<Vec<TransactionLogEntry>>>,
+    /// 待处理事务
     pending_transactions: HashMap<String, Vec<MessageBatch>>,
 }
 
 impl<O> TwoPhaseCommitOutput<O> {
-    /// Create new two-phase commit output
+    /// 创建新的两阶段提交输出
     pub fn new(inner: O, state_manager: Arc<tokio::sync::RwLock<EnhancedStateManager>>) -> Self {
         Self {
             inner,
@@ -402,37 +428,37 @@ impl<O> TwoPhaseCommitOutput<O> {
         }
     }
 
-    /// Write with two-phase commit
+    /// 带有两阶段提交的写入
     pub async fn write(&self, batch: MessageBatch) -> Result<(), Error>
     where
         O: crate::output::Output,
     {
         if let Some(tx_ctx) = batch.transaction_context() {
             if tx_ctx.is_checkpoint() {
-                // Phase 1: Prepare
+                // 第一阶段：准备
                 self.prepare_transaction(&tx_ctx, &batch).await?;
 
-                // Phase 2: Commit (after checkpoint completes)
+                // 第二阶段：提交（检查点完成后）
                 self.commit_transaction(&tx_ctx).await?;
             } else {
-                // Normal write
+                // 普通写入
                 self.inner.write(batch).await?;
             }
         } else {
-            // Non-transactional write
+            // 非事务写入
             self.inner.write(batch).await?;
         }
 
         Ok(())
     }
 
-    /// Prepare phase of two-phase commit
+    /// 两阶段提交的准备阶段
     async fn prepare_transaction(
         &self,
         tx_ctx: &TransactionContext,
         batch: &MessageBatch,
     ) -> Result<(), Error> {
-        // Log the transaction
+        // 记录事务日志
         let log_entry = TransactionLogEntry {
             transaction_id: tx_ctx.transaction_id.clone(),
             checkpoint_id: tx_ctx.checkpoint_id,
@@ -443,17 +469,17 @@ impl<O> TwoPhaseCommitOutput<O> {
 
         self.transaction_log.write().await.push(log_entry);
 
-        // In a real implementation, you would:
-        // 1. Write to a temporary/staging area
-        // 2. Ensure all data is durable
-        // 3. Prepare to commit
+        // 在实际实现中，你需要：
+        // 1. 写入临时/暂存区域
+        // 2. 确保所有数据都是持久的
+        // 3. 准备提交
 
         Ok(())
     }
 
-    /// Commit phase of two-phase commit
+    /// 两阶段提交的提交阶段
     async fn commit_transaction(&self, tx_ctx: &TransactionContext) -> Result<(), Error> {
-        // Update transaction log
+        // 更新事务日志
         let mut log = self.transaction_log.write().await;
         if let Some(entry) = log
             .iter_mut()
@@ -462,33 +488,41 @@ impl<O> TwoPhaseCommitOutput<O> {
             entry.status = TransactionStatus::Committed;
         }
 
-        // In a real implementation, you would:
-        // 1. Make data visible to consumers
-        // 2. Confirm with transaction coordinator
+        // 在实际实现中，你需要：
+        // 1. 使数据对消费者可见
+        // 2. 与事务协调器确认
 
         Ok(())
     }
 
-    /// Get transaction log
+    /// 获取事务日志
     pub async fn get_transaction_log(&self) -> Vec<TransactionLogEntry> {
         self.transaction_log.read().await.clone()
     }
 }
 
-/// Transaction log entry
+/// 事务日志条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionLogEntry {
+    /// 事务 ID
     pub transaction_id: String,
+    /// 检查点 ID
     pub checkpoint_id: u64,
+    /// 时间戳
     pub timestamp: std::time::SystemTime,
+    /// 事务状态
     pub status: TransactionStatus,
+    /// 批次大小
     pub batch_size: usize,
 }
 
-/// Transaction status
+/// 事务状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TransactionStatus {
+    /// 已准备
     Prepared,
+    /// 已提交
     Committed,
+    /// 已中止
     Aborted,
 }
