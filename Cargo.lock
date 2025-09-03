@@ -9616,9 +9616,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "626bd9fa9734751fc50d6060752170984d7053f5a39061f524cda68023d4db8a"
+checksum = "2f06ae92f42f5e5c42443fd094f245eb656abf56dd7cce9b8b263236565e00f2"
 
 [[package]]
 name = "zstd"
