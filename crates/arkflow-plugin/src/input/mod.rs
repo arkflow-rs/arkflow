@@ -28,6 +28,7 @@ pub mod mqtt;
 pub mod multiple_inputs;
 pub mod nats;
 pub mod redis;
+pub mod rocketmq;
 pub mod sql;
 pub mod websocket;
 
@@ -39,6 +40,7 @@ pub fn init() -> Result<(), Error> {
     mqtt::init()?;
     nats::init()?;
     redis::init()?;
+    rocketmq::init()?;
     sql::init()?;
     websocket::init()?;
     multiple_inputs::init()?;

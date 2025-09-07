@@ -22,9 +22,10 @@ pub mod drop;
 pub mod http;
 pub mod kafka;
 pub mod mqtt;
-pub mod sql;
 pub mod nats;
 pub mod redis;
+pub mod rocketmq;
+pub mod sql;
 pub mod stdout;
 
 pub fn init() -> Result<(), Error> {
@@ -36,5 +37,6 @@ pub fn init() -> Result<(), Error> {
     sql::init()?;
     nats::init()?;
     redis::init()?;
+    rocketmq::init()?;
     Ok(())
 }

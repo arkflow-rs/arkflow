@@ -75,6 +75,9 @@ tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 # NATS
 async-nats = "0.42"
 
+# RocketMQ (using HTTP API)
+# Note: This implementation uses RocketMQ HTTP API instead of native protocol
+
 
 # modbus
 tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
