@@ -93,6 +93,7 @@ pub struct RocketMQAck {
     http_client: Arc<Client>,
     base_url: String,
     consumer_group: String,
+    input_name: Option<String>,
 }
 
 impl RocketMQInput {
@@ -106,9 +107,12 @@ impl RocketMQInput {
             .pool_idle_timeout(Duration::from_secs(60));
         
         if let Some(access_key) = &config.access_key {
-            let auth_header = format!("Basic {}:{}", access_key, config.secret_key.as_deref().unwrap_or(""));
+            let secret_key = config.secret_key.as_deref().unwrap_or("");
+            let auth_header = format!("Basic {}:{}", access_key, secret_key);
             let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Authorization", auth_header.parse().unwrap());
+            let header_value = auth_header.parse()
+                .map_err(|e| Error::Connection(format!("Failed to parse auth header: {}", e)))?;
+            headers.insert("Authorization", header_value);
             client_builder = client_builder.default_headers(headers);
         }
         
@@ -149,7 +153,8 @@ impl RocketMQInput {
             }
             
             tracing::warn!(
-                "RocketMQ connection attempt {} failed, retrying in {:?}",
+                "RocketMQ input '{}' connection attempt {} failed, retrying in {:?}",
+                self.input_name.as_deref().unwrap_or("unnamed"),
                 attempt + 1,
                 retry_delay
             );
@@ -217,10 +222,13 @@ impl Input for RocketMQInput {
             }
             
             if let Some(keys) = &message.keys {
-                msg_data.insert("keys".to_string(), serde_json::to_string(keys).unwrap_or_default());
+                let keys_json = serde_json::to_string(keys)
+                    .map_err(|e| Error::Read(format!("Failed to serialize keys: {}", e)))?;
+                msg_data.insert("keys".to_string(), keys_json);
             }
             
-            let msg_json = serde_json::to_string(&msg_data).unwrap();
+            let msg_json = serde_json::to_string(&msg_data)
+                .map_err(|e| Error::Read(format!("Failed to serialize message data: {}", e)))?;
             messages.push(msg_json.into_bytes());
             
             let ack = RocketMQAck {
@@ -228,14 +236,16 @@ impl Input for RocketMQInput {
                 http_client: self.http_client.clone(),
                 base_url: self.base_url.clone(),
                 consumer_group: self.config.consumer_group.clone(),
+                input_name: self.input_name.clone(),
             };
             acks.push(Arc::new(ack) as Arc<dyn Ack>);
         }
         
-        let batch = MessageBatch::new_binary(messages)?;
+        let mut batch = MessageBatch::new_binary(messages)?;
+        batch.set_input_name(self.input_name.clone());
         
         let ack = if acks.len() == 1 {
-            acks.into_iter().next().unwrap()
+            acks.into_iter().next().expect("Expected exactly one ack")
         } else {
             Arc::new(arkflow_core::input::VecAck(acks))
         };
@@ -258,7 +268,7 @@ impl Ack for RocketMQAck {
         params.insert("message_id", self.message_id.clone());
         
         if let Err(e) = self.http_client.post(&url).form(&params).send().await {
-            tracing::error!("Failed to acknowledge RocketMQ message {}: {}", self.message_id, e);
+            tracing::error!("Failed to acknowledge RocketMQ message {} from input '{}': {}", self.message_id, self.input_name.as_deref().unwrap_or("unnamed"), e);
         }
     }
 }
@@ -314,7 +324,8 @@ mod tests {
         }
         "#;
         
-        let config: RocketMQInputConfig = serde_json::from_str(config_json).unwrap();
+        let config: RocketMQInputConfig = serde_json::from_str(config_json)
+            .expect("Failed to deserialize test config");
         assert_eq!(config.nameserver_addr, "localhost:9876");
         assert_eq!(config.consumer_group, "test_group");
         assert_eq!(config.topic, "test_topic");

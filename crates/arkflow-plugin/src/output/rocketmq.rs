@@ -89,7 +89,9 @@ impl RocketMQOutput {
         if let Some(access_key) = &config.access_key {
             let auth_header = format!("Basic {}:{}", access_key, config.secret_key.as_deref().unwrap_or(""));
             let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Authorization", auth_header.parse().unwrap());
+            let header_value = auth_header.parse()
+                .map_err(|e| Error::Connection(format!("Failed to parse auth header: {}", e)))?;
+            headers.insert("Authorization", header_value);
             client_builder = client_builder.default_headers(headers);
         }
         
@@ -130,7 +132,8 @@ impl RocketMQOutput {
             }
             
             tracing::warn!(
-                "RocketMQ connection attempt {} failed, retrying in {:?}",
+                "RocketMQ output '{}' connection attempt {} failed, retrying in {:?}",
+                self.output_name.as_deref().unwrap_or("unnamed"),
                 attempt + 1,
                 retry_delay
             );
@@ -152,7 +155,8 @@ impl RocketMQOutput {
                         return Err(Error::Process(format!("Failed to send message after {} attempts: {}", retry_count, e)));
                     }
                     tracing::warn!(
-                        "RocketMQ send attempt {} failed: {}, retrying in {:?}",
+                        "RocketMQ output '{}' send attempt {} failed: {}, retrying in {:?}",
+                        self.output_name.as_deref().unwrap_or("unnamed"),
                         attempt + 1,
                         e,
                         retry_delay
@@ -254,7 +258,9 @@ impl RocketMQOutput {
             message_data
         }).collect();
         
-        batch_data.insert("messages", serde_json::to_string(&message_list).unwrap_or_default());
+        let messages_json = serde_json::to_string(&message_list)
+            .map_err(|e| Error::Process(format!("Failed to serialize message list: {}", e)))?;
+        batch_data.insert("messages", messages_json);
         
         let response = self.http_client.post(&url).json(&batch_data).send()
             .await
@@ -342,7 +348,8 @@ mod tests {
         }
         "#;
         
-        let config: RocketMQOutputConfig = serde_json::from_str(config_json).unwrap();
+        let config: RocketMQOutputConfig = serde_json::from_str(config_json)
+            .expect("Failed to deserialize test config");
         assert_eq!(config.nameserver_addr, "localhost:9876");
         assert_eq!(config.topic, "test_topic");
         assert_eq!(config.tag, Some("test_tag".to_string()));
