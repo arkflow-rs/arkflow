@@ -39,6 +39,14 @@ pub struct KafkaInputConfig {
     pub client_id: Option<String>,
     /// Start with the most news
     pub start_from_latest: bool,
+    /// Fetch min bytes
+    pub fetch_min_bytes: Option<u32>,
+    /// Fetch max bytes
+    pub fetch_max_bytes: Option<u32>,
+    /// Fetch max partition bytes
+    pub fetch_max_partition_bytes: Option<u32>,
+    /// Fetch wait max milliseconds
+    pub fetch_wait_max_ms: Option<u64>,
 }
 
 /// Kafka input component
@@ -73,6 +81,26 @@ impl Input for KafkaInput {
         // Set the client ID
         if let Some(client_id) = &self.config.client_id {
             client_config.set("client.id", client_id);
+        }
+
+        // Set the fetch min bytes
+        if let Some(fetch_min_bytes) = self.config.fetch_min_bytes {
+            client_config.set("fetch.min.bytes", fetch_min_bytes.to_string());
+        }
+        // Set the fetch max bytes
+        if let Some(fetch_max_bytes) = self.config.fetch_max_bytes {
+            client_config.set("fetch.max.bytes", fetch_max_bytes.to_string());
+        }
+        // Set the fetch max partition bytes
+        if let Some(fetch_max_partition_bytes) = self.config.fetch_max_partition_bytes {
+            client_config.set(
+                "max.partition.fetch.bytes",
+                fetch_max_partition_bytes.to_string(),
+            );
+        }
+        // Set the fetch max wait
+        if let Some(fetch_wait_max_ms) = self.config.fetch_wait_max_ms {
+            client_config.set("fetch.wait.max.ms", fetch_wait_max_ms.to_string());
         }
 
         // Set the offset reset policy
@@ -213,6 +241,10 @@ mod tests {
             consumer_group: "test-group".to_string(),
             client_id: Some("test-client".to_string()),
             start_from_latest: false,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
         };
 
         let input = KafkaInput::new(None, config);
@@ -233,6 +265,10 @@ mod tests {
             consumer_group: "test-group".to_string(),
             client_id: None,
             start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
         };
 
         let input = KafkaInput::new(None, config).unwrap();
@@ -255,6 +291,10 @@ mod tests {
             consumer_group: "test-group".to_string(),
             client_id: None,
             start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
         };
 
         let input = KafkaInput::new(None, config).unwrap();
