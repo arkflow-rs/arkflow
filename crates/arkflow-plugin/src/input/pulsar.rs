@@ -23,13 +23,52 @@ use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
+use std::collections::VecDeque;
+use std::sync::Arc;
 use futures::StreamExt;
 use pulsar::{Pulsar, SubType, TokioExecutor};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
+
+/// Buffer pool for reducing memory allocations
+#[derive(Clone)]
+pub struct BufferPool {
+    buffers: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    buffer_size: usize,
+    max_buffers: usize,
+}
+
+impl BufferPool {
+    pub fn new(buffer_size: usize, max_buffers: usize) -> Self {
+        Self {
+            buffers: Arc::new(Mutex::new(VecDeque::new())),
+            buffer_size,
+            max_buffers,
+        }
+    }
+
+    pub async fn acquire(&self) -> Vec<u8> {
+        let mut buffers = self.buffers.lock().await;
+        buffers.pop_front().unwrap_or_else(|| Vec::with_capacity(self.buffer_size))
+    }
+
+    pub async fn release(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        if buffer.capacity() >= self.buffer_size {
+            let mut buffers = self.buffers.lock().await;
+            if buffers.len() < self.max_buffers {
+                buffers.push_back(buffer);
+            }
+        }
+    }
+
+    pub async fn get_stats(&self) -> (usize, usize) {
+        let buffers = self.buffers.lock().await;
+        (buffers.len(), self.max_buffers)
+    }
+}
 
 /// Pulsar input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

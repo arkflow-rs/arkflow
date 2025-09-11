@@ -16,6 +16,7 @@
 //!
 //! Send data to a Pulsar topic
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::expr::Expr;
 use crate::pulsar::{
     PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarProducer, RetryConfig,
@@ -90,7 +91,7 @@ pub struct PulsarBatchingConfig {
 /// Producer wrapper with metrics
 pub struct ProducerWrapper {
     producer: Arc<Mutex<Option<PulsarProducer>>>,
-    pending_messages: Arc<RwLock<u32>>,
+    pending_messages: AtomicU32,
     topic: String,
 }
 
@@ -98,15 +99,14 @@ impl ProducerWrapper {
     pub fn new(producer: PulsarProducer, topic: String) -> Self {
         Self {
             producer: Arc::new(Mutex::new(Some(producer))),
-            pending_messages: Arc::new(RwLock::new(0)),
+            pending_messages: AtomicU32::new(0),
             topic,
         }
     }
 
     pub async fn send_message(&self, payload: Vec<u8>) -> Result<(), Error> {
-        let mut pending = self.pending_messages.write().await;
-        *pending += 1;
-        drop(pending);
+        // Atomically increment pending count
+        self.pending_messages.fetch_add(1, Ordering::Relaxed);
 
         let result = async {
             let mut producer_guard = self.producer.lock().await;
@@ -121,15 +121,14 @@ impl ProducerWrapper {
         }
         .await;
 
-        let mut pending = self.pending_messages.write().await;
-        *pending = pending.saturating_sub(1);
-        drop(pending);
+        // Atomically decrement pending count
+        self.pending_messages.fetch_sub(1, Ordering::Relaxed);
 
         result
     }
 
-    pub async fn get_pending_count(&self) -> u32 {
-        *self.pending_messages.read().await
+    pub fn get_pending_count(&self) -> u32 {
+        self.pending_messages.load(Ordering::Relaxed)
     }
 
     pub fn get_topic(&self) -> &str {
@@ -205,7 +204,7 @@ impl PulsarProducerPool {
                 // Collect all pending counts first to minimize race condition window
                 let mut pending_counts = Vec::with_capacity(self.producers.len());
                 for producer in &self.producers {
-                    pending_counts.push(producer.get_pending_count().await);
+                    pending_counts.push(producer.get_pending_count());
                 }
 
                 // Find the producer with minimum load
@@ -232,7 +231,7 @@ impl PulsarProducerPool {
     pub async fn get_pool_stats(&self) -> Vec<(String, u32)> {
         let mut stats = Vec::new();
         for producer in &self.producers {
-            let pending = producer.get_pending_count().await;
+            let pending = producer.get_pending_count();
             stats.push((producer.get_topic().to_string(), pending));
         }
         stats
