@@ -12,31 +12,11 @@
  *    limitations under the License.
  */
 
-//! Output component module
-//!
-//! The output component is responsible for sending the processed data to the target system.
+//! Pulsar common module
 
-use arkflow_core::Error;
+pub mod common;
 
-pub mod drop;
-pub mod http;
-pub mod kafka;
-pub mod mqtt;
-pub mod nats;
-pub mod pulsar;
-pub mod redis;
-pub mod sql;
-pub mod stdout;
-
-pub fn init() -> Result<(), Error> {
-    drop::init()?;
-    http::init()?;
-    kafka::init()?;
-    mqtt::init()?;
-    nats::init()?;
-    pulsar::init()?;
-    redis::init()?;
-    sql::init()?;
-    stdout::init()?;
-    Ok(())
-}
+pub use common::{
+    PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarConsumer,
+    PulsarMessage, PulsarProducer, RetryConfig, RetryUtils, SubscriptionType,
+};
