@@ -529,23 +529,25 @@ impl Ack for PulsarAck {
 
 /// Pulsar batch message acknowledgment
 pub struct PulsarBatchAck {
-    batch: Option<PulsarMessageBatch>,
+    batch: Option<Arc<Mutex<PulsarMessageBatch>>>,
 }
 
 impl PulsarBatchAck {
     pub fn new(batch: PulsarMessageBatch) -> Self {
-        Self { batch: Some(batch) }
+        Self { batch: Some(Arc::new(Mutex::new(batch))) }
     }
 }
 
 #[async_trait]
 impl Ack for PulsarBatchAck {
     async fn ack(&self) {
-        if let Some(ref _batch) = self.batch {
-            // Note: In a real implementation, we would need to make the batch mutable
-            // For now, we'll acknowledge through the stored consumer reference
-            tracing::debug!("Acknowledging Pulsar message batch");
-            // The actual acknowledgment happens through the batch's acknowledge_all method
+        if let Some(batch) = &self.batch {
+            let mut batch_guard = batch.lock().await;
+            if let Err(e) = batch_guard.acknowledge_all().await {
+                tracing::error!("Failed to acknowledge Pulsar message batch: {}", e);
+            } else {
+                tracing::debug!("Successfully acknowledged Pulsar message batch");
+            }
         }
     }
 }
