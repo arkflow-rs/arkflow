@@ -324,6 +324,46 @@ impl PulsarConfigValidator {
         Ok(())
     }
 
+    /// Validate output batching configuration
+    pub fn validate_output_batching_config(
+        config: &crate::output::pulsar::PulsarBatchingConfig,
+    ) -> Result<(), Error> {
+        if let Some(max_messages) = config.max_messages {
+            if max_messages == 0 {
+                return Err(Error::Config("Max messages must be at least 1".to_string()));
+            }
+            if max_messages > 10000 {
+                return Err(Error::Config(
+                    "Max messages cannot exceed 10000".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_size) = config.max_size {
+            if max_size == 0 {
+                return Err(Error::Config("Max size must be at least 1".to_string()));
+            }
+            if max_size > 100 * 1024 * 1024 {
+                return Err(Error::Config("Max size cannot exceed 100MB".to_string()));
+            }
+        }
+
+        if let Some(max_delay_ms) = config.max_delay_ms {
+            if max_delay_ms == 0 {
+                return Err(Error::Config(
+                    "Max delay must be greater than 0".to_string(),
+                ));
+            }
+            if max_delay_ms > 300000 {
+                return Err(Error::Config(
+                    "Max delay cannot exceed 300000ms (5 minutes)".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate producer pool configuration
     pub fn validate_producer_pool_config(
         config: &crate::output::pulsar::PulsarProducerPoolConfig,

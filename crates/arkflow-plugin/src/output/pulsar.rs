@@ -202,13 +202,19 @@ impl PulsarProducerPool {
                 Ok(&self.producers[index])
             }
             ProducerSelectionStrategy::LeastLoaded => {
+                // Collect all pending counts first to minimize race condition window
+                let mut pending_counts = Vec::with_capacity(self.producers.len());
+                for producer in &self.producers {
+                    pending_counts.push(producer.get_pending_count().await);
+                }
+
+                // Find the producer with minimum load
                 let mut min_load = u32::MAX;
                 let mut selected_index = 0;
 
-                for (i, producer) in self.producers.iter().enumerate() {
-                    let load = producer.get_pending_count().await;
-                    if load < min_load {
-                        min_load = load;
+                for (i, load) in pending_counts.iter().enumerate() {
+                    if *load < min_load {
+                        min_load = *load;
                         selected_index = i;
                     }
                 }
@@ -281,6 +287,9 @@ impl Output for PulsarOutput {
 
         if let Some(ref producer_pool_config) = self.config.producer_pool {
             PulsarConfigValidator::validate_producer_pool_config(producer_pool_config)?;
+        }
+        if let Some(ref batching_config) = self.config.batching {
+            PulsarConfigValidator::validate_output_batching_config(batching_config)?;
         }
 
         let _retry_config = self.config.retry_config.clone().unwrap_or_default();
@@ -479,21 +488,39 @@ impl PulsarOutput {
         let _max_size = batching_config.max_size.unwrap_or(1024 * 1024); // 1MB default
         let max_delay = batching_config.max_delay_ms.unwrap_or(100); // 100ms default
 
-        // Simple batching logic - send messages in batches
-        for chunk in payloads.chunks(max_messages as usize) {
-            // Send each message in the chunk
+        // Improved batching logic with better error handling and topic support
+        for (chunk_index, chunk) in payloads.chunks(max_messages as usize).enumerate() {
+            let mut failed_count = 0;
+
+            // Send all messages in the current batch
             for payload in chunk {
                 if let Err(e) = producer.send_non_blocking(payload.clone()).await {
                     error!("Failed to send message to Pulsar: {}", e);
-                    return Err(Error::Process(format!(
-                        "Failed to send message to Pulsar: {}",
-                        e
-                    )));
+                    failed_count += 1;
                 }
             }
 
-            // Add small delay between batches if configured
-            if max_delay > 0 {
+            // If all messages in the batch failed, return an error
+            if failed_count == chunk.len() && !chunk.is_empty() {
+                return Err(Error::Process(format!(
+                    "All {} messages in batch {} failed to send to Pulsar",
+                    chunk.len(),
+                    chunk_index + 1
+                )));
+            }
+
+            // If some messages failed, log a warning but continue
+            if failed_count > 0 {
+                warn!(
+                    "Batch {}: {}/{} messages failed to send to Pulsar",
+                    chunk_index + 1,
+                    failed_count,
+                    chunk.len()
+                );
+            }
+
+            // Add delay between batches if configured (except for the last batch)
+            if chunk_index < payloads.chunks(max_messages as usize).count() - 1 && max_delay > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(max_delay)).await;
             }
         }
@@ -622,6 +649,9 @@ impl OutputBuilder for PulsarOutputBuilder {
 
         if let Some(ref producer_pool_config) = config.producer_pool {
             PulsarConfigValidator::validate_producer_pool_config(producer_pool_config)?;
+        }
+        if let Some(ref batching_config) = config.batching {
+            PulsarConfigValidator::validate_output_batching_config(batching_config)?;
         }
 
         Ok(Arc::new(PulsarOutput::new(config)?))

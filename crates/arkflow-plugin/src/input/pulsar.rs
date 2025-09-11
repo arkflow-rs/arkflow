@@ -208,16 +208,26 @@ impl PulsarInput {
                                 current_size += message_size;
                             }
                             Ok(PulsarMsg::Err(e)) => {
-                                // Send error as single-message batch
-                                let batch = PulsarMessageBatch::new(
-                                    std::mem::take(&mut messages),
+                                // Send any accumulated messages first
+                                if !messages.is_empty() {
+                                    let valid_batch = PulsarMessageBatch::new(
+                                        std::mem::take(&mut messages),
+                                        consumer.clone(),
+                                    );
+                                    if let Err(e) = batch_sender.send_async(valid_batch).await {
+                                        error!("Failed to send accumulated messages batch: {}", e);
+                                    }
+                                }
+
+                                // Create error batch with just the error
+                                let error_batch = PulsarMessageBatch::new(
+                                    Vec::new(), // Empty messages for error
                                     consumer.clone(),
                                 );
-                                if let Err(e) = batch_sender.send_async(batch).await {
+                                if let Err(e) = batch_sender.send_async(error_batch).await {
                                     error!("Failed to send error batch: {}", e);
                                 }
 
-                                // Create error batch
                                 error!("Batch processor received error: {}", e);
                                 break;
                             }
@@ -261,8 +271,6 @@ impl Input for PulsarInput {
         if let Some(ref batching_config) = self.config.batching {
             PulsarConfigValidator::validate_batching_config(batching_config)?;
         }
-
-        let _retry_config = self.config.retry_config.clone().unwrap_or_default();
 
         // Use shared client builder with authentication
         let builder =
@@ -529,24 +537,49 @@ impl Ack for PulsarAck {
 
 /// Pulsar batch message acknowledgment
 pub struct PulsarBatchAck {
-    batch: Option<Arc<Mutex<PulsarMessageBatch>>>,
+    messages: Vec<pulsar::consumer::Message<Vec<u8>>>,
+    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>,
 }
 
 impl PulsarBatchAck {
     pub fn new(batch: PulsarMessageBatch) -> Self {
-        Self { batch: Some(Arc::new(Mutex::new(batch))) }
+        Self {
+            messages: batch.messages,
+            consumer: batch.consumer,
+        }
     }
 }
 
 #[async_trait]
 impl Ack for PulsarBatchAck {
     async fn ack(&self) {
-        if let Some(batch) = &self.batch {
-            let mut batch_guard = batch.lock().await;
-            if let Err(e) = batch_guard.acknowledge_all().await {
-                tracing::error!("Failed to acknowledge Pulsar message batch: {}", e);
+        if let Some(consumer) = &self.consumer {
+            let mut consumer_guard = consumer.lock().await;
+            let mut failed_count = 0;
+
+            for message in &self.messages {
+                if let Err(e) = consumer_guard.ack(message).await {
+                    failed_count += 1;
+                    tracing::warn!("Failed to acknowledge Pulsar message: {}", e);
+                }
+            }
+
+            if failed_count == 0 {
+                tracing::debug!(
+                    "Successfully acknowledged {} Pulsar messages",
+                    self.messages.len()
+                );
+            } else if failed_count == self.messages.len() {
+                tracing::error!(
+                    "Failed to acknowledge all {} Pulsar messages",
+                    self.messages.len()
+                );
             } else {
-                tracing::debug!("Successfully acknowledged Pulsar message batch");
+                tracing::warn!(
+                    "Failed to acknowledge {}/{} Pulsar messages",
+                    failed_count,
+                    self.messages.len()
+                );
             }
         }
     }
