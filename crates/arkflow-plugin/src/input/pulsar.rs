@@ -29,6 +29,7 @@ use futures::StreamExt;
 use pulsar::{Pulsar, SubType, TokioExecutor};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use futures::future;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -109,13 +110,13 @@ enum PulsarMsg {
 /// Batched Pulsar messages with acknowledgment capability
 pub struct PulsarMessageBatch {
     messages: Vec<pulsar::consumer::Message<Vec<u8>>>,
-    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>,
+    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>>,
 }
 
 impl PulsarMessageBatch {
     pub fn new(
         messages: Vec<pulsar::consumer::Message<Vec<u8>>>,
-        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>,
+        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>,
     ) -> Self {
         Self {
             messages,
@@ -153,7 +154,7 @@ pub struct PulsarInput {
     config: PulsarInputConfig,
     client: Arc<RwLock<Option<Pulsar<TokioExecutor>>>>,
     consumer:
-        Arc<RwLock<Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>>>,
+        Arc<RwLock<Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>>>>,
     sender: Sender<PulsarMsg>,
     receiver: Receiver<PulsarMsg>,
     batch_sender: Sender<PulsarMessageBatch>,
@@ -183,7 +184,7 @@ impl PulsarInput {
     /// Start the batch processor task
     async fn start_batch_processor(
         &self,
-        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>,
+        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>,
     ) {
         let receiver = self.receiver.clone();
         let batch_sender = self.batch_sender.clone();
@@ -545,13 +546,13 @@ pub struct PulsarAck {
     // Store the full message for acknowledgment
     message: Option<pulsar::consumer::Message<Vec<u8>>>,
     // Reference to consumer for acknowledgment
-    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>,
+    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>>,
 }
 
 impl PulsarAck {
     pub fn new(
         message: pulsar::consumer::Message<Vec<u8>>,
-        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>,
+        consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>,
     ) -> Self {
         Self {
             message: Some(message),
@@ -577,7 +578,7 @@ impl Ack for PulsarAck {
 /// Pulsar batch message acknowledgment
 pub struct PulsarBatchAck {
     messages: Vec<pulsar::consumer::Message<Vec<u8>>>,
-    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>,
+    consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>>,
 }
 
 impl PulsarBatchAck {
@@ -593,31 +594,43 @@ impl PulsarBatchAck {
 impl Ack for PulsarBatchAck {
     async fn ack(&self) {
         if let Some(consumer) = &self.consumer {
-            let mut consumer_guard = consumer.lock().await;
-            let mut failed_count = 0;
-
-            for message in &self.messages {
-                if let Err(e) = consumer_guard.ack(message).await {
-                    failed_count += 1;
-                    tracing::warn!("Failed to acknowledge Pulsar message: {}", e);
+            // Use parallel acknowledgment for better performance
+            let ack_futures: Vec<_> = self.messages.iter().map(|message| {
+                let consumer = consumer.clone();
+                async move {
+                    let mut consumer_guard = consumer.lock().await;
+                    consumer_guard.ack(message).await
+                        .map_err(|e| e.to_string())
                 }
-            }
+            }).collect();
+
+            // Execute all acknowledgments in parallel
+            let results: Vec<_> = future::join_all(ack_futures).await;
+            
+            let failed_count = results.iter().filter(|result| result.is_err()).count();
+            let total_count = results.len();
 
             if failed_count == 0 {
                 tracing::debug!(
-                    "Successfully acknowledged {} Pulsar messages",
-                    self.messages.len()
+                    "Successfully acknowledged {} Pulsar messages in parallel",
+                    total_count
                 );
-            } else if failed_count == self.messages.len() {
+            } else if failed_count == total_count {
                 tracing::error!(
-                    "Failed to acknowledge all {} Pulsar messages",
-                    self.messages.len()
+                    "Failed to acknowledge all {} Pulsar messages in parallel",
+                    total_count
                 );
+                // Log first few errors for debugging
+                for (i, result) in results.iter().take(3).enumerate() {
+                    if let Err(e) = result {
+                        tracing::error!("  Message {} failed with: {}", i, e);
+                    }
+                }
             } else {
                 tracing::warn!(
-                    "Failed to acknowledge {}/{} Pulsar messages",
+                    "Failed to acknowledge {}/{} Pulsar messages in parallel",
                     failed_count,
-                    self.messages.len()
+                    total_count
                 );
             }
         }
