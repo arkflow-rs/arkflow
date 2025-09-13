@@ -19,6 +19,7 @@ pub mod expr;
 pub mod input;
 pub mod output;
 pub mod processor;
+pub mod pulsar;
 pub mod temporary;
 pub mod time;
 pub mod udf;
