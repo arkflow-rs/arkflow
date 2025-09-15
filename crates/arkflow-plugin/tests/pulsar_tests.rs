@@ -18,10 +18,8 @@
 
 mod pulsar_tests {
     use arkflow_core::{input::InputBuilder, output::OutputBuilder};
-    use arkflow_plugin::input::pulsar::{PulsarInputBatchingConfig, PulsarInputConfig};
-    use arkflow_plugin::output::pulsar::{
-        ProducerSelectionStrategy, PulsarOutputConfig, PulsarProducerPoolConfig,
-    };
+    use arkflow_plugin::input::pulsar::PulsarInputConfig;
+    use arkflow_plugin::output::pulsar::PulsarOutputConfig;
     use arkflow_plugin::pulsar::{
         PulsarAuth, PulsarConfigValidator, RetryConfig, SubscriptionType,
     };
@@ -135,122 +133,6 @@ mod pulsar_tests {
     }
 
     #[test]
-    fn test_validate_batching_config_valid() {
-        // Valid batching configurations
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1000),
-            max_wait_ms: Some(1000),
-            max_size_bytes: Some(1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_ok());
-
-        // Empty batching config should be valid
-        let config = PulsarInputBatchingConfig {
-            max_messages: None,
-            max_wait_ms: None,
-            max_size_bytes: None,
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_batching_config_invalid() {
-        // Invalid batching configurations
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(0),
-            max_wait_ms: Some(1000),
-            max_size_bytes: Some(1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1001),
-            max_wait_ms: Some(1000),
-            max_size_bytes: Some(1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1000),
-            max_wait_ms: Some(0),
-            max_size_bytes: Some(1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1000),
-            max_wait_ms: Some(60001),
-            max_size_bytes: Some(1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1000),
-            max_wait_ms: Some(1000),
-            max_size_bytes: Some(0),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-
-        let config = PulsarInputBatchingConfig {
-            max_messages: Some(1000),
-            max_wait_ms: Some(1000),
-            max_size_bytes: Some(11 * 1024 * 1024),
-        };
-        assert!(PulsarConfigValidator::validate_batching_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_producer_pool_config_valid() {
-        // Valid producer pool configurations
-        let config = PulsarProducerPoolConfig {
-            pool_size: Some(10),
-            max_pending_messages: Some(1000),
-            selection_strategy: Some(ProducerSelectionStrategy::RoundRobin),
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_ok());
-
-        // Empty pool config should be valid
-        let config = PulsarProducerPoolConfig {
-            pool_size: None,
-            max_pending_messages: None,
-            selection_strategy: None,
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_producer_pool_config_invalid() {
-        // Invalid producer pool configurations
-        let config = PulsarProducerPoolConfig {
-            pool_size: Some(0),
-            max_pending_messages: Some(1000),
-            selection_strategy: Some(ProducerSelectionStrategy::RoundRobin),
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_err());
-
-        let config = PulsarProducerPoolConfig {
-            pool_size: Some(51),
-            max_pending_messages: Some(1000),
-            selection_strategy: Some(ProducerSelectionStrategy::RoundRobin),
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_err());
-
-        let config = PulsarProducerPoolConfig {
-            pool_size: Some(10),
-            max_pending_messages: Some(0),
-            selection_strategy: Some(ProducerSelectionStrategy::RoundRobin),
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_err());
-
-        let config = PulsarProducerPoolConfig {
-            pool_size: Some(10),
-            max_pending_messages: Some(10001),
-            selection_strategy: Some(ProducerSelectionStrategy::RoundRobin),
-        };
-        assert!(PulsarConfigValidator::validate_producer_pool_config(&config).is_err());
-    }
-
-    #[test]
     fn test_validate_auth_config_token_valid() {
         // Valid token authentication
         let auth = PulsarAuth::Token {
@@ -332,15 +214,6 @@ mod pulsar_tests {
     }
 
     #[test]
-    fn test_producer_selection_strategy_default() {
-        let default_strategy = ProducerSelectionStrategy::default();
-        assert!(matches!(
-            default_strategy,
-            ProducerSelectionStrategy::RoundRobin
-        ));
-    }
-
-    #[test]
     fn test_pulsar_input_config_deserialization() {
         let config_json = serde_json::json!({
             "service_url": "pulsar://localhost:6650",
@@ -356,11 +229,6 @@ mod pulsar_tests {
                 "initial_delay_ms": 200,
                 "max_delay_ms": 10000,
                 "backoff_multiplier": 1.5
-            },
-            "batching": {
-                "max_messages": 500,
-                "max_wait_ms": 2000,
-                "max_size_bytes": 512000
             }
         });
 
@@ -374,7 +242,6 @@ mod pulsar_tests {
         ));
         assert!(config.auth.is_some());
         assert!(config.retry_config.is_some());
-        assert!(config.batching.is_some());
     }
 
     #[test]
@@ -391,32 +258,13 @@ mod pulsar_tests {
                 "credentials_url": "https://oauth2.googleapis.com/token",
                 "audience": "test-audience"
             },
-            "value_field": "data",
-            "batching": {
-                "max_messages": 1000,
-                "max_size": 1048576,
-                "max_delay_ms": 500
-            },
-            "retry_config": {
-                "max_attempts": 3,
-                "initial_delay_ms": 100,
-                "max_delay_ms": 5000,
-                "backoff_multiplier": 2.0
-            },
-            "producer_pool": {
-                "pool_size": 5,
-                "max_pending_messages": 500,
-                "selection_strategy": "least_loaded"
-            }
+            "value_field": "data"
         });
 
         let config: PulsarOutputConfig = serde_json::from_value(config_json).unwrap();
         assert_eq!(config.service_url, "pulsar://localhost:6650");
         assert_eq!(config.value_field, Some("data".to_string()));
         assert!(config.auth.is_some());
-        assert!(config.batching.is_some());
-        assert!(config.retry_config.is_some());
-        assert!(config.producer_pool.is_some());
     }
 
     #[test]
