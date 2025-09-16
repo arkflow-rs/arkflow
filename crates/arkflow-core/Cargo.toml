@@ -27,4 +27,6 @@ clap = { workspace = true }
 colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
+uuid = { version = "1.8", features = ["v4"] }
+tempfile = "3.10"
 num_cpus = "1.17.0"

@@ -31,10 +31,13 @@ pub mod cli;
 pub mod codec;
 pub mod config;
 pub mod engine;
+pub mod idempotent_ack;
 pub mod input;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
+pub mod reliable_ack;
+pub mod reliable_stream;
 pub mod stream;
 pub mod temporary;
 

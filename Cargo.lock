@@ -251,12 +251,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tokio-util",
  "toml 0.8.22",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
