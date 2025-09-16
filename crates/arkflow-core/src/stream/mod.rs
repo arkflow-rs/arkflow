@@ -19,6 +19,7 @@
 use crate::buffer::Buffer;
 use crate::input::Ack;
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
+use async_ack::AsyncAckProcessor;
 use flume::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -27,6 +28,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
+
+pub mod async_ack;
 
 const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
@@ -41,6 +44,7 @@ pub struct Stream {
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
+    ack_processor: Option<AsyncAckProcessor>,
 }
 
 enum ProcessorData {
@@ -69,6 +73,7 @@ impl Stream {
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
+            ack_processor: None,
         }
     }
 
@@ -90,6 +95,10 @@ impl Stream {
             flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
 
         let tracker = TaskTracker::new();
+
+        // Initialize async ack processor
+        let ack_processor = AsyncAckProcessor::new(&tracker, cancellation_token.clone());
+        self.ack_processor = Some(ack_processor);
 
         // Input
         tracker.spawn(Self::do_input(
@@ -127,11 +136,13 @@ impl Stream {
         // drop(error_output_sender);
 
         // Output
+        let ack_processor = self.ack_processor.clone();
         tracker.spawn(Self::do_output(
             self.next_seq.clone(),
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
+            ack_processor,
         ));
 
         tracker.close();
@@ -311,13 +322,14 @@ impl Stream {
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
+        ack_processor: Option<AsyncAckProcessor>,
     ) {
         let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
 
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
                 for (_, (data, x)) in tree_map {
-                    Self::output(data, &x, &output, err_output.as_ref()).await;
+                    Self::output(data, &x, &output, err_output.as_ref(), &ack_processor).await;
                 }
                 break;
             };
@@ -337,7 +349,7 @@ impl Stream {
                     break;
                 };
 
-                Self::output(data, &ack, &output, err_output.as_ref()).await;
+                Self::output(data, &ack, &output, err_output.as_ref(), &ack_processor).await;
                 next_seq.fetch_add(1, Ordering::Release);
             }
         }
@@ -350,16 +362,29 @@ impl Stream {
         ack: &Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
+        ack_processor: &Option<AsyncAckProcessor>,
     ) {
         match data {
             ProcessorData::Err(msg, e) => match err_output {
                 None => {
-                    ack.ack().await;
+                    if let Some(processor) = ack_processor {
+                        if let Err(e) = processor.ack(ack.clone()).await {
+                            error!("Failed to send ack to async processor: {}", e);
+                        }
+                    } else {
+                        ack.ack().await;
+                    }
                     error!("{e}");
                 }
                 Some(err_output) => match err_output.write(msg).await {
                     Ok(_) => {
-                        ack.ack().await;
+                        if let Some(processor) = ack_processor {
+                            if let Err(e) = processor.ack(ack.clone()).await {
+                                error!("Failed to send ack to async processor: {}", e);
+                            }
+                        } else {
+                            ack.ack().await;
+                        }
                     }
                     Err(e) => {
                         error!("{}", e);
@@ -381,7 +406,13 @@ impl Stream {
                 }
 
                 if success_cnt >= size {
-                    ack.ack().await;
+                    if let Some(processor) = ack_processor {
+                        if let Err(e) = processor.ack(ack.clone()).await {
+                            error!("Failed to send ack to async processor: {}", e);
+                        }
+                    } else {
+                        ack.ack().await;
+                    }
                 }
             }
         }
