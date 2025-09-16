@@ -8689,9 +8689,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-modbus"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da3a7306f3ba9b5b80eff01462688f64a299469f3a3b7c496adc599050d3d0d"
+checksum = "dd3772ce689e8431a9d83ef03a854c1699bb912fecb8e742bcecdac9ad1c0cdc"
 dependencies = [
  "async-trait",
  "byteorder",
