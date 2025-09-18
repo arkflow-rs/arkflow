@@ -509,6 +509,37 @@ impl Stream {
     }
 }
 
+/// Reliable acknowledgment configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReliableAckConfig {
+    /// Enable reliable acknowledgment processing
+    pub enabled: bool,
+    /// WAL file path for persistence
+    pub wal_path: Option<String>,
+    /// Maximum pending acknowledgments
+    pub max_pending_acks: Option<usize>,
+    /// Maximum retry attempts
+    pub max_retries: Option<u32>,
+    /// Retry delay in milliseconds
+    pub retry_delay_ms: Option<u64>,
+    /// Enable backpressure control
+    pub enable_backpressure: Option<bool>,
+}
+
+impl Default for ReliableAckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wal_path: Some("./reliable_ack.wal".to_string()),
+            max_pending_acks: Some(5000),
+            max_retries: Some(5),
+            retry_delay_ms: Some(1000),
+            enable_backpressure: Some(true),
+        }
+    }
+}
+
 /// Stream configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamConfig {
@@ -518,6 +549,7 @@ pub struct StreamConfig {
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
+    pub reliable_ack: Option<ReliableAckConfig>,
 }
 
 impl StreamConfig {
@@ -552,6 +584,39 @@ impl StreamConfig {
             None
         };
 
+        // Check if reliable ack is enabled
+        if let Some(reliable_ack_config) = &self.reliable_ack {
+            if reliable_ack_config.enabled {
+                let wal_path = reliable_ack_config
+                    .wal_path
+                    .as_ref()
+                    .map_or("./reliable_ack.wal".to_string(), |p| p.clone());
+
+                // Create reliable ack processor
+                let tracker = tokio_util::task::TaskTracker::new();
+                let cancellation_token = tokio_util::sync::CancellationToken::new();
+                let ack_processor =
+                    std::sync::Arc::new(crate::reliable_ack::ReliableAckProcessor::new(
+                        &tracker,
+                        cancellation_token,
+                        std::path::Path::new(&wal_path),
+                    )?);
+
+                // Create reliable stream
+                return Ok(Stream::new_reliable(
+                    input,
+                    pipeline,
+                    output,
+                    error_output,
+                    buffer,
+                    resource,
+                    thread_num,
+                    ack_processor,
+                ));
+            }
+        }
+
+        // Create regular stream
         Ok(Stream::new(
             input,
             pipeline,
