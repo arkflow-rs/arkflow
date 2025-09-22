@@ -34,6 +34,7 @@ use tower_http::cors::CorsLayer;
 
 /// HTTP input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthType {
     /// Basic authentication
     Basic { username: String, password: String },
