@@ -368,16 +368,13 @@ impl FileInput {
     }
 
     fn hdfs_store(&self, ctx: &SessionContext, config: &HdfsConfig) -> Result<(), Error> {
-        let hdfs_storage = if let Some(ha_config) = &config.ha_config {
-            HdfsObjectStoreBuilder::new()
-                .with_url(&config.url)
-                .with_config(ha_config.clone())
-                .build()
-        } else {
-            HdfsObjectStoreBuilder::new().with_url(&config.url).build()
+        let mut builder = HdfsObjectStoreBuilder::new().with_url(&config.url);
+        if let Some(ha_config) = config.ha_config.as_ref().filter(|m| !m.is_empty()) {
+            builder = builder.with_config(ha_config.clone());
         }
-        .map_err(|e| Error::Config(format!("Failed to create HDFS client: {}", e)))?;
-
+        let hdfs_storage = builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create HDFS client: {}", e)))?;
         let object_store_url = ObjectStoreUrl::parse(&config.url)
             .map_err(|e| Error::Config(format!("Failed to parse HDFS URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
