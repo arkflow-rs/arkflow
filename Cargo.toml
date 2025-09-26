@@ -6,6 +6,7 @@ authors = ["chenquan <chenquan.dev@gmail.com>"]
 repository = "https://github.com/arkflow-rs/arkflow"
 homepage = "https://github.com/arkflow-rs/arkflow"
 license = "Apache-2.0"
+rust-version = "1.88"
 
 [workspace]
 members = ["crates/arkflow-plugin", "crates/arkflow-core", "crates/arkflow"]
