@@ -509,6 +509,8 @@ impl Stream {
     }
 }
 
+pub mod distributed_ack_stream;
+
 /// Reliable acknowledgment configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -550,6 +552,7 @@ pub struct StreamConfig {
     pub buffer: Option<crate::buffer::BufferConfig>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
     pub reliable_ack: Option<ReliableAckConfig>,
+    pub distributed_ack: Option<crate::distributed_ack_config::DistributedAckConfig>,
 }
 
 impl StreamConfig {
@@ -583,6 +586,27 @@ impl StreamConfig {
         } else {
             None
         };
+
+        // Check if distributed ack is enabled (takes precedence over reliable ack)
+        if let Some(distributed_ack_config) = &self.distributed_ack {
+            // For now, log that distributed acknowledgment is configured but not fully implemented
+            println!("⚠️  Distributed acknowledgment is configured but not yet fully implemented");
+            println!("   Available integration options:");
+            println!("   1. Use distributed_ack_input type at input level");
+            println!("   2. Use distributed_ack_processor type at processor level");
+            println!("   3. Stream-level integration will be available in future updates");
+
+            // Fall back to regular stream for now
+            return Ok(Stream::new(
+                input,
+                pipeline,
+                output,
+                error_output,
+                buffer,
+                resource,
+                thread_num,
+            ));
+        }
 
         // Check if reliable ack is enabled
         if let Some(reliable_ack_config) = &self.reliable_ack {

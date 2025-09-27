@@ -97,6 +97,31 @@ impl AckTask {
         self.retry_count += 1;
     }
 
+    /// Get the acknowledgment object
+    pub fn ack(&self) -> &Arc<dyn Ack> {
+        &self.ack
+    }
+
+    /// Get the acknowledgment type
+    pub fn ack_type(&self) -> &str {
+        &self.ack_type
+    }
+
+    /// Get the payload
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Get the creation time
+    pub fn created_at(&self) -> &Instant {
+        &self.created_at
+    }
+
+    /// Get the retry count
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
     pub fn to_record(&self) -> AckRecord {
         AckRecord {
             sequence: self.sequence,

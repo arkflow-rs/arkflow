@@ -286,7 +286,7 @@ impl RecoveryManager {
     }
 
     /// Perform automatic recovery
-    async fn perform_auto_recovery(&self) -> Result<RecoveryInfo, Error> {
+    pub async fn perform_auto_recovery(&self) -> Result<RecoveryInfo, Error> {
         let strategy = match self.recovery_config.recovery_strategy {
             RecoveryStrategy::FromLatestCheckpoint => {
                 // Get latest checkpoint
@@ -854,6 +854,41 @@ impl RecoveryManager {
     pub async fn clear_history(&self) {
         let mut history = self.recovery_history.write().await;
         history.clear();
+    }
+
+    /// Get a reference to the node registry
+    pub fn node_registry(&self) -> &Arc<dyn NodeRegistry> {
+        &self.node_registry
+    }
+
+    /// Get a reference to the checkpoint manager
+    pub fn checkpoint_manager(&self) -> &Arc<CheckpointManager> {
+        &self.checkpoint_manager
+    }
+
+    /// Get a reference to the object storage
+    pub fn object_storage(&self) -> &Arc<dyn ObjectStorage> {
+        &self.object_storage
+    }
+
+    /// Get a reference to the deduplication manager
+    pub fn deduplication_manager(&self) -> &Arc<DeduplicationManager> {
+        &self.deduplication_manager
+    }
+
+    /// Get the recovery configuration
+    pub fn recovery_config(&self) -> &RecoveryConfig {
+        &self.recovery_config
+    }
+
+    /// Get the cluster ID
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    /// Get the node ID
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 }
 

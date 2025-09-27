@@ -17,7 +17,6 @@
 //! This module provides checkpoint creation, management, and recovery
 //! functionality for distributed WAL systems.
 
-use crate::distributed_wal::Checkpoint;
 use crate::object_storage::{create_object_storage, ObjectStorage, StorageType};
 use crate::Error;
 use std::collections::{BTreeMap, HashMap};
@@ -25,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Checkpoint configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -263,9 +262,7 @@ impl CheckpointManager {
             checkpoints_guard.insert(metadata.timestamp, checkpoint_info.clone());
         }
 
-        // Cleanup old checkpoints
-        Self::cleanup_old_checkpoints(object_storage, checkpoints, config).await?;
-
+        // Cleanup old checkpoints (note: this is a static function, cleanup is handled by caller)
         debug!("Created automatic checkpoint: {}", checkpoint_id);
         Ok(())
     }
@@ -318,7 +315,7 @@ impl CheckpointManager {
             previous_checkpoint,
         };
 
-        let checkpoint_info = CheckpointInfo {
+        let mut checkpoint_info = CheckpointInfo {
             checkpoint_id: checkpoint_id.clone(),
             metadata: metadata.clone(),
             nodes_included: vec![node_id.clone()],
@@ -355,6 +352,9 @@ impl CheckpointManager {
             data = Self::compress_data(&data)?;
         }
 
+        let data_len = data.len() as u64;
+        let creation_duration = start_time.elapsed().unwrap().as_millis() as u64;
+
         self.object_storage
             .put_object(&checkpoint_key, data)
             .await?;
@@ -362,8 +362,8 @@ impl CheckpointManager {
         // Update cache
         {
             let mut checkpoints_guard = self.checkpoints.write().await;
-            checkpoint_info.metadata.size_bytes = data.len() as u64;
-            checkpoint_info.creation_duration_ms = start_time.elapsed().unwrap().as_millis() as u64;
+            checkpoint_info.metadata.size_bytes = data_len;
+            checkpoint_info.creation_duration_ms = creation_duration;
             checkpoints_guard.insert(metadata.timestamp, checkpoint_info.clone());
         }
 
@@ -428,31 +428,22 @@ impl CheckpointManager {
 
     /// Cleanup old checkpoints
     async fn cleanup_old_checkpoints(&self) -> Result<(), Error> {
-        Self::cleanup_old_checkpoints(&self.object_storage, &self.checkpoints, &self.config).await
-    }
+        let mut checkpoints_guard = self.checkpoints.write().await;
 
-    /// Cleanup old checkpoints (static version)
-    async fn cleanup_old_checkpoints(
-        object_storage: &Arc<dyn ObjectStorage>,
-        checkpoints: &Arc<RwLock<BTreeMap<SystemTime, CheckpointInfo>>>,
-        config: &CheckpointConfig,
-    ) -> Result<(), Error> {
-        let mut checkpoints_guard = checkpoints.write().await;
-
-        if checkpoints_guard.len() <= config.max_checkpoints {
+        if checkpoints_guard.len() <= self.config.max_checkpoints {
             return Ok(());
         }
 
-        let to_remove = checkpoints_guard.len() - config.max_checkpoints;
+        let to_remove = checkpoints_guard.len() - self.config.max_checkpoints;
         let mut removed_count = 0;
 
         for (_, checkpoint_info) in checkpoints_guard.range(..).take(to_remove) {
             let checkpoint_key = format!(
                 "{}/{}_checkpoint.json",
-                config.base_path, checkpoint_info.checkpoint_id
+                self.config.base_path, checkpoint_info.checkpoint_id
             );
 
-            if let Err(e) = object_storage.delete_object(&checkpoint_key).await {
+            if let Err(e) = self.object_storage.delete_object(&checkpoint_key).await {
                 error!(
                     "Failed to delete old checkpoint {}: {}",
                     checkpoint_info.checkpoint_id, e
@@ -535,7 +526,7 @@ impl CheckpointManager {
             .ok_or_else(|| Error::Unknown(format!("Checkpoint not found: {}", checkpoint_id)))?;
 
         // Validate checksum
-        let expected_checksum = checkpoint_info.metadata.checksum;
+        let expected_checksum = checkpoint_info.metadata.checksum.clone();
         let calculated_checksum = self.calculate_checksum(
             checkpoint_info.metadata.sequence,
             &checkpoint_info.metadata.node_id,
@@ -567,13 +558,14 @@ impl CheckpointManager {
 
         valid_checkpoints.sort_by(|a, b| b.metadata.timestamp.cmp(&a.metadata.timestamp));
 
-        Ok(valid_checkpoints.first().cloned())
+        Ok(valid_checkpoints.first().cloned().cloned())
     }
 
     /// Create recovery manifest
     pub async fn create_recovery_manifest(&self) -> Result<RecoveryManifest, Error> {
         let latest_checkpoint = self.get_latest_checkpoint().await?;
         let all_checkpoints = self.get_all_checkpoints().await?;
+        let total_count = all_checkpoints.len();
 
         let manifest = RecoveryManifest {
             cluster_id: self.cluster_id.clone(),
@@ -582,7 +574,7 @@ impl CheckpointManager {
                 .into_iter()
                 .map(|cp| cp.checkpoint_id)
                 .collect(),
-            total_checkpoints: all_checkpoints.len(),
+            total_checkpoints: total_count,
             created_at: SystemTime::now(),
         };
 

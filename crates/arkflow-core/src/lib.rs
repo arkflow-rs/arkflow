@@ -32,6 +32,8 @@ pub mod cli;
 pub mod codec;
 pub mod config;
 pub mod distributed_ack_config;
+pub mod distributed_ack_init;
+pub mod distributed_ack_integration;
 pub mod distributed_ack_processor;
 pub mod distributed_wal;
 pub mod engine;

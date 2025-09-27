@@ -19,7 +19,7 @@
 
 use crate::object_storage::{create_object_storage, ObjectStorage, StorageType};
 use crate::reliable_ack::{AckRecord, AckTask, AckWAL};
-use crate::{Error, ReliableAckProcessorMetrics};
+use crate::Error;
 use flume::{Receiver, Sender};
 use md5::{Digest, Md5};
 use std::collections::{HashMap, HashSet};
@@ -241,6 +241,7 @@ impl DistributedWAL {
         let node_id = self.node_id.clone();
 
         // Start upload worker
+        let config_for_upload = config.clone();
         self.task_tracker.spawn(async move {
             Self::upload_worker(
                 upload_receiver,
@@ -248,7 +249,7 @@ impl DistributedWAL {
                 metrics,
                 state,
                 cancellation_token,
-                config,
+                config_for_upload,
                 base_path,
                 node_id,
             )
@@ -256,7 +257,7 @@ impl DistributedWAL {
         });
 
         // Start periodic uploader
-        if self.config.upload_interval_ms > 0 {
+        if config.upload_interval_ms > 0 {
             let local_wal = self.local_wal.clone();
             let sequence_counter = self.sequence_counter.clone();
             let upload_queue = self.upload_queue.clone();

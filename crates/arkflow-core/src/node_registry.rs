@@ -19,6 +19,7 @@
 
 use crate::object_storage::{create_object_storage, ObjectStorage, StorageType};
 use crate::Error;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -404,7 +405,7 @@ impl NodeRegistry for ObjectStorageNodeRegistry {
 
     async fn get_active_nodes(&self) -> Result<Vec<NodeInfo>, Error> {
         let nodes = self.load_nodes().await?;
-        let active_nodes = nodes
+        let active_nodes: Vec<NodeInfo> = nodes
             .into_iter()
             .filter(|node| self.is_node_alive_internal(node))
             .collect();
@@ -412,7 +413,7 @@ impl NodeRegistry for ObjectStorageNodeRegistry {
         // Update local cache
         {
             let mut local_nodes = self.local_nodes.write().await;
-            for node in &active_nodes {
+            for node in active_nodes.iter() {
                 local_nodes.insert(node.node_id.clone(), node.clone());
             }
         }
@@ -550,6 +551,16 @@ impl NodeRegistryManager {
         self.task_tracker.wait().await;
 
         Ok(())
+    }
+
+    /// Get a reference to the node registry
+    pub fn registry(&self) -> &Arc<dyn NodeRegistry> {
+        &self.registry
+    }
+
+    /// Get the node ID
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 }
 

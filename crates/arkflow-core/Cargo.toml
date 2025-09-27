@@ -37,8 +37,10 @@ aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 azure_storage = { version = "0.20" }
 azure_storage_blobs = { version = "0.20" }
 google-cloud-storage = { version = "0.15", default-features = false, features = ["auth"] }
+http = "1.1"
 md-5 = "0.10"
 base64 = "0.22"
 crc32fast = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1.0"
+log = "0.4"
