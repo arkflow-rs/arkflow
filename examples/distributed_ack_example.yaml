@@ -1,0 +1,104 @@
+# Distributed Acknowledgment Configuration Example
+# This example shows how to configure distributed acknowledgment processing
+# with object storage backing for high availability and fault tolerance.
+
+logging:
+  level: debug
+  format: json
+
+streams:
+  - input:
+      type: kafka
+      name: kafka-input
+      config:
+        brokers:
+          - localhost:9092
+        topics:
+          - test-topic
+        consumer_group: test-group
+        client_id: rsflow-distributed
+        start_from_latest: true
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: "SELECT * FROM flow"
+        - type: arrow_to_json
+
+    output:
+      type: kafka
+      name: kafka-output
+      config:
+        brokers:
+          - localhost:9092
+        topic:
+          type: value
+          value: test-topic-distributed
+        client_id: rsflow-distributed-output
+
+    # Distributed acknowledgment configuration
+    distributed_ack:
+      enabled: true
+
+      # Cluster identification
+      cluster_id: "production-cluster"
+
+      # Node identification (optional - will auto-generate if not provided)
+      node_id: "node-1"
+
+      # Object storage configuration
+      storage:
+        type: "s3"
+        config:
+          bucket: "arkflow-wal"
+          region: "us-east-1"
+          endpoint: "https://s3.amazonaws.com"
+          access_key_id: "your-access-key"
+          secret_access_key: "your-secret-key"
+
+      # Distributed WAL configuration
+      wal:
+        local_wal_path: "/var/lib/arkflow/local_wal"
+        local_wal_size_limit: 1073741824  # 1GB
+        upload_batch_size: 100
+        upload_interval_ms: 30000  # 30 seconds
+        max_retry_attempts: 5
+        enable_auto_recovery: true
+        enable_metrics: true
+
+      # Checkpoint configuration
+      checkpoint:
+        checkpoint_interval_ms: 300000  # 5 minutes
+        max_checkpoints: 10
+        auto_checkpoint: true
+        enable_compression: true
+
+      # Recovery configuration
+      recovery:
+        recovery_strategy: "FromLatestCheckpoint"
+        recovery_batch_size: 1000
+        enable_consistency_check: true
+        recovery_timeout_ms: 300000  # 5 minutes
+        enable_deduplication: true
+        duplicate_tracking_age_hours: 48
+
+      # Node registry configuration
+      node_registry:
+        coordinator:
+          type: "object_storage"
+          heartbeat_interval_ms: 30000  # 30 seconds
+          node_timeout_ms: 90000  # 90 seconds
+          cleanup_interval_ms: 60000  # 60 seconds
+
+        node_info:
+          address: "192.168.1.100"  # Optional - will auto-detect if not provided
+          port: 8080  # Optional
+          capabilities:
+            - "ack_processing"
+            - "stream_processing"
+          metadata:
+            environment: "production"
+            datacenter: "us-east-1"
+            version: "1.0.0"
