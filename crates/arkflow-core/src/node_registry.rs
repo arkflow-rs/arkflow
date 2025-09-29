@@ -23,10 +23,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Node information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,7 +578,7 @@ pub async fn create_node_registry(
             let registry = InMemoryNodeRegistry::new(cluster_id).await?;
             Ok(Arc::new(registry))
         }
-        CoordinatorType::ZooKeeper(config) => {
+        CoordinatorType::ZooKeeper(_config) => {
             return Err(Error::Unknown(
                 "ZooKeeper coordinator not yet implemented".to_string(),
             ));

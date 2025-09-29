@@ -18,11 +18,11 @@
 //! data in object storage for high availability and fault tolerance.
 
 use crate::object_storage::{create_object_storage, ObjectStorage, StorageType};
-use crate::reliable_ack::{AckRecord, AckTask, AckWAL};
+use crate::reliable_ack::{AckRecord, AckWAL};
 use crate::Error;
 use flume::{Receiver, Sender};
 use md5::{Digest, Md5};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -201,7 +201,7 @@ impl DistributedWAL {
             .clone()
             .unwrap_or_else(|| "wal".to_string());
 
-        let mut wal = Self {
+        let wal = Self {
             node_id: config.node_id.clone(),
             cluster_id: config.cluster_id.clone(),
             local_wal,
@@ -469,12 +469,12 @@ impl DistributedWAL {
 
     /// Periodic upload worker
     async fn periodic_upload_worker(
-        local_wal: Arc<AckWAL>,
+        _local_wal: Arc<AckWAL>,
         sequence_counter: Arc<AtomicU64>,
-        upload_queue: Sender<WALUploadTask>,
+        _upload_queue: Sender<WALUploadTask>,
         cancellation_token: CancellationToken,
         interval: Duration,
-        node_id: String,
+        _node_id: String,
     ) {
         let mut last_sequence = 0;
 
@@ -502,7 +502,7 @@ impl DistributedWAL {
 
     /// Append a record to the distributed WAL
     pub async fn append(&self, record: &AckRecord) -> Result<(), Error> {
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
 
         // Generate unique global ID
         let global_id = self.generate_global_id(record);

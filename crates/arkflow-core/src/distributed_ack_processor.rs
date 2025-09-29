@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
-const MAX_RETRIES: u32 = 5;
+const _MAX_RETRIES: u32 = 5;
 const RETRY_DELAY_MS: u64 = 1000;
 const ACK_TIMEOUT_MS: u64 = 10000;
 const BATCH_SIZE: usize = 50;
@@ -42,24 +42,25 @@ const BACKPRESSURE_THRESHOLD: usize = 3000;
 
 /// Distributed acknowledgment processor
 pub struct DistributedAckProcessor {
-    node_id: String,
-    cluster_id: String,
-    ack_sender: Sender<AckTask>,
-    metrics: DistributedAckProcessorMetrics,
-    sequence_counter: Arc<AtomicU64>,
-    backpressure_active: Arc<AtomicBool>,
+    pub node_id: String,
+    pub cluster_id: String,
+    pub ack_sender: Sender<AckTask>,
+    pub metrics: DistributedAckProcessorMetrics,
+    pub enhanced_metrics: Arc<crate::enhanced_metrics::EnhancedMetrics>,
+    pub sequence_counter: Arc<AtomicU64>,
+    pub backpressure_active: Arc<AtomicBool>,
 
     // Distributed components
-    distributed_wal: Option<Arc<DistributedWAL>>,
-    checkpoint_manager: Option<Arc<CheckpointManager>>,
-    node_registry_manager: Option<Arc<NodeRegistryManager>>,
-    recovery_manager: Option<Arc<RecoveryManager>>,
+    pub distributed_wal: Option<Arc<DistributedWAL>>,
+    pub checkpoint_manager: Option<Arc<CheckpointManager>>,
+    pub node_registry_manager: Option<Arc<NodeRegistryManager>>,
+    pub recovery_manager: Option<Arc<RecoveryManager>>,
 
     // Configuration
-    config: DistributedAckConfig,
+    pub config: DistributedAckConfig,
 
     // Fallback local processor for non-distributed mode
-    fallback_processor: Option<Arc<crate::reliable_ack::ReliableAckProcessor>>,
+    pub fallback_processor: Option<Arc<crate::reliable_ack::ReliableAckProcessor>>,
 }
 
 /// Enhanced metrics for distributed acknowledgment processor
@@ -128,7 +129,8 @@ impl DistributedAckProcessor {
         let node_id = config.get_node_id();
         let cluster_id = config.cluster_id.clone();
 
-        // Initialize base metrics
+        // Initialize base metrics with enhanced metrics
+        let enhanced_metrics = crate::enhanced_metrics::EnhancedMetrics::new();
         let metrics = DistributedAckProcessorMetrics::default();
         let sequence_counter = Arc::new(AtomicU64::new(0));
         let backpressure_active = Arc::new(AtomicBool::new(false));
@@ -141,6 +143,7 @@ impl DistributedAckProcessor {
             cluster_id: cluster_id.clone(),
             ack_sender,
             metrics: metrics.clone(),
+            enhanced_metrics: Arc::new(enhanced_metrics),
             sequence_counter,
             backpressure_active: backpressure_active.clone(),
             distributed_wal: None,
@@ -173,7 +176,7 @@ impl DistributedAckProcessor {
             ack_receiver,
             metrics: metrics.clone(),
             cancellation_token: cancellation_token.clone(),
-            distributed_wal: processor.distributed_wal.clone(),
+            _distributed_wal: processor.distributed_wal.clone(),
             backpressure_active: backpressure_active.clone(),
         };
 
@@ -196,8 +199,8 @@ impl DistributedAckProcessor {
     /// Initialize distributed components
     async fn initialize_distributed_components(
         &mut self,
-        tracker: &TaskTracker,
-        cancellation_token: CancellationToken,
+        _tracker: &TaskTracker,
+        _cancellation_token: CancellationToken,
     ) -> Result<(), Error> {
         info!(
             "Initializing distributed components for node: {}",
@@ -205,19 +208,45 @@ impl DistributedAckProcessor {
         );
 
         // Initialize distributed WAL
+        self.init_distributed_wal().await?;
+
+        // Initialize checkpoint manager
+        self.init_checkpoint_manager().await?;
+
+        // Initialize node registry and manager
+        let node_registry = self.init_node_registry().await?;
+
+        // Initialize recovery manager
+        self.init_recovery_manager(node_registry).await?;
+
+        info!("Distributed components initialized successfully");
+        Ok(())
+    }
+
+    /// Initialize distributed WAL
+    async fn init_distributed_wal(&mut self) -> Result<(), Error> {
         let mut wal_config = self.config.wal.clone();
         wal_config.node_id = self.node_id.clone();
         wal_config.cluster_id = self.cluster_id.clone();
 
         let distributed_wal = Arc::new(DistributedWAL::new(wal_config).await?);
-        self.distributed_wal = Some(distributed_wal.clone());
+        self.distributed_wal = Some(distributed_wal);
+        Ok(())
+    }
 
-        // Initialize checkpoint manager
-        let mut checkpoint_config = self.config.checkpoint.clone();
+    /// Initialize checkpoint manager
+    async fn init_checkpoint_manager(&mut self) -> Result<(), Error> {
+        let checkpoint_config = self.config.checkpoint.clone();
         let checkpoint_manager =
             Arc::new(CheckpointManager::new(self.cluster_id.clone(), checkpoint_config).await?);
-        self.checkpoint_manager = Some(checkpoint_manager.clone());
+        self.checkpoint_manager = Some(checkpoint_manager);
+        Ok(())
+    }
 
+    /// Initialize node registry and manager
+    async fn init_node_registry(
+        &mut self,
+    ) -> Result<Arc<dyn crate::node_registry::NodeRegistry>, Error> {
         // Initialize node registry
         let node_registry = create_node_registry(
             self.config.node_registry.coordinator_type.clone(),
@@ -226,24 +255,7 @@ impl DistributedAckProcessor {
         .await?;
 
         // Create node info
-        let node_info = NodeInfo {
-            node_id: self.node_id.clone(),
-            cluster_id: self.cluster_id.clone(),
-            address: self.config.node_registry.node_info.address.clone(),
-            port: self.config.node_registry.node_info.port,
-            last_heartbeat: SystemTime::now(),
-            status: NodeStatus::Starting,
-            capabilities: self
-                .config
-                .node_registry
-                .node_info
-                .capabilities
-                .clone()
-                .into_iter()
-                .collect(),
-            metadata: self.config.node_registry.node_info.metadata.clone(),
-            started_at: SystemTime::now(),
-        };
+        let node_info = self.create_node_info()?;
 
         // Initialize node registry manager
         let coordinator_config = match &self.config.node_registry.coordinator_type {
@@ -265,12 +277,46 @@ impl DistributedAckProcessor {
         // Register node and start heartbeat
         node_registry_manager.start(node_info).await?;
 
-        // Initialize recovery manager
+        Ok(node_registry)
+    }
+
+    /// Create node information structure
+    fn create_node_info(&self) -> Result<NodeInfo, Error> {
+        Ok(NodeInfo {
+            node_id: self.node_id.clone(),
+            cluster_id: self.cluster_id.clone(),
+            address: self.config.node_registry.node_info.address.clone(),
+            port: self.config.node_registry.node_info.port,
+            last_heartbeat: SystemTime::now(),
+            status: NodeStatus::Starting,
+            capabilities: self
+                .config
+                .node_registry
+                .node_info
+                .capabilities
+                .clone()
+                .into_iter()
+                .collect(),
+            metadata: self.config.node_registry.node_info.metadata.clone(),
+            started_at: SystemTime::now(),
+        })
+    }
+
+    /// Initialize recovery manager
+    async fn init_recovery_manager(
+        &mut self,
+        node_registry: Arc<dyn crate::node_registry::NodeRegistry>,
+    ) -> Result<(), Error> {
+        let checkpoint_manager = self
+            .checkpoint_manager
+            .clone()
+            .ok_or_else(|| Error::Unknown("Checkpoint manager not initialized".to_string()))?;
+
         let recovery_manager = Arc::new(
             RecoveryManager::new(
                 self.cluster_id.clone(),
                 self.node_id.clone(),
-                checkpoint_manager.clone(),
+                checkpoint_manager,
                 node_registry,
                 self.config.recovery.clone(),
             )
@@ -278,8 +324,6 @@ impl DistributedAckProcessor {
         );
 
         self.recovery_manager = Some(recovery_manager);
-
-        info!("Distributed components initialized successfully");
         Ok(())
     }
 
@@ -292,13 +336,31 @@ impl DistributedAckProcessor {
         info!("Starting background tasks for distributed acknowledgment processor");
 
         // Start metrics collection task
+        self.start_metrics_collection_task(tracker, cancellation_token.clone())
+            .await?;
+
+        // Start periodic checkpoint creation if enabled
+        self.start_periodic_checkpoint_task(tracker, cancellation_token.clone())
+            .await?;
+
+        // Start periodic consistency checking if enabled
+        self.start_consistency_check_task(tracker, cancellation_token)
+            .await?;
+
+        info!("Background tasks started successfully");
+        Ok(())
+    }
+
+    /// Start metrics collection task
+    async fn start_metrics_collection_task(
+        &self,
+        tracker: &TaskTracker,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Error> {
         let metrics = self.metrics.clone();
         let checkpoint_manager = self.checkpoint_manager.clone();
         let recovery_manager = self.recovery_manager.clone();
         let distributed_wal = self.distributed_wal.clone();
-        let cancellation_token1 = cancellation_token.clone();
-        let cancellation_token2 = cancellation_token.clone();
-        let cancellation_token3 = cancellation_token.clone();
 
         tracker.spawn(async move {
             Self::metrics_collection_task(
@@ -306,53 +368,54 @@ impl DistributedAckProcessor {
                 checkpoint_manager,
                 recovery_manager,
                 distributed_wal,
-                cancellation_token1,
+                cancellation_token,
             )
             .await;
         });
 
-        // Start periodic checkpoint creation if enabled
+        Ok(())
+    }
+
+    /// Start periodic checkpoint creation task
+    async fn start_periodic_checkpoint_task(
+        &self,
+        tracker: &TaskTracker,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Error> {
         if let Some(checkpoint_manager) = &self.checkpoint_manager {
-            let metrics = self.metrics.clone();
-            let node_id = self.node_id.clone();
             let checkpoint_manager_clone = checkpoint_manager.clone();
 
             tracker.spawn(async move {
-                Self::periodic_checkpoint_task(
-                    checkpoint_manager_clone,
-                    metrics,
-                    node_id,
-                    cancellation_token2,
-                )
-                .await;
+                Self::periodic_checkpoint_task(checkpoint_manager_clone, cancellation_token).await;
             });
         }
 
-        // Start periodic consistency checking if enabled
+        Ok(())
+    }
+
+    /// Start consistency check task
+    async fn start_consistency_check_task(
+        &self,
+        tracker: &TaskTracker,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Error> {
         if self.config.recovery.enable_consistency_check {
             if let Some(recovery_manager) = &self.recovery_manager {
-                let metrics = self.metrics.clone();
                 let recovery_manager_clone = recovery_manager.clone();
 
                 tracker.spawn(async move {
-                    Self::consistency_check_task(
-                        recovery_manager_clone,
-                        metrics,
-                        cancellation_token3,
-                    )
-                    .await;
+                    Self::consistency_check_task(recovery_manager_clone, cancellation_token).await;
                 });
             }
         }
 
-        info!("Background tasks started successfully");
         Ok(())
     }
 
     /// Submit acknowledgment to distributed processor
     pub async fn submit_ack(
         &self,
-        ack_id: String,
+        _ack_id: String,
         ack_type: String,
         ack: Arc<dyn Ack>,
     ) -> Result<(), Error> {
@@ -423,7 +486,7 @@ impl DistributedAckProcessor {
                 }
             }
         } else if let Some(ref fallback) = self.fallback_processor {
-            let record = task.to_record();
+            let _record = task.to_record();
             // For fallback mode, we just send to the fallback processor
             return fallback
                 .ack(
@@ -620,7 +683,7 @@ impl DistributedAckProcessor {
     /// Metrics collection task
     async fn metrics_collection_task(
         metrics: DistributedAckProcessorMetrics,
-        checkpoint_manager: Option<Arc<CheckpointManager>>,
+        _checkpoint_manager: Option<Arc<CheckpointManager>>,
         recovery_manager: Option<Arc<RecoveryManager>>,
         distributed_wal: Option<Arc<DistributedWAL>>,
         cancellation_token: CancellationToken,
@@ -658,8 +721,6 @@ impl DistributedAckProcessor {
     /// Periodic checkpoint task
     async fn periodic_checkpoint_task(
         checkpoint_manager: Arc<CheckpointManager>,
-        metrics: DistributedAckProcessorMetrics,
-        node_id: String,
         cancellation_token: CancellationToken,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
@@ -689,7 +750,6 @@ impl DistributedAckProcessor {
     /// Consistency check task
     async fn consistency_check_task(
         recovery_manager: Arc<RecoveryManager>,
-        metrics: DistributedAckProcessorMetrics,
         cancellation_token: CancellationToken,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(600)); // 10 minutes
@@ -734,7 +794,7 @@ struct DistributedAckProcessorWorker {
     ack_receiver: Receiver<AckTask>,
     metrics: DistributedAckProcessorMetrics,
     cancellation_token: CancellationToken,
-    distributed_wal: Option<Arc<DistributedWAL>>,
+    _distributed_wal: Option<Arc<DistributedWAL>>,
     backpressure_active: Arc<AtomicBool>,
 }
 

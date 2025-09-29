@@ -1,0 +1,1 @@
+{"node_id":"test-node-984905ed","cluster_id":"test-cluster","address":"127.0.0.1","port":8080,"last_heartbeat":{"secs_since_epoch":1759139466,"nanos_since_epoch":670828000},"status":"Starting","capabilities":["ack_processing","test"],"metadata":{"environment":"testing"},"started_at":{"secs_since_epoch":1759139466,"nanos_since_epoch":670835000}}

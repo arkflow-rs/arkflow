@@ -20,7 +20,6 @@
 use crate::Error;
 use async_trait::async_trait;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use http;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -161,7 +160,7 @@ pub async fn create_object_storage(
 pub struct S3Storage {
     client: aws_sdk_s3::Client,
     bucket: String,
-    endpoint: Option<String>,
+    _endpoint: Option<String>,
 }
 
 impl S3Storage {
@@ -181,10 +180,10 @@ impl S3Storage {
 
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
 
-        // TODO: Fix AWS S3 endpoint configuration - API compatibility issues
-        // if let Some(endpoint) = &config.endpoint {
-        //     s3_config = s3_config.endpoint_resolver(...);
-        // }
+        // Configure custom endpoint if provided
+        if let Some(endpoint) = &config.endpoint {
+            s3_config = s3_config.endpoint_url(endpoint);
+        }
 
         if let Some(use_path_style) = config.use_path_style {
             s3_config = s3_config.force_path_style(use_path_style);
@@ -195,7 +194,7 @@ impl S3Storage {
         Ok(Self {
             client,
             bucket: config.bucket,
-            endpoint: config.endpoint,
+            _endpoint: config.endpoint,
         })
     }
 
@@ -382,8 +381,9 @@ impl ObjectStorage for S3Storage {
 
 /// Azure Blob Storage implementation
 pub struct AzureStorage {
-    connection_string: String,
-    container: String,
+    _connection_string: String,
+    _container: String,
+    _client: Arc<()>, // Placeholder for Azure storage client
 }
 
 impl AzureStorage {
@@ -392,55 +392,57 @@ impl AzureStorage {
             Error::Unknown("Azure storage configuration requires connection_string".to_string())
         })?;
 
+        // Create a simple placeholder client for now
+        // This can be replaced with actual Azure SDK implementation later
         Ok(Self {
-            connection_string,
-            container: config.container,
+            _connection_string: connection_string,
+            _container: config.container,
+            _client: Arc::new(()), // Placeholder
         })
     }
 }
 
 #[async_trait]
 impl ObjectStorage for AzureStorage {
-    async fn put_object(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
-        // TODO: Implement Azure Blob Storage integration
+    async fn put_object(&self, _key: &str, _data: Vec<u8>) -> Result<(), Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, Error> {
+    async fn get_object(&self, _key: &str) -> Result<Vec<u8>, Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, Error> {
+    async fn exists(&self, _key: &str) -> Result<bool, Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn delete_object(&self, key: &str) -> Result<(), Error> {
+    async fn delete_object(&self, _key: &str) -> Result<(), Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
+    async fn list_objects(&self, _prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn get_object_info(&self, key: &str) -> Result<ObjectInfo, Error> {
+    async fn get_object_info(&self, _key: &str) -> Result<ObjectInfo, Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 
-    async fn copy_object(&self, source: &str, destination: &str) -> Result<(), Error> {
+    async fn copy_object(&self, _source: &str, _destination: &str) -> Result<(), Error> {
         Err(Error::Unknown(
-            "Azure storage not yet implemented".to_string(),
+            "Azure storage not implemented yet".to_string(),
         ))
     }
 

@@ -56,7 +56,7 @@ struct TemporaryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BallistaConfig {
+struct _BallistaConfig {
     /// Ballista server url
     remote_url: String,
 }

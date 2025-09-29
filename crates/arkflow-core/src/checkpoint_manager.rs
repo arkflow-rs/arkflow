@@ -413,7 +413,7 @@ impl CheckpointManager {
     }
 
     /// Decompress data
-    fn decompress_data(compressed_data: &[u8]) -> Result<Vec<u8>, Error> {
+    fn _decompress_data(compressed_data: &[u8]) -> Result<Vec<u8>, Error> {
         use flate2::read::GzDecoder;
         use std::io::Read;
 

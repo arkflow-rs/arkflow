@@ -1,0 +1,88 @@
+# 开发环境分布式 ACK 配置
+# 简化的配置，便于本地开发和测试
+
+logging:
+  level: "debug"
+  format: "plain"
+
+streams:
+  - name: "dev-test-stream"
+    input:
+      type: "kafka"
+      name: "dev-kafka-input"
+      config:
+        brokers: ["localhost:9092"]
+        topics: ["test-topic"]
+        consumer_group: "dev-group"
+        client_id: "arkflow-dev"
+        start_from_latest: true
+
+    pipeline:
+      thread_num: 1
+      processors:
+        - type: "json_to_arrow"
+        - type: "sql"
+          query: "SELECT * FROM flow"
+        - type: "arrow_to_json"
+
+    output:
+      type: "kafka"
+      name: "dev-kafka-output"
+      config:
+        brokers: ["localhost:9092"]
+        topic: "test-topic-output"
+        client_id: "arkflow-dev-output"
+
+    # 简化的分布式 ACK 配置
+    distributed_ack:
+      enabled: true
+      cluster_id: "dev-cluster"
+
+      # 使用本地存储进行开发测试
+      storage:
+        type: "local"
+        config:
+          base_path: "./dev-data/distributed-storage"
+
+      # 本地 WAL 配置
+      wal:
+        local_wal_path: "./dev-data/local-wal"
+        local_wal_size_limit: 104857600  # 100MB
+        upload_batch_size: 10
+        upload_interval_ms: 5000  # 5秒
+        max_retry_attempts: 3
+        enable_auto_recovery: true
+        enable_metrics: true
+
+      # 检查点配置
+      checkpoint:
+        checkpoint_interval_ms: 60000  # 1分钟
+        max_checkpoints: 3
+        auto_checkpoint: true
+        enable_compression: false  # 开发时不压缩，便于调试
+
+      # 恢复配置
+      recovery:
+        recovery_strategy: "FromLatestCheckpoint"
+        recovery_batch_size: 100
+        enable_consistency_check: true
+        recovery_timeout_ms: 60000  # 1分钟
+        enable_deduplication: true
+        duplicate_tracking_age_hours: 1  # 开发时较短
+        auto_recovery: true
+
+      # 节点注册表配置
+      node_registry:
+        coordinator:
+          type: "object_storage"
+          heartbeat_interval_ms: 10000  # 10秒，便于开发调试
+          node_timeout_ms: 30000  # 30秒
+          cleanup_interval_ms: 30000  # 30秒
+
+        node_info:
+          capabilities:
+            - "ack_processing"
+            - "development"
+          metadata:
+            environment: "development"
+            developer: "local-dev"

@@ -114,17 +114,17 @@ impl Input for DistributedAckInput {
 /// Processor wrapper that adds distributed acknowledgment support
 pub struct DistributedAckProcessorWrapper {
     inner: Arc<dyn Processor>,
-    distributed_processor: Arc<DistributedAckProcessor>,
+    _distributed_processor: Arc<DistributedAckProcessor>,
 }
 
 impl DistributedAckProcessorWrapper {
     pub fn new(
         processor: Arc<dyn Processor>,
-        distributed_processor: Arc<DistributedAckProcessor>,
+        _distributed_processor: Arc<DistributedAckProcessor>,
     ) -> Self {
         Self {
             inner: processor,
-            distributed_processor,
+            _distributed_processor,
         }
     }
 }

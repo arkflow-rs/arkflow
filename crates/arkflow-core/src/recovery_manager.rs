@@ -17,13 +17,12 @@
 //! This module provides comprehensive data recovery, deduplication, and
 //! consistency checking functionality for distributed WAL systems.
 
-use crate::checkpoint_manager::{CheckpointInfo, CheckpointManager, RecoveryManifest};
-use crate::distributed_wal::DistributedWAL;
-use crate::node_registry::{NodeInfo, NodeRegistry};
+use crate::checkpoint_manager::CheckpointManager;
+use crate::node_registry::NodeRegistry;
 use crate::object_storage::{create_object_storage, ObjectStorage, StorageType};
 use crate::reliable_ack::AckRecord;
-use crate::{distributed_wal::Checkpoint, Error};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::Error;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -137,7 +136,7 @@ pub struct RecoveryStatistics {
 pub struct DeduplicationManager {
     processed_ids: Arc<RwLock<HashSet<String>>>,
     recovery_config: RecoveryConfig,
-    max_age: Duration,
+    _max_age: Duration,
 }
 
 impl DeduplicationManager {
@@ -148,7 +147,7 @@ impl DeduplicationManager {
         Self {
             processed_ids: Arc::new(RwLock::new(HashSet::new())),
             recovery_config,
-            max_age,
+            _max_age: max_age,
         }
     }
 

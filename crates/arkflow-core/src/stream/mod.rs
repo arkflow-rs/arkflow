@@ -588,7 +588,7 @@ impl StreamConfig {
         };
 
         // Check if distributed ack is enabled (takes precedence over reliable ack)
-        if let Some(distributed_ack_config) = &self.distributed_ack {
+        if let Some(_distributed_ack_config) = &self.distributed_ack {
             // For now, log that distributed acknowledgment is configured but not fully implemented
             println!("⚠️  Distributed acknowledgment is configured but not yet fully implemented");
             println!("   Available integration options:");

@@ -367,7 +367,7 @@ impl DistributedAckConfig {
             },
             node_registry: NodeRegistryConfig {
                 coordinator_type: CoordinatorType::ObjectStorage(ObjectStorageCoordinatorConfig {
-                    storage_type: storage_type,
+                    storage_type,
                     base_path: format!("{}/coordinator", base_path),
                     heartbeat_interval_ms: 30000, // 30 seconds
                     node_timeout_ms: 90000,       // 90 seconds

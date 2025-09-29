@@ -20,7 +20,7 @@ use crate::distributed_ack_config::DistributedAckConfig;
 use crate::distributed_ack_integration::DistributedAckBuilder;
 use crate::distributed_ack_processor::DistributedAckProcessor;
 use crate::input::{Input, InputBuilder};
-use crate::{Error, MessageBatch, Resource};
+use crate::{Error, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub struct DistributedAckInputBuilder;
 impl InputBuilder for DistributedAckInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        _name: Option<&String>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
