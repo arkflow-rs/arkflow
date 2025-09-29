@@ -73,7 +73,7 @@ sqlx = { workspace = true }
 tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 
 # NATS
-async-nats = "0.42"
+async-nats = "0.43"
 
 # Pulsar
 pulsar = "6.3"

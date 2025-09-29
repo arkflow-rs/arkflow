@@ -9,6 +9,13 @@ streams:
       type: "http"
       address: '0.0.0.0:8090'
       path: '/'
+      auth:
+        type: "bearer"
+        token: "123456"
+#        type: "basic"
+#        username: "admin"
+#        password: "admin"
+
 
 
     pipeline:
