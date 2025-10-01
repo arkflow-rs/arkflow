@@ -86,3 +86,5 @@ pub fn register_processor_builder(
     builders.insert(type_name.to_string(), builder);
     Ok(())
 }
+
+pub mod distributed_ack_processor;

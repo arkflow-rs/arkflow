@@ -1,0 +1,42 @@
+logging:
+  level: debug
+streams:
+  - input:
+      type: kafka
+      name: kafka-input
+      config:
+        brokers:
+          - localhost:9092
+        topics:
+          - test-topic
+        consumer_group: test-group
+        client_id: rsflow-reliable
+        start_from_latest: true
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: "SELECT * FROM flow"
+        - type: arrow_to_json
+
+    output:
+      type: kafka
+      name: kafka-output
+      config:
+        brokers:
+          - localhost:9092
+        topic:
+          type: value
+          value: test-topic-reliable
+        client_id: rsflow-reliable-output
+
+    # 可靠确认配置
+    reliable_ack:
+      enabled: true
+      wal_path: "./reliable_ack.wal"
+      max_pending_acks: 5000
+      max_retries: 5
+      retry_delay_ms: 1000
+      enable_backpressure: true
