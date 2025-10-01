@@ -291,7 +291,7 @@ dependencies = [
  "protobuf-parse",
  "pulsar",
  "pyo3",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rdkafka",
  "rdkafka-sys",
  "redis",
