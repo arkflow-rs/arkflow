@@ -76,7 +76,7 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 async-nats = "0.43"
 
 # Pulsar
-pulsar = "6.3"
+pulsar = "6.4"
 rand = "0.9"
 
 
