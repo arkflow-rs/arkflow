@@ -51,6 +51,11 @@ pub trait Input: Send + Sync {
 
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;
+
+    /// Check if the input source is ready and healthy
+    async fn check_ready(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct NoopAck;

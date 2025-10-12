@@ -37,6 +37,11 @@ pub trait Output: Send + Sync {
 
     /// Close the output destination connection
     async fn close(&self) -> Result<(), Error>;
+
+    /// Check if the output destination is ready and healthy
+    async fn check_ready(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Output configuration

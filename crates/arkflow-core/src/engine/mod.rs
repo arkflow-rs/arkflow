@@ -13,6 +13,8 @@
  */
 
 use crate::config::EngineConfig;
+use crate::input::Input;
+use crate::output::Output;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,10 +31,20 @@ use axum::{routing::get, Router};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
+/// Holds references to stream components for health checking
+struct StreamComponents {
+    input: Arc<dyn Input>,
+    output: Arc<dyn Output>,
+    error_output: Option<Arc<dyn Output>>,
+}
+
+struct EngineApiState {
+    health_state: Arc<HealthState>,
+    components: Vec<StreamComponents>,
+}
+
 /// Health check status
 struct HealthState {
-    /// Whether the engine has been initialized
-    is_ready: AtomicBool,
     /// Whether the engine is currently running
     is_running: AtomicBool,
 }
@@ -82,7 +94,6 @@ impl Engine {
         Self {
             config,
             health_state: Arc::new(HealthState {
-                is_ready: AtomicBool::new(false),
                 is_running: AtomicBool::new(false),
             }),
         }
@@ -99,6 +110,7 @@ impl Engine {
     async fn start_health_check_server(
         &self,
         cancellation_token: CancellationToken,
+        components: Vec<StreamComponents>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let health_check = &self.config.health_check;
 
@@ -113,7 +125,10 @@ impl Engine {
             .route(&*health_check.health_path, get(Self::handle_health))
             .route(&*health_check.readiness_path, get(Self::handle_readiness))
             .route(&*health_check.liveness_path, get(Self::handle_liveness))
-            .with_state(health_state);
+            .with_state(Arc::new(EngineApiState {
+                health_state,
+                components,
+            }));
 
         let addr = &health_check.address;
         let addr = addr.clone();
@@ -149,8 +164,8 @@ impl Engine {
     ///
     /// # Arguments
     /// * `state` - The shared health state containing running status
-    async fn handle_health(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
-        let is_running = state.is_running.load(Ordering::SeqCst);
+    async fn handle_health(State(state): State<Arc<EngineApiState>>) -> impl IntoResponse {
+        let is_running = state.health_state.is_running.load(Ordering::SeqCst);
         let status = if is_running { "healthy" } else { "unhealthy" };
 
         let response = HealthResponse {
@@ -174,8 +189,25 @@ impl Engine {
     ///
     /// # Arguments
     /// * `state` - The shared health state containing readiness status
-    async fn handle_readiness(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
-        let is_ready = state.is_ready.load(Ordering::SeqCst);
+    async fn handle_readiness(State(state): State<Arc<EngineApiState>>) -> impl IntoResponse {
+        let mut is_ready = true;
+
+        for component in state.components.iter() {
+            if !component.input.check_ready().await.is_ok()
+                || !component.output.check_ready().await.is_ok()
+            {
+                is_ready = false;
+            }
+            if let Some(error_output) = component.error_output.as_ref() {
+                if !error_output.check_ready().await.is_ok() {
+                    is_ready = false;
+                }
+            }
+            if !is_ready {
+                break;
+            }
+        }
+
         let status = if is_ready { "ready" } else { "not ready" };
 
         let response = ReadinessResponse {
@@ -198,7 +230,7 @@ impl Engine {
     ///
     /// # Arguments
     /// * `_` - Unused health state parameter
-    async fn handle_liveness(_: State<Arc<HealthState>>) -> impl IntoResponse {
+    async fn handle_liveness(_: State<Arc<EngineApiState>>) -> impl IntoResponse {
         // As long as the server can respond, it is considered alive
         let response = LivenessResponse {
             status: "alive".to_string(),
@@ -220,9 +252,6 @@ impl Engine {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let token = CancellationToken::new();
 
-        // Start the health check server
-        self.start_health_check_server(token.clone()).await?;
-
         // Create and run all flows
         let mut streams = Vec::new();
         let mut handles = Vec::new();
@@ -241,8 +270,19 @@ impl Engine {
             }
         }
 
-        // Set the readiness status
-        self.health_state.is_ready.store(true, Ordering::SeqCst);
+        let components = streams
+            .iter()
+            .map(|stream| StreamComponents {
+                input: stream.get_input(),
+                output: stream.get_output(),
+                error_output: stream.get_error_output(),
+            })
+            .collect();
+
+        // Start the health check server
+        self.start_health_check_server(token.clone(), components)
+            .await?;
+
         // Set up signal handlers
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
