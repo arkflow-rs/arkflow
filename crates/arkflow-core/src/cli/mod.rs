@@ -19,13 +19,9 @@ use std::process;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
+#[derive(Default)]
 pub struct Cli {
     pub config: Option<EngineConfig>,
-}
-impl Default for Cli {
-    fn default() -> Self {
-        Self { config: None }
-    }
 }
 
 impl Cli {

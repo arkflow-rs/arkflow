@@ -27,4 +27,22 @@ clap = { workspace = true }
 colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
+uuid = { version = "1.8", features = ["v4"] }
+tempfile = "3.10"
 num_cpus = "1.17.0"
+
+# Object Storage dependencies
+aws-sdk-s3 = { version = "1.8", features = ["rt-tokio"] }
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+azure_storage = { version = "0.20" }
+azure_storage_blobs = { version = "0.20" }
+google-cloud-storage = { version = "0.15", default-features = false, features = ["auth"] }
+http = "1.1"
+md-5 = "0.10"
+base64 = "0.22"
+crc32fast = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1.0"
+log = "0.4"
+parking_lot = "0.12"
+rand = "0.8"

@@ -12,12 +12,13 @@
  *    limitations under the License.
  */
 
-//! Stream component module
+//! Reliable stream processing with acknowledgment persistence
 //!
-//! A stream is a complete data processing unit, containing input, pipeline, and output.
+//! This module provides a stream implementation that uses reliable acknowledgment
+//! processing to prevent data loss during failures.
 
 use crate::buffer::Buffer;
-use crate::idempotent_ack::AckId;
+use crate::idempotent_ack::{AckBuilder, AckCache, AckId};
 use crate::input::Ack;
 use crate::reliable_ack::ReliableAckProcessor;
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
@@ -32,8 +33,8 @@ use tracing::{error, info};
 
 const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
-/// A stream structure, containing input, pipe, output, and an optional buffer.
-pub struct Stream {
+/// A reliable stream structure with persistent acknowledgments
+pub struct ReliableStream {
     input: Arc<dyn Input>,
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
@@ -43,7 +44,8 @@ pub struct Stream {
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
-    reliable_ack_processor: Option<Arc<ReliableAckProcessor>>,
+    ack_processor: Option<Arc<ReliableAckProcessor>>,
+    ack_cache: Arc<AckCache>,
 }
 
 enum ProcessorData {
@@ -51,8 +53,8 @@ enum ProcessorData {
     Ok(Vec<MessageBatch>),
 }
 
-impl Stream {
-    /// Create a new stream.
+impl ReliableStream {
+    /// Create a new reliable stream.
     pub fn new(
         input: Arc<dyn Input>,
         pipeline: Pipeline,
@@ -72,36 +74,18 @@ impl Stream {
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
-            reliable_ack_processor: None,
+            ack_processor: None,
+            ack_cache: Arc::new(AckCache::new()),
         }
     }
 
-    /// Create a new stream with reliable acknowledgment processing.
-    pub fn new_reliable(
-        input: Arc<dyn Input>,
-        pipeline: Pipeline,
-        output: Arc<dyn Output>,
-        error_output: Option<Arc<dyn Output>>,
-        buffer: Option<Arc<dyn Buffer>>,
-        resource: Resource,
-        thread_num: u32,
-        ack_processor: Arc<ReliableAckProcessor>,
-    ) -> Self {
-        Self {
-            input,
-            pipeline: Arc::new(pipeline),
-            output,
-            error_output,
-            buffer,
-            resource,
-            thread_num,
-            sequence_counter: Arc::new(AtomicU64::new(0)),
-            next_seq: Arc::new(AtomicU64::new(0)),
-            reliable_ack_processor: Some(ack_processor),
-        }
+    /// Initialize reliable ack processor
+    pub fn with_ack_processor(mut self, ack_processor: ReliableAckProcessor) -> Self {
+        self.ack_processor = Some(Arc::new(ack_processor));
+        self
     }
 
-    /// Running stream processing
+    /// Running reliable stream processing
     pub async fn run(&mut self, cancellation_token: CancellationToken) -> Result<(), Error> {
         // Connect input and output
         self.input.connect().await?;
@@ -120,12 +104,25 @@ impl Stream {
 
         let tracker = TaskTracker::new();
 
+        // Initialize reliable ack processor if not already set
+        if self.ack_processor.is_none() {
+            let temp_dir = std::env::temp_dir();
+            let wal_path = temp_dir.join(format!("ack_wal_{}", std::process::id()));
+            let ack_processor =
+                ReliableAckProcessor::new(&tracker, cancellation_token.clone(), &wal_path)?;
+            self.ack_processor = Some(Arc::new(ack_processor));
+        }
+
+        let ack_processor = self.ack_processor.clone();
+        let ack_cache = self.ack_cache.clone();
+
         // Input
         tracker.spawn(Self::do_input(
             cancellation_token.clone(),
             self.input.clone(),
             input_sender.clone(),
             self.buffer.clone(),
+            ack_cache.clone(),
         ));
 
         // Buffer
@@ -160,7 +157,7 @@ impl Stream {
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
-            self.reliable_ack_processor.clone(),
+            ack_processor,
         ));
 
         tracker.close();
@@ -179,6 +176,7 @@ impl Stream {
         input: Arc<dyn Input>,
         input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
         buffer_option: Option<Arc<dyn Buffer>>,
+        ack_cache: Arc<AckCache>,
     ) {
         loop {
             tokio::select! {
@@ -188,13 +186,28 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok(msg) => {
+                            // Create reliable ack wrapper
+                            let ack_id = AckId::new(
+                                "stream_input".to_string(),
+                                format!("msg_{}", std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis())
+                            );
+
+                            let reliable_ack = AckBuilder::new(msg.1)
+                                .with_ack_id(ack_id.clone())
+                                .with_cache(ack_cache.clone())
+                                .with_tracing()
+                                .build();
+
                             if let Some(buffer) = &buffer_option {
-                                if let Err(e) = buffer.write(msg.0, msg.1).await {
+                                if let Err(e) = buffer.write(msg.0, reliable_ack).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
                             } else {
-                                if let Err(e) = input_sender.send_async(msg).await {
+                                if let Err(e) = input_sender.send_async((msg.0, reliable_ack)).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
@@ -289,7 +302,7 @@ impl Stream {
         next_seq: Arc<AtomicU64>,
     ) {
         let i = i + 1;
-        info!("Processor worker {} started", i);
+        info!("Reliable processor worker {} started", i);
         loop {
             let pending_messages =
                 sequence_counter.load(Ordering::Acquire) - next_seq.load(Ordering::Acquire);
@@ -332,7 +345,7 @@ impl Stream {
                 }
             }
         }
-        info!("Processor worker {} stopped", i);
+        info!("Reliable processor worker {} stopped", i);
     }
 
     async fn do_output(
@@ -340,21 +353,14 @@ impl Stream {
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
-        reliable_ack_processor: Option<Arc<ReliableAckProcessor>>,
+        ack_processor: Option<Arc<ReliableAckProcessor>>,
     ) {
         let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
 
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
                 for (_, (data, x)) in tree_map {
-                    Self::output(
-                        data,
-                        &x,
-                        &output,
-                        err_output.as_ref(),
-                        &reliable_ack_processor,
-                    )
-                    .await;
+                    Self::output(data, &x, &output, err_output.as_ref(), &ack_processor).await;
                 }
                 break;
             };
@@ -374,19 +380,12 @@ impl Stream {
                     break;
                 };
 
-                Self::output(
-                    data,
-                    &ack,
-                    &output,
-                    err_output.as_ref(),
-                    &reliable_ack_processor,
-                )
-                .await;
+                Self::output(data, &ack, &output, err_output.as_ref(), &ack_processor).await;
                 next_seq.fetch_add(1, Ordering::Release);
             }
         }
 
-        info!("Output stopped")
+        info!("Reliable output stopped")
     }
 
     async fn output(
@@ -394,76 +393,83 @@ impl Stream {
         ack: &Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
-        reliable_ack_processor: &Option<Arc<ReliableAckProcessor>>,
+        ack_processor: &Option<Arc<ReliableAckProcessor>>,
     ) {
-        let ack_result = async {
-            match data {
-                ProcessorData::Err(msg, e) => match err_output {
-                    None => {
-                        error!("{e}");
-                        Ok(())
-                    }
-                    Some(err_output) => match err_output.write(msg).await {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            error!("{}", e);
-                            Err(())
-                        }
-                    },
-                },
-                ProcessorData::Ok(msgs) => {
-                    let size = msgs.len();
-                    let mut success_cnt = 0;
-                    for x in msgs {
-                        match output.write(x).await {
-                            Ok(_) => {
-                                success_cnt = success_cnt + 1;
-                            }
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        }
-                    }
-
-                    if success_cnt >= size {
-                        Ok(())
-                    } else {
-                        Err(())
-                    }
-                }
-            }
-        }
-        .await;
-
-        // Handle acknowledgment based on result and processor availability
-        match reliable_ack_processor {
-            Some(processor) => {
-                match ack_result {
-                    Ok(_) => {
-                        // Use reliable ack processor for successful processing
-                        let ack_id =
-                            AckId::new("stream".to_string(), uuid::Uuid::new_v4().to_string());
+        match data {
+            ProcessorData::Err(msg, e) => match err_output {
+                None => {
+                    if let Some(processor) = ack_processor {
                         if let Err(e) = processor
                             .ack(
                                 ack.clone(),
-                                "stream".to_string(),
-                                ack_id.source_id.as_bytes().to_vec(),
+                                "error".to_string(),
+                                msg.get_input_name()
+                                    .unwrap_or_else(|| "unknown".to_string())
+                                    .into_bytes(),
                             )
                             .await
                         {
-                            error!("Failed to process reliable ack: {}", e);
+                            error!("Failed to send error ack to reliable processor: {}", e);
                         }
-                    }
-                    Err(_) => {
-                        // For failed processing, use direct ack
+                    } else {
                         ack.ack().await;
                     }
+                    error!("{e}");
                 }
-            }
-            None => {
-                // Fall back to direct acknowledgment
-                if ack_result.is_ok() {
-                    ack.ack().await;
+                Some(err_output) => match err_output.write(msg).await {
+                    Ok(_) => {
+                        if let Some(processor) = ack_processor {
+                            if let Err(e) = processor
+                                .ack(
+                                    ack.clone(),
+                                    "error_output".to_string(),
+                                    b"error_output_success".to_vec(),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to send error_output ack to reliable processor: {}",
+                                    e
+                                );
+                            }
+                        } else {
+                            ack.ack().await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("{}", e);
+                    }
+                },
+            },
+            ProcessorData::Ok(msgs) => {
+                let size = msgs.len();
+                let mut success_cnt = 0;
+                for x in msgs {
+                    match output.write(x).await {
+                        Ok(_) => {
+                            success_cnt = success_cnt + 1;
+                        }
+                        Err(e) => {
+                            error!("{}", e);
+                        }
+                    }
+                }
+
+                if success_cnt >= size {
+                    if let Some(processor) = ack_processor {
+                        if let Err(e) = processor
+                            .ack(
+                                ack.clone(),
+                                "success".to_string(),
+                                b"output_success".to_vec(),
+                            )
+                            .await
+                        {
+                            error!("Failed to send success ack to reliable processor: {}", e);
+                        }
+                    } else {
+                        ack.ack().await;
+                    }
                 }
             }
         }
@@ -505,59 +511,29 @@ impl Stream {
         }
         info!("error output closed");
 
+        // Clear ack cache
+        self.ack_cache.clear().await;
+
         Ok(())
     }
 }
 
-pub mod distributed_ack_stream;
-
-/// Reliable acknowledgment configuration
+/// Reliable stream configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct ReliableAckConfig {
-    /// Enable reliable acknowledgment processing
-    pub enabled: bool,
-    /// WAL file path for persistence
-    pub wal_path: Option<String>,
-    /// Maximum pending acknowledgments
-    pub max_pending_acks: Option<usize>,
-    /// Maximum retry attempts
-    pub max_retries: Option<u32>,
-    /// Retry delay in milliseconds
-    pub retry_delay_ms: Option<u64>,
-    /// Enable backpressure control
-    pub enable_backpressure: Option<bool>,
-}
-
-impl Default for ReliableAckConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            wal_path: Some("./reliable_ack.wal".to_string()),
-            max_pending_acks: Some(5000),
-            max_retries: Some(5),
-            retry_delay_ms: Some(1000),
-            enable_backpressure: Some(true),
-        }
-    }
-}
-
-/// Stream configuration
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StreamConfig {
+pub struct ReliableStreamConfig {
     pub input: crate::input::InputConfig,
     pub pipeline: crate::pipeline::PipelineConfig,
     pub output: crate::output::OutputConfig,
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
-    pub reliable_ack: Option<ReliableAckConfig>,
-    pub distributed_ack: Option<crate::distributed_ack_config::DistributedAckConfig>,
+    pub enable_reliable_ack: bool,
+    pub wal_path: Option<String>,
 }
 
-impl StreamConfig {
-    /// Build stream based on configuration
-    pub fn build(&self) -> Result<Stream, Error> {
+impl ReliableStreamConfig {
+    /// Build reliable stream based on configuration
+    pub fn build(&self) -> Result<ReliableStream, Error> {
         let mut resource = Resource {
             temporary: HashMap::new(),
             input_names: RefCell::default(),
@@ -587,61 +563,7 @@ impl StreamConfig {
             None
         };
 
-        // Check if distributed ack is enabled (takes precedence over reliable ack)
-        if let Some(_distributed_ack_config) = &self.distributed_ack {
-            // For now, log that distributed acknowledgment is configured but not fully implemented
-            println!("⚠️  Distributed acknowledgment is configured but not yet fully implemented");
-            println!("   Available integration options:");
-            println!("   1. Use distributed_ack_input type at input level");
-            println!("   2. Use distributed_ack_processor type at processor level");
-            println!("   3. Stream-level integration will be available in future updates");
-
-            // Fall back to regular stream for now
-            return Ok(Stream::new(
-                input,
-                pipeline,
-                output,
-                error_output,
-                buffer,
-                resource,
-                thread_num,
-            ));
-        }
-
-        // Check if reliable ack is enabled
-        if let Some(reliable_ack_config) = &self.reliable_ack {
-            if reliable_ack_config.enabled {
-                let wal_path = reliable_ack_config
-                    .wal_path
-                    .as_ref()
-                    .map_or("./reliable_ack.wal".to_string(), |p| p.clone());
-
-                // Create reliable ack processor
-                let tracker = tokio_util::task::TaskTracker::new();
-                let cancellation_token = tokio_util::sync::CancellationToken::new();
-                let ack_processor =
-                    std::sync::Arc::new(crate::reliable_ack::ReliableAckProcessor::new(
-                        &tracker,
-                        cancellation_token,
-                        std::path::Path::new(&wal_path),
-                    )?);
-
-                // Create reliable stream
-                return Ok(Stream::new_reliable(
-                    input,
-                    pipeline,
-                    output,
-                    error_output,
-                    buffer,
-                    resource,
-                    thread_num,
-                    ack_processor,
-                ));
-            }
-        }
-
-        // Create regular stream
-        Ok(Stream::new(
+        let mut stream = ReliableStream::new(
             input,
             pipeline,
             output,
@@ -649,6 +571,25 @@ impl StreamConfig {
             buffer,
             resource,
             thread_num,
-        ))
+        );
+
+        // Initialize ack processor if enabled
+        if self.enable_reliable_ack {
+            let temp_dir = std::env::temp_dir();
+            let wal_path_str = self
+                .wal_path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| temp_dir.join("ack_wal").to_string_lossy().into_owned());
+            let wal_path = std::path::Path::new(&wal_path_str);
+
+            let tracker = TaskTracker::new();
+            let cancellation_token = CancellationToken::new();
+            let ack_processor = ReliableAckProcessor::new(&tracker, cancellation_token, wal_path)?;
+
+            stream = stream.with_ack_processor(ack_processor);
+        }
+
+        Ok(stream)
     }
 }

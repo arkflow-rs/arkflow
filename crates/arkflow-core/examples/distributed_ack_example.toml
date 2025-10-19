@@ -1,0 +1,87 @@
+# Distributed Acknowledgment Configuration Example
+
+[streams]
+name = "distributed_ack_stream"
+
+# Input configuration with distributed acknowledgment support
+[streams.input]
+type = "distributed_ack_input"
+
+# Inner input configuration
+[streams.input.inner_input]
+type = "kafka"
+brokers = ["localhost:9092"]
+topic = "test-topic"
+group_id = "distributed_ack_group"
+
+# Distributed acknowledgment configuration
+[streams.input.distributed_ack]
+enabled = true
+node_id = "node-1"
+cluster_nodes = ["node-1:8080", "node-2:8080", "node-3:8080"]
+
+# Object storage configuration
+[streams.input.distributed_ack.object_storage]
+type = "s3"
+bucket = "distributed-ack-bucket"
+region = "us-east-1"
+access_key_id = "your-access-key"
+secret_access_key = "your-secret-key"
+
+# WAL configuration
+[streams.input.distributed_ack.wal]
+type = "rocksdb"
+path = "./distributed_ack_wal"
+
+# Processor configuration
+[[streams.pipeline.processors]]
+type = "distributed_ack_processor"
+
+# Inner processor configuration
+[streams.pipeline.processors.inner_processor]
+type = "transform"
+script = "data.value = data.value.toUpperCase()"
+
+# Distributed acknowledgment configuration for processor
+[streams.pipeline.processors.distributed_ack]
+enabled = true
+node_id = "node-1"
+cluster_nodes = ["node-1:8080", "node-2:8080", "node-3:8080"]
+
+# Output configuration
+[streams.output]
+type = "kafka"
+brokers = ["localhost:9092"]
+topic = "output-topic"
+
+# Stream-level distributed acknowledgment configuration (alternative approach)
+[streams.distributed_ack]
+enabled = true
+node_id = "node-1"
+cluster_nodes = ["node-1:8080", "node-2:8080", "node-3:8080"]
+
+# Object storage configuration for stream-level
+[streams.distributed_ack.object_storage]
+type = "s3"
+bucket = "distributed-ack-bucket"
+region = "us-east-1"
+access_key_id = "your-access-key"
+secret_access_key = "your-secret-key"
+
+# WAL configuration for stream-level
+[streams.distributed_ack.wal]
+type = "rocksdb"
+path = "./distributed_ack_wal"
+
+# Performance configuration
+[streams.distributed_ack.performance]
+max_pending_acks = 10000
+batch_size = 100
+flush_interval_ms = 1000
+retry_config = { max_retries = 5, initial_delay_ms = 1000, max_delay_ms = 30000, backoff_multiplier = 2.0 }
+
+# Recovery configuration
+[streams.distributed_ack.recovery]
+enable_recovery = true
+recovery_interval_ms = 30000
+checkpoint_interval_ms = 60000

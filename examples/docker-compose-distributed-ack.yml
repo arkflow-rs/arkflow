@@ -1,0 +1,262 @@
+# 分布式 ACK 系统 Docker Compose 部署示例
+# 包含 Kafka、S3 兼容存储和多个 ArkFlow 节点
+
+version: '3.8'
+
+services:
+  # Zookeeper (Kafka 需要)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - arkflow-network
+
+  # Kafka Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+      KAFKA_DELETE_TOPIC_ENABLE: true
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - arkflow-network
+
+  # S3 兼容对象存储 (MinIO)
+  minio:
+    image: minio/minio:RELEASE.2023-11-20T22-40-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: arkflow
+      MINIO_ROOT_PASSWORD: arkflow123
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    volumes:
+      - minio_data:/data
+    networks:
+      - arkflow-network
+
+  # 创建 S3 bucket
+  minio-init:
+    image: minio/mc:RELEASE.2023-11-20T18-00-02Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add minio http://minio:9000 arkflow arkflow123;
+      /usr/bin/mc mb minio/arkflow-orders;
+      /usr/bin/mc mb minio/arkflow-monitoring;
+      /usr/bin/mc mb minio/arkflow-backup;
+      exit 0;
+      "
+    networks:
+      - arkflow-network
+
+  # ArkFlow 节点 1
+  arkflow-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - minio
+      - minio-init
+    environment:
+      - NODE_ID=node-1
+      - ENVIRONMENT=production
+      - DATACENTER=local
+      - POD_IP=arkflow-node-1
+
+      # Kafka 配置
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_USERNAME=arkflow
+      - KAFKA_PASSWORD=arkflow123
+
+      # S3 配置
+      - S3_BUCKET=arkflow-orders
+      - AWS_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=arkflow
+      - AWS_SECRET_ACCESS_KEY=arkflow123
+
+      # 健康检查端口
+      - HEALTH_CHECK_PORT=8080
+
+      # 日志级别
+      - RUST_LOG=info
+    ports:
+      - "8081:8080"   # 健康检查
+      - "9091:9091"   # 指标端口
+    volumes:
+      - ./config/production_distributed_ack_config.yaml:/app/config.yaml
+      - arkflow_data_1:/var/lib/arkflow
+    networks:
+      - arkflow-network
+    restart: unless-stopped
+
+  # ArkFlow 节点 2
+  arkflow-node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - minio
+      - minio-init
+      - arkflow-node-1
+    environment:
+      - NODE_ID=node-2
+      - ENVIRONMENT=production
+      - DATACENTER=local
+      - POD_IP=arkflow-node-2
+
+      # Kafka 配置
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_USERNAME=arkflow
+      - KAFKA_PASSWORD=arkflow123
+
+      # S3 配置
+      - S3_BUCKET=arkflow-orders
+      - AWS_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=arkflow
+      - AWS_SECRET_ACCESS_KEY=arkflow123
+
+      # 健康检查端口
+      - HEALTH_CHECK_PORT=8080
+
+      # 日志级别
+      - RUST_LOG=info
+    ports:
+      - "8082:8080"   # 健康检查
+      - "9092:9091"   # 指标端口
+    volumes:
+      - ./config/production_distributed_ack_config.yaml:/app/config.yaml
+      - arkflow_data_2:/var/lib/arkflow
+    networks:
+      - arkflow-network
+    restart: unless-stopped
+
+  # ArkFlow 节点 3
+  arkflow-node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - minio
+      - minio-init
+      - arkflow-node-1
+    environment:
+      - NODE_ID=node-3
+      - ENVIRONMENT=production
+      - DATACENTER=local
+      - POD_IP=arkflow-node-3
+
+      # Kafka 配置
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_USERNAME=arkflow
+      - KAFKA_PASSWORD=arkflow123
+
+      # S3 配置
+      - S3_BUCKET=arkflow-orders
+      - AWS_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=arkflow
+      - AWS_SECRET_ACCESS_KEY=arkflow123
+
+      # 健康检查端口
+      - HEALTH_CHECK_PORT=8080
+
+      # 日志级别
+      - RUST_LOG=info
+    ports:
+      - "8083:8080"   # 健康检查
+      - "9093:9091"   # 指标端口
+    volumes:
+      - ./config/production_distributed_ack_config.yaml:/app/config.yaml
+      - arkflow_data_3:/var/lib/arkflow
+    networks:
+      - arkflow-network
+    restart: unless-stopped
+
+  # Prometheus 监控
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - arkflow-network
+
+  # Grafana 仪表板
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - arkflow-network
+
+  # 数据生成器 (测试用)
+  data-generator:
+    image: confluentinc/cp-kafkacat:7.3.0
+    depends_on:
+      - kafka
+    command: >
+      sh -c "
+      echo 'Waiting for Kafka...';
+      until kafka-topics --bootstrap-server kafka:9092 --list; do
+        sleep 1;
+      done;
+      echo 'Kafka is ready. Generating test data...';
+      while true; do
+        echo '{\"order_id\": \"'$$RANDOM'\", \"user_id\": \"user_'$$RANDOM'\", \"amount\": '$$(($$RANDOM % 10000))', \"currency\": \"USD\", \"status\": \"completed\", \"timestamp\": \"'$$(date -Iseconds)'\"}' | kafkacat -b kafka:9092 -t orders -P;
+        sleep 0.$$(($$RANDOM % 10));
+      done;
+      "
+    networks:
+      - arkflow-network
+
+volumes:
+  zookeeper_data:
+  kafka_data:
+  minio_data:
+  arkflow_data_1:
+  arkflow_data_2:
+  arkflow_data_3:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  arkflow-network:
+    driver: bridge

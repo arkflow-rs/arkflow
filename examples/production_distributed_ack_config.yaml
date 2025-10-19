@@ -1,0 +1,246 @@
+# 生产环境分布式 ACK 配置
+# 实用、简洁但功能完整的配置示例
+
+logging:
+  level: "info"
+  format: "json"
+  file_path: "/var/log/arkflow/arkflow.log"
+
+health_check:
+  enabled: true
+  address: "0.0.0.0:8080"
+  health_path: "/health"
+
+streams:
+  - name: "order-processing-stream"
+    input:
+      type: "kafka"
+      name: "kafka-input"
+      config:
+        brokers:
+          - "kafka1:9092"
+          - "kafka2:9092"
+          - "kafka3:9092"
+        topics: ["orders"]
+        consumer_group: "order-processors"
+        client_id: "arkflow-order-processor"
+
+        # 安全配置
+        security_protocol: "SASL_SSL"
+        sasl_mechanism: "SCRAM-SHA-256"
+        sasl_username: "${KAFKA_USERNAME}"
+        sasl_password: "${KAFKA_PASSWORD}"
+
+        # 性能配置
+        max_poll_records: 500
+        max_poll_interval_ms: 300000
+
+    pipeline:
+      thread_num: 4
+      batch_size: 1000
+
+      processors:
+        # 1. JSON 解析和验证
+        - type: "json_to_arrow"
+          name: "json-parser"
+
+        # 2. 数据验证
+        - type: "validator"
+          name: "order-validator"
+          config:
+            rules:
+              - field: "order_id"
+                type: "required"
+              - field: "user_id"
+                type: "required"
+              - field: "amount"
+                type: "numeric"
+                min: 0
+              - field: "timestamp"
+                type: "timestamp"
+
+        # 3. 数据转换和丰富化
+        - type: "sql"
+          name: "order-transformer"
+          config:
+            query: |
+              SELECT
+                order_id,
+                user_id,
+                amount,
+                currency,
+                status,
+                timestamp,
+                DATE(timestamp) as order_date,
+                HOUR(timestamp) as order_hour,
+                CASE
+                  WHEN amount >= 1000 THEN 'high_value'
+                  WHEN amount >= 100 THEN 'medium_value'
+                  ELSE 'low_value'
+                END as value_segment,
+                CASE
+                  WHEN status = 'completed' THEN 1
+                  ELSE 0
+                END as is_completed
+              FROM flow
+
+        # 4. 转换回 JSON
+        - type: "arrow_to_json"
+          name: "json-formatter"
+
+    output:
+      type: "kafka"
+      name: "kafka-output"
+      config:
+        brokers:
+          - "kafka1:9092"
+          - "kafka2:9092"
+          - "kafka3:9092"
+        topic: "processed-orders"
+        client_id: "arkflow-order-producer"
+
+        # 生产者配置
+        acks: "all"
+        retries: 3
+        compression_type: "lz4"
+        batch_size: 16384
+        linger_ms: 5
+
+        # 安全配置
+        security_protocol: "SASL_SSL"
+        sasl_mechanism: "SCRAM-SHA-256"
+        sasl_username: "${KAFKA_USERNAME}"
+        sasl_password: "${KAFKA_PASSWORD}"
+
+        # 分区策略
+        partitioner: "murmur2"
+        key_field: "user_id"
+
+    # 分布式 ACK 配置
+    distributed_ack:
+      enabled: true
+      cluster_id: "order-processing-cluster"
+
+      # 节点信息 (可选，系统会自动生成)
+      node_id: "${NODE_ID:-auto}"
+
+      # 存储配置
+      storage:
+        type: "s3"
+        config:
+          bucket: "${S3_BUCKET:-arkflow-orders}"
+          region: "${AWS_REGION:-us-east-1}"
+          endpoint: "${S3_ENDPOINT}"
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+          # 高级配置
+          max_connections: 50
+          timeout_ms: 30000
+          server_side_encryption: true
+
+      # WAL 配置
+      wal:
+        local_wal_path: "/var/lib/arkflow/wal"
+        local_wal_size_limit: 1073741824  # 1GB
+        upload_batch_size: 100
+        upload_interval_ms: 30000  # 30秒
+        max_retry_attempts: 5
+        enable_auto_recovery: true
+        enable_metrics: true
+        enable_compression: true
+
+      # 检查点配置
+      checkpoint:
+        checkpoint_interval_ms: 300000  # 5分钟
+        max_checkpoints: 10
+        auto_checkpoint: true
+        enable_compression: true
+        validate_integrity: true
+
+      # 恢复配置
+      recovery:
+        recovery_strategy: "FromLatestCheckpoint"
+        recovery_batch_size: 1000
+        enable_consistency_check: true
+        recovery_timeout_ms: 300000  # 5分钟
+        enable_deduplication: true
+        duplicate_tracking_age_hours: 48
+        auto_recovery: true
+        validate_data: true
+
+      # 节点注册表配置
+      node_registry:
+        coordinator:
+          type: "object_storage"
+          heartbeat_interval_ms: 30000  # 30秒
+          node_timeout_ms: 90000  # 90秒
+          cleanup_interval_ms: 60000  # 60秒
+
+        node_info:
+          address: "${POD_IP:-auto}"
+          capabilities:
+            - "ack_processing"
+            - "order_processing"
+            - "metrics_collection"
+          metadata:
+            environment: "${ENVIRONMENT:-production}"
+            datacenter: "${DATACENTER:-us-east-1}"
+            pod_name: "${POD_NAME}"
+            version: "1.0.0"
+
+  # 第二个流：实时监控
+  - name: "monitoring-stream"
+    input:
+      type: "kafka"
+      name: "monitoring-input"
+      config:
+        brokers:
+          - "kafka1:9092"
+          - "kafka2:9092"
+          - "kafka3:9092"
+        topics: ["metrics", "logs"]
+        consumer_group: "monitoring-consumers"
+
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: "json_to_arrow"
+        - type: "sql"
+          query: "SELECT * FROM flow WHERE level = 'ERROR'"
+        - type: "arrow_to_json"
+
+    output:
+      type: "elasticsearch"
+      name: "elasticsearch-output"
+      config:
+        hosts: ["http://elasticsearch:9200"]
+        index: "arkflow-logs-{date}"
+        username: "${ES_USERNAME}"
+        password: "${ES_PASSWORD}"
+
+    # 监控流使用独立的 ACK 配置
+    distributed_ack:
+      enabled: true
+      cluster_id: "monitoring-cluster"
+
+      storage:
+        type: "s3"
+        config:
+          bucket: "${S3_BUCKET:-arkflow-monitoring}"
+          region: "${AWS_REGION:-us-east-1}"
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+      wal:
+        local_wal_path: "/var/lib/arkflow/monitoring-wal"
+        upload_batch_size: 50
+        upload_interval_ms: 60000  # 1分钟
+
+      checkpoint:
+        checkpoint_interval_ms: 600000  # 10分钟
+        max_checkpoints: 5
+
+      recovery:
+        recovery_strategy: "FromLatestCheckpoint"
+        enable_consistency_check: true
