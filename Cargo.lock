@@ -227,7 +227,7 @@ checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
 
 [[package]]
 name = "arkflow"
-version = "0.4.0-rc1"
+version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-core"
-version = "0.4.0-rc1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-plugin"
-version = "0.4.0-rc1"
+version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "arrow-json",
