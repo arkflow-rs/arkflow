@@ -1,0 +1,9 @@
+{
+  "label": "Deploy",
+  "position": 4,
+  "link": {
+    "title": "Deploy",
+    "type": "generated-index",
+    "description": "Deploy ArkFlow to the cloud"
+  }
+}

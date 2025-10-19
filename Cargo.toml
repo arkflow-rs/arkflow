@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.0-rc1"
+version = "0.5.0"
 edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
@@ -46,7 +46,7 @@ flume = "=0.11"
 # Sql
 sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 mockall = "0.12"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
