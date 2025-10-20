@@ -1040,9 +1040,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.86.0"
+version = "1.87.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7d835f123f307cafffca7b9027c14979f1d403b417d8541d67cf252e8a21e35"
+checksum = "5871bec9a79a3e8d928c7788d654f135dde0e71d2dd98089388bab36b37ef607"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1548,7 +1548,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -4406,7 +4406,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -5604,7 +5604,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.16",
  "http 1.3.1",
@@ -6696,7 +6696,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.31",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -6733,7 +6733,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "tracing",
  "windows-sys 0.60.2",
 ]
