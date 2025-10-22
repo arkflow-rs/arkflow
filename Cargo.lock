@@ -1241,9 +1241,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-xml"
-version = "0.60.10"
+version = "0.60.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3db87b96cb1b16c024980f133968d52882ca0daaee3a086c6decc500f6c99728"
+checksum = "e9c34127e8c624bc2999f3b657e749c1393bedc9cd97b92a804db8ced4d2e163"
 dependencies = [
  "xmlparser",
 ]
