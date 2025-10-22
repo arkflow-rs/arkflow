@@ -5604,7 +5604,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.16",
  "http 1.3.1",
@@ -6248,9 +6248,9 @@ dependencies = [
 
 [[package]]
 name = "postgres-types"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a120daaabfcb0e324d5bf6e411e9222994cb3795c79943a0ef28ed27ea76e4"
+checksum = "ef4605b7c057056dd35baeb6ac0c0338e4975b1f2bef0f65da953285eb007095"
 dependencies = [
  "bytes",
  "chrono",
