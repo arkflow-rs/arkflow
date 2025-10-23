@@ -81,7 +81,7 @@ rand = "0.9"
 
 
 # modbus
-tokio-modbus = { version = "0.16", default-features = false, features = ["tcp"] }
+tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
 
 # Object Store
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
