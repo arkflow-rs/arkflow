@@ -425,6 +425,18 @@ impl Stream {
 
         Ok(())
     }
+
+    pub fn get_input(&self) -> Arc<dyn Input> {
+        self.input.clone()
+    }
+
+    pub fn get_output(&self) -> Arc<dyn Output> {
+        self.output.clone()
+    }
+
+    pub fn get_error_output(&self) -> Option<Arc<dyn Output>> {
+        self.error_output.clone()
+    }
 }
 
 /// Stream configuration
