@@ -51,7 +51,7 @@ pub struct OutputConfig {
 
 impl OutputConfig {
     /// Build the output component according to the configuration
-    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Output>, Error> {
+    pub fn build(&self, resource: &mut Resource) -> Result<Arc<dyn Output>, Error> {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
@@ -70,7 +70,7 @@ pub trait OutputBuilder: Send + Sync {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Output>, Error>;
 }
 

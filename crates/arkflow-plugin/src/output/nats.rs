@@ -221,7 +221,7 @@ impl OutputBuilder for NatsOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
             return Err(Error::Config(

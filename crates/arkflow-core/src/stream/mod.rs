@@ -17,7 +17,7 @@
 //! A stream is a complete data processing unit, containing input, pipeline, and output.
 
 use crate::buffer::Buffer;
-use crate::input::Ack;
+use crate::input::{Ack, InputEncoder};
 use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
 use flume::{Receiver, Sender};
 use std::cell::RefCell;
@@ -32,7 +32,7 @@ const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
 /// A stream structure, containing input, pipe, output, and an optional buffer.
 pub struct Stream {
-    input: Arc<dyn Input>,
+    input: Arc<dyn InputEncoder>,
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
     error_output: Option<Arc<dyn Output>>,
@@ -51,7 +51,7 @@ enum ProcessorData {
 impl Stream {
     /// Create a new stream.
     pub fn new(
-        input: Arc<dyn Input>,
+        input: Arc<dyn InputEncoder>,
         pipeline: Pipeline,
         output: Arc<dyn Output>,
         error_output: Option<Arc<dyn Output>>,
@@ -80,7 +80,7 @@ impl Stream {
         if let Some(ref error_output) = self.error_output {
             error_output.connect().await?;
         }
-        for (_, temporary) in &self.resource.temporary {
+        for (_, temporary) in self.resource.temporary.get_mut() {
             temporary.connect().await?
         }
 
@@ -147,7 +147,7 @@ impl Stream {
 
     async fn do_input(
         cancellation_token: CancellationToken,
-        input: Arc<dyn Input>,
+        input: Arc<dyn InputEncoder>,
         input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
         buffer_option: Option<Arc<dyn Buffer>>,
     ) {
@@ -159,13 +159,20 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok(msg) => {
+                            let encoded_msg = input.encode(msg.0);
+                            if let Err(e) = encoded_msg {
+                                error!("Failed to encode message: {}", e);
+                                continue;
+                            }
+
+                            let encoded_msg = encoded_msg.unwrap();
                             if let Some(buffer) = &buffer_option {
-                                if let Err(e) = buffer.write(msg.0, msg.1).await {
+                                if let Err(e) = buffer.write(encoded_msg, msg.1).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
                             } else {
-                                if let Err(e) = input_sender.send_async(msg).await {
+                                if let Err(e) = input_sender.send_async((encoded_msg,msg.1)).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
@@ -442,25 +449,28 @@ impl StreamConfig {
     /// Build stream based on configuration
     pub fn build(&self) -> Result<Stream, Error> {
         let mut resource = Resource {
-            temporary: HashMap::new(),
+            temporary: RefCell::default(),
             input_names: RefCell::default(),
         };
 
         if let Some(temporary_configs) = &self.temporary {
-            resource.temporary = HashMap::with_capacity(temporary_configs.len());
+            resource
+                .temporary
+                .replace(HashMap::with_capacity(temporary_configs.len()));
             for temporary_config in temporary_configs {
-                resource.temporary.insert(
-                    temporary_config.name.clone(),
-                    temporary_config.build(&resource)?,
-                );
+                let temp = temporary_config.build(&resource)?;
+                resource
+                    .temporary
+                    .get_mut()
+                    .insert(temporary_config.name.clone(), temp);
             }
         };
 
-        let input = self.input.build(&resource)?;
-        let (pipeline, thread_num) = self.pipeline.build(&resource)?;
-        let output = self.output.build(&resource)?;
+        let input = self.input.build(&mut resource)?;
+        let (pipeline, thread_num) = self.pipeline.build(&mut resource)?;
+        let output = self.output.build(&mut resource)?;
         let error_output = if let Some(error_output_config) = &self.error_output {
-            Some(error_output_config.build(&resource)?)
+            Some(error_output_config.build(&mut resource)?)
         } else {
             None
         };

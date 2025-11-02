@@ -13,6 +13,7 @@
  */
 
 use crate::udf;
+use arkflow_core::codec::Codec;
 use arkflow_core::input::{Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{input, Error, MessageBatch, Resource};
 use async_trait::async_trait;
@@ -153,7 +154,11 @@ struct FileInput {
 }
 
 impl FileInput {
-    fn new(name: Option<&String>, config: FileInputConfig) -> Result<Self, Error> {
+    fn new(
+        name: Option<&String>,
+        config: FileInputConfig,
+        _resource: &mut Resource,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
@@ -459,17 +464,16 @@ impl InputBuilder for FileBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        _resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "File input configuration is missing".to_string(),
             ));
         }
-
         let config: FileInputConfig = serde_json::from_value(config.clone().unwrap())
             .map_err(|e| Error::Config(format!("Failed to parse File input config: {}", e)))?;
-        Ok(Arc::new(FileInput::new(name, config)?))
+        Ok(Arc::new(FileInput::new(name, config, resource)?))
     }
 }
 

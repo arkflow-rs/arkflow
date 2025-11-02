@@ -16,6 +16,7 @@
 //!
 //! The input component is responsible for receiving data from various sources such as message queues, file systems, HTTP endpoints, and so on.
 
+use crate::codec::{Codec, CodecConfig, Encoder};
 use crate::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ pub trait InputBuilder: Send + Sync {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error>;
 }
 
@@ -97,17 +98,25 @@ pub struct InputConfig {
     #[serde(rename = "type")]
     pub input_type: String,
     pub name: Option<String>,
+    pub decode: Option<CodecConfig>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
 
 impl InputConfig {
     /// Building input components
-    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Input>, Error> {
+    pub fn build(&self, resource: &mut Resource) -> Result<Arc<dyn InputEncoder>, Error> {
         let builders = INPUT_BUILDERS.read().unwrap();
+        let encoder = if let Some(codec_config) = self.decode.as_ref() {
+            let arc = codec_config.build(resource)?;
+            Some(arc)
+        } else {
+            None
+        };
 
         if let Some(builder) = builders.get(&self.input_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            let input = builder.build(self.name.as_ref(), &self.config, resource)?;
+            Ok(Arc::new(InputEncode { input, encoder }))
         } else {
             Err(Error::Config(format!(
                 "Unknown input type: {}",
@@ -115,6 +124,41 @@ impl InputConfig {
             )))
         }
     }
+}
+
+pub struct InputEncode {
+    pub input: Arc<dyn Input>,
+    pub encoder: Option<Arc<dyn Codec>>,
+}
+
+impl InputEncoder for InputEncode {
+    fn encode(&self, msg: MessageBatch) -> Result<MessageBatch, Error> {
+        if let Some(e) = &self.encoder {
+            MessageBatch::new_binary(e.encode(msg)?)
+        } else {
+            Ok(msg)
+        }
+    }
+}
+
+#[async_trait]
+impl Input for InputEncode {
+    async fn connect(&self) -> Result<(), Error> {
+        self.input.connect().await
+    }
+
+    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+        self.input.read().await
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        self.input.close().await
+    }
+}
+
+// #[async_trait]
+pub trait InputEncoder: Input {
+    fn encode(&self, msg: MessageBatch) -> Result<MessageBatch, Error>;
 }
 
 pub fn register_input_builder(

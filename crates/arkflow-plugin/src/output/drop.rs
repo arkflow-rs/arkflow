@@ -49,7 +49,7 @@ impl OutputBuilder for DropOutputBuilder {
         &self,
         _name: Option<&String>,
         _: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         Ok(Arc::new(DropOutput))
     }

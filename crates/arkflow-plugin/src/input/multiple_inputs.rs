@@ -11,7 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use arkflow_core::input::{Ack, Input, InputBuilder, InputConfig};
+use arkflow_core::input::{Ack, Input, InputBuilder, InputConfig, InputEncoder};
 use arkflow_core::{input, Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -29,7 +29,7 @@ struct MultipleInputsConfig {
 struct MultipleInputs {
     #[allow(unused)]
     input_name: Option<String>,
-    inputs: Vec<Arc<dyn Input>>,
+    inputs: Vec<Arc<dyn InputEncoder>>,
     sender: Sender<Msg>,
     receiver: Receiver<Msg>,
     cancellation_token: CancellationToken,
@@ -122,11 +122,10 @@ impl MultipleInputs {
     fn new(
         name: Option<&String>,
         config: MultipleInputsConfig,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::unbounded();
         let mut inputs = Vec::with_capacity(config.inputs.len());
-        let mut input_names_mut = resource.input_names.borrow_mut();
         for x in config.inputs {
             if let Some(name) = &x.name {
                 if name.is_empty() {
@@ -134,10 +133,12 @@ impl MultipleInputs {
                         "Multiple-inputs input configuration has empty input name".to_string(),
                     ));
                 }
-                input_names_mut.push(name.clone());
+                resource.input_names.borrow_mut().push(name.clone());
             }
             inputs.push(x.build(resource)?);
         }
+        let input_names_mut = resource.input_names.borrow();
+
         let input_names_hash_set = input_names_mut.iter().cloned().collect::<HashSet<String>>();
         if input_names_hash_set.len() != input_names_mut.len() {
             return Err(Error::Config(
@@ -162,7 +163,7 @@ impl InputBuilder for MultipleInputsBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
