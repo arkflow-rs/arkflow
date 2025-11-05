@@ -28,7 +28,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
-datafusion = { version = "47", features = ["avro", "pyarrow"] }
+datafusion = { version = "48", features = ["avro", "pyarrow"] }
 datafusion-functions-json = "0.47.0"
 arrow-json = "55"
 prost-reflect = "0.16.2"
