@@ -4629,7 +4629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.3",
  "serde",
  "serde_core",
 ]
@@ -4984,9 +4984,9 @@ dependencies = [
 
 [[package]]
 name = "libflate"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45d9dfdc14ea4ef0900c1cddbc8dcd553fbaacd8a4a282cf4018ae9dd04fb21e"
+checksum = "249fa21ba2b59e8cbd69e722f5b31e1b466db96c937ae3de23e8b99ead0d1383"
 dependencies = [
  "adler32",
  "core2",
