@@ -49,7 +49,7 @@ pub struct ProcessorConfig {
 
 impl ProcessorConfig {
     /// Build the processor components according to the configuration
-    pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Processor>, Error> {
+    pub fn build(&self, resource: &mut Resource) -> Result<Arc<dyn Processor>, Error> {
         let builders = PROCESSOR_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.processor_type) {
@@ -68,7 +68,7 @@ pub trait ProcessorBuilder: Send + Sync {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Processor>, Error>;
 }
 

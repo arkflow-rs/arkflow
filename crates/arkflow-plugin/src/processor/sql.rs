@@ -55,12 +55,6 @@ struct TemporaryConfig {
     key: Expr<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BallistaConfig {
-    /// Ballista server url
-    remote_url: String,
-}
-
 /// SQL processor component
 struct SqlProcessor {
     config: SqlProcessorConfig,
@@ -70,12 +64,12 @@ struct SqlProcessor {
 
 impl SqlProcessor {
     /// Create a new SQL processor component.
-    pub fn new(config: SqlProcessorConfig, resource: &Resource) -> Result<Self, Error> {
+    pub fn new(config: SqlProcessorConfig, resource: &mut Resource) -> Result<Self, Error> {
         let temporary = {
             if let Some(temporary_list) = config.temporary_list.as_ref() {
                 let mut temporary_map = HashMap::with_capacity(temporary_list.len());
                 for temporary in temporary_list {
-                    let Some(t) = resource.temporary.get(&temporary.name) else {
+                    let Some(t) = resource.temporary.get_mut().get(&temporary.name) else {
                         return Err(Error::Process(format!(
                             "Temporary {} not found",
                             temporary.name
@@ -231,7 +225,7 @@ impl ProcessorBuilder for SqlProcessorBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
-        resource: &Resource,
+        resource: &mut Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
