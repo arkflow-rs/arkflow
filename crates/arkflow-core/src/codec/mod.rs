@@ -42,7 +42,7 @@ pub trait CodecBuilder: Send + Sync {
     ) -> Result<Arc<dyn Codec>, Error>;
 }
 
-/// Buffer configuration
+/// Codec configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodecConfig {
     #[serde(rename = "type")]

@@ -14,6 +14,7 @@
 
 //! Rust stream processing engine
 
+use crate::codec::Codec;
 use crate::temporary::Temporary;
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -78,7 +79,8 @@ pub enum Error {
 
 #[derive(Clone)]
 pub struct Resource {
-    pub temporary: HashMap<String, Arc<dyn Temporary>>,
+    pub temporary: RefCell<HashMap<String, Arc<dyn Temporary>>>,
+    // pub codec: RefCell<HashMap<String, Arc<dyn Codec>>>,
     pub input_names: RefCell<Vec<String>>,
 }
 

@@ -66,7 +66,7 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     /// Build pipelines based on your configuration
-    pub fn build(&self, resource: &Resource) -> Result<(Pipeline, u32), Error> {
+    pub fn build(&self, resource: &mut Resource) -> Result<(Pipeline, u32), Error> {
         let mut processors = Vec::with_capacity(self.processors.len());
         for processor_config in &self.processors {
             processors.push(processor_config.build(resource)?);
