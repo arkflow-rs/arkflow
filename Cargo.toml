@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
 datafusion = { version = "47", features = ["avro", "pyarrow"] }
 datafusion-functions-json = "0.47.0"
-arrow-json = "55"
+arrow-json = "57"
 prost-reflect = "0.16.2"
 prost-types = "0.14.1"
 protobuf-parse = "3.7.2"
