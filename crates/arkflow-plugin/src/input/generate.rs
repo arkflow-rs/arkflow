@@ -94,7 +94,7 @@ impl InputBuilder for GenerateInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -241,6 +241,7 @@ mod tests {
                 &Some(config_json),
                 &Resource {
                     temporary: Default::default(),
+                    codec: Default::default(),
                     input_names: RefCell::new(Default::default()),
                 },
             )
