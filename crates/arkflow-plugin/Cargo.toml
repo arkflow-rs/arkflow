@@ -43,7 +43,7 @@ tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 base64 = "0.22"
 colored = { workspace = true }
 flume = { workspace = true }
-rumqttc = "0.25.0"
+rumqttc = "0.25.1"
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
