@@ -421,7 +421,7 @@ impl InputBuilder for RedisInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config: RedisInputConfig =
             serde_json::from_value(config.clone().unwrap_or_default())

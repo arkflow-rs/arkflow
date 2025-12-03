@@ -241,7 +241,7 @@ impl InputBuilder for WebSocketInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(

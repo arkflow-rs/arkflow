@@ -83,7 +83,7 @@ impl ProcessorBuilder for VrlProcessorBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
