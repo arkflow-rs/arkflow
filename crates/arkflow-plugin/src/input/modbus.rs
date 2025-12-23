@@ -216,7 +216,7 @@ impl InputBuilder for ModbusInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        _resource: &Resource,
+        _resource: &mut Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config = config
             .as_ref()
