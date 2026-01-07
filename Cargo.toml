@@ -46,7 +46,7 @@ flume = "=0.11"
 # Sql
 sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
-tempfile = "3.23.0"
+tempfile = "3.24.0"
 mockall = "0.14"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
