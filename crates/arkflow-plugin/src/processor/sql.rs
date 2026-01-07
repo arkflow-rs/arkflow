@@ -55,12 +55,6 @@ struct TemporaryConfig {
     key: Expr<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BallistaConfig {
-    /// Ballista server url
-    remote_url: String,
-}
-
 /// SQL processor component
 struct SqlProcessor {
     config: SqlProcessorConfig,

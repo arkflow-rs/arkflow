@@ -284,8 +284,7 @@ fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
 }
 
 fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageBatch, Error> {
-    if vrl_values.is_empty() {}
-    let Some(first_value) = vrl_values.get(0) else {
+    let Some(first_value) = vrl_values.first() else {
         return Ok(MessageBatch::from(RecordBatch::new_empty(Arc::new(
             Schema::empty(),
         ))));

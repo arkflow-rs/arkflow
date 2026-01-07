@@ -128,7 +128,7 @@ mod tests {
     #[tokio::test]
     async fn test_sql_processor() {
         let batch =
-            RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![4, 0230, 21])) as _)])
+            RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![4, 230, 21])) as _)])
                 .unwrap();
         let sql = r#" 0.9"#;
         let result = evaluate_expr(sql, &batch).await.unwrap();

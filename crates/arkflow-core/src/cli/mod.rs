@@ -19,13 +19,9 @@ use std::process;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
+#[derive(Default)]
 pub struct Cli {
     pub config: Option<EngineConfig>,
-}
-impl Default for Cli {
-    fn default() -> Self {
-        Self { config: None }
-    }
 }
 
 impl Cli {
@@ -80,7 +76,7 @@ impl Cli {
         Ok(())
     }
 }
-fn init_logging(config: &EngineConfig) -> () {
+fn init_logging(config: &EngineConfig) {
     let log_level = match config.logging.level.as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,

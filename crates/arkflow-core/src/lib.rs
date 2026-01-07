@@ -181,7 +181,7 @@ impl MessageBatch {
 
     pub fn from_json<T: Serialize>(value: &T) -> Result<Self, Error> {
         let content = serde_json::to_vec(value)?;
-        Ok(Self::new_binary(vec![content])?)
+        Self::new_binary(vec![content])
     }
 
     pub fn new_arrow(content: RecordBatch) -> Self {
@@ -218,12 +218,7 @@ impl MessageBatch {
         let Some(v) = array_ref.as_any().downcast_ref::<BinaryArray>() else {
             return Err(Error::Process("not support data type".to_string()));
         };
-        let mut vec_bytes = Vec::with_capacity(v.len());
-        for x in v {
-            if let Some(data) = x {
-                vec_bytes.push(data)
-            }
-        }
+        let vec_bytes: Vec<&[u8]> = v.iter().flatten().collect();
         Ok(vec_bytes)
     }
 }

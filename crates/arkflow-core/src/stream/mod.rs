@@ -80,7 +80,7 @@ impl Stream {
         if let Some(ref error_output) = self.error_output {
             error_output.connect().await?;
         }
-        for (_, temporary) in &self.resource.temporary {
+        for temporary in self.resource.temporary.values() {
             temporary.connect().await?
         }
 
@@ -164,11 +164,9 @@ impl Stream {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
-                            } else {
-                                if let Err(e) = input_sender.send_async(msg).await {
-                                    error!("Failed to send input message: {}", e);
-                                    break;
-                                }
+                            } else if let Err(e) = input_sender.send_async(msg).await {
+                                error!("Failed to send input message: {}", e);
+                                break;
                             }
 
                     }
@@ -240,13 +238,10 @@ impl Stream {
 
         info!("Buffer flushed");
 
-        match buffer.read().await {
-            Ok(Some(v)) => {
-                if let Err(e) = input_sender.send_async(v).await {
-                    error!("Failed to send input message: {}", e);
-                }
+        if let Ok(Some(v)) = buffer.read().await {
+            if let Err(e) = input_sender.send_async(v).await {
+                error!("Failed to send input message: {}", e);
             }
-            _ => {}
         }
         info!("Buffer stopped");
     }
@@ -267,7 +262,7 @@ impl Stream {
             if pending_messages > BACKPRESSURE_THRESHOLD {
                 let wait_time = std::cmp::min(
                     500,
-                    100 + (pending_messages as u64 - BACKPRESSURE_THRESHOLD) / 100 * 10,
+                    100 + (pending_messages - BACKPRESSURE_THRESHOLD) / 100 * 10,
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(wait_time)).await;
                 continue;
@@ -372,7 +367,7 @@ impl Stream {
                 for x in msgs {
                     match output.write(x).await {
                         Ok(_) => {
-                            success_cnt = success_cnt + 1;
+                            success_cnt += 1;
                         }
                         Err(e) => {
                             error!("{}", e);

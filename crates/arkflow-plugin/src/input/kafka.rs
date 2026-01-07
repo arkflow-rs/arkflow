@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(input.config.topics, vec!["test-topic".to_string()]);
         assert_eq!(input.config.consumer_group, "test-group".to_string());
         assert_eq!(input.config.client_id, Some("test-client".to_string()));
-        assert_eq!(input.config.start_from_latest, false);
+        assert!(!input.config.start_from_latest);
     }
 
     #[tokio::test]

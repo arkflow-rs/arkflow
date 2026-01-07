@@ -110,9 +110,9 @@ impl Engine {
 
         // Create routes
         let app = Router::new()
-            .route(&*health_check.health_path, get(Self::handle_health))
-            .route(&*health_check.readiness_path, get(Self::handle_readiness))
-            .route(&*health_check.liveness_path, get(Self::handle_liveness))
+            .route(&health_check.health_path, get(Self::handle_health))
+            .route(&health_check.readiness_path, get(Self::handle_readiness))
+            .route(&health_check.liveness_path, get(Self::handle_liveness))
             .with_state(health_state);
 
         let addr = &health_check.address;
