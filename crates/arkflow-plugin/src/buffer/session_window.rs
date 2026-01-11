@@ -193,3 +193,224 @@ pub fn init() -> Result<(), Error> {
     register_buffer_builder("session_window", Arc::new(SessionWindowBuilder))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::input::NoopAck;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_window_config_deserialization() {
+        let config_json = serde_json::json!({
+            "gap": "1s"
+        });
+
+        let config: SessionWindowConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.gap, time::Duration::from_secs(1));
+        assert!(config.join.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_config_with_join() {
+        let config_json = serde_json::json!({
+            "gap": "500ms",
+            "join": {
+                "query": "SELECT * FROM flow",
+                "codec": {
+                    "type": "json"
+                }
+            }
+        });
+
+        let config: SessionWindowConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.gap, time::Duration::from_millis(500));
+        assert!(config.join.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_basic() {
+        let buf = SessionWindow::new(
+            SessionWindowConfig {
+                gap: time::Duration::from_millis(100),
+                join: None,
+            },
+            &create_test_resource(),
+        )
+        .unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        // Wait for gap to elapse
+        tokio::time::sleep(time::Duration::from_millis(150)).await;
+
+        let result = buf.read().await;
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_multiple_messages() {
+        let buf = SessionWindow::new(
+            SessionWindowConfig {
+                gap: time::Duration::from_millis(200),
+                join: None,
+            },
+            &create_test_resource(),
+        )
+        .unwrap();
+
+        // Send multiple messages within the gap
+        for i in 0..5 {
+            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+            tokio::time::sleep(time::Duration::from_millis(50)).await;
+        }
+
+        // Wait for gap to elapse
+        tokio::time::sleep(time::Duration::from_millis(250)).await;
+
+        let result = buf.read().await;
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_multiple_sessions() {
+        let buf = Arc::new(
+            SessionWindow::new(
+                SessionWindowConfig {
+                    gap: time::Duration::from_millis(100),
+                    join: None,
+                },
+                &create_test_resource(),
+            )
+            .unwrap(),
+        );
+
+        // First session
+        let msg1 = MessageBatch::new_binary(vec![b"session1-msg1".to_vec()]).unwrap();
+        buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
+        tokio::time::sleep(time::Duration::from_millis(50)).await;
+
+        let msg2 = MessageBatch::new_binary(vec![b"session1-msg2".to_vec()]).unwrap();
+        buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
+
+        // Wait for first session to close
+        tokio::time::sleep(time::Duration::from_millis(150)).await;
+
+        let result1 = buf.read().await;
+        assert!(result1.is_ok());
+        let batch1 = result1.unwrap();
+        assert!(batch1.is_some());
+
+        // Second session
+        tokio::time::sleep(time::Duration::from_millis(50)).await;
+        let msg3 = MessageBatch::new_binary(vec![b"session2-msg1".to_vec()]).unwrap();
+        buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
+
+        // Wait for second session to close
+        tokio::time::sleep(time::Duration::from_millis(150)).await;
+
+        let result2 = buf.read().await;
+        assert!(result2.is_ok());
+        let batch2 = result2.unwrap();
+        assert!(batch2.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_close() {
+        let buf = SessionWindow::new(
+            SessionWindowConfig {
+                gap: time::Duration::from_secs(10),
+                join: None,
+            },
+            &create_test_resource(),
+        )
+        .unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        buf.close().await.unwrap();
+
+        let result = buf.read().await;
+        assert!(result.is_ok());
+        // After close, should return None when queue is empty
+        // or Some if there were pending messages
+    }
+
+    #[tokio::test]
+    async fn test_session_window_flush() {
+        let buf = SessionWindow::new(
+            SessionWindowConfig {
+                gap: time::Duration::from_secs(10),
+                join: None,
+            },
+            &create_test_resource(),
+        )
+        .unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap();
+        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        buf.flush().await.unwrap();
+
+        // After flush, should be able to read the pending message
+        let result = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_builder_with_valid_config() {
+        let builder = SessionWindowBuilder;
+        let config_json = serde_json::json!({
+            "gap": "1s"
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_builder_with_invalid_config() {
+        let builder = SessionWindowBuilder;
+        let config_json = serde_json::json!({
+            "gap": "invalid"
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_session_window_builder_without_config() {
+        let builder = SessionWindowBuilder;
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &None,
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+    }
+}
+

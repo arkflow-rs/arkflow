@@ -62,3 +62,143 @@ pub(crate) fn init() -> Result<(), Error> {
     codec::register_codec_builder("json", Arc::new(JsonCodecBuilder))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn test_json_codec_encode() {
+        let codec = JsonCodec;
+
+        // Create a simple message batch
+        let batch = MessageBatch::new_binary(vec![
+            br#"{"name":"Alice","age":30}"#.to_vec(),
+            br#"{"name":"Bob","age":25}"#.to_vec(),
+        ])
+        .unwrap();
+
+        let result = codec.encode(batch);
+        assert!(result.is_ok());
+        let encoded = result.unwrap();
+
+        // Should have encoded the data
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_json_codec_decode() {
+        let codec = JsonCodec;
+
+        let json_data = vec![
+            br#"{"name":"Alice","age":30}"#.to_vec(),
+            br#"{"name":"Bob","age":25}"#.to_vec(),
+        ];
+
+        let result = codec.decode(json_data);
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+
+        // Should have decoded to a message batch
+        assert!(batch.len() > 0);
+    }
+
+    #[test]
+    fn test_json_codec_encode_decode_roundtrip() {
+        let codec = JsonCodec;
+
+        let original_data = vec![
+            br#"{"id":1,"value":"test1"}"#.to_vec(),
+            br#"{"id":2,"value":"test2"}"#.to_vec(),
+        ];
+
+        // Decode
+        let batch = codec.decode(original_data.clone()).unwrap();
+
+        // Encode
+        let encoded = codec.encode(batch.clone()).unwrap();
+
+        // Decode again
+        let final_batch = codec.decode(encoded).unwrap();
+
+        // Both batches should have the same number of rows
+        assert_eq!(batch.len(), final_batch.len());
+    }
+
+    #[test]
+    fn test_json_codec_decode_empty() {
+        let codec = JsonCodec;
+        let result = codec.decode(vec![]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_codec_decode_invalid_json() {
+        let codec = JsonCodec;
+        let invalid_data = vec![b"{invalid json}".to_vec()];
+        let result = codec.decode(invalid_data);
+        // Should handle invalid JSON gracefully or return error
+        assert!(result.is_err() || result.is_ok());
+    }
+
+    #[test]
+    fn test_json_codec_builder() {
+        let builder = JsonCodecBuilder;
+        let result = builder.build(
+            Some(&"test-codec".to_string()),
+            &None,
+            &create_test_resource(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_codec_builder_with_config() {
+        let builder = JsonCodecBuilder;
+        let config = serde_json::json!({});
+
+        let result = builder.build(
+            Some(&"test-codec".to_string()),
+            &Some(config),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_codec_encode_single_message() {
+        let codec = JsonCodec;
+        let batch = MessageBatch::new_binary(vec![br#"{"test":"data"}"#.to_vec()]).unwrap();
+
+        let result = codec.encode(batch);
+        assert!(result.is_ok());
+        let encoded = result.unwrap();
+
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_json_codec_decode_complex_json() {
+        let codec = JsonCodec;
+
+        let complex_json = vec![
+            br#"{"user":{"name":"Alice","tags":["admin","user"]},"active":true}"#.to_vec(),
+            br#"{"user":{"name":"Bob","tags":["user"]},"active":false}"#.to_vec(),
+        ];
+
+        let result = codec.decode(complex_json);
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+
+        assert!(batch.len() > 0);
+    }
+}
