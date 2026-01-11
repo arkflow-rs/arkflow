@@ -236,3 +236,125 @@ impl OutputBuilder for NatsOutputBuilder {
 pub fn init() -> Result<(), Error> {
     register_output_builder("nats", Arc::new(NatsOutputBuilder))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn test_nats_output_config_regular_mode() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "regular",
+                "subject": {
+                    "type": "expr",
+                    "expr": "test.subject"
+                }
+            },
+            "auth": null,
+            "value_field": null
+        });
+
+        let config: NatsOutputConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.url, "nats://localhost:4222");
+        assert!(config.auth.is_none());
+        assert!(config.value_field.is_none());
+        match config.mode {
+            Mode::Regular { subject } => {
+                match subject {
+                    crate::expr::Expr::Expr { expr } => assert_eq!(expr, "test.subject"),
+                    _ => panic!("Expected Expr type"),
+                }
+            }
+            _ => panic!("Expected Regular mode"),
+        }
+    }
+
+    #[test]
+    fn test_nats_output_config_jetstream_mode() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "jet_stream",
+                "subject": {
+                    "type": "value",
+                    "value": "my.subject"
+                }
+            }
+        });
+
+        let config: NatsOutputConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.url, "nats://localhost:4222");
+        match config.mode {
+            Mode::JetStream { subject } => {
+                match subject {
+                    crate::expr::Expr::Value { value } => assert_eq!(value, "my.subject"),
+                    _ => panic!("Expected Value type"),
+                }
+            }
+            _ => panic!("Expected JetStream mode"),
+        }
+    }
+
+    #[test]
+    fn test_nats_output_config_with_auth() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "regular",
+                "subject": {
+                    "type": "value",
+                    "value": "test"
+                }
+            },
+            "auth": {
+                "username": "user",
+                "password": "pass",
+                "token": null
+            },
+            "value_field": "data"
+        });
+
+        let config: NatsOutputConfig = serde_json::from_value(config_json).unwrap();
+        assert!(config.auth.is_some());
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.username, Some("user".to_string()));
+        assert_eq!(auth.password, Some("pass".to_string()));
+        assert!(auth.token.is_none());
+        assert_eq!(config.value_field, Some("data".to_string()));
+    }
+
+    #[test]
+    fn test_nats_output_builder_without_config() {
+        let builder = NatsOutputBuilder;
+        let result = builder.build(None, &None, &create_test_resource());
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_nats_output_new() {
+        let config = NatsOutputConfig {
+            url: "nats://localhost:4222".to_string(),
+            mode: Mode::Regular {
+                subject: crate::expr::Expr::Value {
+                    value: "test".to_string(),
+                },
+            },
+            auth: None,
+            value_field: None,
+        };
+
+        let output = NatsOutput::new(config);
+        assert!(output.is_ok());
+    }
+}

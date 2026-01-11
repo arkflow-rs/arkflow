@@ -178,3 +178,172 @@ impl BufferBuilder for TumblingWindowBuilder {
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("tumbling_window", Arc::new(TumblingWindowBuilder))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::input::NoopAck;
+    use std::time::Duration;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn test_tumbling_window_config_deserialization() {
+        let config_json = serde_json::json!({
+            "interval": "5s"
+        });
+
+        let config: TumblingWindowConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.interval, Duration::from_secs(5));
+        assert!(config.join.is_none());
+    }
+
+    #[test]
+    fn test_tumbling_window_config_with_join() {
+        let config_json = serde_json::json!({
+            "interval": "1s",
+            "join": {
+                "query": "SELECT * FROM flow",
+                "codec": {
+                    "type": "json"
+                }
+            }
+        });
+
+        let config: TumblingWindowConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.interval, Duration::from_secs(1));
+        assert!(config.join.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_basic() {
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(100),
+            join: None,
+        };
+
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        // Read should return the message
+        let result = tokio::time::timeout(Duration::from_millis(200), buffer.read()).await;
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+        assert!(batch.is_ok());
+        let batch = batch.unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_multiple_messages() {
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(100),
+            join: None,
+        };
+
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        // Write multiple messages
+        for i in 0..5 {
+            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+        }
+
+        // Read should return the messages
+        let result = tokio::time::timeout(Duration::from_millis(200), buffer.read()).await;
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+        assert!(batch.is_ok());
+        let batch = batch.unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_close() {
+        let config = TumblingWindowConfig {
+            interval: Duration::from_secs(10),
+            join: None,
+        };
+
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        buffer.close().await.unwrap();
+
+        let result = buffer.read().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_flush() {
+        let config = TumblingWindowConfig {
+            interval: Duration::from_secs(10),
+            join: None,
+        };
+
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        let msg = MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap();
+        buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+
+        buffer.flush().await.unwrap();
+
+        // After flush, should be able to read the pending message
+        let result = tokio::time::timeout(Duration::from_millis(100), buffer.read()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_builder_with_valid_config() {
+        let builder = TumblingWindowBuilder;
+        let config_json = serde_json::json!({
+            "interval": "1s"
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tumbling_window_builder_without_config() {
+        let builder = TumblingWindowBuilder;
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &None,
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_tumbling_window_builder_with_invalid_interval() {
+        let builder = TumblingWindowBuilder;
+        let config_json = serde_json::json!({
+            "interval": "invalid"
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+    }
+}
