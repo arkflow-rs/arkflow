@@ -133,3 +133,100 @@ pub(crate) fn init() -> Result<(), Error> {
     codec::register_codec_builder("protobuf", Arc::new(ProtobufCodecBuilder))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn test_protobuf_codec_config_deserialization() {
+        let config_json = serde_json::json!({
+            "proto_inputs": ["/path/to/file.proto"],
+            "message_type": "MyMessage"
+        });
+
+        let config: ProtobufCodecConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.proto_inputs, vec!["/path/to/file.proto"]);
+        assert_eq!(config.message_type, "MyMessage");
+        assert!(config.proto_includes.is_none());
+    }
+
+    #[test]
+    fn test_protobuf_codec_config_with_includes() {
+        let config_json = serde_json::json!({
+            "proto_inputs": ["/path/to/file.proto"],
+            "proto_includes": ["/include/path"],
+            "message_type": "MyMessage"
+        });
+
+        let config: ProtobufCodecConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.proto_inputs, vec!["/path/to/file.proto"]);
+        assert_eq!(config.message_type, "MyMessage");
+        assert!(config.proto_includes.is_some());
+        assert_eq!(config.proto_includes.unwrap(), vec!["/include/path"]);
+    }
+
+    #[test]
+    fn test_protobuf_codec_builder_with_valid_config() {
+        let builder = ProtobufCodecBuilder;
+        let config_json = serde_json::json!({
+            "proto_inputs": ["/path/to/file.proto"],
+            "message_type": "MyMessage"
+        });
+
+        // This will fail at runtime because the file doesn't exist,
+        // but we can at least test that config parsing works
+        let config: ProtobufCodecConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.message_type, "MyMessage");
+    }
+
+    #[test]
+    fn test_protobuf_codec_builder_without_config() {
+        let builder = ProtobufCodecBuilder;
+        let result = builder.build(
+            Some(&"test-codec".to_string()),
+            &None,
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_protobuf_codec_config_impl() {
+        let config = ProtobufCodecConfig {
+            proto_inputs: vec!["test.proto".to_string()],
+            proto_includes: Some(vec!["/include".to_string()]),
+            message_type: "TestMessage".to_string(),
+        };
+
+        assert_eq!(config.proto_inputs(), &vec!["test.proto".to_string()]);
+        assert_eq!(config.proto_includes(), &Some(vec!["/include".to_string()]));
+    }
+
+    #[test]
+    fn test_protobuf_codec_builder_invalid_json() {
+        let builder = ProtobufCodecBuilder;
+        let invalid_json = serde_json::json!({
+            "proto_inputs": "should_be_array"
+        });
+
+        let result = builder.build(
+            Some(&"test-codec".to_string()),
+            &Some(invalid_json),
+            &create_test_resource(),
+        );
+
+        // Should fail due to invalid JSON structure
+        assert!(result.is_err());
+    }
+}

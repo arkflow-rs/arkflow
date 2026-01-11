@@ -38,6 +38,9 @@ pub mod processor;
 pub mod stream;
 pub mod temporary;
 
+#[cfg(test)]
+mod message_batch_tests;
+
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
 pub const DEFAULT_RECORD_BATCH: usize = 8192;
 

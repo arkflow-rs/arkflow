@@ -460,3 +460,129 @@ impl Ack for NatsAck {
 pub fn init() -> Result<(), Error> {
     register_input_builder("nats", Arc::new(NatsInputBuilder))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn test_nats_config_regular_mode() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "regular",
+                "subject": "test.subject",
+                "queue_group": null
+            },
+            "auth": null
+        });
+
+        let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.url, "nats://localhost:4222");
+        match config.mode {
+            Mode::Regular { subject, queue_group } => {
+                assert_eq!(subject, "test.subject");
+                assert!(queue_group.is_none());
+            }
+            _ => panic!("Expected Regular mode"),
+        }
+    }
+
+    #[test]
+    fn test_nats_config_jetstream_mode() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "jet_stream",
+                "stream": "mystream",
+                "consumer_name": "myconsumer",
+                "durable_name": "mydurable"
+            }
+        });
+
+        let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.url, "nats://localhost:4222");
+        match config.mode {
+            Mode::JetStream { stream, consumer_name, durable_name } => {
+                assert_eq!(stream, "mystream");
+                assert_eq!(consumer_name, "myconsumer");
+                assert_eq!(durable_name, Some("mydurable".to_string()));
+            }
+            _ => panic!("Expected JetStream mode"),
+        }
+    }
+
+    #[test]
+    fn test_nats_config_with_auth() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "regular",
+                "subject": "test.subject"
+            },
+            "auth": {
+                "username": "user",
+                "password": "pass",
+                "token": null
+            }
+        });
+
+        let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
+        assert!(config.auth.is_some());
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.username, Some("user".to_string()));
+        assert_eq!(auth.password, Some("pass".to_string()));
+        assert!(auth.token.is_none());
+    }
+
+    #[test]
+    fn test_nats_builder_without_config() {
+        let builder = NatsInputBuilder;
+        let result = builder.build(None, &None, &create_test_resource());
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_nats_auth_with_token() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "type": "regular",
+                "subject": "test.subject"
+            },
+            "auth": {
+                "username": null,
+                "password": null,
+                "token": "mytoken"
+            }
+        });
+
+        let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.token, Some("mytoken".to_string()));
+        assert!(auth.username.is_none());
+        assert!(auth.password.is_none());
+    }
+
+    #[test]
+    fn test_nats_mode_serialization() {
+        let mode = Mode::Regular {
+            subject: "test".to_string(),
+            queue_group: Some("queue".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&mode).unwrap();
+        assert!(serialized.contains("regular"));
+        assert!(serialized.contains("test"));
+        assert!(serialized.contains("queue"));
+    }
+}

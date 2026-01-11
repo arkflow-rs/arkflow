@@ -21,3 +21,15 @@ pub fn init() -> Result<(), Error> {
     protobuf::init()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_codec_init() {
+        // Test that codec initialization succeeds
+        let result = init();
+        assert!(result.is_ok());
+    }
+}

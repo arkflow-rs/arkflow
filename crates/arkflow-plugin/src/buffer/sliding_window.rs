@@ -274,3 +274,186 @@ impl BufferBuilder for SlidingWindowBuilder {
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("sliding_window", Arc::new(SlidingWindowBuilder))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::input::NoopAck;
+    use std::time::Duration;
+
+    fn create_test_resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_config_deserialization() {
+        let config_json = serde_json::json!({
+            "window_size": 10,
+            "interval": "1s",
+            "slide_size": 5
+        });
+
+        let config: SlidingWindowConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.window_size, 10);
+        assert_eq!(config.interval, Duration::from_secs(1));
+        assert_eq!(config.slide_size, 5);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_builder_with_valid_config() {
+        let builder = SlidingWindowBuilder;
+        let config_json = serde_json::json!({
+            "window_size": 10,
+            "interval": "1s",
+            "slide_size": 5
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sliding_window_builder_with_invalid_window_size() {
+        let builder = SlidingWindowBuilder;
+        let config_json = serde_json::json!({
+            "window_size": 0,
+            "interval": "1s",
+            "slide_size": 5
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_sliding_window_builder_with_invalid_slide_size() {
+        let builder = SlidingWindowBuilder;
+        let config_json = serde_json::json!({
+            "window_size": 10,
+            "interval": "1s",
+            "slide_size": 0
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_sliding_window_builder_window_size_less_than_slide_size() {
+        let builder = SlidingWindowBuilder;
+        let config_json = serde_json::json!({
+            "window_size": 5,
+            "interval": "1s",
+            "slide_size": 10
+        });
+
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &Some(config_json),
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_sliding_window_builder_without_config() {
+        let builder = SlidingWindowBuilder;
+        let result = builder.build(
+            Some(&"test-buffer".to_string()),
+            &None,
+            &create_test_resource(),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_basic() {
+        let config = SlidingWindowConfig {
+            window_size: 3,
+            interval: Duration::from_millis(100),
+            slide_size: 2,
+        };
+
+        let buffer = SlidingWindow::new(config).unwrap();
+
+        // Write 3 messages
+        for i in 0..3 {
+            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+        }
+
+        // Read should return a window with 3 messages
+        let result = buffer.read().await;
+        assert!(result.is_ok());
+        let batch = result.unwrap();
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_write_and_close() {
+        let config = SlidingWindowConfig {
+            window_size: 3,
+            interval: Duration::from_millis(100),
+            slide_size: 1,
+        };
+
+        let buffer = SlidingWindow::new(config).unwrap();
+
+        // Write some messages
+        for i in 0..2 {
+            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+        }
+
+        // Close the buffer
+        buffer.close().await.unwrap();
+
+        // Read should return None after close
+        let result = buffer.read().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_flush() {
+        let config = SlidingWindowConfig {
+            window_size: 3,
+            interval: Duration::from_millis(100),
+            slide_size: 1,
+        };
+
+        let buffer = SlidingWindow::new(config).unwrap();
+
+        // Write some messages
+        for i in 0..2 {
+            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
+        }
+
+        // Flush the buffer
+        buffer.flush().await.unwrap();
+    }
+}
