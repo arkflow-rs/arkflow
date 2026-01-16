@@ -43,7 +43,7 @@ struct PythonProcessor {
 
 #[async_trait]
 impl Processor for PythonProcessor {
-    async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let func_to_call = Python::with_gil(|py| self.func.clone_ref(py));
 
         let result = tokio::task::spawn_blocking(move || {

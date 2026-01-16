@@ -93,7 +93,7 @@ impl BatchProcessor {
 
 #[async_trait]
 impl Processor for BatchProcessor {
-    async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
         {
             let mut batch = self.batch.write().await;
             // Add messages to a batch
@@ -162,7 +162,7 @@ mod tests {
 
         // First message should not trigger flush
         let result = processor
-            .process_arc(Arc::new(
+            .process(Arc::new(
                 MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
             ))
             .await
@@ -171,7 +171,7 @@ mod tests {
 
         // Second message should trigger flush due to batch size
         let result = processor
-            .process_arc(Arc::new(
+            .process(Arc::new(
                 MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap(),
             ))
             .await
@@ -195,7 +195,7 @@ mod tests {
 
         // Add one message
         let result = processor
-            .process_arc(Arc::new(
+            .process(Arc::new(
                 MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
             ))
             .await
@@ -207,7 +207,7 @@ mod tests {
 
         // Next message should trigger flush due to timeout
         let result = processor
-            .process_arc(Arc::new(
+            .process(Arc::new(
                 MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap(),
             ))
             .await
@@ -243,7 +243,7 @@ mod tests {
 
         // Add a message to the batch
         processor
-            .process_arc(Arc::new(
+            .process(Arc::new(
                 MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
             ))
             .await

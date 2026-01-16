@@ -39,7 +39,7 @@ struct VrlProcessor {
 
 #[async_trait]
 impl Processor for VrlProcessor {
-    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let result = message_batch_to_vrl_values((*msg_batch).clone());
 
         let mut state = RuntimeState::default();

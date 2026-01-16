@@ -45,7 +45,7 @@ struct JsonToArrowProcessor {
 
 #[async_trait]
 impl Processor for JsonToArrowProcessor {
-    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let result = msg_batch.to_binary(
             self.config
                 .value_field
@@ -77,7 +77,7 @@ pub struct ArrowToJsonProcessor {
 
 #[async_trait]
 impl Processor for ArrowToJsonProcessor {
-    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let json_data = self.arrow_to_json((*msg_batch).clone())?;
 
         Ok(ProcessResult::Single(Arc::new(
@@ -195,7 +195,7 @@ mod tests {
 
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
 
-        let result = processor.process_arc(Arc::new(msg_batch)).await.unwrap();
+        let result = processor.process(Arc::new(msg_batch)).await.unwrap();
         match result {
             ProcessResult::Single(batch) => {
                 assert_eq!(batch.len(), 1);
@@ -232,7 +232,7 @@ mod tests {
 
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()])?;
 
-        let result = processor.process_arc(Arc::new(msg_batch)).await?;
+        let result = processor.process(Arc::new(msg_batch)).await?;
         match result {
             ProcessResult::Single(batch) => {
                 assert_eq!(batch.len(), 1);
@@ -260,7 +260,7 @@ mod tests {
         let invalid_json = b"not a json object";
         let msg_batch = MessageBatch::new_binary(vec![invalid_json.to_vec()])?;
 
-        let result = processor.process_arc(Arc::new(msg_batch)).await;
+        let result = processor.process(Arc::new(msg_batch)).await;
         assert!(result.is_err());
         Ok(())
     }
@@ -300,10 +300,7 @@ mod tests {
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
 
         // Convert JSON to Arrow
-        let arrow_result = json_to_arrow
-            .process_arc(Arc::new(msg_batch))
-            .await
-            .unwrap();
+        let arrow_result = json_to_arrow.process(Arc::new(msg_batch)).await.unwrap();
 
         let arrow_batch = match arrow_result {
             ProcessResult::Single(batch) => batch,
@@ -311,7 +308,7 @@ mod tests {
         };
 
         // Convert Arrow back to JSON
-        let json_result = arrow_to_json.process_arc(arrow_batch).await.unwrap();
+        let json_result = arrow_to_json.process(arrow_batch).await.unwrap();
 
         match json_result {
             ProcessResult::Single(batch) => {

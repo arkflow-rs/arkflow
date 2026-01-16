@@ -276,7 +276,7 @@ impl Stream {
                 break;
             };
 
-            let processed = pipeline.process_arc(msg.clone()).await;
+            let processed = pipeline.process(msg.clone()).await;
             let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
 
             match processed {

@@ -97,7 +97,7 @@ impl ProtobufProcessor {
 
 #[async_trait]
 impl Processor for ProtobufProcessor {
-    async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
         if msg.is_empty() {
             return Ok(ProcessResult::None);
         }
@@ -315,7 +315,7 @@ message TestMessage {
         test_message.encode(&mut encoded).unwrap();
         let msg_batch = MessageBatch::new_binary(vec![encoded])?;
 
-        let result = processor.process_arc(Arc::new(msg_batch)).await?;
+        let result = processor.process(Arc::new(msg_batch)).await?;
         assert_eq!(result.len(), 1);
 
         let batch = match &result {
@@ -375,7 +375,7 @@ message TestMessage {
 
         let msg_batch = MessageBatch::new_arrow(batch);
 
-        let result = processor.process_arc(Arc::new(msg_batch)).await?;
+        let result = processor.process(Arc::new(msg_batch)).await?;
         assert_eq!(result.len(), 1);
 
         let batch = match &result {
@@ -417,7 +417,7 @@ message TestMessage {
 
         let empty_batch = MessageBatch::new_binary(vec![])?;
 
-        let result = processor.process_arc(Arc::new(empty_batch)).await?;
+        let result = processor.process(Arc::new(empty_batch)).await?;
         assert_eq!(result.len(), 0);
 
         Ok(())

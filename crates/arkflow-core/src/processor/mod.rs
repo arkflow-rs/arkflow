@@ -41,7 +41,7 @@ pub trait Processor: Send + Sync {
     /// struct MyProcessor;
     ///
     /// impl MyProcessor {
-    ///     async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    ///     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
     ///         // Forward without copying
     ///         Ok(ProcessResult::Single(batch))
     ///     }
@@ -62,7 +62,7 @@ pub trait Processor: Send + Sync {
     /// struct MyProcessor;
     ///
     /// impl MyProcessor {
-    ///     async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    ///     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
     ///         if needs_transform(&batch) {
     ///             let new_batch = transform(&*batch)?;
     ///             Ok(ProcessResult::Single(Arc::new(new_batch)))
@@ -72,7 +72,7 @@ pub trait Processor: Send + Sync {
     ///     }
     /// }
     /// ```
-    async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error>;
+    async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error>;
 
     /// Turn off the processor
     async fn close(&self) -> Result<(), Error>;

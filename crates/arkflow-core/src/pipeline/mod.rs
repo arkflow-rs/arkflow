@@ -50,20 +50,20 @@ impl Pipeline {
     /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let pipeline = Pipeline::new(vec![]);  // Empty pipeline
     ///     let batch = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()])?);
-    ///     let result = pipeline.process_arc(batch).await?;
+    ///     let result = pipeline.process(batch).await?;
     ///     Ok(())
     /// }
     /// ```
-    pub async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
+    pub async fn process(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
         let mut current = ProcessResult::Single(msg);
 
         for processor in &self.processors {
             current = match current {
-                ProcessResult::Single(batch) => processor.process_arc(batch).await?,
+                ProcessResult::Single(batch) => processor.process(batch).await?,
                 ProcessResult::Multiple(batches) => {
                     let mut results = Vec::new();
                     for batch in batches {
-                        match processor.process_arc(batch).await? {
+                        match processor.process(batch).await? {
                             ProcessResult::Single(result) => results.push(result),
                             ProcessResult::Multiple(mut res) => results.append(&mut res),
                             ProcessResult::None => {} // Filtered out

@@ -203,7 +203,7 @@ impl SqlProcessor {
 
 #[async_trait]
 impl Processor for SqlProcessor {
-    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         // If the batch is empty, return empty result
         if msg_batch.is_empty() {
             return Ok(ProcessResult::None);
@@ -281,7 +281,7 @@ mod tests {
         .unwrap();
 
         let result = processor
-            .process_arc(Arc::new(MessageBatch::new_arrow(batch)))
+            .process(Arc::new(MessageBatch::new_arrow(batch)))
             .await
             .unwrap();
 
@@ -309,7 +309,7 @@ mod tests {
         .unwrap();
 
         let result = processor
-            .process_arc(Arc::new(MessageBatch::new_arrow(RecordBatch::new_empty(
+            .process(Arc::new(MessageBatch::new_arrow(RecordBatch::new_empty(
                 Arc::new(Schema::empty()),
             ))))
             .await
@@ -359,7 +359,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
 
         let result = processor
-            .process_arc(Arc::new(MessageBatch::new_arrow(batch)))
+            .process(Arc::new(MessageBatch::new_arrow(batch)))
             .await
             .unwrap();
 
