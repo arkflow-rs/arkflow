@@ -19,7 +19,7 @@
 use crate::{expr, udf};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::temporary::Temporary;
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
@@ -203,15 +203,17 @@ impl SqlProcessor {
 
 #[async_trait]
 impl Processor for SqlProcessor {
-    async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        // If the batch is empty, return an empty result.
+    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        // If the batch is empty, return empty result
         if msg_batch.is_empty() {
-            return Ok(vec![]);
+            return Ok(ProcessResult::None);
         }
 
         // Execute SQL query
-        let result_batch = self.execute_query(msg_batch).await?;
-        Ok(vec![MessageBatch::new_arrow(result_batch)])
+        let result_batch = self.execute_query((*msg_batch).clone()).await?;
+        Ok(ProcessResult::Single(Arc::new(MessageBatch::new_arrow(
+            result_batch,
+        ))))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -279,12 +281,16 @@ mod tests {
         .unwrap();
 
         let result = processor
-            .process(MessageBatch::new_arrow(batch))
+            .process_arc(Arc::new(MessageBatch::new_arrow(batch)))
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].len(), 3);
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 3);
+            }
+            _ => panic!("Expected single result"),
+        }
     }
 
     #[tokio::test]
@@ -303,8 +309,8 @@ mod tests {
         .unwrap();
 
         let result = processor
-            .process(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
-                Schema::empty(),
+            .process_arc(Arc::new(MessageBatch::new_arrow(RecordBatch::new_empty(
+                Arc::new(Schema::empty()),
             ))))
             .await
             .unwrap();
@@ -353,11 +359,15 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
 
         let result = processor
-            .process(MessageBatch::new_arrow(batch))
+            .process_arc(Arc::new(MessageBatch::new_arrow(batch)))
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].len(), 1);
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 1);
+            }
+            _ => panic!("Expected single result"),
+        }
     }
 }

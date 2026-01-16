@@ -17,8 +17,10 @@
 //! Send the processed data to the MQTT broker
 
 use crate::expr::Expr;
-use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    output::{register_output_builder, Output, OutputBuilder},
+    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
@@ -119,7 +121,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         if !self.connected.load(Ordering::SeqCst) {
             return Err(Error::Connection("The output is not connected".to_string()));
         }
@@ -395,7 +397,7 @@ mod tests {
         let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
         output.connect().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message").unwrap();
+        let msg = Arc::new(MessageBatch::from_string("test message").unwrap());
         assert!(output.write(msg).await.is_ok());
 
         // Verify the message was published
@@ -459,7 +461,7 @@ mod tests {
         output.connect().await.unwrap();
         output.close().await.unwrap();
 
-        let msg = MessageBatch::from_string("test message").unwrap();
+        let msg = Arc::new(MessageBatch::from_string("test message").unwrap());
         assert!(output.write(msg).await.is_err());
     }
 }

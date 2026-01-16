@@ -20,7 +20,9 @@ use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
 };
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    Error, MessageBatch, MessageBatchRef, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_trait::async_trait;
 use datafusion::arrow;
 use prost_reflect::MessageDescriptor;
@@ -95,31 +97,31 @@ impl ProtobufProcessor {
 
 #[async_trait]
 impl Processor for ProtobufProcessor {
-    async fn process(&self, msg: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+    async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
         if msg.is_empty() {
-            return Ok(vec![]);
+            return Ok(ProcessResult::None);
         }
 
-        match self._config.mode {
+        let result = match self._config.mode {
             ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
                 let proto_data = if let Some(ref fields_to_include) = self._config.fields_to_include
                 {
-                    let filter_msg = msg.filter_columns(fields_to_include)?;
+                    let filter_msg = (*msg).filter_columns(fields_to_include)?;
                     arrow_to_protobuf(&self.descriptor, &filter_msg)?
                 } else {
                     arrow_to_protobuf(&self.descriptor, &msg)?
                 };
 
-                Ok(vec![msg.new_binary_with_origin(proto_data)?])
+                Arc::new((*msg).new_binary_with_origin(proto_data)?)
             }
             ToType::ProtobufToArrow(ref c) => {
                 if msg.is_empty() {
-                    return Ok(vec![]);
+                    return Ok(ProcessResult::None);
                 }
 
                 let mut batches = Vec::with_capacity(msg.len());
-                let result = msg.to_binary(
+                let result = (*msg).to_binary(
                     c.value_field
                         .as_deref()
                         .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
@@ -133,9 +135,11 @@ impl Processor for ProtobufProcessor {
                 let schema = batches[0].schema();
                 let batch = arrow::compute::concat_batches(&schema, &batches)
                     .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?;
-                Ok(vec![MessageBatch::new_arrow(batch)])
+                Arc::new(MessageBatch::new_arrow(batch))
             }
-        }
+        };
+
+        Ok(ProcessResult::Single(result))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -311,10 +315,13 @@ message TestMessage {
         test_message.encode(&mut encoded).unwrap();
         let msg_batch = MessageBatch::new_binary(vec![encoded])?;
 
-        let result = processor.process(msg_batch).await?;
+        let result = processor.process_arc(Arc::new(msg_batch)).await?;
         assert_eq!(result.len(), 1);
 
-        let batch = &result[0];
+        let batch = match &result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
 
         assert_eq!(batch.schema().fields().len(), 3);
 
@@ -368,10 +375,14 @@ message TestMessage {
 
         let msg_batch = MessageBatch::new_arrow(batch);
 
-        let result = processor.process(msg_batch).await?;
+        let result = processor.process_arc(Arc::new(msg_batch)).await?;
         assert_eq!(result.len(), 1);
 
-        let binary_data = result[0].to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
+        let batch = match &result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
+        let binary_data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
         assert_eq!(binary_data.len(), 1);
 
         let decoded_msg =
@@ -406,7 +417,7 @@ message TestMessage {
 
         let empty_batch = MessageBatch::new_binary(vec![])?;
 
-        let result = processor.process(empty_batch).await?;
+        let result = processor.process_arc(Arc::new(empty_batch)).await?;
         assert_eq!(result.len(), 0);
 
         Ok(())

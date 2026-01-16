@@ -13,7 +13,7 @@
  */
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -167,7 +167,7 @@ impl Input for SqlInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
         if stream_lock.is_none() {
@@ -193,7 +193,7 @@ impl Input for SqlInput {
                 let mut msg = MessageBatch::new_arrow(x);
                 msg.set_input_name(self.input_name.clone());
 
-                Ok((msg, Arc::new(NoopAck)))
+                Ok((Arc::new(msg), Arc::new(NoopAck)))
             }
 
         }

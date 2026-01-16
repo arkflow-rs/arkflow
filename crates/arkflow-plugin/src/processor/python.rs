@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::processor::{Processor, ProcessorBuilder};
-use arkflow_core::{processor, Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -43,13 +43,13 @@ struct PythonProcessor {
 
 #[async_trait]
 impl Processor for PythonProcessor {
-    async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+    async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let func_to_call = Python::with_gil(|py| self.func.clone_ref(py));
 
         let result = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> Result<Vec<RecordBatch>, Error> {
                 // Convert MessageBatch to PyArrow
-                let py_batch = batch.to_pyarrow(py).map_err(|e| {
+                let py_batch = (*batch).to_pyarrow(py).map_err(|e| {
                     Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
                 })?;
 
@@ -82,7 +82,18 @@ impl Processor for PythonProcessor {
             .into_iter()
             .map(|rb| MessageBatch::new_arrow(rb))
             .collect::<Vec<_>>();
-        Ok(vec_mb)
+
+        if vec_mb.is_empty() {
+            Ok(ProcessResult::None)
+        } else if vec_mb.len() == 1 {
+            Ok(ProcessResult::Single(Arc::new(
+                vec_mb.into_iter().next().unwrap(),
+            )))
+        } else {
+            Ok(ProcessResult::Multiple(
+                vec_mb.into_iter().map(Arc::new).collect(),
+            ))
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -164,5 +175,5 @@ fn default_module() -> String {
 }
 
 pub fn init() -> Result<(), Error> {
-    processor::register_processor_builder("python", Arc::new(PythonProcessorBuilder))
+    arkflow_core::processor::register_processor_builder("python", Arc::new(PythonProcessorBuilder))
 }

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatch, Resource};
+use crate::{Error, MessageBatchRef, Resource};
 
 lazy_static::lazy_static! {
     static ref OUTPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn OutputBuilder>>> = RwLock::new(HashMap::new());
@@ -32,8 +32,8 @@ pub trait Output: Send + Sync {
     /// Connect to the output destination
     async fn connect(&self) -> Result<(), Error>;
 
-    /// Write a message to the output destination
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error>;
+    /// Write a message using Arc for zero-copy
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error>;
 
     /// Close the output destination connection
     async fn close(&self) -> Result<(), Error>;

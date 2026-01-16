@@ -24,7 +24,7 @@ use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,7 +103,7 @@ impl Buffer for SessionWindow {
     ///
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
-    async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         self.base_window.write(msg, ack).await?;
         // Update the last message timestamp to track session activity
         *self.last_message_time.write().await = Instant::now();
@@ -114,9 +114,9 @@ impl Buffer for SessionWindow {
     /// Waits until either the session gap has elapsed or the buffer is closed
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
-    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         if self.close.is_cancelled() {
             return Ok(None);
         }
@@ -244,7 +244,7 @@ mod tests {
         )
         .unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         // Wait for gap to elapse
@@ -269,7 +269,8 @@ mod tests {
 
         // Send multiple messages within the gap
         for i in 0..5 {
-            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            let msg =
+                Arc::new(MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap());
             buf.write(msg, Arc::new(NoopAck)).await.unwrap();
             tokio::time::sleep(time::Duration::from_millis(50)).await;
         }
@@ -297,11 +298,11 @@ mod tests {
         );
 
         // First session
-        let msg1 = MessageBatch::new_binary(vec![b"session1-msg1".to_vec()]).unwrap();
+        let msg1 = Arc::new(MessageBatch::new_binary(vec![b"session1-msg1".to_vec()]).unwrap());
         buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
         tokio::time::sleep(time::Duration::from_millis(50)).await;
 
-        let msg2 = MessageBatch::new_binary(vec![b"session1-msg2".to_vec()]).unwrap();
+        let msg2 = Arc::new(MessageBatch::new_binary(vec![b"session1-msg2".to_vec()]).unwrap());
         buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
 
         // Wait for first session to close
@@ -314,7 +315,7 @@ mod tests {
 
         // Second session
         tokio::time::sleep(time::Duration::from_millis(50)).await;
-        let msg3 = MessageBatch::new_binary(vec![b"session2-msg1".to_vec()]).unwrap();
+        let msg3 = Arc::new(MessageBatch::new_binary(vec![b"session2-msg1".to_vec()]).unwrap());
         buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
 
         // Wait for second session to close
@@ -337,7 +338,7 @@ mod tests {
         )
         .unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         buf.close().await.unwrap();
@@ -359,7 +360,7 @@ mod tests {
         )
         .unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         buf.flush().await.unwrap();
@@ -413,4 +414,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

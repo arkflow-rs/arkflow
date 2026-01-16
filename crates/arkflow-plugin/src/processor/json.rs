@@ -18,7 +18,10 @@
 
 use crate::component;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Bytes, Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,
+    DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -42,7 +45,7 @@ struct JsonToArrowProcessor {
 
 #[async_trait]
 impl Processor for JsonToArrowProcessor {
-    async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let result = msg_batch.to_binary(
             self.config
                 .value_field
@@ -52,7 +55,9 @@ impl Processor for JsonToArrowProcessor {
 
         let json_data: Vec<u8> = result.join(b"\n" as &[u8]);
         let record_batch = self.json_to_arrow(&json_data)?;
-        Ok(vec![MessageBatch::new_arrow(record_batch)])
+        Ok(ProcessResult::Single(Arc::new(MessageBatch::new_arrow(
+            record_batch,
+        ))))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -72,10 +77,12 @@ pub struct ArrowToJsonProcessor {
 
 #[async_trait]
 impl Processor for ArrowToJsonProcessor {
-    async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let json_data = self.arrow_to_json(msg_batch.clone())?;
+    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        let json_data = self.arrow_to_json((*msg_batch).clone())?;
 
-        Ok(vec![msg_batch.new_binary_with_origin(json_data)?])
+        Ok(ProcessResult::Single(Arc::new(
+            msg_batch.new_binary_with_origin(json_data)?,
+        )))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -154,10 +161,11 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use crate::processor::json::{ArrowToJsonProcessorBuilder, JsonToArrowProcessorBuilder};
     use arkflow_core::processor::ProcessorBuilder;
-    use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+    use arkflow_core::{Error, MessageBatch, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD};
     use serde_json::json;
     use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_json_to_arrow_basic_types() -> Result<(), Error> {
@@ -187,8 +195,13 @@ mod tests {
 
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
 
-        let result = processor.process(msg_batch).await.unwrap();
-        assert_eq!(result.len(), 1);
+        let result = processor.process_arc(Arc::new(msg_batch)).await.unwrap();
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 1);
+            }
+            _ => panic!("Expected single result"),
+        }
         Ok(())
     }
 
@@ -219,8 +232,13 @@ mod tests {
 
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()])?;
 
-        let result = processor.process(msg_batch).await?;
-        assert_eq!(result.len(), 1);
+        let result = processor.process_arc(Arc::new(msg_batch)).await?;
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 1);
+            }
+            _ => panic!("Expected single result"),
+        }
         Ok(())
     }
 
@@ -242,7 +260,7 @@ mod tests {
         let invalid_json = b"not a json object";
         let msg_batch = MessageBatch::new_binary(vec![invalid_json.to_vec()])?;
 
-        let result = processor.process(msg_batch).await;
+        let result = processor.process_arc(Arc::new(msg_batch)).await;
         assert!(result.is_err());
         Ok(())
     }
@@ -282,12 +300,25 @@ mod tests {
         let msg_batch = MessageBatch::new_binary(vec![json_data.to_string().into_bytes()]).unwrap();
 
         // Convert JSON to Arrow
-        let arrow_batch = json_to_arrow.process(msg_batch).await.unwrap();
-        assert_eq!(arrow_batch.len(), 1);
+        let arrow_result = json_to_arrow
+            .process_arc(Arc::new(msg_batch))
+            .await
+            .unwrap();
+
+        let arrow_batch = match arrow_result {
+            ProcessResult::Single(batch) => batch,
+            _ => panic!("Expected single result"),
+        };
 
         // Convert Arrow back to JSON
-        let json_result = arrow_to_json.process(arrow_batch[0].clone()).await.unwrap();
-        assert_eq!(json_result.len(), 1);
+        let json_result = arrow_to_json.process_arc(arrow_batch).await.unwrap();
+
+        match json_result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 1);
+            }
+            _ => panic!("Expected single result"),
+        }
     }
 
     #[tokio::test]

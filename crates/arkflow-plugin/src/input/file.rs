@@ -13,8 +13,10 @@
  */
 
 use crate::udf;
-use arkflow_core::input::{Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{input, Error, MessageBatch, Resource};
+use arkflow_core::{
+    input::{Ack, Input, InputBuilder, NoopAck},
+    Error, MessageBatch, MessageBatchRef, Resource,
+};
 use async_trait::async_trait;
 use ballista::prelude::SessionContextExt;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -414,7 +416,7 @@ impl Input for FileInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
         if stream_lock.is_none() {
@@ -440,7 +442,7 @@ impl Input for FileInput {
                 let mut msg = MessageBatch::new_arrow(x);
                 msg.set_input_name(self.input_name.clone());
 
-                Ok((msg, Arc::new(NoopAck)))
+                Ok((Arc::new(msg), Arc::new(NoopAck)))
             }
 
         }
@@ -474,7 +476,7 @@ impl InputBuilder for FileBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    input::register_input_builder("file", Arc::new(FileBuilder))?;
+    arkflow_core::input::register_input_builder("file", Arc::new(FileBuilder))?;
     Ok(())
 }
 

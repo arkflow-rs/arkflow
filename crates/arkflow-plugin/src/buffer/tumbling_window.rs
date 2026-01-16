@@ -24,7 +24,7 @@ use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,7 +96,7 @@ impl Buffer for TumblingWindow {
     ///
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
-    async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         self.base_window.write(msg, ack).await
     }
 
@@ -104,9 +104,9 @@ impl Buffer for TumblingWindow {
     /// Waits until either messages are available or the buffer is closed
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
-    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         // If the buffer is closed, return None
         if self.close.is_cancelled() {
             return Ok(None);
@@ -229,7 +229,7 @@ mod tests {
 
         let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap());
         buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         // Read should return the message
@@ -252,7 +252,8 @@ mod tests {
 
         // Write multiple messages
         for i in 0..5 {
-            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            let msg =
+                Arc::new(MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap());
             buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
         }
 
@@ -274,7 +275,7 @@ mod tests {
 
         let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()]).unwrap());
         buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         buffer.close().await.unwrap();
@@ -292,7 +293,7 @@ mod tests {
 
         let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
 
-        let msg = MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"flush-test".to_vec()]).unwrap());
         buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
 
         buffer.flush().await.unwrap();

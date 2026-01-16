@@ -12,8 +12,10 @@
  *    limitations under the License.
  */
 use crate::time::deserialize_duration;
-use arkflow_core::input::{Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{input, Error, MessageBatch, Resource};
+use arkflow_core::{
+    input::{Ack, Input, InputBuilder, NoopAck},
+    Error, MessageBatch, MessageBatchRef, Resource,
+};
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, ListArray, RecordBatch, UInt16Array};
 use datafusion::arrow::buffer::OffsetBuffer;
@@ -88,7 +90,7 @@ impl Input for ModbusInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         let mut ctx = self.client.lock().await;
         let Some(ctx) = ctx.as_mut() else {
             return Err(Error::Disconnection);
@@ -166,7 +168,7 @@ impl Input for ModbusInput {
             .map_err(|e| Error::Process(format!("Failed to create record batch:{}", e)))?;
         let mut msg: MessageBatch = batch.into();
         msg.set_input_name(self.name.clone());
-        Ok((msg, Arc::new(NoopAck)))
+        Ok((Arc::new(msg), Arc::new(NoopAck)))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -228,6 +230,6 @@ impl InputBuilder for ModbusInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    input::register_input_builder("modbus", Arc::new(ModbusInputBuilder))?;
+    arkflow_core::input::register_input_builder("modbus", Arc::new(ModbusInputBuilder))?;
     Ok(())
 }

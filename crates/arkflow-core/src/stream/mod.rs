@@ -18,7 +18,10 @@
 
 use crate::buffer::Buffer;
 use crate::input::Ack;
-use crate::{input::Input, output::Output, pipeline::Pipeline, Error, MessageBatch, Resource};
+use crate::{
+    input::Input, output::Output, pipeline::Pipeline, Error, MessageBatchRef, ProcessResult,
+    Resource,
+};
 use flume::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -44,8 +47,8 @@ pub struct Stream {
 }
 
 enum ProcessorData {
-    Err(MessageBatch, Error),
-    Ok(Vec<MessageBatch>),
+    Err(MessageBatchRef, Error),
+    Ok(Vec<MessageBatchRef>),
 }
 
 impl Stream {
@@ -85,7 +88,7 @@ impl Stream {
         }
 
         let (input_sender, input_receiver) =
-            flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
+            flume::bounded::<(MessageBatchRef, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
             flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
 
@@ -148,7 +151,7 @@ impl Stream {
     async fn do_input(
         cancellation_token: CancellationToken,
         input: Arc<dyn Input>,
-        input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
+        input_sender: Sender<(MessageBatchRef, Arc<dyn Ack>)>,
         buffer_option: Option<Arc<dyn Buffer>>,
     ) {
         loop {
@@ -158,13 +161,13 @@ impl Stream {
                 },
                 result = input.read() =>{
                     match result {
-                    Ok(msg) => {
+                    Ok((msg, ack)) => {
                             if let Some(buffer) = &buffer_option {
-                                if let Err(e) = buffer.write(msg.0, msg.1).await {
+                                if let Err(e) = buffer.write(msg, ack).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
-                            } else if let Err(e) = input_sender.send_async(msg).await {
+                            } else if let Err(e) = input_sender.send_async((msg, ack)).await {
                                 error!("Failed to send input message: {}", e);
                                 break;
                             }
@@ -208,7 +211,7 @@ impl Stream {
     async fn do_buffer(
         cancellation_token: CancellationToken,
         buffer: Arc<dyn Buffer>,
-        input_sender: Sender<(MessageBatch, Arc<dyn Ack>)>,
+        input_sender: Sender<(MessageBatchRef, Arc<dyn Ack>)>,
     ) {
         loop {
             tokio::select! {
@@ -217,8 +220,8 @@ impl Stream {
                 },
                 result = buffer.read() =>{
                     match result {
-                        Ok(Some(v)) => {
-                             if let Err(e) = input_sender.send_async(v).await {
+                        Ok(Some((v, ack))) => {
+                             if let Err(e) = input_sender.send_async((v, ack)).await {
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
@@ -238,8 +241,8 @@ impl Stream {
 
         info!("Buffer flushed");
 
-        if let Ok(Some(v)) = buffer.read().await {
-            if let Err(e) = input_sender.send_async(v).await {
+        if let Ok(Some((v, ack))) = buffer.read().await {
+            if let Err(e) = input_sender.send_async((v, ack)).await {
                 error!("Failed to send input message: {}", e);
             }
         }
@@ -249,7 +252,7 @@ impl Stream {
     async fn do_processor(
         i: u32,
         pipeline: Arc<Pipeline>,
-        input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
+        input_receiver: Receiver<(MessageBatchRef, Arc<dyn Ack>)>,
         output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
         next_seq: Arc<AtomicU64>,
@@ -257,6 +260,7 @@ impl Stream {
         let i = i + 1;
         info!("Processor worker {} started", i);
         loop {
+            // Backpressure control
             let pending_messages =
                 sequence_counter.load(Ordering::Acquire) - next_seq.load(Ordering::Acquire);
             if pending_messages > BACKPRESSURE_THRESHOLD {
@@ -272,20 +276,31 @@ impl Stream {
                 break;
             };
 
-            // Process messages through pipeline
-            let processed = pipeline.process(msg.clone()).await;
+            let processed = pipeline.process_arc(msg.clone()).await;
             let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
 
-            // Process result messages
             match processed {
-                Ok(msgs) => {
+                Ok(ProcessResult::Single(result_msg)) => {
                     if let Err(e) = output_sender
-                        .send_async((ProcessorData::Ok(msgs), ack, seq))
+                        .send_async((ProcessorData::Ok(vec![result_msg]), ack, seq))
                         .await
                     {
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
+                }
+                Ok(ProcessResult::Multiple(result_msgs)) => {
+                    if let Err(e) = output_sender
+                        .send_async((ProcessorData::Ok(result_msgs), ack, seq))
+                        .await
+                    {
+                        error!("Failed to send processed message: {}", e);
+                        break;
+                    }
+                }
+                Ok(ProcessResult::None) => {
+                    // Message filtered out, just ACK
+                    ack.ack().await;
                 }
                 Err(e) => {
                     if let Err(e) = output_sender
@@ -364,8 +379,8 @@ impl Stream {
             ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
-                for x in msgs {
-                    match output.write(x).await {
+                for msg in msgs {
+                    match output.write(msg).await {
                         Ok(_) => {
                             success_cnt += 1;
                         }

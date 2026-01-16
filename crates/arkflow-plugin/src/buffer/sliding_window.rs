@@ -22,7 +22,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -54,7 +54,7 @@ struct SlidingWindow {
     /// Configuration parameters for the sliding window
     config: SlidingWindowConfig,
     /// Thread-safe queue to store message batches and their acknowledgments
-    queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -107,9 +107,9 @@ impl SlidingWindow {
     /// Processes the current window by merging messages and sliding forward
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if there aren't enough messages to form a window
-    async fn process_slide(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn process_slide(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         let mut queue_lock = self.queue.write().await;
         if queue_lock.len() < self.config.window_size as usize {
             return Ok(None);
@@ -134,7 +134,10 @@ impl SlidingWindow {
         }
 
         let schema = messages[0].schema();
-        let batches: Vec<RecordBatch> = messages.into_iter().map(|batch| batch.into()).collect();
+        let batches: Vec<RecordBatch> = messages
+            .into_iter()
+            .map(|batch| (*batch).clone().into())
+            .collect();
         let new_batch = arrow::compute::concat_batches(&schema, &batches)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
@@ -148,7 +151,10 @@ impl SlidingWindow {
             }
         }
 
-        Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
+        Ok(Some((
+            Arc::new(MessageBatch::new_arrow(new_batch)),
+            new_ack,
+        )))
     }
 }
 
@@ -162,7 +168,7 @@ impl Buffer for SlidingWindow {
     ///
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
-    async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let mut queue_lock = self.queue.write().await;
         queue_lock.push_back((msg, ack));
         Ok(())
@@ -172,9 +178,9 @@ impl Buffer for SlidingWindow {
     /// Waits until either enough messages are available to form a window or the buffer is closed
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
-    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         if self.close.is_cancelled() {
             return Ok(None);
         }
@@ -402,7 +408,8 @@ mod tests {
 
         // Write 3 messages
         for i in 0..3 {
-            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            let msg =
+                Arc::new(MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap());
             buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
         }
 
@@ -425,7 +432,8 @@ mod tests {
 
         // Write some messages
         for i in 0..2 {
-            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            let msg =
+                Arc::new(MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap());
             buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
         }
 
@@ -449,7 +457,8 @@ mod tests {
 
         // Write some messages
         for i in 0..2 {
-            let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+            let msg =
+                Arc::new(MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap());
             buffer.write(msg, Arc::new(NoopAck)).await.unwrap();
         }
 

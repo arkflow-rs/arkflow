@@ -20,7 +20,7 @@ use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
@@ -198,7 +198,7 @@ impl Input for PulsarInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         // Check client connection
         let client_guard = self.client.read().await;
         if client_guard.is_none() {
@@ -225,7 +225,7 @@ impl Input for PulsarInput {
                                     .ok_or_else(|| Error::Connection("Pulsar consumer not available".to_string()))?;
 
                                 let ack = PulsarAck::new(message, consumer);
-                                Ok((msg_batch, Arc::new(ack) as Arc<dyn Ack>))
+                                Ok((Arc::new(msg_batch), Arc::new(ack) as Arc<dyn Ack>))
                             },
                             PulsarMsg::Err(e) => {
                                 Err(e)

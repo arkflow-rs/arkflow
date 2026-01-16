@@ -11,8 +11,10 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use arkflow_core::input::{Ack, Input, InputBuilder, InputConfig};
-use arkflow_core::{input, Error, MessageBatch, Resource};
+use arkflow_core::{
+    input::{Ack, Input, InputBuilder, InputConfig},
+    Error, MessageBatch, MessageBatchRef, Resource,
+};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -37,7 +39,7 @@ struct MultipleInputs {
 }
 
 enum Msg {
-    Message(MessageBatch, Arc<dyn Ack>),
+    Message(MessageBatchRef, Arc<dyn Ack>),
     Err(Error),
 }
 
@@ -91,7 +93,7 @@ impl Input for MultipleInputs {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         let cancellation_token = self.cancellation_token.clone();
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -176,6 +178,9 @@ impl InputBuilder for MultipleInputsBuilder {
 }
 
 pub(crate) fn init() -> Result<(), Error> {
-    input::register_input_builder("multiple_inputs", Arc::new(MultipleInputsBuilder))?;
+    arkflow_core::input::register_input_builder(
+        "multiple_inputs",
+        Arc::new(MultipleInputsBuilder),
+    )?;
     Ok(())
 }

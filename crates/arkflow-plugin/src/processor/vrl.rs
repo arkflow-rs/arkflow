@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arkflow_core::{
     processor::{register_processor_builder, Processor, ProcessorBuilder},
-    Error, MessageBatch, Resource,
+    Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,
 };
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
@@ -39,8 +39,8 @@ struct VrlProcessor {
 
 #[async_trait]
 impl Processor for VrlProcessor {
-    async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let result = message_batch_to_vrl_values(msg_batch);
+    async fn process_arc(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        let result = message_batch_to_vrl_values((*msg_batch).clone());
 
         let mut state = RuntimeState::default();
         let timezone = TimeZone::default();
@@ -66,10 +66,23 @@ impl Processor for VrlProcessor {
             }
         }
 
-        output
+        let batches = output
             .into_iter()
             .map(|x| vrl_values_to_message_batch(x))
-            .collect::<Result<Vec<MessageBatch>, Error>>()
+            .collect::<Result<Vec<MessageBatch>, Error>>()?;
+
+        // Convert to ProcessResult
+        if batches.is_empty() {
+            Ok(ProcessResult::None)
+        } else if batches.len() == 1 {
+            Ok(ProcessResult::Single(Arc::new(
+                batches.into_iter().next().unwrap(),
+            )))
+        } else {
+            Ok(ProcessResult::Multiple(
+                batches.into_iter().map(Arc::new).collect(),
+            ))
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {

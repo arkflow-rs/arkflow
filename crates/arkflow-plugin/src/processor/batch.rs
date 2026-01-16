@@ -17,7 +17,7 @@
 //! Batch multiple messages into one or more messages
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -37,7 +37,7 @@ struct BatchProcessorConfig {
 /// Batch Processor Components
 pub struct BatchProcessor {
     config: BatchProcessorConfig,
-    batch: Arc<RwLock<Vec<MessageBatch>>>,
+    batch: Arc<RwLock<Vec<MessageBatchRef>>>,
     last_batch_time: Arc<Mutex<std::time::Instant>>,
 }
 
@@ -69,7 +69,7 @@ impl BatchProcessor {
     }
 
     /// Refresh the batch
-    async fn flush(&self) -> Result<Vec<MessageBatch>, Error> {
+    async fn flush(&self) -> Result<Vec<MessageBatchRef>, Error> {
         let mut batch = self.batch.write().await;
 
         if batch.is_empty() {
@@ -77,23 +77,23 @@ impl BatchProcessor {
         }
 
         let schema = batch[0].schema();
-        let x: Vec<RecordBatch> = batch.iter().map(|batch| batch.clone().into()).collect();
+        let x: Vec<RecordBatch> = batch.iter().map(|b| (**b).clone().into()).collect();
         let new_batch = arrow::compute::concat_batches(&schema, &x)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-        let new_batch = Ok(vec![MessageBatch::new_arrow(new_batch)]);
+        let result = vec![Arc::new(MessageBatch::new_arrow(new_batch))];
 
         batch.clear();
         let mut last_batch_time = self.last_batch_time.lock().await;
 
         *last_batch_time = std::time::Instant::now();
 
-        new_batch
+        Ok(result)
     }
 }
 
 #[async_trait]
 impl Processor for BatchProcessor {
-    async fn process(&self, msg: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
+    async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
         {
             let mut batch = self.batch.write().await;
             // Add messages to a batch
@@ -102,10 +102,17 @@ impl Processor for BatchProcessor {
 
         // Check if the batch should be refreshed
         if self.should_flush().await {
-            self.flush().await
+            let batches = self.flush().await?;
+            if batches.is_empty() {
+                Ok(ProcessResult::None)
+            } else if batches.len() == 1 {
+                Ok(ProcessResult::Single(batches.into_iter().next().unwrap()))
+            } else {
+                Ok(ProcessResult::Multiple(batches))
+            }
         } else {
-            // If it is not refreshed, an empty result is returned
-            Ok(vec![])
+            // If it is not refreshed, return None (filtered)
+            Ok(ProcessResult::None)
         }
     }
 
@@ -155,17 +162,27 @@ mod tests {
 
         // First message should not trigger flush
         let result = processor
-            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .process_arc(Arc::new(
+                MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
+            ))
             .await
             .unwrap();
         assert!(result.is_empty());
 
         // Second message should trigger flush due to batch size
         let result = processor
-            .process(MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap())
+            .process_arc(Arc::new(
+                MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap(),
+            ))
             .await
             .unwrap();
-        assert_eq!(result.len(), 1);
+
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 2); // 2 messages combined
+            }
+            _ => panic!("Expected single result"),
+        }
     }
 
     #[tokio::test]
@@ -178,7 +195,9 @@ mod tests {
 
         // Add one message
         let result = processor
-            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .process_arc(Arc::new(
+                MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
+            ))
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -188,10 +207,18 @@ mod tests {
 
         // Next message should trigger flush due to timeout
         let result = processor
-            .process(MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap())
+            .process_arc(Arc::new(
+                MessageBatch::new_binary(vec!["test2".as_bytes().to_vec()]).unwrap(),
+            ))
             .await
             .unwrap();
-        assert_eq!(result.len(), 1);
+
+        match result {
+            ProcessResult::Single(batch) => {
+                assert_eq!(batch.len(), 2); // 2 messages combined
+            }
+            _ => panic!("Expected single result"),
+        }
     }
 
     #[tokio::test]
@@ -216,7 +243,9 @@ mod tests {
 
         // Add a message to the batch
         processor
-            .process(MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap())
+            .process_arc(Arc::new(
+                MessageBatch::new_binary(vec!["test1".as_bytes().to_vec()]).unwrap(),
+            ))
             .await
             .unwrap();
 

@@ -13,7 +13,7 @@
  */
 
 use crate::input::Ack;
-use crate::{Error, MessageBatch, Resource};
+use crate::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,9 +25,11 @@ lazy_static::lazy_static! {
 
 #[async_trait]
 pub trait Buffer: Send + Sync {
-    async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error>;
+    /// Write message to buffer using Arc for zero-copy
+    async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error>;
 
-    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>;
+    /// Read message from buffer using Arc for zero-copy
+    async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>;
 
     async fn flush(&self) -> Result<(), Error>;
 

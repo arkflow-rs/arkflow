@@ -14,7 +14,7 @@
 use crate::buffer::join::{JoinConfig, JoinOperation};
 use crate::component;
 use arkflow_core::input::{Ack, VecAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct BaseWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
-    queue: Arc<RwLock<HashMap<String, Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>>>>,
+    queue: Arc<RwLock<HashMap<String, Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -94,7 +94,7 @@ impl BaseWindow {
 
     pub(crate) async fn process_window(
         &self,
-    ) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    ) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         let queue_arc = Arc::clone(&self.queue);
         let queue_arc = queue_arc.write().await;
         let queue_len = queue_arc.len();
@@ -117,14 +117,16 @@ impl BaseWindow {
             }
 
             let schema = messages[0].schema();
-            let batches: Vec<RecordBatch> =
-                messages.into_iter().map(|batch| batch.into()).collect();
+            let batches: Vec<RecordBatch> = messages
+                .into_iter()
+                .map(|batch| (*batch).clone().into())
+                .collect();
             let new_batch = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
             let mut new_batch: MessageBatch = new_batch.into();
             new_batch.set_input_name(Some(input_name.clone()));
             let new_ack = Arc::new(VecAck(acks));
-            all_messages.push(new_batch);
+            all_messages.push(Arc::new(new_batch));
             all_acks.push(new_ack);
         }
 
@@ -137,8 +139,10 @@ impl BaseWindow {
         match &self.join_operation {
             None => {
                 let schema = all_messages[0].schema();
-                let batches: Vec<RecordBatch> =
-                    all_messages.into_iter().map(|batch| batch.into()).collect();
+                let batches: Vec<RecordBatch> = all_messages
+                    .into_iter()
+                    .map(|batch| (*batch).clone().into())
+                    .collect();
 
                 if batches.is_empty() {
                     return Ok(None);
@@ -147,17 +151,24 @@ impl BaseWindow {
                 let new_batch = arrow::compute::concat_batches(&schema, &batches)
                     .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
-                Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
+                Ok(Some((
+                    Arc::new(MessageBatch::new_arrow(new_batch)),
+                    new_ack,
+                )))
             }
             Some(join) => {
                 let ctx = component::sql::create_session_context()?;
-                let new_batch = join.join_operation(&ctx, all_messages).await?;
-                Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
+                let messages: Vec<_> = all_messages.into_iter().map(|m| (*m).clone()).collect();
+                let new_batch = join.join_operation(&ctx, messages).await?;
+                Ok(Some((
+                    Arc::new(MessageBatch::new_arrow(new_batch)),
+                    new_ack,
+                )))
             }
         }
     }
 
-    pub(crate) async fn write(&self, msg: MessageBatch, ack: Arc<dyn Ack>) -> Result<(), Error> {
+    pub(crate) async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let input_name = msg.get_input_name().unwrap_or("".to_string());
         let queue_arc = Arc::clone(&self.queue);
         let mut queue_arc = queue_arc.write().await;

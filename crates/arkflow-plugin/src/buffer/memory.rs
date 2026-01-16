@@ -21,7 +21,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -50,7 +50,7 @@ struct MemoryBuffer {
     /// Configuration parameters for the memory buffer
     config: MemoryBufferConfig,
     /// Thread-safe queue to store message batches and their acknowledgments
-    queue: Arc<RwLock<VecDeque<(MessageBatch, Arc<dyn Ack>)>>>,
+    queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -101,9 +101,9 @@ impl MemoryBuffer {
     /// Processes accumulated messages by merging them into a single batch
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the queue is empty
-    async fn process_messages(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn process_messages(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         let queue_arc = Arc::clone(&self.queue);
         let mut queue_lock = queue_arc.write().await;
 
@@ -123,12 +123,18 @@ impl MemoryBuffer {
             return Ok(None);
         }
         let schema = messages[0].schema();
-        let x: Vec<RecordBatch> = messages.into_iter().map(|batch| batch.into()).collect();
+        let x: Vec<RecordBatch> = messages
+            .into_iter()
+            .map(|batch| (*batch).clone().into())
+            .collect();
         let new_batch = arrow::compute::concat_batches(&schema, &x)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
 
         let new_ack = Arc::new(ArrayAck(acks));
-        Ok(Some((MessageBatch::new_arrow(new_batch), new_ack)))
+        Ok(Some((
+            Arc::new(MessageBatch::new_arrow(new_batch)),
+            new_ack,
+        )))
     }
 }
 
@@ -142,7 +148,7 @@ impl Buffer for MemoryBuffer {
     ///
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
-    async fn write(&self, msg: MessageBatch, arc: Arc<dyn Ack>) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef, arc: Arc<dyn Ack>) -> Result<(), Error> {
         let queue_arc = Arc::clone(&self.queue);
 
         let mut queue_lock = queue_arc.write().await;
@@ -166,9 +172,9 @@ impl Buffer for MemoryBuffer {
     /// Waits until either messages are available or the buffer is closed
     ///
     /// # Returns
-    /// * `Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
+    /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
-    async fn read(&self) -> Result<Option<(MessageBatch, Arc<dyn Ack>)>, Error> {
+    async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         loop {
             {
                 let queue_arc = Arc::clone(&self.queue);
@@ -277,9 +283,9 @@ mod tests {
             timeout: time::Duration::from_millis(100),
         })
         .unwrap();
-        let msg1 = MessageBatch::new_binary(vec![b"a".to_vec()]).unwrap();
-        let msg2 = MessageBatch::new_binary(vec![b"b".to_vec()]).unwrap();
-        let msg3 = MessageBatch::new_binary(vec![b"c".to_vec()]).unwrap();
+        let msg1 = Arc::new(MessageBatch::new_binary(vec![b"a".to_vec()]).unwrap());
+        let msg2 = Arc::new(MessageBatch::new_binary(vec![b"b".to_vec()]).unwrap());
+        let msg3 = Arc::new(MessageBatch::new_binary(vec![b"c".to_vec()]).unwrap());
         buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
         buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
         buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
@@ -296,7 +302,7 @@ mod tests {
             timeout: time::Duration::from_millis(100),
         })
         .unwrap();
-        let msg = MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
         let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
         assert!(r.is_ok());
@@ -311,7 +317,7 @@ mod tests {
             timeout: time::Duration::from_secs(10),
         })
         .unwrap();
-        let msg = MessageBatch::new_binary(vec![b"flush".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"flush".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
         let _ = buf.flush().await;
         let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
@@ -327,7 +333,7 @@ mod tests {
             timeout: time::Duration::from_secs(10),
         })
         .unwrap();
-        let msg = MessageBatch::new_binary(vec![b"close".to_vec()]).unwrap();
+        let msg = Arc::new(MessageBatch::new_binary(vec![b"close".to_vec()]).unwrap());
         buf.write(msg, Arc::new(NoopAck)).await.unwrap();
         let _ = buf.close().await;
         let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
@@ -346,7 +352,9 @@ mod tests {
         let buf2 = buf.clone();
         let handle = tokio::spawn(async move {
             for i in 0..10 {
-                let msg = MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap();
+                let msg = Arc::new(
+                    MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap(),
+                );
                 buf2.write(msg, Arc::new(NoopAck)).await.unwrap();
             }
         });

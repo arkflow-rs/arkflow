@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 /// Memory input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ impl Input for MemoryInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         if !self.connected.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
@@ -91,7 +91,7 @@ impl Input for MemoryInput {
         if let Some(mut msg) = msg_option {
             msg.set_input_name(self.input_name.clone());
 
-            Ok((msg, Arc::new(NoopAck)))
+            Ok((Arc::new(msg), Arc::new(NoopAck)))
         } else {
             Err(Error::EOF)
         }

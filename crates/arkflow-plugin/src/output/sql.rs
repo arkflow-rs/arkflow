@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -256,7 +256,7 @@ impl Output for SqlOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
         let conn = conn_guard.as_mut().ok_or_else(|| Error::Disconnection)?;
 

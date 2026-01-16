@@ -17,7 +17,7 @@
 //! Outputs the processed data to standard output
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use serde::{Deserialize, Serialize};
@@ -58,8 +58,8 @@ where
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
-        self.arrow_stdout(msg).await
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+        self.arrow_stdout((*msg).clone()).await
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -158,7 +158,7 @@ mod tests {
         assert!(output.connect().await.is_ok());
 
         // Test write with simple text
-        let msg = MessageBatch::from_string("test message").unwrap();
+        let msg = Arc::new(MessageBatch::from_string("test message").unwrap());
         assert!(output.write(msg).await.is_ok());
 
         // Test close
@@ -174,7 +174,7 @@ mod tests {
         let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
 
         // Test binary data
-        let binary_msg = MessageBatch::from_string("binary test").unwrap();
+        let binary_msg = Arc::new(MessageBatch::from_string("binary test").unwrap());
         assert!(output.write(binary_msg).await.is_ok());
 
         // Test Arrow data (would need more complex setup)

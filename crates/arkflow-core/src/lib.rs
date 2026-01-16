@@ -87,6 +87,121 @@ pub struct Resource {
 
 pub type Bytes = Vec<u8>;
 
+/// Shared reference to a message batch (zero-copy)
+///
+/// This type alias enables zero-copy message passing by wrapping MessageBatch in Arc.
+/// Multiple components can share the same message batch without cloning the underlying data.
+///
+/// # Example
+/// ```rust,no_run
+/// use arkflow_core::{MessageBatch, MessageBatchRef};
+/// use std::sync::Arc;
+///
+/// // Create a message batch
+/// let batch = MessageBatch::new_binary(vec![b"data".to_vec()]).unwrap();
+///
+/// // Convert to shared reference
+/// let shared: MessageBatchRef = Arc::new(batch);
+///
+/// // Clone is cheap (just increments reference count)
+/// let another_ref = shared.clone();
+/// ```
+pub type MessageBatchRef = Arc<MessageBatch>;
+
+/// Result of processing a message batch
+///
+/// This enum represents the output of processor operations, supporting
+/// single output, multiple outputs, or filtering (no output).
+///
+/// # Variants
+///
+/// * `Single` - Processor produces a single message batch
+/// * `Multiple` - Processor splits/produces multiple message batches
+/// * `None` - Processor filters out the message
+///
+/// # Example
+/// ```rust,no_run
+/// use arkflow_core::{MessageBatch, MessageBatchRef, ProcessResult};
+/// use std::sync::Arc;
+///
+/// // Pass-through processor
+/// fn passthrough(batch: MessageBatchRef) -> ProcessResult {
+///     ProcessResult::Single(batch)
+/// }
+///
+/// // Filter processor
+/// fn filter(batch: MessageBatchRef) -> ProcessResult {
+///     let should_keep = |_batch: &MessageBatchRef| true;
+///     if should_keep(&batch) {
+///         ProcessResult::Single(batch)
+///     } else {
+///         ProcessResult::None
+///     }
+/// }
+///
+/// // Split processor
+/// fn split(batch: MessageBatchRef) -> ProcessResult {
+///     fn split_batch(_: &MessageBatchRef, _: usize) -> Vec<MessageBatchRef> { vec![] };
+///     let chunks = split_batch(&batch, 100);
+///     ProcessResult::Multiple(chunks)
+/// }
+/// ```
+#[derive(Debug)]
+pub enum ProcessResult {
+    /// Single message batch output
+    Single(MessageBatchRef),
+    /// Multiple message batches output
+    Multiple(Vec<MessageBatchRef>),
+    /// No output (filtered)
+    None,
+}
+
+impl ProcessResult {
+    /// Convert to Vec<MessageBatch> for backward compatibility
+    ///
+    /// This method consumes the ProcessResult and converts it to a vector
+    /// of owned MessageBatch instances. This may involve cloning Arc contents
+    /// if the Arc is shared.
+    ///
+    /// # Performance Note
+    /// Prefer working with ProcessResult directly to avoid unnecessary conversions.
+    pub fn into_vec(self) -> Vec<MessageBatch> {
+        match self {
+            ProcessResult::Single(msg) => {
+                vec![Arc::try_unwrap(msg).unwrap_or_else(|m| (*m).clone())]
+            }
+            ProcessResult::Multiple(msgs) => msgs
+                .into_iter()
+                .map(|m| Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone()))
+                .collect(),
+            ProcessResult::None => vec![],
+        }
+    }
+
+    /// Create ProcessResult from Vec<MessageBatch> for backward compatibility
+    pub fn from_vec(vec: Vec<MessageBatch>) -> Self {
+        match vec.len() {
+            0 => ProcessResult::None,
+            1 => ProcessResult::Single(Arc::new(vec.into_iter().next().unwrap())),
+            _ => ProcessResult::Multiple(vec.into_iter().map(Arc::new).collect()),
+        }
+    }
+
+    /// Check if result is empty (filtered out)
+    pub fn is_empty(&self) -> bool {
+        matches!(self, ProcessResult::None)
+    }
+
+    /// Get the number of output batches
+    pub fn len(&self) -> usize {
+        match self {
+            ProcessResult::Single(_) => 1,
+            ProcessResult::Multiple(vec) => vec.len(),
+            ProcessResult::None => 0,
+        }
+    }
+}
+
 /// Represents a message in a stream processing engine.
 #[derive(Clone, Debug)]
 pub struct MessageBatch {
@@ -223,6 +338,11 @@ impl MessageBatch {
         };
         let vec_bytes: Vec<&[u8]> = v.iter().flatten().collect();
         Ok(vec_bytes)
+    }
+
+    /// Convert this batch into a shared reference (Arc) for zero-copy passing
+    pub fn into_arc(self) -> MessageBatchRef {
+        Arc::new(self)
     }
 }
 

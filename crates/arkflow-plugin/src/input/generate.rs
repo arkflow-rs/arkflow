@@ -14,7 +14,7 @@
 
 use crate::time::deserialize_duration;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -56,7 +56,7 @@ impl Input for GenerateInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         if !self.first.swap(false, Ordering::SeqCst) {
             tokio::time::sleep(self.config.interval).await;
         }
@@ -81,7 +81,7 @@ impl Input for GenerateInput {
             .fetch_add(self.batch_size as i64, Ordering::SeqCst);
         let mut message_batch = MessageBatch::new_binary(msgs)?;
         message_batch.set_input_name(self.input_name.clone());
-        Ok((message_batch, Arc::new(NoopAck)))
+        Ok((Arc::new(message_batch), Arc::new(NoopAck)))
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())

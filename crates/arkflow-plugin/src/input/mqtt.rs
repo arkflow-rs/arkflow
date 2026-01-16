@@ -17,7 +17,7 @@
 //! Receive data from the MQTT broker
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -169,7 +169,7 @@ impl Input for MqttInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         {
             let client_arc = Arc::clone(&self.client);
             if client_arc.lock().await.is_none() {
@@ -188,7 +188,7 @@ impl Input for MqttInput {
                             let mut msg = MessageBatch::new_binary(vec![payload])?;
                             msg.set_input_name(self.input_name.clone());
 
-                            Ok((msg, Arc::new(MqttAck {
+                            Ok((Arc::new(msg), Arc::new(MqttAck {
                                 client: Arc::clone(&self.client),
                                 publish,
                             })))

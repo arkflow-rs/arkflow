@@ -16,12 +16,13 @@
 //!
 //! The input component is responsible for receiving data from various sources such as message queues, file systems, HTTP endpoints, and so on.
 
-use crate::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
+
+use crate::{Error, MessageBatchRef, Resource};
 
 lazy_static::lazy_static! {
     static ref INPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn InputBuilder>>> = RwLock::new(HashMap::new());
@@ -46,8 +47,8 @@ pub trait Input: Send + Sync {
     /// Connect to the input source
     async fn connect(&self) -> Result<(), Error>;
 
-    /// Read the message from the input source
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error>;
+    /// Read a message using Arc for zero-copy
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error>;
 
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;

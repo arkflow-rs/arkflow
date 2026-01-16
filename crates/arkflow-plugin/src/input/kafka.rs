@@ -17,7 +17,7 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -134,7 +134,7 @@ impl Input for KafkaInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         let consumer_arc = self.consumer.clone();
         let consumer_guard = consumer_arc.read().await;
         if consumer_guard.is_none() {
@@ -166,7 +166,7 @@ impl Input for KafkaInput {
                     offset,
                 };
 
-                Ok((msg_batch, Arc::new(ack)))
+                Ok((Arc::new(msg_batch), Arc::new(ack)))
             }
             Err(e) => Err(Error::Connection(format!(
                 "Error receiving Kafka message: {}",

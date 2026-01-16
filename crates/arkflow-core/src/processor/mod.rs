@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatch, Resource};
+use crate::{Error, MessageBatchRef, ProcessResult, Resource};
 
 lazy_static::lazy_static! {
     static ref PROCESSOR_BUILDERS: RwLock<HashMap<String, Arc<dyn ProcessorBuilder>>> = RwLock::new(HashMap::new());
@@ -30,8 +30,49 @@ lazy_static::lazy_static! {
 /// Characteristic interface of the processor component
 #[async_trait]
 pub trait Processor: Send + Sync {
-    /// Process messages
-    async fn process(&self, batch: MessageBatch) -> Result<Vec<MessageBatch>, Error>;
+    /// Process messages using Arc for zero-copy
+    ///
+    /// # Zero-Copy Example
+    ///
+    /// ```rust,no_run
+    /// use arkflow_core::{MessageBatchRef, ProcessResult};
+    /// use arkflow_core::Error;
+    ///
+    /// struct MyProcessor;
+    ///
+    /// impl MyProcessor {
+    ///     async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    ///         // Forward without copying
+    ///         Ok(ProcessResult::Single(batch))
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Conditional Processing
+    ///
+    /// ```rust,no_run
+    /// use arkflow_core::{MessageBatch, MessageBatchRef, ProcessResult, Error};
+    /// use std::sync::Arc;
+    ///
+    /// fn needs_transform(_: &MessageBatchRef) -> bool { false }
+    /// fn transform(_: &MessageBatch) -> Result<MessageBatch, Error> {
+    ///     Ok(MessageBatch::new_binary(vec![]).unwrap())
+    /// }
+    ///
+    /// struct MyProcessor;
+    ///
+    /// impl MyProcessor {
+    ///     async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+    ///         if needs_transform(&batch) {
+    ///             let new_batch = transform(&*batch)?;
+    ///             Ok(ProcessResult::Single(Arc::new(new_batch)))
+    ///         } else {
+    ///             Ok(ProcessResult::Single(batch))
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    async fn process_arc(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error>;
 
     /// Turn off the processor
     async fn close(&self) -> Result<(), Error>;

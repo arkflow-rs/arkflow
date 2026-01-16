@@ -13,8 +13,10 @@
  */
 use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
-use arkflow_core::output::{Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    output::{Output, OutputBuilder},
+    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::Pipeline;
@@ -81,7 +83,7 @@ impl Output for RedisOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let value_field = &self
             .config
             .value_field

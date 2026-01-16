@@ -17,7 +17,7 @@
 //! Receive data from a NATS subject
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
 use async_nats::{Client, ConnectOptions, Message};
@@ -341,7 +341,7 @@ impl Input for NatsInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         // Check client connection
         let client_guard = self.client.read().await;
         if client_guard.is_none() {
@@ -362,7 +362,7 @@ impl Input for NatsInput {
                                 let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
-                                Ok((msg_batch, Arc::new(NatsAck::Regular)))
+                                Ok((Arc::new(msg_batch), Arc::new(NatsAck::Regular)))
                             },
                             NatsMsg::JetStream( message) => {
                                 let payload = message.payload.to_vec();
@@ -372,7 +372,7 @@ impl Input for NatsInput {
                                 let ack = NatsAck::JetStream {
                                     message,
                                 };
-                                Ok((msg_batch, Arc::new(ack) as Arc<dyn Ack>))
+                                Ok((Arc::new(msg_batch), Arc::new(ack) as Arc<dyn Ack>))
                             },
                             NatsMsg::Err(e) => {
                                 Err(e)
@@ -488,7 +488,10 @@ mod tests {
         let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
         assert_eq!(config.url, "nats://localhost:4222");
         match config.mode {
-            Mode::Regular { subject, queue_group } => {
+            Mode::Regular {
+                subject,
+                queue_group,
+            } => {
                 assert_eq!(subject, "test.subject");
                 assert!(queue_group.is_none());
             }
@@ -511,7 +514,11 @@ mod tests {
         let config: NatsInputConfig = serde_json::from_value(config_json).unwrap();
         assert_eq!(config.url, "nats://localhost:4222");
         match config.mode {
-            Mode::JetStream { stream, consumer_name, durable_name } => {
+            Mode::JetStream {
+                stream,
+                consumer_name,
+                durable_name,
+            } => {
                 assert_eq!(stream, "mystream");
                 assert_eq!(consumer_name, "myconsumer");
                 assert_eq!(durable_name, Some("mydurable".to_string()));

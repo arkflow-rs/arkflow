@@ -17,7 +17,7 @@
 //! Receive data from Redis pub/sub channels
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -339,7 +339,7 @@ impl Input for RedisInput {
         }
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         {
             let client_arc = Arc::clone(&self.client);
             if client_arc.lock().await.is_none() {
@@ -354,7 +354,7 @@ impl Input for RedisInput {
                 })?;
                 msg.set_input_name(self.input_name.clone());
 
-                Ok((msg, Arc::new(NoopAck)))
+                Ok((Arc::new(msg), Arc::new(NoopAck)))
             }
             Ok(RedisMsg::Err(e)) => Err(e),
             Err(_) => Err(Error::EOF),

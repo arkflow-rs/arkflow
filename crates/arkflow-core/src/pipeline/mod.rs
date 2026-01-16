@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{processor::Processor, Error, MessageBatch, Resource};
+use crate::{processor::Processor, Error, MessageBatchRef, ProcessResult, Resource};
 
 pub struct Pipeline {
     processors: Vec<Arc<dyn Processor>>,
@@ -31,20 +31,57 @@ impl Pipeline {
         Self { processors }
     }
 
-    /// Process messages
-    pub async fn process(&self, msg: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let mut msgs = vec![msg];
+    /// Process messages using Arc for zero-copy
+    ///
+    /// # Processing Flow
+    /// 1. Start with a single message batch
+    /// 2. For each processor in the pipeline:
+    ///    - If current result is Single: apply processor
+    ///    - If current result is Multiple: apply processor to each batch
+    ///    - If current result is None: skip (filtered)
+    /// 3. Return final result
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use arkflow_core::pipeline::Pipeline;
+    /// use arkflow_core::{MessageBatch, ProcessResult, MessageBatchRef};
+    /// use std::sync::Arc;
+    ///
+    /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let pipeline = Pipeline::new(vec![]);  // Empty pipeline
+    ///     let batch = Arc::new(MessageBatch::new_binary(vec![b"test".to_vec()])?);
+    ///     let result = pipeline.process_arc(batch).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn process_arc(&self, msg: MessageBatchRef) -> Result<ProcessResult, Error> {
+        let mut current = ProcessResult::Single(msg);
+
         for processor in &self.processors {
-            let mut new_msgs = Vec::with_capacity(msgs.len());
-            for msg in msgs {
-                match processor.process(msg).await {
-                    Ok(processed) => new_msgs.extend(processed),
-                    Err(e) => return Err(e),
+            current = match current {
+                ProcessResult::Single(batch) => processor.process_arc(batch).await?,
+                ProcessResult::Multiple(batches) => {
+                    let mut results = Vec::new();
+                    for batch in batches {
+                        match processor.process_arc(batch).await? {
+                            ProcessResult::Single(result) => results.push(result),
+                            ProcessResult::Multiple(mut res) => results.append(&mut res),
+                            ProcessResult::None => {} // Filtered out
+                        }
+                    }
+                    if results.is_empty() {
+                        ProcessResult::None
+                    } else if results.len() == 1 {
+                        ProcessResult::Single(results.pop().unwrap())
+                    } else {
+                        ProcessResult::Multiple(results)
+                    }
                 }
-            }
-            msgs = new_msgs;
+                ProcessResult::None => ProcessResult::None, // Already filtered
+            };
         }
-        Ok(msgs)
+
+        Ok(current)
     }
 
     /// Shut down all processors in the pipeline

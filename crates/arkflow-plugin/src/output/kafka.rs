@@ -18,8 +18,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    output::{register_output_builder, Output, OutputBuilder},
+    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 
 use crate::expr::{EvaluateResult, Expr};
 use async_trait::async_trait;
@@ -172,7 +174,7 @@ impl Output for KafkaOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let producer_arc = self.inner_kafka_output.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {

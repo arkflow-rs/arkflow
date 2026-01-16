@@ -17,8 +17,10 @@
 //! Send data to a NATS subject
 
 use crate::expr::Expr;
-use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    output::{register_output_builder, Output, OutputBuilder},
+    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_nats::jetstream::Context;
 use async_nats::{Client, ConnectOptions};
 use async_trait::async_trait;
@@ -123,7 +125,7 @@ impl Output for NatsOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Check client connection
         let client_guard = self.client.read().await;
         let client = client_guard
@@ -269,12 +271,10 @@ mod tests {
         assert!(config.auth.is_none());
         assert!(config.value_field.is_none());
         match config.mode {
-            Mode::Regular { subject } => {
-                match subject {
-                    crate::expr::Expr::Expr { expr } => assert_eq!(expr, "test.subject"),
-                    _ => panic!("Expected Expr type"),
-                }
-            }
+            Mode::Regular { subject } => match subject {
+                crate::expr::Expr::Expr { expr } => assert_eq!(expr, "test.subject"),
+                _ => panic!("Expected Expr type"),
+            },
             _ => panic!("Expected Regular mode"),
         }
     }
@@ -295,12 +295,10 @@ mod tests {
         let config: NatsOutputConfig = serde_json::from_value(config_json).unwrap();
         assert_eq!(config.url, "nats://localhost:4222");
         match config.mode {
-            Mode::JetStream { subject } => {
-                match subject {
-                    crate::expr::Expr::Value { value } => assert_eq!(value, "my.subject"),
-                    _ => panic!("Expected Value type"),
-                }
-            }
+            Mode::JetStream { subject } => match subject {
+                crate::expr::Expr::Value { value } => assert_eq!(value, "my.subject"),
+                _ => panic!("Expected Value type"),
+            },
             _ => panic!("Expected JetStream mode"),
         }
     }

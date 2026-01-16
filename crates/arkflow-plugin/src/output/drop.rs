@@ -18,7 +18,7 @@
 //! It's useful for testing or when you want to intentionally discard data.
 
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ impl Output for DropOutput {
         Ok(())
     }
 
-    async fn write(&self, _: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, _: MessageBatchRef) -> Result<(), Error> {
         Ok(())
     }
 
@@ -87,7 +87,7 @@ mod tests {
 
         // Create a binary message batch
         let binary_data = vec![b"test message".to_vec()];
-        let message_batch = MessageBatch::new_binary(binary_data).unwrap();
+        let message_batch = Arc::new(MessageBatch::new_binary(binary_data).unwrap());
 
         // Test write method with binary data
         let result = drop_output.write(message_batch).await;
@@ -114,7 +114,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap();
 
-        let message_batch = MessageBatch::new_arrow(batch);
+        let message_batch = Arc::new(MessageBatch::new_arrow(batch));
 
         // Test write method with Arrow data
         let result = drop_output.write(message_batch).await;
@@ -145,7 +145,7 @@ mod tests {
 
         // Create a binary message batch
         let binary_data = vec![b"test message".to_vec()];
-        let message_batch = MessageBatch::new_binary(binary_data).unwrap();
+        let message_batch = Arc::new(MessageBatch::new_binary(binary_data).unwrap());
 
         // Write multiple messages
         for _ in 0..5 {

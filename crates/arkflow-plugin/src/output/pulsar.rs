@@ -20,8 +20,10 @@ use crate::expr::Expr;
 use crate::pulsar::{
     PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarProducer,
 };
-use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, Resource, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{
+    output::{register_output_builder, Output, OutputBuilder},
+    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -96,7 +98,7 @@ impl Output for PulsarOutput {
         Ok(())
     }
 
-    async fn write(&self, msg: MessageBatch) -> Result<(), Error> {
+    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Check client connection
         let client_guard = self.client.read().await;
         let _client = client_guard

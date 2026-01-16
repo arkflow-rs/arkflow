@@ -17,7 +17,7 @@
 //! Receive data from a WebSocket server
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -124,7 +124,7 @@ impl Input for WebSocketInput {
         Ok(())
     }
 
-    async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
         // Check if we're still connected
         {
             let writer_arc = Arc::clone(&self.writer);
@@ -160,7 +160,7 @@ impl Input for WebSocketInput {
                                 let mut msg = MessageBatch::new_binary(vec![payload])?;
                                 msg.set_input_name(self.input_name.clone());
 
-                                Ok((msg, Arc::new(NoopAck)))
+                                Ok((Arc::new(msg), Arc::new(NoopAck)))
                             },
                             WebSocketMsg::Err(e) => {
                                 Err(e)
