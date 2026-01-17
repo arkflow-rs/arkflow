@@ -15,7 +15,7 @@
 //! Rust stream processing engine
 
 use crate::temporary::Temporary;
-use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
+use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, MapArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::time::SystemTime;
 use thiserror::Error;
 
 pub mod buffer;
@@ -43,6 +44,22 @@ mod message_batch_tests;
 
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
 pub const DEFAULT_RECORD_BATCH: usize = 8192;
+
+/// Metadata column name prefix
+pub const META_COLUMN_PREFIX: &str = "__meta_";
+
+/// Standard metadata column names for SQL-accessible metadata
+pub mod meta_columns {
+    pub const SOURCE: &str = "__meta_source";
+    pub const PARTITION: &str = "__meta_partition";
+    pub const OFFSET: &str = "__meta_offset";
+    pub const KEY: &str = "__meta_key";
+    pub const TIMESTAMP: &str = "__meta_timestamp";
+    pub const INGEST_TIME: &str = "__meta_ingest_time";
+
+    /// Extended metadata column using MapArray for flexible key-value pairs
+    pub const EXT: &str = "__meta_ext";
+}
 
 /// Error in the stream processing engine
 #[derive(Error, Debug)]
@@ -425,4 +442,541 @@ pub fn split_batch(batch_to_split: RecordBatch, size: usize) -> Vec<RecordBatch>
     }
 
     chunks
+}
+
+/// Metadata utilities for adding metadata columns to RecordBatch
+///
+/// This module provides helper functions to add metadata columns (with __meta_ prefix)
+/// to RecordBatch instances. These columns can be accessed directly in SQL queries.
+///
+/// # Example
+/// ```rust,no_run
+/// use arkflow_core::{meta_columns, metadata};
+/// use datafusion::arrow::record_batch::RecordBatch;
+///
+/// let batch = RecordBatch::new_empty(schema);
+/// let batch_with_meta = metadata::with_source(batch, "kafka://topic-a");
+/// let batch_with_meta = metadata::with_partition(batch_with_meta, 0);
+/// ```
+pub mod metadata {
+    use super::*;
+    use datafusion::arrow::array::{
+        BinaryArray, StringArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    };
+
+    /// Add source column to RecordBatch
+    pub fn with_source(batch: RecordBatch, source: &str) -> Result<RecordBatch, Error> {
+        add_string_column(batch, meta_columns::SOURCE, source)
+    }
+
+    /// Add partition column to RecordBatch
+    pub fn with_partition(batch: RecordBatch, partition: u32) -> Result<RecordBatch, Error> {
+        add_uint32_column(batch, meta_columns::PARTITION, partition)
+    }
+
+    /// Add offset column to RecordBatch
+    pub fn with_offset(batch: RecordBatch, offset: u64) -> Result<RecordBatch, Error> {
+        add_uint64_column(batch, meta_columns::OFFSET, offset)
+    }
+
+    /// Add key column to RecordBatch
+    pub fn with_key(batch: RecordBatch, key: &[u8]) -> Result<RecordBatch, Error> {
+        add_binary_column(batch, meta_columns::KEY, key)
+    }
+
+    /// Add timestamp column to RecordBatch
+    pub fn with_timestamp(batch: RecordBatch, timestamp: SystemTime) -> Result<RecordBatch, Error> {
+        let nanos = timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        add_timestamp_column(batch, meta_columns::TIMESTAMP, nanos)
+    }
+
+    /// Add ingest_time column to RecordBatch
+    pub fn with_ingest_time(
+        batch: RecordBatch,
+        ingest_time: SystemTime,
+    ) -> Result<RecordBatch, Error> {
+        let nanos = ingest_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        add_timestamp_column(batch, meta_columns::INGEST_TIME, nanos)
+    }
+
+    // Helper functions to add scalar columns
+
+    fn add_string_column(
+        batch: RecordBatch,
+        column_name: &str,
+        value: &str,
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(column_name, DataType::Utf8, false)));
+        columns.push(Arc::new(StringArray::from(vec![value; row_count])));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+
+    fn add_uint32_column(
+        batch: RecordBatch,
+        column_name: &str,
+        value: u32,
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(column_name, DataType::UInt32, false)));
+        columns.push(Arc::new(UInt32Array::from(vec![value; row_count])));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+
+    fn add_uint64_column(
+        batch: RecordBatch,
+        column_name: &str,
+        value: u64,
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(column_name, DataType::UInt64, false)));
+        columns.push(Arc::new(UInt64Array::from(vec![value; row_count])));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+
+    fn add_binary_column(
+        batch: RecordBatch,
+        column_name: &str,
+        value: &[u8],
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(column_name, DataType::Binary, false)));
+        let binary_vec: Vec<&[u8]> = vec![value; row_count];
+        columns.push(Arc::new(BinaryArray::from(binary_vec)));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+
+    fn add_timestamp_column(
+        batch: RecordBatch,
+        column_name: &str,
+        value_nanos: i64,
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(
+            column_name,
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )));
+        columns.push(Arc::new(TimestampNanosecondArray::from(vec![
+            value_nanos;
+            row_count
+        ])));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+
+    /// Add extended metadata column (MapArray) to RecordBatch
+    ///
+    /// This adds a `__meta_ext` column containing a Map<String, String> with custom metadata.
+    /// All rows will have the same metadata values (scalar metadata).
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use arkflow_core::{metadata, meta_columns};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut ext_meta = HashMap::new();
+    /// ext_meta.insert("tag".to_string(), "production".to_string());
+    /// ext_meta.insert("version".to_string(), "1.0".to_string());
+    ///
+    /// let batch_with_ext = metadata::with_ext_metadata(batch, &ext_meta)?;
+    /// ```
+    pub fn with_ext_metadata(
+        batch: RecordBatch,
+        metadata: &HashMap<String, String>,
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        if row_count == 0 {
+            return Ok(batch);
+        }
+
+        // Create MapArray with the same metadata for all rows
+        let keys: Vec<&str> = metadata.keys().map(|k| k.as_str()).collect();
+        let values: Vec<&str> = metadata.values().map(|v| v.as_str()).collect();
+        let entries_per_row = keys.len();
+
+        // Build keys and values arrays (repeated for each row)
+        let mut all_keys = Vec::with_capacity(row_count * entries_per_row);
+        let mut all_values = Vec::with_capacity(row_count * entries_per_row);
+        let mut offsets = vec![0i32];
+
+        for row in 0..row_count {
+            for &key in &keys {
+                all_keys.push(key);
+            }
+            for &value in &values {
+                all_values.push(value);
+            }
+            offsets.push(((row + 1) * entries_per_row) as i32);
+        }
+
+        let keys_array = StringArray::from(all_keys);
+        let values_array = StringArray::from(all_values);
+
+        // Create StructArray for map entries
+        let struct_array = datafusion::arrow::array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(keys_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+                Arc::new(values_array) as ArrayRef,
+            ),
+        ]);
+
+        // Create the map field
+        let map_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+
+        // Convert offsets to OffsetBuffer
+        let offsets_buffer = datafusion::arrow::buffer::OffsetBuffer::new(offsets.into());
+
+        let map_array = MapArray::new(map_field, offsets_buffer, struct_array, None, false);
+
+        // Add the map column to the batch
+        add_map_column(batch, meta_columns::EXT, map_array)
+    }
+
+    /// Add extended metadata column with different metadata per row
+    ///
+    /// Each row can have different metadata keys and values.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use arkflow_core::metadata;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut row1_meta = HashMap::new();
+    /// row1_meta.insert("tag".to_string(), "prod".to_string());
+    ///
+    /// let mut row2_meta = HashMap::new();
+    /// row2_meta.insert("tag".to_string(), "dev".to_string());
+    /// row2_meta.insert("debug".to_string(), "true".to_string());
+    ///
+    /// let batch_with_ext = metadata::with_ext_metadata_per_row(batch, &[row1_meta, row2_meta])?;
+    /// ```
+    pub fn with_ext_metadata_per_row(
+        batch: RecordBatch,
+        metadata_list: &[HashMap<String, String>],
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        if row_count == 0 || metadata_list.is_empty() {
+            return Ok(batch);
+        }
+
+        if metadata_list.len() != row_count {
+            return Err(Error::Process(format!(
+                "Metadata list length ({}) must match batch row count ({})",
+                metadata_list.len(),
+                row_count
+            )));
+        }
+
+        // Build keys and values arrays
+        let mut all_keys = Vec::new();
+        let mut all_values = Vec::new();
+        let mut offsets = vec![0i32];
+
+        for metadata in metadata_list {
+            for (key, value) in metadata {
+                all_keys.push(key.as_str());
+                all_values.push(value.as_str());
+            }
+            offsets.push(all_keys.len() as i32);
+        }
+
+        let keys_array = StringArray::from(all_keys);
+        let values_array = StringArray::from(all_values);
+
+        let struct_array = datafusion::arrow::array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(keys_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+                Arc::new(values_array) as ArrayRef,
+            ),
+        ]);
+
+        // Create the map field
+        let map_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+
+        // Convert offsets to OffsetBuffer
+        let offsets_buffer = datafusion::arrow::buffer::OffsetBuffer::new(offsets.into());
+
+        let map_array = MapArray::new(map_field, offsets_buffer, struct_array, None, false);
+
+        add_map_column(batch, meta_columns::EXT, map_array)
+    }
+
+    /// Add a MapArray column to the batch
+    fn add_map_column(
+        batch: RecordBatch,
+        column_name: &str,
+        map_array: MapArray,
+    ) -> Result<RecordBatch, Error> {
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        // Add the map field
+        fields.push(Arc::new(Field::new(
+            column_name,
+            map_array.data_type().clone(),
+            false,
+        )));
+        columns.push(Arc::new(map_array));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to add column {}: {}", column_name, e)))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use datafusion::arrow::array::StringArray;
+
+    #[test]
+    fn test_metadata_with_source() {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+
+        let batch_with_source = metadata::with_source(batch, "kafka://topic-a").unwrap();
+
+        assert!(batch_with_source
+            .column_by_name(meta_columns::SOURCE)
+            .is_some());
+        assert_eq!(batch_with_source.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_metadata_with_partition() {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+
+        let batch_with_partition = metadata::with_partition(batch, 0).unwrap();
+
+        assert!(batch_with_partition
+            .column_by_name(meta_columns::PARTITION)
+            .is_some());
+        assert_eq!(batch_with_partition.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_metadata_chain() {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+
+        let batch_with_meta = metadata::with_source(batch, "kafka://topic-a")
+            .and_then(|b| metadata::with_partition(b, 0))
+            .and_then(|b| metadata::with_offset(b, 123))
+            .unwrap();
+
+        assert!(batch_with_meta
+            .column_by_name(meta_columns::SOURCE)
+            .is_some());
+        assert!(batch_with_meta
+            .column_by_name(meta_columns::PARTITION)
+            .is_some());
+        assert!(batch_with_meta
+            .column_by_name(meta_columns::OFFSET)
+            .is_some());
+        assert_eq!(batch_with_meta.num_columns(), 4); // data + 3 metadata columns
+    }
+
+    #[test]
+    fn test_metadata_in_sql() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["Alice"])),
+            ],
+        )
+        .unwrap();
+
+        // Add metadata
+        let batch_with_meta = metadata::with_source(batch, "kafka://users")
+            .and_then(|b| metadata::with_partition(b, 0))
+            .unwrap();
+
+        // Can be queried in SQL as:
+        // SELECT id, name, __meta_source, __meta_partition FROM flow
+        assert!(batch_with_meta.column_by_name("__meta_source").is_some());
+        assert!(batch_with_meta.column_by_name("__meta_partition").is_some());
+    }
+
+    #[test]
+    fn test_ext_metadata_scalar() {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["test1", "test2", "test3"]))],
+        )
+        .unwrap();
+
+        let mut ext_meta = HashMap::new();
+        ext_meta.insert("tag".to_string(), "production".to_string());
+        ext_meta.insert("version".to_string(), "1.0.0".to_string());
+
+        let batch_with_ext = metadata::with_ext_metadata(batch, &ext_meta).unwrap();
+
+        // Verify __meta_ext column exists
+        assert!(batch_with_ext.column_by_name(meta_columns::EXT).is_some());
+        assert_eq!(batch_with_ext.num_columns(), 2); // data + __meta_ext
+        assert_eq!(batch_with_ext.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_ext_metadata_per_row() {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["test1", "test2"]))],
+        )
+        .unwrap();
+
+        let mut row1_meta = HashMap::new();
+        row1_meta.insert("tag".to_string(), "prod".to_string());
+        row1_meta.insert("region".to_string(), "us-east".to_string());
+
+        let mut row2_meta = HashMap::new();
+        row2_meta.insert("tag".to_string(), "dev".to_string());
+        row2_meta.insert("debug".to_string(), "true".to_string());
+
+        let batch_with_ext =
+            metadata::with_ext_metadata_per_row(batch, &[row1_meta, row2_meta]).unwrap();
+
+        // Verify __meta_ext column exists
+        assert!(batch_with_ext.column_by_name(meta_columns::EXT).is_some());
+        assert_eq!(batch_with_ext.num_columns(), 2); // data + __meta_ext
+        assert_eq!(batch_with_ext.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_mixed_metadata() {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+
+        // Add standard metadata columns
+        let batch = metadata::with_source(batch, "kafka://topic-a").unwrap();
+        let batch = metadata::with_partition(batch, 0).unwrap();
+
+        // Add extended metadata
+        let mut ext_meta = HashMap::new();
+        ext_meta.insert("custom_field".to_string(), "custom_value".to_string());
+        let batch = metadata::with_ext_metadata(batch, &ext_meta).unwrap();
+
+        // Verify all columns exist
+        assert!(batch.column_by_name(meta_columns::SOURCE).is_some());
+        assert!(batch.column_by_name(meta_columns::PARTITION).is_some());
+        assert!(batch.column_by_name(meta_columns::EXT).is_some());
+        assert_eq!(batch.num_columns(), 4); // data + 3 metadata columns
+    }
+
+    #[test]
+    fn test_ext_metadata_empty() {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+
+        let empty_meta = HashMap::new();
+        let batch_with_ext = metadata::with_ext_metadata(batch, &empty_meta).unwrap();
+
+        // Empty metadata should still add the column
+        assert!(batch_with_ext.column_by_name(meta_columns::EXT).is_some());
+    }
+
+    #[test]
+    fn test_ext_metadata_mismatch_length() {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["test1", "test2"]))],
+        )
+        .unwrap();
+
+        let mut meta = HashMap::new();
+        meta.insert("key".to_string(), "value".to_string());
+
+        // Only 1 metadata for 2 rows should fail
+        let result = metadata::with_ext_metadata_per_row(batch, &[meta.clone()]);
+        assert!(result.is_err());
+    }
 }
