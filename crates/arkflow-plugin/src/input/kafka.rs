@@ -17,13 +17,15 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::Message as KafkaMessage;
+use rdkafka::message::{Message as KafkaMessage, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 /// Kafka input configuration
@@ -154,14 +156,55 @@ impl Input for KafkaInput {
                 let mut msg_batch = MessageBatch::new_binary(binary_data)?;
                 msg_batch.set_input_name(self.input_name.clone());
 
-                // Create acknowledgment object
-                let topic = kafka_message.topic().to_string();
-                let partition = kafka_message.partition();
-                let offset = kafka_message.offset();
+                // Convert to RecordBatch to add metadata
+                let mut record_batch: datafusion::arrow::record_batch::RecordBatch =
+                    msg_batch.into();
 
+                // Add core metadata
+                record_batch = metadata::with_source(record_batch, "kafka")?;
+
+                let partition = kafka_message.partition();
+                record_batch = metadata::with_partition(record_batch, partition as u32)?;
+
+                let offset = kafka_message.offset();
+                record_batch = metadata::with_offset(record_batch, offset as u64)?;
+
+                // Add key if present
+                if let Some(key) = kafka_message.key() {
+                    record_batch = metadata::with_key(record_batch, key)?;
+                }
+
+                // Add timestamp if available
+                let kafka_timestamp = kafka_message.timestamp();
+                if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
+                    let duration = std::time::Duration::from_millis(millis_since_epoch as u64);
+                    let timestamp = SystemTime::UNIX_EPOCH + duration;
+                    record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                }
+
+                // Add ingest time
+                let ingest_time = SystemTime::now();
+                record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
+
+                // Add extended metadata (topic, headers)
+                let topic = kafka_message.topic().to_string();
+                let mut ext_metadata = HashMap::new();
+                ext_metadata.insert("topic".to_string(), topic);
+
+                // Add headers if present
+                // Note: rdkafka Headers API varies by version, skipping for now
+                // TODO: Implement headers extraction based on rdkafka version
+
+                record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
+
+                // Convert back to MessageBatch
+                let mut msg_batch = MessageBatch::new_arrow(record_batch);
+                msg_batch.set_input_name(self.input_name.clone());
+
+                // Create acknowledgment object
                 let ack = KafkaAck {
                     consumer: self.consumer.clone(),
-                    topic,
+                    topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
                 };
@@ -308,5 +351,55 @@ mod tests {
         // Test acknowledgment, should have no effect since there is no actual consumer
         ack.ack().await;
         // This test mainly verifies that the ack method does not panic
+    }
+
+    #[test]
+    fn test_kafka_metadata_api_compatibility() {
+        // Test that metadata API imports work correctly
+        use arkflow_core::metadata;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Create a simple test batch
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                "test",
+            ]))],
+        )
+        .unwrap();
+
+        // Test that metadata functions are callable
+        let result = metadata::with_source(batch, "kafka");
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        let result = metadata::with_partition(batch, 0);
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        let result = metadata::with_offset(batch, 100);
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        let result = metadata::with_key(batch, b"test-key");
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        let result = metadata::with_timestamp(batch, std::time::SystemTime::now());
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        let result = metadata::with_ingest_time(batch, std::time::SystemTime::now());
+        assert!(result.is_ok());
+
+        let batch = result.unwrap();
+        use std::collections::HashMap;
+        let mut ext_meta = HashMap::new();
+        ext_meta.insert("topic".to_string(), "test-topic".to_string());
+        let result = metadata::with_ext_metadata(batch, &ext_meta);
+        assert!(result.is_ok());
     }
 }
