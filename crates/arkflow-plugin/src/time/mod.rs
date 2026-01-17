@@ -13,7 +13,7 @@
  */
 
 use serde::de::Unexpected;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer};
 use std::time::Duration;
 
 pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -29,6 +29,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
     use serde_json;
 
     #[derive(Debug, Deserialize, Serialize)]

@@ -13,7 +13,7 @@
  */
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, InputConfig},
-    Error, MessageBatch, MessageBatchRef, Resource,
+    Error, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
 use flume::{Receiver, Sender};

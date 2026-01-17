@@ -19,7 +19,7 @@
 use crate::expr::Expr;
 use arkflow_core::{
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
@@ -278,6 +278,7 @@ impl MqttClient for AsyncClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkflow_core::MessageBatch;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 

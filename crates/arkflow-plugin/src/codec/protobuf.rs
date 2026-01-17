@@ -176,7 +176,6 @@ mod tests {
 
     #[test]
     fn test_protobuf_codec_builder_with_valid_config() {
-        let builder = ProtobufCodecBuilder;
         let config_json = serde_json::json!({
             "proto_inputs": ["/path/to/file.proto"],
             "message_type": "MyMessage"

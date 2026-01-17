@@ -24,7 +24,7 @@ use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -197,6 +197,7 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use super::*;
     use arkflow_core::input::NoopAck;
+    use arkflow_core::MessageBatch;
 
     fn create_test_resource() -> Resource {
         Resource {

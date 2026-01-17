@@ -15,7 +15,7 @@ use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
 use arkflow_core::{
     output::{Output, OutputBuilder},
-    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
