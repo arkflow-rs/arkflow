@@ -16,6 +16,7 @@
 //!
 //! Receive data from a NATS subject
 
+use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
@@ -418,6 +419,7 @@ impl InputBuilder for NatsInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
+        _codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -553,7 +555,7 @@ mod tests {
     #[test]
     fn test_nats_builder_without_config() {
         let builder = NatsInputBuilder;
-        let result = builder.build(None, &None, &create_test_resource());
+        let result = builder.build(None, &None, None, &create_test_resource());
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::Config(_))));
     }

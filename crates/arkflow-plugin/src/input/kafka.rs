@@ -16,6 +16,7 @@
 //!
 //! Receive data from a Kafka topic
 
+use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -56,15 +57,21 @@ pub struct KafkaInput {
     input_name: Option<String>,
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl KafkaInput {
     /// Create a new Kafka input component
-    pub fn new(name: Option<&String>, config: KafkaInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: KafkaInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             input_name: name.cloned(),
             config,
             consumer: Arc::new(RwLock::new(None)),
+            codec,
         })
     }
     /// 将 Kafka 时间戳转换为 SystemTime
@@ -156,14 +163,14 @@ impl Input for KafkaInput {
 
         match consumer.recv().await {
             Ok(kafka_message) => {
-                // Create internal message from Kafka message
+                // Get payload from Kafka message
                 let payload = kafka_message.payload().ok_or_else(|| {
                     Error::Process("The Kafka message has no content".to_string())
                 })?;
 
-                let mut binary_data = Vec::new();
-                binary_data.push(payload.to_vec());
-                let mut msg_batch = MessageBatch::new_binary(binary_data)?;
+                // Apply codec if configured
+                let mut msg_batch =
+                    crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec)?;
                 msg_batch.set_input_name(self.input_name.clone());
 
                 // Convert to RecordBatch to add metadata
@@ -260,20 +267,26 @@ impl Ack for KafkaAck {
 }
 
 pub(crate) struct KafkaInputBuilder;
+
 impl InputBuilder for KafkaInputBuilder {
     fn build(
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _resource: &Resource,
+        _codec: Option<Arc<dyn Codec>>,
+        resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "Kafka input configuration is missing".to_string(),
             ));
         }
-        let config: KafkaInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(KafkaInput::new(name, config)?))
+        let kafka_config: KafkaInputConfig = serde_json::from_value(config.clone().unwrap())?;
+
+        // Extract codec from config if present
+        let codec = crate::input::codec_helper::extract_codec_from_config(config, resource)?;
+
+        Ok(Arc::new(KafkaInput::new(name, kafka_config, codec)?))
     }
 }
 
@@ -299,7 +312,7 @@ mod tests {
             fetch_wait_max_ms: None,
         };
 
-        let input = KafkaInput::new(None, config);
+        let input = KafkaInput::new(None, config, None);
         assert!(input.is_ok());
         let input = input.unwrap();
         assert_eq!(input.config.brokers, vec!["localhost:9092".to_string()]);
@@ -307,6 +320,7 @@ mod tests {
         assert_eq!(input.config.consumer_group, "test-group".to_string());
         assert_eq!(input.config.client_id, Some("test-client".to_string()));
         assert!(!input.config.start_from_latest);
+        assert!(input.codec.is_none()); // Verify codec is None
     }
 
     #[tokio::test]
@@ -323,7 +337,7 @@ mod tests {
             fetch_wait_max_ms: None,
         };
 
-        let input = KafkaInput::new(None, config).unwrap();
+        let input = KafkaInput::new(None, config, None).unwrap();
         // Try to read in unconnected state, should return error
         let result = input.read().await;
         assert!(result.is_err());
@@ -349,7 +363,7 @@ mod tests {
             fetch_wait_max_ms: None,
         };
 
-        let input = KafkaInput::new(None, config).unwrap();
+        let input = KafkaInput::new(None, config, None).unwrap();
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             topic: "test-topic".to_string(),

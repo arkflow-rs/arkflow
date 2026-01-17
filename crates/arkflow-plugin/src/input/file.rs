@@ -13,6 +13,7 @@
  */
 
 use crate::udf;
+use arkflow_core::codec::Codec;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
     Error, MessageBatch, MessageBatchRef, Resource,
@@ -461,6 +462,7 @@ impl InputBuilder for FileBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
+        _codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {

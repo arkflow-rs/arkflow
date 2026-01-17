@@ -10,6 +10,11 @@ cargo build --release          # Build optimized release binary
 cargo build                    # Build debug binary
 ```
 
+The release profile in `Cargo.toml` is optimized for performance:
+- `codegen-units = 1`: Better optimization at cost of slower builds
+- `lto = true`: Link-time optimization across crates
+- `opt-level = 3`: Maximum optimization level
+
 ### Testing
 ```bash
 cargo test                     # Run all tests
@@ -36,6 +41,12 @@ export PROTOC=$(which protoc)
 
 ArkFlow is a high-performance Rust stream processing engine built on Tokio with a plugin-based architecture.
 
+### Workspace Dependency Management
+
+The project uses Cargo workspace with centralized dependency management in the root `Cargo.toml`. All workspace members share versions through `[workspace.package]` and dependencies through `[workspace.dependencies]`. When adding dependencies, add them to the workspace section and reference with `workspace = true` in crate `Cargo.toml` files.
+
+**Important**: The project requires Rust 1.88 or later (specified in `rust-version`).
+
 ### Workspace Structure
 
 This is a Cargo workspace with three crates:
@@ -48,8 +59,8 @@ This is a Cargo workspace with three crates:
   - Abstract traits for `Input`, `Output`, `Processor`, `Buffer`, `Codec`
 
 - **`arkflow-plugin`** (`crates/arkflow-plugin/`) - Extensible plugin implementations
-  - Input plugins: Kafka, MQTT, HTTP, File, Database, NATS, Redis, WebSocket, Modbus, Generate
-  - Output plugins: Kafka, MQTT, HTTP, Stdout, Drop, NATS, SQL
+  - Input plugins: Kafka, MQTT, HTTP, File, Database, NATS, Redis, WebSocket, Modbus, Generate, Pulsar
+  - Output plugins: Kafka, MQTT, HTTP, Stdout, Drop, NATS, SQL, Pulsar
   - Processor plugins: JSON, SQL, Protobuf, Batch, VRL, Python UDF
   - Buffer plugins: Memory, Session Window, Sliding Window, Tumbling Window, Join
   - Codec plugins: JSON, Arrow, Protobuf
@@ -71,10 +82,12 @@ Each `Stream` runs concurrently with:
 - **Input worker**: Reads data from source
 - **Processor workers**: Multiple threads (configurable via `thread_num`) process batches
 - **Output worker**: Writes to sink with ordered delivery using sequence numbers
-- **Buffer layer**: Handles backpressure (threshold: 1024 messages)
+- **Buffer layer**: Handles backpressure (threshold: 1024 messages in channel)
 
 Data flow: `Input → Buffer → [Processor1 → Processor2 → ...] → Output`
 Errors are routed to `error_output` if configured.
+
+**Backpressure Mechanism**: When the channel between input and processor contains 1024+ messages, the input worker blocks until space is available, preventing memory overflow from fast inputs/slow processors.
 
 #### Data Model
 Uses Apache Arrow's `RecordBatch` for efficient columnar storage. The `MessageBatch` wrapper includes:
@@ -83,12 +96,30 @@ Uses Apache Arrow's `RecordBatch` for efficient columnar storage. The `MessageBa
 
 Configuration is YAML-driven and supports dynamic component loading.
 
+#### Metadata System
+Inputs can attach metadata to messages using standardized columns (prefixed with `__meta_`):
+- `__meta_source`: Source identifier
+- `__meta_partition`: Partition number (for partitioned sources like Kafka)
+- `__meta_offset`: Offset/position within partition
+- `__meta_key`: Message key
+- `__meta_timestamp`: Message timestamp from source
+- `__meta_ingest_time`: When the message was ingested
+- `__meta_ext`: Extended metadata as MapArray for flexible key-value pairs
+
+These metadata columns are accessible in SQL queries within processors.
+
 #### Actor-like Concurrency
 Each stream is an independent concurrent task using:
 - `Tokio` async runtime with multi-threaded executor
 - `CancellationToken` for graceful shutdown coordination
 - `flume` channels for message passing between stages
 - `TaskTracker` for managing concurrent tasks
+
+#### Ordered Output Delivery
+The output worker ensures ordered delivery using:
+- **Sequence numbers**: Each message batch gets an incrementing sequence number
+- **Blocking queue**: Output worker waits for out-of-order batches before writing
+- Atomic counters track the next expected sequence, preventing out-of-order writes to sinks
 
 ### Configuration System
 
@@ -136,12 +167,26 @@ Uses `thiserror` for structured error types and `anyhow` for context. Errors are
 
 Integration tests are in `tests/` directories within crates. Uses `mockall` for mocking dependencies. Example configurations in `examples/` serve as integration test fixtures.
 
-To run tests for a specific component:
+To run tests:
 ```bash
-cargo test -p arkflow-plugin test_name
+cargo test -p arkflow-plugin                    # Test all plugin components
+cargo test -p arkflow-plugin test_name          # Run specific test
+cargo test --package arkflow-core               # Test core engine
+cargo test --package arkflow-plugin --lib       # Test plugin library only
+cargo test --workspace                          # Test entire workspace
 ```
 
 ### Adding New Components
+
+All component types (input, output, processor, buffer, codec) follow the same registration pattern defined in `arkflow-core`.
+
+**Component Initialization Order** (in `crates/arkflow/src/main.rs`):
+1. `input::init()` - Register all input builders
+2. `output::init()` - Register all output builders
+3. `processor::init()` - Register all processor builders
+4. `buffer::init()` - Register all buffer builders
+5. `temporary::init()` - Register temporary storage components
+6. `codec::init()` - Register codec builders
 
 **New Input:**
 1. Create struct implementing `Input` trait
@@ -165,5 +210,14 @@ Similar patterns apply for outputs, buffers, and codecs.
 - **Axum**: HTTP server for health checks
 - **Serde**: Serialization framework
 - **Tracing**: Structured logging and instrumentation
-- **SQLx**: Database connectivity (MySQL, PostgreSQL)
+- **SQLx**: Database connectivity (MySQL, PostgreSQL, SQLite)
 - **Protobuf**: Schema evolution support
+- **PyO3**: Python UDF support for custom processors
+
+### Plugin Development
+
+When creating new plugins, the registration pattern is consistent across all component types. All registration functions use `lazy_static` with `RwLock<HashMap>` for thread-safe dynamic component lookup by name.
+
+**Python UDFs**: The Python processor plugin uses PyO3 to allow users to write custom processors in Python. These are loaded dynamically at runtime and can access `MessageBatch` data directly.
+
+**VRL Processor**: Uses Vector Remap Language (VRL) for powerful data transformation and enrichment. VRL is a safe, fast expression language designed specifically for observability data pipelines. See https://vector.dev/docs/reference/vrl/ for syntax reference.

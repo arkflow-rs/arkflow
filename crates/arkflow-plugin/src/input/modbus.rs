@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 use crate::time::deserialize_duration;
+use arkflow_core::codec::Codec;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
     Error, MessageBatch, MessageBatchRef, Resource,
@@ -218,6 +219,7 @@ impl InputBuilder for ModbusInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
+        _codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config = config

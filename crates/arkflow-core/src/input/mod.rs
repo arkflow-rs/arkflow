@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 
+use crate::codec::{Codec, CodecConfig};
 use crate::{Error, MessageBatchRef, Resource};
 
 lazy_static::lazy_static! {
@@ -33,6 +34,7 @@ pub trait InputBuilder: Send + Sync {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error>;
 }
@@ -98,6 +100,7 @@ pub struct InputConfig {
     #[serde(rename = "type")]
     pub input_type: String,
     pub name: Option<String>,
+    pub codec: Option<CodecConfig>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
@@ -108,7 +111,14 @@ impl InputConfig {
         let builders = INPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.input_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            // Build codec if configured
+            let codec = if let Some(codec_config) = &self.codec {
+                Some(codec_config.build(resource)?)
+            } else {
+                None
+            };
+
+            builder.build(self.name.as_ref(), &self.config, codec, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown input type: {}",

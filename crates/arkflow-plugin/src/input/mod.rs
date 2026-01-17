@@ -18,6 +18,7 @@
 
 use arkflow_core::Error;
 
+pub mod codec_helper;
 pub mod file;
 pub mod generate;
 pub mod http;

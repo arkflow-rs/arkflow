@@ -16,6 +16,7 @@
 //!
 //! Receive data from a WebSocket server
 
+use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -241,6 +242,7 @@ impl InputBuilder for WebSocketInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
+        _codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {

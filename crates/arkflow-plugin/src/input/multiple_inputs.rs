@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::codec::Codec;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, InputConfig},
     Error, MessageBatchRef, Resource,
@@ -164,6 +165,7 @@ impl InputBuilder for MultipleInputsBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
+        _codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
