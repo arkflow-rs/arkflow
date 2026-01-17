@@ -177,11 +177,15 @@ impl Input for KafkaInput {
                 // Add timestamp if available
                 let kafka_timestamp = kafka_message.timestamp();
                 if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
-                    let duration = std::time::Duration::from_millis(millis_since_epoch as u64);
-                    let timestamp = SystemTime::UNIX_EPOCH + duration;
-                    record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                    if millis_since_epoch >= 0 {
+                        if let Ok(millis_u64) = u64::try_from(millis_since_epoch) {
+                            let duration = std::time::Duration::from_millis(millis_u64);
+                            if let Some(timestamp) = SystemTime::UNIX_EPOCH.checked_add(duration) {
+                                record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                            }
+                        }
+                    }
                 }
-
                 // Add ingest time
                 let ingest_time = SystemTime::now();
                 record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
