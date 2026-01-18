@@ -93,11 +93,16 @@ pub struct NatsInput {
     sender: Sender<NatsMsg>,
     receiver: Receiver<NatsMsg>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl NatsInput {
     /// Create a new NATS input component
-    pub fn new(name: Option<&String>, config: NatsInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: NatsInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<NatsMsg>(1000);
         Ok(Self {
@@ -109,6 +114,7 @@ impl NatsInput {
             sender,
             receiver,
             cancellation_token,
+            codec,
         })
     }
 }
@@ -360,14 +366,24 @@ impl Input for NatsInput {
                         match msg {
                             NatsMsg::Regular(message) => {
                                 let payload = message.payload.to_vec();
-                                let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
+
+                                // Apply codec if configured
+                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
+                                    &payload,
+                                    &self.codec,
+                                )?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
                                 Ok((Arc::new(msg_batch), Arc::new(NatsAck::Regular)))
                             },
                             NatsMsg::JetStream( message) => {
                                 let payload = message.payload.to_vec();
-                                let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
+
+                                // Apply codec if configured
+                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
+                                    &payload,
+                                    &self.codec,
+                                )?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
                                 let ack = NatsAck::JetStream {
@@ -419,7 +435,7 @@ impl InputBuilder for NatsInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -428,7 +444,7 @@ impl InputBuilder for NatsInputBuilder {
             ));
         }
         let config: NatsInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(NatsInput::new(name, config)?))
+        Ok(Arc::new(NatsInput::new(name, config, codec)?))
     }
 }
 

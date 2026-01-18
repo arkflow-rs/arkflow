@@ -127,16 +127,22 @@ pub struct SqlInput {
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl SqlInput {
-    pub fn new(name: Option<&String>, sql_config: SqlInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        sql_config: SqlInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
+            codec,
         })
     }
 }
@@ -324,7 +330,7 @@ impl InputBuilder for SqlInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -334,7 +340,7 @@ impl InputBuilder for SqlInputBuilder {
         }
 
         let config: SqlInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SqlInput::new(name, config)?))
+        Ok(Arc::new(SqlInput::new(name, config, codec)?))
     }
 }
 

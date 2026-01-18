@@ -40,17 +40,28 @@ pub struct MemoryInput {
     input_name: Option<String>,
     queue: Arc<Mutex<VecDeque<MessageBatch>>>,
     connected: AtomicBool,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl MemoryInput {
     /// Create a new memory input component
-    pub fn new(name: Option<&String>, config: MemoryInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: MemoryInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let mut queue = VecDeque::new();
 
         // If there is an initial message in the configuration, it is added to the queue
         if let Some(messages) = &config.messages {
             for msg_str in messages {
-                queue.push_back(MessageBatch::from_string(msg_str)?);
+                // Apply codec if configured
+                let msg_batch = if let Some(c) = &codec {
+                    c.decode(vec![msg_str.as_bytes().to_vec()])?
+                } else {
+                    MessageBatch::from_string(msg_str)?
+                };
+                queue.push_back(msg_batch);
             }
         }
 
@@ -58,6 +69,7 @@ impl MemoryInput {
             input_name: name.cloned(),
             queue: Arc::new(Mutex::new(queue)),
             connected: AtomicBool::new(false),
+            codec,
         })
     }
 
@@ -65,6 +77,14 @@ impl MemoryInput {
     pub async fn push(&self, msg: MessageBatch) -> Result<(), Error> {
         let mut queue = self.queue.lock().await;
         queue.push_back(msg);
+        Ok(())
+    }
+
+    /// Add raw bytes to the memory input (codec will be applied if configured)
+    pub async fn push_bytes(&self, data: Vec<u8>) -> Result<(), Error> {
+        let msg_batch = crate::input::codec_helper::apply_codec_to_payload(&data, &self.codec)?;
+        let mut queue = self.queue.lock().await;
+        queue.push_back(msg_batch);
         Ok(())
     }
 }
@@ -111,7 +131,7 @@ impl InputBuilder for MemoryInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -120,7 +140,7 @@ impl InputBuilder for MemoryInputBuilder {
             ));
         }
         let config: MemoryInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MemoryInput::new(name, config)?))
+        Ok(Arc::new(MemoryInput::new(name, config, codec)?))
     }
 }
 
@@ -136,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_connect() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(None, config).unwrap();
+        let input = MemoryInput::new(None, config, None).unwrap();
         assert!(input.connect().await.is_ok());
         assert!(input.connected.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -146,7 +166,7 @@ mod tests {
         let config = MemoryInputConfig {
             messages: Some(vec!["test message".to_string()]),
         };
-        let input = MemoryInput::new(None, config).unwrap();
+        let input = MemoryInput::new(None, config, None).unwrap();
         input.connect().await.unwrap();
 
         let (msg, ack) = input.read().await.unwrap();
@@ -161,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_read_not_connected() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(None, config).unwrap();
+        let input = MemoryInput::new(None, config, None).unwrap();
 
         let result = input.read().await;
         assert!(result.is_err());
@@ -175,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_input_close() {
         let config = MemoryInputConfig { messages: None };
-        let input = MemoryInput::new(None, config).unwrap();
+        let input = MemoryInput::new(None, config, None).unwrap();
         input.connect().await.unwrap();
         assert!(input.close().await.is_ok());
         assert!(!input.connected.load(std::sync::atomic::Ordering::SeqCst));

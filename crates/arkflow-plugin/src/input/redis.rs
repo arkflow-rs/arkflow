@@ -71,6 +71,7 @@ struct RedisInput {
     sender: Sender<RedisMsg>,
     receiver: Receiver<RedisMsg>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 enum Cli {
@@ -85,7 +86,11 @@ enum RedisMsg {
 
 impl RedisInput {
     /// Create a new Redis input component
-    fn new(name: Option<&String>, config: RedisInputConfig) -> Result<Self, Error> {
+    fn new(
+        name: Option<&String>,
+        config: RedisInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
@@ -110,6 +115,7 @@ impl RedisInput {
             sender,
             receiver,
             cancellation_token,
+            codec,
         })
     }
 
@@ -350,9 +356,12 @@ impl Input for RedisInput {
 
         match self.receiver.recv_async().await {
             Ok(RedisMsg::Message(_channel, payload)) => {
-                let mut msg = MessageBatch::new_binary(vec![payload]).map_err(|e| {
-                    Error::Connection(format!("Failed to create message batch: {}", e))
-                })?;
+                // Apply codec if configured
+                let mut msg =
+                    crate::input::codec_helper::apply_codec_to_payload(&payload, &self.codec)
+                        .map_err(|e| {
+                            Error::Connection(format!("Failed to create message batch: {}", e))
+                        })?;
                 msg.set_input_name(self.input_name.clone());
 
                 Ok((Arc::new(msg), Arc::new(NoopAck)))
@@ -422,13 +431,13 @@ impl InputBuilder for RedisInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config: RedisInputConfig =
             serde_json::from_value(config.clone().unwrap_or_default())
                 .map_err(|e| Error::Config(format!("Invalid Redis input config: {}", e)))?;
-        Ok(Arc::new(RedisInput::new(name, config)?))
+        Ok(Arc::new(RedisInput::new(name, config, codec)?))
     }
 }
 

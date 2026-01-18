@@ -59,6 +59,7 @@ pub struct MqttInput {
     sender: Sender<MqttMsg>,
     receiver: Receiver<MqttMsg>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 enum MqttMsg {
@@ -68,7 +69,11 @@ enum MqttMsg {
 
 impl MqttInput {
     /// Create a new MQTT input component
-    pub fn new(name: Option<&String>, config: MqttInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: MqttInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
@@ -78,6 +83,7 @@ impl MqttInput {
             sender,
             receiver,
             cancellation_token,
+            codec,
         })
     }
 }
@@ -185,14 +191,19 @@ impl Input for MqttInput {
                     Ok(msg) => {
                         match msg{
                             MqttMsg::Publish(publish) => {
-                                 let payload = publish.payload.to_vec();
-                            let mut msg = MessageBatch::new_binary(vec![payload])?;
-                            msg.set_input_name(self.input_name.clone());
+                                let payload = publish.payload.to_vec();
 
-                            Ok((Arc::new(msg), Arc::new(MqttAck {
-                                client: Arc::clone(&self.client),
-                                publish,
-                            })))
+                                // Apply codec if configured
+                                let mut msg = crate::input::codec_helper::apply_codec_to_payload(
+                                    &payload,
+                                    &self.codec,
+                                )?;
+                                msg.set_input_name(self.input_name.clone());
+
+                                Ok((Arc::new(msg), Arc::new(MqttAck {
+                                    client: Arc::clone(&self.client),
+                                    publish,
+                                })))
                             },
                             MqttMsg::Err(e) => {
                                   Err(e)
@@ -248,7 +259,7 @@ impl InputBuilder for MqttInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -258,7 +269,8 @@ impl InputBuilder for MqttInputBuilder {
         }
 
         let config: MqttInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MqttInput::new(name, config)?))
+
+        Ok(Arc::new(MqttInput::new(name, config, codec)?))
     }
 }
 

@@ -15,7 +15,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -37,9 +37,14 @@ struct GenerateInput {
     count: AtomicI64,
     batch_size: usize,
     first: AtomicBool,
+    codec: Option<Arc<dyn Codec>>,
 }
 impl GenerateInput {
-    fn new(name: Option<&String>, config: GenerateInputConfig) -> Result<Self, Error> {
+    fn new(
+        name: Option<&String>,
+        config: GenerateInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let batch_size = config.batch_size.unwrap_or(1);
         Ok(Self {
             input_name: name.cloned(),
@@ -47,6 +52,7 @@ impl GenerateInput {
             count: AtomicI64::new(0),
             batch_size,
             first: AtomicBool::new(true),
+            codec,
         })
     }
 }
@@ -80,7 +86,10 @@ impl Input for GenerateInput {
 
         self.count
             .fetch_add(self.batch_size as i64, Ordering::SeqCst);
-        let mut message_batch = MessageBatch::new_binary(msgs)?;
+
+        // Apply codec if configured
+        let mut message_batch =
+            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec)?;
         message_batch.set_input_name(self.input_name.clone());
         Ok((Arc::new(message_batch), Arc::new(NoopAck)))
     }
@@ -95,7 +104,7 @@ impl InputBuilder for GenerateInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -105,7 +114,7 @@ impl InputBuilder for GenerateInputBuilder {
         }
         let config: GenerateInputConfig =
             serde_json::from_value::<GenerateInputConfig>(config.clone().unwrap())?;
-        Ok(Arc::new(GenerateInput::new(name, config)?))
+        Ok(Arc::new(GenerateInput::new(name, config, codec)?))
     }
 }
 
@@ -129,7 +138,7 @@ mod tests {
             count: None,
             batch_size: None,
         };
-        let input = GenerateInput::new(None, config).unwrap();
+        let input = GenerateInput::new(None, config, None).unwrap();
 
         // Test connect
         assert!(input.connect().await.is_ok());
@@ -155,7 +164,7 @@ mod tests {
             count: None,
             batch_size: Some(3),
         };
-        let input = GenerateInput::new(None, config).unwrap();
+        let input = GenerateInput::new(None, config, None).unwrap();
 
         let (msg_batch, _) = input.read().await.unwrap();
         assert_eq!(msg_batch.len(), 3);
@@ -178,7 +187,7 @@ mod tests {
             count: Some(2),
             batch_size: Some(1),
         };
-        let input = GenerateInput::new(None, config).unwrap();
+        let input = GenerateInput::new(None, config, None).unwrap();
 
         // First read should succeed
         assert!(input.read().await.is_ok());
@@ -196,7 +205,7 @@ mod tests {
             count: Some(3),
             batch_size: Some(2),
         };
-        let input = GenerateInput::new(None, config).unwrap();
+        let input = GenerateInput::new(None, config, None).unwrap();
 
         // First read should succeed (2 messages)
         let (msg_batch, _) = input.read().await.unwrap();
@@ -214,7 +223,7 @@ mod tests {
             count: None,
             batch_size: None,
         };
-        let input = GenerateInput::new(None, config).unwrap();
+        let input = GenerateInput::new(None, config, None).unwrap();
 
         // First read should be immediate
         let start = std::time::Instant::now();

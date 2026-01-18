@@ -64,17 +64,23 @@ pub struct HttpInput {
     receiver: Arc<Receiver<MessageBatch>>,
     connected: AtomicBool,
     auth: Option<AuthType>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 struct AppStateInner {
     sender: Sender<MessageBatch>,
     auth: Option<AuthType>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 type AppState = Arc<AppStateInner>;
 
 impl HttpInput {
-    pub fn new(name: Option<&String>, config: HttpInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: HttpInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
         let auth = config.auth.clone();
 
@@ -86,6 +92,7 @@ impl HttpInput {
             sender: Arc::new(sender),
             receiver: Arc::new(receiver),
             auth,
+            codec,
         })
     }
 
@@ -100,10 +107,18 @@ impl HttpInput {
             }
         }
 
-        let msg = match MessageBatch::from_json(&body.0) {
-            Ok(msg) => msg,
+        // Convert JSON to bytes for codec processing
+        let json_bytes = match serde_json::to_vec(&body.0) {
+            Ok(bytes) => bytes,
             Err(_) => return StatusCode::BAD_REQUEST,
         };
+
+        // Apply codec if configured
+        let msg =
+            match crate::input::codec_helper::apply_codec_to_payload(&json_bytes, &state.codec) {
+                Ok(msg) => msg,
+                Err(_) => return StatusCode::BAD_REQUEST,
+            };
 
         let _ = state.sender.send_async(msg).await;
 
@@ -124,6 +139,7 @@ impl Input for HttpInput {
         let app_state = Arc::new(AppStateInner {
             sender: self.sender.as_ref().clone(),
             auth: self.auth.clone(),
+            codec: self.codec.clone(),
         });
 
         let mut app = Router::new()
@@ -186,7 +202,7 @@ impl InputBuilder for HttpInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -196,7 +212,7 @@ impl InputBuilder for HttpInputBuilder {
         }
 
         let config: HttpInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(HttpInput::new(name, config)?))
+        Ok(Arc::new(HttpInput::new(name, config, codec)?))
     }
 }
 
@@ -261,10 +277,11 @@ mod tests {
             cors_enabled: Some(false),
             auth: None,
         };
-        let input = HttpInput::new(None, config).unwrap();
+        let input = HttpInput::new(None, config, None).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),
+            codec: None,
         });
 
         let app = Router::new()
@@ -293,10 +310,11 @@ mod tests {
                 password: "pass".to_string(),
             }),
         };
-        let input = HttpInput::new(None, config).unwrap();
+        let input = HttpInput::new(None, config, None).unwrap();
         let app_state = Arc::new(AppStateInner {
             sender: input.sender.as_ref().clone(),
             auth: input.auth.clone(),
+            codec: None,
         });
 
         let app = Router::new()

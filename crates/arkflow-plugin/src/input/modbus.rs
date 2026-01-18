@@ -62,15 +62,17 @@ struct ModbusInput {
     name: Option<String>,
     first_read: AtomicBool,
     client: Arc<Mutex<Option<tokio_modbus::client::Context>>>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl ModbusInput {
-    fn new(config: ModbusInputConfig, name: Option<String>) -> Self {
+    fn new(config: ModbusInputConfig, name: Option<String>, codec: Option<Arc<dyn Codec>>) -> Self {
         Self {
             config,
             first_read: AtomicBool::new(false),
             client: Arc::new(Mutex::new(None)),
             name,
+            codec,
         }
     }
 }
@@ -219,7 +221,7 @@ impl InputBuilder for ModbusInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let config = config
@@ -227,7 +229,7 @@ impl InputBuilder for ModbusInputBuilder {
             .ok_or(Error::Process("Modbus input config is missing".to_string()))?;
         let config: ModbusInputConfig = serde_json::from_value(config.clone())
             .map_err(|e| Error::Process(format!("Failed to parse modbus input config:{}", e)))?;
-        Ok(Arc::new(ModbusInput::new(config, name.cloned())))
+        Ok(Arc::new(ModbusInput::new(config, name.cloned(), codec)))
     }
 }
 

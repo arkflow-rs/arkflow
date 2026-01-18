@@ -165,7 +165,7 @@ impl InputBuilder for MultipleInputsBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -175,6 +175,8 @@ impl InputBuilder for MultipleInputsBuilder {
         }
 
         let config: MultipleInputsConfig = serde_json::from_value(config.clone().unwrap())?;
+        // Note: codec is not used here as individual inputs have their own codecs
+        let _ = codec;
         Ok(Arc::new(MultipleInputs::new(name, config, resource)?))
     }
 }

@@ -65,11 +65,16 @@ pub struct PulsarInput {
     sender: Sender<PulsarMsg>,
     receiver: Receiver<PulsarMsg>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl PulsarInput {
     /// Create a new Pulsar input component
-    pub fn new(name: Option<&String>, config: PulsarInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: PulsarInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<PulsarMsg>(1000);
         Ok(Self {
@@ -80,6 +85,7 @@ impl PulsarInput {
             sender,
             receiver,
             cancellation_token,
+            codec,
         })
     }
 }
@@ -217,7 +223,12 @@ impl Input for PulsarInput {
                         match msg {
                             PulsarMsg::Message(mut message) => {
                                 let payload = std::mem::take(&mut message.payload.data);
-                                let mut msg_batch = MessageBatch::new_binary(vec![payload])?;
+
+                                // Apply codec if configured
+                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
+                                    &payload,
+                                    &self.codec,
+                                )?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
                                 // Get consumer reference for acknowledgment
@@ -269,7 +280,7 @@ impl InputBuilder for PulsarInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -292,7 +303,7 @@ impl InputBuilder for PulsarInputBuilder {
             PulsarConfigValidator::validate_retry_config(retry_config)?;
         }
 
-        Ok(Arc::new(PulsarInput::new(name, config)?))
+        Ok(Arc::new(PulsarInput::new(name, config, codec)?))
     }
 }
 

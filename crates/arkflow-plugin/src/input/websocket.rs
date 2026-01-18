@@ -61,11 +61,16 @@ pub struct WebSocketInput {
     receiver: Receiver<WebSocketMsg>,
     writer: Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl WebSocketInput {
     /// Create a new WebSocket input component
-    pub fn new(name: Option<&String>, config: WebSocketInputConfig) -> Result<Self, Error> {
+    pub fn new(
+        name: Option<&String>,
+        config: WebSocketInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<WebSocketMsg>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
@@ -75,6 +80,7 @@ impl WebSocketInput {
             receiver,
             writer: Arc::new(Mutex::new(None)),
             cancellation_token,
+            codec,
         })
     }
 }
@@ -158,7 +164,11 @@ impl Input for WebSocketInput {
                                     }
                                 };
 
-                                let mut msg = MessageBatch::new_binary(vec![payload])?;
+                                // Apply codec if configured
+                                let mut msg = crate::input::codec_helper::apply_codec_to_payload(
+                                    &payload,
+                                    &self.codec,
+                                )?;
                                 msg.set_input_name(self.input_name.clone());
 
                                 Ok((Arc::new(msg), Arc::new(NoopAck)))
@@ -242,7 +252,7 @@ impl InputBuilder for WebSocketInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -252,7 +262,7 @@ impl InputBuilder for WebSocketInputBuilder {
         }
 
         let config: WebSocketInputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(WebSocketInput::new(name, config)?))
+        Ok(Arc::new(WebSocketInput::new(name, config, codec)?))
     }
 }
 

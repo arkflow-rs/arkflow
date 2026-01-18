@@ -153,16 +153,22 @@ struct FileInput {
     config: FileInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl FileInput {
-    fn new(name: Option<&String>, config: FileInputConfig) -> Result<Self, Error> {
+    fn new(
+        name: Option<&String>,
+        config: FileInputConfig,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
             config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
+            codec,
         })
     }
 
@@ -462,7 +468,7 @@ impl InputBuilder for FileBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        _codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
@@ -473,7 +479,7 @@ impl InputBuilder for FileBuilder {
 
         let config: FileInputConfig = serde_json::from_value(config.clone().unwrap())
             .map_err(|e| Error::Config(format!("Failed to parse File input config: {}", e)))?;
-        Ok(Arc::new(FileInput::new(name, config)?))
+        Ok(Arc::new(FileInput::new(name, config, codec)?))
     }
 }
 
