@@ -88,37 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_codec_from_config_no_codec() {
-        let config: Option<Value> = None;
-        let resource = Resource {
-            temporary: std::collections::HashMap::new(),
-            input_names: std::cell::RefCell::new(Vec::new()),
-        };
-
-        let result = extract_codec_from_config(&config, &resource);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_extract_codec_from_config_with_codec() {
-        let config = Some(serde_json::json!({
-            "codec": {
-                "type": "json"
-            }
-        }));
-
-        let resource = Resource {
-            temporary: std::collections::HashMap::new(),
-            input_names: std::cell::RefCell::new(Vec::new()),
-        };
-
-        let result = extract_codec_from_config(&config, &resource);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-    }
-
-    #[test]
     fn test_apply_codec_to_payload_no_codec() {
         let payload = b"test data";
         let codec: Option<Arc<dyn Codec>> = None;

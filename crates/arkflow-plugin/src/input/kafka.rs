@@ -273,8 +273,8 @@ impl InputBuilder for KafkaInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
-        _codec: Option<Arc<dyn Codec>>,
-        resource: &Resource,
+        codec: Option<Arc<dyn Codec>>,
+        _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         if config.is_none() {
             return Err(Error::Config(
@@ -282,9 +282,6 @@ impl InputBuilder for KafkaInputBuilder {
             ));
         }
         let kafka_config: KafkaInputConfig = serde_json::from_value(config.clone().unwrap())?;
-
-        // Extract codec from config if present
-        let codec = crate::input::codec_helper::extract_codec_from_config(config, resource)?;
 
         Ok(Arc::new(KafkaInput::new(name, kafka_config, codec)?))
     }
