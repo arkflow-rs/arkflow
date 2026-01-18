@@ -74,7 +74,7 @@ impl KafkaInput {
             codec,
         })
     }
-    /// 将 Kafka 时间戳转换为 SystemTime
+    /// Convert Kafka timestamps to SystemTime
     fn convert_kafka_timestamp(millis_since_epoch: i64) -> Option<SystemTime> {
         if millis_since_epoch < 0 {
             return None;

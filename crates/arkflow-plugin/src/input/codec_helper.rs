@@ -14,34 +14,9 @@
 
 //! Helper functions for codec integration in input components
 
-use arkflow_core::codec::{Codec, CodecConfig};
-use arkflow_core::{Bytes, Error, MessageBatch, Resource};
-use serde_json::Value;
+use arkflow_core::codec::Codec;
+use arkflow_core::{Bytes, Error, MessageBatch};
 use std::sync::Arc;
-
-/// Extract codec configuration from input config
-///
-/// # Arguments
-/// * `config` - The input configuration (may contain "codec" field)
-/// * `resource` - The resource context for building codec
-///
-/// # Returns
-/// * `Ok(Some(codec))` - If codec is configured
-/// * `Ok(None)` - If no codec configured
-/// * `Err(Error)` - If codec configuration is invalid
-pub fn extract_codec_from_config(
-    config: &Option<Value>,
-    resource: &Resource,
-) -> Result<Option<Arc<dyn Codec>>, Error> {
-    if let Some(cfg) = config {
-        if let Some(codec_cfg_val) = cfg.get("codec") {
-            let codec_config: CodecConfig = serde_json::from_value(codec_cfg_val.clone())
-                .map_err(|e| Error::Config(format!("Invalid codec config: {}", e)))?;
-            return Ok(Some(codec_config.build(resource)?));
-        }
-    }
-    Ok(None)
-}
 
 /// Apply codec to payload bytes
 ///
