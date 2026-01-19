@@ -17,6 +17,7 @@
 //! This component discards all messages without performing any operations.
 //! It's useful for testing or when you want to intentionally discard data.
 
+use arkflow_core::codec::Codec;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -49,8 +50,11 @@ impl OutputBuilder for DropOutputBuilder {
         &self,
         _name: Option<&String>,
         _: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
+        // Drop output doesn't need codec, but we accept it for interface consistency
+        let _ = codec;
         Ok(Arc::new(DropOutput))
     }
 }

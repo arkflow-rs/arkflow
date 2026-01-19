@@ -18,6 +18,7 @@
 
 use crate::expr::Expr;
 use arkflow_core::{
+    codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
     Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
@@ -73,15 +74,17 @@ struct NatsOutput {
     config: NatsOutputConfig,
     client: Arc<RwLock<Option<Client>>>,
     js_stream: Arc<RwLock<Option<Context>>>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl NatsOutput {
     /// Create a new NATS output component
-    fn new(config: NatsOutputConfig) -> Result<Self, Error> {
+    fn new(config: NatsOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
             js_stream: Arc::new(RwLock::new(None)),
+            codec,
         })
     }
 }
@@ -132,15 +135,8 @@ impl Output for NatsOutput {
             .as_ref()
             .ok_or_else(|| Error::Connection("NATS client not connected".to_string()))?;
 
-        // Get value field
-        let value_field = self
-            .config
-            .value_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-
-        // Get message payloads
-        let payloads = msg.to_binary(value_field)?;
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -223,6 +219,7 @@ impl OutputBuilder for NatsOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -231,7 +228,7 @@ impl OutputBuilder for NatsOutputBuilder {
             ));
         }
         let config: NatsOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(NatsOutput::new(config)?))
+        Ok(Arc::new(NatsOutput::new(config, codec)?))
     }
 }
 
@@ -334,7 +331,7 @@ mod tests {
     #[test]
     fn test_nats_output_builder_without_config() {
         let builder = NatsOutputBuilder;
-        let result = builder.build(None, &None, &create_test_resource());
+        let result = builder.build(None, &None, None, &create_test_resource());
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::Config(_))));
     }
@@ -352,7 +349,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = NatsOutput::new(config);
+        let output = NatsOutput::new(config, None);
         assert!(output.is_ok());
     }
 }

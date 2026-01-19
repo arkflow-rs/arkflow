@@ -327,6 +327,7 @@ mod pulsar_tests {
         let result = builder.build(
             Some(&"test-output".to_string()),
             &Some(config_json),
+            None,
             &arkflow_core::Resource {
                 temporary: std::collections::HashMap::new(),
                 input_names: std::cell::RefCell::new(Vec::new()),
@@ -348,6 +349,7 @@ mod pulsar_tests {
         let result = builder.build(
             Some(&"test-output".to_string()),
             &Some(config_json),
+            None,
             &arkflow_core::Resource {
                 temporary: std::collections::HashMap::new(),
                 input_names: std::cell::RefCell::new(Vec::new()),

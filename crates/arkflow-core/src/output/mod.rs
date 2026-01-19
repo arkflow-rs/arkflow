@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, MessageBatchRef, Resource};
+use crate::{codec::Codec, Error, MessageBatchRef, Resource};
 
 lazy_static::lazy_static! {
     static ref OUTPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn OutputBuilder>>> = RwLock::new(HashMap::new());
@@ -45,9 +45,12 @@ pub struct OutputConfig {
     #[serde(rename = "type")]
     pub output_type: String,
     pub name: Option<String>,
+    pub codec: Option<CodecConfig>,
     #[serde(flatten)]
     pub config: Option<serde_json::Value>,
 }
+
+use crate::codec::CodecConfig;
 
 impl OutputConfig {
     /// Build the output component according to the configuration
@@ -55,7 +58,14 @@ impl OutputConfig {
         let builders = OUTPUT_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.output_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            // Build codec if configured
+            let codec = if let Some(codec_config) = &self.codec {
+                Some(codec_config.build(resource)?)
+            } else {
+                None
+            };
+
+            builder.build(self.name.as_ref(), &self.config, codec, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown output type: {}",
@@ -70,6 +80,7 @@ pub trait OutputBuilder: Send + Sync {
         &self,
         name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error>;
 }

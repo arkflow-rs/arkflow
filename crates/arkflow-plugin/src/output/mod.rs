@@ -18,6 +18,7 @@
 
 use arkflow_core::Error;
 
+pub mod codec_helper;
 pub mod drop;
 pub mod http;
 pub mod kafka;

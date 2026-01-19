@@ -18,6 +18,7 @@
 
 use crate::expr::Expr;
 use arkflow_core::{
+    codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
     Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
@@ -62,16 +63,18 @@ struct MqttOutput<T: MqttClient> {
     client: Arc<Mutex<Option<T>>>,
     connected: AtomicBool,
     eventloop_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl<T: MqttClient> MqttOutput<T> {
     /// Create a new MQTT output component
-    fn new(config: MqttOutputConfig) -> Result<Self, Error> {
+    fn new(config: MqttOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
             eventloop_handle: Arc::new(Mutex::new(None)),
+            codec,
         })
     }
 }
@@ -132,19 +135,11 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .as_ref()
             .ok_or_else(|| Error::Connection("The MQTT client is not initialized".to_string()))?;
 
-        let value_field = self
-            .config
-            .value_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-
-        // Get the message content
-        let payloads = match msg.to_binary(value_field) {
-            Ok(v) => v.to_vec(),
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        if payloads.is_empty() {
+            return Ok(());
+        }
 
         let topic = self.config.topic.evaluate_expr(&msg).await?;
 
@@ -203,6 +198,7 @@ impl OutputBuilder for MqttOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -211,7 +207,7 @@ impl OutputBuilder for MqttOutputBuilder {
             ));
         }
         let config: MqttOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(MqttOutput::<AsyncClient>::new(config)?))
+        Ok(Arc::new(MqttOutput::<AsyncClient>::new(config, codec)?))
     }
 }
 
@@ -349,7 +345,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = MqttOutput::<MockMqttClient>::new(config);
+        let output = MqttOutput::<MockMqttClient>::new(config, None);
         assert!(output.is_ok());
     }
 
@@ -372,7 +368,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        let output = MqttOutput::<MockMqttClient>::new(config, None).unwrap();
         assert!(output.connect().await.is_ok());
     }
 
@@ -395,7 +391,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        let output = MqttOutput::<MockMqttClient>::new(config, None).unwrap();
         output.connect().await.unwrap();
 
         let msg = Arc::new(MessageBatch::from_string("test message").unwrap());
@@ -429,7 +425,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        let output = MqttOutput::<MockMqttClient>::new(config, None).unwrap();
         output.connect().await.unwrap();
         assert!(output.close().await.is_ok());
 
@@ -458,7 +454,7 @@ mod tests {
             value_field: None,
         };
 
-        let output = MqttOutput::<MockMqttClient>::new(config).unwrap();
+        let output = MqttOutput::<MockMqttClient>::new(config, None).unwrap();
         output.connect().await.unwrap();
         output.close().await.unwrap();
 

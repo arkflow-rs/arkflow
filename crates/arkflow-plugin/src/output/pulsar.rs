@@ -21,6 +21,7 @@ use crate::pulsar::{
     PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarProducer,
 };
 use arkflow_core::{
+    codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
     Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
@@ -48,15 +49,17 @@ pub struct PulsarOutput {
     config: PulsarOutputConfig,
     client: Arc<RwLock<Option<PulsarClient>>>,
     producer: Arc<RwLock<Option<PulsarProducer>>>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl PulsarOutput {
     /// Create a new Pulsar output component
-    fn new(config: PulsarOutputConfig) -> Result<Self, Error> {
+    fn new(config: PulsarOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
             producer: Arc::new(RwLock::new(None)),
+            codec,
         })
     }
 }
@@ -105,15 +108,8 @@ impl Output for PulsarOutput {
             .as_ref()
             .ok_or_else(|| Error::Connection("Pulsar client not connected".to_string()))?;
 
-        // Get value field
-        let value_field = self
-            .config
-            .value_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-
-        // Get message payloads
-        let payloads = msg.to_binary(value_field)?;
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -187,6 +183,7 @@ impl OutputBuilder for PulsarOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -206,7 +203,7 @@ impl OutputBuilder for PulsarOutputBuilder {
             PulsarConfigValidator::validate_auth_config(auth)?;
         }
 
-        Ok(Arc::new(PulsarOutput::new(config)?))
+        Ok(Arc::new(PulsarOutput::new(config, codec)?))
     }
 }
 

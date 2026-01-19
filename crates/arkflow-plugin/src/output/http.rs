@@ -17,8 +17,9 @@
 //! Send the processed data to the HTTP endpoint
 
 use arkflow_core::{
+    codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -62,17 +63,19 @@ struct HttpOutput {
     client: Arc<Mutex<Option<Client>>>,
     connected: AtomicBool,
     auth: Option<AuthType>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl HttpOutput {
     /// Create a new HTTP output component
-    fn new(config: HttpOutputConfig) -> Result<Self, Error> {
+    fn new(config: HttpOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let auth = config.auth.clone();
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
             auth,
+            codec,
         })
     }
 }
@@ -95,18 +98,14 @@ impl Output for HttpOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        let body_field = self
-            .config
-            .body_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-        let content = msg.to_binary(body_field)?;
-        if content.is_empty() {
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        if payloads.is_empty() {
             return Ok(());
         }
 
-        for x in content {
-            self.send(x).await?
+        for x in payloads {
+            self.send(&x).await?
         }
         Ok(())
     }
@@ -221,6 +220,7 @@ impl OutputBuilder for HttpOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -230,7 +230,7 @@ impl OutputBuilder for HttpOutputBuilder {
         }
         let config: HttpOutputConfig = serde_json::from_value(config.clone().unwrap())?;
 
-        Ok(Arc::new(HttpOutput::new(config)?))
+        Ok(Arc::new(HttpOutput::new(config, codec)?))
     }
 }
 

@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{codec::Codec, Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -232,16 +232,18 @@ struct SqlOutput {
     sql_config: SqlOutputConfig,
     conn_lock: Arc<Mutex<Option<DatabaseConnection>>>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl SqlOutput {
-    fn new(sql_config: SqlOutputConfig) -> Result<Self, Error> {
+    fn new(sql_config: SqlOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
 
         Ok(Self {
             sql_config,
             conn_lock: Arc::new(Mutex::new(None)),
             cancellation_token,
+            codec,
         })
     }
 }
@@ -260,7 +262,17 @@ impl Output for SqlOutput {
         let mut conn_guard = self.conn_lock.lock().await;
         let conn = conn_guard.as_mut().ok_or_else(|| Error::Disconnection)?;
 
-        self.insert_row(conn, &msg).await?;
+        // Apply codec encoding if configured, otherwise use the message as-is
+        let processed_msg = if let Some(codec) = &self.codec {
+            let encoded = codec.encode((*msg).clone())?;
+            // Convert encoded bytes back to MessageBatch for SQL insertion
+            // This is a simplified approach - in practice, you might need more sophisticated handling
+            MessageBatch::new_binary(encoded)?
+        } else {
+            (*msg).clone()
+        };
+
+        self.insert_row(conn, &processed_msg).await?;
         Ok(())
     }
 
@@ -412,6 +424,7 @@ impl OutputBuilder for SqlOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -421,7 +434,7 @@ impl OutputBuilder for SqlOutputBuilder {
         }
 
         let config: SqlOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(SqlOutput::new(config)?))
+        Ok(Arc::new(SqlOutput::new(config, codec)?))
     }
 }
 

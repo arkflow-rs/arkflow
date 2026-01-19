@@ -16,10 +16,10 @@
 //!
 //! Outputs the processed data to standard output
 
+use arkflow_core::codec::Codec;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
-use datafusion::arrow;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Stdout, Write};
 use std::string::String;
@@ -37,14 +37,20 @@ struct StdoutOutputConfig {
 struct StdoutOutput<T> {
     config: StdoutOutputConfig,
     writer: Mutex<T>,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 impl<T: StdWriter> StdoutOutput<T> {
     /// Create a new standard output component
-    pub fn new(config: StdoutOutputConfig, writer: T) -> Result<Self, Error> {
+    pub fn new(
+        config: StdoutOutputConfig,
+        writer: T,
+        codec: Option<Arc<dyn Codec>>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             config,
             writer: Mutex::new(writer),
+            codec,
         })
     }
 }
@@ -59,36 +65,26 @@ where
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        self.arrow_stdout((*msg).clone()).await
-    }
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
 
-    async fn close(&self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl<T: StdWriter> StdoutOutput<T> {
-    async fn arrow_stdout(&self, message_batch: MessageBatch) -> Result<(), Error> {
+        // Write each payload to stdout
         let mut writer_std = self.writer.lock().await;
+        for payload in payloads {
+            let s = String::from_utf8_lossy(&payload);
 
-        // Use Arrow's JSON serialization functionality
-        let mut buf = Vec::new();
-        let mut writer = arrow::json::ArrayWriter::new(&mut buf);
-        writer
-            .write(&message_batch)
-            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
-        writer
-            .finish()
-            .map_err(|e| Error::Process(format!("Arrow JSON serialization error: {}", e)))?;
-        let s = String::from_utf8_lossy(&buf);
-
-        if self.config.append_newline.unwrap_or(true) {
-            writeln!(writer_std, "{}", s).map_err(Error::Io)?
-        } else {
-            write!(writer_std, "{}", s).map_err(Error::Io)?
+            if self.config.append_newline.unwrap_or(true) {
+                writeln!(writer_std, "{}", s).map_err(Error::Io)?
+            } else {
+                write!(writer_std, "{}", s).map_err(Error::Io)?
+            }
         }
 
         writer_std.flush().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -100,6 +96,7 @@ impl OutputBuilder for StdoutOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -108,7 +105,7 @@ impl OutputBuilder for StdoutOutputBuilder {
             ));
         }
         let config: StdoutOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(StdoutOutput::new(config, io::stdout())?))
+        Ok(Arc::new(StdoutOutput::new(config, io::stdout(), codec)?))
     }
 }
 
@@ -123,6 +120,7 @@ impl StdWriter for Stdout {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkflow_core::MessageBatch;
     use std::io::Cursor;
 
     // Mock writer for testing
@@ -152,7 +150,7 @@ mod tests {
         let config = StdoutOutputConfig {
             append_newline: Some(true),
         };
-        let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
+        let output = StdoutOutput::new(config, MockWriter::new(), None).unwrap();
 
         // Test connect
         assert!(output.connect().await.is_ok());
@@ -171,7 +169,7 @@ mod tests {
         let config = StdoutOutputConfig {
             append_newline: Some(true),
         };
-        let output = StdoutOutput::new(config, MockWriter::new()).unwrap();
+        let output = StdoutOutput::new(config, MockWriter::new(), None).unwrap();
 
         // Test binary data
         let binary_msg = Arc::new(MessageBatch::from_string("binary test").unwrap());

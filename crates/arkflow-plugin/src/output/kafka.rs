@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::{
+    codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
     Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
@@ -81,6 +82,7 @@ struct KafkaOutput {
     config: KafkaOutputConfig,
     inner_kafka_output: Arc<InnerKafkaOutput>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 struct InnerKafkaOutput {
@@ -90,7 +92,7 @@ struct InnerKafkaOutput {
 
 impl KafkaOutput {
     /// Create a new Kafka output component
-    pub fn new(config: KafkaOutputConfig) -> Result<Self, Error> {
+    pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
@@ -117,6 +119,7 @@ impl KafkaOutput {
             config,
             inner_kafka_output,
             cancellation_token,
+            codec,
         })
     }
 }
@@ -181,12 +184,8 @@ impl Output for KafkaOutput {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        let value_field = self
-            .config
-            .value_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-        let payloads = msg.to_binary(value_field)?;
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -198,8 +197,8 @@ impl Output for KafkaOutput {
         for (i, x) in payloads.into_iter().enumerate() {
             // Create record
             let mut record = match &topic {
-                EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x),
+                EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
             };
 
             // Add key if available
@@ -212,7 +211,7 @@ impl Output for KafkaOutput {
             }
 
             // Send the record
-            debug!("send payload:{}", String::from_utf8_lossy(x));
+            debug!("send payload:{}", String::from_utf8_lossy(&x));
 
             loop {
                 match producer.send_result(record) {
@@ -293,6 +292,7 @@ impl OutputBuilder for KafkaOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -303,7 +303,7 @@ impl OutputBuilder for KafkaOutputBuilder {
 
         // Parse the configuration
         let config: KafkaOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(KafkaOutput::new(config)?))
+        Ok(Arc::new(KafkaOutput::new(config, codec)?))
     }
 }
 

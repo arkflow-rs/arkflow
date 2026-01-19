@@ -14,8 +14,9 @@
 use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
 use arkflow_core::{
+    codec::Codec,
     output::{Output, OutputBuilder},
-    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
@@ -56,13 +57,14 @@ struct RedisOutput {
     client: Arc<Mutex<Option<Cli>>>,
     connection_manager: Arc<Mutex<Option<ConnectionManager>>>,
     cancellation_token: CancellationToken,
+    codec: Option<Arc<dyn Codec>>,
 }
 
 type Cli = Connection;
 
 impl RedisOutput {
     /// Create a new Redis input component
-    pub fn new(config: RedisOutputConfig) -> Result<Self, Error> {
+    pub fn new(config: RedisOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
 
         Ok(Self {
@@ -70,6 +72,7 @@ impl RedisOutput {
             client: Arc::new(Mutex::new(None)),
             connection_manager: Arc::new(Mutex::new(None)),
             cancellation_token,
+            codec,
         })
     }
 }
@@ -84,12 +87,8 @@ impl Output for RedisOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        let value_field = &self
-            .config
-            .value_field
-            .as_deref()
-            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
-        let data = msg.to_binary(value_field)?;
+        // Apply codec encoding if configured
+        let data = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
         let client_lock = self.client.lock().await;
         let Some(cli) = client_lock.as_ref() else {
             return Err(Error::Process(
@@ -179,6 +178,7 @@ impl OutputBuilder for RedisOutputBuilder {
         &self,
         _name: Option<&String>,
         config: &Option<serde_json::Value>,
+        codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         if config.is_none() {
@@ -187,7 +187,7 @@ impl OutputBuilder for RedisOutputBuilder {
             ));
         }
         let config: RedisOutputConfig = serde_json::from_value(config.clone().unwrap())?;
-        Ok(Arc::new(RedisOutput::new(config)?))
+        Ok(Arc::new(RedisOutput::new(config, codec)?))
     }
 }
 
