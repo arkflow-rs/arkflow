@@ -15,7 +15,7 @@ resolver = "2"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7.17"
+tokio-util = "0.7.18"
 async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
