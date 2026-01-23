@@ -21,6 +21,7 @@ use arkflow_core::Error;
 pub mod codec_helper;
 pub mod drop;
 pub mod http;
+pub mod influxdb;
 pub mod kafka;
 pub mod mqtt;
 pub mod nats;
@@ -32,6 +33,7 @@ pub mod stdout;
 pub fn init() -> Result<(), Error> {
     drop::init()?;
     http::init()?;
+    influxdb::init()?;
     kafka::init()?;
     mqtt::init()?;
     nats::init()?;
