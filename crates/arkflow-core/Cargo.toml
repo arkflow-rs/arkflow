@@ -23,8 +23,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 datafusion = { workspace = true }
 lazy_static = { workspace = true }
+once_cell = { workspace = true }
+prometheus = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
 flume = { workspace = true }
+chrono = { workspace = true }
+humantime-serde = { workspace = true }
+rmp-serde = { workspace = true }
+lru = { workspace = true }
+bincode = { workspace = true }
+zstd = { workspace = true }
 axum = { workspace = true }
 num_cpus = "1.17.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }

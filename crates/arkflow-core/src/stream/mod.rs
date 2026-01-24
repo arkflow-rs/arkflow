@@ -17,7 +17,9 @@
 //! A stream is a complete data processing unit, containing input, pipeline, and output.
 
 use crate::buffer::Buffer;
+use crate::checkpoint::{Barrier, BarrierManager};
 use crate::input::Ack;
+use crate::metrics;
 use crate::{
     input::Input, output::Output, pipeline::Pipeline, Error, MessageBatchRef, ProcessResult,
     Resource,
@@ -29,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
@@ -44,6 +46,10 @@ pub struct Stream {
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
+    /// Optional barrier manager for checkpoint alignment
+    barrier_manager: Option<Arc<BarrierManager>>,
+    /// Barrier sender for injecting barriers into processor workers
+    barrier_sender: Option<Sender<Barrier>>,
 }
 
 enum ProcessorData {
@@ -72,7 +78,15 @@ impl Stream {
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
+            barrier_manager: None,
+            barrier_sender: None,
         }
+    }
+
+    /// Set the barrier manager for checkpoint alignment
+    pub fn with_barrier_manager(mut self, barrier_manager: Arc<BarrierManager>) -> Self {
+        self.barrier_manager = Some(barrier_manager);
+        self
     }
 
     /// Running stream processing
@@ -91,6 +105,18 @@ impl Stream {
             flume::bounded::<(MessageBatchRef, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
             flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
+
+        // Create barrier channel if checkpointing is enabled
+        let barrier_channel = if self.barrier_manager.is_some() {
+            let (tx, rx) = flume::bounded::<Barrier>(1);
+            self.barrier_sender = Some(tx.clone());
+            Some((tx, rx))
+        } else {
+            None
+        };
+
+        let barrier_sender = barrier_channel.as_ref().map(|(tx, _)| tx.clone());
+        let barrier_receiver = barrier_channel.map(|(_, rx)| rx);
 
         let tracker = TaskTracker::new();
 
@@ -122,6 +148,8 @@ impl Stream {
                 output_sender.clone(),
                 self.sequence_counter.clone(),
                 self.next_seq.clone(),
+                self.barrier_manager.clone(),
+                barrier_receiver.clone(),
             ));
         }
 
@@ -162,12 +190,25 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok((msg, ack)) => {
+                            // Record metrics if enabled
+                            if metrics::is_metrics_enabled() {
+                                let row_count = msg.record_batch.num_rows();
+                                metrics::MESSAGES_PROCESSED.inc_by(row_count as f64);
+                                metrics::INPUT_QUEUE_DEPTH.set(input_sender.len() as f64);
+                            }
+
                             if let Some(buffer) = &buffer_option {
                                 if let Err(e) = buffer.write(msg, ack).await {
+                                    if metrics::is_metrics_enabled() {
+                                        metrics::ERRORS_TOTAL.inc();
+                                    }
                                     error!("Failed to send input message: {}", e);
                                     break;
                                 }
                             } else if let Err(e) = input_sender.send_async((msg, ack)).await {
+                                if metrics::is_metrics_enabled() {
+                                    metrics::ERRORS_TOTAL.inc();
+                                }
                                 error!("Failed to send input message: {}", e);
                                 break;
                             }
@@ -256,13 +297,27 @@ impl Stream {
         output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
         next_seq: Arc<AtomicU64>,
+        barrier_manager: Option<Arc<BarrierManager>>,
+        barrier_receiver: Option<Receiver<Barrier>>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
+
         loop {
             // Backpressure control
             let pending_messages =
                 sequence_counter.load(Ordering::Acquire) - next_seq.load(Ordering::Acquire);
+
+            // Record backpressure status
+            if metrics::is_metrics_enabled() {
+                if pending_messages > BACKPRESSURE_THRESHOLD {
+                    metrics::BACKPRESSURE_ACTIVE.set(1.0);
+                } else {
+                    metrics::BACKPRESSURE_ACTIVE.set(0.0);
+                }
+                metrics::OUTPUT_QUEUE_DEPTH.set(output_sender.len() as f64);
+            }
+
             if pending_messages > BACKPRESSURE_THRESHOLD {
                 let wait_time = std::cmp::min(
                     500,
@@ -272,12 +327,46 @@ impl Stream {
                 continue;
             }
 
+            // Check for barrier if checkpointing is enabled
+            if let Some(ref receiver) = barrier_receiver {
+                if let Some(ref manager) = barrier_manager {
+                    // Try to receive barrier without blocking
+                    if let Ok(barrier) = receiver.try_recv() {
+                        debug!("Processor {} received barrier {}", i, barrier.id);
+
+                        // Acknowledge barrier
+                        if let Err(e) = manager.acknowledge_barrier(barrier.id).await {
+                            error!("Failed to acknowledge barrier {}: {}", barrier.id, e);
+                        }
+
+                        // Wait for barrier alignment (all processors to acknowledge)
+                        match manager.wait_for_barrier(barrier.id).await {
+                            Ok(_) => {
+                                debug!("Processor {} aligned on barrier {}", i, barrier.id);
+                                // Continue processing after checkpoint alignment
+                            }
+                            Err(e) => {
+                                error!("Barrier alignment failed for {}: {}", barrier.id, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Receive and process data
             let Ok((msg, ack)) = input_receiver.recv_async().await else {
                 break;
             };
 
+            let start_time = std::time::Instant::now();
             let processed = pipeline.process(msg.clone()).await;
             let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
+
+            // Record processing latency if metrics enabled
+            if metrics::is_metrics_enabled() {
+                let latency_ms = start_time.elapsed().as_millis() as f64;
+                metrics::PROCESSING_LATENCY_MS.observe(latency_ms);
+            }
 
             match processed {
                 Ok(ProcessResult::Single(result_msg)) => {
@@ -285,6 +374,9 @@ impl Stream {
                         .send_async((ProcessorData::Ok(vec![result_msg]), ack, seq))
                         .await
                     {
+                        if metrics::is_metrics_enabled() {
+                            metrics::ERRORS_TOTAL.inc();
+                        }
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
@@ -294,6 +386,9 @@ impl Stream {
                         .send_async((ProcessorData::Ok(result_msgs), ack, seq))
                         .await
                     {
+                        if metrics::is_metrics_enabled() {
+                            metrics::ERRORS_TOTAL.inc();
+                        }
                         error!("Failed to send processed message: {}", e);
                         break;
                     }
@@ -303,6 +398,9 @@ impl Stream {
                     ack.ack().await;
                 }
                 Err(e) => {
+                    if metrics::is_metrics_enabled() {
+                        metrics::ERRORS_TOTAL.inc();
+                    }
                     if let Err(e) = output_sender
                         .send_async((ProcessorData::Err(msg, e), ack, seq))
                         .await
@@ -362,20 +460,28 @@ impl Stream {
         err_output: Option<&Arc<dyn Output>>,
     ) {
         match data {
-            ProcessorData::Err(msg, e) => match err_output {
-                None => {
-                    ack.ack().await;
-                    error!("{e}");
+            ProcessorData::Err(msg, e) => {
+                if metrics::is_metrics_enabled() {
+                    metrics::ERRORS_TOTAL.inc();
                 }
-                Some(err_output) => match err_output.write(msg).await {
-                    Ok(_) => {
+                match err_output {
+                    None => {
                         ack.ack().await;
+                        error!("{e}");
                     }
-                    Err(e) => {
-                        error!("{}", e);
-                    }
-                },
-            },
+                    Some(err_output) => match err_output.write(msg).await {
+                        Ok(_) => {
+                            ack.ack().await;
+                        }
+                        Err(e) => {
+                            if metrics::is_metrics_enabled() {
+                                metrics::ERRORS_TOTAL.inc();
+                            }
+                            error!("{}", e);
+                        }
+                    },
+                }
+            }
             ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
@@ -385,6 +491,9 @@ impl Stream {
                             success_cnt += 1;
                         }
                         Err(e) => {
+                            if metrics::is_metrics_enabled() {
+                                metrics::ERRORS_TOTAL.inc();
+                            }
                             error!("{}", e);
                         }
                     }

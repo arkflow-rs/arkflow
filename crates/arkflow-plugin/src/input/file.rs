@@ -15,6 +15,7 @@
 use crate::udf;
 use arkflow_core::codec::Codec;
 use arkflow_core::{
+    checkpoint::state::InputState,
     input::{Ack, Input, InputBuilder, NoopAck},
     Error, MessageBatch, MessageBatchRef, Resource,
 };
@@ -154,6 +155,12 @@ struct FileInput {
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// Track number of batches read for checkpoint
+    batches_read: Arc<Mutex<u64>>,
+    /// File path being processed (for checkpoint)
+    file_path: Arc<Mutex<Option<String>>>,
+    /// Whether stream has been completed (EOF reached)
+    stream_completed: Arc<Mutex<bool>>,
 }
 
 impl FileInput {
@@ -163,13 +170,32 @@ impl FileInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
+
+        // Extract file path from config
+        let file_path = match &config.input_type {
+            InputType::Avro(c) => Some(c.path.clone()),
+            InputType::Arrow(c) => Some(c.path.clone()),
+            InputType::Json(c) => Some(c.path.clone()),
+            InputType::Csv(c) => Some(c.path.clone()),
+            InputType::Parquet(c) => Some(c.path.clone()),
+        };
+
         Ok(Self {
             input_name: name.cloned(),
             config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
             codec,
+            batches_read: Arc::new(Mutex::new(0)),
+            file_path: Arc::new(Mutex::new(file_path)),
+            stream_completed: Arc::new(Mutex::new(false)),
         })
+    }
+
+    /// Get the file path for checkpoint tracking
+    async fn get_file_path(&self) -> String {
+        let path_lock = self.file_path.lock().await;
+        path_lock.clone().unwrap_or_else(|| "unknown".to_string())
     }
 
     async fn read_df(&self, ctx: &mut SessionContext) -> Result<DataFrame, Error> {
@@ -431,6 +457,8 @@ impl Input for FileInput {
         }
 
         let cancellation_token = self.cancellation_token.clone();
+        let batches_read = self.batches_read.clone();
+        let stream_completed = self.stream_completed.clone();
 
         let stream_lock = stream_lock.as_mut().unwrap();
         let mut stream_pin = stream_lock.as_mut();
@@ -444,8 +472,16 @@ impl Input for FileInput {
                     Error::EOF
                 })?;
                 let Some(x) = value else {
+                    // Mark stream as completed
+                    *stream_completed.lock().await = true;
                     return Err(Error::EOF);
                 };
+
+                // Increment batch counter
+                let mut counter = batches_read.lock().await;
+                *counter += 1;
+                drop(counter);
+
                 let mut msg = MessageBatch::new_arrow(x);
                 msg.set_input_name(self.input_name.clone());
 
@@ -458,6 +494,56 @@ impl Input for FileInput {
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.clone().cancel();
         Ok(())
+    }
+
+    /// Get current file processing position for checkpoint
+    async fn get_position(&self) -> Result<Option<InputState>, Error> {
+        let path = self.get_file_path().await;
+        let batches_read = *self.batches_read.lock().await;
+        let completed = *self.stream_completed.lock().await;
+
+        // Only return position if we've read something
+        if batches_read > 0 || completed {
+            Ok(Some(InputState::File {
+                path,
+                offset: batches_read,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Seek to a specific file position for checkpoint recovery
+    async fn seek(&self, position: &InputState) -> Result<(), Error> {
+        match position {
+            InputState::File { path, offset } => {
+                // For batch file processing, seeking is not practical
+                // We log the restoration but acknowledge that we cannot rewind
+                tracing::info!(
+                    "File input checkpoint restoration: path={}, batches_read={}",
+                    path,
+                    offset
+                );
+
+                // Note: File input using DataFusion streams cannot easily rewind
+                // In a recovery scenario, the file would be re-read from the beginning
+                // For true checkpoint support, consider:
+                // 1. Using offset-based file readers for line-oriented formats
+                // 2. Splitting files into chunks with tracking
+                // 3. Using a database or message queue instead of files for streaming
+
+                // For now, we acknowledge the checkpoint but will re-read from start
+                tracing::warn!(
+                    "File input cannot seek to offset {}; will re-read from beginning",
+                    offset
+                );
+
+                Ok(())
+            }
+            _ => Err(Error::Process(
+                "Invalid input state for File input".to_string(),
+            )),
+        }
     }
 }
 
@@ -494,4 +580,108 @@ fn default_disallow_http() -> bool {
 
 fn default_table() -> String {
     "flow".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::checkpoint::state::InputState;
+
+    #[tokio::test]
+    async fn test_file_input_new() {
+        let config = FileInputConfig {
+            input_type: InputType::Json(FileFormatConfig {
+                path: "/tmp/test.json".to_string(),
+                store: None,
+            }),
+            ballista: None,
+            query: None,
+        };
+
+        let input = FileInput::new(None, config, None);
+        assert!(input.is_ok());
+        let input = input.unwrap();
+        assert_eq!(input.get_file_path().await, "/tmp/test.json");
+        assert_eq!(*input.batches_read.lock().await, 0);
+        assert_eq!(*input.stream_completed.lock().await, false);
+    }
+
+    #[tokio::test]
+    async fn test_file_input_get_position() {
+        let config = FileInputConfig {
+            input_type: InputType::Csv(FileFormatConfig {
+                path: "/tmp/test.csv".to_string(),
+                store: None,
+            }),
+            ballista: None,
+            query: None,
+        };
+
+        let input = FileInput::new(None, config, None).unwrap();
+
+        // Initially, no position
+        let position = input.get_position().await.unwrap();
+        assert!(position.is_none());
+
+        // Simulate reading some batches
+        *input.batches_read.lock().await = 5;
+
+        // Now we should have a position
+        let position = input.get_position().await.unwrap();
+        assert!(position.is_some());
+        match position.unwrap() {
+            InputState::File { path, offset } => {
+                assert_eq!(path, "/tmp/test.csv");
+                assert_eq!(offset, 5);
+            }
+            _ => panic!("Expected File input state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_input_seek() {
+        let config = FileInputConfig {
+            input_type: InputType::Parquet(FileFormatConfig {
+                path: "/tmp/test.parquet".to_string(),
+                store: None,
+            }),
+            ballista: None,
+            query: None,
+        };
+
+        let input = FileInput::new(None, config, None).unwrap();
+
+        // Test seeking
+        let position = InputState::File {
+            path: "/tmp/test.parquet".to_string(),
+            offset: 10,
+        };
+
+        let result = input.seek(&position).await;
+        assert!(result.is_ok());
+        // Note: seek() logs a warning because file input cannot actually seek
+    }
+
+    #[tokio::test]
+    async fn test_file_input_seek_invalid_state() {
+        let config = FileInputConfig {
+            input_type: InputType::Json(FileFormatConfig {
+                path: "/tmp/test.json".to_string(),
+                store: None,
+            }),
+            ballista: None,
+            query: None,
+        };
+
+        let input = FileInput::new(None, config, None).unwrap();
+
+        // Test with invalid state type
+        let invalid_state = InputState::Kafka {
+            topic: "test".to_string(),
+            offsets: std::collections::HashMap::new(),
+        };
+
+        let result = input.seek(&invalid_state).await;
+        assert!(result.is_err());
+    }
 }
