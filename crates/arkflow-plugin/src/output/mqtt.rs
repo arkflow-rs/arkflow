@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 /// MQTT output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,8 +110,18 @@ impl<T: MqttClient> Output for MqttOutput<T> {
 
         // Start an event loop processing thread (keep the connection active)
         let eventloop_handle = tokio::spawn(async move {
-            while let Ok(_) = eventloop.poll().await {
-                // Just keep the event loop running and don't need to process the event
+            loop {
+                match eventloop.poll().await {
+                    Ok(_) => {
+                        // Event loop running successfully, continue
+                    }
+                    Err(e) => {
+                        error!("MQTT output event loop error: {}", e);
+                        // Output doesn't have reconnection mechanism like Input,
+                        // so we log the error and exit the loop
+                        break;
+                    }
+                }
             }
         });
 
