@@ -309,16 +309,13 @@ impl Input for NatsInput {
                                             Err(e) => {
                                                 error!("Failed to get JetStream message: {}", e);
                                                 if let Err(e) = sender
-                                                    .send_async(NatsMsg::Err(Error::Process(format!(
-                                                        "Failed to get message: {}",
-                                                        e
-                                                    ))))
+                                                    .send_async(NatsMsg::Err(Error::Disconnection))
                                                     .await
                                                 {
                                                     error!("Failed to send error to channel: {}", e);
                                                 }
-                                                // Short pause before retrying
-                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                                // Break the loop to allow reconnection to create a new consumer task
+                                                break;
                                             }
                                         }
                                     }
@@ -326,16 +323,13 @@ impl Input for NatsInput {
                                 Err(e) => {
                                     error!("Failed to fetch JetStream messages: {}", e);
                                     if let Err(e) = sender
-                                        .send_async(NatsMsg::Err(Error::Process(format!(
-                                            "Failed to fetch messages: {}",
-                                            e
-                                        ))))
+                                        .send_async(NatsMsg::Err(Error::Disconnection))
                                         .await
                                     {
                                         error!("Failed to send error to channel: {}", e);
                                     }
-                                    // Short pause before retrying
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    // Break the loop to allow reconnection to create a new consumer task
+                                    break;
                                 }
                             }
                             }

@@ -154,7 +154,7 @@ impl Input for MqttInput {
                                 }
                             }
                             Err(e) => {
-                               // Log the error and wait a short time before continuing
+                               // Log the error and notify the main loop to trigger reconnection
                                 error!("MQTT event loop error: {}", e);
                                 match sender_clone.send_async(MqttMsg::Err(Error::Disconnection)).await {
                                         Ok(_) => {}
@@ -162,7 +162,8 @@ impl Input for MqttInput {
                                             error!("{}",e)
                                         }
                                 };
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                // Break the loop to allow reconnection to create a new event loop task
+                                break;
                             }
                         }
                     }

@@ -180,14 +180,11 @@ impl Input for PulsarInput {
                             }
                             Some(Err(e)) => {
                                 warn!("Failed to receive Pulsar message: {}", e);
-                                if let Err(e) = sender_clone.send_async(PulsarMsg::Err(Error::Process(format!(
-                                    "Failed to receive message: {}",
-                                    e
-                                )))).await {
+                                if let Err(e) = sender_clone.send_async(PulsarMsg::Err(Error::Disconnection)).await {
                                     error!("Failed to send error to channel: {}", e);
                                 }
-                                // Exponential backoff for connection errors
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                // Break the loop to allow reconnection to create a new consumer task
+                                break;
                             }
                             None => {
                                 // Stream ended

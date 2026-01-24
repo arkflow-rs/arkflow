@@ -84,6 +84,28 @@ enum RedisMsg {
     Err(Error),
 }
 
+/// Check if a Redis error is temporary (should retry) or permanent (should not retry)
+///
+/// Temporary errors include: connection issues, timeouts, I/O errors
+/// Permanent errors include: authentication failures, permission errors, invalid configuration
+fn is_temporary_redis_error<E: std::fmt::Display>(err: &E) -> bool {
+    let err_str = err.to_string().to_lowercase();
+
+    // Permanent errors - these should not trigger infinite reconnection
+    if err_str.contains("noauth")
+        || err_str.contains("wrongpass")
+        || err_str.contains("noperm")
+        || err_str.contains("not allowed")
+        || err_str.contains("unknown command")
+        || err_str.contains("invalid")
+    {
+        return false;
+    }
+
+    // Most other errors (connection issues, timeouts, etc.) are temporary
+    true
+}
+
 impl RedisInput {
     /// Create a new Redis input component
     fn new(
@@ -175,7 +197,14 @@ impl RedisInput {
                         for channel in channels {
                             if let Err(e) = cluster_conn.subscribe(&channel).await {
                                 error!("Failed to subscribe to Redis channel {}: {}", channel, e);
-                                return Err(Error::Disconnection);
+                                if is_temporary_redis_error(&e) {
+                                    return Err(Error::Disconnection);
+                                } else {
+                                    return Err(Error::Connection(format!(
+                                        "Redis subscription failed for channel '{}': {}",
+                                        channel, e
+                                    )));
+                                }
                             }
                         }
                     }
@@ -184,7 +213,14 @@ impl RedisInput {
                         for pattern in patterns {
                             if let Err(e) = cluster_conn.psubscribe(&pattern).await {
                                 error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
-                                return Err(Error::Disconnection);
+                                if is_temporary_redis_error(&e) {
+                                    return Err(Error::Disconnection);
+                                } else {
+                                    return Err(Error::Connection(format!(
+                                        "Redis subscription failed for pattern '{}': {}",
+                                        pattern, e
+                                    )));
+                                }
                             }
                         }
                     }
@@ -256,7 +292,14 @@ impl RedisInput {
                         for channel in channels {
                             if let Err(e) = pubsub_conn.subscribe(&channel).await {
                                 error!("Failed to subscribe to Redis channel {}: {}", channel, e);
-                                return Err(Error::Disconnection);
+                                if is_temporary_redis_error(&e) {
+                                    return Err(Error::Disconnection);
+                                } else {
+                                    return Err(Error::Connection(format!(
+                                        "Redis subscription failed for channel '{}': {}",
+                                        channel, e
+                                    )));
+                                }
                             }
                         }
                     }
@@ -265,7 +308,14 @@ impl RedisInput {
                         for pattern in patterns {
                             if let Err(e) = pubsub_conn.psubscribe(&pattern).await {
                                 error!("Failed to subscribe to Redis pattern {}: {}", pattern, e);
-                                return Err(Error::Disconnection);
+                                if is_temporary_redis_error(&e) {
+                                    return Err(Error::Disconnection);
+                                } else {
+                                    return Err(Error::Connection(format!(
+                                        "Redis subscription failed for pattern '{}': {}",
+                                        pattern, e
+                                    )));
+                                }
                             }
                         }
                     }
