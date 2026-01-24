@@ -109,15 +109,19 @@ streams: # Stream definition list
 
 ArkFlow supports multiple input sources:
 
-- **Kafka**: Read data from Kafka topics
-- **MQTT**: Subscribe to messages from MQTT topics
-- **HTTP**: Receive data via HTTP
-- **File**: Reading data from files(Csv,Json, Parquet, Avro, Arrow) using SQL
-- **Generator**: Generate test data
-- **Database**: Query data from databases(MySQL, PostgreSQL, SQLite, Duckdb)
-- **Nats**: Subscribe to messages from Nats topics
-- **Redis**: Subscribe to messages from Redis channels or lists
-- **Websocket**: Subscribe to messages from WebSocket connections
+- **Kafka**: Read data from Kafka topics with consumer group support
+- **MQTT**: Subscribe to messages from MQTT topics with QoS levels
+- **HTTP**: Receive data via HTTP endpoints
+- **File**: Reading data from files (CSV, JSON, Parquet, Avro, Arrow) with cloud storage support and SQL queries
+- **Generate**: Generate synthetic test data
+- **Memory**: In-memory data source for testing
+- **Modbus**: Industrial protocol support for sensor data
+- **Multiple Inputs**: Combine multiple input streams into one pipeline
+- **Nats**: Subscribe to messages from NATS topics with JetStream support
+- **Pulsar**: Subscribe to messages from Pulsar topics with various subscription types
+- **Redis**: Subscribe to messages from Redis streams, lists, or pub/sub channels
+- **SQL**: Query data from SQL databases (MySQL, PostgreSQL, SQLite)
+- **WebSocket**: Real-time communication via WebSocket connections
 
 Example:
 
@@ -158,12 +162,16 @@ pipeline:
 
 ArkFlow supports multiple output targets:
 
-- **Kafka**: Write data to Kafka topics
+- **Drop**: Discard messages (useful for testing)
+- **HTTP**: Send data via HTTP with authentication support
+- **InfluxDB**: Write time-series data to InfluxDB 2.x with batching and retry logic
+- **Kafka**: Write data to Kafka topics with automatic partitioning
 - **MQTT**: Publish messages to MQTT topics
-- **HTTP**: Send data via HTTP
-- **Standard Output**: Output data to the console
-- **Drop**: Discard data
-- **Nats**: Publish messages to Nats topics
+- **Nats**: Publish messages to NATS topics
+- **Pulsar**: Publish messages to Pulsar topics
+- **Redis**: Write to Redis streams, lists, or pub/sub channels
+- **SQL**: Write to SQL databases (MySQL, PostgreSQL, SQLite) with batch inserts and UPSERT
+- **Stdout**: Output data to the console for debugging
 
 Example:
 
@@ -202,12 +210,13 @@ error_output:
 
 ### Buffer Components
 
-ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
+ArkFlow provides buffer capabilities to handle backpressure, windowing, and joining of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
-- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
-- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide size.
-- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
+- **Memory Buffer**: Simple in-memory buffer for high-throughput scenarios
+- **Tumbling Window**: Fixed-size, non-overlapping time windows
+- **Sliding Window**: Overlapping time windows with configurable size and slide interval
+- **Session Window**: Dynamic windows based on activity gaps
+- **Join**: SQL join operations across multiple input sources within a window
 
 Example:
 
@@ -216,4 +225,92 @@ buffer:
   type: memory
   capacity: 10000  # Maximum number of messages to buffer
   timeout: 10s  # Maximum time to buffer messages
+```
+
+## Advanced Features
+
+### Cloud Storage Integration
+
+ArkFlow File input supports multiple cloud storage providers:
+
+```yaml
+- input:
+    type: "parquet"
+    path: "s3://bucket/data.parquet"
+    object_store:
+      type: "s3"
+      region: "us-west-2"
+      bucket_name: "my-bucket"
+      access_key_id: "${AWS_ACCESS_KEY_ID}"
+      secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+```
+
+Supported providers: AWS S3, Google Cloud Storage, Azure Blob Storage, HTTP, HDFS
+
+### Multi-Source Joins
+
+Combine and correlate data from multiple sources:
+
+```yaml
+buffer:
+  type: "session_window"
+  gap: 1s
+  join:
+    query: |
+      SELECT
+        flow_input1.user_id,
+        flow_input1.name,
+        flow_input2.order_id,
+        flow_input2.amount
+      FROM flow_input1
+      INNER JOIN flow_input2 ON flow_input1.user_id = flow_input2.user_id
+    codec:
+      type: "json"
+```
+
+### Time-Series Data to InfluxDB
+
+```yaml
+- output:
+    type: "influxdb"
+    url: "http://localhost:8086"
+    org: "production"
+    bucket: "sensor-data"
+    token: "${INFLUXDB_TOKEN}"
+    measurement: "temperature"
+    tags:
+      - name: "location"
+        value: "datacenter"
+      - name: "device"
+        value: "device_id"
+    fields:
+      - name: "value"
+        value: "temperature"
+        value_type: "float"
+      - name: "status"
+        value: "status"
+        value_type: "boolean"
+    batch_size: 1000
+    flush_interval: 5s
+```
+
+### Python UDF Processing
+
+```yaml
+pipeline:
+  processors:
+    - type: "python"
+      script: |
+        def transform_data(batch):
+            import pyarrow as pa
+            values = batch.column("value").to_pylist()
+            transformed = [x * 2 for x in values]
+            new_array = pa.array(transformed)
+            new_batch = batch.add_column(
+                batch.num_columns,
+                "doubled_value",
+                new_array
+            )
+            return new_batch
+      function: "transform_data"
 ```
