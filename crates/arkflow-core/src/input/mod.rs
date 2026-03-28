@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 
+use crate::checkpoint::state::InputState;
 use crate::codec::{Codec, CodecConfig};
 use crate::{Error, MessageBatchRef, Resource};
 
@@ -54,6 +55,20 @@ pub trait Input: Send + Sync {
 
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;
+
+    /// Get current input position for checkpoint
+    ///
+    /// Default implementation returns Ok(None) for inputs that don't support checkpoint
+    async fn get_position(&self) -> Result<Option<InputState>, Error> {
+        Ok(None)
+    }
+
+    /// Seek to a specific position for checkpoint recovery
+    ///
+    /// Default implementation returns Ok(()) for inputs that don't support checkpoint
+    async fn seek(&self, _position: &InputState) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct NoopAck;

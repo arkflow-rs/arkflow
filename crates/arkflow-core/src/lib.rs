@@ -28,16 +28,19 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 pub mod buffer;
+pub mod checkpoint;
 pub mod cli;
 pub mod codec;
 pub mod config;
 pub mod engine;
 pub mod input;
+pub mod metrics;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
 pub mod stream;
 pub mod temporary;
+pub mod transaction;
 
 #[cfg(test)]
 mod message_batch_tests;

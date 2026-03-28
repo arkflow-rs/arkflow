@@ -71,7 +71,7 @@ impl BaseWindow {
                     .input_names
                     .borrow()
                     .iter()
-                    .map(|name| name.clone())
+                    .cloned()
                     .collect::<HashSet<String>>();
 
                 JoinOperation::new(
@@ -189,7 +189,7 @@ impl BaseWindow {
         }
 
         for (_, q) in queue_arc.iter() {
-            let q = Arc::clone(&q);
+            let q = Arc::clone(q);
             if !q.read().await.is_empty() {
                 return false;
             };

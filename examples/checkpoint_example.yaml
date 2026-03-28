@@ -1,0 +1,125 @@
+# ArkFlow Checkpoint Example
+#
+# This example demonstrates the checkpoint mechanism for fault tolerance.
+# Checkpoints are automatically created at regular intervals, allowing the
+# stream to recover from failures by restoring the last checkpoint.
+#
+# Key features:
+# - Automatic periodic checkpointing
+# - State persistence for Kafka offsets and buffer contents
+# - Fault recovery with minimal data loss
+# - Configurable retention policies
+
+logging:
+  level: info
+  format: plain
+
+# Health check endpoints
+health_check:
+  enabled: true
+  address: "0.0.0.0:8080"
+  health_path: "/health"
+  readiness_path: "/readiness"
+  liveness_path: "/liveness"
+
+# Prometheus metrics
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  address: "0.0.0.0:9090"
+
+# Checkpoint configuration
+checkpoint:
+  # Enable checkpointing for fault tolerance
+  enabled: true
+
+  # Checkpoint interval (how often to create checkpoints)
+  # Supports humantime format: 60s, 5m, 1h, etc.
+  interval: 60s
+
+  # Maximum number of checkpoints to retain
+  # Older checkpoints are automatically deleted
+  max_checkpoints: 10
+
+  # Minimum age before a checkpoint can be deleted
+  # This ensures recent checkpoints are always available
+  min_age: 1h
+
+  # Local storage path for checkpoint files
+  # Checkpoints are stored as compressed MessagePack files
+  local_path: "/var/lib/arkflow/checkpoints"
+
+  # Barrier alignment timeout
+  # How long to wait for all processor workers to align on a barrier
+  alignment_timeout: 30s
+
+streams:
+  - input:
+      type: "kafka"
+      brokers:
+        - "localhost:9092"
+      topics:
+        - "input-topic"
+      consumer_group: "arkflow-consumer-group"
+      start_from_latest: false
+      # The checkpoint mechanism will automatically track and restore Kafka offsets
+
+    pipeline:
+      thread_num: 4
+
+      processors:
+        - type: "sql"
+          query: |
+            SELECT
+              *,
+              __meta_source as source,
+              __meta_partition as partition,
+              __meta_offset as offset
+            FROM flow
+
+    buffer:
+      type: "memory"
+      capacity: 10000
+      timeout: 5s
+      # The checkpoint mechanism will automatically save and restore buffer contents
+
+    output:
+      type: "kafka"
+      brokers:
+        - "localhost:9092"
+      topic: "output-topic"
+      # In production, enable Kafka transactions for exactly-once semantics
+
+# Example Usage:
+#
+# 1. Start the stream:
+#    ./target/release/arkflow --config examples/checkpoint_example.yaml
+#
+# 2. The system will:
+#    - Create checkpoints every 60 seconds
+#    - Track Kafka offsets for each partition
+#    - Save buffer contents (in-memory messages)
+#    - Store sequence counters for ordered delivery
+#
+# 3. Simulate a crash (kill the process):
+#    # After processing some messages, kill the process
+#    pkill -9 arkflow
+#
+# 4. Restart the stream:
+#    ./target/release/arkflow --config examples/checkpoint_example.yaml
+#
+# 5. The system will:
+#    - Automatically detect the latest checkpoint
+#    - Restore Kafka offsets to the checkpointed position
+#    - Restore buffer contents
+#    - Continue processing from the checkpoint point
+#
+# Benefits:
+# - Minimal data loss (only messages after the last checkpoint)
+# - Fast recovery (no need to replay from the beginning)
+# - Transparent operation (no manual intervention required)
+#
+# Monitoring:
+# - Check health endpoints for checkpoint status
+# - Prometheus metrics track checkpoint statistics
+# - Logs show checkpoint creation and restoration events

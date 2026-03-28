@@ -16,8 +16,10 @@
 //!
 //! Receive data from a Kafka topic
 
+use arkflow_core::checkpoint::state::InputState;
 use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
+use arkflow_core::metrics;
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -26,7 +28,7 @@ use rdkafka::message::{Message as KafkaMessage, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::RwLock;
 
 /// Kafka input configuration
@@ -58,6 +60,9 @@ pub struct KafkaInput {
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
     codec: Option<Arc<dyn Codec>>,
+    last_fetch_time: Arc<RwLock<Option<Instant>>>,
+    /// Track current offsets for each partition (for checkpoint)
+    current_offsets: Arc<RwLock<std::collections::HashMap<i32, i64>>>,
 }
 
 impl KafkaInput {
@@ -72,6 +77,8 @@ impl KafkaInput {
             config,
             consumer: Arc::new(RwLock::new(None)),
             codec,
+            last_fetch_time: Arc::new(RwLock::new(None)),
+            current_offsets: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
     /// Convert Kafka timestamps to SystemTime
@@ -92,7 +99,7 @@ impl Input for KafkaInput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the consumer group ID
         client_config.set("group.id", &self.config.consumer_group);
@@ -154,6 +161,8 @@ impl Input for KafkaInput {
     }
 
     async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        let fetch_start = Instant::now();
+
         let consumer_arc = self.consumer.clone();
         let consumer_guard = consumer_arc.read().await;
         if consumer_guard.is_none() {
@@ -163,6 +172,27 @@ impl Input for KafkaInput {
 
         match consumer.recv().await {
             Ok(kafka_message) => {
+                // Record Kafka metrics if enabled
+                if metrics::is_metrics_enabled() {
+                    // Record fetch rate (records per second)
+                    let fetch_duration = fetch_start.elapsed().as_secs_f64();
+                    if fetch_duration > 0.0 {
+                        let records_per_second = 1.0 / fetch_duration;
+                        metrics::KAFKA_FETCH_RATE.observe(records_per_second);
+                    }
+
+                    // Try to get consumer lag (watermark offsets)
+                    // Note: This requires rdkafka's consumer watermarks
+                    if let Ok((low_watermark, high_watermark)) = consumer.fetch_watermarks(
+                        kafka_message.topic(),
+                        kafka_message.partition(),
+                        std::time::Duration::from_secs(1),
+                    ) {
+                        let lag = high_watermark - kafka_message.offset();
+                        metrics::KAFKA_CONSUMER_LAG.observe(lag as f64);
+                    }
+                }
+
                 // Get payload from Kafka message
                 let payload = kafka_message.payload().ok_or_else(|| {
                     Error::Process("The Kafka message has no content".to_string())
@@ -185,6 +215,12 @@ impl Input for KafkaInput {
 
                 let offset = kafka_message.offset();
                 record_batch = metadata::with_offset(record_batch, offset as u64)?;
+
+                // Update current offset tracking for checkpoint
+                {
+                    let mut offsets = self.current_offsets.write().await;
+                    offsets.insert(partition, offset);
+                }
 
                 // Add key if present
                 if let Some(key) = kafka_message.key() {
@@ -223,6 +259,7 @@ impl Input for KafkaInput {
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
+                    commit_time: Arc::new(RwLock::new(None)),
                 };
 
                 Ok((Arc::new(msg_batch), Arc::new(ack)))
@@ -243,6 +280,73 @@ impl Input for KafkaInput {
         }
         Ok(())
     }
+
+    /// Get current Kafka position for checkpoint
+    async fn get_position(&self) -> Result<Option<InputState>, Error> {
+        let offsets = self.current_offsets.read().await;
+        if offsets.is_empty() {
+            return Ok(None);
+        }
+
+        // Use the first topic from config for checkpoint
+        let topic = self
+            .config
+            .topics
+            .first()
+            .ok_or_else(|| Error::Config("No topics configured".to_string()))?;
+
+        // Convert offsets to HashMap<i32, i64>
+        let offsets_map = offsets.iter().map(|(&k, &v)| (k, v)).collect();
+
+        Ok(Some(InputState::Kafka {
+            topic: topic.clone(),
+            offsets: offsets_map,
+        }))
+    }
+
+    /// Seek to a specific Kafka offset for checkpoint recovery
+    async fn seek(&self, position: &InputState) -> Result<(), Error> {
+        match position {
+            InputState::Kafka { topic, offsets } => {
+                let consumer_guard = self.consumer.read().await;
+                let consumer = consumer_guard
+                    .as_ref()
+                    .ok_or_else(|| Error::Connection("Kafka consumer not connected".to_string()))?;
+
+                // Seek each partition to the specified offset
+                for (&partition, &offset) in offsets {
+                    // Use rdkafka's seek functionality
+                    let topic_ref = topic.as_str();
+                    let kafka_offset = rdkafka::Offset::Offset(offset);
+                    let timeout = std::time::Duration::from_secs(10);
+
+                    consumer
+                        .seek(topic_ref, partition, kafka_offset, timeout)
+                        .map_err(|e| {
+                            Error::Process(format!("Failed to seek Kafka offset: {}", e))
+                        })?;
+
+                    tracing::info!(
+                        "Kafka input sought to topic={}, partition={}, offset={}",
+                        topic,
+                        partition,
+                        offset
+                    );
+                }
+
+                // Update current offsets tracking
+                let mut current_offsets = self.current_offsets.write().await;
+                for (&partition, &offset) in offsets {
+                    current_offsets.insert(partition, offset);
+                }
+
+                Ok(())
+            }
+            _ => Err(Error::Process(
+                "Invalid input state for Kafka input".to_string(),
+            )),
+        }
+    }
 }
 
 /// Kafka message acknowledgment
@@ -251,16 +355,28 @@ pub struct KafkaAck {
     topic: String,
     partition: i32,
     offset: i64,
+    commit_time: Arc<RwLock<Option<Instant>>>,
 }
 
 #[async_trait]
 impl Ack for KafkaAck {
     async fn ack(&self) {
+        let commit_start = Instant::now();
+
         // Commit offsets
         let consumer_mutex_guard = self.consumer.read().await;
         if let Some(v) = &*consumer_mutex_guard {
             if let Err(e) = v.store_offset(&self.topic, self.partition, self.offset) {
                 tracing::error!("Error committing Kafka offset: {}", e);
+            } else {
+                // Record commit rate if enabled
+                if metrics::is_metrics_enabled() {
+                    let commit_duration = commit_start.elapsed().as_secs_f64();
+                    if commit_duration > 0.0 {
+                        let commits_per_second = 1.0 / commit_duration;
+                        metrics::KAFKA_COMMIT_RATE.observe(commits_per_second);
+                    }
+                }
             }
         }
     }
@@ -366,6 +482,7 @@ mod tests {
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
+            commit_time: Arc::new(RwLock::new(None)),
         };
 
         // Test acknowledgment, should have no effect since there is no actual consumer

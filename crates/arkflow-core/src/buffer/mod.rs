@@ -34,6 +34,20 @@ pub trait Buffer: Send + Sync {
     async fn flush(&self) -> Result<(), Error>;
 
     async fn close(&self) -> Result<(), Error>;
+
+    /// Get buffered messages for checkpoint
+    ///
+    /// Default implementation returns Ok(None) for buffers that don't support checkpoint
+    async fn get_buffered_messages(&self) -> Result<Option<Vec<MessageBatchRef>>, Error> {
+        Ok(None)
+    }
+
+    /// Restore buffer state from checkpoint
+    ///
+    /// Default implementation returns Ok(()) for buffers that don't support checkpoint
+    async fn restore_buffer(&self, _messages: Vec<MessageBatchRef>) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Buffer builder

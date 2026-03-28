@@ -80,7 +80,7 @@ impl Processor for PythonProcessor {
 
         let vec_mb = result
             .into_iter()
-            .map(|rb| MessageBatch::new_arrow(rb))
+            .map(MessageBatch::new_arrow)
             .collect::<Vec<_>>();
 
         if vec_mb.is_empty() {

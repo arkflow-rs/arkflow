@@ -105,7 +105,24 @@ impl Output for HttpOutput {
         }
 
         for x in payloads {
-            self.send(&x).await?
+            self.send(&x, None).await?
+        }
+        Ok(())
+    }
+
+    async fn write_idempotent(
+        &self,
+        msg: MessageBatchRef,
+        idempotency_key: &str,
+    ) -> Result<(), Error> {
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        for x in payloads {
+            self.send(&x, Some(idempotency_key)).await?
         }
         Ok(())
     }
@@ -119,7 +136,7 @@ impl Output for HttpOutput {
 }
 
 impl HttpOutput {
-    async fn send(&self, data: &[u8]) -> Result<(), Error> {
+    async fn send(&self, data: &[u8], idempotency_key: Option<&str>) -> Result<(), Error> {
         let client_arc = self.client.clone();
         let client_arc_guard = client_arc.lock().await;
         if !self.connected.load(Ordering::SeqCst) || client_arc_guard.is_none() {
@@ -156,6 +173,11 @@ impl HttpOutput {
                         request_builder.header(header::AUTHORIZATION, format!("Bearer {}", token));
                 }
             }
+        }
+
+        // Add idempotency key header if provided
+        if let Some(key) = idempotency_key {
+            request_builder = request_builder.header("Idempotency-Key", key);
         }
 
         // Add request headers

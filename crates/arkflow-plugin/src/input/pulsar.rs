@@ -21,7 +21,7 @@ use crate::pulsar::{
 };
 use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures::StreamExt;

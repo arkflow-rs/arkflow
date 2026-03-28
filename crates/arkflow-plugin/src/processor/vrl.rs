@@ -68,7 +68,7 @@ impl Processor for VrlProcessor {
 
         let batches = output
             .into_iter()
-            .map(|x| vrl_values_to_message_batch(x))
+            .map(vrl_values_to_message_batch)
             .collect::<Result<Vec<MessageBatch>, Error>>()?;
 
         // Convert to ProcessResult
@@ -380,9 +380,7 @@ fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageB
                     match vrl_value {
                         VrlValue::Object(obj) => {
                             if let Some(VrlValue::Timestamp(v)) = obj.remove(field_name.as_str()) {
-                                cols.push(
-                                    v.timestamp_nanos_opt().map_or_else(|| None, |v| Some(v)),
-                                );
+                                cols.push(v.timestamp_nanos_opt().map_or_else(|| None, Some));
                             } else {
                                 cols.push(None)
                             }

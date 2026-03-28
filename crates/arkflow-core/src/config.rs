@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use toml;
 
-use crate::{stream::StreamConfig, Error};
+use crate::{
+    checkpoint::CheckpointConfig, stream::StreamConfig, transaction::TransactionCoordinatorConfig,
+    Error,
+};
 
 /// Configuration file format
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +74,45 @@ pub struct HealthCheckConfig {
     pub liveness_path: String,
 }
 
+/// Metrics configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Whether metrics collection is enabled
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// HTTP endpoint for metrics scraping
+    #[serde(default = "default_metrics_endpoint")]
+    pub endpoint: String,
+    /// Address for metrics server
+    #[serde(default = "default_metrics_address")]
+    pub address: String,
+}
+
+/// Default value for metrics enabled
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+/// Default value for metrics endpoint
+fn default_metrics_endpoint() -> String {
+    "/metrics".to_string()
+}
+
+/// Default value for metrics address
+fn default_metrics_address() -> String {
+    "0.0.0.0:9090".to_string()
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            endpoint: default_metrics_endpoint(),
+            address: default_metrics_address(),
+        }
+    }
+}
+
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -82,6 +124,41 @@ pub struct EngineConfig {
     /// Health check configuration (optional)
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// Metrics configuration (optional)
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    /// Checkpoint configuration (optional)
+    #[serde(default)]
+    pub checkpoint: CheckpointConfig,
+    /// Exactly-once semantics configuration (optional)
+    #[serde(default)]
+    pub exactly_once: ExactlyOnceConfig,
+}
+
+/// Exactly-once semantics configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactlyOnceConfig {
+    /// Whether exactly-once semantics is enabled
+    #[serde(default = "default_exactly_once_enabled")]
+    pub enabled: bool,
+
+    /// Transaction coordinator configuration
+    #[serde(default)]
+    pub transaction: TransactionCoordinatorConfig,
+}
+
+/// Default value for exactly-once enabled
+fn default_exactly_once_enabled() -> bool {
+    false
+}
+
+impl Default for ExactlyOnceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_exactly_once_enabled(),
+            transaction: TransactionCoordinatorConfig::default(),
+        }
+    }
 }
 
 impl EngineConfig {
@@ -218,7 +295,7 @@ mod tests {
     #[test]
     fn test_health_check_config_default() {
         let config = HealthCheckConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.address, "0.0.0.0:8080");
         assert_eq!(config.health_path, "/health");
         assert_eq!(config.readiness_path, "/readiness");
@@ -267,7 +344,10 @@ mod tests {
         let deserialized: LoggingConfig = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.level, "debug");
-        assert_eq!(deserialized.file_path, Some("/var/log/arkflow.log".to_string()));
+        assert_eq!(
+            deserialized.file_path,
+            Some("/var/log/arkflow.log".to_string())
+        );
         assert!(matches!(deserialized.format, LogFormat::JSON));
     }
 
@@ -284,7 +364,7 @@ mod tests {
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: HealthCheckConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, false);
+        assert!(!deserialized.enabled);
         assert_eq!(deserialized.address, "127.0.0.1:9090");
         assert_eq!(deserialized.health_path, "/healthz");
         assert_eq!(deserialized.readiness_path, "/ready");
@@ -293,22 +373,43 @@ mod tests {
 
     #[test]
     fn test_get_format_from_path_yaml() {
-        assert_eq!(get_format_from_path("config.yaml"), Some(ConfigFormat::YAML));
+        assert_eq!(
+            get_format_from_path("config.yaml"),
+            Some(ConfigFormat::YAML)
+        );
         assert_eq!(get_format_from_path("config.yml"), Some(ConfigFormat::YAML));
-        assert_eq!(get_format_from_path("/path/to/config.YAML"), Some(ConfigFormat::YAML));
-        assert_eq!(get_format_from_path("/path/to/config.YML"), Some(ConfigFormat::YAML));
+        assert_eq!(
+            get_format_from_path("/path/to/config.YAML"),
+            Some(ConfigFormat::YAML)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.YML"),
+            Some(ConfigFormat::YAML)
+        );
     }
 
     #[test]
     fn test_get_format_from_path_json() {
-        assert_eq!(get_format_from_path("config.json"), Some(ConfigFormat::JSON));
-        assert_eq!(get_format_from_path("/path/to/config.JSON"), Some(ConfigFormat::JSON));
+        assert_eq!(
+            get_format_from_path("config.json"),
+            Some(ConfigFormat::JSON)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.JSON"),
+            Some(ConfigFormat::JSON)
+        );
     }
 
     #[test]
     fn test_get_format_from_path_toml() {
-        assert_eq!(get_format_from_path("config.toml"), Some(ConfigFormat::TOML));
-        assert_eq!(get_format_from_path("/path/to/config.TOML"), Some(ConfigFormat::TOML));
+        assert_eq!(
+            get_format_from_path("config.toml"),
+            Some(ConfigFormat::TOML)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.TOML"),
+            Some(ConfigFormat::TOML)
+        );
     }
 
     #[test]
@@ -345,7 +446,7 @@ streams: []
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.file_path, Some("/tmp/test.log".to_string()));
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "127.0.0.1:9090");
         assert!(config.streams.is_empty());
 
@@ -378,7 +479,7 @@ streams: []
 
         assert_eq!(config.logging.level, "info");
         assert!(matches!(config.logging.format, LogFormat::PLAIN));
-        assert_eq!(config.health_check.enabled, true);
+        assert!(config.health_check.enabled);
         assert_eq!(config.health_check.address, "0.0.0.0:8080");
         assert!(config.streams.is_empty());
 
@@ -422,7 +523,7 @@ type = "stdout"
 
         assert_eq!(config.logging.level, "warn");
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "192.168.1.1:8888");
         assert_eq!(config.streams.len(), 1);
 
@@ -490,6 +591,9 @@ type = "stdout"
             streams: vec![],
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
+            metrics: MetricsConfig::default(),
+            checkpoint: CheckpointConfig::default(),
+            exactly_once: ExactlyOnceConfig::default(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -497,7 +601,151 @@ type = "stdout"
 
         assert_eq!(deserialized.logging.level, "info");
         assert!(matches!(deserialized.logging.format, LogFormat::PLAIN));
-        assert_eq!(deserialized.health_check.enabled, true);
+        assert!(deserialized.health_check.enabled);
         assert_eq!(deserialized.health_check.address, "0.0.0.0:8080");
+        assert!(deserialized.metrics.enabled);
+        assert_eq!(deserialized.metrics.address, "0.0.0.0:9090");
+        assert_eq!(deserialized.metrics.endpoint, "/metrics");
+        assert!(!deserialized.checkpoint.enabled);
+        assert_eq!(
+            deserialized.checkpoint.interval,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_metrics_config_default() {
+        let config = MetricsConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.address, "0.0.0.0:9090");
+        assert_eq!(config.endpoint, "/metrics");
+    }
+
+    #[test]
+    fn test_metrics_config_serialization() {
+        let config = MetricsConfig {
+            enabled: false,
+            address: "127.0.0.1:8081".to_string(),
+            endpoint: "/prometheus".to_string(),
+        };
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let deserialized: MetricsConfig = serde_json::from_str(&serialized).unwrap();
+
+        assert!(!deserialized.enabled);
+        assert_eq!(deserialized.address, "127.0.0.1:8081");
+        assert_eq!(deserialized.endpoint, "/prometheus");
+    }
+
+    #[test]
+    fn test_default_metrics_enabled() {
+        let enabled = default_metrics_enabled();
+        assert!(enabled);
+    }
+
+    #[test]
+    fn test_default_metrics_endpoint() {
+        let endpoint = default_metrics_endpoint();
+        assert_eq!(endpoint, "/metrics");
+    }
+
+    #[test]
+    fn test_default_metrics_address() {
+        let address = default_metrics_address();
+        assert_eq!(address, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn test_checkpoint_config_default() {
+        let config = CheckpointConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.interval, std::time::Duration::from_secs(60));
+        assert_eq!(config.max_checkpoints, 10);
+        assert_eq!(config.min_age, std::time::Duration::from_secs(3600));
+        assert_eq!(config.local_path, "/var/lib/arkflow/checkpoints");
+        assert_eq!(config.alignment_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_checkpoint_config_serialization() {
+        let config = CheckpointConfig {
+            enabled: true,
+            interval: std::time::Duration::from_secs(120),
+            max_checkpoints: 20,
+            min_age: std::time::Duration::from_secs(7200),
+            local_path: "/tmp/checkpoints".to_string(),
+            alignment_timeout: std::time::Duration::from_secs(60),
+        };
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let deserialized: CheckpointConfig = serde_json::from_str(&serialized).unwrap();
+
+        assert!(deserialized.enabled);
+        assert_eq!(deserialized.interval, std::time::Duration::from_secs(120));
+        assert_eq!(deserialized.max_checkpoints, 20);
+        assert_eq!(deserialized.min_age, std::time::Duration::from_secs(7200));
+        assert_eq!(deserialized.local_path, "/tmp/checkpoints");
+        assert_eq!(
+            deserialized.alignment_timeout,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_engine_config_with_checkpoint() {
+        let yaml_content = r#"
+checkpoint:
+  enabled: true
+  interval: 120s
+  max_checkpoints: 20
+  min_age: 2h
+  local_path: "/tmp/checkpoints"
+  alignment_timeout: 60s
+
+streams: []
+"#;
+
+        let config: EngineConfig = serde_yaml::from_str(yaml_content).unwrap();
+
+        assert!(config.checkpoint.enabled);
+        assert_eq!(
+            config.checkpoint.interval,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(config.checkpoint.max_checkpoints, 20);
+        assert_eq!(
+            config.checkpoint.min_age,
+            std::time::Duration::from_secs(7200)
+        );
+        assert_eq!(config.checkpoint.local_path, "/tmp/checkpoints");
+        assert_eq!(
+            config.checkpoint.alignment_timeout,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_engine_config_checkpoint_defaults() {
+        let yaml_content = r#"
+streams: []
+"#;
+
+        let config: EngineConfig = serde_yaml::from_str(yaml_content).unwrap();
+
+        assert!(!config.checkpoint.enabled);
+        assert_eq!(
+            config.checkpoint.interval,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(config.checkpoint.max_checkpoints, 10);
+        assert_eq!(
+            config.checkpoint.min_age,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(config.checkpoint.local_path, "/var/lib/arkflow/checkpoints");
+        assert_eq!(
+            config.checkpoint.alignment_timeout,
+            std::time::Duration::from_secs(30)
+        );
     }
 }

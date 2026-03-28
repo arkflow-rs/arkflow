@@ -79,6 +79,9 @@ async-nats = "0.46"
 pulsar = "6.6"
 rand = "0.9"
 
+# Utilities
+uuid = { workspace = true }
+fastrand = "2.3"
 
 # modbus
 tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }

@@ -62,7 +62,7 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
         proto_inputs.extend(
             files_in_dir_result
                 .iter()
-                .filter(|path| path.extension().map_or(false, |ext| ext == "proto"))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "proto"))
                 .filter_map(|path| path.to_str().map(|s| s.to_string()))
                 .collect::<Vec<_>>(),
         )
@@ -137,31 +137,31 @@ pub fn protobuf_to_arrow(
         match field_value.as_ref() {
             Value::Bool(value) => {
                 fields.push(Field::new(field_name, DataType::Boolean, false));
-                columns.push(Arc::new(BooleanArray::from(vec![value.clone()])));
+                columns.push(Arc::new(BooleanArray::from(vec![*value])));
             }
             Value::I32(value) => {
                 fields.push(Field::new(field_name, DataType::Int32, false));
-                columns.push(Arc::new(Int32Array::from(vec![value.clone()])));
+                columns.push(Arc::new(Int32Array::from(vec![*value])));
             }
             Value::I64(value) => {
                 fields.push(Field::new(field_name, DataType::Int64, false));
-                columns.push(Arc::new(Int64Array::from(vec![value.clone()])));
+                columns.push(Arc::new(Int64Array::from(vec![*value])));
             }
             Value::U32(value) => {
                 fields.push(Field::new(field_name, DataType::UInt32, false));
-                columns.push(Arc::new(UInt32Array::from(vec![value.clone()])));
+                columns.push(Arc::new(UInt32Array::from(vec![*value])));
             }
             Value::U64(value) => {
                 fields.push(Field::new(field_name, DataType::UInt64, false));
-                columns.push(Arc::new(UInt64Array::from(vec![value.clone()])));
+                columns.push(Arc::new(UInt64Array::from(vec![*value])));
             }
             Value::F32(value) => {
                 fields.push(Field::new(field_name, DataType::Float32, false));
-                columns.push(Arc::new(Float32Array::from(vec![value.clone()])))
+                columns.push(Arc::new(Float32Array::from(vec![*value])))
             }
             Value::F64(value) => {
                 fields.push(Field::new(field_name, DataType::Float64, false));
-                columns.push(Arc::new(Float64Array::from(vec![value.clone()])));
+                columns.push(Arc::new(Float64Array::from(vec![*value])));
             }
             Value::String(value) => {
                 fields.push(Field::new(field_name, DataType::Utf8, false));
@@ -173,7 +173,7 @@ pub fn protobuf_to_arrow(
             }
             Value::EnumNumber(value) => {
                 fields.push(Field::new(field_name, DataType::Int32, false));
-                columns.push(Arc::new(Int32Array::from(vec![value.clone()])));
+                columns.push(Arc::new(Int32Array::from(vec![*value])));
             }
             _ => {
                 return Err(Error::Process(format!(
@@ -326,8 +326,7 @@ pub fn arrow_to_protobuf(
         }
     }
 
-    Ok(vec
-        .into_iter()
+    vec.into_iter()
         .map(|proto_msg| {
             let mut buf = Vec::new();
             proto_msg
@@ -335,5 +334,5 @@ pub fn arrow_to_protobuf(
                 .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
             Ok(buf)
         })
-        .collect::<Result<Vec<_>, Error>>()?)
+        .collect::<Result<Vec<_>, Error>>()
 }
