@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    transaction::TransactionId,
+    Error, MessageBatch, MessageBatchRef, Resource,
 };
 
 use crate::expr::{EvaluateResult, Expr};
@@ -75,6 +76,15 @@ struct KafkaOutputConfig {
     acks: Option<String>,
     /// Value type
     value_field: Option<String>,
+    /// Transactional ID for exactly-once semantics (optional)
+    transactional_id: Option<String>,
+    /// Transaction timeout (default 30s)
+    #[serde(default = "default_transaction_timeout")]
+    transaction_timeout: u64,
+}
+
+fn default_transaction_timeout() -> u64 {
+    30
 }
 
 /// Kafka output component
@@ -88,15 +98,22 @@ struct KafkaOutput {
 struct InnerKafkaOutput {
     producer: Arc<RwLock<Option<FutureProducer>>>,
     send_futures: Arc<Mutex<Vec<DeliveryFuture>>>,
+    /// Current transaction ID (if in transactional mode)
+    current_transaction_id: Arc<Mutex<Option<TransactionId>>>,
+    /// Whether transactional mode is enabled
+    transactional: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl KafkaOutput {
     /// Create a new Kafka output component
     pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
+        let transactional = config.transactional_id.is_some();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
             send_futures: Arc::new(Mutex::new(vec![])),
+            current_transaction_id: Arc::new(Mutex::new(None)),
+            transactional: Arc::new(std::sync::atomic::AtomicBool::new(transactional)),
         });
 
         let output_p = Arc::clone(&inner_kafka_output);
@@ -147,7 +164,7 @@ impl Output for KafkaOutput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the client ID
         if let Some(client_id) = &self.config.client_id {
@@ -164,10 +181,31 @@ impl Output for KafkaOutput {
             client_config.set("acks", acks);
         }
 
+        // Configure transactional settings
+        if let Some(ref transactional_id) = self.config.transactional_id {
+            client_config.set("transactional.id", transactional_id);
+            client_config.set(
+                "transaction.timeout.ms",
+                format!("{}", self.config.transaction_timeout * 1000),
+            );
+            // Enable idempotence for transactions
+            client_config.set("enable.idempotence", "true");
+        }
+
         // Create a producer
-        let producer = client_config
+        let producer: FutureProducer = client_config
             .create()
             .map_err(|e| Error::Connection(format!("A Kafka producer cannot be created: {}", e)))?;
+
+        // Initialize transactions if transactional
+        if self.config.transactional_id.is_some() {
+            producer
+                .init_transactions(Duration::from_secs(self.config.transaction_timeout))
+                .map_err(|e| {
+                    Error::Connection(format!("Failed to initialize Kafka transactions: {}", e))
+                })?;
+            debug!("Kafka transactions initialized");
+        }
 
         // Save the producer instance
         let producer_arc = self.inner_kafka_output.producer.clone();
@@ -198,7 +236,7 @@ impl Output for KafkaOutput {
             // Create record
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
             };
 
             // Add key if available
@@ -269,6 +307,190 @@ impl Output for KafkaOutput {
                 ))
             })?;
         }
+        Ok(())
+    }
+
+    async fn write_idempotent(
+        &self,
+        msg: MessageBatchRef,
+        idempotency_key: &str,
+    ) -> Result<(), Error> {
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let producer_guard = producer_arc.read().await;
+        let producer = producer_guard.as_ref().ok_or_else(|| {
+            Error::Connection("The Kafka producer is not initialized".to_string())
+        })?;
+
+        // Apply codec encoding if configured
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let topic = self.get_topic(&msg).await?;
+        let key = self.get_key(&msg).await?;
+
+        // Prepare all records for sending
+        for (i, x) in payloads.into_iter().enumerate() {
+            // Create record
+            let mut record = match &topic {
+                EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
+            };
+
+            // Add key if available
+            match &key {
+                Some(EvaluateResult::Scalar(s)) => record = record.key(s),
+                Some(EvaluateResult::Vec(v)) if i < v.len() => {
+                    record = record.key(&v[i]);
+                }
+                _ => {}
+            }
+
+            // Add idempotency key as a header
+            record = record.headers(rdkafka::message::OwnedHeaders::new().insert(
+                rdkafka::message::Header {
+                    key: "idempotency-key",
+                    value: Some(idempotency_key),
+                },
+            ));
+
+            // Send the record
+            debug!(
+                "send payload with idempotency key {}: {}",
+                idempotency_key,
+                String::from_utf8_lossy(&x)
+            );
+
+            loop {
+                match producer.send_result(record) {
+                    Ok(future) => {
+                        self.inner_kafka_output
+                            .send_futures
+                            .lock()
+                            .await
+                            .push(future);
+                        debug!("Kafka record sent");
+                        break;
+                    }
+                    Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), f)) => {
+                        record = f;
+                    }
+                    Err((e, _)) => {
+                        return Err(Error::Connection(format!("Failed to write to Kafka: {e}")));
+                    }
+                };
+
+                // back off and retry
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                debug!("Kafka queue full, retrying...");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn begin_transaction(&self) -> Result<TransactionId, Error> {
+        // Check if transactional mode is enabled
+        if !self
+            .inner_kafka_output
+            .transactional
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Process(
+                "Kafka output is not configured for transactions. Set 'transactional_id' in config.".to_string(),
+            ));
+        }
+
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let producer_guard = producer_arc.read().await;
+        let producer = producer_guard.as_ref().ok_or_else(|| {
+            Error::Connection("The Kafka producer is not initialized".to_string())
+        })?;
+
+        // Generate a new transaction ID
+        let tx_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Process(format!("Failed to generate transaction ID: {}", e)))?
+            .as_nanos() as u64;
+
+        // Begin the transaction
+        producer
+            .begin_transaction()
+            .map_err(|e| Error::Connection(format!("Failed to begin Kafka transaction: {}", e)))?;
+
+        // Store the transaction ID
+        let mut current_tx = self.inner_kafka_output.current_transaction_id.lock().await;
+        *current_tx = Some(tx_id);
+
+        debug!("Kafka transaction {} started", tx_id);
+        Ok(tx_id)
+    }
+
+    async fn prepare_transaction(&self, _id: TransactionId) -> Result<(), Error> {
+        // Kafka uses single-phase commit, so prepare is a no-op
+        // The transaction is prepared implicitly when we call commit_transaction
+        debug!("Kafka transaction prepare (no-op for single-phase commit)");
+        Ok(())
+    }
+
+    async fn commit_transaction(&self, id: TransactionId) -> Result<(), Error> {
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let producer_guard = producer_arc.read().await;
+        let producer = producer_guard.as_ref().ok_or_else(|| {
+            Error::Connection("The Kafka producer is not initialized".to_string())
+        })?;
+
+        // Verify the transaction ID matches
+        let current_tx = self.inner_kafka_output.current_transaction_id.lock().await;
+        if *current_tx != Some(id) {
+            return Err(Error::Process(format!(
+                "Transaction ID mismatch: expected {:?}, got {}",
+                *current_tx, id
+            )));
+        }
+        drop(current_tx);
+
+        // Commit the transaction
+        producer
+            .commit_transaction(Duration::from_secs(self.config.transaction_timeout))
+            .map_err(|e| Error::Connection(format!("Failed to commit Kafka transaction: {}", e)))?;
+
+        // Clear the transaction ID
+        let mut current_tx = self.inner_kafka_output.current_transaction_id.lock().await;
+        *current_tx = None;
+
+        debug!("Kafka transaction {} committed", id);
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self, id: TransactionId) -> Result<(), Error> {
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let producer_guard = producer_arc.read().await;
+        let producer = producer_guard.as_ref().ok_or_else(|| {
+            Error::Connection("The Kafka producer is not initialized".to_string())
+        })?;
+
+        // Verify the transaction ID matches
+        let current_tx = self.inner_kafka_output.current_transaction_id.lock().await;
+        if *current_tx != Some(id) {
+            return Err(Error::Process(format!(
+                "Transaction ID mismatch: expected {:?}, got {}",
+                *current_tx, id
+            )));
+        }
+        drop(current_tx);
+
+        // Abort the transaction
+        producer
+            .abort_transaction(Duration::from_secs(self.config.transaction_timeout))
+            .map_err(|e| Error::Connection(format!("Failed to abort Kafka transaction: {}", e)))?;
+
+        // Clear the transaction ID
+        let mut current_tx = self.inner_kafka_output.current_transaction_id.lock().await;
+        *current_tx = None;
+
+        debug!("Kafka transaction {} rolled back", id);
         Ok(())
     }
 }
