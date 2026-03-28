@@ -49,6 +49,7 @@ flume = "=0.11"
 chrono = { version = "0.4", features = ["serde"] }
 rmp-serde = "1.1"
 zstd = "0.13"
+uuid = "1.6"
 
 # Sql
 sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
