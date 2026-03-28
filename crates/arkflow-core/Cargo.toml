@@ -36,6 +36,7 @@ bincode = { workspace = true }
 zstd = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
+crc32fast = "1.4"
 num_cpus = "1.17.0"
 
 [dev-dependencies]

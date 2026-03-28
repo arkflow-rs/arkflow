@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const BACKPRESSURE_THRESHOLD: u64 = 1024;
 
@@ -605,8 +605,37 @@ impl Stream {
                             let _ = output.rollback_transaction(tx_id).await;
                             let _ = coordinator.rollback_transaction(tx_id).await;
 
-                            // Don't ACK - message will be retried
-                            // With idempotency, retry is safe
+                            // Classify error type to determine ACK strategy
+                            let is_temporary = match &e {
+                                Error::Connection(_) | Error::Disconnection => {
+                                    // Network/Connection errors are temporary
+                                    debug!("Temporary error detected, will retry");
+                                    true
+                                }
+                                Error::Process(msg) if msg.contains("timeout") => {
+                                    // Timeouts are temporary
+                                    debug!("Timeout error detected, will retry");
+                                    true
+                                }
+                                _ => {
+                                    // Configuration and other errors are permanent
+                                    warn!("Permanent error detected, ACKing to discard message");
+                                    false
+                                }
+                            };
+
+                            if is_temporary {
+                                // Don't ACK - message will be retried
+                                // With idempotency, retry is safe
+                                if metrics::is_metrics_enabled() {
+                                    metrics::RETRY_TOTAL.inc();
+                                }
+                            } else {
+                                // Permanent error: ACK and discard to prevent infinite retry loop
+                                // Message will be sent to error_output if configured
+                                error!("Permanent error in transaction, discarding message: {}", e);
+                                ack.ack().await;
+                            }
                         }
                     }
                 } else {

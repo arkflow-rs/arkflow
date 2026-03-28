@@ -251,6 +251,11 @@ impl Output for KafkaOutput {
             // Send the record
             debug!("send payload:{}", String::from_utf8_lossy(&x));
 
+            // Retry with exponential backoff
+            const MAX_RETRIES: u32 = 10;
+            const BASE_BACKOFF_MS: u64 = 50;
+            let mut retries = 0;
+
             loop {
                 match producer.send_result(record) {
                     Ok(future) => {
@@ -264,15 +269,30 @@ impl Output for KafkaOutput {
                     }
                     Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), f)) => {
                         record = f;
+                        retries += 1;
+
+                        if retries >= MAX_RETRIES {
+                            return Err(Error::Connection(format!(
+                                "Kafka queue full after {} retries",
+                                MAX_RETRIES
+                            )));
+                        }
+
+                        // Exponential backoff with jitter
+                        let backoff_ms = BASE_BACKOFF_MS * (1 << retries.min(6));
+                        let jitter = (fastrand::u64(0..backoff_ms / 4)) as u64;
+                        let total_backoff = backoff_ms + jitter;
+
+                        debug!(
+                            "Kafka queue full, retrying {} after {}ms...",
+                            retries, total_backoff
+                        );
+                        tokio::time::sleep(Duration::from_millis(total_backoff)).await;
                     }
                     Err((e, _)) => {
                         return Err(Error::Connection(format!("Failed to write to Kafka: {e}")));
                     }
                 };
-
-                // back off and retry
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                debug!("Kafka queue full, retrying...");
             }
         }
 
@@ -362,6 +382,11 @@ impl Output for KafkaOutput {
                 String::from_utf8_lossy(&x)
             );
 
+            // Retry with exponential backoff
+            const MAX_RETRIES: u32 = 10;
+            const BASE_BACKOFF_MS: u64 = 50;
+            let mut retries = 0;
+
             loop {
                 match producer.send_result(record) {
                     Ok(future) => {
@@ -375,15 +400,30 @@ impl Output for KafkaOutput {
                     }
                     Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), f)) => {
                         record = f;
+                        retries += 1;
+
+                        if retries >= MAX_RETRIES {
+                            return Err(Error::Connection(format!(
+                                "Kafka queue full after {} retries",
+                                MAX_RETRIES
+                            )));
+                        }
+
+                        // Exponential backoff with jitter
+                        let backoff_ms = BASE_BACKOFF_MS * (1 << retries.min(6));
+                        let jitter = (fastrand::u64(0..backoff_ms / 4)) as u64;
+                        let total_backoff = backoff_ms + jitter;
+
+                        debug!(
+                            "Kafka queue full, retrying {} after {}ms...",
+                            retries, total_backoff
+                        );
+                        tokio::time::sleep(Duration::from_millis(total_backoff)).await;
                     }
                     Err((e, _)) => {
                         return Err(Error::Connection(format!("Failed to write to Kafka: {e}")));
                     }
                 };
-
-                // back off and retry
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                debug!("Kafka queue full, retrying...");
             }
         }
 
@@ -408,11 +448,20 @@ impl Output for KafkaOutput {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        // Generate a new transaction ID
-        let tx_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| Error::Process(format!("Failed to generate transaction ID: {}", e)))?
-            .as_nanos() as u64;
+        // Generate a new transaction ID using UUID for better uniqueness
+        // Combine UUID timestamp and random bits for collision-free IDs
+        let uuid = uuid::Uuid::new_v4();
+        let tx_id = {
+            // Use a combination of UUID and timestamp for maximum uniqueness
+            let uuid_u128 = uuid.as_u128();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Error::Process(format!("Failed to get timestamp: {}", e)))?
+                .as_nanos() as u64;
+
+            // XOR the high and low parts of UUID with timestamp
+            ((uuid_u128 >> 64) as u64) ^ ((uuid_u128 & 0xFFFFFFFFFFFFFFFF) as u64) ^ timestamp
+        };
 
         // Begin the transaction
         producer

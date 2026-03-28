@@ -248,6 +248,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "crc32fast",
  "datafusion",
  "flume",
  "futures",
@@ -288,6 +289,7 @@ dependencies = [
  "datafusion",
  "datafusion-functions-json",
  "datafusion-table-providers",
+ "fastrand",
  "flume",
  "futures",
  "futures-util",
@@ -327,6 +329,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "uuid",
  "vrl",
 ]
 

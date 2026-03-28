@@ -30,11 +30,22 @@ pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 /// Flag indicating whether metrics collection is enabled
 pub static METRICS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
+/// Flag indicating whether metrics have been initialized
+/// This prevents duplicate registration errors
+static METRICS_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
 /// Initialize the metrics registry
 ///
 /// This function must be called before any metrics are used.
 /// It registers all core metrics with the global registry.
+/// This function is idempotent - safe to call multiple times.
 pub fn init_metrics() -> Result<(), Error> {
+    // Check if already initialized
+    if METRICS_INITIALIZED.load(Ordering::Acquire) {
+        info!("Metrics already initialized, skipping registration");
+        return Ok(());
+    }
+
     // Register all counters
     REGISTRY
         .register(Box::new(MESSAGES_PROCESSED.clone()))
@@ -118,6 +129,9 @@ pub fn init_metrics() -> Result<(), Error> {
     REGISTRY
         .register(Box::new(ACTIVE_TASKS.clone()))
         .map_err(|e| Error::Config(format!("Failed to register ACTIVE_TASKS: {}", e)))?;
+
+    // Mark as initialized
+    METRICS_INITIALIZED.store(true, Ordering::Release);
 
     info!("All metrics registered successfully");
     Ok(())

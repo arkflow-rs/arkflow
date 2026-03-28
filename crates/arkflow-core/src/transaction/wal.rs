@@ -28,6 +28,11 @@ use tokio::sync::RwLock;
 
 use super::types::TransactionRecord;
 
+/// Calculate CRC32 checksum for data
+fn calculate_crc32(data: &[u8]) -> u64 {
+    crc32fast::hash(data) as u64
+}
+
 /// WAL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalConfig {
@@ -67,20 +72,16 @@ struct WalEntry {
 
 impl WalEntry {
     fn new(record: TransactionRecord) -> Self {
-        // Simple checksum (in production, use CRC32)
+        // Use CRC32 for robust integrity verification
         let serialized = bincode::serialize(&record).unwrap_or_default();
-        let checksum = serialized
-            .iter()
-            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let checksum = calculate_crc32(&serialized);
 
         Self { record, checksum }
     }
 
     fn verify(&self) -> bool {
         let serialized = bincode::serialize(&self.record).unwrap_or_default();
-        let checksum = serialized
-            .iter()
-            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let checksum = calculate_crc32(&serialized);
         checksum == self.checksum
     }
 }
@@ -262,21 +263,22 @@ impl WriteAheadLog for FileWal {
         // Keep only the last N records
         let retained: Vec<_> = all_records.into_iter().rev().take(retain_last_n).collect();
 
-        // Rewrite WAL file
+        // Use atomic rename pattern: write to temp file first, then rename
         let path = self.wal_file_path();
+        let temp_path = path.with_extension("tmp");
 
-        // Close current file
+        // Close current file handle
         *self.current_file.write().await = None;
         *self.current_size.write().await = 0;
 
-        // Create new file
+        // Create temp file
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
+            .open(&temp_path)
             .await
-            .map_err(|e| Error::Read(format!("Failed to recreate WAL: {}", e)))?;
+            .map_err(|e| Error::Read(format!("Failed to create temp WAL: {}", e)))?;
 
         // Write retained records (in original order)
         for record in retained.into_iter().rev() {
@@ -293,11 +295,20 @@ impl WriteAheadLog for FileWal {
                 .map_err(|e| Error::Read(format!("Failed to write data: {}", e)))?;
         }
 
+        // Sync to ensure data is persisted
         file.sync_all()
             .await
-            .map_err(|e| Error::Read(format!("Failed to sync WAL: {}", e)))?;
+            .map_err(|e| Error::Read(format!("Failed to sync temp WAL: {}", e)))?;
 
-        tracing::info!("Truncated WAL, retained {} records", retain_last_n);
+        // Atomically rename temp file to actual WAL file
+        tokio::fs::rename(&temp_path, &path)
+            .await
+            .map_err(|e| Error::Read(format!("Failed to rename WAL: {}", e)))?;
+
+        tracing::info!(
+            "Truncated WAL (atomic rename), retained {} records",
+            retain_last_n
+        );
         Ok(())
     }
 }
