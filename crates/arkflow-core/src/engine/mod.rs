@@ -13,6 +13,7 @@
  */
 
 use crate::config::EngineConfig;
+use crate::transaction::TransactionCoordinator;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -305,11 +306,55 @@ impl Engine {
         let mut streams = Vec::new();
         let mut handles = Vec::new();
 
+        // Create transaction coordinator if exactly-once is enabled
+        let tx_coordinator = if self.config.exactly_once.enabled {
+            info!("Exactly-once semantics enabled, creating transaction coordinator");
+
+            match TransactionCoordinator::new(self.config.exactly_once.transaction.clone()).await {
+                Ok(coordinator) => {
+                    // Recover from WAL
+                    info!("Recovering from WAL...");
+                    match coordinator.recover().await {
+                        Ok(recovered_tx_ids) => {
+                            if !recovered_tx_ids.is_empty() {
+                                info!(
+                                    "Recovered {} incomplete transactions from WAL",
+                                    recovered_tx_ids.len()
+                                );
+                                for tx_id in recovered_tx_ids {
+                                    info!("Recovered transaction: {}", tx_id);
+                                }
+                            } else {
+                                info!("No incomplete transactions to recover");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to recover from WAL: {}", e);
+                            error!("Continuing without recovery...");
+                        }
+                    }
+
+                    Some(Arc::new(coordinator))
+                }
+                Err(e) => {
+                    error!("Failed to create transaction coordinator: {}", e);
+                    error!("Exactly-once semantics will not be available");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         for (i, stream_config) in self.config.streams.iter().enumerate() {
             info!("Initializing flow #{}", i + 1);
 
             match stream_config.build() {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Attach transaction coordinator if available
+                    if let Some(ref coordinator) = tx_coordinator {
+                        stream = stream.with_transaction_coordinator(Arc::clone(coordinator));
+                    }
                     streams.push(stream);
                 }
                 Err(e) => {
