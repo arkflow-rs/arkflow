@@ -3,7 +3,7 @@
 
 logging:
   level: debug
-  format: JSON
+  format: json
 
 exactly_once:
   enabled: true
@@ -33,36 +33,33 @@ streams:
   - name: "kafka-to-kafka-transactional"
     input:
       type: "kafka"
-      config:
-        brokers:
-          - "localhost:9092"
-        topics:
-          - "test-input"
-        group_id: "e2e-test-group"
-        auto_offset_reset: "earliest"
+      brokers:
+        - "localhost:9092"
+      topics:
+        - "test-input"
+      consumer_group: "e2e-test-group"
+      start_from_latest: false
 
     pipeline:
       thread_num: 2
       processors:
         - type: "sql"
-          config:
-            query: |
-              SELECT
-                *,
-                __meta_topic as source_topic,
-                __meta_partition as source_partition,
-                __meta_offset as source_offset,
-                __meta_timestamp as source_timestamp,
-                'processed' as status
-              FROM flow
+          query: |
+            SELECT
+              *,
+              __meta_source as source_topic,
+              __meta_partition as source_partition,
+              __meta_offset as source_offset,
+              __meta_timestamp as source_timestamp,
+              'processed' as status
+            FROM flow
 
     output:
       type: "kafka"
-      config:
-        brokers:
-          - "localhost:9092"
-        topic: "test-output"
-        transactional_id: "e2e-test-producer-1"
-        enable_idempotence: true
-        acks: "all"
-        max_in_flight: 1
+      brokers:
+        - "localhost:9092"
+      topic: { type: "value", value: "test-output" }
+      transactional_id: "e2e-test-producer-1"
+      enable_idempotence: true
+      acks: "all"
+      max_in_flight: 1
