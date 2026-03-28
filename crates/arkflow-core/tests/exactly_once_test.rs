@@ -448,13 +448,9 @@ fn test_exactly_once_config() {
             compression: false
           idempotency:
             cache_size: 100000
-            ttl:
-              secs: 86400
-              nanos: 0
+            ttl: 86400s
             persist_path: "/tmp/idempotency.json"
-            persist_interval:
-              secs: 60
-              nanos: 0
+            persist_interval: 60s
           transaction_timeout: 30s
         "#,
     )
