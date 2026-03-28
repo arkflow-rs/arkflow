@@ -1,0 +1,68 @@
+# 端到端测试：Kafka -> Kafka (完整事务支持)
+# 测试场景：验证2PC协议和事务完整性
+
+logging:
+  level: debug
+  format: JSON
+
+exactly_once:
+  enabled: true
+  transaction_coordinator:
+    timeout: 30s
+  wal:
+    path: "/tmp/arkflow/e2e/kafka-to-kafka/wal"
+    max_size: 10485760  # 10MB
+    sync_on_write: true
+    compression: false
+  idempotency:
+    capacity: 10000
+    ttl: 3600s
+    persistence_path: "/tmp/arkflow/e2e/kafka-to-kafka/idempotency"
+
+health_check:
+  enabled: true
+  address: "0.0.0.0:8081"
+
+metrics:
+  enabled: true
+  address: "0.0.0.0:9091"
+  endpoint: "/metrics"
+
+streams:
+  # 从Kafka消费并写入Kafka（完整事务）
+  - name: "kafka-to-kafka-transactional"
+    input:
+      type: "kafka"
+      config:
+        brokers:
+          - "localhost:9092"
+        topics:
+          - "test-input"
+        group_id: "e2e-test-group"
+        auto_offset_reset: "earliest"
+
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: "sql"
+          config:
+            query: |
+              SELECT
+                *,
+                __meta_topic as source_topic,
+                __meta_partition as source_partition,
+                __meta_offset as source_offset,
+                __meta_timestamp as source_timestamp,
+                'processed' as status
+              FROM flow
+
+    output:
+      type: "kafka"
+      config:
+        brokers:
+          - "localhost:9092"
+        topic: "test-output"
+        transactional_id: "e2e-test-producer-1"
+        enable_idempotence: true
+        acks: "all"
+        max_in_flight: 1
