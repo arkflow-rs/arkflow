@@ -33,7 +33,7 @@ exactly_once:
   transaction:
     # Write-ahead log configuration
     wal:
-      wal_dir: "/var/lib/arkflow/wal"
+      wal_dir: "./target/test/wal"
       max_file_size: 1073741824  # 1GB
       sync_on_write: true
       compression: true
@@ -41,9 +41,9 @@ exactly_once:
     # Idempotency cache configuration
     idempotency:
       cache_size: 100000
-      ttl: 86400s  # 24 hours
-      persist_path: "/var/lib/arkflow/idempotency.json"
-      persist_interval: 60s
+      ttl: 86400  # 24 hours
+      persist_path: "./target/test/idempotency.json"
+      persist_interval: 60
 
     # Transaction timeout
     transaction_timeout: 30s

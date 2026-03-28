@@ -35,12 +35,14 @@ pub struct IdempotencyConfig {
     pub cache_size: usize,
 
     /// Time-to-live for entries
+        #[serde(with = "humantime_serde")]
     pub ttl: Duration,
 
     /// Persistence file path (optional)
     pub persist_path: Option<String>,
 
     /// Interval for persisting to disk
+        #[serde(with = "humantime_serde")]
     pub persist_interval: Duration,
 }
 

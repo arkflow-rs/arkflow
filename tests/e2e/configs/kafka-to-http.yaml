@@ -10,14 +10,14 @@ exactly_once:
   transaction_coordinator:
     timeout: 30s
   wal:
-    path: "/tmp/arkflow/e2e/kafka-to-http/wal"
+    path: "./target/test/http-wal"
     max_size: 10485760
     sync_on_write: true
     compression: false
   idempotency:
     capacity: 10000
     ttl: 3600s
-    persistence_path: "/tmp/arkflow/e2e/kafka-to-http/idempotency"
+    persistence_path: "./target/test/http-idempotency"
 
 health_check:
   enabled: true
