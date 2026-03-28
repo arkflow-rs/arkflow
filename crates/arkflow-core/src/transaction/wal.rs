@@ -20,13 +20,13 @@
 use crate::Error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
-use super::types::{TransactionId, TransactionRecord};
+use super::types::TransactionRecord;
 
 /// WAL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,7 +228,7 @@ impl WriteAheadLog for FileWal {
 
             // Read entry data
             let mut buffer = vec![0u8; len as usize];
-            if let Err(_) = reader.read_exact(&mut buffer).await {
+            if (reader.read_exact(&mut buffer).await).is_err() {
                 break;
             }
 

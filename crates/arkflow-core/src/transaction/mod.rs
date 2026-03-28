@@ -18,10 +18,12 @@
 //! write-ahead logging (WAL), and idempotency tracking to ensure
 //! exactly-once processing guarantees.
 
+pub mod coordinator;
 pub mod idempotency;
 pub mod types;
 pub mod wal;
 
+pub use coordinator::{TransactionCoordinator, TransactionCoordinatorConfig};
 pub use idempotency::{IdempotencyCache, IdempotencyConfig};
 // Re-export commonly used types
 pub use types::{TransactionId, TransactionRecord, TransactionState};

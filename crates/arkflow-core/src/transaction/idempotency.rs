@@ -21,7 +21,7 @@ use crate::Error;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::fs::File;
@@ -74,7 +74,7 @@ impl IdempotencyEntry {
     }
 
     fn is_expired(&self, ttl: Duration) -> bool {
-        self.created_at.elapsed().unwrap_or_default().as_secs() > ttl.as_secs()
+        self.created_at.elapsed().unwrap_or_default().as_millis() > ttl.as_millis()
     }
 }
 
@@ -87,8 +87,11 @@ pub struct IdempotencyCache {
 impl IdempotencyCache {
     /// Create a new idempotency cache
     pub fn new(config: IdempotencyConfig) -> Self {
+        let capacity = NonZeroUsize::new(config.cache_size)
+            .unwrap_or_else(|| unsafe { NonZeroUsize::new_unchecked(1) });
+
         Self {
-            cache: Arc::new(RwLock::new(LruCache::new(config.cache_size))),
+            cache: Arc::new(RwLock::new(LruCache::new(capacity))),
             config,
         }
     }
@@ -213,7 +216,7 @@ impl IdempotencyCache {
         };
 
         // Check if file exists
-        if !Path::new(&persist_path).exists() {
+        if !std::path::Path::new(&persist_path).exists() {
             return Ok(());
         }
 
@@ -263,11 +266,11 @@ mod tests {
 
         // First check - not processed
         let is_duplicate = cache.check_and_mark("key1").await.unwrap();
-        assert_eq!(is_duplicate, false);
+        assert!(!is_duplicate);
 
         // Second check - should be marked as processed
         let is_duplicate = cache.check_and_mark("key1").await.unwrap();
-        assert_eq!(is_duplicate, true);
+        assert!(is_duplicate);
     }
 
     #[tokio::test]
@@ -275,10 +278,10 @@ mod tests {
         let config = IdempotencyConfig::default();
         let cache = IdempotencyCache::new(config);
 
-        assert_eq!(cache.check_and_mark("key1").await.unwrap(), false);
-        assert_eq!(cache.check_and_mark("key2").await.unwrap(), false);
-        assert_eq!(cache.check_and_mark("key1").await.unwrap(), true);
-        assert_eq!(cache.check_and_mark("key2").await.unwrap(), true);
+        assert!(!cache.check_and_mark("key1").await.unwrap());
+        assert!(!cache.check_and_mark("key2").await.unwrap());
+        assert!(cache.check_and_mark("key1").await.unwrap());
+        assert!(cache.check_and_mark("key2").await.unwrap());
     }
 
     #[tokio::test]
@@ -298,7 +301,7 @@ mod tests {
         assert_eq!(cache.len().await, 2);
 
         // key1 should have been evicted
-        assert_eq!(cache.check_and_mark("key1").await.unwrap(), false);
+        assert!(!cache.check_and_mark("key1").await.unwrap());
     }
 
     #[tokio::test]
@@ -346,8 +349,8 @@ mod tests {
         cache2.restore().await.unwrap();
 
         // Check that entries were restored
-        assert_eq!(cache2.check_and_mark("key1").await.unwrap(), true);
-        assert_eq!(cache2.check_and_mark("key2").await.unwrap(), true);
-        assert_eq!(cache2.check_and_mark("key3").await.unwrap(), false);
+        assert!(cache2.check_and_mark("key1").await.unwrap());
+        assert!(cache2.check_and_mark("key2").await.unwrap());
+        assert!(!cache2.check_and_mark("key3").await.unwrap());
     }
 }
