@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use toml;
 
-use crate::{checkpoint::CheckpointConfig, stream::StreamConfig, Error};
+use crate::{
+    checkpoint::CheckpointConfig, stream::StreamConfig, transaction::TransactionCoordinatorConfig,
+    Error,
+};
 
 /// Configuration file format
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,6 +130,35 @@ pub struct EngineConfig {
     /// Checkpoint configuration (optional)
     #[serde(default)]
     pub checkpoint: CheckpointConfig,
+    /// Exactly-once semantics configuration (optional)
+    #[serde(default)]
+    pub exactly_once: ExactlyOnceConfig,
+}
+
+/// Exactly-once semantics configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactlyOnceConfig {
+    /// Whether exactly-once semantics is enabled
+    #[serde(default = "default_exactly_once_enabled")]
+    pub enabled: bool,
+
+    /// Transaction coordinator configuration
+    #[serde(default)]
+    pub transaction: TransactionCoordinatorConfig,
+}
+
+/// Default value for exactly-once enabled
+fn default_exactly_once_enabled() -> bool {
+    false
+}
+
+impl Default for ExactlyOnceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_exactly_once_enabled(),
+            transaction: TransactionCoordinatorConfig::default(),
+        }
+    }
 }
 
 impl EngineConfig {
@@ -263,7 +295,7 @@ mod tests {
     #[test]
     fn test_health_check_config_default() {
         let config = HealthCheckConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.address, "0.0.0.0:8080");
         assert_eq!(config.health_path, "/health");
         assert_eq!(config.readiness_path, "/readiness");
@@ -332,7 +364,7 @@ mod tests {
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: HealthCheckConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, false);
+        assert!(!deserialized.enabled);
         assert_eq!(deserialized.address, "127.0.0.1:9090");
         assert_eq!(deserialized.health_path, "/healthz");
         assert_eq!(deserialized.readiness_path, "/ready");
@@ -414,7 +446,7 @@ streams: []
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.file_path, Some("/tmp/test.log".to_string()));
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "127.0.0.1:9090");
         assert!(config.streams.is_empty());
 
@@ -447,7 +479,7 @@ streams: []
 
         assert_eq!(config.logging.level, "info");
         assert!(matches!(config.logging.format, LogFormat::PLAIN));
-        assert_eq!(config.health_check.enabled, true);
+        assert!(config.health_check.enabled);
         assert_eq!(config.health_check.address, "0.0.0.0:8080");
         assert!(config.streams.is_empty());
 
@@ -491,7 +523,7 @@ type = "stdout"
 
         assert_eq!(config.logging.level, "warn");
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "192.168.1.1:8888");
         assert_eq!(config.streams.len(), 1);
 
@@ -561,6 +593,7 @@ type = "stdout"
             health_check: HealthCheckConfig::default(),
             metrics: MetricsConfig::default(),
             checkpoint: CheckpointConfig::default(),
+            exactly_once: ExactlyOnceConfig::default(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -568,12 +601,12 @@ type = "stdout"
 
         assert_eq!(deserialized.logging.level, "info");
         assert!(matches!(deserialized.logging.format, LogFormat::PLAIN));
-        assert_eq!(deserialized.health_check.enabled, true);
+        assert!(deserialized.health_check.enabled);
         assert_eq!(deserialized.health_check.address, "0.0.0.0:8080");
-        assert_eq!(deserialized.metrics.enabled, true);
+        assert!(deserialized.metrics.enabled);
         assert_eq!(deserialized.metrics.address, "0.0.0.0:9090");
         assert_eq!(deserialized.metrics.endpoint, "/metrics");
-        assert_eq!(deserialized.checkpoint.enabled, false);
+        assert!(!deserialized.checkpoint.enabled);
         assert_eq!(
             deserialized.checkpoint.interval,
             std::time::Duration::from_secs(60)
@@ -583,7 +616,7 @@ type = "stdout"
     #[test]
     fn test_metrics_config_default() {
         let config = MetricsConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.address, "0.0.0.0:9090");
         assert_eq!(config.endpoint, "/metrics");
     }
@@ -599,7 +632,7 @@ type = "stdout"
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: MetricsConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, false);
+        assert!(!deserialized.enabled);
         assert_eq!(deserialized.address, "127.0.0.1:8081");
         assert_eq!(deserialized.endpoint, "/prometheus");
     }
@@ -625,7 +658,7 @@ type = "stdout"
     #[test]
     fn test_checkpoint_config_default() {
         let config = CheckpointConfig::default();
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.interval, std::time::Duration::from_secs(60));
         assert_eq!(config.max_checkpoints, 10);
         assert_eq!(config.min_age, std::time::Duration::from_secs(3600));
@@ -647,7 +680,7 @@ type = "stdout"
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: CheckpointConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, true);
+        assert!(deserialized.enabled);
         assert_eq!(deserialized.interval, std::time::Duration::from_secs(120));
         assert_eq!(deserialized.max_checkpoints, 20);
         assert_eq!(deserialized.min_age, std::time::Duration::from_secs(7200));
@@ -674,7 +707,7 @@ streams: []
 
         let config: EngineConfig = serde_yaml::from_str(yaml_content).unwrap();
 
-        assert_eq!(config.checkpoint.enabled, true);
+        assert!(config.checkpoint.enabled);
         assert_eq!(
             config.checkpoint.interval,
             std::time::Duration::from_secs(120)
@@ -699,7 +732,7 @@ streams: []
 
         let config: EngineConfig = serde_yaml::from_str(yaml_content).unwrap();
 
-        assert_eq!(config.checkpoint.enabled, false);
+        assert!(!config.checkpoint.enabled);
         assert_eq!(
             config.checkpoint.interval,
             std::time::Duration::from_secs(60)
