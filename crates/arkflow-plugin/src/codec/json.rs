@@ -107,7 +107,7 @@ mod tests {
         let batch = result.unwrap();
 
         // Should have decoded to a message batch
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
     }
 
     #[test]
@@ -199,6 +199,6 @@ mod tests {
         assert!(result.is_ok());
         let batch = result.unwrap();
 
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
     }
 }

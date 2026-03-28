@@ -15,7 +15,7 @@
 //! Helper functions for codec integration in output components
 
 use arkflow_core::codec::Codec;
-use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef, DEFAULT_BINARY_VALUE_FIELD};
+use arkflow_core::{Bytes, Error, MessageBatchRef, DEFAULT_BINARY_VALUE_FIELD};
 use std::sync::Arc;
 
 /// Apply codec encoding to message batch

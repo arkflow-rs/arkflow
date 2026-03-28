@@ -18,7 +18,7 @@
 
 use arkflow_core::codec::Codec;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -118,13 +118,13 @@ impl RedisInput {
         match &config.mode {
             ModeConfig::Cluster { urls, .. } => {
                 for url in urls {
-                    if let None = redis::parse_redis_url(&url) {
+                    if redis::parse_redis_url(url).is_none() {
                         return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
                     }
                 }
             }
             ModeConfig::Single { url, .. } => {
-                if let None = redis::parse_redis_url(&url) {
+                if redis::parse_redis_url(url).is_none() {
                     return Err(Error::Config(format!("Invalid Redis URL: {}", url)));
                 }
             }
@@ -389,9 +389,7 @@ impl RedisInput {
 impl Input for RedisInput {
     async fn connect(&self) -> Result<(), Error> {
         match &self.config.mode {
-            ModeConfig::Cluster { urls } => {
-                self.cluster_connect(urls.iter().cloned().collect()).await
-            }
+            ModeConfig::Cluster { urls } => self.cluster_connect(urls.to_vec()).await,
             ModeConfig::Single { url } => self.single_connect(url.clone()).await,
         }
     }
@@ -425,48 +423,50 @@ impl Input for RedisInput {
         self.cancellation_token.cancel();
         if let Some(cli) = self.client.lock().await.take() {
             match cli {
-                Cli::Single(mut c) => match self.config.redis_type {
-                    Type::Subscribe { ref subscribe } => match subscribe {
-                        Subscribe::Channels { channels } => {
-                            match c.unsubscribe(channels).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!("Failed to unsubscribe from Redis channel: {}", e);
-                                }
-                            };
+                Cli::Single(mut c) => {
+                    if let Type::Subscribe { ref subscribe } = self.config.redis_type {
+                        match subscribe {
+                            Subscribe::Channels { channels } => {
+                                match c.unsubscribe(channels).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("Failed to unsubscribe from Redis channel: {}", e);
+                                    }
+                                };
+                            }
+                            Subscribe::Patterns { patterns } => {
+                                match c.punsubscribe(patterns).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                    }
+                                };
+                            }
                         }
-                        Subscribe::Patterns { patterns } => {
-                            match c.punsubscribe(patterns).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
-                                }
-                            };
+                    }
+                }
+                Cli::Cluster(mut c) => {
+                    if let Type::Subscribe { ref subscribe } = self.config.redis_type {
+                        match subscribe {
+                            Subscribe::Channels { channels } => {
+                                match c.unsubscribe(channels).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("Failed to unsubscribe from Redis channel: {}", e);
+                                    }
+                                };
+                            }
+                            Subscribe::Patterns { patterns } => {
+                                match c.punsubscribe(patterns).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("Failed to unsubscribe from Redis pattern: {}", e);
+                                    }
+                                };
+                            }
                         }
-                    },
-                    _ => {}
-                },
-                Cli::Cluster(mut c) => match self.config.redis_type {
-                    Type::Subscribe { ref subscribe } => match subscribe {
-                        Subscribe::Channels { channels } => {
-                            match c.unsubscribe(channels).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!("Failed to unsubscribe from Redis channel: {}", e);
-                                }
-                            };
-                        }
-                        Subscribe::Patterns { patterns } => {
-                            match c.punsubscribe(patterns).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!("Failed to unsubscribe from Redis pattern: {}", e);
-                                }
-                            };
-                        }
-                    },
-                    _ => {}
-                },
+                    }
+                }
             }
         }
         Ok(())

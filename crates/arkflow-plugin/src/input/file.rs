@@ -603,7 +603,7 @@ mod tests {
         let input = input.unwrap();
         assert_eq!(input.get_file_path().await, "/tmp/test.json");
         assert_eq!(*input.batches_read.lock().await, 0);
-        assert_eq!(*input.stream_completed.lock().await, false);
+        assert!(!(*input.stream_completed.lock().await));
     }
 
     #[tokio::test]

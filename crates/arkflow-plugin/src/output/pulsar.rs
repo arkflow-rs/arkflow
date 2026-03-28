@@ -23,7 +23,7 @@ use crate::pulsar::{
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
