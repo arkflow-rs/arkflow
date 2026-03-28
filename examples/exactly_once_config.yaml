@@ -1,0 +1,133 @@
+# ArkFlow Exactly-Once Semantics Example Configuration
+#
+# This example demonstrates how to enable exactly-once semantics
+# for reliable stream processing with automatic fault recovery.
+
+logging:
+  level: info
+
+# Health check configuration
+health_check:
+  enabled: true
+  address: "0.0.0.0:8080"
+
+# Metrics configuration
+metrics:
+  enabled: true
+  address: "0.0.0.0:9090"
+
+# Checkpoint configuration (optional, works with exactly-once)
+checkpoint:
+  enabled: true
+  interval: 60s
+  max_checkpoints: 10
+  min_age: 3600s
+  local_path: "/var/lib/arkflow/checkpoints"
+  alignment_timeout: 30s
+
+# Exactly-once semantics configuration
+exactly_once:
+  enabled: true
+
+  # Transaction coordinator settings
+  transaction:
+    # Write-ahead log configuration
+    wal:
+      wal_dir: "/var/lib/arkflow/wal"
+      max_file_size: 1073741824  # 1GB
+      sync_on_write: true
+      compression: true
+
+    # Idempotency cache configuration
+    idempotency:
+      cache_size: 100000
+      ttl: 86400s  # 24 hours
+      persist_path: "/var/lib/arkflow/idempotency.json"
+      persist_interval: 60s
+
+    # Transaction timeout
+    transaction_timeout: 30s
+
+streams:
+  # Example 1: Kafka to Kafka with transactions
+  - input:
+      type: "kafka"
+      name: "kafka_input"
+      brokers:
+        - "localhost:9092"
+      topics:
+        - "input-topic"
+      consumer_group: "arkflow-processor"
+      start_from_latest: false
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: "SELECT * FROM flow WHERE value > 100"
+
+    output:
+      type: "kafka"
+      name: "kafka_output"
+      brokers:
+        - "localhost:9092"
+      topic: "output-topic"
+      # Enable transactions for this Kafka output
+      transactional_id: "arkflow-producer-1"
+      transaction_timeout: 30
+      acks: "all"
+
+  # Example 2: File to HTTP with idempotency
+  - input:
+      type: "file"
+      name: "file_input"
+      path: "/data/input/*.json"
+      format:
+        type: "json"
+
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: "json"
+          operator: "parse"
+
+    output:
+      type: "http"
+      name: "http_output"
+      url: "http://api.example.com/data"
+      method: "POST"
+      # Idempotency is automatic via Idempotency-Key header
+      timeout_ms: 5000
+      retry_count: 3
+
+  # Example 3: Kafka to PostgreSQL with UPSERT
+  - input:
+      type: "kafka"
+      name: "kafka_input_2"
+      brokers:
+        - "localhost:9092"
+      topics:
+        - "events"
+      consumer_group: "arkflow-db-writer"
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "sql"
+          query: |
+            SELECT
+              user_id,
+              event_type,
+              timestamp,
+              data
+            FROM flow
+
+    output:
+      type: "sql"
+      name: "postgres_output"
+      output_type:
+        type: "postgres"
+        uri: "postgresql://user:password@localhost:5432/mydb"
+      table_name: "events"
+      # Enable idempotency with UPSERT (ON CONFLICT DO NOTHING)
+      idempotency_key_column: "event_id"
