@@ -260,12 +260,9 @@ impl BarrierManager {
         let mut barriers = self.barriers.write().await;
 
         for (barrier_id, state) in barriers.iter_mut() {
-            match state {
-                BarrierState::InProgress { .. } => {
-                    *state = BarrierState::Completed;
-                    tracing::warn!("Barrier {} force completed", barrier_id);
-                }
-                _ => {}
+            if let BarrierState::InProgress { .. } = state {
+                *state = BarrierState::Completed;
+                tracing::warn!("Barrier {} force completed", barrier_id);
             }
         }
 

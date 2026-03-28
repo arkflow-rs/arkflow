@@ -20,7 +20,6 @@ use once_cell::sync::Lazy;
 use prometheus::{Counter, Gauge, Histogram};
 
 /// ========== Throughput Metrics (Counters) ==========
-
 /// Total number of messages processed
 pub static MESSAGES_PROCESSED: Lazy<Counter> = Lazy::new(|| {
     Counter::new(
@@ -49,7 +48,6 @@ pub static BATCHES_PROCESSED: Lazy<Counter> = Lazy::new(|| {
 });
 
 /// ========== Error Metrics (Counters) ==========
-
 /// Total number of errors
 pub static ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     Counter::new("arkflow_errors_total", "Total number of errors").expect("metric should be valid")
@@ -62,7 +60,6 @@ pub static RETRY_TOTAL: Lazy<Counter> = Lazy::new(|| {
 });
 
 /// ========== Queue/Buffer Metrics (Gauges) ==========
-
 /// Number of messages in input queue
 pub static INPUT_QUEUE_DEPTH: Lazy<Gauge> = Lazy::new(|| {
     Gauge::new(
@@ -91,7 +88,6 @@ pub static BACKPRESSURE_ACTIVE: Lazy<Gauge> = Lazy::new(|| {
 });
 
 /// ========== Latency Metrics (Histograms) ==========
-
 /// Message processing latency in milliseconds
 pub static PROCESSING_LATENCY_MS: Lazy<Histogram> = Lazy::new(|| {
     Histogram::with_opts(
@@ -121,7 +117,6 @@ pub static END_TO_END_LATENCY_MS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 /// ========== Kafka-Specific Metrics ==========
-
 /// Kafka consumer lag by topic and partition
 pub static KAFKA_CONSUMER_LAG: Lazy<Histogram> = Lazy::new(|| {
     Histogram::with_opts(
@@ -159,7 +154,6 @@ pub static KAFKA_COMMIT_RATE: Lazy<Histogram> = Lazy::new(|| {
 });
 
 /// ========== Buffer-Specific Metrics ==========
-
 /// Current buffer size (number of messages)
 pub static BUFFER_SIZE: Lazy<Gauge> = Lazy::new(|| {
     Gauge::new(
@@ -185,7 +179,6 @@ pub static BUFFER_UTILIZATION: Lazy<Gauge> = Lazy::new(|| {
 });
 
 /// ========== Output-Specific Metrics ==========
-
 /// Output write rate (messages per second)
 pub static OUTPUT_WRITE_RATE: Lazy<Histogram> = Lazy::new(|| {
     Histogram::with_opts(
@@ -227,7 +220,6 @@ pub static OUTPUT_CONNECTION_STATUS: Lazy<Gauge> = Lazy::new(|| {
 });
 
 /// ========== System Resource Metrics ==========
-
 /// Memory usage in bytes
 pub static MEMORY_USAGE_BYTES: Lazy<Gauge> = Lazy::new(|| {
     Gauge::new("arkflow_memory_usage_bytes", "Memory usage in bytes")

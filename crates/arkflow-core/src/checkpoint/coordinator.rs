@@ -124,6 +124,7 @@ pub struct CheckpointCoordinator {
 
 /// State of an in-progress checkpoint
 #[derive(Debug)]
+#[allow(dead_code)]
 struct CheckpointState {
     /// Checkpoint ID
     id: CheckpointId,

@@ -25,7 +25,7 @@ use tracing::info;
 use super::definitions::*;
 
 /// Global metric registry
-pub static REGISTRY: Lazy<Registry> = Lazy::new(|| Registry::new());
+pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 /// Flag indicating whether metrics collection is enabled
 pub static METRICS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
