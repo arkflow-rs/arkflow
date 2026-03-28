@@ -20,6 +20,7 @@ use crate::buffer::Buffer;
 use crate::checkpoint::{Barrier, BarrierManager};
 use crate::input::Ack;
 use crate::metrics;
+use crate::transaction::TransactionCoordinator;
 use crate::{
     input::Input, output::Output, pipeline::Pipeline, Error, MessageBatchRef, ProcessResult,
     Resource,
@@ -50,6 +51,10 @@ pub struct Stream {
     barrier_manager: Option<Arc<BarrierManager>>,
     /// Barrier sender for injecting barriers into processor workers
     barrier_sender: Option<Sender<Barrier>>,
+    /// Optional transaction coordinator for exactly-once semantics
+    transaction_coordinator: Option<Arc<TransactionCoordinator>>,
+    /// Stream UUID for idempotency keys
+    stream_uuid: String,
 }
 
 enum ProcessorData {
@@ -68,6 +73,9 @@ impl Stream {
         resource: Resource,
         thread_num: u32,
     ) -> Self {
+        // Generate a unique stream UUID
+        let stream_uuid = uuid::Uuid::new_v4().to_string();
+
         Self {
             input,
             pipeline: Arc::new(pipeline),
@@ -80,12 +88,23 @@ impl Stream {
             next_seq: Arc::new(AtomicU64::new(0)),
             barrier_manager: None,
             barrier_sender: None,
+            transaction_coordinator: None,
+            stream_uuid,
         }
     }
 
     /// Set the barrier manager for checkpoint alignment
     pub fn with_barrier_manager(mut self, barrier_manager: Arc<BarrierManager>) -> Self {
         self.barrier_manager = Some(barrier_manager);
+        self
+    }
+
+    /// Set the transaction coordinator for exactly-once semantics
+    pub fn with_transaction_coordinator(
+        mut self,
+        coordinator: Arc<TransactionCoordinator>,
+    ) -> Self {
+        self.transaction_coordinator = Some(coordinator);
         self
     }
 
@@ -115,7 +134,7 @@ impl Stream {
             None
         };
 
-        let barrier_sender = barrier_channel.as_ref().map(|(tx, _)| tx.clone());
+        let _barrier_sender = barrier_channel.as_ref().map(|(tx, _)| tx.clone());
         let barrier_receiver = barrier_channel.map(|(_, rx)| rx);
 
         let tracker = TaskTracker::new();
@@ -163,6 +182,8 @@ impl Stream {
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
+            self.transaction_coordinator.clone(),
+            self.stream_uuid.clone(),
         ));
 
         tracker.close();
@@ -419,13 +440,25 @@ impl Stream {
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
+        tx_coordinator: Option<Arc<TransactionCoordinator>>,
+        stream_uuid: String,
     ) {
         let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
 
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
-                for (_, (data, x)) in tree_map {
-                    Self::output(data, &x, &output, err_output.as_ref()).await;
+                // Flush remaining messages
+                for (seq, (data, ack)) in tree_map {
+                    Self::output(
+                        data,
+                        &ack,
+                        &output,
+                        err_output.as_ref(),
+                        tx_coordinator.as_ref(),
+                        &stream_uuid,
+                        seq,
+                    )
+                    .await;
                 }
                 break;
             };
@@ -445,7 +478,16 @@ impl Stream {
                     break;
                 };
 
-                Self::output(data, &ack, &output, err_output.as_ref()).await;
+                Self::output(
+                    data,
+                    &ack,
+                    &output,
+                    err_output.as_ref(),
+                    tx_coordinator.as_ref(),
+                    &stream_uuid,
+                    next_seq_val,
+                )
+                .await;
                 next_seq.fetch_add(1, Ordering::Release);
             }
         }
@@ -458,6 +500,9 @@ impl Stream {
         ack: &Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
+        tx_coordinator: Option<&Arc<TransactionCoordinator>>,
+        stream_uuid: &str,
+        seq: u64,
     ) {
         match data {
             ProcessorData::Err(msg, e) => {
@@ -485,22 +530,104 @@ impl Stream {
             ProcessorData::Ok(msgs) => {
                 let size = msgs.len();
                 let mut success_cnt = 0;
-                for msg in msgs {
-                    match output.write(msg).await {
-                        Ok(_) => {
+
+                // Check if transactions are enabled
+                if let Some(coordinator) = tx_coordinator {
+                    // Transactional write
+                    let tx_id = match coordinator.begin_transaction(vec![seq]).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error!("Failed to begin transaction: {}", e);
+                            if metrics::is_metrics_enabled() {
+                                metrics::ERRORS_TOTAL.inc();
+                            }
+                            return;
+                        }
+                    };
+
+                    let tx_result: Result<(), Error> = async {
+                        // Process each message
+                        for (index, msg) in msgs.iter().enumerate() {
+                            // Generate unique idempotency key using sequence and index
+                            let idempotency_key = format!("{}:{}:{}", stream_uuid, seq, index);
+
+                            // Check for duplicate
+                            if coordinator
+                                .check_and_mark_idempotency(&idempotency_key)
+                                .await?
+                            {
+                                debug!("Duplicate message detected, skipping: {}", idempotency_key);
+                                continue;
+                            }
+
+                            // Add idempotency key to transaction
+                            coordinator
+                                .add_idempotency_key(tx_id, idempotency_key.clone())
+                                .await?;
+
+                            // Write idempotently
+                            output
+                                .write_idempotent(msg.clone(), &idempotency_key)
+                                .await?;
                             success_cnt += 1;
+                        }
+
+                        // Prepare transaction
+                        coordinator.prepare_transaction(tx_id).await?;
+                        output.prepare_transaction(tx_id).await?;
+
+                        // Commit transaction
+                        output.commit_transaction(tx_id).await?;
+                        coordinator.commit_transaction(tx_id).await?;
+
+                        Ok(())
+                    }
+                    .await;
+
+                    match tx_result {
+                        Ok(_) => {
+                            // Only ACK if all messages were successfully written
+                            if success_cnt >= size {
+                                ack.ack().await;
+                            } else {
+                                // Some messages were skipped (duplicates), but that's ok
+                                // They were already written in a previous transaction
+                                ack.ack().await;
+                            }
                         }
                         Err(e) => {
                             if metrics::is_metrics_enabled() {
                                 metrics::ERRORS_TOTAL.inc();
                             }
-                            error!("{}", e);
+                            error!("Transaction failed: {}", e);
+
+                            // Try to rollback
+                            let _ = output.rollback_transaction(tx_id).await;
+                            let _ = coordinator.rollback_transaction(tx_id).await;
+
+                            // Don't ACK - message will be retried
+                            // With idempotency, retry is safe
                         }
                     }
-                }
+                } else {
+                    // Non-transactional write (original behavior)
+                    for msg in msgs {
+                        match output.write(msg).await {
+                            Ok(_) => {
+                                success_cnt += 1;
+                            }
+                            Err(e) => {
+                                if metrics::is_metrics_enabled() {
+                                    metrics::ERRORS_TOTAL.inc();
+                                }
+                                error!("{}", e);
+                            }
+                        }
+                    }
 
-                if success_cnt >= size {
-                    ack.ack().await;
+                    if success_cnt >= size {
+                        ack.ack().await;
+                    }
                 }
             }
         }
