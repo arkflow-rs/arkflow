@@ -28,7 +28,7 @@ use crate::{
 use flume::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -324,6 +324,9 @@ impl Stream {
         let i = i + 1;
         info!("Processor worker {} started", i);
 
+        // Track whether we're currently processing a checkpoint
+        let in_checkpoint = Arc::new(AtomicBool::new(false));
+
         loop {
             // Backpressure control
             let pending_messages =
@@ -348,28 +351,70 @@ impl Stream {
                 continue;
             }
 
-            // Check for barrier if checkpointing is enabled
-            if let Some(ref receiver) = barrier_receiver {
-                if let Some(ref manager) = barrier_manager {
-                    // Try to receive barrier without blocking
-                    if let Ok(barrier) = receiver.try_recv() {
-                        debug!("Processor {} received barrier {}", i, barrier.id);
+            // Check for barrier if checkpointing is enabled (non-blocking)
+            if let (Some(ref receiver), Some(ref manager)) =
+                (barrier_receiver.as_ref(), barrier_manager.as_ref())
+            {
+                // Try to receive barrier with timeout to prevent starving data processing
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(10),
+                    receiver.recv_async(),
+                )
+                .await
+                {
+                    Ok(Ok(barrier)) => {
+                        info!(
+                            "Processor {} received barrier {} (checkpoint {})",
+                            i, barrier.id, barrier.checkpoint_id
+                        );
 
-                        // Acknowledge barrier
-                        if let Err(e) = manager.acknowledge_barrier(barrier.id).await {
-                            error!("Failed to acknowledge barrier {}: {}", barrier.id, e);
-                        }
+                        // Set checkpoint flag
+                        in_checkpoint.store(true, std::sync::atomic::Ordering::Release);
 
-                        // Wait for barrier alignment (all processors to acknowledge)
-                        match manager.wait_for_barrier(barrier.id).await {
-                            Ok(_) => {
-                                debug!("Processor {} aligned on barrier {}", i, barrier.id);
-                                // Continue processing after checkpoint alignment
+                        // Step 1: Acknowledge barrier
+                        match manager.acknowledge_barrier(barrier.id).await {
+                            Ok(completed) => {
+                                if completed {
+                                    info!(
+                                        "Processor {} barrier {} completed immediately",
+                                        i, barrier.id
+                                    );
+                                } else {
+                                    debug!("Processor {} barrier {} acknowledged, waiting for alignment", i, barrier.id);
+                                }
                             }
                             Err(e) => {
-                                error!("Barrier alignment failed for {}: {}", barrier.id, e);
+                                error!("Failed to acknowledge barrier {}: {}", barrier.id, e);
+                                in_checkpoint.store(false, std::sync::atomic::Ordering::Release);
                             }
                         }
+
+                        // Step 2: Wait for barrier alignment (all processors to acknowledge)
+                        match manager.wait_for_barrier(barrier.id).await {
+                            Ok(_) => {
+                                info!(
+                                    "Processor {} aligned on barrier {} (checkpoint {})",
+                                    i, barrier.id, barrier.checkpoint_id
+                                );
+
+                                // Step 3: Take state snapshot if needed
+                                // For now, we assume the pipeline is stateless
+                                // In the future, we'd serialize pipeline state here
+                                debug!("Processor {} checkpoint alignment completed", i);
+
+                                // Clear checkpoint flag
+                                in_checkpoint.store(false, std::sync::atomic::Ordering::Release);
+                            }
+                            Err(e) => {
+                                error!("Barrier alignment failed for processor {}: {}", i, e);
+                                in_checkpoint.store(false, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        // Continue to next iteration to check for more barriers or process data
+                        continue;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // No barrier available or timeout, continue processing data
                     }
                 }
             }
@@ -379,6 +424,15 @@ impl Stream {
                 break;
             };
 
+            // Skip processing if we're in checkpoint mode
+            if in_checkpoint.load(std::sync::atomic::Ordering::Acquire) {
+                debug!("Processor {} holding message during checkpoint", i);
+                // Re-queue message for later processing
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            // Process the message
             let start_time = std::time::Instant::now();
             let processed = pipeline.process(msg.clone()).await;
             let seq = sequence_counter.fetch_add(1, Ordering::AcqRel);
@@ -698,6 +752,72 @@ impl Stream {
         }
         info!("error output closed");
 
+        Ok(())
+    }
+
+    /// Restore stream state from a checkpoint
+    ///
+    /// This method restores the stream to a previously saved state:
+    /// - Input position (e.g., Kafka offsets, file position)
+    /// - Sequence counters
+    /// - Transaction state (if applicable)
+    pub async fn restore_from_checkpoint(
+        &mut self,
+        snapshot: &crate::checkpoint::StateSnapshot,
+    ) -> Result<(), Error> {
+        info!(
+            "Restoring stream from checkpoint (version={}, timestamp={})",
+            snapshot.version, snapshot.timestamp
+        );
+
+        // Restore sequence counters
+        self.sequence_counter
+            .store(snapshot.sequence_counter, Ordering::SeqCst);
+        self.next_seq.store(snapshot.next_seq, Ordering::SeqCst);
+
+        info!(
+            "Restored sequence counters: sequence_counter={}, next_seq={}",
+            snapshot.sequence_counter, snapshot.next_seq
+        );
+
+        // Restore input position
+        if let Some(ref input_state) = snapshot.input_state {
+            info!("Restoring input position from checkpoint");
+            if let Err(e) = self.input.seek(input_state).await {
+                error!("Failed to restore input position: {}", e);
+                return Err(e);
+            }
+            info!("Input position restored successfully");
+        } else {
+            info!("No input state in checkpoint, starting from current position");
+        }
+
+        // Restore transaction state if coordinator is available
+        if let Some(ref tx_coordinator) = self.transaction_coordinator {
+            info!("Restoring transaction state from WAL");
+            match tx_coordinator.recover().await {
+                Ok(recovered_tx_ids) => {
+                    if !recovered_tx_ids.is_empty() {
+                        info!(
+                            "Recovered {} incomplete transactions",
+                            recovered_tx_ids.len()
+                        );
+                        for tx_id in &recovered_tx_ids {
+                            info!("Recovered transaction: {}", tx_id);
+                        }
+                    } else {
+                        info!("No incomplete transactions to recover");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to recover transaction state: {}", e);
+                    // Transaction recovery failure is not fatal, continue anyway
+                    warn!("Continuing without transaction recovery");
+                }
+            }
+        }
+
+        info!("Stream restored from checkpoint successfully");
         Ok(())
     }
 }

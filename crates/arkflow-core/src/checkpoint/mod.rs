@@ -18,13 +18,20 @@
 //! enabling automatic recovery from failures without data loss.
 
 pub mod barrier;
+pub mod committing_state;
 pub mod coordinator;
+pub mod events;
 pub mod metadata;
 pub mod state;
 pub mod storage;
 
 pub use barrier::{Barrier, BarrierId, BarrierManager};
+pub use committing_state::{CheckpointProgress, CommittingState};
 pub use coordinator::{CheckpointConfig, CheckpointCoordinator};
+pub use events::{
+    CheckpointEvent, CheckpointEventType, OperatorCheckpointMetadata, SubtaskCheckpointMetadata,
+    TableCheckpointMetadata, TaskCheckpointCompleted,
+};
 pub use metadata::{CheckpointId, CheckpointMetadata, CheckpointStatus};
 pub use state::{StateSerializer, StateSnapshot};
 pub use storage::{CheckpointStorage, CloudStorage, LocalFileStorage};

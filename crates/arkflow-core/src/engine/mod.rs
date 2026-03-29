@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 
+use crate::checkpoint::{BarrierManager, CheckpointCoordinator};
 use crate::config::EngineConfig;
 use crate::transaction::TransactionCoordinator;
 use std::process;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use axum::extract::State;
 use axum::http::header;
@@ -346,6 +347,31 @@ impl Engine {
             None
         };
 
+        // Create checkpoint coordinator if checkpoint is enabled
+        let checkpoint_coordinator = if self.config.checkpoint.enabled {
+            info!("Checkpoint enabled, creating checkpoint coordinator");
+
+            match CheckpointCoordinator::new(self.config.checkpoint.clone()) {
+                Ok(coordinator) => {
+                    info!("Checkpoint coordinator created successfully");
+                    Some(Arc::new(coordinator))
+                }
+                Err(e) => {
+                    error!("Failed to create checkpoint coordinator: {}", e);
+                    error!("Checkpoint will not be available");
+                    None
+                }
+            }
+        } else {
+            info!("Checkpoint disabled");
+            None
+        };
+
+        // Get barrier manager from checkpoint coordinator
+        let barrier_manager = checkpoint_coordinator
+            .as_ref()
+            .map(|coord| coord.barrier_manager());
+
         for (i, stream_config) in self.config.streams.iter().enumerate() {
             info!("Initializing flow #{}", i + 1);
 
@@ -355,6 +381,41 @@ impl Engine {
                     if let Some(ref coordinator) = tx_coordinator {
                         stream = stream.with_transaction_coordinator(Arc::clone(coordinator));
                     }
+
+                    // Attach barrier manager if checkpoint is enabled
+                    if let Some(ref manager) = barrier_manager {
+                        info!("Attaching barrier manager to stream #{}", i + 1);
+                        stream = stream.with_barrier_manager(Arc::clone(manager));
+                    }
+
+                    // Restore from checkpoint if available
+                    if let Some(ref coord) = checkpoint_coordinator {
+                        info!("Attempting to restore stream #{} from checkpoint", i + 1);
+                        match coord.restore_from_checkpoint().await {
+                            Ok(Some(snapshot)) => {
+                                info!("Found checkpoint for stream #{}, restoring state", i + 1);
+                                if let Err(e) = stream.restore_from_checkpoint(&snapshot).await {
+                                    error!("Failed to restore stream #{} from checkpoint: {}, starting fresh", i + 1, e);
+                                } else {
+                                    info!(
+                                        "Stream #{} restored successfully from checkpoint",
+                                        i + 1
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                info!("No checkpoint found for stream #{}, starting fresh", i + 1);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to load checkpoint for stream #{}: {}, starting fresh",
+                                    i + 1,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     streams.push(stream);
                 }
                 Err(e) => {
