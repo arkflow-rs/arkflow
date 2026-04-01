@@ -181,6 +181,94 @@ impl EngineConfig {
 
         Err(Error::Config("The configuration file format cannot be determined. Please use YAML, JSON, or TOML format.".to_string()))
     }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), Error> {
+        // Validate streams configuration
+        if self.streams.is_empty() {
+            return Err(Error::Config(
+                "At least one stream must be configured".to_string(),
+            ));
+        }
+
+        // Validate health check address
+        if self.health_check.enabled {
+            if let Err(e) = validate_socket_addr(&self.health_check.address) {
+                return Err(Error::Config(format!(
+                    "Invalid health check address '{}': {}",
+                    self.health_check.address, e
+                )));
+            }
+        }
+
+        // Validate metrics address
+        if self.metrics.enabled {
+            if let Err(e) = validate_socket_addr(&self.metrics.address) {
+                return Err(Error::Config(format!(
+                    "Invalid metrics address '{}': {}",
+                    self.metrics.address, e
+                )));
+            }
+        }
+
+        // Validate checkpoint configuration
+        if self.checkpoint.enabled {
+            if self.checkpoint.interval.as_secs() < 1 {
+                return Err(Error::Config(
+                    "Checkpoint interval must be at least 1 second".to_string(),
+                ));
+            }
+
+            if self.checkpoint.max_checkpoints == 0 {
+                return Err(Error::Config(
+                    "max_checkpoints must be greater than 0".to_string(),
+                ));
+            }
+
+            // Validate local path exists or can be created
+            if let Err(e) = std::fs::create_dir_all(&self.checkpoint.local_path) {
+                return Err(Error::Config(format!(
+                    "Cannot create checkpoint directory '{}': {}",
+                    self.checkpoint.local_path, e
+                )));
+            }
+        }
+
+        // Validate each stream configuration
+        for (i, stream) in self.streams.iter().enumerate() {
+            if let Err(e) = validate_stream_config(stream) {
+                return Err(Error::Config(format!(
+                    "Stream #{} configuration error: {}",
+                    i + 1,
+                    e
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Validate a socket address
+fn validate_socket_addr(addr: &str) -> Result<(), String> {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|_| ())
+        .map_err(|e| format!("Invalid socket address: {}", e))
+}
+
+/// Validate stream configuration
+fn validate_stream_config(stream: &StreamConfig) -> Result<(), String> {
+    // Validate thread_num
+    if stream.pipeline.thread_num == 0 {
+        return Err("thread_num must be greater than 0".to_string());
+    }
+
+    // Maximum thread_num to prevent resource exhaustion
+    if stream.pipeline.thread_num > 256 {
+        return Err("thread_num cannot exceed 256".to_string());
+    }
+
+    Ok(())
 }
 
 /// Get configuration format from file path.

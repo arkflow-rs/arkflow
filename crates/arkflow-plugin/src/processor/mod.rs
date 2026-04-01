@@ -19,6 +19,7 @@
 use arkflow_core::Error;
 
 pub mod batch;
+pub mod filter;
 pub mod json;
 pub mod protobuf;
 pub mod python;
@@ -27,6 +28,7 @@ pub mod vrl;
 
 pub fn init() -> Result<(), Error> {
     batch::init()?;
+    filter::init()?;
     json::init()?;
     protobuf::init()?;
     sql::init()?;

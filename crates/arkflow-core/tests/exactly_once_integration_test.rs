@@ -241,7 +241,7 @@ async fn test_checkpoint_save_and_restore() {
     assert!(result.unwrap().is_none());
 
     // Trigger checkpoint
-    let metadata = coordinator.trigger_checkpoint().await.unwrap();
+    let metadata = coordinator.trigger_checkpoint(None).await.unwrap();
     assert_eq!(metadata.id, 1);
     assert!(metadata.is_completed());
 
@@ -274,7 +274,7 @@ async fn test_checkpoint_stats() {
     assert_eq!(stats.failed_checkpoints, 0);
 
     // Trigger successful checkpoint
-    coordinator.trigger_checkpoint().await.unwrap();
+    coordinator.trigger_checkpoint(None).await.unwrap();
 
     let stats = coordinator.get_stats().await;
     assert_eq!(stats.total_checkpoints, 1);
@@ -392,7 +392,7 @@ async fn test_exactly_once_semantics_integration() {
 
     // Step 5: Trigger checkpoint completion
     println!("Step 5: Triggering checkpoint");
-    let metadata = coordinator.trigger_checkpoint().await.unwrap();
+    let metadata = coordinator.trigger_checkpoint(None).await.unwrap();
     println!(
         "  → Checkpoint {} completed ({} bytes)",
         metadata.id, metadata.size_bytes

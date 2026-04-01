@@ -24,7 +24,7 @@ use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::{Message as KafkaMessage, Timestamp};
+use rdkafka::message::{Headers, Message as KafkaMessage, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -244,10 +244,15 @@ impl Input for KafkaInput {
                 ext_metadata.insert("topic".to_string(), topic);
 
                 // Add headers if present
-                // Note: rdkafka Headers API varies by version, skipping for now
-                // TODO: Implement headers extraction based on rdkafka version
-
-                record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
+                if let Some(headers) = kafka_message.headers() {
+                    for header in headers.iter() {
+                        if let Some(value) = header.value {
+                            let key = header.key.to_string();
+                            let value_str = String::from_utf8_lossy(value).to_string();
+                            ext_metadata.insert(format!("header_{}", key), value_str);
+                        }
+                    }
+                }
 
                 // Convert back to MessageBatch
                 let mut msg_batch = MessageBatch::new_arrow(record_batch);

@@ -108,6 +108,16 @@ impl Stream {
         self
     }
 
+    /// Get the stream UUID
+    pub fn get_uuid(&self) -> &str {
+        &self.stream_uuid
+    }
+
+    /// Get the number of processor worker threads
+    pub fn get_thread_num(&self) -> u32 {
+        self.thread_num
+    }
+
     /// Running stream processing
     pub async fn run(&mut self, cancellation_token: CancellationToken) -> Result<(), Error> {
         // Connect input and output
@@ -753,6 +763,62 @@ impl Stream {
         info!("error output closed");
 
         Ok(())
+    }
+
+    /// Get current stream state for checkpoint
+    ///
+    /// This method captures the current state of the stream:
+    /// - Input position (e.g., Kafka offsets, file position)
+    /// - Sequence counters
+    /// - Buffer state (if applicable)
+    pub async fn get_state_for_checkpoint(&self) -> Result<crate::checkpoint::StateSnapshot, Error> {
+        use crate::checkpoint::StateSnapshot;
+        use crate::checkpoint::state::BufferState;
+
+        let mut snapshot = StateSnapshot::new();
+
+        // Capture sequence counters
+        snapshot.sequence_counter = self.sequence_counter.load(Ordering::SeqCst);
+        snapshot.next_seq = self.next_seq.load(Ordering::SeqCst);
+
+        // Capture input position
+        match self.input.get_position().await {
+            Ok(Some(input_state)) => {
+                snapshot.input_state = Some(input_state);
+            }
+            Ok(None) => {
+                // Input doesn't support position tracking
+            }
+            Err(e) => {
+                warn!("Failed to get input position for checkpoint: {}", e);
+            }
+        }
+
+        // Capture buffer state
+        if let Some(ref buffer) = self.buffer {
+            match buffer.get_buffered_messages().await {
+                Ok(Some(messages)) => {
+                    // For now, just store message count
+                    // Full serialization would require more complex handling
+                    snapshot.buffer_state = Some(BufferState {
+                        message_count: messages.len(),
+                        messages: None, // Don't serialize actual messages for now
+                        buffer_type: "unknown".to_string(),
+                    });
+                }
+                Ok(None) => {
+                    // Buffer doesn't support checkpoint
+                }
+                Err(e) => {
+                    warn!("Failed to get buffer state for checkpoint: {}", e);
+                }
+            }
+        }
+
+        // Add stream UUID to metadata
+        snapshot.add_metadata("stream_uuid".to_string(), self.stream_uuid.clone());
+
+        Ok(snapshot)
     }
 
     /// Restore stream state from a checkpoint

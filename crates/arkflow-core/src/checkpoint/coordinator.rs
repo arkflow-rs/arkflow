@@ -28,6 +28,7 @@ use super::{
     barrier::BarrierManager, metadata::CheckpointMetadata, state::StateSnapshot, CheckpointId,
     CheckpointResult, CheckpointStorage, LocalFileStorage,
 };
+use std::collections::HashMap;
 use crate::Error;
 
 /// Checkpoint configuration
@@ -120,6 +121,9 @@ pub struct CheckpointCoordinator {
 
     /// Checkpoint statistics
     stats: Arc<RwLock<CheckpointStats>>,
+
+    /// Registered streams with their processor worker counts
+    registered_streams: Arc<RwLock<std::collections::HashMap<String, usize>>>,
 }
 
 /// State of an in-progress checkpoint
@@ -175,6 +179,7 @@ impl CheckpointCoordinator {
             current_checkpoint: Arc::new(RwLock::new(None)),
             enabled: Arc::new(RwLock::new(true)),
             stats: Arc::new(RwLock::new(CheckpointStats::default())),
+            registered_streams: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -203,8 +208,8 @@ impl CheckpointCoordinator {
                 continue;
             }
 
-            // Trigger checkpoint
-            if let Err(e) = self.trigger_checkpoint().await {
+            // Trigger checkpoint (without stream states, will be empty snapshot)
+            if let Err(e) = self.trigger_checkpoint(None).await {
                 error!("Failed to trigger checkpoint: {}", e);
 
                 let mut stats = self.stats.write().await;
@@ -213,8 +218,42 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// Register a stream with the checkpoint coordinator
+    pub async fn register_stream(&self, stream_uuid: String, thread_num: usize) {
+        let mut streams = self.registered_streams.write().await;
+        info!(
+            "Registering stream {} with {} processor workers",
+            stream_uuid, thread_num
+        );
+        streams.insert(stream_uuid.clone(), thread_num);
+        info!(
+            "Registered stream {} with {} processor workers",
+            stream_uuid, thread_num
+        );
+    }
+
+    /// Unregister a stream from the checkpoint coordinator
+    pub async fn unregister_stream(&self, stream_uuid: &str) {
+        let mut streams = self.registered_streams.write().await;
+        streams.remove(stream_uuid);
+        info!("Unregistered stream {}", stream_uuid);
+    }
+
+    /// Calculate expected acknowledgments based on registered streams
+    async fn calculate_expected_acks(&self) -> usize {
+        // Each stream has 1 input worker + thread_num processor workers
+        let streams = self.registered_streams.read().await;
+        streams.values().map(|&n| 1 + n).sum()
+    }
+
     /// Trigger a checkpoint
-    pub async fn trigger_checkpoint(&self) -> CheckpointResult<CheckpointMetadata> {
+    ///
+    /// # Arguments
+    /// * `stream_states` - Optional map of stream UUID to their state snapshots
+    pub async fn trigger_checkpoint(
+        &self,
+        stream_states: Option<HashMap<String, StateSnapshot>>,
+    ) -> CheckpointResult<CheckpointMetadata> {
         let checkpoint_id = self.next_checkpoint_id().await;
         info!("Triggering checkpoint {}", checkpoint_id);
 
@@ -226,8 +265,10 @@ impl CheckpointCoordinator {
             stats.total_checkpoints += 1;
         }
 
-        // 1. Inject barrier
-        let expected_acks = 1; // TODO: Calculate based on processor workers
+        // 1. Inject barrier with calculated expected acknowledgments
+        let expected_acks = self.calculate_expected_acks().await;
+        debug!("Expecting {} barrier acknowledgments", expected_acks);
+
         let barrier = self
             .barrier_manager
             .inject_barrier(checkpoint_id, expected_acks)
@@ -243,11 +284,7 @@ impl CheckpointCoordinator {
 
         *self.current_checkpoint.write().await = Some(checkpoint_state);
 
-        // 3. For now, immediately acknowledge barrier (since no processor workers yet)
-        // TODO: Remove this when processor workers are integrated
-        let _ = self.barrier_manager.acknowledge_barrier(barrier.id).await;
-
-        // 4. Wait for barrier alignment
+        // 3. Wait for barrier alignment (processor workers will acknowledge barriers)
         match self.barrier_manager.wait_for_barrier(barrier.id).await {
             Ok(_) => {
                 debug!(
@@ -255,10 +292,10 @@ impl CheckpointCoordinator {
                     barrier.id, checkpoint_id
                 );
 
-                // 5. Capture state
-                let snapshot = self.capture_state().await?;
+                // 4. Capture state (with provided stream states)
+                let snapshot = self.capture_state(stream_states).await?;
 
-                // 6. Save checkpoint
+                // 5. Save checkpoint
                 let metadata = self
                     .storage
                     .save_checkpoint(checkpoint_id, &snapshot)
@@ -303,17 +340,53 @@ impl CheckpointCoordinator {
     }
 
     /// Capture current state from all components
-    async fn capture_state(&self) -> CheckpointResult<StateSnapshot> {
+    ///
+    /// # Arguments
+    /// * `stream_states` - Optional map of stream UUID to their state snapshots
+    async fn capture_state(
+        &self,
+        stream_states: Option<HashMap<String, StateSnapshot>>,
+    ) -> CheckpointResult<StateSnapshot> {
         let mut snapshot = StateSnapshot::new();
 
-        // Get current checkpoint state
-        let checkpoint_state = self.current_checkpoint.read().await;
-        if let Some(ref state) = *checkpoint_state {
-            snapshot = state.snapshot.clone();
+        // Merge stream states if provided
+        if let Some(ref states) = stream_states {
+            for (stream_uuid, stream_snapshot) in states.iter() {
+                // Add stream metadata
+                snapshot.add_metadata(
+                    format!("stream_{}", stream_uuid),
+                    format!(
+                        "seq_counter={}, next_seq={}",
+                        stream_snapshot.sequence_counter, stream_snapshot.next_seq
+                    ),
+                );
+
+                // For now, we capture the first stream's input state
+                // In a multi-stream setup, we'd need to decide how to merge these
+                if snapshot.input_state.is_none() {
+                    snapshot.input_state = stream_snapshot.input_state.clone();
+                }
+
+                // Also capture buffer state
+                if snapshot.buffer_state.is_none() {
+                    snapshot.buffer_state = stream_snapshot.buffer_state.clone();
+                }
+
+                // Use the highest sequence counter
+                if stream_snapshot.sequence_counter > snapshot.sequence_counter {
+                    snapshot.sequence_counter = stream_snapshot.sequence_counter;
+                }
+                if stream_snapshot.next_seq > snapshot.next_seq {
+                    snapshot.next_seq = stream_snapshot.next_seq;
+                }
+            }
         }
 
-        // TODO: Capture state from input, buffer, processors
-        // For now, return empty snapshot
+        // Add metadata about the checkpoint
+        snapshot.add_metadata(
+            "num_streams".to_string(),
+            stream_states.as_ref().map(|s| s.len().to_string()).unwrap_or_else(|| "0".to_string()),
+        );
 
         Ok(snapshot)
     }
@@ -512,7 +585,7 @@ mod tests {
         let coordinator = CheckpointCoordinator::new(config).unwrap();
 
         // Trigger checkpoint
-        let result = coordinator.trigger_checkpoint().await;
+        let result = coordinator.trigger_checkpoint(None).await;
 
         // Should succeed even without component state
         assert!(result.is_ok());
@@ -538,7 +611,7 @@ mod tests {
         assert!(result.unwrap().is_none());
 
         // Create a checkpoint
-        coordinator.trigger_checkpoint().await.unwrap();
+        coordinator.trigger_checkpoint(None).await.unwrap();
 
         // Now restore should succeed
         let result = coordinator.restore_from_checkpoint().await;
@@ -561,7 +634,7 @@ mod tests {
         assert_eq!(stats.successful_checkpoints, 0);
 
         // Trigger a checkpoint
-        coordinator.trigger_checkpoint().await.unwrap();
+        coordinator.trigger_checkpoint(None).await.unwrap();
 
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.total_checkpoints, 1);

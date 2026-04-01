@@ -27,6 +27,14 @@ use tokio::sync::RwLock;
 static EXPR_CACHE: Lazy<RwLock<HashMap<String, Arc<dyn PhysicalExpr>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+/// Global shared SessionContext for expression evaluation
+/// Reusing the context avoids creating a new one for each expression evaluation
+static SESSION_CONTEXT: Lazy<SessionContext> = Lazy::new(|| {
+    let config = SessionConfig::new()
+        .with_target_partitions(1); // Single partition for expression evaluation
+    SessionContext::new_with_config(config)
+});
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Expr<T> {
@@ -106,10 +114,9 @@ pub async fn evaluate_expr(
         if let Some(expr) = cache.get(expr_str) {
             expr.clone()
         } else {
-            // TODO: Maybe you can reuse session_context?
-            let session_context = SessionContext::new();
-            let expr = session_context.parse_sql_expr(expr_str, &df_schema)?;
-            let physical_expr = session_context.create_physical_expr(expr, &df_schema)?;
+            // Use the global shared SessionContext
+            let expr = SESSION_CONTEXT.parse_sql_expr(expr_str, &df_schema)?;
+            let physical_expr = SESSION_CONTEXT.create_physical_expr(expr, &df_schema)?;
             cache.insert(expr_str.to_string(), physical_expr.clone());
             physical_expr
         }

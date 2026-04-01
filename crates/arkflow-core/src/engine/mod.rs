@@ -367,6 +367,25 @@ impl Engine {
             None
         };
 
+        // Start checkpoint coordinator background task if enabled
+        if let Some(ref coordinator) = checkpoint_coordinator {
+            let coord = Arc::clone(coordinator);
+            let checkpoint_token = token.clone();
+            tokio::spawn(async move {
+                info!("Starting checkpoint coordinator background task");
+                tokio::select! {
+                    _ = async {
+                        if let Err(e) = coord.run().await {
+                            error!("Checkpoint coordinator failed: {}", e);
+                        }
+                    } => {}
+                    _ = checkpoint_token.cancelled() => {
+                        info!("Checkpoint coordinator shutting down");
+                    }
+                }
+            });
+        }
+
         // Get barrier manager from checkpoint coordinator
         let barrier_manager = checkpoint_coordinator
             .as_ref()
@@ -386,6 +405,12 @@ impl Engine {
                     if let Some(ref manager) = barrier_manager {
                         info!("Attaching barrier manager to stream #{}", i + 1);
                         stream = stream.with_barrier_manager(Arc::clone(manager));
+                    }
+
+                    // Register stream with checkpoint coordinator
+                    if let Some(ref coord) = checkpoint_coordinator {
+                        let stream_uuid = stream.get_uuid().to_string();
+                        coord.register_stream(stream_uuid, stream_config.pipeline.thread_num as usize).await;
                     }
 
                     // Restore from checkpoint if available
