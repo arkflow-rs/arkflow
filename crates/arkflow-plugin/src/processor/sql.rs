@@ -130,10 +130,8 @@ impl SqlProcessor {
             return Ok(result_batches[0].clone());
         }
 
-        Ok(
-            arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
-        )
+        arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
+            .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))
     }
 
     async fn get_temporary_message_batch(
@@ -157,7 +155,7 @@ impl SqlProcessor {
                 }
             };
 
-            if let Some(data) = temporary.get(&vec![columnar_value]).await? {
+            if let Some(data) = temporary.get(&[columnar_value]).await? {
                 ctx.register_batch(&config.table_name, data.into())
                     .map_err(|e| {
                         Error::Process(format!("Register temporary message batch failed: {}", e))

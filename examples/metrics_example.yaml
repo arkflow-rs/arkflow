@@ -1,0 +1,85 @@
+# ArkFlow Metrics Configuration Example
+#
+# This example demonstrates how to enable and configure Prometheus metrics export.
+#
+# After starting ArkFlow with this configuration, metrics will be available at:
+#   http://localhost:9090/metrics
+#
+# You can configure Prometheus to scrape this endpoint by adding to your prometheus.yml:
+#   scrape_configs:
+#     - job_name: 'arkflow'
+#       static_configs:
+#         - targets: ['localhost:9090']
+
+# Logging configuration
+logging:
+  level: info
+  format: plain
+
+# Health check configuration
+health_check:
+  enabled: true
+  address: "0.0.0.0:8080"
+  health_path: "/health"
+  readiness_path: "/readiness"
+  liveness_path: "/liveness"
+
+# Metrics configuration
+metrics:
+  enabled: true                    # Enable metrics collection (default: true)
+  endpoint: "/metrics"              # HTTP endpoint for metrics scraping (default: /metrics)
+  address: "0.0.0.0:9090"          # Metrics server address (default: 0.0.0.0:9090)
+
+# Stream configuration
+streams:
+  - input:
+      type: "generate"
+      config:
+        interval: 1s
+        batch_size: 10
+        count: 100
+
+    pipeline:
+      thread_num: 4
+      processors: []
+
+    output:
+      type: "stdout"
+
+# Available Metrics
+# ===================
+#
+# Counters:
+#   arkflow_messages_processed_total  - Total number of messages processed
+#   arkflow_bytes_processed_total     - Total number of bytes processed
+#   arkflow_batches_processed_total   - Total number of batches processed
+#   arkflow_errors_total              - Total number of errors
+#   arkflow_retries_total             - Total number of retry attempts
+#
+# Gauges:
+#   arkflow_input_queue_depth         - Number of messages in input queue
+#   arkflow_output_queue_depth        - Number of messages in output queue
+#   arkflow_backpressure_active       - Whether backpressure is active (1=active, 0=inactive)
+#
+# Histograms:
+#   arkflow_processing_latency_ms     - Message processing latency in milliseconds
+#   arkflow_end_to_end_latency_ms     - End-to-end message latency in milliseconds
+#
+# Example Prometheus Queries
+# ============================
+#
+# Calculate messages per second:
+#   rate(arkflow_messages_processed_total[1m])
+#
+# Calculate average processing latency:
+#   rate(arkflow_processing_latency_ms_sum[5m]) / rate(arkflow_processing_latency_ms_count[5m])
+#
+# Check error rate:
+#   rate(arkflow_errors_total[5m])
+#
+# Monitor queue depths:
+#   arkflow_input_queue_depth
+#   arkflow_output_queue_depth
+#
+# P95 processing latency:
+#   histogram_quantile(0.95, rate(arkflow_processing_latency_ms_bucket[5m]))

@@ -64,6 +64,7 @@ impl DatabaseConnection {
         output_config: &SqlOutputConfig,
         columns: Vec<String>,
         rows: Vec<Vec<SqlValue>>,
+        idempotency_key: Option<&str>,
     ) -> Result<(), Error> {
         match self {
             DatabaseConnection::Mysql(conn) => {
@@ -89,6 +90,16 @@ impl DatabaseConnection {
                         };
                     }
                 });
+
+                // Add ON DUPLICATE KEY UPDATE for MySQL if idempotency_key is provided
+                if let Some(key_col) = &output_config.idempotency_key_column {
+                    if idempotency_key.is_some() {
+                        query_builder.push(format!(
+                            " ON DUPLICATE KEY UPDATE `{}` = `{}`",
+                            key_col, key_col
+                        ));
+                    }
+                }
 
                 let query = query_builder.build();
                 query
@@ -121,6 +132,13 @@ impl DatabaseConnection {
                     }
                 });
 
+                // Add ON CONFLICT DO NOTHING for PostgreSQL if idempotency_key is provided
+                if let Some(key_col) = &output_config.idempotency_key_column {
+                    if idempotency_key.is_some() {
+                        query_builder.push(format!(" ON CONFLICT (\"{}\") DO NOTHING", key_col));
+                    }
+                }
+
                 let query = query_builder.build();
                 query.execute(conn).await.map_err(|e| {
                     Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
@@ -138,6 +156,9 @@ struct SqlOutputConfig {
     /// SQL query statement
     output_type: DatabaseType,
     table_name: String,
+    /// Column name for idempotency key (optional)
+    /// If set, enables UPSERT mode for idempotent writes
+    idempotency_key_column: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,7 +281,7 @@ impl Output for SqlOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
-        let conn = conn_guard.as_mut().ok_or_else(|| Error::Disconnection)?;
+        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
 
         // Apply codec encoding if configured, otherwise use the message as-is
         let processed_msg = if let Some(codec) = &self.codec {
@@ -272,7 +293,30 @@ impl Output for SqlOutput {
             (*msg).clone()
         };
 
-        self.insert_row(conn, &processed_msg).await?;
+        self.insert_row(conn, &processed_msg, None).await?;
+        Ok(())
+    }
+
+    async fn write_idempotent(
+        &self,
+        msg: MessageBatchRef,
+        idempotency_key: &str,
+    ) -> Result<(), Error> {
+        let mut conn_guard = self.conn_lock.lock().await;
+        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
+
+        // Apply codec encoding if configured, otherwise use the message as-is
+        let processed_msg = if let Some(codec) = &self.codec {
+            let encoded = codec.encode((*msg).clone())?;
+            // Convert encoded bytes back to MessageBatch for SQL insertion
+            // This is a simplified approach - in practice, you might need more sophisticated handling
+            MessageBatch::new_binary(encoded)?
+        } else {
+            (*msg).clone()
+        };
+
+        self.insert_row(conn, &processed_msg, Some(idempotency_key))
+            .await?;
         Ok(())
     }
 
@@ -301,29 +345,56 @@ impl SqlOutput {
         &self,
         conn: &mut DatabaseConnection,
         msg: &MessageBatch,
+        idempotency_key: Option<&str>,
     ) -> Result<(), Error> {
         let schema = msg.schema();
         let num_rows = msg.len();
         let num_columns = schema.fields().len();
-        let columns: Vec<String> = (0..num_columns)
+        let mut columns: Vec<String> = (0..num_columns)
             .map(|i| schema.field(i).name().clone())
             .collect();
 
-        let mut rows = Vec::with_capacity(num_columns * num_rows);
-        for row_index in 0..num_rows {
-            for col_index in 0..num_columns {
-                let column = msg.column(col_index);
-
-                let value = self.matching_data_type(column, row_index).await?;
-                rows.push(value);
+        // If idempotency_key is provided and config has idempotency_key_column, add it to the data
+        let rows_with_key = if let (Some(key), Some(key_col)) =
+            (idempotency_key, &self.sql_config.idempotency_key_column)
+        {
+            // Add the idempotency key column if it's not already in the schema
+            if !columns.contains(key_col) {
+                columns.push(key_col.clone());
             }
-        }
-        let rows: Vec<Vec<SqlValue>> = rows
-            .chunks(num_columns)
+
+            let mut rows = Vec::with_capacity(num_columns * num_rows);
+            for row_index in 0..num_rows {
+                for col_index in 0..num_columns {
+                    let column = msg.column(col_index);
+
+                    let value = self.matching_data_type(column, row_index).await?;
+                    rows.push(value);
+                }
+                // Add idempotency key as the last column
+                rows.push(SqlValue::String(key.to_string()));
+            }
+            rows
+        } else {
+            let mut rows = Vec::with_capacity(num_columns * num_rows);
+            for row_index in 0..num_rows {
+                for col_index in 0..num_columns {
+                    let column = msg.column(col_index);
+
+                    let value = self.matching_data_type(column, row_index).await?;
+                    rows.push(value);
+                }
+            }
+            rows
+        };
+
+        let rows: Vec<Vec<SqlValue>> = rows_with_key
+            .chunks(columns.len())
             .map(|chunk| chunk.to_vec())
             .collect();
 
-        conn.execute_insert(&self.sql_config, columns, rows).await?;
+        conn.execute_insert(&self.sql_config, columns, rows, idempotency_key)
+            .await?;
         Ok(())
     }
 

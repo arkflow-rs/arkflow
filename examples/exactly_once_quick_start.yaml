@@ -1,0 +1,137 @@
+# Exactly-Once Semantics Quick Start Configuration
+#
+# This configuration demonstrates how to enable exactly-once semantics
+# in ArkFlow streams.
+
+# Logging configuration
+logging:
+  level: info
+
+streams:
+  - name: kafka-to-kafka-exactly-once
+    description: "Kafka to Kafka with Exactly-Once semantics"
+
+    # Input configuration
+    input:
+      type: kafka
+      config:
+        bootstrap.servers: "localhost:9092"
+        group.id: "arkflow-exactly-once"
+        topics:
+          - input-topic
+        auto.offset.reset: "earliest"
+        enable.partition.eof: false
+      # Exactly-once configuration for input
+      exactly_once:
+        enabled: true
+        # Track offsets for exactly-once processing
+        track_offsets: true
+        # Start from committed offset on restart
+        start_from_committed: true
+
+    # Pipeline configuration
+    pipeline:
+      thread_num: 4
+
+      processors:
+        - type: sql
+          config:
+            query: |
+              SELECT
+                *,
+                __meta_source as source,
+                __meta_partition as partition,
+                __meta_offset as offset
+              FROM flow
+
+    # Buffer configuration (optional)
+    buffer:
+      type: memory
+      config:
+        capacity: 10000
+
+    # Output configuration with exactly-once
+    output:
+      type: kafka
+      config:
+        bootstrap.servers: "localhost:9092"
+        topic: output-topic
+        # Exactly-once configuration
+        exactly_once:
+          enabled: true
+          # Enable transactional writes
+          transactional:
+            enabled: true
+            # Transaction timeout (must be longer than checkpoint interval)
+            timeout: 90s
+            # Idempotent writes
+            idempotent: true
+        # Batching configuration
+        batch:
+          size: 1000
+          linger: 10ms
+        # Compression
+        compression:
+          type: snappy
+
+    # Exactly-once global configuration
+    exactly_once:
+      enabled: true
+
+      # Checkpoint configuration
+      checkpoint:
+        # Checkpoint interval
+        interval: 60s
+        # Maximum checkpoints to retain
+        max_checkpoints: 10
+        # Minimum age before deletion
+        min_age: 3600s
+        # Storage path
+        storage:
+          type: local
+          path: /var/lib/arkflow/checkpoints
+        # Barrier alignment timeout
+        alignment_timeout: 30s
+
+      # Transaction coordinator configuration
+      transaction_coordinator:
+        # WAL configuration
+        wal:
+          type: file
+          path: /var/lib/arkflow/wal
+          # Sync mode: none, async, fsync, fdatasync
+          sync_mode: fsync
+          # Segment size
+          segment_size: 64MB
+          # Retention
+          retention:
+            max_segments: 10
+            max_age: 24h
+
+        # Idempotency cache configuration
+        idempotency:
+          # Cache type: memory, redis
+          type: memory
+          # Maximum entries
+          max_entries: 100000
+          # TTL for entries
+          ttl: 3600s
+
+      # Two-phase commit configuration
+      two_phase_commit:
+        # Enable 2PC
+        enabled: true
+        # Phase 1 timeout
+        prepare_timeout: 30s
+        # Phase 2 timeout
+        commit_timeout: 30s
+        # Retry configuration
+        retry:
+          max_attempts: 3
+          backoff: 1s
+          max_backoff: 10s
+
+# Health check configuration
+health:
+  enabled: true
+  port: 8080

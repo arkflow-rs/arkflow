@@ -59,10 +59,18 @@ impl Cli {
             }
         };
 
-        // If you just verify the configuration, exit it
+        // If you just verify the configuration, validate and exit
         if matches.get_flag("validate") {
-            info!("The config is validated.");
-            return Ok(());
+            match config.validate() {
+                Ok(()) => {
+                    println!("Configuration is valid.");
+                    process::exit(0);
+                }
+                Err(e) => {
+                    println!("Configuration validation failed: {}", e);
+                    process::exit(1);
+                }
+            }
         }
         self.config = Some(config);
         Ok(())

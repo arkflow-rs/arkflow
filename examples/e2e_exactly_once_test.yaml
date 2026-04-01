@@ -1,0 +1,70 @@
+# ArkFlow E2E Exactly-Once Test Configuration
+#
+# This configuration is used for end-to-end testing of:
+# - Exactly-Once semantics
+# - Checkpoint and recovery
+# - System crash recovery
+
+logging:
+  level: "info"
+  format: "plain"
+
+streams:
+  - input:
+      type: "kafka"
+      brokers:
+        - "localhost:9092"
+      topics:
+        - "e2e_test_input"
+      consumer_group: "e2e_test_group"
+      start_from_latest: false
+      fetch_min_bytes: 1024
+      fetch_max_bytes: 1048576
+      fetch_wait_max_ms: 100
+
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: "sql"
+          query: |
+            SELECT
+              *,
+              __meta_offset as offset,
+              __meta_partition as partition
+            FROM flow
+
+    output:
+      type: "kafka"
+      brokers:
+        - "localhost:9092"
+      topic: "e2e_test_output"
+      acks: "all"
+      compression: "snappy"
+      linger_ms: 10
+      batch_size: 16
+
+    buffer:
+      type: "memory"
+      capacity: 10000
+
+    checkpoint:
+      enabled: true
+      interval: "2s"
+      max_checkpoints: 5
+      min_age: "1h"
+      local_path: "/tmp/arkflow_e2e_checkpoints"
+      alignment_timeout: "30s"
+
+    exactly_once:
+      enabled: true
+      transaction:
+        wal:
+          enabled: true
+          path: "/tmp/arkflow_e2e_wal"
+          max_file_size: "100MB"
+          retention: "1d"
+        idempotency:
+          enabled: true
+          cache_size: 10000
+          ttl: "1h"
+        transaction_timeout: "30s"
