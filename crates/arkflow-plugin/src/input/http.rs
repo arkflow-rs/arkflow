@@ -17,6 +17,7 @@
 //! Receive data from HTTP endpoints
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -142,13 +144,15 @@ impl Input for HttpInput {
             codec: self.codec.clone(),
         });
 
-        let mut app = Router::new()
+        let app = Router::new()
             .route(&path, post(Self::handle_request))
             .with_state(app_state);
 
-        if self.config.cors_enabled.unwrap_or(false) {
-            app = app.layer(CorsLayer::very_permissive());
-        }
+        let mut app = if self.config.cors_enabled.unwrap_or(false) {
+            app.layer(CorsLayer::very_permissive())
+        } else {
+            app
+        };
 
         let addr: SocketAddr = address
             .parse()
@@ -205,13 +209,7 @@ impl InputBuilder for HttpInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Http input configuration is missing".to_string(),
-            ));
-        }
-
-        let config: HttpInputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: HttpInputConfig = parse_config(config, "Http input")?;
         Ok(Arc::new(HttpInput::new(name, config, codec)?))
     }
 }
@@ -242,7 +240,20 @@ async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {
 
             if let Ok(auth_string) = String::from_utf8(decoded) {
                 let parts: Vec<&str> = auth_string.splitn(2, ':').collect();
-                return parts.len() == 2 && parts[0] == username && parts[1] == password;
+                if parts.len() != 2 {
+                    return false;
+                }
+
+                // 使用常量时间比较来防止时序攻击
+                let user_bytes = parts[0].as_bytes();
+                let pass_bytes = parts[1].as_bytes();
+                let username_bytes = username.as_bytes();
+                let password_bytes = password.as_bytes();
+
+                let user_valid = user_bytes.ct_eq(username_bytes).into();
+                let pass_valid = pass_bytes.ct_eq(password_bytes).into();
+
+                return user_valid && pass_valid;
             }
 
             false
@@ -251,7 +262,10 @@ async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
                     let received_token = auth_str.trim_start_matches("Bearer ");
-                    return received_token == token;
+                    // 使用常量时间比较来防止时序攻击
+                    let received_bytes = received_token.as_bytes();
+                    let token_bytes = token.as_bytes();
+                    return received_bytes.ct_eq(token_bytes).into();
                 }
             }
             false
@@ -330,5 +344,95 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_constant_time_comparison() {
+        use std::time::Instant;
+
+        // 测试Basic认证的常量时间比较
+        let auth = AuthType::Basic {
+            username: "admin".to_string(),
+            password: "password123".to_string(),
+        };
+
+        let credentials = base64::engine::general_purpose::STANDARD.encode("admin:password123");
+        let auth_header_valid = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Basic {}", credentials).parse().unwrap(),
+        )]);
+
+        let credentials_wrong = base64::engine::general_purpose::STANDARD.encode("admin:wrongpass");
+        let auth_header_wrong = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Basic {}", credentials_wrong).parse().unwrap(),
+        )]);
+
+        // 测试正确密码的时间
+        let start = Instant::now();
+        let result_valid = validate_auth(&auth_header_valid, &auth).await;
+        let time_valid = start.elapsed();
+
+        // 测试错误密码的时间
+        let start = Instant::now();
+        let result_wrong = validate_auth(&auth_header_wrong, &auth).await;
+        let time_wrong = start.elapsed();
+
+        // 验证结果正确性
+        assert!(result_valid, "Valid credentials should pass");
+        assert!(!result_wrong, "Wrong credentials should fail");
+
+        // 验证时间差异在合理范围内（<10ms）
+        let time_diff = if time_valid > time_wrong {
+            time_valid - time_wrong
+        } else {
+            time_wrong - time_valid
+        };
+        assert!(
+            time_diff.as_millis() < 10,
+            "Time difference too large: {:?}",
+            time_diff
+        );
+
+        // 测试Bearer认证的常量时间比较
+        let bearer_auth = AuthType::Bearer {
+            token: "secret_token_123".to_string(),
+        };
+
+        let auth_header_bearer_valid = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            "Bearer secret_token_123".parse().unwrap(),
+        )]);
+
+        let auth_header_bearer_wrong = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            "Bearer wrong_token_456".parse().unwrap(),
+        )]);
+
+        // 测试正确token的时间
+        let start = Instant::now();
+        let result_bearer_valid = validate_auth(&auth_header_bearer_valid, &bearer_auth).await;
+        let time_bearer_valid = start.elapsed();
+
+        // 测试错误token的时间
+        let start = Instant::now();
+        let result_bearer_wrong = validate_auth(&auth_header_bearer_wrong, &bearer_auth).await;
+        let time_bearer_wrong = start.elapsed();
+
+        // 验证结果正确性
+        assert!(result_bearer_valid, "Valid bearer token should pass");
+        assert!(!result_bearer_wrong, "Wrong bearer token should fail");
+
+        // 验证时间差异在合理范围内（<10ms）
+        let time_diff = if time_bearer_valid > time_bearer_wrong {
+            time_bearer_valid - time_bearer_wrong
+        } else {
+            time_bearer_wrong - time_bearer_valid
+        };
+        assert!(
+            time_diff.as_millis() < 10,
+            "Bearer time difference too large: {:?}",
+            time_diff
+        );
     }
 }

@@ -20,6 +20,7 @@ use crate::expr::Expr;
 use crate::pulsar::{
     PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarProducer,
 };
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
@@ -186,12 +187,7 @@ impl OutputBuilder for PulsarOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Pulsar output configuration is missing".to_string(),
-            ));
-        }
-        let config: PulsarOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: PulsarOutputConfig = parse_config(config, "PulsarOutput input")?;
 
         // Validate configuration during build
         PulsarConfigValidator::validate_service_url(&config.service_url)?;

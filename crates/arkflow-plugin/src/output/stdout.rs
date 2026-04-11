@@ -17,6 +17,7 @@
 //! Outputs the processed data to standard output
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -99,12 +100,7 @@ impl OutputBuilder for StdoutOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Stdout output configuration is missing".to_string(),
-            ));
-        }
-        let config: StdoutOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: StdoutOutputConfig = parse_config(config, "StdoutOutput input")?;
         Ok(Arc::new(StdoutOutput::new(config, io::stdout(), codec)?))
     }
 }

@@ -17,6 +17,7 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -276,13 +277,7 @@ impl InputBuilder for KafkaInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Kafka input configuration is missing".to_string(),
-            ));
-        }
-        let kafka_config: KafkaInputConfig = serde_json::from_value(config.clone().unwrap())?;
-
+        let kafka_config: KafkaInputConfig = parse_config(config, "Kafka input")?;
         Ok(Arc::new(KafkaInput::new(name, kafka_config, codec)?))
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::udf;
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
     Error, MessageBatch, MessageBatchRef, Resource,
@@ -471,14 +472,7 @@ impl InputBuilder for FileBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "File input configuration is missing".to_string(),
-            ));
-        }
-
-        let config: FileInputConfig = serde_json::from_value(config.clone().unwrap())
-            .map_err(|e| Error::Config(format!("Failed to parse File input config: {}", e)))?;
+        let config: FileInputConfig = parse_config(config, "File input")?;
         Ok(Arc::new(FileInput::new(name, config, codec)?))
     }
 }

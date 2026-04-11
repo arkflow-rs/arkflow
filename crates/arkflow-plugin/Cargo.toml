@@ -41,8 +41,11 @@ reqwest = { workspace = true }
 tower = "0.5"
 tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 base64 = "0.22"
+subtle = { workspace = true }
+governor = { workspace = true, features = ["std"] }
 colored = { workspace = true }
 flume = { workspace = true }
+dashmap = { workspace = true }
 rumqttc = "0.25.1"
 
 # Kafka

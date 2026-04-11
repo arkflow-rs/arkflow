@@ -15,11 +15,13 @@
 pub mod buffer;
 pub mod codec;
 pub mod component;
+pub mod context_pool;
 pub mod expr;
 pub mod input;
 pub mod output;
 pub mod processor;
 pub mod pulsar;
+pub mod rate_limiter;
 pub mod temporary;
 pub mod time;
 pub mod udf;

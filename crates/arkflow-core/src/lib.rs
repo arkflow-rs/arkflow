@@ -32,6 +32,7 @@ pub mod cli;
 pub mod codec;
 pub mod config;
 pub mod engine;
+pub mod error_helpers;
 pub mod input;
 pub mod output;
 pub mod pipeline;
@@ -94,6 +95,18 @@ pub enum Error {
 
     #[error("EOF")]
     EOF,
+
+    #[error("Authentication error: {0}")]
+    Authentication(String),
+
+    #[error("Rate limit exceeded: {0}")]
+    RateLimit(String),
+
+    #[error("Lock timeout: {0}")]
+    LockTimeout(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 #[derive(Clone)]

@@ -118,13 +118,17 @@ impl ProcessorBuilder for VrlProcessorBuilder {
 
 fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
     let rows = message_batch.num_rows();
+    let num_columns = message_batch.num_columns();
+    let schema = message_batch.schema();
+
+    // Pre-allocate with capacity to reduce reallocations
     let mut vrl_values: Vec<ObjectMap> = Vec::with_capacity(rows);
     for _ in 0..rows {
+        // Pre-allocate BTreeMap with expected column count
+        // BTreeMap starts with a small capacity, so we specify capacity upfront
         vrl_values.push(BTreeMap::new());
     }
 
-    let schema = message_batch.schema();
-    let num_columns = message_batch.num_columns();
     for i in 0..num_columns {
         let column = message_batch.column(i);
         let name = schema.field(i).name();

@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{codec::Codec, Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -427,13 +428,7 @@ impl OutputBuilder for SqlOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "SQL output configuration is missing".to_string(),
-            ));
-        }
-
-        let config: SqlOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: SqlOutputConfig = parse_config(config, "SqlOutput input")?;
         Ok(Arc::new(SqlOutput::new(config, codec)?))
     }
 }

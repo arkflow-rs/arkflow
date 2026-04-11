@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, InputConfig},
     Error, MessageBatchRef, Resource,
@@ -168,13 +169,7 @@ impl InputBuilder for MultipleInputsBuilder {
         codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Multiple-inputs input configuration is missing".to_string(),
-            ));
-        }
-
-        let config: MultipleInputsConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: MultipleInputsConfig = parse_config(config, "MultipleInputs input")?;
         // Note: codec is not used here as individual inputs have their own codecs
         let _ = codec;
         Ok(Arc::new(MultipleInputs::new(name, config, resource)?))

@@ -17,6 +17,7 @@
 //! Receive data from a NATS subject
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
@@ -432,12 +433,7 @@ impl InputBuilder for NatsInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "NATS input configuration is missing".to_string(),
-            ));
-        }
-        let config: NatsInputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: NatsInputConfig = parse_config(config, "NATS input")?;
         Ok(Arc::new(NatsInput::new(name, config, codec)?))
     }
 }

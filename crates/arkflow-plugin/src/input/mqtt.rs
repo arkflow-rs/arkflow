@@ -17,6 +17,7 @@
 //! Receive data from the MQTT broker
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -263,14 +264,7 @@ impl InputBuilder for MqttInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "MQTT input configuration is missing".to_string(),
-            ));
-        }
-
-        let config: MqttInputConfig = serde_json::from_value(config.clone().unwrap())?;
-
+        let config: MqttInputConfig = parse_config(config, "MQTT input")?;
         Ok(Arc::new(MqttInput::new(name, config, codec)?))
     }
 }

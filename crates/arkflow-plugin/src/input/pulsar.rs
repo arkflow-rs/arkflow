@@ -20,6 +20,7 @@ use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -280,12 +281,7 @@ impl InputBuilder for PulsarInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Pulsar input configuration is missing".to_string(),
-            ));
-        }
-        let config: PulsarInputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: PulsarInputConfig = parse_config(config, "Pulsar input")?;
 
         // Validate configuration during build
         PulsarConfigValidator::validate_service_url(&config.service_url)?;

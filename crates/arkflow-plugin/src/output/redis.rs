@@ -13,6 +13,7 @@
  */
 use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
     output::{Output, OutputBuilder},
@@ -181,12 +182,7 @@ impl OutputBuilder for RedisOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Redis output configuration is missing".to_string(),
-            ));
-        }
-        let config: RedisOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: RedisOutputConfig = parse_config(config, "RedisOutput input")?;
         Ok(Arc::new(RedisOutput::new(config, codec)?))
     }
 }

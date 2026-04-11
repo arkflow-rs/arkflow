@@ -42,6 +42,9 @@ reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
 flume = "=0.11"
+subtle = "2.6"
+governor = "0.6"
+dashmap = "6.1"
 
 # Sql
 sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }

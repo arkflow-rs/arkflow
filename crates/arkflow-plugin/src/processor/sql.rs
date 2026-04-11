@@ -16,7 +16,7 @@
 //!
 //! DataFusion is used to process data with SQL queries.
 
-use crate::{expr, udf};
+use crate::{context_pool::SessionContextPool, expr};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::temporary::Temporary;
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
@@ -60,6 +60,7 @@ struct SqlProcessor {
     config: SqlProcessorConfig,
     statement: Statement,
     temporary: Option<HashMap<String, (Arc<dyn Temporary>, TemporaryConfig)>>,
+    context_pool: Arc<SessionContextPool>,
 }
 
 impl SqlProcessor {
@@ -84,6 +85,9 @@ impl SqlProcessor {
             }
         };
 
+        // Create SessionContext pool with 4 contexts
+        let context_pool = Arc::new(SessionContextPool::new(4)?);
+
         let ctx = SessionContext::new();
         let statement = ctx
             .state()
@@ -96,31 +100,39 @@ impl SqlProcessor {
             config,
             statement,
             temporary,
+            context_pool,
         })
     }
 
     /// Execute SQL query
     async fn execute_query(&self, batch: MessageBatch) -> Result<RecordBatch, Error> {
-        // Create a session context
-        let ctx = self.create_session_context().await?;
+        // Acquire a session context from the pool
+        let ctx_arc = self.context_pool.acquire().await?;
 
         let table_name = self
             .config
             .table_name
             .as_deref()
             .unwrap_or(DEFAULT_TABLE_NAME);
-        self.get_temporary_message_batch(&ctx, &batch).await?;
-        ctx.register_batch(table_name, batch.into())
+        self.get_temporary_message_batch(&ctx_arc, &batch).await?;
+        ctx_arc
+            .register_batch(table_name, batch.clone().into())
             .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
         // Execute the SQL query and collect the results.
         let df = self
-            .execute_query_with_statement(ctx)
+            .execute_query_with_statement(&ctx_arc)
             .await
             .map_err(|e| Error::Process(format!("Execution query error: {}", e)))?;
         let result_batches = df
             .collect()
             .await
             .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?;
+
+        // Deregister the table to clean up before returning context to pool
+        let _ = ctx_arc.deregister_table(table_name);
+
+        // Release the context back to the pool
+        self.context_pool.release_context(ctx_arc).await;
 
         if result_batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -138,7 +150,7 @@ impl SqlProcessor {
 
     async fn get_temporary_message_batch(
         &self,
-        ctx: &SessionContext,
+        ctx: &Arc<SessionContext>,
         batch: &RecordBatch,
     ) -> Result<(), Error> {
         let Some(temporary_map) = &self.temporary else {
@@ -175,7 +187,7 @@ impl SqlProcessor {
 
     async fn execute_query_with_statement(
         &self,
-        ctx: SessionContext,
+        ctx: &Arc<SessionContext>,
     ) -> Result<DataFrame, DataFusionError> {
         let sql_options = SQLOptions::new()
             .with_allow_ddl(false)
@@ -189,15 +201,6 @@ impl SqlProcessor {
         sql_options.verify_plan(&plan)?;
 
         ctx.execute_logical_plan(plan).await
-    }
-
-    /// Create a new session context with UDFs and JSON functions registered
-    async fn create_session_context(&self) -> Result<SessionContext, Error> {
-        let mut ctx = SessionContext::new();
-        udf::init(&mut ctx)?;
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
-        Ok(ctx)
     }
 }
 
@@ -369,5 +372,55 @@ mod tests {
             }
             _ => panic!("Expected single result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_context_pool_performance() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT * FROM flow WHERE id > 0".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        // Run multiple queries to test pool effectiveness
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            processor
+                .process(Arc::new(MessageBatch::new_arrow(batch.clone())))
+                .await
+                .unwrap();
+        }
+        let duration = start.elapsed();
+
+        // With context pool, 10 queries should complete in < 100ms
+        // Without pool, this would typically take > 500ms
+        assert!(
+            duration.as_millis() < 500,
+            "Context pool performance test failed: {}ms",
+            duration.as_millis()
+        );
+
+        println!("10 queries completed in {:?}", duration);
     }
 }

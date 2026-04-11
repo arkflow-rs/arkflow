@@ -17,6 +17,7 @@
 //! Send data to a NATS subject
 
 use crate::expr::Expr;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
@@ -222,12 +223,7 @@ impl OutputBuilder for NatsOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "NATS output configuration is missing".to_string(),
-            ));
-        }
-        let config: NatsOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: NatsOutputConfig = parse_config(config, "NatsOutput input")?;
         Ok(Arc::new(NatsOutput::new(config, codec)?))
     }
 }

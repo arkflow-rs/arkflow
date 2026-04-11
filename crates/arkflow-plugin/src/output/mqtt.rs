@@ -17,6 +17,7 @@
 //! Send the processed data to the MQTT broker
 
 use crate::expr::Expr;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
@@ -211,12 +212,7 @@ impl OutputBuilder for MqttOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "HTTP output configuration is missing".to_string(),
-            ));
-        }
-        let config: MqttOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: MqttOutputConfig = parse_config(config, "MqttOutput input")?;
         Ok(Arc::new(MqttOutput::<AsyncClient>::new(config, codec)?))
     }
 }

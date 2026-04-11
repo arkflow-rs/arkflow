@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -134,12 +135,7 @@ impl InputBuilder for MemoryInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "Memory input configuration is missing".to_string(),
-            ));
-        }
-        let config: MemoryInputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: MemoryInputConfig = parse_config(config, "Memory input")?;
         Ok(Arc::new(MemoryInput::new(name, config, codec)?))
     }
 }

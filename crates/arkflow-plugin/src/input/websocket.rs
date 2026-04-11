@@ -17,6 +17,7 @@
 //! Receive data from a WebSocket server
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -255,13 +256,7 @@ impl InputBuilder for WebSocketInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "WebSocket input configuration is missing".to_string(),
-            ));
-        }
-
-        let config: WebSocketInputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: WebSocketInputConfig = parse_config(config, "WebSocket input")?;
         Ok(Arc::new(WebSocketInput::new(name, config, codec)?))
     }
 }

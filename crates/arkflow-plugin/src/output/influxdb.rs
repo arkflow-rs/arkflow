@@ -17,12 +17,11 @@
 //! Write the processed data to InfluxDB 2.x
 
 use arkflow_core::codec::Codec;
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, StringArray,
-};
+use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -110,10 +109,7 @@ pub struct InfluxDBOutput {
 
 impl InfluxDBOutput {
     /// Create a new InfluxDB output component
-    pub fn new(
-        config: InfluxDBOutputConfig,
-        codec: Option<Arc<dyn Codec>>,
-    ) -> Result<Self, Error> {
+    pub fn new(config: InfluxDBOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         Ok(Self {
             config,
             client: Arc::new(Mutex::new(None)),
@@ -136,10 +132,7 @@ impl InfluxDBOutput {
     }
 
     /// Convert MessageBatch to InfluxDB Line Protocol
-    fn convert_to_line_protocol(
-        &self,
-        msg: &MessageBatch,
-    ) -> Result<Vec<String>, Error> {
+    fn convert_to_line_protocol(&self, msg: &MessageBatch) -> Result<Vec<String>, Error> {
         let mut lines = Vec::new();
 
         // Get measurement
@@ -363,9 +356,9 @@ impl InfluxDBOutput {
         }
 
         let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or_else(|| {
-            Error::Connection("InfluxDB client not initialized".to_string())
-        })?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| Error::Connection("InfluxDB client not initialized".to_string()))?;
 
         // Build URL
         let url = format!(
@@ -411,7 +404,8 @@ impl InfluxDBOutput {
 
             // Exponential backoff
             if attempt < retry_count - 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(attempt))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(attempt)))
+                    .await;
             }
         }
 
@@ -441,7 +435,9 @@ impl Output for InfluxDBOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         if !self.connected.load(Ordering::SeqCst) {
-            return Err(Error::Connection("InfluxDB output not connected".to_string()));
+            return Err(Error::Connection(
+                "InfluxDB output not connected".to_string(),
+            ));
         }
 
         // Apply codec encoding if configured
@@ -503,8 +499,7 @@ fn escape_tag_value(s: &str) -> String {
 
 /// Escape field string values
 fn escape_field_value(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub(crate) struct InfluxDBOutputBuilder;
@@ -517,13 +512,7 @@ impl OutputBuilder for InfluxDBOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "InfluxDB output configuration is missing".to_string(),
-            ));
-        }
-
-        let config: InfluxDBOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: InfluxDBOutputConfig = parse_config(config, "InfluxDBOutput input")?;
 
         Ok(Arc::new(InfluxDBOutput::new(config, codec)?))
     }

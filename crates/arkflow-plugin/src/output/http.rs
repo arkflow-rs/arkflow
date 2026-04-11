@@ -16,6 +16,7 @@
 //!
 //! Send the processed data to the HTTP endpoint
 
+use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
@@ -223,12 +224,7 @@ impl OutputBuilder for HttpOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
-        if config.is_none() {
-            return Err(Error::Config(
-                "HTTP output configuration is missing".to_string(),
-            ));
-        }
-        let config: HttpOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        let config: HttpOutputConfig = parse_config(config, "HttpOutput input")?;
 
         Ok(Arc::new(HttpOutput::new(config, codec)?))
     }
