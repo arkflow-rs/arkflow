@@ -286,7 +286,7 @@ dependencies = [
  "lazy_static",
  "mockall",
  "num_cpus",
- "object_store",
+ "object_store 0.12.5",
  "once_cell",
  "prost-reflect 0.16.3",
  "prost-types 0.14.3",
@@ -1420,7 +1420,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "md-5",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -1484,7 +1484,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2039,7 +2039,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2593,7 +2593,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "parquet",
  "rand 0.8.5",
@@ -2628,7 +2628,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "tokio",
 ]
@@ -2652,7 +2652,7 @@ dependencies = [
  "datafusion-session",
  "futures",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "tokio",
 ]
 
@@ -2672,7 +2672,7 @@ dependencies = [
  "indexmap 2.13.0",
  "libc",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parquet",
  "paste",
  "pyo3",
@@ -2718,7 +2718,7 @@ dependencies = [
  "glob",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parquet",
  "rand 0.8.5",
  "tempfile",
@@ -2750,7 +2750,7 @@ dependencies = [
  "datafusion-session",
  "futures",
  "num-traits",
- "object_store",
+ "object_store 0.12.5",
  "tokio",
 ]
 
@@ -2774,7 +2774,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store",
+ "object_store 0.12.5",
  "regex",
  "tokio",
 ]
@@ -2799,7 +2799,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store",
+ "object_store 0.12.5",
  "serde_json",
  "tokio",
 ]
@@ -2828,7 +2828,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "parquet",
  "rand 0.8.5",
@@ -2853,7 +2853,7 @@ dependencies = [
  "datafusion-expr",
  "futures",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "rand 0.8.5",
  "tempfile",
@@ -3160,7 +3160,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-proto-common",
- "object_store",
+ "object_store 0.12.5",
  "prost 0.13.5",
 ]
 
@@ -3194,7 +3194,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.12.5",
  "parking_lot 0.12.5",
  "tokio",
 ]
@@ -3333,6 +3333,18 @@ name = "dns-lookup"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf5597a4b7fe5275fc9dcf88ce26326bc8e4cb87d0130f33752d4c5f717793cf"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2 0.6.2",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "dns-lookup"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e39034cee21a2f5bbb66ba0e3689819c4bb5d00382a282006e802a7ffa6c41d"
 dependencies = [
  "cfg-if",
  "libc",
@@ -4127,9 +4139,9 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.12.4"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08603b51f970930b0025b92d3f6c0ba39a0a6d0dfb4b3f527af58768adc2f3b2"
+checksum = "b3a055a5ea36d0e55d2d53643678a747154606dc030b44ace229b307f50130d9"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -4142,13 +4154,13 @@ dependencies = [
  "crc",
  "ctr",
  "des",
- "dns-lookup",
+ "dns-lookup 3.0.1",
  "futures",
  "g2p",
  "hex",
  "hmac",
  "libc",
- "libloading",
+ "libloading 0.9.0",
  "log",
  "md-5",
  "num-traits",
@@ -4168,16 +4180,16 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native-object-store"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d5495a763df493ea3883271e727914e83a0ce188a32e230ca820e3cb5e188d2"
+checksum = "c2a8fd74d01f5831e0a81581e252831c70572b7a9145b813fad99323460f2f69"
 dependencies = [
  "async-trait",
  "bytes",
  "chrono",
  "futures",
  "hdfs-native",
- "object_store",
+ "object_store 0.13.1",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -5003,6 +5015,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5691,6 +5713,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_store"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2858065e55c148d294a9f3aae3b0fa9458edadb41a108397094566f4e3c0dfb"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "http 1.4.0",
+ "humantime",
+ "itertools 0.14.0",
+ "parking_lot 0.12.5",
+ "percent-encoding",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
 name = "octseq"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5978,7 +6024,7 @@ dependencies = [
  "lz4_flex",
  "num",
  "num-bigint",
- "object_store",
+ "object_store 0.12.5",
  "paste",
  "seq-macro",
  "simdutf8",
@@ -9578,7 +9624,7 @@ dependencies = [
  "csv",
  "ctr",
  "digest",
- "dns-lookup",
+ "dns-lookup 2.1.1",
  "domain",
  "dyn-clone",
  "encoding_rs",
