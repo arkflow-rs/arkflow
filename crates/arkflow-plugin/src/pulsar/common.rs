@@ -39,17 +39,13 @@ pub enum PulsarAuth {
 /// Pulsar subscription type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SubscriptionType {
+    #[default]
     Exclusive,
     Shared,
     Failover,
     KeyShared,
-}
-
-impl Default for SubscriptionType {
-    fn default() -> Self {
-        SubscriptionType::Exclusive
-    }
 }
 
 /// Common Pulsar client utilities

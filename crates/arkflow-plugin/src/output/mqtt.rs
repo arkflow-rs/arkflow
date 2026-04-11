@@ -20,7 +20,7 @@ use crate::expr::Expr;
 use arkflow_core::{
     codec::Codec,
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
@@ -167,7 +167,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         for (i, payload) in payloads.into_iter().enumerate() {
             info!(
                 "Send message: {}",
-                &String::from_utf8_lossy((&payload).as_ref())
+                &String::from_utf8_lossy(payload.as_ref())
             );
 
             if let Some(topic_str) = topic.get(i) {

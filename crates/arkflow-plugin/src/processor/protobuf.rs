@@ -386,7 +386,7 @@ message TestMessage {
         assert_eq!(binary_data.len(), 1);
 
         let decoded_msg =
-            DynamicMessage::decode(processor.descriptor.clone(), binary_data[0].as_ref())
+            DynamicMessage::decode(processor.descriptor.clone(), binary_data[0])
                 .map_err(|e| Error::Process(format!("Failed to decode protobuf: {}", e)))?;
 
         let timestamp = decoded_msg.get_field_by_name("timestamp").unwrap();

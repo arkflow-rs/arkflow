@@ -12,18 +12,21 @@
  *    limitations under the License.
  */
 
+use crate::checkpoint::{BarrierManager, CheckpointCoordinator};
 use crate::config::EngineConfig;
+use crate::transaction::TransactionCoordinator;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use axum::extract::State;
+use axum::http::header;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::response::Json;
+use axum::response::{IntoResponse, Response};
 // Import axum related dependencies
 use axum::{routing::get, Router};
 use serde::Serialize;
@@ -207,14 +210,88 @@ impl Engine {
 
         (StatusCode::OK, Json(response))
     }
+
+    /// Metrics handler function that returns Prometheus metrics
+    ///
+    /// Returns OK (200) with Prometheus text format body if metrics are enabled
+    async fn handle_metrics() -> Response {
+        use crate::metrics;
+
+        match metrics::gather_metrics() {
+            Ok(buffer) => {
+                let mut headers = header::HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4".parse().unwrap(),
+                );
+                (StatusCode::OK, headers, buffer).into_response()
+            }
+            Err(e) => {
+                error!("Failed to gather metrics: {}", e);
+                let response = serde_json::json!({
+                    "error": format!("Failed to gather metrics: {}", e)
+                });
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+            }
+        }
+    }
+
+    /// Start the metrics server if enabled in configuration
+    ///
+    /// Sets up HTTP endpoint for metrics scraping in Prometheus text format.
+    /// The server runs on a separate port from the health check server.
+    async fn start_metrics_server(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let metrics_config = &self.config.metrics;
+
+        if !metrics_config.enabled {
+            return Ok(());
+        }
+
+        // Initialize and enable metrics
+        use crate::metrics;
+        if let Err(e) = metrics::init_metrics() {
+            error!("Failed to initialize metrics: {}", e);
+            return Err(e.into());
+        }
+        metrics::enable_metrics();
+
+        // Create routes
+        let app = Router::new().route(&metrics_config.endpoint, get(Self::handle_metrics));
+
+        let addr = &metrics_config.address;
+        let addr = addr.clone();
+        info!("Starting metrics server on {}", &addr);
+
+        // Start the server
+        tokio::spawn(async move {
+            let server = axum::serve(
+                TcpListener::bind(addr).await.expect("bind error"),
+                app.into_make_service(),
+            );
+
+            // Run the server with graceful shutdown
+            let graceful = server.with_graceful_shutdown(Self::shutdown_signal(cancellation_token));
+            if let Err(e) = graceful.await {
+                error!("Metrics server error: {}", e);
+            } else {
+                info!("Metrics server stopped");
+            }
+        });
+
+        Ok(())
+    }
     /// Run the engine and all configured streams
     ///
     /// This method:
     /// 1. Starts the health check server if enabled
-    /// 2. Initializes all configured streams
-    /// 3. Sets up signal handlers for graceful shutdown
-    /// 4. Runs all streams concurrently
-    /// 5. Waits for all streams to complete
+    /// 2. Starts the metrics server if enabled
+    /// 3. Initializes all configured streams
+    /// 4. Sets up signal handlers for graceful shutdown
+    /// 5. Runs all streams concurrently
+    /// 6. Waits for all streams to complete
     ///
     /// Returns an error if any part of the initialization or execution fails
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -223,15 +300,147 @@ impl Engine {
         // Start the health check server
         self.start_health_check_server(token.clone()).await?;
 
+        // Start the metrics server
+        self.start_metrics_server(token.clone()).await?;
+
         // Create and run all flows
         let mut streams = Vec::new();
         let mut handles = Vec::new();
+
+        // Create transaction coordinator if exactly-once is enabled
+        let tx_coordinator = if self.config.exactly_once.enabled {
+            info!("Exactly-once semantics enabled, creating transaction coordinator");
+
+            match TransactionCoordinator::new(self.config.exactly_once.transaction.clone()).await {
+                Ok(coordinator) => {
+                    // Recover from WAL
+                    info!("Recovering from WAL...");
+                    match coordinator.recover().await {
+                        Ok(recovered_tx_ids) => {
+                            if !recovered_tx_ids.is_empty() {
+                                info!(
+                                    "Recovered {} incomplete transactions from WAL",
+                                    recovered_tx_ids.len()
+                                );
+                                for tx_id in recovered_tx_ids {
+                                    info!("Recovered transaction: {}", tx_id);
+                                }
+                            } else {
+                                info!("No incomplete transactions to recover");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to recover from WAL: {}", e);
+                            error!("Continuing without recovery...");
+                        }
+                    }
+
+                    Some(Arc::new(coordinator))
+                }
+                Err(e) => {
+                    error!("Failed to create transaction coordinator: {}", e);
+                    error!("Exactly-once semantics will not be available");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Create checkpoint coordinator if checkpoint is enabled
+        let checkpoint_coordinator = if self.config.checkpoint.enabled {
+            info!("Checkpoint enabled, creating checkpoint coordinator");
+
+            match CheckpointCoordinator::new(self.config.checkpoint.clone()) {
+                Ok(coordinator) => {
+                    info!("Checkpoint coordinator created successfully");
+                    Some(Arc::new(coordinator))
+                }
+                Err(e) => {
+                    error!("Failed to create checkpoint coordinator: {}", e);
+                    error!("Checkpoint will not be available");
+                    None
+                }
+            }
+        } else {
+            info!("Checkpoint disabled");
+            None
+        };
+
+        // Start checkpoint coordinator background task if enabled
+        if let Some(ref coordinator) = checkpoint_coordinator {
+            let coord = Arc::clone(coordinator);
+            let checkpoint_token = token.clone();
+            tokio::spawn(async move {
+                info!("Starting checkpoint coordinator background task");
+                tokio::select! {
+                    _ = async {
+                        if let Err(e) = coord.run().await {
+                            error!("Checkpoint coordinator failed: {}", e);
+                        }
+                    } => {}
+                    _ = checkpoint_token.cancelled() => {
+                        info!("Checkpoint coordinator shutting down");
+                    }
+                }
+            });
+        }
+
+        // Get barrier manager from checkpoint coordinator
+        let barrier_manager = checkpoint_coordinator
+            .as_ref()
+            .map(|coord| coord.barrier_manager());
 
         for (i, stream_config) in self.config.streams.iter().enumerate() {
             info!("Initializing flow #{}", i + 1);
 
             match stream_config.build() {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Attach transaction coordinator if available
+                    if let Some(ref coordinator) = tx_coordinator {
+                        stream = stream.with_transaction_coordinator(Arc::clone(coordinator));
+                    }
+
+                    // Attach barrier manager if checkpoint is enabled
+                    if let Some(ref manager) = barrier_manager {
+                        info!("Attaching barrier manager to stream #{}", i + 1);
+                        stream = stream.with_barrier_manager(Arc::clone(manager));
+                    }
+
+                    // Register stream with checkpoint coordinator
+                    if let Some(ref coord) = checkpoint_coordinator {
+                        let stream_uuid = stream.get_uuid().to_string();
+                        coord.register_stream(stream_uuid, stream_config.pipeline.thread_num as usize).await;
+                    }
+
+                    // Restore from checkpoint if available
+                    if let Some(ref coord) = checkpoint_coordinator {
+                        info!("Attempting to restore stream #{} from checkpoint", i + 1);
+                        match coord.restore_from_checkpoint().await {
+                            Ok(Some(snapshot)) => {
+                                info!("Found checkpoint for stream #{}, restoring state", i + 1);
+                                if let Err(e) = stream.restore_from_checkpoint(&snapshot).await {
+                                    error!("Failed to restore stream #{} from checkpoint: {}, starting fresh", i + 1, e);
+                                } else {
+                                    info!(
+                                        "Stream #{} restored successfully from checkpoint",
+                                        i + 1
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                info!("No checkpoint found for stream #{}, starting fresh", i + 1);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to load checkpoint for stream #{}: {}, starting fresh",
+                                    i + 1,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     streams.push(stream);
                 }
                 Err(e) => {

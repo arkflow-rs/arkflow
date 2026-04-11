@@ -21,11 +21,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{codec::Codec, Error, MessageBatchRef, Resource};
+use crate::{codec::Codec, transaction::TransactionId, Error, MessageBatchRef, Resource};
 
 lazy_static::lazy_static! {
     static ref OUTPUT_BUILDERS: RwLock<HashMap<String, Arc<dyn OutputBuilder>>> = RwLock::new(HashMap::new());
 }
+
 /// Feature interface of the output component
 #[async_trait]
 pub trait Output: Send + Sync {
@@ -37,6 +38,51 @@ pub trait Output: Send + Sync {
 
     /// Close the output destination connection
     async fn close(&self) -> Result<(), Error>;
+
+    /// Write a message idempotently (for exactly-once semantics)
+    ///
+    /// Default implementation just calls write(), but outputs that support
+    /// idempotency (e.g., HTTP with Idempotency-Key, SQL with UPSERT) should
+    /// override this method.
+    async fn write_idempotent(
+        &self,
+        msg: MessageBatchRef,
+        _idempotency_key: &str,
+    ) -> Result<(), Error> {
+        // Default: just call regular write
+        self.write(msg).await
+    }
+
+    /// Begin a transaction (for exactly-once semantics)
+    ///
+    /// Default implementation returns an error indicating transactions are not supported.
+    /// Outputs that support transactions (e.g., Kafka) should override this method.
+    async fn begin_transaction(&self) -> Result<TransactionId, Error> {
+        Err(Error::Process(
+            "Transactions not supported by this output type".to_string(),
+        ))
+    }
+
+    /// Prepare transaction (two-phase commit phase 1)
+    ///
+    /// Default implementation does nothing (no-op).
+    async fn prepare_transaction(&self, _id: TransactionId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Commit transaction (two-phase commit phase 2)
+    ///
+    /// Default implementation does nothing (no-op).
+    async fn commit_transaction(&self, _id: TransactionId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Rollback transaction
+    ///
+    /// Default implementation does nothing (no-op).
+    async fn rollback_transaction(&self, _id: TransactionId) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Output configuration

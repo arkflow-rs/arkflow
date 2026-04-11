@@ -1,0 +1,71 @@
+# Filter Processor Example
+#
+# This example demonstrates how to use the filter processor to filter messages
+# based on field conditions.
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      interval: 1s
+      count: 10
+      batch_size: 5
+
+    pipeline:
+      thread_num: 2
+      processors:
+        # Example 1: Filter by exact match
+        - type: "filter"
+          conditions:
+            - field: "value"
+              operator: "gte"
+              value: 50
+
+        # Example 2: Filter by string contains
+        # - type: "filter"
+        #   conditions:
+        #     - field: "message"
+        #       operator: "contains"
+        #       value: "error"
+
+        # Example 3: Multiple conditions (AND logic)
+        # - type: "filter"
+        #   conditions:
+        #     - field: "status"
+        #       operator: "eq"
+        #       value: "active"
+        #     - field: "priority"
+        #       operator: "gte"
+        #       value: 3
+
+        # Example 4: Invert filter (NOT logic)
+        # - type: "filter"
+        #   invert: true
+        #   conditions:
+        #     - field: "level"
+        #       operator: "eq"
+        #       value: "debug"
+
+        # Example 5: Filter null values
+        # - type: "filter"
+        #   conditions:
+        #     - field: "optional_field"
+        #       operator: "is_not_null"
+
+    output:
+      type: "stdout"
+
+# Supported operators:
+# - eq: Equals
+# - ne: Not equals
+# - gt: Greater than
+# - gte: Greater than or equal
+# - lt: Less than
+# - lte: Less than or equal
+# - contains: Contains (strings only)
+# - starts_with: Starts with (strings only)
+# - ends_with: Ends with (strings only)
+# - is_null: Is null
+# - is_not_null: Is not null

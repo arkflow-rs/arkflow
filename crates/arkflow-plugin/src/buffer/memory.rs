@@ -21,7 +21,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{metrics, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
@@ -68,7 +68,7 @@ impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
-        let duration = config.timeout.clone();
+        let duration = config.timeout;
         let close = CancellationToken::new();
         let close_clone = close.clone();
 
@@ -155,10 +155,17 @@ impl Buffer for MemoryBuffer {
         queue_lock.push_front((msg, arc));
 
         // Calculate the total number of messages in the buffer
-        let cnt = queue_lock.iter().map(|x| x.0.len()).reduce(|acc, x| {
-            return acc + x;
-        });
+        let cnt = queue_lock
+            .iter()
+            .map(|x| x.0.len())
+            .reduce(|acc, x| acc + x);
         let cnt = cnt.unwrap_or(0);
+
+        // Record buffer metrics if enabled
+        if metrics::is_metrics_enabled() {
+            metrics::BUFFER_SIZE.set(cnt as f64);
+            metrics::BUFFER_UTILIZATION.set((cnt as f64 / self.config.capacity as f64) * 100.0);
+        }
 
         // If capacity threshold is reached, notify readers to process the batch
         if cnt >= self.config.capacity as usize {
@@ -219,6 +226,41 @@ impl Buffer for MemoryBuffer {
     /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
         self.close.cancel();
+        Ok(())
+    }
+
+    /// Get buffered messages for checkpoint
+    async fn get_buffered_messages(&self) -> Result<Option<Vec<MessageBatchRef>>, Error> {
+        let queue_arc = Arc::clone(&self.queue);
+        let queue_lock = queue_arc.read().await;
+
+        if queue_lock.is_empty() {
+            return Ok(None);
+        }
+
+        // Clone all messages for checkpoint
+        let messages: Vec<MessageBatchRef> =
+            queue_lock.iter().map(|(msg, _ack)| msg.clone()).collect();
+
+        Ok(Some(messages))
+    }
+
+    /// Restore buffer state from checkpoint
+    async fn restore_buffer(&self, messages: Vec<MessageBatchRef>) -> Result<(), Error> {
+        let queue_arc = Arc::clone(&self.queue);
+        let mut queue_lock = queue_arc.write().await;
+
+        // Clear existing queue
+        queue_lock.clear();
+
+        // Restore messages
+        for msg in messages {
+            // Create a NoopAck for restored messages
+            let ack = Arc::new(arkflow_core::input::NoopAck);
+            queue_lock.push_front((msg, ack));
+        }
+
+        tracing::info!("Restored {} messages to memory buffer", queue_lock.len());
         Ok(())
     }
 }
