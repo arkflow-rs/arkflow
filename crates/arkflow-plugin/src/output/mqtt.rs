@@ -17,6 +17,7 @@
 //! Send the processed data to the MQTT broker
 
 use crate::expr::Expr;
+use crate::mqtt_client::{create_mqtt_options, parse_qos};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -83,24 +84,16 @@ impl<T: MqttClient> MqttOutput<T> {
 #[async_trait]
 impl<T: MqttClient> Output for MqttOutput<T> {
     async fn connect(&self) -> Result<(), Error> {
-        // Create MQTT options
-        let mut mqtt_options =
-            MqttOptions::new(&self.config.client_id, &self.config.host, self.config.port);
-
-        // Set the authentication information
-        if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            mqtt_options.set_credentials(username, password);
-        }
-
-        // Set the keep-alive time
-        if let Some(keep_alive) = self.config.keep_alive {
-            mqtt_options.set_keep_alive(std::time::Duration::from_secs(keep_alive));
-        }
-
-        // Set up a purge session
-        if let Some(clean_session) = self.config.clean_session {
-            mqtt_options.set_clean_session(clean_session);
-        }
+        // Create MQTT options using shared utility
+        let mqtt_options = create_mqtt_options(
+            &self.config.client_id,
+            &self.config.host,
+            self.config.port,
+            self.config.username.as_deref(),
+            self.config.password.as_deref(),
+            self.config.keep_alive,
+            self.config.clean_session,
+        );
 
         // Create an MQTT client
         let (client, mut eventloop) = T::create(mqtt_options, 10).await?;

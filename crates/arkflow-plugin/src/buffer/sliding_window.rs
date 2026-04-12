@@ -19,6 +19,8 @@
 //! number of messages after each window is emitted. This allows messages to be part of
 //! multiple windows, providing a more continuous view of the data stream.
 
+use crate::buffer::common_window::CommonWindowContext;
+use crate::buffer::window_strategy::{SlidingWindowStrategy, WindowStrategy};
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
@@ -31,9 +33,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time;
-use tokio::sync::{Notify, RwLock};
-use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::RwLock;
 
 /// Configuration for the sliding window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +55,8 @@ struct SlidingWindow {
     config: SlidingWindowConfig,
     /// Thread-safe queue to store message batches and their acknowledgments
     queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
-    /// Notification mechanism for signaling between threads
-    notify: Arc<Notify>,
-    /// Token for cancellation of background tasks
-    close: CancellationToken,
+    /// Common window context for timer and notification management
+    context: CommonWindowContext,
 }
 
 impl SlidingWindow {
@@ -70,37 +68,19 @@ impl SlidingWindow {
     /// # Returns
     /// * `Result<Self, Error>` - A new sliding window instance or an error
     fn new(config: SlidingWindowConfig) -> Result<Self, Error> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = Arc::clone(&notify);
-        let interval = config.interval;
-        let close = CancellationToken::new();
-        let close_clone = close.clone();
+        let strategy = SlidingWindowStrategy::new(
+            time::Duration::from_secs(config.window_size as u64),
+            config.interval,
+        );
+        let context = CommonWindowContext::new();
 
-        tokio::spawn(async move {
-            loop {
-                let timer = sleep(interval);
-                tokio::select! {
-                    _ = timer => {
-                        notify_clone.notify_waiters();
-                    }
-                    _ = close_clone.cancelled() => {
-                        notify_clone.notify_waiters();
-                        break;
-                    }
-                    _ = notify_clone.notified() => {
-                        if close_clone.is_cancelled(){
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        // Start the background timer
+        context.start_timer(strategy.check_interval());
 
         Ok(Self {
-            close,
-            notify,
             config,
             queue: Arc::new(Default::default()),
+            context,
         })
     }
 
@@ -181,14 +161,13 @@ impl Buffer for SlidingWindow {
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        if self.close.is_cancelled() {
+        if self.context.is_closed() {
             return Ok(None);
         }
 
         loop {
             {
-                let queue_arc = Arc::clone(&self.queue);
-                let queue_lock = queue_arc.read().await;
+                let queue_lock = self.queue.read().await;
                 // If there are enough messages to form a window, break the loop and process them
                 if queue_lock.len() >= self.config.window_size as usize {
                     break;
@@ -196,7 +175,7 @@ impl Buffer for SlidingWindow {
                 // If the buffer is closed, return None
             }
             // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
+            let notify = Arc::clone(&self.context.notify);
             notify.notified().await;
         }
         // Process the current window and slide forward
@@ -208,12 +187,11 @@ impl Buffer for SlidingWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
-        self.close.cancel();
-        let queue_arc = Arc::clone(&self.queue);
-        let queue_lock = queue_arc.read().await;
+        self.context.close();
+        let queue_lock = self.queue.read().await;
         if !queue_lock.is_empty() {
             // Notify any waiting readers to process remaining messages
-            let notify = Arc::clone(&self.notify);
+            let notify = Arc::clone(&self.context.notify);
             notify.notify_waiters();
         }
         Ok(())
@@ -224,7 +202,7 @@ impl Buffer for SlidingWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
-        self.close.cancel();
+        self.context.close();
         Ok(())
     }
 }
