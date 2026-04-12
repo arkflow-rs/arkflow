@@ -19,8 +19,10 @@
 //! if they arrive within the gap duration of each other. When the gap duration elapses
 //! without new messages, the session is closed and all accumulated messages are emitted.
 
+use crate::buffer::common_window::CommonWindowContext;
 use crate::buffer::join::JoinConfig;
 use crate::buffer::window::BaseWindow;
+use crate::buffer::window_strategy::{SessionWindowStrategy, WindowStrategy};
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
@@ -30,9 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 /// Configuration for the session window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,10 +53,8 @@ struct SessionWindow {
     /// Configuration parameters for the session window
     config: SessionWindowConfig,
     base_window: BaseWindow,
-    /// Notification mechanism for signaling between threads
-    notify: Arc<Notify>,
-    /// Token for cancellation of background tasks
-    close: CancellationToken,
+    /// Common window context for timer and notification management
+    context: CommonWindowContext,
     /// Timestamp of the last received message, used to determine session boundaries
     last_message_time: Arc<RwLock<Instant>>,
 }
@@ -69,26 +68,19 @@ impl SessionWindow {
     /// # Returns
     /// * `Result<Self, Error>` - A new session window instance or an error
     fn new(config: SessionWindowConfig, resource: &Resource) -> Result<Self, Error> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = Arc::clone(&notify);
-        let gap = config.gap;
-        let close = CancellationToken::new();
-        let close_clone = close.clone();
-        let last_message_time = Arc::new(RwLock::new(Instant::now()));
-        let base_window = BaseWindow::new(
-            config.join.clone(),
-            notify_clone,
-            close_clone,
-            gap,
-            resource,
-        )?;
+        let strategy = SessionWindowStrategy::new(config.gap);
+        let context = CommonWindowContext::new();
+
+        // Start the background timer
+        context.start_timer(strategy.check_interval());
+
+        let base_window = context.create_base_window(config.join.clone(), config.gap, resource)?;
 
         Ok(Self {
-            close,
-            notify,
             config,
             base_window,
-            last_message_time,
+            context,
+            last_message_time: Arc::new(RwLock::new(Instant::now())),
         })
     }
 }
@@ -117,7 +109,7 @@ impl Buffer for SessionWindow {
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        if self.close.is_cancelled() {
+        if self.context.is_closed() {
             return Ok(None);
         }
 
@@ -134,7 +126,7 @@ impl Buffer for SessionWindow {
             }
 
             // Wait for notification from timer or write operation
-            let notify = Arc::clone(&self.notify);
+            let notify = Arc::clone(&self.context.notify);
             notify.notified().await;
         }
         // Process and return the current session
@@ -146,7 +138,12 @@ impl Buffer for SessionWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
-        self.base_window.flush().await
+        self.context.close();
+        if !self.base_window.queue_is_empty().await {
+            let notify = Arc::clone(&self.context.notify);
+            notify.notify_waiters();
+        }
+        Ok(())
     }
 
     /// Closes the buffer by cancelling the background task
@@ -154,7 +151,8 @@ impl Buffer for SessionWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
-        self.base_window.close().await
+        self.context.close();
+        Ok(())
     }
 }
 
