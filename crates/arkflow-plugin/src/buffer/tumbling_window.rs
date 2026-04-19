@@ -19,6 +19,7 @@
 //! period elapses, all accumulated messages are emitted as a single batch and a new
 //! window begins immediately.
 
+use crate::buffer::common_window::CommonWindowContext;
 use crate::buffer::join::JoinConfig;
 use crate::buffer::window::BaseWindow;
 use crate::time::deserialize_duration;
@@ -30,8 +31,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time;
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 /// Configuration for the tumbling window buffer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,12 +47,10 @@ struct TumblingWindowConfig {
 /// Tumbling window buffer implementation
 /// Groups messages into fixed-size, non-overlapping time windows
 struct TumblingWindow {
-    /// Thread-safe queue to store message batches and their acknowledgments
+    /// Base window implementation for queue management
     base_window: BaseWindow,
-    /// Notification mechanism for signaling between threads
-    notify: Arc<Notify>,
-    /// Token for cancellation of background tasks
-    close: CancellationToken,
+    /// Common window context for timer and notification management
+    context: CommonWindowContext,
 }
 
 impl TumblingWindow {
@@ -65,23 +62,14 @@ impl TumblingWindow {
     /// # Returns
     /// * `Result<Self, Error>` - A new tumbling window instance or an error
     fn new(config: TumblingWindowConfig, resource: &Resource) -> Result<Self, Error> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = Arc::clone(&notify);
-        let interval = config.interval;
-        let close = CancellationToken::new();
-        let close_clone = close.clone();
-        let base_window = BaseWindow::new(
-            config.join.clone(),
-            notify_clone,
-            close_clone,
-            interval,
-            resource,
-        )?;
+        let context = CommonWindowContext::new();
+
+        // BaseWindow already starts a background timer, no need to start another one here
+        let base_window = context.create_base_window(config.join, config.interval, resource)?;
 
         Ok(Self {
-            close,
-            notify,
             base_window,
+            context,
         })
     }
 }
@@ -108,7 +96,7 @@ impl Buffer for TumblingWindow {
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         // If the buffer is closed, return None
-        if self.close.is_cancelled() {
+        if self.context.is_closed() {
             return Ok(None);
         }
 
@@ -120,8 +108,7 @@ impl Buffer for TumblingWindow {
                 }
             }
             // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            self.context.notify.notified().await;
         }
         // Process and return the current window
         self.base_window.process_window().await

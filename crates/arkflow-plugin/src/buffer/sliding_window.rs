@@ -76,6 +76,7 @@ impl SlidingWindow {
         let close = CancellationToken::new();
         let close_clone = close.clone();
 
+        // SlidingWindow needs its own timer since it doesn't use BaseWindow
         tokio::spawn(async move {
             loop {
                 let timer = sleep(interval);
@@ -97,10 +98,10 @@ impl SlidingWindow {
         });
 
         Ok(Self {
-            close,
-            notify,
             config,
             queue: Arc::new(Default::default()),
+            notify,
+            close,
         })
     }
 
@@ -171,6 +172,9 @@ impl Buffer for SlidingWindow {
     async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let mut queue_lock = self.queue.write().await;
         queue_lock.push_back((msg, ack));
+        drop(queue_lock);
+        // Notify waiting readers that a new message has arrived
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -186,9 +190,11 @@ impl Buffer for SlidingWindow {
         }
 
         loop {
+            if self.close.is_cancelled() {
+                return Ok(None);
+            }
             {
-                let queue_arc = Arc::clone(&self.queue);
-                let queue_lock = queue_arc.read().await;
+                let queue_lock = self.queue.read().await;
                 // If there are enough messages to form a window, break the loop and process them
                 if queue_lock.len() >= self.config.window_size as usize {
                     break;
@@ -196,8 +202,7 @@ impl Buffer for SlidingWindow {
                 // If the buffer is closed, return None
             }
             // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            self.notify.notified().await;
         }
         // Process the current window and slide forward
         self.process_slide().await
@@ -209,12 +214,10 @@ impl Buffer for SlidingWindow {
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
         self.close.cancel();
-        let queue_arc = Arc::clone(&self.queue);
-        let queue_lock = queue_arc.read().await;
+        let queue_lock = self.queue.read().await;
         if !queue_lock.is_empty() {
             // Notify any waiting readers to process remaining messages
-            let notify = Arc::clone(&self.notify);
-            notify.notify_waiters();
+            self.notify.notify_waiters();
         }
         Ok(())
     }
