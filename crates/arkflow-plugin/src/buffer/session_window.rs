@@ -22,7 +22,6 @@
 use crate::buffer::common_window::CommonWindowContext;
 use crate::buffer::join::JoinConfig;
 use crate::buffer::window::BaseWindow;
-use crate::buffer::window_strategy::{SessionWindowStrategy, WindowStrategy};
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::Ack;
@@ -68,12 +67,9 @@ impl SessionWindow {
     /// # Returns
     /// * `Result<Self, Error>` - A new session window instance or an error
     fn new(config: SessionWindowConfig, resource: &Resource) -> Result<Self, Error> {
-        let strategy = SessionWindowStrategy::new(config.gap);
         let context = CommonWindowContext::new();
 
-        // Start the background timer
-        context.start_timer(strategy.check_interval());
-
+        // BaseWindow already starts a background timer, no need to start another one here
         let base_window = context.create_base_window(config.join.clone(), config.gap, resource)?;
 
         Ok(Self {
@@ -99,6 +95,8 @@ impl Buffer for SessionWindow {
         self.base_window.write(msg, ack).await?;
         // Update the last message timestamp to track session activity
         *self.last_message_time.write().await = Instant::now();
+        // Notify waiting readers that a new message has arrived
+        self.context.notify.notify_waiters();
         Ok(())
     }
 
@@ -126,8 +124,7 @@ impl Buffer for SessionWindow {
             }
 
             // Wait for notification from timer or write operation
-            let notify = Arc::clone(&self.context.notify);
-            notify.notified().await;
+            self.context.notify.notified().await;
         }
         // Process and return the current session
         self.base_window.process_window().await
@@ -138,12 +135,7 @@ impl Buffer for SessionWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
-        self.context.close();
-        if !self.base_window.queue_is_empty().await {
-            let notify = Arc::clone(&self.context.notify);
-            notify.notify_waiters();
-        }
-        Ok(())
+        self.base_window.flush().await
     }
 
     /// Closes the buffer by cancelling the background task
@@ -151,8 +143,7 @@ impl Buffer for SessionWindow {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn close(&self) -> Result<(), Error> {
-        self.context.close();
-        Ok(())
+        self.base_window.close().await
     }
 }
 

@@ -20,7 +20,6 @@
 //! multiple windows, providing a more continuous view of the data stream.
 
 use crate::buffer::common_window::CommonWindowContext;
-use crate::buffer::window_strategy::{SlidingWindowStrategy, WindowStrategy};
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::input::{Ack, VecAck};
@@ -68,14 +67,11 @@ impl SlidingWindow {
     /// # Returns
     /// * `Result<Self, Error>` - A new sliding window instance or an error
     fn new(config: SlidingWindowConfig) -> Result<Self, Error> {
-        let strategy = SlidingWindowStrategy::new(
-            time::Duration::from_secs(config.window_size as u64),
-            config.interval,
-        );
         let context = CommonWindowContext::new();
 
-        // Start the background timer
-        context.start_timer(strategy.check_interval());
+        // BaseWindow already starts a background timer (when used), no need to start another one here
+        // Note: SlidingWindow doesn't use BaseWindow, so it relies on CommonWindowContext's timer if needed
+        // For now, we remove the duplicate timer call
 
         Ok(Self {
             config,
@@ -151,6 +147,9 @@ impl Buffer for SlidingWindow {
     async fn write(&self, msg: MessageBatchRef, ack: Arc<dyn Ack>) -> Result<(), Error> {
         let mut queue_lock = self.queue.write().await;
         queue_lock.push_back((msg, ack));
+        drop(queue_lock);
+        // Notify waiting readers that a new message has arrived
+        self.context.notify.notify_waiters();
         Ok(())
     }
 
@@ -166,6 +165,9 @@ impl Buffer for SlidingWindow {
         }
 
         loop {
+            if self.context.is_closed() {
+                return Ok(None);
+            }
             {
                 let queue_lock = self.queue.read().await;
                 // If there are enough messages to form a window, break the loop and process them
@@ -175,8 +177,7 @@ impl Buffer for SlidingWindow {
                 // If the buffer is closed, return None
             }
             // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.context.notify);
-            notify.notified().await;
+            self.context.notify.notified().await;
         }
         // Process the current window and slide forward
         self.process_slide().await
@@ -191,8 +192,7 @@ impl Buffer for SlidingWindow {
         let queue_lock = self.queue.read().await;
         if !queue_lock.is_empty() {
             // Notify any waiting readers to process remaining messages
-            let notify = Arc::clone(&self.context.notify);
-            notify.notify_waiters();
+            self.context.notify.notify_waiters();
         }
         Ok(())
     }
