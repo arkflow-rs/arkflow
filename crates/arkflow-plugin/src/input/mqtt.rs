@@ -16,6 +16,7 @@
 //!
 //! Receive data from the MQTT broker
 
+use crate::mqtt_client::{create_mqtt_options, parse_qos};
 use arkflow_core::codec::Codec;
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
@@ -23,7 +24,7 @@ use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
+use rumqttc::{AsyncClient, Event, Packet, Publish};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -92,34 +93,23 @@ impl MqttInput {
 #[async_trait]
 impl Input for MqttInput {
     async fn connect(&self) -> Result<(), Error> {
-        // Create MQTT options
-        let mut mqtt_options =
-            MqttOptions::new(&self.config.client_id, &self.config.host, self.config.port);
+        // Create MQTT options using shared utility
+        let mut mqtt_options = create_mqtt_options(
+            &self.config.client_id,
+            &self.config.host,
+            self.config.port,
+            self.config.username.as_deref(),
+            self.config.password.as_deref(),
+            self.config.keep_alive,
+            self.config.clean_session,
+        );
         mqtt_options.set_manual_acks(true);
-        // Set the authentication information
-        if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            mqtt_options.set_credentials(username, password);
-        }
-
-        // Set the keep-alive time
-        if let Some(keep_alive) = self.config.keep_alive {
-            mqtt_options.set_keep_alive(std::time::Duration::from_secs(keep_alive));
-        }
-
-        // Set up a clean session
-        if let Some(clean_session) = self.config.clean_session {
-            mqtt_options.set_clean_session(clean_session);
-        }
 
         // Create an MQTT client
         let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+
         // Subscribe to topics
-        let qos_level = match self.config.qos {
-            Some(0) => QoS::AtMostOnce,
-            Some(1) => QoS::AtLeastOnce,
-            Some(2) => QoS::ExactlyOnce,
-            _ => QoS::AtLeastOnce, // Default is QoS 1
-        };
+        let qos_level = parse_qos(self.config.qos);
 
         for topic in &self.config.topics {
             client.subscribe(topic, qos_level).await.map_err(|e| {

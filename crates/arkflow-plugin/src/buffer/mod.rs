@@ -11,12 +11,14 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+pub mod common_window;
 mod join;
 pub mod memory;
 pub mod session_window;
 pub mod sliding_window;
 pub mod tumbling_window;
 pub(crate) mod window;
+pub mod window_strategy;
 
 use arkflow_core::Error;
 
