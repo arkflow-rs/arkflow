@@ -81,6 +81,24 @@ impl Stream {
 
     /// Running stream processing
     pub async fn run(&mut self, cancellation_token: CancellationToken) -> Result<(), Error> {
+        let result = self.run_inner(cancellation_token).await;
+
+        // Always close, even on error, so already-connected resources
+        // (input/output/error_output/temporaries/WAL) are released when
+        // recovery or worker setup fails. close() logs internally and
+        // continues on per-component errors, matching the established
+        // close-time policy.
+        info!("Closing....");
+        if let Err(e) = self.close().await {
+            error!("Failed to close: {}", e);
+        }
+        info!("Closed.");
+        info!("Exited.");
+
+        result
+    }
+
+    async fn run_inner(&mut self, cancellation_token: CancellationToken) -> Result<(), Error> {
         // Connect input and output
         self.input.connect().await?;
         self.output.connect().await?;
@@ -95,6 +113,21 @@ impl Stream {
             flume::bounded::<(MessageBatchRef, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
             flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
+
+        // WAL recovery: replay any entries past the committed cursor before
+        // spawning workers. Lives in `run_inner` (not `do_input`) so a failure
+        // here fails stream startup rather than silently continuing into the
+        // input loop. Replayed entries carry a NoopAck source (we replay from
+        // the WAL, not a live source) wrapped in WalAck so the cursor advances
+        // on downstream confirmation.
+        if let Some(wal) = &self.wal {
+            let entries = wal.read_after_cursor()?;
+            info!("WAL recovery: replaying {} entries", entries.len());
+            for (seq, msg) in entries {
+                let ack: Arc<dyn Ack> = Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
+                Self::forward(msg, ack, &self.buffer, &input_sender).await?;
+            }
+        }
 
         let tracker = TaskTracker::new();
 
@@ -132,7 +165,6 @@ impl Stream {
 
         // Close the output sender to notify all workers
         drop(output_sender);
-        // drop(error_output_sender);
 
         // Output
         tracker.spawn(Self::do_output(
@@ -144,11 +176,6 @@ impl Stream {
 
         tracker.close();
         tracker.wait().await;
-
-        info!("Closing....");
-        self.close().await?;
-        info!("Closed.");
-        info!("Exited.");
 
         Ok(())
     }
@@ -178,28 +205,6 @@ impl Stream {
         buffer_option: Option<Arc<dyn Buffer>>,
         wal: Option<Arc<Wal>>,
     ) {
-        // Recovery: replay any WAL entries past the committed cursor before
-        // reading new input. Replayed entries carry a NoopAck source (we replay
-        // from the WAL, not a live source) wrapped in WalAck so the cursor
-        // advances on downstream confirmation.
-        if let Some(wal) = &wal {
-            match wal.read_after_cursor() {
-                Ok(entries) => {
-                    info!("WAL recovery: replaying {} entries", entries.len());
-                    for (seq, msg) in entries {
-                        let ack: Arc<dyn Ack> =
-                            Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
-                        if let Err(e) = Self::forward(msg, ack, &buffer_option, &input_sender).await
-                        {
-                            error!("Failed to forward replayed message: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => error!("WAL recovery: failed to read WAL: {}", e),
-            }
-        }
-
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
@@ -512,6 +517,7 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
     use crate::input::{Input, NoopAck};
     use crate::output::Output;
     use crate::pipeline::Pipeline;
@@ -521,6 +527,7 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::record_batch::RecordBatch;
     use std::collections::VecDeque;
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use tokio::sync::Mutex;
 
@@ -576,6 +583,10 @@ mod tests {
     }
 
     fn sample_batch() -> MessageBatch {
+        sample_batch_with_value(1)
+    }
+
+    fn sample_batch_with_value(v: i64) -> MessageBatch {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -583,7 +594,7 @@ mod tests {
             false,
         )]));
         let batch =
-            RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![1]))])
+            RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![v]))])
                 .unwrap();
         MessageBatch::new_arrow(batch)
     }
@@ -757,6 +768,260 @@ mod tests {
             .expect("stream did not terminate in time")
             .unwrap();
         assert!(res.is_ok(), "stream without WAL must close cleanly");
+    }
+
+    /// Buffer that always fails on `write`. Used to drive recovery's
+    /// `Self::forward` into the error path during a durability-enabled
+    /// stream's startup.
+    struct FailingBuffer;
+
+    #[async_trait]
+    impl Buffer for FailingBuffer {
+        async fn write(&self, _msg: MessageBatchRef, _ack: Arc<dyn Ack>) -> Result<(), Error> {
+            Err(Error::Process("stub buffer intentionally fails".into()))
+        }
+
+        async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
+            Ok(None)
+        }
+
+        async fn flush(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// WAL corruption must surface before the stream enters its running state.
+    ///
+    /// redb 2.6.3 verifies the entire B-tree at `Database::open` time (via
+    /// `verify_primary_checksums` in `redb/src/db.rs:783 do_repair`), so
+    /// corruptions that would make `read_after_cursor` return `Err` are
+    /// detected when `Wal::open` is called from `StreamConfig::build` —
+    /// before `Stream::run` is reached. The structural `?` propagation in
+    /// `Stream::run_inner` covers the hypothetical case where redb ever
+    /// lets a corruption through to read time, but constructing that
+    /// scenario deterministically requires mocking `Wal`, which is out of
+    /// scope for this change.
+    #[tokio::test]
+    async fn wal_corruption_surfaces_before_stream_run() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::PerEntry,
+        };
+
+        // Phase 1: write a valid WAL with one unacked entry, then close.
+        {
+            let wal = Wal::open(&cfg).unwrap();
+            wal.append(&Arc::new(sample_batch())).await.unwrap();
+            wal.close().await.unwrap();
+        }
+
+        // Phase 2: corrupt the WAL file (same手法 as
+        // `wal::tests::corrupted_store_surfaces_error`).
+        let db_path = dir.join("wal.redb");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        f.write_all(&[0xFFu8; 256]).unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        // Phase 3: re-opening the WAL fails. In the production flow this
+        // error surfaces from `StreamConfig::build` (which calls
+        // `Wal::open`), so the stream never reaches `run()`.
+        let result = Wal::open(&cfg);
+        assert!(
+            result.is_err(),
+            "WAL corruption must surface before stream startup completes"
+        );
+    }
+
+    /// When `Wal::read_after_cursor()` returns entries but forwarding one of
+    /// them into the downstream buffer fails, `Stream::run` MUST return
+    /// `Err` rather than silently breaking out of the replay loop and
+    /// reading new input. The WAL cursor MUST NOT advance for the failed
+    /// entry, so the entry remains pending for the next restart.
+    #[tokio::test]
+    async fn stream_run_returns_err_when_recovery_forward_fails() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::PerEntry,
+        };
+        let wal = Wal::open(&cfg).unwrap();
+
+        // Persist one unacked entry so `read_after_cursor` returns it.
+        wal.append(&Arc::new(sample_batch())).await.unwrap();
+        assert_eq!(wal.cursor(), 0, "cursor must start at 0");
+
+        // The failing buffer is configured on the stream, so recovery's
+        // `Self::forward(msg, ack, &self.buffer, &input_sender)` routes via
+        // `buffer.write`, which always returns `Err`.
+        let buffer: Arc<dyn Buffer> = Arc::new(FailingBuffer);
+
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(VecDeque::new()),
+        });
+        let output: Arc<dyn Output> = Arc::new(StubOutput);
+        let pipeline = Pipeline::new(vec![]);
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            Some(buffer),
+            Some(wal.clone()),
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        let result = stream.run(CancellationToken::new()).await;
+        assert!(
+            result.is_err(),
+            "Stream::run must surface recovery forward failure as Err (got {result:?})"
+        );
+        // Cursor must not advance — the failed entry remains pending.
+        assert_eq!(
+            wal.cursor(),
+            0,
+            "cursor must not advance on recovery forward failure"
+        );
+
+        wal.close().await.unwrap();
+    }
+
+    /// Records the first cell of column 0 for every batch written. Used to
+    /// assert ordering between replayed entries and freshly-read input.
+    #[derive(Default)]
+    struct RecordingOutput {
+        received: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl Output for RecordingOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+            let arr = msg.column(0);
+            let arr = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("RecordingOutput expects an Int64 column 0");
+            self.received.lock().await.push(arr.value(0));
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// End-to-end coverage for the happy recovery path (spec scenario 4):
+    ///
+    /// - Stream starts with an unacked entry persisted in the WAL.
+    /// - `Stream::run_inner` replays it via `WalAck(NoopAck)` before any
+    ///   worker is spawned.
+    /// - The replayed entry flows through the pipeline, the output worker
+    ///   acknowledges it, and the WAL cursor advances.
+    /// - Only after replay does `do_input` read new input, so the output
+    ///   observes `[replayed, new]` in that order.
+    ///
+    /// Existing WAL-layer tests cover the cursor mechanics; this test pins
+    /// the `Stream::run`-level ordering and ack feedback loop.
+    #[tokio::test]
+    async fn stream_run_replays_unacked_entries_before_new_input() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::PerEntry,
+        };
+
+        // Phase 1: persist one unacked entry to the WAL, simulating a crash
+        // before downstream acknowledgement.
+        const REPLAYED_VALUE: i64 = 100;
+        {
+            let wal = Wal::open(&cfg).unwrap();
+            wal.append(&Arc::new(sample_batch_with_value(REPLAYED_VALUE)))
+                .await
+                .unwrap();
+            assert_eq!(wal.cursor(), 0, "cursor must stay at 0 until ack");
+            wal.close().await.unwrap();
+        }
+
+        // Phase 2: reopen the WAL (simulating restart) and wire a fresh input
+        // message. The stream must replay the WAL entry *before* consuming the
+        // new input.
+        const NEW_VALUE: i64 = 200;
+        let wal = Wal::open(&cfg).unwrap();
+        let mut input_queue = VecDeque::new();
+        input_queue.push_back(sample_batch_with_value(NEW_VALUE));
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(input_queue),
+        });
+        let recording_output = Arc::new(RecordingOutput::default());
+        let output: Arc<dyn Output> = recording_output.clone();
+        let pipeline = Pipeline::new(vec![]);
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            None,
+            Some(wal.clone()),
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let run_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.run(cancel))
+                .await
+                .expect("stream did not terminate in time");
+        assert!(
+            run_result.is_ok(),
+            "happy recovery path must complete without error (got {run_result:?})"
+        );
+
+        // Cursor advanced twice: once for the replayed entry (acked via
+        // WalAck(NoopAck)) and once for the freshly-read input (acked via
+        // WalAck(source_ack) after the output worker confirms). Both
+        // acknowledgements flowing through `WalAck` is exactly the contract
+        // spec scenario 4 calls for.
+        assert_eq!(
+            wal.cursor(),
+            2,
+            "WAL cursor must advance for both the replayed entry and the new input"
+        );
+
+        // The new input message was consumed after replay. Both reached the
+        // output in the order [replayed, new] — proving replay is not skipped
+        // and is sequenced before fresh ingestion.
+        let received = recording_output.received.lock().await.clone();
+        assert_eq!(
+            received,
+            vec![REPLAYED_VALUE, NEW_VALUE],
+            "replayed entry must reach output before newly-read input"
+        );
+
+        wal.close().await.unwrap();
     }
 }
 
