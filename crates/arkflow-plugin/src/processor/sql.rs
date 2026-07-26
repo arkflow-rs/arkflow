@@ -17,6 +17,7 @@
 //! DataFusion is used to process data with SQL queries.
 
 use crate::{context_pool::SessionContextPool, expr};
+use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::temporary::Temporary;
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
@@ -244,7 +245,35 @@ impl ProcessorBuilder for SqlProcessorBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_processor_builder("sql", Arc::new(SqlProcessorBuilder))
+    register_processor_builder("sql", Arc::new(SqlProcessorBuilder))?;
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "sql",
+        "Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "description": "SQL query to run on every batch."},
+                "table_name": {"type": "string", "description": "Name used for the batch table in the query (default 'flow')."},
+                "temporary_list": {
+                    "type": "array",
+                    "description": "Temporary tables to register before running the query.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "table_name": {"type": "string"},
+                            "key": {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}
+                        },
+                        "required": ["name", "table_name", "key"]
+                    }
+                }
+            },
+            "required": ["query"]
+        }),
+    ).with_example(serde_json::json!({
+        "query": "SELECT *, __meta_source AS source FROM flow"
+    })))
 }
 
 #[cfg(test)]

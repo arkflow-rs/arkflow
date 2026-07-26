@@ -18,6 +18,7 @@
 //! It's useful for testing or when you want to intentionally discard data.
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -60,7 +61,11 @@ impl OutputBuilder for DropOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("drop", Arc::new(DropOutputBuilder))
+    register_output_builder("drop", Arc::new(DropOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::unit(
+        "drop",
+        "Discards all messages. Useful for performance benchmarks and dead-end pipelines.",
+    ))
 }
 
 #[cfg(test)]

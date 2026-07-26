@@ -17,6 +17,7 @@
 //! A processor for converting between binary data and the Arrow format
 
 use crate::component;
+use arkflow_core::component::{register_processor_metadata, ComponentMetadata as CoreComponentMetadata};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{
     Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,
@@ -154,6 +155,28 @@ impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
 pub fn init() -> Result<(), Error> {
     register_processor_builder("arrow_to_json", Arc::new(ArrowToJsonProcessorBuilder))?;
     register_processor_builder("json_to_arrow", Arc::new(JsonToArrowProcessorBuilder))?;
+    register_processor_metadata(CoreComponentMetadata::with_schema(
+        "arrow_to_json",
+        "Converts an Arrow RecordBatch into JSON byte payloads (one per row).",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "pretty": {"type": "boolean", "default": false, "description": "Pretty-print JSON output."}
+            }
+        }),
+    ).with_optional())?;
+    register_processor_metadata(CoreComponentMetadata::with_schema(
+        "json_to_arrow",
+        "Parses JSON byte payloads into an Arrow RecordBatch with inferred schema.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "batch_size": {"type": "integer", "minimum": 1, "description": "Rows per output batch."}
+            }
+        }),
+    ).with_optional())?;
     Ok(())
 }
 

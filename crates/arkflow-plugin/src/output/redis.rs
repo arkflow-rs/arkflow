@@ -13,6 +13,7 @@
  */
 use crate::component::redis::{Connection, Mode};
 use crate::expr::Expr;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -188,5 +189,37 @@ impl OutputBuilder for RedisOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    arkflow_core::output::register_output_builder("redis", Arc::new(RedisOutputBuilder))
+    arkflow_core::output::register_output_builder("redis", Arc::new(RedisOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "redis",
+        "Writes messages to Redis: streams, lists, or pub/sub channels.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mode": {
+                    "type": "object",
+                    "description": "Connection mode (single or cluster).",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "cluster"}, "urls": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "urls"]},
+                        {"properties": {"type": {"const": "single"}, "url": {"type": "string"}}, "required": ["type", "url"]}
+                    ]
+                },
+                "redis_type": {
+                    "type": "object",
+                    "description": "Destination data structure.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "stream"}, "stream": {"type": "string"}}, "required": ["type", "stream"]},
+                        {"properties": {"type": {"const": "list"}, "list": {"type": "string"}}, "required": ["type", "list"]},
+                        {"properties": {"type": {"const": "channel"}, "channel": {"type": "string"}}, "required": ["type", "channel"]}
+                    ]
+                },
+                "value_field": {"type": "string", "description": "Record field used as the payload."}
+            },
+            "required": ["mode", "redis_type"]
+        }),
+    ).with_example(serde_json::json!({
+        "mode": {"type": "single", "url": "redis://localhost:6379"},
+        "redis_type": {"type": "stream", "stream": "events"}
+    })))
 }

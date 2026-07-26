@@ -17,6 +17,7 @@
 //! Receive data from Redis pub/sub channels
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
@@ -493,5 +494,38 @@ impl InputBuilder for RedisInputBuilder {
 
 /// Initialize Redis input component
 pub fn init() -> Result<(), Error> {
-    register_input_builder("redis", Arc::new(RedisInputBuilder))
+    register_input_builder("redis", Arc::new(RedisInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "redis",
+        "Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mode": {
+                    "type": "object",
+                    "description": "Connection mode.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "cluster"}, "urls": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "urls"]},
+                        {"properties": {"type": {"const": "single"}, "url": {"type": "string"}}, "required": ["type", "url"]}
+                    ]
+                },
+                "redis_type": {
+                    "type": "object",
+                    "description": "Data structure to consume from.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "subscribe"}, "subscribe": {"type": "object", "oneOf": [
+                            {"properties": {"type": {"const": "channels"}, "channels": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "channels"]},
+                            {"properties": {"type": {"const": "patterns"}, "patterns": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "patterns"]}
+                        ]}}, "required": ["type", "subscribe"]},
+                        {"properties": {"type": {"const": "list"}, "list": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "list"]}
+                    ]
+                }
+            },
+            "required": ["mode", "redis_type"]
+        }),
+    ).with_example(serde_json::json!({
+        "mode": {"type": "single", "url": "redis://localhost:6379"},
+        "redis_type": {"type": "list", "list": ["events"]}
+    })))
 }

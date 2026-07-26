@@ -20,6 +20,7 @@
 
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
+use arkflow_core::component::{register_buffer_metadata, ComponentMetadata};
 use arkflow_core::input::Ack;
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -269,7 +270,20 @@ impl BufferBuilder for MemoryBufferBuilder {
 /// # Returns
 /// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
-    register_buffer_builder("memory", Arc::new(MemoryBufferBuilder))
+    register_buffer_builder("memory", Arc::new(MemoryBufferBuilder))?;
+    register_buffer_metadata(ComponentMetadata::with_schema(
+        "memory",
+        "In-memory buffer that releases a batch when it reaches capacity or after a timeout.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "capacity": {"type": "integer", "minimum": 1, "description": "Maximum number of messages to accumulate before releasing."},
+                "timeout": {"type": "string", "description": "Maximum time to wait before releasing a partial batch (humantime)."}
+            },
+            "required": ["capacity", "timeout"]
+        }),
+    ).with_example(serde_json::json!({"capacity": 1000, "timeout": "5s"})))
 }
 
 #[cfg(test)]

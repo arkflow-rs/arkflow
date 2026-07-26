@@ -17,6 +17,7 @@
 //! Write the processed data to InfluxDB 2.x
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -519,7 +520,35 @@ impl OutputBuilder for InfluxDBOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("influxdb", Arc::new(InfluxDBOutputBuilder))
+    register_output_builder("influxdb", Arc::new(InfluxDBOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "influxdb",
+        "Writes time-series data to InfluxDB v2.x using the Line Protocol.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "InfluxDB server URL (e.g. http://localhost:8086)."},
+                "org": {"type": "string", "description": "Organization name."},
+                "bucket": {"type": "string", "description": "Destination bucket."},
+                "token": {"type": "string", "description": "Authentication token."},
+                "measurement": {"type": "string", "description": "Measurement name."},
+                "tags": {"type": "array", "description": "Tag mappings (label fields)."},
+                "fields": {"type": "array", "description": "Field mappings (value fields)."},
+                "timestamp_field": {"type": "string", "description": "Source field for the point timestamp."},
+                "batch_size": {"type": "integer", "minimum": 1, "description": "Batch size for write requests."},
+                "flush_interval": {"type": "string", "description": "Maximum time to wait before flushing a partial batch."}
+            },
+            "required": ["url", "org", "bucket", "token", "measurement", "fields"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "http://localhost:8086",
+        "org": "arkflow",
+        "bucket": "metrics",
+        "token": "${INFLUX_TOKEN}",
+        "measurement": "sensor",
+        "fields": [{"name": "value", "value_type": "float"}]
+    })))
 }
 
 #[cfg(test)]

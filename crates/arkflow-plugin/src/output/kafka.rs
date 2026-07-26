@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use arkflow_core::{
     codec::Codec,
+    component::{register_output_metadata, ComponentMetadata},
     output::{register_output_builder, Output, OutputBuilder},
     Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
@@ -308,5 +309,26 @@ impl OutputBuilder for KafkaOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("kafka", Arc::new(KafkaOutputBuilder))
+    register_output_builder("kafka", Arc::new(KafkaOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "kafka",
+        "Produces messages to Apache Kafka. Supports key-based partitioning and compression.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brokers": {"type": "array", "items": {"type": "string"}, "description": "List of Kafka broker addresses."},
+                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
+                "key": {"type": "string", "description": "Field used as the message key for partitioning."},
+                "client_id": {"type": "string", "description": "Optional client identifier."},
+                "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4", "zstd"], "description": "Compression algorithm."},
+                "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
+                "value_field": {"type": "string", "description": "Record field used as the message payload."}
+            },
+            "required": ["brokers", "topic"]
+        }),
+    ).with_example(serde_json::json!({
+        "brokers": ["localhost:9092"],
+        "topic": "events"
+    })))
 }

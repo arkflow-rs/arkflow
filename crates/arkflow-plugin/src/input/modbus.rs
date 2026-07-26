@@ -13,6 +13,7 @@
  */
 use crate::time::deserialize_duration;
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
     Error, MessageBatch, MessageBatchRef, Resource,
@@ -235,5 +236,37 @@ impl InputBuilder for ModbusInputBuilder {
 
 pub fn init() -> Result<(), Error> {
     arkflow_core::input::register_input_builder("modbus", Arc::new(ModbusInputBuilder))?;
-    Ok(())
+    register_input_metadata(ComponentMetadata::with_schema(
+        "modbus",
+        "Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "addr": {"type": "string", "description": "Modbus server address (host:port)."},
+                "slave_id": {"type": "integer", "description": "Modbus unit / slave ID."},
+                "points": {
+                    "type": "array",
+                    "description": "Points to read on every poll.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["coils", "discrete_inputs", "holding_registers", "input_registers"]},
+                            "name": {"type": "string"},
+                            "address": {"type": "integer"},
+                            "quantity": {"type": "integer", "minimum": 1}
+                        },
+                        "required": ["type", "name", "address", "quantity"]
+                    }
+                },
+                "interval": {"type": "string", "description": "Poll interval (humantime)."}
+            },
+            "required": ["addr", "slave_id", "points", "interval"]
+        }),
+    ).with_example(serde_json::json!({
+        "addr": "127.0.0.1:502",
+        "slave_id": 1,
+        "interval": "1s",
+        "points": [{"type": "holding_registers", "name": "voltage", "address": 0, "quantity": 1}]
+    })))
 }
