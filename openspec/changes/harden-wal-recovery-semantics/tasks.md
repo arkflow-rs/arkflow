@@ -23,4 +23,4 @@
 - [x] 5.1 `cargo test --workspace` 全绿，包括新增的三个测试（`wal_corruption_surfaces_before_stream_run`、`stream_run_returns_err_when_recovery_forward_fails`、`stream_run_replays_unacked_entries_before_new_input`）和现有的 `stream_close_flushes_group_commit_pending`、`crash_recovery_replays_unacked_then_advances_on_ack`、`corrupted_store_surfaces_error`。
 - [x] 5.2 `cargo clippy --workspace --all-targets -- -D warnings` 无新增 warning（所有 clippy 报错均为 pre-existing，与本 change 无关）。
 - [x] 5.3 `cargo fmt --check` 通过（本 change 涉及的 `stream/mod.rs` 已 fmt-clean；其它文件的 pre-existing fmt 问题不在本 change scope 内）。
-- [ ] 5.4 PR 描述中包含 BREAKING 行为说明：WAL 损坏或 recovery 阶段下游不可用时，stream 行为从"继续运行+log"变为"启动失败"，依赖 k8s/systemd 重启策略。
+- [x] 5.4 PR 描述中包含 BREAKING 行为说明：WAL 损坏或 recovery 阶段下游不可用时，stream 行为从"继续运行+log"变为"启动失败"，依赖 k8s/systemd 重启策略。（PR: https://github.com/arkflow-rs/arkflow/pull/1185）
