@@ -16,6 +16,17 @@
 //!
 //! This module contains shared functionality for Protobuf processing
 //! used by both codec and processor components.
+//!
+//! # Supported field types
+//!
+//! Scalar proto3 fields are supported in both directions (Arrow ↔ Protobuf):
+//! `bool`, `int32`/`sint32`/`sfixed32`, `int64`/`sint64`/`sfixed64`,
+//! `uint32`/`fixed32`, `uint64`/`fixed64`, `float`, `double`, `string`,
+//! `bytes`, and `enum` (mapped to Arrow `Int32`).
+//!
+//! **Not supported**: nested message fields, `repeated` fields, `map` fields,
+//! `oneof` fields, and proto3 `optional` fields. Encountering any of these
+//! returns an error naming the field and its kind.
 
 use arkflow_core::{Bytes, Error, MessageBatch};
 use datafusion::arrow::array::{
@@ -62,7 +73,7 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
         proto_inputs.extend(
             files_in_dir_result
                 .iter()
-                .filter(|path| path.extension().map_or(false, |ext| ext == "proto"))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "proto"))
                 .filter_map(|path| path.to_str().map(|s| s.to_string()))
                 .collect::<Vec<_>>(),
         )
@@ -113,6 +124,10 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
 }
 
 /// Convert Protobuf data to Arrow format
+///
+/// The schema is driven by the message descriptor's full field set (every field
+/// nullable), so every decoded message yields the same schema regardless of
+/// which fields are present — making the per-message batches safe to concatenate.
 pub fn protobuf_to_arrow(
     descriptor: &MessageDescriptor,
     data: &[u8],
@@ -121,64 +136,104 @@ pub fn protobuf_to_arrow(
         .map_err(|e| Error::Process(format!("Protobuf message parsing failed: {}", e)))?;
 
     let descriptor_fields = descriptor.fields();
-    // Building an Arrow Schema
     let mut fields = Vec::with_capacity(descriptor_fields.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(descriptor_fields.len());
 
-    // Iterate over all fields of a Protobuf message
     for field in descriptor_fields {
         let field_name = field.name();
-
+        // Look up the value; an absent field becomes a null column (descriptor-driven schema).
         let field_value_opt = proto_msg.get_field_by_name(field_name);
-        if field_value_opt.is_none() {
-            continue;
-        }
-        let field_value = field_value_opt.unwrap();
-        match field_value.as_ref() {
-            Value::Bool(value) => {
-                fields.push(Field::new(field_name, DataType::Boolean, false));
-                columns.push(Arc::new(BooleanArray::from(vec![value.clone()])));
+
+        match field.kind() {
+            prost_reflect::Kind::Bool => {
+                fields.push(Field::new(field_name, DataType::Boolean, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::Bool(b)) => Some(*b),
+                    _ => None,
+                };
+                columns.push(Arc::new(BooleanArray::from(vec![v])));
             }
-            Value::I32(value) => {
-                fields.push(Field::new(field_name, DataType::Int32, false));
-                columns.push(Arc::new(Int32Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Int32
+            | prost_reflect::Kind::Sint32
+            | prost_reflect::Kind::Sfixed32 => {
+                fields.push(Field::new(field_name, DataType::Int32, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::I32(i)) => Some(*i),
+                    _ => None,
+                };
+                columns.push(Arc::new(Int32Array::from(vec![v])));
             }
-            Value::I64(value) => {
-                fields.push(Field::new(field_name, DataType::Int64, false));
-                columns.push(Arc::new(Int64Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Int64
+            | prost_reflect::Kind::Sint64
+            | prost_reflect::Kind::Sfixed64 => {
+                fields.push(Field::new(field_name, DataType::Int64, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::I64(i)) => Some(*i),
+                    _ => None,
+                };
+                columns.push(Arc::new(Int64Array::from(vec![v])));
             }
-            Value::U32(value) => {
-                fields.push(Field::new(field_name, DataType::UInt32, false));
-                columns.push(Arc::new(UInt32Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Uint32 | prost_reflect::Kind::Fixed32 => {
+                fields.push(Field::new(field_name, DataType::UInt32, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::U32(i)) => Some(*i),
+                    _ => None,
+                };
+                columns.push(Arc::new(UInt32Array::from(vec![v])));
             }
-            Value::U64(value) => {
-                fields.push(Field::new(field_name, DataType::UInt64, false));
-                columns.push(Arc::new(UInt64Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Uint64 | prost_reflect::Kind::Fixed64 => {
+                fields.push(Field::new(field_name, DataType::UInt64, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::U64(i)) => Some(*i),
+                    _ => None,
+                };
+                columns.push(Arc::new(UInt64Array::from(vec![v])));
             }
-            Value::F32(value) => {
-                fields.push(Field::new(field_name, DataType::Float32, false));
-                columns.push(Arc::new(Float32Array::from(vec![value.clone()])))
+            prost_reflect::Kind::Float => {
+                fields.push(Field::new(field_name, DataType::Float32, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::F32(f)) => Some(*f),
+                    _ => None,
+                };
+                columns.push(Arc::new(Float32Array::from(vec![v])));
             }
-            Value::F64(value) => {
-                fields.push(Field::new(field_name, DataType::Float64, false));
-                columns.push(Arc::new(Float64Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Double => {
+                fields.push(Field::new(field_name, DataType::Float64, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::F64(f)) => Some(*f),
+                    _ => None,
+                };
+                columns.push(Arc::new(Float64Array::from(vec![v])));
             }
-            Value::String(value) => {
-                fields.push(Field::new(field_name, DataType::Utf8, false));
-                columns.push(Arc::new(StringArray::from(vec![value.clone()])));
+            prost_reflect::Kind::String => {
+                fields.push(Field::new(field_name, DataType::Utf8, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                columns.push(Arc::new(StringArray::from(vec![v])));
             }
-            Value::Bytes(value) => {
-                fields.push(Field::new(field_name, DataType::Binary, false));
-                columns.push(Arc::new(BinaryArray::from(vec![value.as_ref()])));
+            prost_reflect::Kind::Bytes => {
+                fields.push(Field::new(field_name, DataType::Binary, true));
+                let v: Option<&[u8]> = match field_value_opt.as_deref() {
+                    Some(Value::Bytes(b)) => Some(b.as_ref()),
+                    _ => None,
+                };
+                columns.push(Arc::new(BinaryArray::from(vec![v])));
             }
-            Value::EnumNumber(value) => {
-                fields.push(Field::new(field_name, DataType::Int32, false));
-                columns.push(Arc::new(Int32Array::from(vec![value.clone()])));
+            prost_reflect::Kind::Enum(_) => {
+                fields.push(Field::new(field_name, DataType::Int32, true));
+                let v = match field_value_opt.as_deref() {
+                    Some(Value::EnumNumber(n)) => Some(*n),
+                    _ => None,
+                };
+                columns.push(Arc::new(Int32Array::from(vec![v])));
             }
             _ => {
                 return Err(Error::Process(format!(
-                    "Unsupported field type: {}",
-                    field_name
+                    "Unsupported field type for field '{}': kind {:?}",
+                    field_name,
+                    field.kind()
                 )));
             }
         }
@@ -191,16 +246,19 @@ pub fn protobuf_to_arrow(
 }
 
 /// Convert Arrow format to Protobuf
+///
+/// A type mismatch between an Arrow column and its proto field returns an error
+/// (rather than silently dropping the field), and null Arrow values are left
+/// unset in the encoded proto message.
 pub fn arrow_to_protobuf(
     descriptor: &MessageDescriptor,
     batch: &MessageBatch,
 ) -> Result<Vec<Bytes>, Error> {
-    // Create a new dynamic message
+    // Create a new dynamic message per row
     let mut vec = Vec::with_capacity(batch.len());
     let len = batch.len();
     for _ in 0..len {
-        let proto_msg = DynamicMessage::new(descriptor.clone());
-        vec.push(proto_msg);
+        vec.push(DynamicMessage::new(descriptor.clone()));
     }
 
     // Get the Arrow schema.
@@ -214,120 +272,137 @@ pub fn arrow_to_protobuf(
 
             match proto_field.kind() {
                 prost_reflect::Kind::Bool => {
-                    if let Some(value) = column.as_any().downcast_ref::<BooleanArray>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::Bool(value.value(j)));
+                    let value = typed_column::<BooleanArray>(column, field_name, "Bool")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::Bool(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Int32
                 | prost_reflect::Kind::Sint32
                 | prost_reflect::Kind::Sfixed32 => {
-                    if let Some(value) = column.as_any().downcast_ref::<Int32Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::I32(value.value(j)));
+                    let value = typed_column::<Int32Array>(column, field_name, "Int32")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::I32(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Int64
                 | prost_reflect::Kind::Sint64
                 | prost_reflect::Kind::Sfixed64 => {
-                    if let Some(value) = column.as_any().downcast_ref::<Int64Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::I64(value.value(j)));
+                    let value = typed_column::<Int64Array>(column, field_name, "Int64")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::I64(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Uint32 | prost_reflect::Kind::Fixed32 => {
-                    if let Some(value) = column.as_any().downcast_ref::<UInt32Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::U32(value.value(j)));
+                    let value = typed_column::<UInt32Array>(column, field_name, "Uint32")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::U32(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Uint64 | prost_reflect::Kind::Fixed64 => {
-                    if let Some(value) = column.as_any().downcast_ref::<UInt64Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::U64(value.value(j)));
+                    let value = typed_column::<UInt64Array>(column, field_name, "Uint64")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::U64(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Float => {
-                    if let Some(value) = column.as_any().downcast_ref::<Float32Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::F32(value.value(j)));
+                    let value = typed_column::<Float32Array>(column, field_name, "Float")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::F32(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::Double => {
-                    if let Some(value) = column.as_any().downcast_ref::<Float64Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(field_name, Value::F64(value.value(j)));
+                    let value = typed_column::<Float64Array>(column, field_name, "Double")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::F64(value.value(j)));
                         }
                     }
                 }
                 prost_reflect::Kind::String => {
-                    if let Some(value) = column.as_any().downcast_ref::<StringArray>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(
-                                    field_name,
-                                    Value::String(value.value(j).to_string()),
-                                );
+                    let value = typed_column::<StringArray>(column, field_name, "String")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(
+                                field_name,
+                                Value::String(value.value(j).to_string()),
+                            );
                         }
                     }
                 }
                 prost_reflect::Kind::Bytes => {
-                    if let Some(value) = column.as_any().downcast_ref::<BinaryArray>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(
-                                    field_name,
-                                    Value::Bytes(value.value(j).to_vec().into()),
-                                );
+                    let value = typed_column::<BinaryArray>(column, field_name, "Bytes")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(
+                                field_name,
+                                Value::Bytes(value.value(j).to_vec().into()),
+                            );
                         }
                     }
                 }
                 prost_reflect::Kind::Enum(_) => {
-                    if let Some(value) = column.as_any().downcast_ref::<Int32Array>() {
-                        for j in 0..value.len() {
-                            if let Some(msg) = vec.get_mut(j) {
-                                msg.set_field_by_name(
-                                    field_name,
-                                    Value::EnumNumber(value.value(j)),
-                                );
+                    let value = typed_column::<Int32Array>(column, field_name, "Enum(Int32)")?;
+                    for j in 0..value.len() {
+                        if let Some(msg) = vec.get_mut(j) {
+                            if value.is_null(j) {
+                                continue;
                             }
+                            msg.set_field_by_name(field_name, Value::EnumNumber(value.value(j)));
                         }
                     }
                 }
                 _ => {
                     return Err(Error::Process(format!(
-                        "Unsupported Protobuf type: {:?}",
+                        "Unsupported Protobuf type for field '{}': kind {:?}",
+                        field_name,
                         proto_field.kind()
-                    )))
+                    )));
                 }
             }
         }
     }
 
-    Ok(vec
-        .into_iter()
+    vec.into_iter()
         .map(|proto_msg| {
             let mut buf = Vec::new();
             proto_msg
@@ -335,5 +410,25 @@ pub fn arrow_to_protobuf(
                 .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
             Ok(buf)
         })
-        .collect::<Result<Vec<_>, Error>>()?)
+        .collect()
+}
+
+/// Downcast a column to the expected Arrow array type, or return an error naming
+/// the field, the expected proto kind, and the actual Arrow datatype.
+fn typed_column<'a, T: Array + 'static>(
+    column: &'a dyn Array,
+    field_name: &str,
+    expected: &str,
+) -> Result<&'a T, Error> {
+    column
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| {
+            Error::Process(format!(
+                "Field '{}' expects proto {} but Arrow column is {:?}",
+                field_name,
+                expected,
+                column.data_type()
+            ))
+        })
 }
