@@ -313,15 +313,24 @@ impl Wal {
     /// Flush any staged appends and stop the background flusher. After this
     /// returns the flusher task has exited, so dropping the last `Arc<Wal>`
     /// closes the underlying database.
+    ///
+    /// The final flush result is returned so callers can surface a flush
+    /// failure rather than silently dropping it. The flusher task's join is
+    /// best-effort: a panic inside the flusher is logged and `Ok` is returned
+    /// so shutdown still proceeds.
     pub async fn close(&self) -> Result<(), Error> {
         self.close.cancel();
         if let Some(handle) = self.flusher.lock().await.take() {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                if e.is_panic() {
+                    tracing::error!("WAL flusher task panicked during shutdown");
+                }
+            }
         }
         // Best-effort final flush (no-op for per-entry; pending already drained
-        // by the flusher's shutdown branch otherwise).
-        let _ = self.flush_pending().await;
-        Ok(())
+        // by the flusher's shutdown branch otherwise). Surface the result so
+        // a torn-write / disk failure is not silently lost on graceful shutdown.
+        self.flush_pending().await
     }
 }
 

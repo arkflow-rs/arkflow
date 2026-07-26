@@ -189,8 +189,7 @@ impl Stream {
                     for (seq, msg) in entries {
                         let ack: Arc<dyn Ack> =
                             Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
-                        if let Err(e) =
-                            Self::forward(msg, ack, &buffer_option, &input_sender).await
+                        if let Err(e) = Self::forward(msg, ack, &buffer_option, &input_sender).await
                         {
                             error!("Failed to forward replayed message: {}", e);
                             break;
@@ -459,7 +458,11 @@ impl Stream {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        // Closing order: input -> pipeline -> buffer -> output -> error output
+        // Closing order: input -> buffer -> pipeline -> output -> error output
+        // -> WAL. The WAL is closed last so that any in-flight ack has already
+        // been drained by the output worker before the background flusher is
+        // stopped; this guarantees pending group-commit/periodic appends are
+        // flushed to disk before the stream terminates.
         info!("input close...");
         if let Err(e) = self.input.close().await {
             error!("Failed to close input: {}", e);
@@ -494,7 +497,266 @@ impl Stream {
         }
         info!("error output closed");
 
+        info!("wal close...");
+        if let Some(wal) = &self.wal {
+            if let Err(e) = wal.close().await {
+                error!("Failed to close WAL: {}", e);
+            }
+        }
+        info!("wal closed");
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{Input, NoopAck};
+    use crate::output::Output;
+    use crate::pipeline::Pipeline;
+    use crate::wal::SyncPolicy;
+    use crate::MessageBatch;
+    use async_trait::async_trait;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use tokio::sync::Mutex;
+
+    struct StubInput {
+        connected: std::sync::atomic::AtomicBool,
+        queue: Mutex<VecDeque<MessageBatch>>,
+    }
+
+    #[async_trait]
+    impl Input for StubInput {
+        async fn connect(&self) -> Result<(), Error> {
+            self.connected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            let msg = {
+                let mut q = self.queue.lock().await;
+                q.pop_front()
+            };
+            match msg {
+                Some(m) => Ok((Arc::new(m), Arc::new(NoopAck))),
+                None => Err(Error::EOF),
+            }
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            self.connected
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct StubOutput;
+
+    #[async_trait]
+    impl Output for StubOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            // Always fail so the output worker never advances the WAL cursor,
+            // leaving the message pending. This isolates the close-time flush
+            // behavior from the ack path.
+            Err(Error::Process("stub output intentionally fails".into()))
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn sample_batch() -> MessageBatch {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        MessageBatch::new_arrow(batch)
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, AtomicOrdering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "arkflow-stream-wal-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drive a stream that uses a group-commit WAL through `Stream::close()`
+    /// and assert that a pending append is durable on reopen. This exercises
+    /// the production close chain rather than calling `Wal::close()` directly.
+    #[tokio::test]
+    async fn stream_close_flushes_group_commit_pending() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        let wal = Wal::open(&cfg).unwrap();
+
+        // Build a stream with one queued message and an empty pipeline.
+        let mut input_queue = VecDeque::new();
+        input_queue.push_back(sample_batch());
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(input_queue),
+        });
+        let output: Arc<dyn Output> = Arc::new(StubOutput);
+        let pipeline = Pipeline::new(vec![]);
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            None,
+            Some(wal.clone()),
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        // Drive the stream to EOF and then exercise the full close path.
+        let cancel = CancellationToken::new();
+        let run_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { stream.run(cancel).await }
+        });
+        // Stream exits on EOF (the stub input returns EOF after the single
+        // queued message is consumed). Wait for run() to return.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("stream did not terminate in time")
+            .unwrap()
+            .unwrap();
+
+        // Drop the local Arc so the redb file lock is released before reopen.
+        drop(wal);
+
+        // Reopen the WAL and confirm the queued message was persisted despite
+        // the group-commit flusher never running on its timer.
+        let wal2 = Wal::open(&cfg).unwrap();
+        let pending = wal2.read_after_cursor().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "group-commit WAL must flush pending entries on Stream::close"
+        );
+        wal2.close().await.unwrap();
+    }
+
+    /// Same property for `periodic` sync policy — the periodic timer is much
+    /// longer than the test, so the only thing that can flush the staged entry
+    /// is `Stream::close()`.
+    #[tokio::test]
+    async fn stream_close_flushes_periodic_pending() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::Periodic(std::time::Duration::from_secs(60)),
+        };
+        let wal = Wal::open(&cfg).unwrap();
+
+        let mut input_queue = VecDeque::new();
+        input_queue.push_back(sample_batch());
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(input_queue),
+        });
+        let output: Arc<dyn Output> = Arc::new(StubOutput);
+        let pipeline = Pipeline::new(vec![]);
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            None,
+            Some(wal.clone()),
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let run_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { stream.run(cancel).await }
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("stream did not terminate in time")
+            .unwrap()
+            .unwrap();
+
+        drop(wal);
+
+        let wal2 = Wal::open(&cfg).unwrap();
+        let pending = wal2.read_after_cursor().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "periodic WAL must flush pending entries on Stream::close"
+        );
+        wal2.close().await.unwrap();
+    }
+
+    /// Streams without a WAL configured must close unchanged: no WAL step
+    /// should be attempted and the close should still return Ok.
+    #[tokio::test]
+    async fn stream_without_wal_close_is_unchanged() {
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(VecDeque::new()),
+        });
+        let output: Arc<dyn Output> = Arc::new(StubOutput);
+        let pipeline = Pipeline::new(vec![]);
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            None,
+            None,
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let run_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { stream.run(cancel).await }
+        });
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("stream did not terminate in time")
+            .unwrap();
+        assert!(res.is_ok(), "stream without WAL must close cleanly");
     }
 }
 
