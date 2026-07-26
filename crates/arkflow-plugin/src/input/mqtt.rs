@@ -245,13 +245,15 @@ struct MqttAck {
 }
 #[async_trait]
 impl Ack for MqttAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         let mutex_guard = self.client.lock().await;
         if let Some(client) = &*mutex_guard {
-            if let Err(e) = client.ack(&self.publish).await {
-                error!("{}", e);
-            }
+            client
+                .ack(&self.publish)
+                .await
+                .map_err(|e| Error::Process(format!("Failed to ack MQTT message: {}", e)))?;
         }
+        Ok(())
     }
 }
 

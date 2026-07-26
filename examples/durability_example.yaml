@@ -1,0 +1,43 @@
+# Durability (crash recovery) example.
+#
+# Enabling `durability:` on a stream persists every message read from the input
+# to a write-ahead log (WAL) before it enters the pipeline. The source is only
+# acknowledged after the downstream output confirms the write, so a crash between
+# read and output does not lose data: on restart, any unacknowledged messages are
+# replayed from the WAL.
+#
+# This is most valuable for NON-replayable sources (HTTP webhooks, Modbus,
+# Generate, files), which cannot re-deliver a message after a crash. For
+# replayable sources (Kafka/MQTT/NATS/Pulsar) the source itself can re-deliver,
+# but the WAL still guarantees no loss regardless of source settings.
+#
+# Semantics: at-least-once. After a crash, in-flight messages MAY be delivered
+# more than once, so outputs should tolerate duplicates (e.g. UPSERT sinks).
+# Single-node only: this survives process crashes, not the loss of the node
+# (the WAL lives on local disk).
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "value": 10, "sensor": "temp_1" }'
+      interval: 1ns
+      batch_size: 1
+      count: 1000
+
+    # Durable ingest: persist every message to ./data/wal before processing.
+    durability:
+      enabled: true
+      path: "./data/wal"
+      sync: "group_commit"   # per_entry | group_commit | periodic
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+        - type: "arrow_to_json"
+
+    output:
+      type: "stdout"

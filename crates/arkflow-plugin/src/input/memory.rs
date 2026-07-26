@@ -171,7 +171,7 @@ mod tests {
             String::from_utf8_lossy(result.get(0).unwrap()),
             "test message"
         );
-        ack.ack().await;
+        let _ = ack.ack().await;
     }
 
     #[tokio::test]

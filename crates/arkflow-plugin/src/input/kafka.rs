@@ -85,11 +85,12 @@ impl KafkaInput {
         let duration = std::time::Duration::from_millis(millis_u64);
         SystemTime::UNIX_EPOCH.checked_add(duration)
     }
-}
 
-#[async_trait]
-impl Input for KafkaInput {
-    async fn connect(&self) -> Result<(), Error> {
+    /// Build the rdkafka `ClientConfig` from the input configuration.
+    ///
+    /// Extracted from `connect()` so the crash-safety settings (notably
+    /// `enable.auto.offset.store=false`) are unit-testable without a broker.
+    fn build_client_config(&self) -> ClientConfig {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
@@ -129,6 +130,30 @@ impl Input for KafkaInput {
         } else {
             client_config.set("auto.offset.reset", "earliest");
         }
+
+        // Disable automatic offset storage so offsets are NOT advanced when a
+        // message is merely delivered to the application. With the default
+        // (`enable.auto.offset.store=true`) every `recv()` would store its
+        // offset, and the periodic auto-commit would then commit it to the
+        // broker before the downstream output has confirmed the write — a
+        // crash in between loses the message.
+        //
+        // Disabling it makes `store_offset()` (called in `KafkaAck::ack()`,
+        // which only fires after a successful `output.write()`) the sole way
+        // to advance the offset, giving at-least-once delivery across crashes.
+        // The periodic auto-commit (`enable.auto.commit=true`, the default)
+        // still runs, but it only commits offsets that have been explicitly
+        // stored — i.e. only acked messages.
+        client_config.set("enable.auto.offset.store", "false");
+
+        client_config
+    }
+}
+
+#[async_trait]
+impl Input for KafkaInput {
+    async fn connect(&self) -> Result<(), Error> {
+        let client_config = self.build_client_config();
 
         // Create consumers
         let consumer: StreamConsumer = client_config
@@ -256,14 +281,15 @@ pub struct KafkaAck {
 
 #[async_trait]
 impl Ack for KafkaAck {
-    async fn ack(&self) {
-        // Commit offsets
+    async fn ack(&self) -> Result<(), Error> {
+        // Store the offset so it is committed by the periodic auto-commit.
+        // Only called after the downstream output confirms the write.
         let consumer_mutex_guard = self.consumer.read().await;
         if let Some(v) = &*consumer_mutex_guard {
-            if let Err(e) = v.store_offset(&self.topic, self.partition, self.offset) {
-                tracing::error!("Error committing Kafka offset: {}", e);
-            }
+            v.store_offset(&self.topic, self.partition, self.offset)
+                .map_err(|e| Error::Process(format!("Failed to store Kafka offset: {}", e)))?;
         }
+        Ok(())
     }
 }
 
@@ -364,7 +390,7 @@ mod tests {
         };
 
         // Test acknowledgment, should have no effect since there is no actual consumer
-        ack.ack().await;
+        let _ = ack.ack().await;
         // This test mainly verifies that the ack method does not panic
     }
 
@@ -416,5 +442,98 @@ mod tests {
         ext_meta.insert("topic".to_string(), "test-topic".to_string());
         let result = metadata::with_ext_metadata(batch, &ext_meta);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_kafka_disables_auto_offset_store_for_crash_safety() {
+        // Phase 0 (add-input-durability): at-least-once crash-safety depends on
+        // offsets being stored ONLY inside `KafkaAck::ack()` (which fires after
+        // the downstream output confirms the write), never on `recv()`. Verify
+        // the consumer config disables rdkafka's automatic offset store.
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: false,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        let client_config = input.build_client_config();
+        assert_eq!(
+            client_config.get("enable.auto.offset.store"),
+            Some("false"),
+            "auto offset store MUST be disabled so offsets advance only on ack (at-least-once)"
+        );
+    }
+
+    /// Broker-gated integration test (Phase 0, task 1.3): proves a replayable
+    /// source re-delivers an unacknowledged message after a simulated crash,
+    /// because `enable.auto.offset.store=false` means the offset only advances
+    /// inside `KafkaAck::ack()` (which never fires below).
+    ///
+    /// Skipped unless `ARKFLOW_KAFKA_BROKER` is set. Run with:
+    /// `cargo test -p arkflow-plugin --lib input::kafka::tests::kafka_redelivers_unacked_after_restart -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn kafka_redelivers_unacked_after_restart() {
+        use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+        use std::time::Duration;
+
+        let broker = match std::env::var("ARKFLOW_KAFKA_BROKER") {
+            Ok(b) => b,
+            Err(_) => return, // no broker available — skip
+        };
+        let topic = std::env::var("ARKFLOW_KAFKA_TOPIC")
+            .unwrap_or_else(|_| "arkflow_durability_test".to_string());
+        let group = format!("arkflow-dur-test-{}", std::process::id());
+
+        fn cfg(brokers: &str, topics: &str, group: &str) -> KafkaInputConfig {
+            KafkaInputConfig {
+                brokers: vec![brokers.to_string()],
+                topics: vec![topics.to_string()],
+                consumer_group: group.to_string(),
+                client_id: None,
+                start_from_latest: false,
+                fetch_min_bytes: None,
+                fetch_max_bytes: None,
+                fetch_max_partition_bytes: None,
+                fetch_wait_max_ms: None,
+            }
+        }
+
+        // Produce one message.
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &broker)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .expect("producer create");
+        let payload_bytes = b"ping".to_vec();
+producer
+            .send(
+                FutureRecord::<String, Vec<u8>>::to(&topic).payload(&payload_bytes),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+        producer.flush(Duration::from_secs(10)).expect("flush");
+
+        // First consumer: read the message, do NOT ack (simulate a crash before
+        // the downstream output confirms). The offset is NOT stored.
+        let input = KafkaInput::new(None, cfg(&broker, &topic, &group), None).unwrap();
+        input.connect().await.unwrap();
+        let (_msg, _ack) = input.read().await.expect("first read must succeed");
+        drop(input); // crash without acking
+
+        // Reconnect with the same group: the message must be re-delivered.
+        let input2 = KafkaInput::new(None, cfg(&broker, &topic, &group), None).unwrap();
+        input2.connect().await.unwrap();
+        let (_msg2, _ack2) = input2
+            .read()
+            .await
+            .expect("unacked message must be re-delivered after restart (no loss)");
     }
 }
