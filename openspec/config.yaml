@@ -1,20 +1,34 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# Project context — shown to AI when creating artifacts.
+context: |
+  ArkFlow — high-performance Rust stream processing engine (Tokio + Apache Arrow/DataFusion).
+  Rust 1.88+. Cargo workspace with three crates:
+    - arkflow-core: engine abstractions and traits (Engine, Stream, Pipeline, MessageBatch,
+      and traits Input/Output/Processor/Buffer/Codec).
+    - arkflow-plugin: plugin implementations (input/output/processor/buffer/codec).
+    - arkflow: the main binary.
+  Plugin registration: lazy_static + RwLock<HashMap>; each plugin implements a builder trait
+  and registers via register_*_builder(); all plugins initialized through *_init() functions
+  called from crates/arkflow/src/main.rs.
+  Data model: Apache Arrow RecordBatch wrapped in MessageBatch (columnar); standardized
+  metadata columns prefixed with __meta_.
+  Data flow: Input → Buffer → [Processors] → Output, with backpressure at the 1024-message
+  channel threshold and ordered output via sequence numbers.
+  Config: hierarchical YAML; --validate flag validates config. Errors use thiserror + anyhow,
+  propagated as Result<T, Error>. Component traits use async-trait.
+  Build/test: cargo build --release; cargo test --workspace. Protobuf compiler required for CI.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+# Per-artifact rules.
+rules:
+  proposal:
+    - Always include a "Non-goals" section.
+    - In "Why", cite concrete file:line evidence for the current behavior.
+  design:
+    - Prefer surgical changes over rewrites; touch only what the task requires.
+  specs:
+    - Every Requirement MUST have at least one Scenario using WHEN/THEN.
+    - Use SHALL/MUST for normative statements.
+  tasks:
+    - Group by phase (one top-level section per phase).
+    - Each sub-task should be ≤ 2 hours and verifiable (a test, clippy, or a command check).
