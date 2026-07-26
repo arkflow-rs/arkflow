@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -141,7 +142,20 @@ impl InputBuilder for MemoryInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("memory", Arc::new(MemoryInputBuilder))
+    register_input_builder("memory", Arc::new(MemoryInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "memory",
+        "In-memory input queue seeded with an initial list of messages. Primarily for tests and demos.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "messages": {"type": "array", "items": {"type": "string"}, "description": "Initial messages to enqueue."}
+            }
+        }),
+    ).with_optional().with_example(serde_json::json!({
+        "messages": ["hello", "world"]
+    })))
 }
 
 #[cfg(test)]
@@ -171,7 +185,7 @@ mod tests {
             String::from_utf8_lossy(result.get(0).unwrap()),
             "test message"
         );
-        ack.ack().await;
+        let _ = ack.ack().await;
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@
 //!
 //! Send the processed data to the HTTP endpoint
 
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -231,5 +232,28 @@ impl OutputBuilder for HttpOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("http", Arc::new(HttpOutputBuilder))
+    register_output_builder("http", Arc::new(HttpOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "http",
+        "Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "Destination URL."},
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "default": "POST", "description": "HTTP method."},
+                "timeout_ms": {"type": "integer", "minimum": 1, "description": "Request timeout in milliseconds."},
+                "retry_count": {"type": "integer", "minimum": 0, "description": "Number of retry attempts on failure."},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Custom HTTP headers."},
+                "body_field": {"type": "string", "description": "Record field that holds the request body."},
+                "auth": {"type": "object", "description": "Authentication configuration."}
+            },
+            "required": ["url"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "https://example.com/ingest",
+        "method": "POST",
+        "timeout_ms": 5000,
+        "retry_count": 3
+    })))
 }

@@ -17,6 +17,7 @@
 //! Receive data from HTTP endpoints
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -215,7 +216,28 @@ impl InputBuilder for HttpInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("http", Arc::new(HttpInputBuilder))
+    register_input_builder("http", Arc::new(HttpInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "http",
+        "Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "address": {"type": "string", "description": "Bind address (server mode) or base URL (client mode)."},
+                "path": {"type": "string", "description": "Path to accept messages on (server mode) or full request path (client mode)."},
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "description": "HTTP method (client mode)."},
+                "interval": {"type": "string", "description": "Polling interval in humantime format (client mode, e.g. '5s')."},
+                "cors_enabled": {"type": "boolean", "default": false, "description": "Enable CORS for the server."},
+                "auth": {"type": "object", "description": "Authentication configuration."}
+            },
+            "required": ["address", "path"]
+        }),
+    ).with_example(serde_json::json!({
+        "address": "0.0.0.0:8080",
+        "path": "/ingest",
+        "cors_enabled": true
+    })))
 }
 
 async fn validate_auth(headers: &HeaderMap, auth_config: &AuthType) -> bool {

@@ -14,6 +14,7 @@
 
 use crate::udf;
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
@@ -479,7 +480,22 @@ impl InputBuilder for FileBuilder {
 
 pub fn init() -> Result<(), Error> {
     arkflow_core::input::register_input_builder("file", Arc::new(FileBuilder))?;
-    Ok(())
+    register_input_metadata(ComponentMetadata::with_schema(
+        "file",
+        "Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "input_type": {"type": "object", "description": "Format-specific input settings (type: csv/json/parquet/avro/arrow)."},
+                "ballista": {"type": "object", "description": "Optional Ballista distributed compute configuration."},
+                "query": {"type": "object", "description": "Optional SQL query and table name to filter the read."}
+            },
+            "required": ["input_type"]
+        }),
+    ).with_example(serde_json::json!({
+        "input_type": {"type": "parquet", "path": "s3://bucket/data.parquet"}
+    })))
 }
 
 fn default_disallow_http() -> bool {

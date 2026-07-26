@@ -17,6 +17,7 @@
 //! Receive data from a NATS subject
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::error;
 
 /// NATS input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,23 +451,49 @@ enum NatsAck {
 
 #[async_trait]
 impl Ack for NatsAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         match self {
             NatsAck::Regular => {
                 // For regular NATS messages, there's no explicit acknowledgment
+                Ok(())
             }
             NatsAck::JetStream { message } => {
                 // Acknowledge JetStream message
-                if let Err(e) = message.ack().await {
-                    warn!("Failed to acknowledge JetStream message: {}", e);
-                }
+                message
+                    .ack()
+                    .await
+                    .map_err(|e| Error::Process(format!("Failed to ack JetStream message: {}", e)))
             }
         }
     }
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("nats", Arc::new(NatsInputBuilder))
+    register_input_builder("nats", Arc::new(NatsInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "nats",
+        "Consumes messages from NATS, supporting both regular subjects and JetStream consumers.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "NATS server URL (e.g. nats://localhost:4222)."},
+                "mode": {
+                    "type": "object",
+                    "description": "Select between plain NATS and JetStream subscriptions.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "regular"}, "subject": {"type": "string"}, "queue_group": {"type": "string"}}, "required": ["type", "subject"]},
+                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "consumer_name": {"type": "string"}, "durable_name": {"type": "string"}}, "required": ["type", "stream", "consumer_name"]}
+                    ]
+                },
+                "auth": {"type": "object", "description": "NATS authentication configuration."}
+            },
+            "required": ["url", "mode"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "nats://localhost:4222",
+        "mode": {"type": "regular", "subject": "events"}
+    })))
 }
 
 #[cfg(test)]

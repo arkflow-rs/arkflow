@@ -20,6 +20,7 @@ use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
 };
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
+use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
@@ -131,6 +132,20 @@ impl CodecBuilder for ProtobufCodecBuilder {
 
 pub(crate) fn init() -> Result<(), Error> {
     codec::register_codec_builder("protobuf", Arc::new(ProtobufCodecBuilder))?;
+    register_codec_metadata(ComponentMetadata::with_schema(
+        "protobuf",
+        "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
+                "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+            },
+            "required": ["message_type", "proto_inputs"]
+        }),
+    ))?;
     Ok(())
 }
 

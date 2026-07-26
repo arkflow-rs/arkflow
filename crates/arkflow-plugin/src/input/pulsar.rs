@@ -20,6 +20,7 @@ use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -322,18 +323,39 @@ impl PulsarAck {
 
 #[async_trait]
 impl Ack for PulsarAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         if let (Some(consumer), Some(message)) = (&self.consumer, &self.message) {
             let mut consumer_guard = consumer.lock().await;
-            if let Err(e) = consumer_guard.ack(message).await {
-                error!("Failed to acknowledge Pulsar message: {}", e);
-            } else {
-                tracing::debug!("Successfully acknowledged Pulsar message");
-            }
+            consumer_guard
+                .ack(message)
+                .await
+                .map_err(|e| Error::Process(format!("Failed to ack Pulsar message: {}", e)))?;
         }
+        Ok(())
     }
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("pulsar", Arc::new(PulsarInputBuilder))
+    register_input_builder("pulsar", Arc::new(PulsarInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "pulsar",
+        "Subscribes to an Apache Pulsar topic with configurable subscription type and authentication.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "service_url": {"type": "string", "description": "Pulsar service URL (e.g. pulsar://localhost:6650)."},
+                "topic": {"type": "string", "description": "Topic to subscribe to."},
+                "subscription_name": {"type": "string", "description": "Subscription name."},
+                "subscription_type": {"type": "string", "enum": ["Exclusive", "Shared", "Failover", "KeyShared"], "description": "Subscription type."},
+                "auth": {"type": "object", "description": "Pulsar authentication configuration."},
+                "retry_config": {"type": "object", "description": "Retry behaviour for failed messages."}
+            },
+            "required": ["service_url", "topic", "subscription_name"]
+        }),
+    ).with_example(serde_json::json!({
+        "service_url": "pulsar://localhost:6650",
+        "topic": "persistent://public/default/events",
+        "subscription_name": "arkflow"
+    })))
 }

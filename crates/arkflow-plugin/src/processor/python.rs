@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
@@ -175,5 +176,22 @@ fn default_module() -> String {
 }
 
 pub fn init() -> Result<(), Error> {
-    arkflow_core::processor::register_processor_builder("python", Arc::new(PythonProcessorBuilder))
+    arkflow_core::processor::register_processor_builder("python", Arc::new(PythonProcessorBuilder))?;
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "python",
+        "Runs a user-defined Python function (with PyArrow) against each batch.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "script": {"type": "string", "description": "Python source defining the transform function."},
+                "function": {"type": "string", "description": "Name of the function to invoke for each batch."},
+                "extra_packages": {"type": "array", "items": {"type": "string"}, "description": "Optional list of pip packages to install before running."}
+            },
+            "required": ["script", "function"]
+        }),
+    ).with_example(serde_json::json!({
+        "script": "def transform(batch):\n    return batch",
+        "function": "transform"
+    })))
 }

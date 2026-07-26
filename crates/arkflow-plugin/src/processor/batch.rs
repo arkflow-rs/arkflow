@@ -16,6 +16,7 @@
 //!
 //! Batch multiple messages into one or more messages
 
+use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
@@ -143,7 +144,20 @@ impl ProcessorBuilder for BatchProcessorBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_processor_builder("batch", Arc::new(BatchProcessorBuilder))
+    register_processor_builder("batch", Arc::new(BatchProcessorBuilder))?;
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "batch",
+        "Batches messages by count, size, or time interval before forwarding.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "description": "Maximum number of messages per batch."},
+                "size": {"type": "integer", "minimum": 1, "description": "Approximate maximum byte size per batch."},
+                "interval": {"type": "string", "description": "Maximum time to wait before flushing a partial batch (humantime)."}
+            }
+        }),
+    ).with_optional().with_example(serde_json::json!({"count": 100, "interval": "5s"})))
 }
 
 #[cfg(test)]

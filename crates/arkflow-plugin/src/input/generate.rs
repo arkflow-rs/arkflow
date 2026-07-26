@@ -14,6 +14,7 @@
 
 use crate::time::deserialize_duration;
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -119,7 +120,42 @@ impl InputBuilder for GenerateInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("generate", Arc::new(GenerateInputBuilder))
+    register_input_builder("generate", Arc::new(GenerateInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "generate",
+        "Generates synthetic text messages on a fixed interval (useful for testing and load simulation).",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "context": {
+                    "type": "string",
+                    "description": "Payload string emitted on every read."
+                },
+                "interval": {
+                    "type": "string",
+                    "description": "Delay between batches (e.g. '100ms', '1s'). Accepts any humantime duration."
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional total number of messages to emit before signalling EOF."
+                },
+                "batch_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "Number of messages returned per read call."
+                }
+            },
+            "required": ["context", "interval"]
+        }),
+    ).with_example(serde_json::json!({
+        "context": "hello",
+        "interval": "1s",
+        "count": 100,
+        "batch_size": 10
+    })))
 }
 
 #[cfg(test)]

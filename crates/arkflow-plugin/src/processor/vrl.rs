@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arkflow_core::{
+    component::{register_processor_metadata, ComponentMetadata},
     processor::{register_processor_builder, Processor, ProcessorBuilder},
     Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,
 };
@@ -23,7 +24,20 @@ use vrl::{
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("vrl", Arc::new(VrlProcessorBuilder))?;
-    Ok(())
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "vrl",
+        "Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "statement": {"type": "string", "description": "VRL program source."}
+            },
+            "required": ["statement"]
+        }),
+    ).with_example(serde_json::json!({
+        "statement": ".message = parse_json!(.message)\n.timestamp = now()"
+    })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
