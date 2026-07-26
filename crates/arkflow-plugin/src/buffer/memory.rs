@@ -229,10 +229,11 @@ struct ArrayAck(Vec<Arc<dyn Ack>>);
 #[async_trait]
 impl Ack for ArrayAck {
     /// Acknowledges all contained acknowledgments
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         for ack in self.0.iter() {
-            ack.ack().await;
+            ack.ack().await?;
         }
+        Ok(())
     }
 }
 

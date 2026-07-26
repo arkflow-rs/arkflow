@@ -41,7 +41,14 @@ pub trait InputBuilder: Send + Sync {
 
 #[async_trait]
 pub trait Ack: Send + Sync {
-    async fn ack(&self);
+    /// Acknowledge the message.
+    ///
+    /// Returns `Err` if the acknowledgement could not be completed (e.g. a
+    /// durable cursor could not be advanced or a source-side commit failed).
+    /// A returned `Err` does not lose data under at-least-once semantics — the
+    /// unacknowledged message will be re-delivered — but it lets the stream
+    /// observe the failure to apply backpressure or stop.
+    async fn ack(&self) -> Result<(), Error>;
 }
 
 #[async_trait]
@@ -60,17 +67,20 @@ pub struct NoopAck;
 
 #[async_trait]
 impl Ack for NoopAck {
-    async fn ack(&self) {}
+    async fn ack(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct VecAck(pub Vec<Arc<dyn Ack>>);
 
 #[async_trait]
 impl Ack for VecAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         for ack in &self.0 {
-            ack.ack().await;
+            ack.ack().await?;
         }
+        Ok(())
     }
 }
 

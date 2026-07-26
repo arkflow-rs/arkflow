@@ -17,7 +17,8 @@
 //! A stream is a complete data processing unit, containing input, pipeline, and output.
 
 use crate::buffer::Buffer;
-use crate::input::Ack;
+use crate::input::{Ack, NoopAck};
+use crate::wal::{Wal, WalAck, WalConfig};
 use crate::{
     input::Input, output::Output, pipeline::Pipeline, Error, MessageBatchRef, ProcessResult,
     Resource,
@@ -41,6 +42,7 @@ pub struct Stream {
     error_output: Option<Arc<dyn Output>>,
     thread_num: u32,
     buffer: Option<Arc<dyn Buffer>>,
+    wal: Option<Arc<Wal>>,
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
@@ -59,6 +61,7 @@ impl Stream {
         output: Arc<dyn Output>,
         error_output: Option<Arc<dyn Output>>,
         buffer: Option<Arc<dyn Buffer>>,
+        wal: Option<Arc<Wal>>,
         resource: Resource,
         thread_num: u32,
     ) -> Self {
@@ -68,6 +71,7 @@ impl Stream {
             output,
             error_output,
             buffer,
+            wal,
             resource,
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
@@ -100,6 +104,7 @@ impl Stream {
             self.input.clone(),
             input_sender.clone(),
             self.buffer.clone(),
+            self.wal.clone(),
         ));
 
         // Buffer
@@ -148,12 +153,54 @@ impl Stream {
         Ok(())
     }
 
+    /// Forward a (message, ack) pair to the buffer if present, otherwise to the
+    /// processor input channel. Shared by normal ingestion and WAL recovery.
+    async fn forward(
+        msg: MessageBatchRef,
+        ack: Arc<dyn Ack>,
+        buffer_option: &Option<Arc<dyn Buffer>>,
+        input_sender: &Sender<(MessageBatchRef, Arc<dyn Ack>)>,
+    ) -> Result<(), Error> {
+        if let Some(buffer) = buffer_option {
+            buffer.write(msg, ack).await
+        } else {
+            input_sender
+                .send_async((msg, ack))
+                .await
+                .map_err(|e| Error::Process(format!("Failed to send input message: {}", e)))
+        }
+    }
+
     async fn do_input(
         cancellation_token: CancellationToken,
         input: Arc<dyn Input>,
         input_sender: Sender<(MessageBatchRef, Arc<dyn Ack>)>,
         buffer_option: Option<Arc<dyn Buffer>>,
+        wal: Option<Arc<Wal>>,
     ) {
+        // Recovery: replay any WAL entries past the committed cursor before
+        // reading new input. Replayed entries carry a NoopAck source (we replay
+        // from the WAL, not a live source) wrapped in WalAck so the cursor
+        // advances on downstream confirmation.
+        if let Some(wal) = &wal {
+            match wal.read_after_cursor() {
+                Ok(entries) => {
+                    info!("WAL recovery: replaying {} entries", entries.len());
+                    for (seq, msg) in entries {
+                        let ack: Arc<dyn Ack> =
+                            Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
+                        if let Err(e) =
+                            Self::forward(msg, ack, &buffer_option, &input_sender).await
+                        {
+                            error!("Failed to forward replayed message: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => error!("WAL recovery: failed to read WAL: {}", e),
+            }
+        }
+
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
@@ -162,16 +209,22 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok((msg, ack)) => {
-                            if let Some(buffer) = &buffer_option {
-                                if let Err(e) = buffer.write(msg, ack).await {
-                                    error!("Failed to send input message: {}", e);
-                                    break;
+                            let ack: Arc<dyn Ack> = if let Some(wal) = &wal {
+                                match wal.append(&msg).await {
+                                    Ok(seq) => Arc::new(WalAck::new(wal.clone(), seq, ack)),
+                                    Err(e) => {
+                                        error!("Failed to persist message to WAL: {}", e);
+                                        break;
+                                    }
                                 }
-                            } else if let Err(e) = input_sender.send_async((msg, ack)).await {
+                            } else {
+                                ack
+                            };
+
+                            if let Err(e) = Self::forward(msg, ack, &buffer_option, &input_sender).await {
                                 error!("Failed to send input message: {}", e);
                                 break;
                             }
-
                     }
                     Err(e) => {
                         match e {
@@ -300,7 +353,9 @@ impl Stream {
                 }
                 Ok(ProcessResult::None) => {
                     // Message filtered out, just ACK
-                    ack.ack().await;
+                    if let Err(e) = ack.ack().await {
+                        error!("Failed to ack filtered message: {}", e);
+                    }
                 }
                 Err(e) => {
                     if let Err(e) = output_sender
@@ -364,12 +419,16 @@ impl Stream {
         match data {
             ProcessorData::Err(msg, e) => match err_output {
                 None => {
-                    ack.ack().await;
+                    if let Err(err) = ack.ack().await {
+                        error!("Failed to ack errored message: {}", err);
+                    }
                     error!("{e}");
                 }
                 Some(err_output) => match err_output.write(msg).await {
                     Ok(_) => {
-                        ack.ack().await;
+                        if let Err(err) = ack.ack().await {
+                            error!("Failed to ack errored message: {}", err);
+                        }
                     }
                     Err(e) => {
                         error!("{}", e);
@@ -391,7 +450,9 @@ impl Stream {
                 }
 
                 if success_cnt >= size {
-                    ack.ack().await;
+                    if let Err(e) = ack.ack().await {
+                        error!("Failed to ack message: {}", e);
+                    }
                 }
             }
         }
@@ -445,6 +506,7 @@ pub struct StreamConfig {
     pub output: crate::output::OutputConfig,
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
+    pub durability: Option<WalConfig>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
 }
 
@@ -479,6 +541,17 @@ impl StreamConfig {
         } else {
             None
         };
+        // Open the durable ingest WAL only when a `durability:` section is
+        // present and enabled. Absent or disabled → today's in-memory behavior.
+        let wal = if let Some(wal_config) = &self.durability {
+            if wal_config.enabled {
+                Some(Wal::open(wal_config)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(Stream::new(
             input,
@@ -486,6 +559,7 @@ impl StreamConfig {
             output,
             error_output,
             buffer,
+            wal,
             resource,
             thread_num,
         ))

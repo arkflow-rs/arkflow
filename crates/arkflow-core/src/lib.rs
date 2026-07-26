@@ -39,6 +39,7 @@ pub mod pipeline;
 pub mod processor;
 pub mod stream;
 pub mod temporary;
+pub mod wal;
 
 #[cfg(test)]
 mod message_batch_tests;

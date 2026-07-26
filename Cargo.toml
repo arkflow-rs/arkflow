@@ -51,6 +51,7 @@ sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls
 
 tempfile = "3.24.0"
 mockall = "0.14"
+redb = "2"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
 
