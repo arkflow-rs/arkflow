@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{codec::Codec, Error, MessageBatch, MessageBatchRef, Resource};
@@ -434,5 +435,25 @@ impl OutputBuilder for SqlOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("sql", Arc::new(SqlOutputBuilder))
+    register_output_builder("sql", Arc::new(SqlOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "sql",
+        "Batch-inserts records into a SQL database. Supports upsert and transaction management.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "connection": {"type": "object", "description": "Database connection settings (type, uri, etc.)."},
+                "table": {"type": "string", "description": "Destination table."},
+                "batch_size": {"type": "integer", "minimum": 1, "description": "Number of rows per insert batch."},
+                "upsert": {"type": "boolean", "default": false, "description": "Use upsert (ON CONFLICT) instead of plain insert."},
+                "upsert_keys": {"type": "array", "items": {"type": "string"}, "description": "Columns used to detect conflicts for upsert."}
+            },
+            "required": ["connection", "table"]
+        }),
+    ).with_example(serde_json::json!({
+        "connection": {"type": "postgres", "uri": "postgres://user:pass@localhost/db"},
+        "table": "events",
+        "batch_size": 500
+    })))
 }

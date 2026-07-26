@@ -17,6 +17,7 @@
 //! Receive data from the MQTT broker
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -272,5 +273,30 @@ impl InputBuilder for MqttInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("mqtt", Arc::new(MqttInputBuilder))
+    register_input_builder("mqtt", Arc::new(MqttInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "mqtt",
+        "Subscribes to an MQTT broker and forwards messages from the configured topics.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "host": {"type": "string", "description": "MQTT broker hostname."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "MQTT broker port."},
+                "client_id": {"type": "string", "description": "Unique client identifier."},
+                "username": {"type": "string", "description": "Optional username."},
+                "password": {"type": "string", "description": "Optional password."},
+                "topics": {"type": "array", "items": {"type": "string"}, "description": "Topics to subscribe to (MQTT wildcards supported)."},
+                "qos": {"type": "integer", "enum": [0, 1, 2], "default": 0, "description": "Quality of Service level."},
+                "clean_session": {"type": "boolean", "default": true, "description": "Whether to use a clean session."},
+                "keep_alive": {"type": "integer", "minimum": 1, "description": "Keep-alive interval in seconds."}
+            },
+            "required": ["host", "port", "client_id", "topics"]
+        }),
+    ).with_example(serde_json::json!({
+        "host": "localhost",
+        "port": 1883,
+        "client_id": "arkflow",
+        "topics": ["sensors/#"]
+    })))
 }

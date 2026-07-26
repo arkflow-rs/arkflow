@@ -30,6 +30,7 @@ use thiserror::Error;
 pub mod buffer;
 pub mod cli;
 pub mod codec;
+pub mod component;
 pub mod config;
 pub mod engine;
 pub mod error_helpers;

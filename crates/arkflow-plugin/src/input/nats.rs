@@ -17,6 +17,7 @@
 //! Receive data from a NATS subject
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -468,7 +469,31 @@ impl Ack for NatsAck {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("nats", Arc::new(NatsInputBuilder))
+    register_input_builder("nats", Arc::new(NatsInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "nats",
+        "Consumes messages from NATS, supporting both regular subjects and JetStream consumers.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "NATS server URL (e.g. nats://localhost:4222)."},
+                "mode": {
+                    "type": "object",
+                    "description": "Select between plain NATS and JetStream subscriptions.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "regular"}, "subject": {"type": "string"}, "queue_group": {"type": "string"}}, "required": ["type", "subject"]},
+                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "consumer_name": {"type": "string"}, "durable_name": {"type": "string"}}, "required": ["type", "stream", "consumer_name"]}
+                    ]
+                },
+                "auth": {"type": "object", "description": "NATS authentication configuration."}
+            },
+            "required": ["url", "mode"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "nats://localhost:4222",
+        "mode": {"type": "regular", "subject": "events"}
+    })))
 }
 
 #[cfg(test)]

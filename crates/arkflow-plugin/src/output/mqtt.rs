@@ -17,6 +17,7 @@
 //! Send the processed data to the MQTT broker
 
 use crate::expr::Expr;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -218,7 +219,30 @@ impl OutputBuilder for MqttOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("mqtt", Arc::new(MqttOutputBuilder))
+    register_output_builder("mqtt", Arc::new(MqttOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "mqtt",
+        "Publishes messages to an MQTT broker topic.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "host": {"type": "string", "description": "MQTT broker hostname."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "MQTT broker port."},
+                "client_id": {"type": "string", "description": "Client identifier."},
+                "username": {"type": "string", "description": "Optional username."},
+                "password": {"type": "string", "description": "Optional password."},
+                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
+                "qos": {"type": "integer", "enum": [0, 1, 2], "default": 0, "description": "Quality of Service."},
+                "clean_session": {"type": "boolean", "default": true},
+                "keep_alive": {"type": "integer", "minimum": 1, "description": "Keep-alive interval in seconds."},
+                "retain": {"type": "boolean", "default": false, "description": "Whether to retain the message on the broker."}
+            },
+            "required": ["host", "port", "client_id", "topic"]
+        }),
+    ).with_example(serde_json::json!({
+        "host": "localhost", "port": 1883, "client_id": "arkflow", "topic": "sensors/data"
+    })))
 }
 
 #[async_trait]

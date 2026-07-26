@@ -30,6 +30,29 @@ cargo test --package <name>    # Run tests for a specific package
 
 The binary supports configuration validation via the `--validate` flag.
 
+### Component Discovery & Configuration Schema
+
+The binary exposes commands for discovering registered components and their
+configuration schemas. These power IDE auto-completion and inline help.
+
+```bash
+# List every registered input / output / processor / buffer / codec
+./target/release/arkflow components list
+./target/release/arkflow components list --kind input
+
+# Print the full configuration schema for one component (text or JSON)
+./target/release/arkflow components show input kafka
+./target/release/arkflow components show processor sql --format json
+
+# Emit a complete JSON Schema describing the engine config. Point your
+# editor's YAML language server at this file to get field-level completion.
+./target/release/arkflow schema > arkflow.schema.json
+```
+
+Component variants are registered alongside their builders via
+`arkflow_core::component::register_*_metadata` and discovered through
+`arkflow_core::component::list_components`.
+
 ### CI Requirements
 The CI pipeline requires protobuf compiler:
 ```bash

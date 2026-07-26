@@ -19,6 +19,7 @@
 use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
 };
+use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{
     Error, MessageBatch, MessageBatchRef, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD,
@@ -240,6 +241,34 @@ pub fn init() -> Result<(), Error> {
         "protobuf_to_arrow",
         Arc::new(ProtobufToArrowProcessorBuilder),
     )?;
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "arrow_to_protobuf",
+        "Serializes Arrow RecordBatches into Protobuf wire-format bytes.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
+                "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+            },
+            "required": ["message_type", "proto_inputs"]
+        }),
+    ))?;
+    register_processor_metadata(ComponentMetadata::with_schema(
+        "protobuf_to_arrow",
+        "Decodes Protobuf wire-format bytes into Arrow RecordBatches.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
+                "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+            },
+            "required": ["message_type", "proto_inputs"]
+        }),
+    ))?;
     Ok(())
 }
 

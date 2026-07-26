@@ -17,6 +17,7 @@
 //! Receive data from a WebSocket server
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -262,5 +263,21 @@ impl InputBuilder for WebSocketInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("websocket", Arc::new(WebSocketInputBuilder))
+    register_input_builder("websocket", Arc::new(WebSocketInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "websocket",
+        "Connects to a WebSocket server and forwards each incoming message as a batch.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "WebSocket server URL (ws:// or wss://)."},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Headers included in the WebSocket handshake."},
+                "timeout": {"type": "integer", "minimum": 1, "description": "Connection timeout in seconds."}
+            },
+            "required": ["url"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "ws://localhost:8080/stream"
+    })))
 }

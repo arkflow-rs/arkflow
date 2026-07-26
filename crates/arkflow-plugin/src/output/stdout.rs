@@ -17,6 +17,7 @@
 //! Outputs the processed data to standard output
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -106,7 +107,18 @@ impl OutputBuilder for StdoutOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("stdout", Arc::new(StdoutOutputBuilder))
+    register_output_builder("stdout", Arc::new(StdoutOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "stdout",
+        "Writes each message to the console. Useful for debugging and demos.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "pretty": {"type": "boolean", "default": false, "description": "Pretty-print JSON output."}
+            }
+        }),
+    ).with_optional().with_example(serde_json::json!({"pretty": true})))
 }
 
 trait StdWriter: Write + Send + Sync {}

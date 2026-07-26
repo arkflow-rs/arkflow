@@ -20,6 +20,7 @@ use crate::expr::Expr;
 use crate::pulsar::{
     PulsarAuth, PulsarClient, PulsarClientUtils, PulsarConfigValidator, PulsarProducer,
 };
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -204,5 +205,23 @@ impl OutputBuilder for PulsarOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("pulsar", Arc::new(PulsarOutputBuilder))
+    register_output_builder("pulsar", Arc::new(PulsarOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "pulsar",
+        "Produces messages to an Apache Pulsar topic.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "service_url": {"type": "string", "description": "Pulsar service URL."},
+                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
+                "auth": {"type": "object", "description": "Pulsar authentication configuration."},
+                "value_field": {"type": "string", "description": "Record field used as the payload."}
+            },
+            "required": ["service_url", "topic"]
+        }),
+    ).with_example(serde_json::json!({
+        "service_url": "pulsar://localhost:6650",
+        "topic": "persistent://public/default/events"
+    })))
 }

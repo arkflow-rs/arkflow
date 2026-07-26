@@ -13,6 +13,7 @@
  */
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
@@ -340,5 +341,24 @@ impl InputBuilder for SqlInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("sql", Arc::new(SqlInputBuilder))
+    register_input_builder("sql", Arc::new(SqlInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "sql",
+        "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "select_sql": {"type": "string", "description": "SELECT statement to execute on every poll."},
+                "poll_interval": {"type": "string", "description": "Optional poll interval (humantime)."},
+                "ballista": {"type": "object", "description": "Optional Ballista distributed compute configuration."},
+                "input_type": {"type": "object", "description": "Database connection settings."}
+            },
+            "required": ["select_sql", "input_type"]
+        }),
+    ).with_example(serde_json::json!({
+        "select_sql": "SELECT id, name FROM users",
+        "poll_interval": "10s",
+        "input_type": {"type": "sqlite", "uri": "file:./data.db"}
+    })))
 }

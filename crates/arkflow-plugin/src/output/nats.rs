@@ -17,6 +17,7 @@
 //! Send data to a NATS subject
 
 use crate::expr::Expr;
+use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     codec::Codec,
@@ -229,7 +230,32 @@ impl OutputBuilder for NatsOutputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_output_builder("nats", Arc::new(NatsOutputBuilder))
+    register_output_builder("nats", Arc::new(NatsOutputBuilder))?;
+    register_output_metadata(ComponentMetadata::with_schema(
+        "nats",
+        "Publishes to NATS, either to a regular subject or a JetStream stream.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "NATS server URL."},
+                "mode": {
+                    "type": "object",
+                    "description": "Select regular or JetStream publishing.",
+                    "oneOf": [
+                        {"properties": {"type": {"const": "regular"}, "subject": {"type": "string"}}, "required": ["type", "subject"]},
+                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "subject": {"type": "string"}}, "required": ["type", "stream", "subject"]}
+                    ]
+                },
+                "auth": {"type": "object", "description": "NATS authentication configuration."},
+                "value_field": {"type": "string", "description": "Record field used as the payload."}
+            },
+            "required": ["url", "mode"]
+        }),
+    ).with_example(serde_json::json!({
+        "url": "nats://localhost:4222",
+        "mode": {"type": "regular", "subject": "events"}
+    })))
 }
 
 #[cfg(test)]

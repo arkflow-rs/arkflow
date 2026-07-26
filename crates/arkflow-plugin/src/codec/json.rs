@@ -13,6 +13,7 @@
  */
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
+use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
 use datafusion::arrow;
 use serde_json::Value;
@@ -60,6 +61,17 @@ impl CodecBuilder for JsonCodecBuilder {
 
 pub(crate) fn init() -> Result<(), Error> {
     codec::register_codec_builder("json", Arc::new(JsonCodecBuilder))?;
+    register_codec_metadata(ComponentMetadata::with_schema(
+        "json",
+        "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "pretty": {"type": "boolean", "default": false, "description": "Pretty-print JSON output."}
+            }
+        }),
+    ).with_optional())?;
     Ok(())
 }
 

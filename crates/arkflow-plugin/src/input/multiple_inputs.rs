@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, InputConfig},
@@ -181,5 +182,32 @@ pub(crate) fn init() -> Result<(), Error> {
         "multiple_inputs",
         Arc::new(MultipleInputsBuilder),
     )?;
-    Ok(())
+    register_input_metadata(ComponentMetadata::with_schema(
+        "multiple_inputs",
+        "Combines multiple input sources into a single stream. Each source is tagged with __meta_source.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "inputs": {
+                    "type": "array",
+                    "description": "List of input components to combine.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "description": "Input type (e.g. 'kafka', 'http')."},
+                            "name": {"type": "string", "description": "Optional logical name for this source."}
+                        },
+                        "required": ["type"]
+                    }
+                }
+            },
+            "required": ["inputs"]
+        }),
+    ).with_example(serde_json::json!({
+        "inputs": [
+            {"type": "kafka", "name": "events", "topics": ["events"]},
+            {"type": "kafka", "name": "logs", "topics": ["logs"]}
+        ]
+    })))
 }

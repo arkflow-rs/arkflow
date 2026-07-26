@@ -21,6 +21,7 @@
 
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
+use arkflow_core::component::{register_buffer_metadata, ComponentMetadata};
 use arkflow_core::input::{Ack, VecAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -278,7 +279,21 @@ impl BufferBuilder for SlidingWindowBuilder {
 /// # Returns
 /// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
-    register_buffer_builder("sliding_window", Arc::new(SlidingWindowBuilder))
+    register_buffer_builder("sliding_window", Arc::new(SlidingWindowBuilder))?;
+    register_buffer_metadata(ComponentMetadata::with_schema(
+        "sliding_window",
+        "Overlapping time windows that slide forward by a fixed interval.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "window_size": {"type": "integer", "minimum": 1, "description": "Number of messages included in each window."},
+                "interval": {"type": "string", "description": "Time interval between window emissions (humantime)."},
+                "slide_size": {"type": "integer", "minimum": 1, "description": "Number of messages to advance the window by on each emission."}
+            },
+            "required": ["window_size", "interval", "slide_size"]
+        }),
+    ).with_example(serde_json::json!({"window_size": 100, "interval": "5s", "slide_size": 20})))
 }
 
 #[cfg(test)]

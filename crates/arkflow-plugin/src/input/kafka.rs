@@ -17,6 +17,7 @@
 //! Receive data from a Kafka topic
 
 use arkflow_core::codec::Codec;
+use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
@@ -309,7 +310,31 @@ impl InputBuilder for KafkaInputBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    register_input_builder("kafka", Arc::new(KafkaInputBuilder))
+    register_input_builder("kafka", Arc::new(KafkaInputBuilder))?;
+    register_input_metadata(ComponentMetadata::with_schema(
+        "kafka",
+        "Consumes messages from Apache Kafka topics with a consumer group.",
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brokers": {"type": "array", "items": {"type": "string"}, "description": "List of Kafka broker addresses."},
+                "topics": {"type": "array", "items": {"type": "string"}, "description": "Topics to subscribe to."},
+                "consumer_group": {"type": "string", "description": "Consumer group ID for offset coordination."},
+                "client_id": {"type": "string", "description": "Optional client identifier."},
+                "start_from_latest": {"type": "boolean", "default": false, "description": "When true, ignore committed offsets and start from the latest message."},
+                "fetch_min_bytes": {"type": "integer", "minimum": 0, "description": "Minimum bytes before the broker responds to a fetch request."},
+                "fetch_max_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes for a fetch request."},
+                "fetch_max_partition_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes per partition in a fetch request."},
+                "fetch_wait_max_ms": {"type": "integer", "minimum": 0, "description": "Maximum time to wait for fetch data in milliseconds."}
+            },
+            "required": ["brokers", "topics", "consumer_group"]
+        }),
+    ).with_example(serde_json::json!({
+        "brokers": ["localhost:9092"],
+        "topics": ["events"],
+        "consumer_group": "arkflow"
+    })))
 }
 
 #[cfg(test)]
