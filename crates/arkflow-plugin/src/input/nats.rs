@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::error;
 
 /// NATS input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,16 +450,18 @@ enum NatsAck {
 
 #[async_trait]
 impl Ack for NatsAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         match self {
             NatsAck::Regular => {
                 // For regular NATS messages, there's no explicit acknowledgment
+                Ok(())
             }
             NatsAck::JetStream { message } => {
                 // Acknowledge JetStream message
-                if let Err(e) = message.ack().await {
-                    warn!("Failed to acknowledge JetStream message: {}", e);
-                }
+                message
+                    .ack()
+                    .await
+                    .map_err(|e| Error::Process(format!("Failed to ack JetStream message: {}", e)))
             }
         }
     }

@@ -322,15 +322,15 @@ impl PulsarAck {
 
 #[async_trait]
 impl Ack for PulsarAck {
-    async fn ack(&self) {
+    async fn ack(&self) -> Result<(), Error> {
         if let (Some(consumer), Some(message)) = (&self.consumer, &self.message) {
             let mut consumer_guard = consumer.lock().await;
-            if let Err(e) = consumer_guard.ack(message).await {
-                error!("Failed to acknowledge Pulsar message: {}", e);
-            } else {
-                tracing::debug!("Successfully acknowledged Pulsar message");
-            }
+            consumer_guard
+                .ack(message)
+                .await
+                .map_err(|e| Error::Process(format!("Failed to ack Pulsar message: {}", e)))?;
         }
+        Ok(())
     }
 }
 

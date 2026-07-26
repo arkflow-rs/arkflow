@@ -27,4 +27,5 @@ clap = { workspace = true }
 colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
+redb = { workspace = true }
 num_cpus = "1.17.0"
