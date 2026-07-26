@@ -1,10 +1,4 @@
-# Capability: Input Durability
-
-## Purpose
-
-Provide durable ingestion at the stream input boundary so that no data entering from any input is lost across crashes. Every message read by an input is persisted (body + sequence) and `fsync`'d to a Write-Ahead Log (WAL) before it enters the pipeline. The WAL cursor advances, and the source is committed, only after the downstream output confirms the write. On startup, the Engine replays any WAL entries past the committed cursor before streams resume, delivering at-least-once semantics.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Durable ingestion at the input boundary
 When durability is enabled for a stream, every message returned by `input.read()` SHALL be persisted (body + sequence) and durably flushed to the WAL before it enters the pipeline. The stream SHALL also flush all pending WAL appends and stop the WAL background flusher before a normal graceful shutdown completes.
