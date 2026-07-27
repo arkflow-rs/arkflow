@@ -62,3 +62,30 @@ not against the loss of the node itself (disk failure, host termination). High
 availability across nodes (replicated WAL / consensus) is out of scope. For
 HA-grade durability, run on replicated storage or front the stream with a
 durable, replayable source (e.g. Kafka).
+
+## WAL recovery failure (fail-fast)
+
+If a durability-enabled stream fails to recover its WAL at startup — either
+because the WAL file is unreadable, or because replaying a pending entry into
+the downstream buffer/channel fails — the stream **fails to start** rather
+than silently continuing with potentially lost data. This is the fail-fast
+contract introduced by `harden-wal-recovery-semantics`.
+
+In practice:
+
+- redb 2.6.3 verifies the entire B-tree at `Database::open` time, so most WAL
+  corruptions surface as `StreamConfig::build` returning `Err` — the stream
+  never reaches the running state.
+- If the WAL opens cleanly but replaying a pending entry cannot be forwarded
+  (for example, the configured buffer rejects the write), `Stream::run`
+  returns `Err` without reading new input.
+
+Operations should monitor stream startup failures. Recovery requires human
+intervention: either delete the WAL file at the configured `durability.path`
+(accepting that any pending entries are lost) or restore it from a backup.
+Rely on k8s/systemd restart strategies to keep retrying, but a persistent
+WAL corruption will not self-heal.
+
+The previous behavior — log the failure and continue reading new input with
+the unacked entries effectively dropped — was a silent at-least-once
+violation and is no longer the case.
