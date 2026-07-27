@@ -70,6 +70,14 @@ impl Default for SyncPolicy {
     }
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_path() -> String {
+    String::new()
+}
+
 /// Configuration for a durable ingest WAL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalConfig {
@@ -101,14 +109,6 @@ impl Default for WalConfig {
             backend: None,
         }
     }
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-fn default_path() -> String {
-    String::new()
 }
 
 impl WalConfig {

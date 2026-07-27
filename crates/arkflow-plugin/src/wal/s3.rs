@@ -15,7 +15,19 @@
 //! Object-store (S3-compatible) WAL backend.
 //!
 //! See `openspec/changes/add-wal-s3-backend/design.md` for the full design.
-//! Key points:
+//! See `docs/performance/s3-wal-backend.md` for performance characteristics.
+//!
+//! # Performance Overview
+//!
+//! | Operation | Latency | Notes |
+//! |-----------|---------|-------|
+//! | `append_batch` | ~1-50μs | In-memory, returns immediately |
+//! | Segment PUT | 10-200ms | Depends on size, network, region |
+//! | Recovery LIST | 100-500ms | Depends on segment count |
+//!
+//! Throughput: 50-150 MB/s practical limit per stream.
+//!
+//! # Key Design Decisions
 //!
 //! - Per-node + per-stream namespace isolation (D2). All keys live under
 //!   `{prefix}/{node_id}/{stream_id}/`.

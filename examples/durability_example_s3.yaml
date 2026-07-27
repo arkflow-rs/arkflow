@@ -84,8 +84,16 @@ streams:
           access_key_id: "${AWS_ACCESS_KEY_ID}"
           secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
           allow_http: true
+        # ── Performance vs Crash Window Trade-off ─────────────────────────────────
         # Segment batching (D4). Three triggers, any one of which seals + PUTs
         # the in-memory segment to a new immutable object.
+        #
+        # Trade-off: Larger segments / longer intervals = fewer PUTs (better
+        # throughput, lower S3 costs) but larger crash window (more data at risk
+        # on node disappearance). See docs/performance/s3-wal-backend.md.
+        #
+        # Crash window ≈ min(max_entries, flush_interval × msg_rate)
+        # Example: @10,000 msg/s with 1s interval → ~10,000 messages at risk
         segment:
           max_entries: 1000      # default 1000
           max_bytes: 1048576     # default 1 MiB
@@ -93,6 +101,9 @@ streams:
         # Cursor (watermark) batching (D6). The watermark is flushed to
         # `manifest.json` every `cursor.max_entries` advances or every
         # `cursor.interval`, whichever comes first.
+        #
+        # Trade-off: Longer intervals = fewer manifest PUTs but more duplicate
+        # deliveries on recovery (at-least-once semantics, outputs must tolerate).
         cursor:
           max_entries: 1000
           interval: "1s"
