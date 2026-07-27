@@ -14,7 +14,15 @@
 
 //! Protobuf Codec Components
 //!
-//! The codec used to convert between Protobuf data and the Arrow format
+//! The codec used to convert between Protobuf data and the Arrow format.
+//!
+//! # Supported field types
+//!
+//! Scalar proto3 fields are supported: `bool`, `int32`/`sint32`/`sfixed32`,
+//! `int64`/`sint64`/`sfixed64`, `uint32`/`fixed32`, `uint64`/`fixed64`,
+//! `float`, `double`, `string`, `bytes`, and `enum` (mapped to Arrow `Int32`).
+//! Nested message / repeated / map / oneof / proto3 optional fields are NOT
+//! supported and produce an error.
 
 use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
@@ -27,7 +35,6 @@ use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::sync::Arc;
 
 /// Protobuf codec configuration
@@ -152,7 +159,10 @@ pub(crate) fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
     use std::cell::RefCell;
+    use tempfile::TempDir;
 
     fn create_test_resource() -> Resource {
         Resource {
@@ -242,5 +252,63 @@ mod tests {
 
         // Should fail due to invalid JSON structure
         assert!(result.is_err());
+    }
+
+    fn create_test_proto_file() -> Result<(TempDir, std::path::PathBuf), Error> {
+        let dir = tempfile::tempdir()
+            .map_err(|e| Error::Process(format!("Failed to create temp dir: {}", e)))?;
+        let proto_dir = dir.path().join("proto");
+        std::fs::create_dir_all(&proto_dir)
+            .map_err(|e| Error::Process(format!("Failed to create proto dir: {}", e)))?;
+        let proto_file_path = proto_dir.join("test_message.proto");
+        std::fs::write(
+            &proto_file_path,
+            r#"syntax = "proto3";
+
+package test;
+
+message TestMessage {
+  int64 timestamp = 1;
+  double value = 2;
+  string sensor = 3;
+}
+"#,
+        )
+        .map_err(|e| Error::Process(format!("Failed to write proto file: {}", e)))?;
+        Ok((dir, proto_dir))
+    }
+
+    #[test]
+    fn test_codec_round_trip() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = serde_json::json!({
+            "proto_inputs": [proto_dir.to_string_lossy()],
+            "message_type": "test.TestMessage",
+        });
+        let codec = ProtobufCodecBuilder.build(None, &Some(config), &create_test_resource())?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("sensor", DataType::Utf8, false),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1634567890])),
+                Arc::new(Float64Array::from(vec![42.5])),
+                Arc::new(StringArray::from(vec!["temperature"])),
+            ],
+        )
+        .map_err(|e| Error::Process(format!("Failed to create record batch: {}", e)))?;
+        let original = MessageBatch::new_arrow(rb);
+
+        let encoded = codec.encode(original)?;
+        assert_eq!(encoded.len(), 1, "one row → one encoded message");
+        let decoded = codec.decode(encoded)?;
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.column(0).data_type(), &DataType::Int64);
+
+        Ok(())
     }
 }

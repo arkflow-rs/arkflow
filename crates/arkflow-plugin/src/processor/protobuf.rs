@@ -14,7 +14,15 @@
 
 //! Protobuf Processor Components
 //!
-//! The processor used to convert between Protobuf data and the Arrow format
+//! The processor used to convert between Protobuf data and the Arrow format.
+//!
+//! # Supported field types
+//!
+//! Scalar proto3 fields are supported: `bool`, `int32`/`sint32`/`sfixed32`,
+//! `int64`/`sint64`/`sfixed64`, `uint32`/`fixed32`, `uint64`/`fixed64`,
+//! `float`, `double`, `string`, `bytes`, and `enum` (mapped to Arrow `Int32`).
+//! Nested message / repeated / map / oneof / proto3 optional fields are NOT
+//! supported and produce an error.
 
 use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
@@ -117,10 +125,6 @@ impl Processor for ProtobufProcessor {
                 Arc::new((*msg).new_binary_with_origin(proto_data)?)
             }
             ToType::ProtobufToArrow(ref c) => {
-                if msg.is_empty() {
-                    return Ok(ProcessResult::None);
-                }
-
                 let mut batches = Vec::with_capacity(msg.len());
                 let result = (*msg).to_binary(
                     c.value_field
@@ -232,7 +236,7 @@ impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
     }
 }
 
-pub fn init() -> Result<(), Error> {
+pub(crate) fn init() -> Result<(), Error> {
     register_processor_builder(
         "arrow_to_protobuf",
         Arc::new(ArrowToProtobufProcessorBuilder),
@@ -250,7 +254,8 @@ pub fn init() -> Result<(), Error> {
             "properties": {
                 "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
                 "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
-                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."},
+                "fields_to_include": {"type": "array", "items": {"type": "string"}, "description": "Optional allow-list of field names to include when serializing to Protobuf."}
             },
             "required": ["message_type", "proto_inputs"]
         }),
@@ -264,7 +269,8 @@ pub fn init() -> Result<(), Error> {
             "properties": {
                 "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
                 "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
-                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."},
+                "value_field": {"type": "string", "description": "Name of the binary column holding the Protobuf wire-format bytes (defaults to '__value')."}
             },
             "required": ["message_type", "proto_inputs"]
         }),
@@ -276,7 +282,9 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use super::*;
     use arkflow_core::processor::ProcessorBuilder;
-    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use prost_reflect::prost::Message;
@@ -494,5 +502,305 @@ message TestMessage {
             },
         );
         assert!(result.is_ok());
+    }
+
+    fn create_test_proto_file_full() -> Result<(TempDir, PathBuf), Error> {
+        let dir =
+            tempdir().map_err(|e| Error::Process(format!("Failed to create temp dir: {}", e)))?;
+        let proto_dir = dir.path().join("proto");
+        std::fs::create_dir_all(&proto_dir)
+            .map_err(|e| Error::Process(format!("Failed to create proto dir: {}", e)))?;
+        let proto_file_path = proto_dir.join("full_message.proto");
+        std::fs::write(&proto_file_path, r#"syntax = "proto3";
+
+package test;
+
+message FullMessage {
+  int64 timestamp = 1;
+  double value = 2;
+  string sensor = 3;
+  bool active = 4;
+  uint32 count = 5;
+  bytes payload = 6;
+}
+"#)
+        .map_err(|e| Error::Process(format!("Failed to write proto file: {}", e)))?;
+        Ok((dir, proto_dir))
+    }
+
+    fn create_test_proto_file_nested() -> Result<(TempDir, PathBuf), Error> {
+        let dir =
+            tempdir().map_err(|e| Error::Process(format!("Failed to create temp dir: {}", e)))?;
+        let proto_dir = dir.path().join("proto");
+        std::fs::create_dir_all(&proto_dir)
+            .map_err(|e| Error::Process(format!("Failed to create proto dir: {}", e)))?;
+        let proto_file_path = proto_dir.join("nested_message.proto");
+        std::fs::write(&proto_file_path, r#"syntax = "proto3";
+
+package test;
+
+message WithNested {
+  Sub sub = 1;
+}
+
+message Sub {
+  int32 x = 1;
+}
+"#)
+        .map_err(|e| Error::Process(format!("Failed to write proto file: {}", e)))?;
+        Ok((dir, proto_dir))
+    }
+
+    #[tokio::test]
+    async fn test_arrow_to_protobuf_full_scalar_round_trip() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file_full()?;
+        let config = ArrowToProtobufProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.FullMessage".to_string(),
+            },
+            fields_to_include: None,
+        };
+        let processor = ProtobufProcessor::new(config.into())?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("sensor", DataType::Utf8, false),
+            Field::new("active", DataType::Boolean, false),
+            Field::new("count", DataType::UInt32, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1634567890])),
+                Arc::new(Float64Array::from(vec![42.5])),
+                Arc::new(StringArray::from(vec!["temperature"])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(UInt32Array::from(vec![7u32])),
+                Arc::new(BinaryArray::from(vec![b"\x01\x02".as_ref()])),
+            ],
+        )
+        .map_err(|e| Error::Process(format!("Failed to create record batch: {}", e)))?;
+        let msg_batch = MessageBatch::new_arrow(rb);
+
+        let result = processor.process(Arc::new(msg_batch)).await?;
+        let batch = match result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
+        let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
+        let decoded =
+            DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        assert_eq!(decoded.get_field_by_name("timestamp").unwrap().as_ref(), &Value::I64(1634567890));
+        assert_eq!(decoded.get_field_by_name("value").unwrap().as_ref(), &Value::F64(42.5));
+        assert_eq!(decoded.get_field_by_name("active").unwrap().as_ref(), &Value::Bool(true));
+        assert_eq!(decoded.get_field_by_name("count").unwrap().as_ref(), &Value::U32(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_type_mismatch_errors() {
+        // An Arrow Int32 column for a proto int64 field must error, not silently drop the field.
+        let (_x, proto_dir) = create_test_proto_file_full().unwrap();
+        let config = ArrowToProtobufProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.FullMessage".to_string(),
+            },
+            fields_to_include: None,
+        };
+        let processor = ProtobufProcessor::new(config.into()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int32, false)]));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await;
+        assert!(
+            result.is_err(),
+            "Int32 column for proto int64 field must error, not silently drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_absent_field_concat_succeeds() -> Result<(), Error> {
+        // Two messages, A with all fields set, B with some unset — concat must not fail
+        // because the schema is descriptor-driven (all fields nullable).
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = ProtobufToArrowProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.TestMessage".to_string(),
+            },
+            value_field: None,
+        };
+        let processor = ProtobufProcessor::new(config.into())?;
+        let d = processor.descriptor.clone();
+
+        let mut a = DynamicMessage::new(d.clone());
+        a.set_field_by_name("timestamp", Value::I64(1));
+        a.set_field_by_name("value", Value::F64(1.0));
+        a.set_field_by_name("sensor", Value::String("s".to_string()));
+
+        let mut b = DynamicMessage::new(d.clone());
+        b.set_field_by_name("timestamp", Value::I64(2));
+        // b.value and b.sensor intentionally unset
+
+        let mut ea = Vec::new();
+        a.encode(&mut ea).map_err(|e| Error::Process(format!("encode: {}", e)))?;
+        let mut eb = Vec::new();
+        b.encode(&mut eb).map_err(|e| Error::Process(format!("encode: {}", e)))?;
+        let msg_batch = MessageBatch::new_binary(vec![ea, eb])?;
+
+        let result = processor.process(Arc::new(msg_batch)).await?;
+        let batch = match result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
+        assert_eq!(batch.len(), 2);
+        // sensor column must exist (descriptor-driven) even though message B lacks it.
+        assert!(batch.schema().field_with_name("sensor").is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_null_arrow_value_left_unset() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = ArrowToProtobufProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.TestMessage".to_string(),
+            },
+            fields_to_include: None,
+        };
+        let processor = ProtobufProcessor::new(config.into())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+            Field::new("sensor", DataType::Utf8, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None])),
+                Arc::new(Float64Array::from(vec![Some(1.0), None])),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            ],
+        )
+        .map_err(|e| Error::Process(format!("Failed to create record batch: {}", e)))?;
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?;
+        let batch = match result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
+        let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
+        // Row 1 (all null) → fields unset → decoded message has no timestamp field.
+        let decoded =
+            DynamicMessage::decode(processor.descriptor.clone(), data[1].as_ref())
+                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        // proto3 does not distinguish unset from default on the wire; assert the null row
+        // decodes to the default (0) and never carries another row's value.
+        let ts = decoded.get_field_by_name("timestamp");
+        let is_default = match &ts {
+            None => true,
+            Some(c) => matches!(c.as_ref(), Value::I64(0)),
+        };
+        assert!(
+            is_default,
+            "null Arrow value must decode to the proto default, got {:?}",
+            ts
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fields_to_include_filters() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let mut include = HashSet::new();
+        include.insert("timestamp".to_string());
+        let config = ArrowToProtobufProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.TestMessage".to_string(),
+            },
+            fields_to_include: Some(include),
+        };
+        let processor = ProtobufProcessor::new(config.into())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("sensor", DataType::Utf8, false),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Float64Array::from(vec![1.0])),
+                Arc::new(StringArray::from(vec!["s"])),
+            ],
+        )
+        .map_err(|e| Error::Process(format!("Failed to create record batch: {}", e)))?;
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?;
+        let batch = match result {
+            ProcessResult::Single(b) => b,
+            _ => panic!("Expected single result"),
+        };
+        let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
+        let decoded =
+            DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        assert_eq!(decoded.get_field_by_name("timestamp").unwrap().as_ref(), &Value::I64(42));
+        // value/sensor were filtered out of the Arrow batch, so they must not carry
+        // the originally-passed values.
+        let value = decoded.get_field_by_name("value");
+        let encoded_value = match &value {
+            None => false,
+            Some(c) => matches!(c.as_ref(), Value::F64(1.0)),
+        };
+        assert!(
+            !encoded_value,
+            "filtered-out field 'value' must not be encoded, got {:?}",
+            value
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_nested_field_errors() -> Result<(), Error> {
+        // A nested-message field is unsupported and must error, naming the kind.
+        let (_x, proto_dir) = create_test_proto_file_nested()?;
+        let config = ProtobufToArrowProcessorConfig {
+            c: CommonProtobufProcessorConfig {
+                proto_inputs: vec![proto_dir.to_string_lossy().to_string()],
+                proto_includes: None,
+                message_type: "test.WithNested".to_string(),
+            },
+            value_field: None,
+        };
+        let processor = ProtobufProcessor::new(config.into())?;
+        let msg = DynamicMessage::new(processor.descriptor.clone());
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)
+            .map_err(|e| Error::Process(format!("encode: {}", e)))?;
+        let msg_batch = MessageBatch::new_binary(vec![buf])?;
+        let result = processor.process(Arc::new(msg_batch)).await;
+        let err = result.err().expect("nested field must error");
+        assert!(
+            format!("{:?}", err).to_lowercase().contains("kind"),
+            "error should mention field kind, got: {:?}",
+            err
+        );
+        Ok(())
     }
 }
