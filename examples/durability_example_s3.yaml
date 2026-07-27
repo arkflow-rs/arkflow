@@ -1,0 +1,107 @@
+# S3-backed (object-store) durability example.
+#
+# Same at-least-once crash-recovery contract as `durability_example.yaml`,
+# but the WAL lives in S3-compatible object storage instead of local disk.
+# This lifts the durability boundary from "process crash" to "node loss":
+# a pod that is killed, OOM-killed, or rescheduled onto another node
+# recovers its in-flight data from the bucket on restart, instead of
+# losing it to local-disk teardown.
+#
+# Multiple arkflow nodes pointing at the same bucket are isolated by the
+# `node_id` and `stream_id` keys in the object namespace — each node
+# reads and writes only its own `{root}/{node_id}/{stream_id}/` prefix.
+# The bucket is shared; the namespace is not.
+#
+# ── `node_id` stability contract ──────────────────────────────────────────
+#
+# `node_id` MUST be stable across restarts of the same logical node. Two
+# nodes with the same `node_id` will silently corrupt each other's WAL
+# (this design does not enforce uniqueness — see change design D2).
+#
+# In Kubernetes, prefer one of:
+#
+#   - `${POD_NAME}` from the downward API on a `StatefulSet` — the
+#     StatefulSet ordinal is stable for the pod's lifetime.
+#   - `${ARKFLOW_NODE_ID}` injected from a ConfigMap or set in the pod
+#     spec — stable as long as the pod spec doesn't change.
+#   - DO NOT use `${HOSTNAME}` from a regular `Deployment` — the
+#     hostname is not guaranteed stable on reschedule.
+#
+# ── Sync policy: per_entry is rejected ────────────────────────────────────
+#
+# `per_entry` would mean one PUT per message; that's not viable on object
+# storage (single-digit msgs/sec). The object-store backend rejects
+# `sync: per_entry` at config-load time. Use `group_commit` (default) or
+# `periodic`.
+#
+# ── Loss window vs the local backend ─────────────────────────────────────
+#
+# Unlike the local backend (loss window = not-yet-`fsync`'d entries,
+# microseconds under `per_entry`), the object-store backend loses up to
+# one `segment.flush_interval` of entries on pod disappearance. This is
+# the explicit trade for surviving node loss at all. Tune `segment.*` to
+# trade throughput against this window.
+#
+# ── At-least-once duplication from cursor batching ───────────────────────
+#
+# `cursor.flush_interval` controls how often the watermark is `PUT` to
+# `manifest.json`. On a crash the persisted cursor may lag the true
+# high-water mark by up to one flush interval, so recovery replays some
+# entries that were already acked. This is additional at-least-once
+# duplication, inside the existing contract (outputs MUST tolerate
+# duplicates) — not a correctness regression.
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "value": 10, "sensor": "temp_1" }'
+      interval: 1ns
+      batch_size: 1
+      count: 1000
+
+    # Durable ingest backed by S3-compatible object storage. The bucket
+    # `my-bucket` is shared; the WAL namespace is `{prefix}/{node_id}/{stream_id}`.
+    durability:
+      enabled: true
+      sync: "group_commit"   # per_entry is rejected for object_store; use group_commit or periodic
+      backend:
+        type: "object_store"
+        # node_id: prefer a stable per-pod id. In K8s, the value typically comes
+        # from the downward API or a ConfigMap (see the comment block above).
+        node_id: "${ARKFLOW_NODE_ID}"
+        stream_id: "main"
+        # Root prefix for this WAL inside the bucket. Defaults to "arkflow/wal".
+        prefix: "arkflow/wal"
+        # S3 connection. `endpoint` is for MinIO / LocalStack; omit for AWS S3.
+        # `allow_http` must be true when `endpoint` is `http://...` (e.g. MinIO).
+        s3:
+          bucket: "my-bucket"
+          region: "us-east-1"
+          endpoint: "http://localhost:9000"
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+          allow_http: true
+        # Segment batching (D4). Three triggers, any one of which seals + PUTs
+        # the in-memory segment to a new immutable object.
+        segment:
+          max_entries: 1000      # default 1000
+          max_bytes: 1048576     # default 1 MiB
+          flush_interval: "1s"   # default 1s — also the loss window on node loss
+        # Cursor (watermark) batching (D6). The watermark is flushed to
+        # `manifest.json` every `cursor.max_entries` advances or every
+        # `cursor.interval`, whichever comes first.
+        cursor:
+          max_entries: 1000
+          interval: "1s"
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+        - type: "arrow_to_json"
+
+    output:
+      type: "stdout"
