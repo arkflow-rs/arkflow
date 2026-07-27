@@ -20,19 +20,29 @@
 //! output confirms the write, so a crash between `append` and `advance` leaves
 //! the entry in the WAL and it is replayed on recovery (`read_after_cursor`).
 //!
-//! Storage is an embedded `redb` database. Per-entry writes commit (and fsync)
-//! a transaction per append. `group-commit` and `periodic` policies coalesce
-//! concurrent appends into shared transactions to amortize the fsync cost, at
-//! the price of a small loss window if the process crashes mid-flush.
+//! `Wal` owns the batching layer (`pending`, flusher task, cursor atomic,
+//! per-entry / group-commit / periodic policy). Storage is delegated to a
+//! pluggable [`WalStore`] backend. The default backend (registered in this
+//! crate) is an embedded `redb` database. The `s3` backend is provided by
+//! `arkflow-plugin` and is opt-in via `backend: s3`. Per-entry writes commit
+//! (and fsync) a transaction per append. `group-commit` and `periodic` policies
+//! coalesce concurrent appends into shared transactions to amortize the
+//! fsync / PUT cost, at the price of a small loss window if the process
+//! crashes mid-flush.
 
-use crate::{Error, MessageBatch, MessageBatchRef};
-use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::ipc::writer::StreamWriter;
-use datafusion::arrow::record_batch::RecordBatch;
-use redb::{Database, ReadableTable, TableDefinition};
+pub mod config;
+pub mod store;
+
+pub use config::WalBackend;
+pub use store::{
+    build_wal_store, ensure_local_store_registered, lookup_wal_store_builder,
+    register_wal_store_builder, registered_wal_store_count, RedbStore,
+    WalStore, WalStoreBuilder,
+};
+
+use crate::wal::store::serialize;
+use crate::{Error, MessageBatchRef};
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,18 +50,12 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Table mapping sequence number → serialized message.
-const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
-/// Single-row metadata table.
-const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-/// Meta key holding the highest fully acknowledged sequence (the watermark).
-const CURSOR_KEY: &str = "cursor";
-
 /// Sync (fsync) policy for appends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncPolicy {
     /// Commit (fsync) a transaction on every append. Fully durable; slowest.
+    /// Not supported on remote backends (one PUT per message is not viable).
     PerEntry,
     /// Coalesce concurrent appends into shared transactions flushed as soon as
     /// pending data is available.
@@ -66,6 +70,14 @@ impl Default for SyncPolicy {
     }
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_path() -> String {
+    String::new()
+}
+
 /// Configuration for a durable ingest WAL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalConfig {
@@ -75,19 +87,129 @@ pub struct WalConfig {
     /// all is not durable (today's in-memory behavior).
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Directory in which to store the WAL database file.
+    /// Directory in which to store the WAL database file. Used by the local
+    /// (`redb`) backend only; ignored when `backend` is set to a non-local
+    /// kind.
+    #[serde(default = "default_path")]
     pub path: String,
     #[serde(default)]
     pub sync: SyncPolicy,
+    /// Storage backend selection. `None` (legacy default) is treated as
+    /// `Some(Local { path, sync })` so old configs keep working unchanged.
+    #[serde(default)]
+    pub backend: Option<WalBackend>,
 }
 
-fn default_enabled() -> bool {
-    true
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: String::new(),
+            sync: SyncPolicy::default(),
+            backend: None,
+        }
+    }
+}
+
+impl WalConfig {
+    /// Build a local-backed `WalConfig` (used by tests and by stream
+    /// construction code that doesn't go through YAML).
+    pub fn local(enabled: bool, path: String, sync: SyncPolicy) -> Self {
+        Self {
+            enabled,
+            path,
+            sync,
+            backend: None,
+        }
+    }
+
+    /// Validate this config at load time. Returns `Err` when a backend-
+    /// specific combination is forbidden (D8: `sync: per_entry` is not
+    /// viable on the object-store backend because it would mean one PUT
+    /// per message) or when required fields are missing (D2: `node_id`
+    /// and `stream_id` are non-empty).
+    ///
+    /// Called from `Wal::open` before the builder is invoked, so a bad
+    /// config surfaces as a `Config` error rather than a runtime panic.
+    pub fn validate(&self) -> Result<(), Error> {
+        match &self.backend {
+            None | Some(WalBackend::Local { .. }) => Ok(()),
+            Some(WalBackend::ObjectStore(o)) => {
+                if o.node_id.trim().is_empty() {
+                    return Err(Error::Config(
+                        "durability.backend.object_store: node_id is required \
+                         and must be non-empty (D2: the id names the WAL \
+                         namespace inside the bucket and must survive \
+                         restarts)"
+                            .into(),
+                    ));
+                }
+                if o.stream_id.trim().is_empty() {
+                    return Err(Error::Config(
+                        "durability.backend.object_store: stream_id is required \
+                         and must be non-empty"
+                            .into(),
+                    ));
+                }
+                if o.s3.bucket.trim().is_empty() {
+                    return Err(Error::Config(
+                        "durability.backend.object_store.s3.bucket is required".into(),
+                    ));
+                }
+                if matches!(o.sync, SyncPolicy::PerEntry) {
+                    return Err(Error::Config(
+                        "durability.backend.object_store: sync: per_entry is \
+                         not supported (one PUT per message is not viable; \
+                         use group_commit or periodic; see D8)"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The local-path when this config resolves to the local backend.
+    /// Returns `None` if the selected backend is not `local`.
+    pub fn local_path(&self) -> Option<&str> {
+        match &self.backend {
+            None => Some(&self.path),
+            Some(WalBackend::Local { path, .. }) => Some(path),
+            Some(_) => None,
+        }
+    }
+
+    /// The sync policy that applies to this config. The `Local` variant
+    /// carries its own; for `ObjectStore` the policy lives on the variant
+    /// itself; for the legacy flat shape it's the top-level `sync` field.
+    pub fn effective_sync(&self) -> &SyncPolicy {
+        match &self.backend {
+            None => &self.sync,
+            Some(WalBackend::Local { sync, .. }) => sync,
+            Some(WalBackend::ObjectStore(o)) => &o.sync,
+        }
+    }
+
+    /// Backend kind name. Defaults to `"local"` so legacy configs (no
+    /// `backend:`) dispatch through the local builder.
+    pub fn backend_kind(&self) -> &'static str {
+        match &self.backend {
+            None => "local",
+            Some(b) => b.kind(),
+        }
+    }
 }
 
 /// A durable write-ahead log for input messages.
+///
+/// `Wal` is a coordinator: it stages appends into `pending`, drains them as a
+/// `Vec<(u64, Vec<u8>)>` to `store.append_batch`, and delegates cursor
+/// advancement and recovery reads to the store. Storage is owned by the
+/// pluggable [`WalStore`].
 pub struct Wal {
-    db: Database,
+    /// Pluggable storage backend. `RedbStore` for local; `S3Store` (or
+    /// equivalent) for S3-compatible object storage.
+    store: Arc<dyn WalStore>,
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
@@ -100,31 +222,44 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open (or create) a WAL database inside `config.path`.
+    /// Open (or create) a WAL.
+    ///
+    /// Dispatches to the registered `WalStoreBuilder` for `config.backend_kind()`.
+    /// For legacy configs with `backend == None`, the local `redb` builder is
+    /// used. To use a plugin-provided backend (e.g. S3), register the builder
+    /// before calling this function.
+    ///
+    /// Synchronous: the registry and the local builder are synchronous. The
+    /// S3 builder (plugin) constructs a client synchronously inside its
+    /// `build()` and only defers network I/O to `append_batch`/`close`.
     pub fn open(config: &WalConfig) -> Result<Arc<Self>, Error> {
-        std::fs::create_dir_all(&config.path).map_err(|e| {
-            Error::Process(format!("Failed to create WAL directory: {}", e))
-        })?;
-        let db_path = Path::new(&config.path).join("wal.redb");
-        let db = Database::create(&db_path)
-            .map_err(|e| Error::Process(format!("Failed to open WAL database: {}", e)))?;
+        config.validate()?;
+        let store = build_wal_store(config)?;
+        // Derive next_seq from the store. The default `next_seq_hint()` uses
+        // `cursor() + 1`, which under-counts for local redb after a restart
+        // where the cursor advanced past the tail of the table; `RedbStore`
+        // overrides it to use `max_seq() + 1`. S3 (and any future remote
+        // backend) keeps the default, since the segment index already covers
+        // every written entry and the recovery `LIST` fallback re-discovers
+        // them on startup.
+        let next_seq = store.next_seq_hint().max(1);
+        Self::open_with_store(config, store, next_seq)
+    }
 
-        // Derive next_seq from existing data (max key + 1, or 1 if empty).
-        let next_seq = {
-            let tx = db
-                .begin_read()
-                .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
-            tx.open_table(ENTRIES)
-                .ok()
-                .and_then(|t| t.last().ok().flatten().map(|(k, _)| k.value()))
-                .map(|m| m + 1)
-                .unwrap_or(1)
-        };
+    /// Open a WAL backed by a caller-provided [`WalStore`] with an explicit
+    /// `next_seq`. Used by plugins when their store has a more precise
+    /// "next sequence" derivation than `cursor() + 1`.
+    pub fn open_with_store(
+        config: &WalConfig,
+        store: Arc<dyn WalStore>,
+        next_seq: u64,
+    ) -> Result<Arc<Self>, Error> {
+        let sync_policy = config.effective_sync().clone();
 
         let wal = Arc::new(Self {
-            db,
+            store,
             next_seq: AtomicU64::new(next_seq),
-            policy: config.sync.clone(),
+            policy: sync_policy,
             pending: Mutex::new(Vec::new()),
             pending_notify: Notify::new(),
             close: CancellationToken::new(),
@@ -178,13 +313,25 @@ impl Wal {
     /// those two policies a crash before the next flush loses staged entries
     /// (the documented small loss window) — pick `per-entry` when every entry
     /// must survive a crash regardless of timing.
+    ///
+    /// The store's blocking calls (redb `commit`, S3 `PUT`) are wrapped in
+    /// `spawn_blocking` for `per-entry` to keep the async executor from
+    /// stalling on fsync / network I/O.
     pub async fn append(&self, msg: &MessageBatchRef) -> Result<u64, Error> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let bytes = serialize(msg)?;
 
         match &self.policy {
             SyncPolicy::PerEntry => {
-                self.commit_entry(seq, &bytes)?;
+                // redb's `commit` is briefly blocking (~µs–ms); the
+                // multi-thread tokio runtime that arkflow ships with handles
+                // this fine. We don't `spawn_blocking` here because the
+                // blocking thread pool can deadlock against redb's fcntl
+                // flock on the database file (the close path also touches
+                // it). The local backend is fast enough; the S3 backend will
+                // be added later and will do its own async PUT inside its
+                // store.
+                self.store.append_batch(vec![(seq, bytes)])?;
             }
             SyncPolicy::GroupCommit | SyncPolicy::Periodic(_) => {
                 self.pending.lock().await.push((seq, bytes));
@@ -196,91 +343,19 @@ impl Wal {
 
     /// Advance the committed cursor to `seq` (monotonic). Called by the ack
     /// path only after the downstream output confirms the write.
-    pub fn advance(&self, seq: u64) -> Result<(), Error> {
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
-        {
-            let mut meta = tx
-                .open_table(META)
-                .map_err(|e| Error::Process(format!("WAL meta open failed: {}", e)))?;
-            let current = meta
-                .get(CURSOR_KEY)
-                .map_err(|e| Error::Process(format!("WAL meta read failed: {}", e)))?
-                .map(|g| g.value())
-                .unwrap_or(0);
-            if seq > current {
-                meta.insert(CURSOR_KEY, seq)
-                    .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
-            }
-        }
-        tx.commit()
-            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
-        Ok(())
+    pub async fn advance(&self, seq: u64) -> Result<(), Error> {
+        self.store.advance_cursor(seq)
     }
 
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
-    pub fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
-        let cursor = tx
-            .open_table(META)
-            .ok()
-            .and_then(|t| t.get(CURSOR_KEY).ok().flatten().map(|g| g.value()))
-            .unwrap_or(0);
-        let Some(entries) = tx.open_table(ENTRIES).ok() else {
-            return Ok(Vec::new());
-        };
-
-        let mut out = Vec::new();
-        let range = entries
-            .iter()
-            .map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
-        for item in range {
-            let (k, v) = item.map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
-            let seq = k.value();
-            if seq <= cursor {
-                continue;
-            }
-            let msg = Arc::new(deserialize(v.value())?);
-            out.push((seq, msg));
-        }
-        Ok(out)
+    pub async fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        self.store.read_after_cursor()
     }
 
     /// Current committed watermark (highest acked sequence, 0 if none).
-    pub fn cursor(&self) -> u64 {
-        self.db
-            .begin_read()
-            .ok()
-            .and_then(|tx| {
-                tx.open_table(META)
-                    .ok()
-                    .and_then(|t| t.get(CURSOR_KEY).ok().flatten().map(|g| g.value()))
-            })
-            .unwrap_or(0)
-    }
-
-    fn commit_entry(&self, seq: u64, bytes: &[u8]) -> Result<(), Error> {
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
-        {
-            let mut table = tx
-                .open_table(ENTRIES)
-                .map_err(|e| Error::Process(format!("WAL entries open failed: {}", e)))?;
-            table
-                .insert(seq, bytes)
-                .map_err(|e| Error::Process(format!("WAL insert failed: {}", e)))?;
-        }
-        tx.commit()
-            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
-        Ok(())
+    pub async fn cursor(&self) -> Result<u64, Error> {
+        Ok(self.store.cursor())
     }
 
     async fn flush_pending(&self) -> Result<(), Error> {
@@ -291,28 +366,12 @@ impl Wal {
             }
             std::mem::take(p.as_mut())
         };
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
-        {
-            let mut table = tx
-                .open_table(ENTRIES)
-                .map_err(|e| Error::Process(format!("WAL entries open failed: {}", e)))?;
-            for (seq, bytes) in &batch {
-                table
-                    .insert(*seq, bytes.as_slice())
-                    .map_err(|e| Error::Process(format!("WAL insert failed: {}", e)))?;
-            }
-        }
-        tx.commit()
-            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
-        Ok(())
+        self.store.append_batch(batch)
     }
 
     /// Flush any staged appends and stop the background flusher. After this
     /// returns the flusher task has exited, so dropping the last `Arc<Wal>`
-    /// closes the underlying database.
+    /// closes the underlying store.
     ///
     /// The final flush result is returned so callers can surface a flush
     /// failure rather than silently dropping it. The flusher task's join is
@@ -330,7 +389,8 @@ impl Wal {
         // Best-effort final flush (no-op for per-entry; pending already drained
         // by the flusher's shutdown branch otherwise). Surface the result so
         // a torn-write / disk failure is not silently lost on graceful shutdown.
-        self.flush_pending().await
+        self.flush_pending().await?;
+        self.store.close()
     }
 }
 
@@ -355,86 +415,22 @@ impl crate::input::Ack for WalAck {
         // Advance the durable cursor first (so the entry is reclaimable on
         // restart), then commit the source. If the source ack fails after the
         // cursor advanced, the source re-delivers — at-least-once, not loss.
-        self.wal.advance(self.seq)?;
+        self.wal.advance(self.seq).await?;
         self.inner.ack().await?;
         Ok(())
     }
-}
-
-// ---------- serialization ----------
-
-/// Serialize a `MessageBatch` to bytes: a length-prefixed optional input name
-/// followed by the Arrow IPC stream of the record batch (which preserves the
-/// schema, data, and `__meta_*` metadata columns).
-fn serialize(msg: &MessageBatch) -> Result<Vec<u8>, Error> {
-    let record: &RecordBatch = msg.deref();
-    let input_name = msg.get_input_name();
-
-    let mut out = Vec::new();
-    match &input_name {
-        Some(name) => {
-            let len = u32::try_from(name.len())
-                .map_err(|_| Error::Process("input name too long".into()))?;
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(name.as_bytes());
-        }
-        None => out.extend_from_slice(&0u32.to_be_bytes()),
-    }
-
-    let mut writer =
-        StreamWriter::try_new(&mut out, record.schema().as_ref()).map_err(|e| {
-            Error::Process(format!("Failed to start Arrow IPC writer: {}", e))
-        })?;
-    writer
-        .write(record)
-        .map_err(|e| Error::Process(format!("Failed to write Arrow IPC: {}", e)))?;
-    writer
-        .finish()
-        .map_err(|e| Error::Process(format!("Failed to finish Arrow IPC: {}", e)))?;
-    Ok(out)
-}
-
-/// Deserialize bytes produced by [`serialize`] back into a `MessageBatch`.
-fn deserialize(bytes: &[u8]) -> Result<MessageBatch, Error> {
-    use std::io::{Cursor, Read};
-
-    let mut cursor = Cursor::new(bytes);
-    let mut len_buf = [0u8; 4];
-    cursor
-        .read_exact(&mut len_buf)
-        .map_err(|e| Error::Process(format!("WAL entry truncated (name len): {}", e)))?;
-    let name_len = u32::from_be_bytes(len_buf) as usize;
-    let input_name = if name_len > 0 {
-        let mut nb = vec![0u8; name_len];
-        cursor
-            .read_exact(&mut nb)
-            .map_err(|e| Error::Process(format!("WAL entry truncated (name): {}", e)))?;
-        Some(
-            String::from_utf8(nb)
-                .map_err(|e| Error::Process(format!("WAL entry has invalid utf8 name: {}", e)))?,
-        )
-    } else {
-        None
-    };
-
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| Error::Process(format!("Failed to start Arrow IPC reader: {}", e)))?;
-    let record_batch = reader
-        .next()
-        .ok_or_else(|| Error::Process("WAL entry has no record batch".into()))?
-        .map_err(|e| Error::Process(format!("Failed to read Arrow IPC: {}", e)))?;
-
-    let mut mb = MessageBatch::new_arrow(record_batch);
-    mb.set_input_name(input_name);
-    Ok(mb)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::{Ack, NoopAck};
+    use crate::wal::store::{deserialize, serialize};
+    use crate::MessageBatch;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::ops::Deref;
     use std::sync::Arc as StdArc;
 
     fn sample_batch(input_name: Option<&str>) -> MessageBatch {
@@ -485,14 +481,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_entry_write_read_advance_and_reopen() {
         let dir = tempdir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
         let wal = Wal::open(&cfg).unwrap();
 
         let seqs = [
@@ -503,14 +495,14 @@ mod tests {
         assert_eq!(seqs, [1, 2, 3]);
 
         // Nothing acked yet: all three are after the cursor.
-        let pending = wal.read_after_cursor().unwrap();
+        let pending = wal.read_after_cursor().await.unwrap();
         assert_eq!(pending.len(), 3);
 
         // Ack the first two in order; the third remains pending.
-        wal.advance(1).unwrap();
-        wal.advance(2).unwrap();
-        assert_eq!(wal.cursor(), 2);
-        let pending = wal.read_after_cursor().unwrap();
+        wal.advance(1).await.unwrap();
+        wal.advance(2).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+        let pending = wal.read_after_cursor().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 3);
 
@@ -518,7 +510,7 @@ mod tests {
         wal.close().await.unwrap();
         drop(wal);
         let wal2 = Wal::open(&cfg).unwrap();
-        let pending = wal2.read_after_cursor().unwrap();
+        let pending = wal2.read_after_cursor().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 3);
         // New appends continue from seq 4, not colliding.
@@ -529,14 +521,10 @@ mod tests {
         assert_eq!(s4, 4);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_commit_flushes_on_close() {
         let dir = tempdir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::GroupCommit,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::GroupCommit);
         let wal = Wal::open(&cfg).unwrap();
         // group-commit stages appends; they are flushed by the background
         // flusher and on close. After close + reopen they must all be present.
@@ -547,6 +535,7 @@ mod tests {
         let wal2 = Wal::open(&cfg).unwrap();
         let seqs: Vec<u64> = wal2
             .read_after_cursor()
+            .await
             .unwrap()
             .iter()
             .map(|(s, _)| *s)
@@ -555,14 +544,10 @@ mod tests {
         assert!(seqs.contains(&s2));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corrupted_store_surfaces_error() {
         let dir = tempdir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
         let wal = Wal::open(&cfg).unwrap();
         wal.append(&StdArc::new(sample_batch(None)))
             .await
@@ -592,14 +577,10 @@ mod tests {
     /// (no loss); the replay IS the at-least-once duplicate. Once the
     /// downstream confirms, the cursor advances and a further restart replays
     /// nothing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crash_recovery_replays_unacked_then_advances_on_ack() {
         let dir = tempdir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
 
         // Phase 1: ingest a message, then "crash" before acknowledging it.
         let wal = Wal::open(&cfg).unwrap();
@@ -614,7 +595,7 @@ mod tests {
 
         // Phase 2: restart. Recovery must replay the unacked message (no loss).
         let wal2 = Wal::open(&cfg).unwrap();
-        let replayed = wal2.read_after_cursor().unwrap();
+        let replayed = wal2.read_after_cursor().await.unwrap();
         assert_eq!(
             replayed.len(),
             1,
@@ -631,19 +612,19 @@ mod tests {
             StdArc::new(NoopAck),
         ));
         ack.ack().await.unwrap();
-        assert_eq!(wal2.cursor(), seq);
+        assert_eq!(wal2.cursor().await.unwrap(), seq);
         drop(ack); // release the WalAck's Arc<Wal> so the database can close
 
         // Phase 4: a further restart replays nothing — fully acknowledged.
         wal2.close().await.unwrap();
         drop(wal2);
         let wal3 = Wal::open(&cfg).unwrap();
-        assert!(wal3.read_after_cursor().unwrap().is_empty());
+        assert!(wal3.read_after_cursor().await.unwrap().is_empty());
     }
 
     /// Throughput benchmark per sync policy (task 5.3). Ignored by default;
     /// run with `cargo test -p arkflow-core --lib wal::tests::bench_append_throughput --release -- --ignored --nocapture`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn bench_append_throughput() {
         let n = 5_000u32;
@@ -653,11 +634,7 @@ mod tests {
             ("periodic_1ms", SyncPolicy::Periodic(Duration::from_millis(1))),
         ] {
             let dir = tempdir();
-            let cfg = WalConfig {
-                enabled: true,
-                path: dir.to_string_lossy().to_string(),
-                sync: policy,
-            };
+            let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), policy);
             let wal = Wal::open(&cfg).unwrap();
             let msg = StdArc::new(sample_batch(None));
             let start = std::time::Instant::now();

@@ -275,6 +275,7 @@ dependencies = [
  "axum 0.8.8",
  "ballista",
  "base64 0.22.1",
+ "bytes",
  "colored",
  "dashmap 6.1.0",
  "datafusion",

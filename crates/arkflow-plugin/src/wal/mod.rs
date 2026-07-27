@@ -12,17 +12,17 @@
  *    limitations under the License.
  */
 
-pub mod buffer;
-pub mod codec;
-pub mod component;
-pub mod context_pool;
-pub mod expr;
-pub mod input;
-pub mod output;
-pub mod processor;
-pub mod pulsar;
-pub mod rate_limiter;
-pub mod temporary;
-pub mod time;
-pub mod udf;
-pub mod wal;
+//! WAL store implementations for arkflow-plugin.
+//!
+//! Currently ships the `object_store` (S3-compatible) backend, registered
+//! under the kind name `"object_store"`. The local `redb` backend lives in
+//! `arkflow-core` and is auto-registered.
+
+mod crc;
+mod manifest;
+mod s3;
+mod segment;
+
+pub fn init() -> Result<(), arkflow_core::Error> {
+    s3::register()
+}

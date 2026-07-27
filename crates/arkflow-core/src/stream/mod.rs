@@ -169,7 +169,7 @@ impl Stream {
         // processor workers' `recv_async` loops.
         let recovery: Result<(), Error> = async {
             if let Some(wal) = &self.wal {
-                let entries = wal.read_after_cursor()?;
+                let entries = wal.read_after_cursor().await?;
                 info!("WAL recovery: replaying {} entries", entries.len());
                 for (seq, msg) in entries {
                     let ack: Arc<dyn Ack> =
@@ -640,11 +640,7 @@ mod tests {
     #[tokio::test]
     async fn stream_close_flushes_group_commit_pending() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::GroupCommit,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::GroupCommit);
         let wal = Wal::open(&cfg).unwrap();
 
         // Build a stream with one queued message and an empty pipeline.
@@ -690,7 +686,7 @@ mod tests {
         // Reopen the WAL and confirm the queued message was persisted despite
         // the group-commit flusher never running on its timer.
         let wal2 = Wal::open(&cfg).unwrap();
-        let pending = wal2.read_after_cursor().unwrap();
+        let pending = wal2.read_after_cursor().await.unwrap();
         assert_eq!(
             pending.len(),
             1,
@@ -705,11 +701,11 @@ mod tests {
     #[tokio::test]
     async fn stream_close_flushes_periodic_pending() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::Periodic(std::time::Duration::from_secs(60)),
-        };
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::Periodic(std::time::Duration::from_secs(60)),
+        );
         let wal = Wal::open(&cfg).unwrap();
 
         let mut input_queue = VecDeque::new();
@@ -748,7 +744,7 @@ mod tests {
         drop(wal);
 
         let wal2 = Wal::open(&cfg).unwrap();
-        let pending = wal2.read_after_cursor().unwrap();
+        let pending = wal2.read_after_cursor().await.unwrap();
         assert_eq!(
             pending.len(),
             1,
@@ -838,11 +834,7 @@ mod tests {
     #[tokio::test]
     async fn wal_corruption_surfaces_before_stream_run() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
 
         // Phase 1: write a valid WAL with one unacked entry, then close.
         {
@@ -880,16 +872,12 @@ mod tests {
     #[tokio::test]
     async fn stream_run_returns_err_when_recovery_forward_fails() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
         let wal = Wal::open(&cfg).unwrap();
 
         // Persist one unacked entry so `read_after_cursor` returns it.
         wal.append(&Arc::new(sample_batch())).await.unwrap();
-        assert_eq!(wal.cursor(), 0, "cursor must start at 0");
+        assert_eq!(wal.cursor().await.unwrap(), 0, "cursor must start at 0");
 
         // The failing buffer is configured on the stream, so recovery's
         // `Self::forward(msg, ack, &self.buffer, &input_sender)` routes via
@@ -927,7 +915,7 @@ mod tests {
         );
         // Cursor must not advance — the failed entry remains pending.
         assert_eq!(
-            wal.cursor(),
+            wal.cursor().await.unwrap(),
             0,
             "cursor must not advance on recovery forward failure"
         );
@@ -987,11 +975,7 @@ mod tests {
     #[tokio::test]
     async fn stream_run_replays_unacked_entries_before_new_input() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
 
         // Phase 1: persist one unacked entry to the WAL, simulating a crash
         // before downstream acknowledgement.
@@ -1001,7 +985,7 @@ mod tests {
             wal.append(&Arc::new(sample_batch_with_value(REPLAYED_VALUE)))
                 .await
                 .unwrap();
-            assert_eq!(wal.cursor(), 0, "cursor must stay at 0 until ack");
+            assert_eq!(wal.cursor().await.unwrap(), 0, "cursor must stay at 0 until ack");
             wal.close().await.unwrap();
         }
 
@@ -1049,7 +1033,7 @@ mod tests {
         // acknowledgements flowing through `WalAck` is exactly the contract
         // spec scenario 4 calls for.
         assert_eq!(
-            wal.cursor(),
+            wal.cursor().await.unwrap(),
             2,
             "WAL cursor must advance for both the replayed entry and the new input"
         );
@@ -1079,11 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn stream_run_replays_more_entries_than_channel_capacity_without_deadlock() {
         let dir = temp_dir();
-        let cfg = WalConfig {
-            enabled: true,
-            path: dir.to_string_lossy().to_string(),
-            sync: SyncPolicy::PerEntry,
-        };
+        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
 
         const ENTRY_COUNT: i64 = 50;
         {
@@ -1094,7 +1074,7 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                wal.cursor(),
+                wal.cursor().await.unwrap(),
                 0,
                 "cursor must stay at 0 — none of the appended entries are acked"
             );
@@ -1150,7 +1130,7 @@ mod tests {
         }
 
         assert_eq!(
-            wal.cursor(),
+            wal.cursor().await.unwrap(),
             ENTRY_COUNT as u64,
             "cursor must advance past every replayed entry once acked"
         );
