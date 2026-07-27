@@ -155,19 +155,38 @@ impl Stream {
             self.error_output.clone(),
         ));
 
-        // WAL recovery: replay any entries past the committed cursor before
-        // `do_input` starts. Lives in `run_inner` (not `do_input`) so a
-        // failure here fails stream startup rather than silently continuing
-        // into the input loop. Replayed entries carry a NoopAck source (we
-        // replay from the WAL, not a live source) wrapped in WalAck so the
-        // cursor advances on downstream confirmation.
-        if let Some(wal) = &self.wal {
-            let entries = wal.read_after_cursor()?;
-            info!("WAL recovery: replaying {} entries", entries.len());
-            for (seq, msg) in entries {
-                let ack: Arc<dyn Ack> = Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
-                Self::forward(msg, ack, &self.buffer, &input_sender).await?;
+        // WAL recovery. Failures here MUST cancel already-spawned workers
+        // (do_buffer / do_processor / do_output) and drain the tracker
+        // before returning. Without that cleanup, `?` would early-return
+        // while the tracker is dropped ungracefully and the spawned tasks
+        // would leak — TaskTracker doesn't wait on drop and `Stream::close`
+        // does not signal the cancellation token.
+        //
+        // `do_input` has not been spawned yet at this point, so only the
+        // three downstream workers need to be drained. `Self::forward` is
+        // invoked with `&input_sender`, so we still own the local sender
+        // and can drop it explicitly on the error path to unblock the
+        // processor workers' `recv_async` loops.
+        let recovery: Result<(), Error> = async {
+            if let Some(wal) = &self.wal {
+                let entries = wal.read_after_cursor()?;
+                info!("WAL recovery: replaying {} entries", entries.len());
+                for (seq, msg) in entries {
+                    let ack: Arc<dyn Ack> =
+                        Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
+                    Self::forward(msg, ack, &self.buffer, &input_sender).await?;
+                }
             }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = recovery {
+            cancellation_token.cancel();
+            drop(input_sender);
+            tracker.close();
+            tracker.wait().await;
+            return Err(e);
         }
 
         tracker.spawn(Self::do_input(
@@ -776,8 +795,13 @@ mod tests {
 
     /// Buffer that always fails on `write`. Used to drive recovery's
     /// `Self::forward` into the error path during a durability-enabled
-    /// stream's startup.
-    struct FailingBuffer;
+    /// stream's startup. `flush_count` lets tests observe whether the
+    /// `do_buffer` worker ran through its post-cancel flush phase — a
+    /// non-zero count proves the spawned worker was actually awaited
+    /// (i.e. no leak) on the recovery-failure path.
+    struct FailingBuffer {
+        flush_count: std::sync::atomic::AtomicU64,
+    }
 
     #[async_trait]
     impl Buffer for FailingBuffer {
@@ -790,6 +814,8 @@ mod tests {
         }
 
         async fn flush(&self) -> Result<(), Error> {
+            self.flush_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
 
@@ -867,8 +893,12 @@ mod tests {
 
         // The failing buffer is configured on the stream, so recovery's
         // `Self::forward(msg, ack, &self.buffer, &input_sender)` routes via
-        // `buffer.write`, which always returns `Err`.
-        let buffer: Arc<dyn Buffer> = Arc::new(FailingBuffer);
+        // `buffer.write`, which always returns `Err`. `flush_count` lets us
+        // assert below that `do_buffer` ran through its post-cancel flush
+        // phase, proving the spawned worker was awaited rather than leaked.
+        let buffer = Arc::new(FailingBuffer {
+            flush_count: std::sync::atomic::AtomicU64::new(0),
+        });
 
         let input = Arc::new(StubInput {
             connected: std::sync::atomic::AtomicBool::new(false),
@@ -881,7 +911,7 @@ mod tests {
             pipeline,
             output,
             None,
-            Some(buffer),
+            Some(buffer.clone() as Arc<dyn Buffer>),
             Some(wal.clone()),
             Resource {
                 temporary: HashMap::new(),
@@ -900,6 +930,15 @@ mod tests {
             wal.cursor(),
             0,
             "cursor must not advance on recovery forward failure"
+        );
+        // The spawned `do_buffer` worker must have been cancelled and awaited
+        // — a non-zero flush count proves the post-cancel flush path ran. If
+        // the recovery error path leaked the worker (TaskTracker dropped
+        // without `close`/`wait`), this stays at 0.
+        assert!(
+            buffer.flush_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "do_buffer worker must be cancelled and awaited on recovery failure (flush_count={})",
+            buffer.flush_count.load(std::sync::atomic::Ordering::SeqCst),
         );
 
         wal.close().await.unwrap();
