@@ -75,6 +75,18 @@ redb 2.6.3 在 `Database::open` 时通过 `verify_primary_checksums()` 已经走
 
 **理由**：现有的 close-wal-on-stream-shutdown change 已经验证过 Engine 在 `Stream::run` 返回 `Err` 时会让整个进程退出、依赖 k8s/systemd 重启。本 change 只依赖现有行为，不引入新的 Engine 层逻辑。
 
+### Decision 6: 下游 worker 在 recovery 之前 spawn，`do_input` 在 recovery 之后 spawn
+
+**选择**：在 `run_inner` 中按 `do_buffer → do_processor → do_output → recovery → do_input` 的顺序 spawn。
+
+**原因**（review 发现）：input channel 是 `flume::bounded(thread_num * 4)`，无 buffer 时 recovery 直接 `send_async` 到 input_sender。如果下游 worker（do_processor 等）未 spawn，backlog > 容量时 `send_async` 会 await 永远——deadlock。有 buffer 时 memory buffer 是 unbounded 不会卡，但其它 future buffer 实现可能不是。所以统一前置 spawn 更安全。
+
+**为何不是其它方案**：
+- 把 recovery 也后移到所有 spawn 之后、`tracker.close()` 之前 → 仍能避免 deadlock，但 do_input 会和 recovery 并发读 input，破坏 spec scenario 4「replay 先于 new input」契约。
+- 取消 input channel 的 capacity → 改变正常路径的背压语义，超出本 change scope。
+
+**WAL ack 行为不变**：`WalAck::new(wal, seq, NoopAck)` 包装的 ack 仍由 do_output 调；不论 do_output spawn 在 recovery 之前或之后，entry 通过管道最终都会被 ack 推进 cursor。新增测试 `stream_run_replays_more_entries_than_channel_capacity_without_deadlock` 验证 50 条 entry（远超容量 4）能完整通过且 cursor 推进到 50。
+
 ## Risks / Trade-offs
 
 - **[行为变更：WAL 损坏时从"继续运行"变成"启动失败"]** → 在 changelog 中明确强调；现有用户遇到 WAL 损坏（罕见）需要人工介入或回滚到 checkpoint，这正是 fail-fast 的目的——让问题被看见而不是被吞掉。

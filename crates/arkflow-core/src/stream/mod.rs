@@ -114,44 +114,25 @@ impl Stream {
         let (output_sender, output_receiver) =
             flume::bounded::<(ProcessorData, Arc<dyn Ack>, u64)>(self.thread_num as usize * 4);
 
-        // WAL recovery: replay any entries past the committed cursor before
-        // spawning workers. Lives in `run_inner` (not `do_input`) so a failure
-        // here fails stream startup rather than silently continuing into the
-        // input loop. Replayed entries carry a NoopAck source (we replay from
-        // the WAL, not a live source) wrapped in WalAck so the cursor advances
-        // on downstream confirmation.
-        if let Some(wal) = &self.wal {
-            let entries = wal.read_after_cursor()?;
-            info!("WAL recovery: replaying {} entries", entries.len());
-            for (seq, msg) in entries {
-                let ack: Arc<dyn Ack> = Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
-                Self::forward(msg, ack, &self.buffer, &input_sender).await?;
-            }
-        }
-
         let tracker = TaskTracker::new();
 
-        // Input
-        tracker.spawn(Self::do_input(
-            cancellation_token.clone(),
-            self.input.clone(),
-            input_sender.clone(),
-            self.buffer.clone(),
-            self.wal.clone(),
-        ));
-
-        // Buffer
+        // Spawn the downstream workers (buffer, processor, output) BEFORE WAL
+        // replay. Recovery forwards unacked entries into the same bounded
+        // `input_sender` (or buffer) that `do_input` uses — if consumers
+        // weren't running yet, a large backlog would fill the channel and
+        // `send_async` would await forever. Starting consumers first lets
+        // `Self::forward` drain naturally during recovery.
+        //
+        // `do_input` is intentionally spawned AFTER replay so new input is
+        // only read once pending entries have been restored (spec scenario 4).
         if let Some(buffer) = self.buffer.clone() {
             tracker.spawn(Self::do_buffer(
                 cancellation_token.clone(),
                 buffer,
-                input_sender,
+                input_sender.clone(),
             ));
-        } else {
-            drop(input_sender)
         }
 
-        // Processor
         for i in 0..self.thread_num {
             tracker.spawn(Self::do_processor(
                 i,
@@ -163,15 +144,38 @@ impl Stream {
             ));
         }
 
-        // Close the output sender to notify all workers
+        // All processor workers have their own clone; drop ours so the output
+        // receiver observes end-of-stream once the last processor exits.
         drop(output_sender);
 
-        // Output
         tracker.spawn(Self::do_output(
             self.next_seq.clone(),
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
+        ));
+
+        // WAL recovery: replay any entries past the committed cursor before
+        // `do_input` starts. Lives in `run_inner` (not `do_input`) so a
+        // failure here fails stream startup rather than silently continuing
+        // into the input loop. Replayed entries carry a NoopAck source (we
+        // replay from the WAL, not a live source) wrapped in WalAck so the
+        // cursor advances on downstream confirmation.
+        if let Some(wal) = &self.wal {
+            let entries = wal.read_after_cursor()?;
+            info!("WAL recovery: replaying {} entries", entries.len());
+            for (seq, msg) in entries {
+                let ack: Arc<dyn Ack> = Arc::new(WalAck::new(wal.clone(), seq, Arc::new(NoopAck)));
+                Self::forward(msg, ack, &self.buffer, &input_sender).await?;
+            }
+        }
+
+        tracker.spawn(Self::do_input(
+            cancellation_token.clone(),
+            self.input.clone(),
+            input_sender,
+            self.buffer.clone(),
+            self.wal.clone(),
         ));
 
         tracker.close();
@@ -1019,6 +1023,97 @@ mod tests {
             received,
             vec![REPLAYED_VALUE, NEW_VALUE],
             "replayed entry must reach output before newly-read input"
+        );
+
+        wal.close().await.unwrap();
+    }
+
+    /// Regression: WAL recovery must not deadlock when the backlog exceeds
+    /// the bounded input channel capacity (`thread_num * 4`).
+    ///
+    /// Before downstream workers were spawned ahead of replay, recovery
+    /// loop's `Self::forward` would `send_async` into a bounded channel
+    /// with no consumers; once the backlog exceeded the capacity, the
+    /// `send_async` awaited forever and `Stream::run` hung. This test
+    /// writes 50 unacked entries (cap = 4 with `thread_num=1`) and asserts
+    /// the stream terminates cleanly.
+    #[tokio::test]
+    async fn stream_run_replays_more_entries_than_channel_capacity_without_deadlock() {
+        let dir = temp_dir();
+        let cfg = WalConfig {
+            enabled: true,
+            path: dir.to_string_lossy().to_string(),
+            sync: SyncPolicy::PerEntry,
+        };
+
+        const ENTRY_COUNT: i64 = 50;
+        {
+            let wal = Wal::open(&cfg).unwrap();
+            for i in 0..ENTRY_COUNT {
+                wal.append(&Arc::new(sample_batch_with_value(i)))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                wal.cursor(),
+                0,
+                "cursor must stay at 0 — none of the appended entries are acked"
+            );
+            wal.close().await.unwrap();
+        }
+
+        let wal = Wal::open(&cfg).unwrap();
+        // Empty input queue → after replay completes, `do_input` hits EOF and
+        // the stream drains naturally.
+        let input = Arc::new(StubInput {
+            connected: std::sync::atomic::AtomicBool::new(false),
+            queue: Mutex::new(VecDeque::new()),
+        });
+        let recording_output = Arc::new(RecordingOutput::default());
+        let output: Arc<dyn Output> = recording_output.clone();
+        let pipeline = Pipeline::new(vec![]);
+        // thread_num=1 → input channel capacity = 4. ENTRY_COUNT=50 > 4, so
+        // the old spawn-order would deadlock on the 5th `send_async`.
+        let mut stream = Stream::new(
+            input.clone(),
+            pipeline,
+            output,
+            None,
+            None,
+            Some(wal.clone()),
+            Resource {
+                temporary: HashMap::new(),
+                input_names: RefCell::default(),
+            },
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let run_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.run(cancel))
+                .await
+                .expect(
+                    "Stream::run must not deadlock when backlog exceeds input channel capacity",
+                );
+        assert!(
+            run_result.is_ok(),
+            "large replay must complete without error (got {run_result:?})"
+        );
+
+        let received = recording_output.received.lock().await.clone();
+        assert_eq!(
+            received.len(),
+            ENTRY_COUNT as usize,
+            "every replayed entry must reach the output"
+        );
+        for (i, v) in received.iter().enumerate() {
+            assert_eq!(*v, i as i64, "replay must preserve sequence order");
+        }
+
+        assert_eq!(
+            wal.cursor(),
+            ENTRY_COUNT as u64,
+            "cursor must advance past every replayed entry once acked"
         );
 
         wal.close().await.unwrap();
