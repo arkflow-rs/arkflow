@@ -8,8 +8,8 @@ three optimization dimensions introduced in 2026-07-28:
 
 For background on the at-least-once contract and replay semantics, see
 [Input Delivery Semantics](delivery-semantics.md). For detailed
-performance characteristics, see
-[S3 WAL Backend Performance](../../../performance/s3-wal-backend.md).
+performance characteristics and tuning rationale, see the S3 WAL backend
+performance guide at `docs/performance/s3-wal-backend.md` in the repository.
 
 ## Quick Start
 
@@ -269,10 +269,10 @@ See the `examples/` directory for ready-to-use configurations:
 
 Key metrics to watch after enabling these optimizations:
 
-- `segment_put_latency` — should be <200 ms p99; if higher, check region
+- `segment_put_latency` — should be under 200 ms p99; if higher, check region
 - `segment_put_frequency` — should drop with `aggressive` strategy
-- `cursor_lag` — should stay <10,000 entries
-- `recovery_latency` — should be <5 s on restart
+- `cursor_lag` — should stay under 10,000 entries
+- `recovery_latency` — should be under 5 s on restart
 
-See [S3 WAL Backend Performance § Monitoring](../../../performance/s3-wal-backend.md#monitoring)
-for the full list and alert thresholds.
+See the S3 WAL backend performance guide (`docs/performance/s3-wal-backend.md`)
+in the repository for the full metrics list and alert thresholds.
