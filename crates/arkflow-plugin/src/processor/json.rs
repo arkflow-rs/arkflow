@@ -17,7 +17,9 @@
 //! A processor for converting between binary data and the Arrow format
 
 use crate::component;
-use arkflow_core::component::{register_processor_metadata, ComponentMetadata as CoreComponentMetadata};
+use arkflow_core::component::{
+    register_processor_metadata, ComponentMetadata as CoreComponentMetadata,
+};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::{
     Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,

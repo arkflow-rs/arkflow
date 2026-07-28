@@ -640,7 +640,11 @@ mod tests {
     #[tokio::test]
     async fn stream_close_flushes_group_commit_pending() {
         let dir = temp_dir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::GroupCommit);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::GroupCommit,
+        );
         let wal = Wal::open(&cfg).unwrap();
 
         // Build a stream with one queued message and an empty pipeline.
@@ -834,7 +838,11 @@ mod tests {
     #[tokio::test]
     async fn wal_corruption_surfaces_before_stream_run() {
         let dir = temp_dir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
 
         // Phase 1: write a valid WAL with one unacked entry, then close.
         {
@@ -872,7 +880,11 @@ mod tests {
     #[tokio::test]
     async fn stream_run_returns_err_when_recovery_forward_fails() {
         let dir = temp_dir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
         let wal = Wal::open(&cfg).unwrap();
 
         // Persist one unacked entry so `read_after_cursor` returns it.
@@ -975,7 +987,11 @@ mod tests {
     #[tokio::test]
     async fn stream_run_replays_unacked_entries_before_new_input() {
         let dir = temp_dir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
 
         // Phase 1: persist one unacked entry to the WAL, simulating a crash
         // before downstream acknowledgement.
@@ -985,7 +1001,11 @@ mod tests {
             wal.append(&Arc::new(sample_batch_with_value(REPLAYED_VALUE)))
                 .await
                 .unwrap();
-            assert_eq!(wal.cursor().await.unwrap(), 0, "cursor must stay at 0 until ack");
+            assert_eq!(
+                wal.cursor().await.unwrap(),
+                0,
+                "cursor must stay at 0 until ack"
+            );
             wal.close().await.unwrap();
         }
 
@@ -1063,7 +1083,11 @@ mod tests {
     #[tokio::test]
     async fn stream_run_replays_more_entries_than_channel_capacity_without_deadlock() {
         let dir = temp_dir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
 
         const ENTRY_COUNT: i64 = 50;
         {

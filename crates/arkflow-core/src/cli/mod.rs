@@ -225,10 +225,7 @@ fn print_component_details(
         } else {
             format!(". Available {} types: {}", kind, known.join(", "))
         };
-        Error::Config(format!(
-            "Unknown {} type: {}{}",
-            kind, name, available
-        ))
+        Error::Config(format!("Unknown {} type: {}{}", kind, name, available))
     })?;
 
     match format {
@@ -248,7 +245,11 @@ fn print_component_details(
             println!("kind: {}", kind);
             println!(
                 "config_optional: {}",
-                if metadata.config_optional { "yes" } else { "no" }
+                if metadata.config_optional {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             if let Some(example) = &metadata.config_example {
                 println!("\nExample:");

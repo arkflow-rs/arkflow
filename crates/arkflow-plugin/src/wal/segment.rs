@@ -127,8 +127,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedSegment, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkflow_core::MessageBatch;
     use arkflow_core::wal::store::serialize;
+    use arkflow_core::MessageBatch;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -140,11 +140,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![StdArc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![StdArc::new(Int64Array::from(vec![1]))]).unwrap();
         let mut mb = MessageBatch::new_arrow(batch);
         mb.set_input_name(Some("test".into()));
         serialize(&mb).unwrap()
@@ -191,11 +188,7 @@ mod tests {
         cut.truncate(bytes.len() - 4 - (last_payload_len / 2));
 
         let decoded = decode(&cut).unwrap();
-        assert_eq!(
-            decoded.entries.len(),
-            2,
-            "torn tail must be discarded"
-        );
+        assert_eq!(decoded.entries.len(), 2, "torn tail must be discarded");
         assert_eq!(decoded.entries[0].0, 1);
         assert_eq!(decoded.entries[1].0, 2);
         assert!(decoded.bytes_consumed <= cut.len());

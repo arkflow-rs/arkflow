@@ -511,7 +511,9 @@ message TestMessage {
         std::fs::create_dir_all(&proto_dir)
             .map_err(|e| Error::Process(format!("Failed to create proto dir: {}", e)))?;
         let proto_file_path = proto_dir.join("full_message.proto");
-        std::fs::write(&proto_file_path, r#"syntax = "proto3";
+        std::fs::write(
+            &proto_file_path,
+            r#"syntax = "proto3";
 
 package test;
 
@@ -523,7 +525,8 @@ message FullMessage {
   uint32 count = 5;
   bytes payload = 6;
 }
-"#)
+"#,
+        )
         .map_err(|e| Error::Process(format!("Failed to write proto file: {}", e)))?;
         Ok((dir, proto_dir))
     }
@@ -535,7 +538,9 @@ message FullMessage {
         std::fs::create_dir_all(&proto_dir)
             .map_err(|e| Error::Process(format!("Failed to create proto dir: {}", e)))?;
         let proto_file_path = proto_dir.join("nested_message.proto");
-        std::fs::write(&proto_file_path, r#"syntax = "proto3";
+        std::fs::write(
+            &proto_file_path,
+            r#"syntax = "proto3";
 
 package test;
 
@@ -546,7 +551,8 @@ message WithNested {
 message Sub {
   int32 x = 1;
 }
-"#)
+"#,
+        )
         .map_err(|e| Error::Process(format!("Failed to write proto file: {}", e)))?;
         Ok((dir, proto_dir))
     }
@@ -592,13 +598,24 @@ message Sub {
             _ => panic!("Expected single result"),
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
-        let decoded =
-            DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
-                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
-        assert_eq!(decoded.get_field_by_name("timestamp").unwrap().as_ref(), &Value::I64(1634567890));
-        assert_eq!(decoded.get_field_by_name("value").unwrap().as_ref(), &Value::F64(42.5));
-        assert_eq!(decoded.get_field_by_name("active").unwrap().as_ref(), &Value::Bool(true));
-        assert_eq!(decoded.get_field_by_name("count").unwrap().as_ref(), &Value::U32(7));
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+            .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        assert_eq!(
+            decoded.get_field_by_name("timestamp").unwrap().as_ref(),
+            &Value::I64(1634567890)
+        );
+        assert_eq!(
+            decoded.get_field_by_name("value").unwrap().as_ref(),
+            &Value::F64(42.5)
+        );
+        assert_eq!(
+            decoded.get_field_by_name("active").unwrap().as_ref(),
+            &Value::Bool(true)
+        );
+        assert_eq!(
+            decoded.get_field_by_name("count").unwrap().as_ref(),
+            &Value::U32(7)
+        );
         Ok(())
     }
 
@@ -615,7 +632,11 @@ message Sub {
             fields_to_include: None,
         };
         let processor = ProtobufProcessor::new(config.into()).unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Int32,
+            false,
+        )]));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
         let result = processor
             .process(Arc::new(MessageBatch::new_arrow(rb)))
@@ -652,9 +673,11 @@ message Sub {
         // b.value and b.sensor intentionally unset
 
         let mut ea = Vec::new();
-        a.encode(&mut ea).map_err(|e| Error::Process(format!("encode: {}", e)))?;
+        a.encode(&mut ea)
+            .map_err(|e| Error::Process(format!("encode: {}", e)))?;
         let mut eb = Vec::new();
-        b.encode(&mut eb).map_err(|e| Error::Process(format!("encode: {}", e)))?;
+        b.encode(&mut eb)
+            .map_err(|e| Error::Process(format!("encode: {}", e)))?;
         let msg_batch = MessageBatch::new_binary(vec![ea, eb])?;
 
         let result = processor.process(Arc::new(msg_batch)).await?;
@@ -703,9 +726,8 @@ message Sub {
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
         // Row 1 (all null) → fields unset → decoded message has no timestamp field.
-        let decoded =
-            DynamicMessage::decode(processor.descriptor.clone(), data[1].as_ref())
-                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[1].as_ref())
+            .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
         // proto3 does not distinguish unset from default on the wire; assert the null row
         // decodes to the default (0) and never carries another row's value.
         let ts = decoded.get_field_by_name("timestamp");
@@ -757,10 +779,12 @@ message Sub {
             _ => panic!("Expected single result"),
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
-        let decoded =
-            DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
-                .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
-        assert_eq!(decoded.get_field_by_name("timestamp").unwrap().as_ref(), &Value::I64(42));
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+            .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
+        assert_eq!(
+            decoded.get_field_by_name("timestamp").unwrap().as_ref(),
+            &Value::I64(42)
+        );
         // value/sensor were filtered out of the Arrow batch, so they must not carry
         // the originally-passed values.
         let value = decoded.get_field_by_name("value");

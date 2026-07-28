@@ -58,11 +58,7 @@ fn sample_payload() -> Vec<u8> {
         DataType::Int64,
         false,
     )]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![1]))],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
     serialize(&MessageBatch::new_arrow(batch)).unwrap()
 }
 
@@ -130,13 +126,58 @@ async fn round_trip_against_minio() {
     let payload = sample_payload();
     // 4 entries → forces a seal.
     for i in 1u64..=4 {
-        store
-            .append_batch(vec![(i, payload.clone())])
-            .unwrap();
+        store.append_batch(vec![(i, payload.clone())]).unwrap();
     }
 
     let replayed = store.read_after_cursor().unwrap();
     assert_eq!(replayed.len(), 4);
 
     store.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn high_qps_workload() {
+    if minio_endpoint().is_none() {
+        eprintln!("MINIO_ENDPOINT not set; skipping. Run MinIO locally to exercise this test.");
+        return;
+    }
+
+    // Ensure plugin builders (and the S3 store builder) are registered.
+    init().expect("plugin init");
+
+    let cfg = WalConfig {
+        enabled: true,
+        path: String::new(),
+        sync: SyncPolicy::GroupCommit,
+        backend: Some(arkflow_core::wal::WalBackend::ObjectStore(osc(s3_config()))),
+    };
+    cfg.validate().expect("config must validate");
+
+    let store = arkflow_core::wal::build_wal_store(&cfg).unwrap();
+
+    let payload = sample_payload();
+
+    // Simulate high QPS: write 100 entries rapidly
+    // With max_entries=4, this creates 25 segments
+    // The new pipeline should handle this without blocking
+    let start = std::time::Instant::now();
+    for i in 1u64..=100 {
+        store.append_batch(vec![(i, payload.clone())]).unwrap();
+    }
+    let write_duration = start.elapsed();
+
+    // Give PUT worker time to finish processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let replayed = store.read_after_cursor().unwrap();
+    assert_eq!(replayed.len(), 100, "all entries should be replayed");
+
+    store.close().unwrap();
+
+    println!(
+        "High QPS test: wrote 100 entries in {:?}, {:.2} entries/sec",
+        write_duration,
+        100.0 / write_duration.as_secs_f64()
+    );
 }

@@ -36,8 +36,7 @@ pub mod store;
 pub use config::WalBackend;
 pub use store::{
     build_wal_store, ensure_local_store_registered, lookup_wal_store_builder,
-    register_wal_store_builder, registered_wal_store_count, RedbStore,
-    WalStore, WalStoreBuilder,
+    register_wal_store_builder, registered_wal_store_count, RedbStore, WalStore, WalStoreBuilder,
 };
 
 use crate::wal::store::serialize;
@@ -454,7 +453,8 @@ mod tests {
     fn tempdir() -> std::path::PathBuf {
         static C: AtomicU64 = AtomicU64::new(0);
         let n = C.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("arkflow-wal-test-{}-{}", std::process::id(), n));
+        let dir =
+            std::env::temp_dir().join(format!("arkflow-wal-test-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -484,7 +484,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_entry_write_read_advance_and_reopen() {
         let dir = tempdir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
         let wal = Wal::open(&cfg).unwrap();
 
         let seqs = [
@@ -514,17 +518,18 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 3);
         // New appends continue from seq 4, not colliding.
-        let s4 = wal2
-            .append(&StdArc::new(sample_batch(None)))
-            .await
-            .unwrap();
+        let s4 = wal2.append(&StdArc::new(sample_batch(None))).await.unwrap();
         assert_eq!(s4, 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_commit_flushes_on_close() {
         let dir = tempdir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::GroupCommit);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::GroupCommit,
+        );
         let wal = Wal::open(&cfg).unwrap();
         // group-commit stages appends; they are flushed by the background
         // flusher and on close. After close + reopen they must all be present.
@@ -547,11 +552,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corrupted_store_surfaces_error() {
         let dir = tempdir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
         let wal = Wal::open(&cfg).unwrap();
-        wal.append(&StdArc::new(sample_batch(None)))
-            .await
-            .unwrap();
+        wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
         wal.close().await.unwrap();
         drop(wal);
         // Corrupt the database header with garbage bytes (a torn header must
@@ -580,7 +587,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crash_recovery_replays_unacked_then_advances_on_ack() {
         let dir = tempdir();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
 
         // Phase 1: ingest a message, then "crash" before acknowledging it.
         let wal = Wal::open(&cfg).unwrap();
@@ -631,7 +642,10 @@ mod tests {
         for (name, policy) in [
             ("per_entry", SyncPolicy::PerEntry),
             ("group_commit", SyncPolicy::GroupCommit),
-            ("periodic_1ms", SyncPolicy::Periodic(Duration::from_millis(1))),
+            (
+                "periodic_1ms",
+                SyncPolicy::Periodic(Duration::from_millis(1)),
+            ),
         ] {
             let dir = tempdir();
             let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), policy);

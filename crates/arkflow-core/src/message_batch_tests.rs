@@ -121,7 +121,10 @@ mod tests {
         assert_eq!(format!("{}", err), "Process errors: test process error");
 
         let err = Error::Connection("test connection error".to_string());
-        assert_eq!(format!("{}", err), "Connection error: test connection error");
+        assert_eq!(
+            format!("{}", err),
+            "Connection error: test connection error"
+        );
     }
 
     #[test]
@@ -175,12 +178,13 @@ mod tests {
 
     #[test]
     fn test_message_batch_to_binary_field_not_found() {
-        let schema = Arc::new(Schema::new(vec![Field::new("other_field", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["test"]))],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "other_field",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
 
         let msg_batch = MessageBatch::new_arrow(batch);
         let result = msg_batch.to_binary("non_existent_field");
@@ -189,7 +193,11 @@ mod tests {
 
     #[test]
     fn test_message_batch_to_binary_with_custom_field() {
-        let schema = Arc::new(Schema::new(vec![Field::new("custom_data", DataType::Binary, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "custom_data",
+            DataType::Binary,
+            false,
+        )]));
         let array = datafusion::arrow::array::BinaryArray::from_vec(vec![
             b"data1".as_ref(),
             b"data2".as_ref(),

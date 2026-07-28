@@ -537,7 +537,7 @@ mod tests {
             .create()
             .expect("producer create");
         let payload_bytes = b"ping".to_vec();
-producer
+        producer
             .send(
                 FutureRecord::<String, Vec<u8>>::to(&topic).payload(&payload_bytes),
                 Duration::from_secs(5),
