@@ -185,11 +185,31 @@ macro_rules! register_metadata {
     };
 }
 
-register_metadata!(register_input_metadata, INPUT_METADATA, ComponentKind::Input);
-register_metadata!(register_output_metadata, OUTPUT_METADATA, ComponentKind::Output);
-register_metadata!(register_processor_metadata, PROCESSOR_METADATA, ComponentKind::Processor);
-register_metadata!(register_buffer_metadata, BUFFER_METADATA, ComponentKind::Buffer);
-register_metadata!(register_codec_metadata, CODEC_METADATA, ComponentKind::Codec);
+register_metadata!(
+    register_input_metadata,
+    INPUT_METADATA,
+    ComponentKind::Input
+);
+register_metadata!(
+    register_output_metadata,
+    OUTPUT_METADATA,
+    ComponentKind::Output
+);
+register_metadata!(
+    register_processor_metadata,
+    PROCESSOR_METADATA,
+    ComponentKind::Processor
+);
+register_metadata!(
+    register_buffer_metadata,
+    BUFFER_METADATA,
+    ComponentKind::Buffer
+);
+register_metadata!(
+    register_codec_metadata,
+    CODEC_METADATA,
+    ComponentKind::Codec
+);
 
 macro_rules! list_metadata {
     ($fn_name:ident, $registry:ident) => {
@@ -235,16 +255,18 @@ pub fn register_component_metadata(
 
 /// Look up metadata for a specific component. Returns `None` if no
 /// component with that name is registered for the given kind.
-pub fn get_component_metadata(
-    kind: ComponentKind,
-    name: &str,
-) -> Option<Arc<ComponentMetadata>> {
+pub fn get_component_metadata(kind: ComponentKind, name: &str) -> Option<Arc<ComponentMetadata>> {
     registry_for(kind).read().unwrap().get(name).cloned()
 }
 
 /// Return every component registered for the given kind, sorted by name.
 pub fn list_components_by_kind(kind: ComponentKind) -> Vec<Arc<ComponentMetadata>> {
-    registry_for(kind).read().unwrap().values().cloned().collect()
+    registry_for(kind)
+        .read()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect()
 }
 
 /// Return every registered component across all kinds, grouped by kind
@@ -335,34 +357,35 @@ pub fn build_config_schema() -> serde_json::Value {
     let buffer_variants = variant_schemas(ComponentKind::Buffer);
     let codec_variants = variant_schemas(ComponentKind::Codec);
 
-    let component_union = |variants: &serde_json::Value, kind: ComponentKind| -> serde_json::Value {
-        let variants = variants.as_array().cloned().unwrap_or_default();
-        if variants.is_empty() {
-            // No components registered for this kind — allow any object so
-            // existing configs still validate.
-            return serde_json::json!({
+    let component_union =
+        |variants: &serde_json::Value, kind: ComponentKind| -> serde_json::Value {
+            let variants = variants.as_array().cloned().unwrap_or_default();
+            if variants.is_empty() {
+                // No components registered for this kind — allow any object so
+                // existing configs still validate.
+                return serde_json::json!({
+                    "type": "object",
+                    "description": format!("No {} components are registered.", kind),
+                });
+            }
+            serde_json::json!({
                 "type": "object",
-                "description": format!("No {} components are registered.", kind),
-            });
-        }
-        serde_json::json!({
-            "type": "object",
-            "description": format!("Select a registered {} component.", kind),
-            "required": ["type"],
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": variants.iter().map(|v| v["name"].clone()).collect::<Vec<_>>(),
-                    "description": format!("{} component type.", kind)
+                "description": format!("Select a registered {} component.", kind),
+                "required": ["type"],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": variants.iter().map(|v| v["name"].clone()).collect::<Vec<_>>(),
+                        "description": format!("{} component type.", kind)
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional logical name for this component instance."
+                    }
                 },
-                "name": {
-                    "type": "string",
-                    "description": "Optional logical name for this component instance."
-                }
-            },
-            "oneOf": variants
-        })
-    };
+                "oneOf": variants
+            })
+        };
 
     let defs = defs.get_mut("$defs").unwrap().as_object_mut().unwrap();
     defs.insert(
@@ -486,7 +509,10 @@ fn variant_schemas(kind: ComponentKind) -> serde_json::Value {
                 "required": ["type"]
             });
             if let Some(ex) = example {
-                variant.as_object_mut().unwrap().insert("examples".to_string(), serde_json::json!([ex]));
+                variant
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("examples".to_string(), serde_json::json!([ex]));
             }
             variant
         })
@@ -609,10 +635,9 @@ mod tests {
             .expect("output variants should be present");
         let variants = variants.as_array().unwrap();
         assert!(
-            variants.iter().any(|v| v
-                .pointer("/properties/type/const")
-                .and_then(|c| c.as_str())
-                == Some(name)),
+            variants.iter().any(
+                |v| v.pointer("/properties/type/const").and_then(|c| c.as_str()) == Some(name)
+            ),
             "registered component should appear in output schema variants"
         );
     }

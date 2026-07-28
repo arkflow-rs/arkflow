@@ -217,9 +217,8 @@ pub mod duration_serde {
         }
         match Raw::deserialize(d)? {
             Raw::Int(ms) => Ok(Duration::from_millis(ms)),
-            Raw::Str(s) => parse_human(&s).ok_or_else(|| {
-                serde::de::Error::custom(format!("invalid duration: {}", s))
-            }),
+            Raw::Str(s) => parse_human(&s)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid duration: {}", s))),
         }
     }
 

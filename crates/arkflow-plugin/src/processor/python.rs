@@ -176,7 +176,10 @@ fn default_module() -> String {
 }
 
 pub fn init() -> Result<(), Error> {
-    arkflow_core::processor::register_processor_builder("python", Arc::new(PythonProcessorBuilder))?;
+    arkflow_core::processor::register_processor_builder(
+        "python",
+        Arc::new(PythonProcessorBuilder),
+    )?;
     register_processor_metadata(ComponentMetadata::with_schema(
         "python",
         "Runs a user-defined Python function (with PyArrow) against each batch.",

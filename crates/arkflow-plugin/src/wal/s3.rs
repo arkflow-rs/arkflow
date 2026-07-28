@@ -49,9 +49,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use arkflow_core::wal::config::{
-    CursorFlushConfig, ObjectStoreS3Config, SegmentConfig,
-};
+use arkflow_core::wal::config::{CursorFlushConfig, ObjectStoreS3Config, SegmentConfig};
 use arkflow_core::wal::{
     store::{WalStore, WalStoreBuilder},
     WalConfig,
@@ -126,8 +124,8 @@ impl S3Store {
                 ))
             }
         };
-        let runtime = Runtime::new()
-            .map_err(|e| Error::Process(format!("S3 store runtime init: {}", e)))?;
+        let runtime =
+            Runtime::new().map_err(|e| Error::Process(format!("S3 store runtime init: {}", e)))?;
         let client: Arc<dyn object_store::ObjectStore> = runtime
             .block_on(build_s3_client(&osc.s3))
             .map_err(|e| Error::Config(format!("S3 client init: {}", e)))?;
@@ -164,9 +162,8 @@ impl S3Store {
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
 
-        let first_index = runtime.block_on(async {
-            probe_next_segment_index(&*client, &segments_prefix).await
-        })?;
+        let first_index = runtime
+            .block_on(async { probe_next_segment_index(&*client, &segments_prefix).await })?;
 
         let store = Arc::new(Self {
             runtime,
@@ -215,7 +212,9 @@ fn now_ms() -> u64 {
 }
 
 /// Build an `object_store::aws::AmazonS3Builder` from our YAML config.
-async fn build_s3_client(cfg: &ObjectStoreS3Config) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+async fn build_s3_client(
+    cfg: &ObjectStoreS3Config,
+) -> Result<Arc<dyn object_store::ObjectStore>, String> {
     let mut b = AmazonS3Builder::new()
         .with_bucket_name(&cfg.bucket)
         .with_allow_http(cfg.allow_http);
@@ -272,17 +271,16 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
         .await
     {
         Ok(r) => {
-            let bytes = r.bytes().await.map_err(|e| {
-                Error::Process(format!("S3 GET manifest body: {}", e))
-            })?;
-            Manifest::from_json(&bytes).map_err(|e| {
-                Error::Process(format!("S3 manifest JSON: {}", e))
-            })?
+            let bytes = r
+                .bytes()
+                .await
+                .map_err(|e| Error::Process(format!("S3 GET manifest body: {}", e)))?;
+            Manifest::from_json(&bytes)
+                .map_err(|e| Error::Process(format!("S3 manifest JSON: {}", e)))?
         }
-        Err(object_store::Error::NotFound { .. }) => Manifest::fresh(
-            store_ns_node_id(store),
-            store_ns_stream_id(store),
-        ),
+        Err(object_store::Error::NotFound { .. }) => {
+            Manifest::fresh(store_ns_node_id(store), store_ns_stream_id(store))
+        }
         Err(e) => return Err(Error::Process(format!("S3 GET manifest: {}", e))),
     };
 
@@ -331,9 +329,10 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
         let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, seg_name).as_str());
         match store.client.get(&key).await {
             Ok(r) => {
-                let bytes = r.bytes().await.map_err(|e| {
-                    Error::Process(format!("S3 GET segment body: {}", e))
-                })?;
+                let bytes = r
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::Process(format!("S3 GET segment body: {}", e)))?;
                 let decoded = segment::decode(&bytes)?;
                 if let Some((last, _)) = decoded.entries.last() {
                     if *last > max_seq_seen {
@@ -448,10 +447,10 @@ impl WalStore for S3Store {
         // greater than the manifest's cursor. The active segment is included.
         // LIST-fallback segments (not in the manifest) are read here too
         // because they're in the same `list_segments()` set.
-        let manifest = match self
-            .runtime
-            .block_on(self.client.get(&ObjectPath::from(self.manifest_key.as_str())))
-        {
+        let manifest = match self.runtime.block_on(
+            self.client
+                .get(&ObjectPath::from(self.manifest_key.as_str())),
+        ) {
             Ok(r) => {
                 let bytes = self
                     .runtime
@@ -460,10 +459,9 @@ impl WalStore for S3Store {
                 Manifest::from_json(&bytes)
                     .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))?
             }
-            Err(object_store::Error::NotFound { .. }) => Manifest::fresh(
-                store_ns_node_id(self),
-                store_ns_stream_id(self),
-            ),
+            Err(object_store::Error::NotFound { .. }) => {
+                Manifest::fresh(store_ns_node_id(self), store_ns_stream_id(self))
+            }
             Err(e) => return Err(Error::Process(format!("S3 GET manifest: {}", e))),
         };
 
@@ -496,17 +494,10 @@ impl WalStore for S3Store {
             let bytes = match self.runtime.block_on(self.client.get(&key)) {
                 Ok(r) => match self.runtime.block_on(r.bytes()) {
                     Ok(b) => b,
-                    Err(e) => {
-                        return Err(Error::Process(format!(
-                            "S3 GET segment body: {}",
-                            e
-                        )))
-                    }
+                    Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
                 Err(object_store::Error::NotFound { .. }) => continue,
-                Err(e) => {
-                    return Err(Error::Process(format!("S3 GET segment: {}", e)))
-                }
+                Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
             };
             let decoded = segment::decode(&bytes)?;
             for (seq, mb) in decoded.entries {
@@ -522,7 +513,10 @@ impl WalStore for S3Store {
     fn cursor(&self) -> u64 {
         // Read the manifest synchronously. Cheap enough; happens once per
         // `Wal::open`.
-        match self.runtime.block_on(self.client.get(&ObjectPath::from(self.manifest_key.as_str()))) {
+        match self.runtime.block_on(
+            self.client
+                .get(&ObjectPath::from(self.manifest_key.as_str())),
+        ) {
             Ok(r) => {
                 let bytes = match self.runtime.block_on(r.bytes()) {
                     Ok(b) => b,
@@ -640,8 +634,7 @@ async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
         let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
         let _ = store.client.delete(&key).await; // best-effort
     }
-    m.sealed_segments
-        .retain(|name| !to_delete.contains(name));
+    m.sealed_segments.retain(|name| !to_delete.contains(name));
 
     write_manifest(store, &m).await
 }
@@ -657,8 +650,7 @@ async fn read_manifest_or_fresh(store: &S3Store) -> Result<Manifest, Error> {
                 .bytes()
                 .await
                 .map_err(|e| Error::Process(format!("S3 GET manifest body: {}", e)))?;
-            Manifest::from_json(&bytes)
-                .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))
+            Manifest::from_json(&bytes).map_err(|e| Error::Process(format!("manifest JSON: {}", e)))
         }
         Err(object_store::Error::NotFound { .. }) => Ok(Manifest::fresh(
             store_ns_node_id(store),
@@ -732,8 +724,8 @@ mod tests {
     use super::*;
     use arkflow_core::wal::config::{ObjectStoreS3Config, ObjectStoreWalConfig};
     use arkflow_core::wal::store::{deserialize, serialize};
-    use arkflow_core::MessageBatch;
     use arkflow_core::wal::SyncPolicy;
+    use arkflow_core::MessageBatch;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -748,11 +740,9 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![std::sync::Arc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
         let mut mb = MessageBatch::new_arrow(batch);
         mb.set_input_name(input_name.map(|s| s.to_string()));
         serialize(&mb).unwrap()
@@ -760,15 +750,15 @@ mod tests {
 
     fn tempdir() -> std::path::PathBuf {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("arkflow-s3wal-test-{}-{}", std::process::id(), n));
+        let dir =
+            std::env::temp_dir().join(format!("arkflow-s3wal-test-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn build_local_store_in(dir: &std::path::Path) -> (Arc<S3Store>, std::path::PathBuf) {
-        let client: Arc<dyn object_store::ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(dir).unwrap(),
-        );
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
         let runtime = Runtime::new().unwrap();
         let osc = ObjectStoreWalConfig {
             node_id: "pod-a".into(),
@@ -793,13 +783,8 @@ mod tests {
             },
             sync: SyncPolicy::GroupCommit,
         };
-        let store = S3Store::build_with_client(
-            &WalConfig::default(),
-            osc,
-            runtime,
-            client,
-        )
-        .unwrap();
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
         (store, dir.to_path_buf())
     }
 
@@ -814,7 +799,10 @@ mod tests {
         // 4 entries → forces a seal (max_entries = 4).
         for _ in 0..4 {
             store
-                .append_batch(vec![(SEQ.fetch_add(1, Ordering::SeqCst) + 1, payload.clone())])
+                .append_batch(vec![(
+                    SEQ.fetch_add(1, Ordering::SeqCst) + 1,
+                    payload.clone(),
+                )])
                 .unwrap();
         }
         store.close().unwrap();
@@ -880,9 +868,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Write a segment object directly using a raw client, no manifest.
-        let client: Arc<dyn object_store::ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(&dir).unwrap(),
-        );
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
         let runtime = Runtime::new().unwrap();
         let payload = sample_payload(None);
         let mut seg_bytes = Vec::new();
@@ -920,13 +907,8 @@ mod tests {
             },
             sync: SyncPolicy::GroupCommit,
         };
-        let store = S3Store::build_with_client(
-            &WalConfig::default(),
-            osc,
-            runtime,
-            client,
-        )
-        .unwrap();
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
         let replayed = store.read_after_cursor().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].0, 42);

@@ -267,7 +267,10 @@ mod tests {
         let deserialized: LoggingConfig = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.level, "debug");
-        assert_eq!(deserialized.file_path, Some("/var/log/arkflow.log".to_string()));
+        assert_eq!(
+            deserialized.file_path,
+            Some("/var/log/arkflow.log".to_string())
+        );
         assert!(matches!(deserialized.format, LogFormat::JSON));
     }
 
@@ -293,22 +296,43 @@ mod tests {
 
     #[test]
     fn test_get_format_from_path_yaml() {
-        assert_eq!(get_format_from_path("config.yaml"), Some(ConfigFormat::YAML));
+        assert_eq!(
+            get_format_from_path("config.yaml"),
+            Some(ConfigFormat::YAML)
+        );
         assert_eq!(get_format_from_path("config.yml"), Some(ConfigFormat::YAML));
-        assert_eq!(get_format_from_path("/path/to/config.YAML"), Some(ConfigFormat::YAML));
-        assert_eq!(get_format_from_path("/path/to/config.YML"), Some(ConfigFormat::YAML));
+        assert_eq!(
+            get_format_from_path("/path/to/config.YAML"),
+            Some(ConfigFormat::YAML)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.YML"),
+            Some(ConfigFormat::YAML)
+        );
     }
 
     #[test]
     fn test_get_format_from_path_json() {
-        assert_eq!(get_format_from_path("config.json"), Some(ConfigFormat::JSON));
-        assert_eq!(get_format_from_path("/path/to/config.JSON"), Some(ConfigFormat::JSON));
+        assert_eq!(
+            get_format_from_path("config.json"),
+            Some(ConfigFormat::JSON)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.JSON"),
+            Some(ConfigFormat::JSON)
+        );
     }
 
     #[test]
     fn test_get_format_from_path_toml() {
-        assert_eq!(get_format_from_path("config.toml"), Some(ConfigFormat::TOML));
-        assert_eq!(get_format_from_path("/path/to/config.TOML"), Some(ConfigFormat::TOML));
+        assert_eq!(
+            get_format_from_path("config.toml"),
+            Some(ConfigFormat::TOML)
+        );
+        assert_eq!(
+            get_format_from_path("/path/to/config.TOML"),
+            Some(ConfigFormat::TOML)
+        );
     }
 
     #[test]

@@ -178,28 +178,31 @@ impl BufferBuilder for TumblingWindowBuilder {
 /// * `Result<(), Error>` - Success or an error
 pub fn init() -> Result<(), Error> {
     register_buffer_builder("tumbling_window", Arc::new(TumblingWindowBuilder))?;
-    register_buffer_metadata(ComponentMetadata::with_schema(
-        "tumbling_window",
-        "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "interval": {"type": "string", "description": "Window duration (humantime)."},
-                "join": {
-                    "type": "object",
-                    "description": "Optional SQL join across input sources.",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "value_field": {"type": "string"},
-                        "codec": {"type": "object"},
-                        "thread_num": {"type": "integer", "minimum": 1}
+    register_buffer_metadata(
+        ComponentMetadata::with_schema(
+            "tumbling_window",
+            "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "interval": {"type": "string", "description": "Window duration (humantime)."},
+                    "join": {
+                        "type": "object",
+                        "description": "Optional SQL join across input sources.",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "value_field": {"type": "string"},
+                            "codec": {"type": "object"},
+                            "thread_num": {"type": "integer", "minimum": 1}
+                        }
                     }
-                }
-            },
-            "required": ["interval"]
-        }),
-    ).with_example(serde_json::json!({"interval": "1m"})))
+                },
+                "required": ["interval"]
+            }),
+        )
+        .with_example(serde_json::json!({"interval": "1m"})),
+    )
 }
 
 #[cfg(test)]

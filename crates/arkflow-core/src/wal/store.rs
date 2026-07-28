@@ -70,10 +70,8 @@ pub fn serialize(msg: &MessageBatch) -> Result<Vec<u8>, Error> {
         None => out.extend_from_slice(&0u32.to_be_bytes()),
     }
 
-    let mut writer =
-        StreamWriter::try_new(&mut out, record.schema().as_ref()).map_err(|e| {
-            Error::Process(format!("Failed to start Arrow IPC writer: {}", e))
-        })?;
+    let mut writer = StreamWriter::try_new(&mut out, record.schema().as_ref())
+        .map_err(|e| Error::Process(format!("Failed to start Arrow IPC writer: {}", e)))?;
     writer
         .write(record)
         .map_err(|e| Error::Process(format!("Failed to write Arrow IPC: {}", e)))?;
@@ -197,9 +195,9 @@ pub fn register_wal_store_builder(
     name: &'static str,
     builder: Arc<dyn WalStoreBuilder>,
 ) -> Result<(), Error> {
-    let mut map = WAL_STORE_BUILDERS.write().map_err(|_| {
-        Error::Process("WAL store builder registry poisoned".into())
-    })?;
+    let mut map = WAL_STORE_BUILDERS
+        .write()
+        .map_err(|_| Error::Process("WAL store builder registry poisoned".into()))?;
     if map.contains_key(name) {
         return Err(Error::Config(format!(
             "WAL store type already registered: {}",
@@ -254,9 +252,8 @@ pub struct RedbStore {
 impl RedbStore {
     /// Open (or create) a redb database at `<dir>/wal.redb`.
     pub fn open(path: &std::path::Path) -> Result<Self, Error> {
-        std::fs::create_dir_all(path).map_err(|e| {
-            Error::Process(format!("Failed to create WAL directory: {}", e))
-        })?;
+        std::fs::create_dir_all(path)
+            .map_err(|e| Error::Process(format!("Failed to create WAL directory: {}", e)))?;
         let db_path = path.join("wal.redb");
         let db = Database::create(&db_path)
             .map_err(|e| Error::Process(format!("Failed to open WAL database: {}", e)))?;
@@ -322,9 +319,8 @@ impl WalStore for RedbStore {
                 .map(|g| g.value())
                 .unwrap_or(0);
             if seq > current {
-                meta.insert(CURSOR_KEY, seq).map_err(|e| {
-                    Error::Process(format!("WAL meta write failed: {}", e))
-                })?;
+                meta.insert(CURSOR_KEY, seq)
+                    .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
             }
         }
         tx.commit()
@@ -398,9 +394,9 @@ impl WalStoreBuilder for LocalStoreBuilder {
         // The dispatcher routes by `cfg.backend_kind()`; we only land here
         // for `local`. For the legacy flat shape, `WalConfig.local_path()`
         // returns `Some(&cfg.path)`.
-        let path = cfg.local_path().ok_or_else(|| {
-            Error::Config("LocalStoreBuilder requires a local `path`".into())
-        })?;
+        let path = cfg
+            .local_path()
+            .ok_or_else(|| Error::Config("LocalStoreBuilder requires a local `path`".into()))?;
         let store = RedbStore::open(std::path::Path::new(path))?;
         Ok(Arc::new(store))
     }
@@ -414,9 +410,9 @@ impl WalStoreBuilder for LocalStoreBuilder {
 /// no-op (the registry rejects duplicates, which is fine on repeat). Safe
 /// under concurrent test invocations.
 pub fn ensure_local_store_registered() -> Result<(), Error> {
-    let mut map = WAL_STORE_BUILDERS.write().map_err(|_| {
-        Error::Process("WAL store builder registry poisoned".into())
-    })?;
+    let mut map = WAL_STORE_BUILDERS
+        .write()
+        .map_err(|_| Error::Process("WAL store builder registry poisoned".into()))?;
     if map.contains_key("local") {
         return Ok(());
     }
@@ -471,7 +467,11 @@ mod tests {
             AtomicU64::new(0).fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = WalConfig::local(true, dir.to_string_lossy().to_string(), SyncPolicy::PerEntry);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
         let store = LocalStoreBuilder.build(&cfg).unwrap();
         assert_eq!(store.kind(), "local");
 

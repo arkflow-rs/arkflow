@@ -612,7 +612,11 @@ mod tests {
     async fn test_binary_stays_binary() -> Result<(), Error> {
         let processor = build_processor(".")?;
         let bad: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
-        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Binary, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Binary,
+            true,
+        )]));
         let arr = Arc::new(BinaryArray::from(vec![Some(bad.as_slice())]));
         let rb = RecordBatch::try_new(schema, vec![arr])
             .map_err(|e| Error::Process(format!("arrow: {e}")))?;
@@ -656,7 +660,11 @@ mod tests {
         // parse_json! is fallible; on bad input the processor must surface an error,
         // not silently drop the batch.
         let processor = build_processor("parse_json!(.message)")?;
-        let schema = Arc::new(Schema::new(vec![Field::new("message", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "message",
+            DataType::Utf8,
+            true,
+        )]));
         let arr = Arc::new(StringArray::from(vec![Some("not json")]));
         let rb = RecordBatch::try_new(schema, vec![arr])
             .map_err(|e| Error::Process(format!("arrow: {e}")))?;
@@ -733,14 +741,20 @@ mod tests {
     fn test_compile_error_rejected() {
         let config = Some(json!({ "statement": "this is not valid vrl !!!" }));
         let result = VrlProcessorBuilder.build(None, &config, &test_resource());
-        assert!(result.is_err(), "an invalid VRL statement must be rejected at build time");
+        assert!(
+            result.is_err(),
+            "an invalid VRL statement must be rejected at build time"
+        );
     }
 
     #[test]
     fn test_timezone_config_accepted() {
         let config = Some(json!({ "statement": ".x = 1", "timezone": "Asia/Shanghai" }));
         let result = VrlProcessorBuilder.build(None, &config, &test_resource());
-        assert!(result.is_ok(), "a valid timezone config should build successfully");
+        assert!(
+            result.is_ok(),
+            "a valid timezone config should build successfully"
+        );
     }
 
     #[test]

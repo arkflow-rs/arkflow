@@ -420,15 +420,12 @@ fn typed_column<'a, T: Array + 'static>(
     field_name: &str,
     expected: &str,
 ) -> Result<&'a T, Error> {
-    column
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| {
-            Error::Process(format!(
-                "Field '{}' expects proto {} but Arrow column is {:?}",
-                field_name,
-                expected,
-                column.data_type()
-            ))
-        })
+    column.as_any().downcast_ref::<T>().ok_or_else(|| {
+        Error::Process(format!(
+            "Field '{}' expects proto {} but Arrow column is {:?}",
+            field_name,
+            expected,
+            column.data_type()
+        ))
+    })
 }
