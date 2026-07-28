@@ -50,7 +50,7 @@ dependencies = [
  "aes 0.8.4",
  "cipher 0.4.4",
  "cmac",
- "ctr",
+ "ctr 0.9.2",
  "dbl",
  "digest 0.10.7",
  "zeroize",
@@ -278,7 +278,7 @@ dependencies = [
  "lz4_flex 0.11.6",
  "mockall",
  "num_cpus",
- "object_store",
+ "object_store 0.13.2",
  "once_cell",
  "prost-reflect 0.16.5",
  "prost-types 0.14.4",
@@ -1432,7 +1432,7 @@ dependencies = [
  "insta",
  "itertools 0.15.0",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "prost 0.14.4",
  "prost-types 0.14.4",
@@ -1638,6 +1638,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "blocking"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1821,6 +1830,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1981,6 +1999,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
+ "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.2",
 ]
@@ -2414,6 +2433,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2599,7 +2627,7 @@ dependencies = [
  "itertools 0.14.0",
  "liblzma",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "parquet",
  "sqlparser",
@@ -2630,7 +2658,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "tokio",
 ]
@@ -2655,7 +2683,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.13.2",
 ]
 
 [[package]]
@@ -2675,7 +2703,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parquet",
  "recursive",
  "sqlparser",
@@ -2722,7 +2750,7 @@ dependencies = [
  "itertools 0.14.0",
  "liblzma",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "rand 0.9.5",
  "tokio",
@@ -2751,7 +2779,7 @@ dependencies = [
  "datafusion-session",
  "futures",
  "itertools 0.14.0",
- "object_store",
+ "object_store 0.13.2",
  "tokio",
 ]
 
@@ -2771,7 +2799,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store",
+ "object_store 0.13.2",
 ]
 
 [[package]]
@@ -2792,7 +2820,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store",
+ "object_store 0.13.2",
  "regex",
  "tokio",
 ]
@@ -2815,7 +2843,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store",
+ "object_store 0.13.2",
  "tokio",
  "tokio-stream",
 ]
@@ -2845,7 +2873,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "parquet",
  "tokio",
@@ -2872,7 +2900,7 @@ dependencies = [
  "datafusion-physical-expr-common",
  "futures",
  "log",
- "object_store",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "rand 0.9.5",
  "tempfile",
@@ -3233,7 +3261,7 @@ dependencies = [
  "datafusion-physical-expr-common",
  "datafusion-physical-plan",
  "datafusion-proto-common",
- "object_store",
+ "object_store 0.13.2",
  "prost 0.14.4",
 ]
 
@@ -3508,11 +3536,11 @@ dependencies = [
 
 [[package]]
 name = "des"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+checksum = "916a94e407b54f9034d71dd748234cd1e516ced6284009906ae246f177eafe5a"
 dependencies = [
- "cipher 0.4.4",
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -4371,35 +4399,35 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.13.5"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51610510377a0847d53b78b53f9c6c9b7df3ffb300d1181b2e04f68bba363734"
+checksum = "eae7949bf7a2d90b051768cf68dcfd75f4cf70a6735d2c9aed94ac5d785f5d9f"
 dependencies = [
- "aes 0.8.4",
+ "aes 0.9.2",
  "base64 0.22.1",
  "bitflags 2.13.1",
  "bumpalo",
  "bytes",
- "cbc",
+ "cbc 0.2.1",
  "chrono",
- "cipher 0.4.4",
+ "cipher 0.5.2",
  "crc",
- "ctr",
+ "ctr 0.10.1",
  "des",
  "dns-lookup 3.0.1",
  "futures",
  "g2p",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "libc",
  "libloading 0.9.0",
  "log",
- "md-5 0.10.6",
+ "md-5 0.11.0",
  "num-traits",
  "once_cell",
  "prost 0.14.4",
  "prost-types 0.14.4",
- "rand 0.9.5",
+ "rand 0.10.2",
  "regex",
  "roxmltree",
  "socket2 0.6.5",
@@ -4407,21 +4435,21 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
- "whoami 1.6.1",
+ "whoami 2.1.2",
 ]
 
 [[package]]
 name = "hdfs-native-object-store"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a8fd74d01f5831e0a81581e252831c70572b7a9145b813fad99323460f2f69"
+checksum = "02a44946970870b3dcde2357d9fe3189e13452161bff1235130733a4716d7ebb"
 dependencies = [
  "async-trait",
  "bytes",
  "chrono",
  "futures",
  "hdfs-native",
- "object_store",
+ "object_store 0.14.1",
  "thiserror 2.0.19",
  "tokio",
 ]
@@ -4910,7 +4938,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding",
+ "block-padding 0.3.3",
  "generic-array",
 ]
 
@@ -4920,6 +4948,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
+ "block-padding 0.4.2",
  "hybrid-array",
 ]
 
@@ -5780,6 +5809,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6092,6 +6133,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_store"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "http 1.4.2",
+ "humantime",
+ "itertools 0.15.0",
+ "nix",
+ "parking_lot 0.12.5",
+ "percent-encoding",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "wasm-bindgen-futures",
+ "web-time",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "octseq"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6382,7 +6451,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "object_store",
+ "object_store 0.13.2",
  "paste",
  "seq-macro",
  "simdutf8",
@@ -9939,7 +10008,7 @@ dependencies = [
  "base62",
  "base64-simd",
  "bytes",
- "cbc",
+ "cbc 0.1.2",
  "cfb-mode",
  "cfg-if",
  "chacha20poly1305",
@@ -9954,7 +10023,7 @@ dependencies = [
  "crc",
  "crypto_secretbox",
  "csv",
- "ctr",
+ "ctr 0.9.2",
  "digest 0.10.7",
  "dns-lookup 2.1.1",
  "domain",
@@ -10251,7 +10320,6 @@ checksum = "5d4a4db5077702ca3015d3d02d74974948aba2ad9e12ab7df718ee64ccd7e97d"
 dependencies = [
  "libredox",
  "wasite 0.1.0",
- "web-sys",
 ]
 
 [[package]]

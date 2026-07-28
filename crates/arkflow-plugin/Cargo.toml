@@ -91,7 +91,7 @@ tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] 
 # Object Store
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
-hdfs-native-object-store = "0.16"
+hdfs-native-object-store = "0.17"
 
 # Compression (WAL segment optimization)
 zstd = "0.13"
