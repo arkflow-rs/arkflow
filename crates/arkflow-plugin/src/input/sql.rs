@@ -27,7 +27,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-#[cfg(feature = "sqlite")]
 use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPoolFactory;
 use datafusion_table_providers::sql::db_connection_pool::Mode;
 use datafusion_table_providers::{
@@ -70,7 +69,6 @@ enum InputType {
     /// Postgres input
     Postgres(PostgresConfig),
     /// Sqlite input
-    #[cfg(feature = "sqlite")]
     Sqlite(SqliteConfig),
 }
 
@@ -119,7 +117,6 @@ struct PostgresSslConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(feature = "sqlite")]
 struct SqliteConfig {
     /// Table name (used in SQL queries)
     name: Option<String>,
@@ -286,7 +283,6 @@ impl SqlInput {
                 ctx.register_catalog(name, Arc::new(catalog));
                 Ok(())
             }
-            #[cfg(feature = "sqlite")]
             InputType::Sqlite(ref c) => {
                 let sqlite_pool = Arc::new(
                     SqliteConnectionPoolFactory::new(

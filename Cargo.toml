@@ -48,7 +48,7 @@ governor = "0.6"
 dashmap = "6.1"
 
 # Sql
-sqlx = { version = "0.8.6", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls", "sqlite"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 
 tempfile = "3.24.0"
 mockall = "0.14"

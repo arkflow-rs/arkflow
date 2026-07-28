@@ -26,6 +26,7 @@ datafusion-table-providers = { version = "0.13", features = [
     "mysql",
     "postgres",
     "duckdb",
+    "sqlite",
 ], default-features = false }
 ballista = { version = "54.0" }
 duckdb = { version = "1.4", package = "spiceai_duckdb_fork" }
@@ -104,9 +105,3 @@ num_cpus = "1.17.0"
 [dev-dependencies]
 tempfile = { workspace = true }
 mockall = { workspace = true }
-
-[features]
-# SQLite support - disabled by default because of libsqlite3-sys version conflicts
-# with datafusion-table-providers-sqlite 0.13 (which requires rusqlite 0.37+).
-# To enable SQLite support, see the libsqlite3-sys resolution in the workspace.
-sqlite = []
