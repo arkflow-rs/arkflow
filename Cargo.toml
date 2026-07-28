@@ -28,9 +28,10 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
 prometheus = "0.13"
-datafusion = { version = "47", features = ["avro", "pyarrow"] }
-datafusion-functions-json = "0.47.0"
-arrow-json = "55"
+datafusion = { version = "54.1", features = ["avro"] }
+datafusion-functions-json = "0.54.2"
+arrow-json = "58.4"
+arrow-pyarrow = "58.4"
 prost-reflect = "0.16.3"
 prost-types = "0.14.3"
 protobuf-parse = "3.7.2"
@@ -47,7 +48,7 @@ governor = "0.6"
 dashmap = "6.1"
 
 # Sql
-sqlx = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
+sqlx = { version = "0.8.6", features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls", "sqlite"] }
 
 tempfile = "3.24.0"
 mockall = "0.14"
