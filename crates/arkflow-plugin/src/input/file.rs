@@ -23,11 +23,10 @@ use arkflow_core::{
 use async_trait::async_trait;
 use ballista::prelude::SessionContextExt;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::execution::options::ArrowReadOptions;
+use datafusion::execution::options::{ArrowReadOptions, NdJsonReadOptions};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::{
-    AvroReadOptions, CsvReadOptions, DataFrame, NdJsonReadOptions, ParquetReadOptions, SQLOptions,
-    SessionContext,
+    AvroReadOptions, CsvReadOptions, DataFrame, ParquetReadOptions, SQLOptions, SessionContext,
 };
 use futures_util::TryStreamExt;
 use hdfs_native_object_store::HdfsObjectStoreBuilder;

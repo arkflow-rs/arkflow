@@ -1,10 +1,10 @@
 # Build stage
-FROM rust:1.88-slim as builder
+FROM rust:1.97-slim as builder
 
 WORKDIR /app
 COPY .. .
 RUN apt-get update && \
-    apt-get install -y clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config build-essential libsqlite3-dev protobuf-compiler python3 python3-dev
+    apt-get install -y clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config build-essential libsqlite3-dev protobuf-compiler python3 python3-dev libcurl4-openssl-dev
 
 # Build project
 RUN cargo build --release

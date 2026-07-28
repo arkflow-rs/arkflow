@@ -94,7 +94,7 @@ impl SqlProcessor {
             .state()
             .sql_to_statement(
                 &config.query,
-                ctx.state().options().sql_parser.dialect.as_str(),
+                &ctx.state().options().sql_parser.dialect,
             )
             .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
         Ok(Self {

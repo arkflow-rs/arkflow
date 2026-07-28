@@ -59,7 +59,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore as _, PutPayload};
+use object_store::{ObjectStore as _, ObjectStoreExt, PutPayload};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 

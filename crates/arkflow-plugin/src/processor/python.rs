@@ -14,9 +14,9 @@
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{Processor, ProcessorBuilder};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+use arrow_array::RecordBatch;
+use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use serde::{Deserialize, Serialize};
@@ -39,18 +39,18 @@ struct PythonProcessorConfig {
 }
 
 struct PythonProcessor {
-    func: PyObject, // Stores the Python function to be called
+    func: Py<PyAny>, // Stores the Python function to be called
 }
 
 #[async_trait]
 impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        let func_to_call = Python::with_gil(|py| self.func.clone_ref(py));
+        let func_to_call = Python::attach(|py| self.func.clone_ref(py));
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> Result<Vec<RecordBatch>, Error> {
+            Python::attach(|py| -> Result<Vec<RecordBatch>, Error> {
                 // Convert MessageBatch to PyArrow
-                let py_batch = (*batch).to_pyarrow(py).map_err(|e| {
+                let py_batch = batch.record_batch().to_pyarrow(py).map_err(|e| {
                     Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
                 })?;
 
@@ -104,7 +104,7 @@ impl Processor for PythonProcessor {
 
 impl PythonProcessor {
     fn new(config: PythonProcessorConfig) -> Result<Self, Error> {
-        Python::with_gil(|py| -> Result<Self, Error> {
+        Python::attach(|py| -> Result<Self, Error> {
             let sys = py
                 .import("sys")
                 .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
@@ -141,7 +141,7 @@ impl PythonProcessor {
             })?;
 
             // Convert the bound function reference to a PyObject for storage.
-            let func_obj: PyObject = func.into_any().unbind();
+            let func_obj: Py<PyAny> = func.into_any().unbind();
             Ok(PythonProcessor { func: func_obj })
         })
     }

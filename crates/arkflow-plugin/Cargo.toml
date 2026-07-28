@@ -22,15 +22,17 @@ humantime = { workspace = true }
 tracing = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
-datafusion-table-providers = { version = "0.5", features = [
+datafusion-table-providers = { version = "0.13", features = [
     "mysql",
     "postgres",
     "duckdb",
     "sqlite",
-] }
-ballista = { version = "47.0.0" }
-duckdb = { version = "=1.3.0", package = "spiceai_duckdb_fork" }
+], default-features = false }
+ballista = { version = "54.0" }
+duckdb = { version = "1.4", package = "spiceai_duckdb_fork" }
 arrow-json = { workspace = true }
+arrow-pyarrow = { workspace = true }
+arrow-array = "58.4"
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 protobuf-parse = { workspace = true }
@@ -87,12 +89,12 @@ rand = "0.9"
 tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
 
 # Object Store
-object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
-hdfs-native-object-store = "0.15"
+hdfs-native-object-store = "0.16"
 
 # python
-pyo3 = { version = "0.24", features = ["auto-initialize", "serde"] }
+pyo3 = { version = "0.28", features = ["auto-initialize", "serde"] }
 
 once_cell = "1.19.0"
 futures = { workspace = true }

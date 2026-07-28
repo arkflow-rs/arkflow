@@ -242,6 +242,9 @@ pub struct MessageBatch {
 }
 
 impl MessageBatch {
+    pub fn record_batch(&self) -> &RecordBatch {
+        &self.record_batch
+    }
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
         Self::new_binary_with_field_name(content, None)
     }
