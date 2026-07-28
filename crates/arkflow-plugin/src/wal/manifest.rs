@@ -26,6 +26,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Compression algorithm used for a sealed segment. Persisted in the
+/// manifest so recovery knows how to decode the bytes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentCompression {
+    /// No compression.
+    None,
+    /// Zstandard.
+    Zstd,
+    /// LZ4.
+    Lz4,
+}
+
+impl Default for SegmentCompression {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// The manifest object. Public for round-trip and tests; the rest of the
 /// crate reads it via `serde_json::from_slice`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +68,10 @@ pub(crate) struct Manifest {
     /// Currently-open segment filename (D4). `None` on a fresh bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_segment: Option<String>,
+    /// Compression algorithm of the active segment, if any. Recorded so
+    /// recovery knows how to decode (task 4.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_segment_compression: Option<SegmentCompression>,
     /// All sealed-but-not-yet-truncated segments. Entries are filenames
     /// relative to the `segments/` prefix.
     #[serde(default)]
@@ -56,7 +79,10 @@ pub(crate) struct Manifest {
 }
 
 fn default_version() -> u32 {
-    1
+    // Bump to 2 when reading manifests that don't yet have
+    // `active_segment_compression`. Old manifests (v1) are forward-
+    // compatible because the field is optional with default `None`.
+    2
 }
 
 impl Manifest {
@@ -68,6 +94,7 @@ impl Manifest {
             cursor: 0,
             max_sealed_seq: 0,
             active_segment: None,
+            active_segment_compression: None,
             sealed_segments: Vec::new(),
         }
     }

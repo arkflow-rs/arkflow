@@ -64,10 +64,42 @@ pub(crate) fn encode(entries: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<()
     Ok(())
 }
 
+/// Encode + compress into `out`. The compression algorithm is selected by
+/// `kind` (`"none"`, `"zstd"`, `"lz4"`). `level` is algorithm-specific (used
+/// by zstd; ignored by lz4 / none).
+pub(crate) fn encode_compressed(
+    entries: &[(u64, Vec<u8>)],
+    out: &mut Vec<u8>,
+    kind: &str,
+    level: i32,
+) -> Result<(), Error> {
+    let mut raw = Vec::new();
+    encode(entries, &mut raw)?;
+    let compressed = crate::wal::compression::compress(kind, level, &raw)?;
+    out.clear();
+    out.extend_from_slice(&compressed);
+    Ok(())
+}
+
 /// Decode a segment byte buffer. Returns the entries whose CRC verifies; if
 /// the trailing entry was truncated mid-PUT (a torn tail), the consumed
 /// length is reported and `entries` contains only the intact prefix.
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedSegment, Error> {
+    decode_with_kind(bytes, "none")
+}
+
+/// Decode a segment byte buffer with explicit compression kind. Used during
+/// recovery when the manifest records the algorithm (task 4.7).
+pub(crate) fn decode_with_kind(bytes: &[u8], kind: &str) -> Result<DecodedSegment, Error> {
+    let raw = if kind == "none" {
+        bytes.to_vec()
+    } else {
+        crate::wal::compression::decompress(kind, bytes)?
+    };
+    decode_raw(&raw)
+}
+
+fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     let mut last_good = 0usize;
@@ -214,5 +246,54 @@ mod tests {
             0,
             "bad crc on the first record must drop everything (it might be the active segment's leading entry)"
         );
+    }
+
+    /// 4.11: round-trip through compressed encode + decode
+    #[test]
+    fn round_trip_compressed_zstd() {
+        // Build a segment big enough that compression actually reduces size.
+        let mut entries = Vec::new();
+        for i in 0..100u64 {
+            entries.push((i + 1, make_payload()));
+        }
+        let mut raw = Vec::new();
+        encode(&entries, &mut raw).unwrap();
+
+        let mut compressed = Vec::new();
+        encode_compressed(&entries, &mut compressed, "zstd", 3).unwrap();
+        assert!(
+            compressed.len() < raw.len(),
+            "compressed {} should be < raw {}",
+            compressed.len(),
+            raw.len()
+        );
+
+        let decoded = decode_with_kind(&compressed, "zstd").unwrap();
+        assert_eq!(decoded.entries.len(), 100);
+        assert_eq!(decoded.entries[0].0, 1);
+        assert_eq!(decoded.entries[99].0, 100);
+    }
+
+    #[test]
+    fn round_trip_compressed_lz4() {
+        let mut entries = Vec::new();
+        for i in 0..100u64 {
+            entries.push((i + 1, make_payload()));
+        }
+        let mut compressed = Vec::new();
+        encode_compressed(&entries, &mut compressed, "lz4", 0).unwrap();
+
+        let decoded = decode_with_kind(&compressed, "lz4").unwrap();
+        assert_eq!(decoded.entries.len(), 100);
+    }
+
+    #[test]
+    fn encode_compressed_none_passes_through() {
+        let entries = vec![(1u64, make_payload()), (2u64, make_payload())];
+        let mut a = Vec::new();
+        encode(&entries, &mut a).unwrap();
+        let mut b = Vec::new();
+        encode_compressed(&entries, &mut b, "none", 0).unwrap();
+        assert_eq!(a, b);
     }
 }

@@ -163,6 +163,43 @@ impl WalConfig {
                             .into(),
                     ));
                 }
+                // Parallel PUT workers validation (task 3.12)
+                if o.parallel_put.workers == 0 {
+                    return Err(Error::Config(
+                        "durability.backend.object_store.parallel_put.workers \
+                         must be positive (1-8)"
+                            .into(),
+                    ));
+                }
+                if o.parallel_put.workers > 8 {
+                    return Err(Error::Config(format!(
+                        "durability.backend.object_store.parallel_put.workers \
+                         {} is out of range (1-8)",
+                        o.parallel_put.workers
+                    )));
+                }
+                // Compression level validation (task 5.4)
+                match &o.compression {
+                    crate::wal::config::CompressionConfig::Zstd { level } => {
+                        if !(0..=22).contains(level) {
+                            return Err(Error::Config(format!(
+                                "durability.backend.object_store.compression.zstd.level \
+                                 {} is out of range (0-22)",
+                                level
+                            )));
+                        }
+                    }
+                    crate::wal::config::CompressionConfig::Lz4 { level } => {
+                        if !(1..=16).contains(level) {
+                            return Err(Error::Config(format!(
+                                "durability.backend.object_store.compression.lz4.level \
+                                 {} is out of range (1-16)",
+                                level
+                            )));
+                        }
+                    }
+                    crate::wal::config::CompressionConfig::None => {}
+                }
                 Ok(())
             }
         }

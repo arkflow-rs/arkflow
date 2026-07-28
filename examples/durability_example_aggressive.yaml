@@ -1,0 +1,79 @@
+# S3 WAL — Aggressive Tuning Example
+#
+# This example demonstrates the `aggressive` segment tuning strategy, which
+# trades a larger crash window for significantly lower S3 API costs and
+# higher throughput.
+#
+# ── When to use ─────────────────────────────────────────────────────────
+#
+#   - Batch processing jobs (loss window is acceptable)
+#   - High-throughput streams where cost matters
+#   - Workloads where losing ~100,000 messages on pod loss is tolerable
+#
+# ── Trade-offs ──────────────────────────────────────────────────────────
+#
+#   Default (balanced) : 1s flush, ~10,000 msgs at risk @10K msg/s
+#   Aggressive         : 10s flush, ~100,000 msgs at risk @10K msg/s
+#                        but 10x fewer PUT requests
+#
+# ── Cost reduction ──────────────────────────────────────────────────────
+#
+#   @10,000 msg/s, 1KB per message:
+#     Balanced   : 36,000 PUTs/hour → ~$7.71/month
+#     Aggressive :  3,600 PUTs/hour → ~$0.77/month (10x reduction)
+#
+# ── See also ────────────────────────────────────────────────────────────
+#
+#   docs/performance/s3-wal-backend.md
+#   examples/durability_example_parallel.yaml
+#   examples/durability_example_compressed.yaml
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "value": 10, "sensor": "temp_1" }'
+      interval: 1ns
+      batch_size: 100
+      count: 100000
+
+    durability:
+      enabled: true
+      sync: "group_commit"
+      backend:
+        type: "object_store"
+        node_id: "${ARKFLOW_NODE_ID}"
+        stream_id: "aggressive-stream"
+        prefix: "arkflow/wal"
+        s3:
+          bucket: "my-bucket"
+          region: "us-east-1"
+          endpoint: "http://localhost:9000"
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+          allow_http: true
+
+        # ── Aggressive Segment Tuning ─────────────────────────────────────
+        # Use the `aggressive` preset for high throughput and low cost.
+        # Each sealed segment is 10MB / 10,000 entries / 10 seconds.
+        segment_tuning:
+          strategy: aggressive
+          # Optional overrides (uncomment to customize):
+          # max_entries: 20000      # override default 10000
+          # max_bytes: 20971520     # override default 10MB
+          # flush_interval: "30s"   # override default 10s
+
+        # Standard cursor config still applies
+        cursor:
+          max_entries: 1000
+          interval: "1s"
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+
+    output:
+      type: "stdout"

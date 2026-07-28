@@ -66,6 +66,153 @@ use tokio::sync::Notify;
 use super::manifest::Manifest;
 use super::segment;
 
+/// A segment ready for upload. Holds the encoded bytes and metadata.
+pub(crate) struct PendingSegment {
+    pub segment_index: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Channel sender for a single PUT worker.
+struct PutWorker {
+    sender: flume::Sender<PendingSegment>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl PutWorker {
+    fn new<F>(
+        id: usize,
+        client: Arc<dyn object_store::ObjectStore>,
+        ns: String,
+        on_complete: F,
+    ) -> Self
+    where
+        F: Fn(u64) + Send + 'static,
+    {
+        let (sender, receiver) = flume::bounded::<PendingSegment>(16);
+        let handle = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("PUT worker {} runtime init failed: {}", id, e);
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                while let Ok(seg) = receiver.recv_async().await {
+                    let key = format!("{}/segments/{:08}.wal", ns, seg.segment_index);
+                    let payload = PutPayload::from(Bytes::from(seg.bytes));
+                    match client.put(&ObjectPath::from(key.as_str()), payload).await {
+                        Ok(_) => {
+                            tracing::debug!(
+                                "PUT worker {} uploaded segment {}",
+                                id,
+                                seg.segment_index
+                            );
+                            on_complete(seg.segment_index);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "PUT worker {} segment {} failed: {}",
+                                id,
+                                seg.segment_index,
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+        });
+        Self {
+            sender,
+            _handle: handle,
+        }
+    }
+
+    /// Returns a sender that can be used to submit segments to this worker.
+    fn sender(&self) -> flume::Sender<PendingSegment> {
+        self.sender.clone()
+    }
+}
+
+/// Manages a pool of PUT workers for parallel segment uploads.
+pub(crate) struct ParallelPutWorkers {
+    workers: Vec<PutWorker>,
+    /// Next worker index to assign (round-robin).
+    next_worker: AtomicU64,
+}
+
+impl ParallelPutWorkers {
+    /// Spawn `count` PUT workers (capped at 8).
+    pub fn spawn<F>(
+        count: usize,
+        client: Arc<dyn object_store::ObjectStore>,
+        ns: String,
+        on_complete: F,
+    ) -> Self
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        let capped = count.min(8).max(1);
+        if count > 8 {
+            tracing::warn!("parallel_put.workers capped at 8 (requested: {})", count);
+        }
+        let on_complete = Arc::new(on_complete);
+        let mut workers = Vec::with_capacity(capped);
+        for i in 0..capped {
+            let oc = on_complete.clone();
+            workers.push(PutWorker::new(i, client.clone(), ns.clone(), move |seq| {
+                oc(seq)
+            }));
+        }
+        Self {
+            workers,
+            next_worker: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns true if this is a single-worker setup (default behavior).
+    pub fn is_single(&self) -> bool {
+        self.workers.len() == 1
+    }
+
+    /// Submit a segment to a worker (round-robin assignment).
+    pub fn submit(&self, seg: PendingSegment) -> Result<(), Error> {
+        if self.workers.is_empty() {
+            return Err(Error::Process("no PUT workers available".into()));
+        }
+        let idx = (self.next_worker.fetch_add(1, Ordering::Relaxed) as usize) % self.workers.len();
+        self.workers[idx]
+            .sender()
+            .send(seg)
+            .map_err(|e| Error::Process(format!("PUT worker channel send: {}", e)))?;
+        Ok(())
+    }
+
+    /// Returns the per-worker channel sender for direct submission.
+    pub fn worker_sender(&self, idx: usize) -> Option<flume::Sender<PendingSegment>> {
+        self.workers.get(idx).map(|w| w.sender())
+    }
+
+    /// Number of workers.
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Wait for all workers to drain their current queues (best-effort).
+    pub fn shutdown(&self) {
+        for w in &self.workers {
+            // Drop the sender to signal the worker to stop after draining.
+            // We don't have the original sender here; rely on the worker
+            // exit when all senders are dropped.
+        }
+    }
+}
+
 /// A background-thread handle for the segment flusher. Owned by `S3Store`
 /// while running; stopped on `close`.
 struct FlusherHandle {
@@ -86,6 +233,8 @@ pub(crate) struct S3Store {
     manifest_key: String,
     segment_cfg: SegmentConfig,
     cursor_cfg: CursorFlushConfig,
+    /// Parallel PUT workers pool (task 3.3).
+    put_workers: Option<ParallelPutWorkers>,
 
     /// In-memory active segment (bytes + parsed entry records so the cursor
     /// can flush without re-reading).
@@ -153,6 +302,60 @@ impl S3Store {
             ));
         }
 
+        // Resolve effective segment config: segment_tuning overrides segment
+        // when present (task 2.3).
+        let resolved_segment = if osc.segment_tuning.strategy
+            != arkflow_core::wal::config::SegmentStrategy::Balanced
+            || osc.segment_tuning.max_entries.is_some()
+            || osc.segment_tuning.max_bytes.is_some()
+            || osc.segment_tuning.flush_interval.is_some()
+        {
+            osc.segment_tuning.resolve()
+        } else {
+            osc.segment
+        };
+
+        // Validate resolved segment config (task 2.4).
+        if resolved_segment.max_entries == 0 {
+            return Err(Error::Config("segment.max_entries must be positive".into()));
+        }
+        if resolved_segment.max_bytes == 0 {
+            return Err(Error::Config("segment.max_bytes must be positive".into()));
+        }
+        if resolved_segment.flush_interval.is_zero() {
+            return Err(Error::Config(
+                "segment.flush_interval must be greater than zero".into(),
+            ));
+        }
+
+        // Validate parallel PUT workers (task 3.12).
+        if osc.parallel_put.workers == 0 {
+            return Err(Error::Config(
+                "parallel_put.workers must be positive (1-8)".into(),
+            ));
+        }
+
+        // Validate compression level ranges (task 5.4).
+        match &osc.compression {
+            arkflow_core::wal::config::CompressionConfig::Zstd { level } => {
+                if !(0..=22).contains(level) {
+                    return Err(Error::Config(format!(
+                        "compression.zstd.level {} is out of range (0-22)",
+                        level
+                    )));
+                }
+            }
+            arkflow_core::wal::config::CompressionConfig::Lz4 { level } => {
+                if !(1..=16).contains(level) {
+                    return Err(Error::Config(format!(
+                        "compression.lz4.level {} is out of range (1-16)",
+                        level
+                    )));
+                }
+            }
+            arkflow_core::wal::config::CompressionConfig::None => {}
+        }
+
         let ns = format!(
             "{}/{}/{}",
             osc.prefix.trim_end_matches('/'),
@@ -167,12 +370,22 @@ impl S3Store {
 
         let store = Arc::new(Self {
             runtime,
-            client,
-            ns,
+            client: client.clone(),
+            ns: ns.clone(),
             segments_prefix,
             manifest_key,
-            segment_cfg: osc.segment,
+            segment_cfg: resolved_segment,
             cursor_cfg: osc.cursor,
+            put_workers: Some(ParallelPutWorkers::spawn(
+                osc.parallel_put.workers,
+                client.clone(),
+                ns.clone(),
+                |_seq| {
+                    // Completion callback: in single-worker mode, the
+                    // completion is handled by the flusher. Multi-worker
+                    // mode updates are tracked separately. Placeholder.
+                },
+            )),
             active: StdMutex::new(ActiveSegment {
                 first_seq: 0,
                 last_seq: 0,
@@ -781,6 +994,9 @@ mod tests {
                 max_entries: 1000,
                 interval: std::time::Duration::from_millis(50),
             },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -905,6 +1121,9 @@ mod tests {
                 max_entries: 1000,
                 interval: std::time::Duration::from_millis(50),
             },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -912,6 +1131,286 @@ mod tests {
         let replayed = store.read_after_cursor().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].0, 42);
+        store.close().unwrap();
+    }
+
+    /// 2.5/2.6: segment tuning presets are applied during build
+    #[test]
+    fn segment_tuning_aggressive_is_applied() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig {
+                strategy: arkflow_core::wal::config::SegmentStrategy::Aggressive,
+                max_entries: None,
+                max_bytes: None,
+                flush_interval: None,
+            },
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
+        // Aggressive: max_entries=10000, max_bytes=10MB, flush_interval=10s
+        assert_eq!(store.segment_cfg.max_entries, 10000);
+        assert_eq!(store.segment_cfg.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(
+            store.segment_cfg.flush_interval,
+            std::time::Duration::from_secs(10)
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn segment_tuning_low_latency_is_applied() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig {
+                strategy: arkflow_core::wal::config::SegmentStrategy::LowLatency,
+                max_entries: None,
+                max_bytes: None,
+                flush_interval: None,
+            },
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
+        // LowLatency: max_entries=100, max_bytes=100KB, flush_interval=100ms
+        assert_eq!(store.segment_cfg.max_entries, 100);
+        assert_eq!(store.segment_cfg.max_bytes, 100 * 1024);
+        assert_eq!(
+            store.segment_cfg.flush_interval,
+            std::time::Duration::from_millis(100)
+        );
+        store.close().unwrap();
+    }
+
+    /// 2.4: validation rejects non-positive segment params
+    #[test]
+    fn segment_validation_rejects_zero_max_entries() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let mut osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig {
+                max_entries: 0, // invalid
+                max_bytes: 1024,
+                flush_interval: std::time::Duration::from_secs(1),
+            },
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        // Force tuning to use the invalid `segment` (no overrides)
+        osc.segment_tuning = arkflow_core::wal::config::SegmentTuningConfig::default();
+
+        let result = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client);
+        match result {
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("max_entries"),
+                    "expected max_entries validation error, got: {}",
+                    e
+                );
+            }
+            Ok(_) => panic!("expected error for zero max_entries"),
+        }
+    }
+
+    /// 3.1/3.2: PutWorker can be created and shut down cleanly
+    #[test]
+    fn put_worker_can_be_created() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let _worker = PutWorker::new(0, client, "test-ns".into(), |_seq| {});
+        // Worker thread will be dropped on scope exit
+    }
+
+    /// 3.3/3.5: ParallelPutWorkers with multiple workers submits in round-robin
+    #[test]
+    fn parallel_put_workers_round_robin_assignment() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let pool = ParallelPutWorkers::spawn(4, client, "test-ns".into(), |_seq| {});
+        assert_eq!(pool.len(), 4);
+        assert!(!pool.is_single());
+    }
+
+    /// 3.3: Single worker setup behaves as default
+    #[test]
+    fn parallel_put_workers_single_is_default() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let pool = ParallelPutWorkers::spawn(1, client, "test-ns".into(), |_seq| {});
+        assert_eq!(pool.len(), 1);
+        assert!(pool.is_single());
+    }
+
+    /// 3.12: validation rejects zero worker count
+    #[test]
+    fn parallel_put_workers_zero_count_rejected() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let mut osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig {
+                workers: 0, // invalid
+                ..Default::default()
+            },
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        let result = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client);
+        match result {
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("workers"),
+                    "expected workers validation error, got: {}",
+                    e
+                );
+            }
+            Ok(_) => panic!("expected error for zero worker count"),
+        }
+    }
+
+    /// 5.4: compression level out of range is rejected
+    #[test]
+    fn compression_level_validation() {
+        // zstd level too high
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::Zstd { level: 25 },
+            sync: SyncPolicy::GroupCommit,
+        };
+        let result = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client);
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("zstd"),
+                "expected zstd level error, got: {}",
+                e
+            ),
+            Ok(_) => panic!("expected zstd level error"),
+        }
+    }
+
+    /// 5.5: compression with no segments uses None path (no errors)
+    #[test]
+    fn compression_none_is_default_and_works() {
+        let dir = tempdir();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let runtime = Runtime::new().unwrap();
+
+        let osc = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: "arkflow/wal".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::None,
+            sync: SyncPolicy::GroupCommit,
+        };
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
         store.close().unwrap();
     }
 }

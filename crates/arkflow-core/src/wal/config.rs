@@ -20,8 +20,154 @@
 //! `arkflow-plugin` reads these fields and turns them into an `S3Store`.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::wal::SyncPolicy;
+
+/// Preset segment tuning strategies for the S3 WAL backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentStrategy {
+    /// High throughput, large crash window (max_entries: 10000, max_bytes: 10MB, flush_interval: 10s)
+    Aggressive,
+    /// Balanced trade-offs (max_entries: 1000, max_bytes: 1MB, flush_interval: 1s) - default
+    Balanced,
+    /// Small crash window, high PUT frequency (max_entries: 100, max_bytes: 100KB, flush_interval: 100ms)
+    LowLatency,
+}
+
+impl SegmentStrategy {
+    /// Returns default segment config for this strategy.
+    pub fn defaults(&self) -> SegmentConfig {
+        match self {
+            Self::Aggressive => SegmentConfig {
+                max_entries: 10000,
+                max_bytes: 10 * 1024 * 1024, // 10 MB
+                flush_interval: Duration::from_secs(10),
+            },
+            Self::Balanced => SegmentConfig::default(),
+            Self::LowLatency => SegmentConfig {
+                max_entries: 100,
+                max_bytes: 100 * 1024, // 100 KB
+                flush_interval: Duration::from_millis(100),
+            },
+        }
+    }
+}
+
+impl Default for SegmentStrategy {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+/// Segment tuning configuration for the S3 WAL backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentTuningConfig {
+    /// Preset strategy to use. Overrides individual params if set.
+    #[serde(default)]
+    pub strategy: SegmentStrategy,
+    /// Override max_entries from the preset strategy.
+    pub max_entries: Option<usize>,
+    /// Override max_bytes from the preset strategy.
+    pub max_bytes: Option<usize>,
+    /// Override flush_interval from the preset strategy.
+    #[serde(with = "duration_serde_option", default)]
+    pub flush_interval: Option<Duration>,
+}
+
+impl SegmentTuningConfig {
+    /// Resolves the final SegmentConfig by merging strategy defaults with any overrides.
+    pub fn resolve(&self) -> SegmentConfig {
+        let base = self.strategy.defaults();
+        SegmentConfig {
+            max_entries: self.max_entries.unwrap_or(base.max_entries),
+            max_bytes: self.max_bytes.unwrap_or(base.max_bytes),
+            flush_interval: self.flush_interval.unwrap_or(base.flush_interval),
+        }
+    }
+}
+
+impl Default for SegmentTuningConfig {
+    fn default() -> Self {
+        Self {
+            strategy: SegmentStrategy::Balanced,
+            max_entries: None,
+            max_bytes: None,
+            flush_interval: None,
+        }
+    }
+}
+
+/// Parallel PUT workers configuration for the S3 WAL backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelPutConfig {
+    /// Number of parallel PUT workers (1-8). Default is 1.
+    #[serde(default = "default_parallel_workers")]
+    pub workers: usize,
+    /// Shutdown timeout for workers to complete in-flight segments.
+    #[serde(default = "default_shutdown_timeout", with = "duration_serde")]
+    pub shutdown_timeout: Duration,
+}
+
+fn default_parallel_workers() -> usize {
+    1
+}
+
+fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+impl Default for ParallelPutConfig {
+    fn default() -> Self {
+        Self {
+            workers: default_parallel_workers(),
+            shutdown_timeout: default_shutdown_timeout(),
+        }
+    }
+}
+
+/// Compression configuration for the S3 WAL backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompressionConfig {
+    /// No compression (default).
+    None,
+    /// Zstandard compression with configurable level (0-22, default 3).
+    #[serde(rename = "zstd")]
+    Zstd {
+        /// Compression level (0-22). Default is 3.
+        #[serde(default = "default_zstd_level")]
+        level: i32,
+    },
+    /// LZ4 compression with configurable acceleration level (1-9, default 4).
+    #[serde(rename = "lz4")]
+    Lz4 {
+        /// Acceleration level (1-9, higher = faster but less compression). Default is 4.
+        #[serde(default = "default_lz4_level")]
+        level: i32,
+    },
+}
+
+fn default_zstd_level() -> i32 {
+    3
+}
+
+fn default_lz4_level() -> i32 {
+    4
+}
+
+impl CompressionConfig {
+    /// Minimum segment size to apply compression (in bytes). Segments smaller than this
+    /// are uploaded uncompressed to avoid CPU overhead.
+    pub const MIN_COMPRESSION_SIZE: usize = 10 * 1024; // 10 KB
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self::None
+    }
+}
 
 /// Backend selection for the WAL.
 ///
@@ -104,6 +250,15 @@ pub struct ObjectStoreWalConfig {
     /// Cursor flush parameters.
     #[serde(default)]
     pub cursor: CursorFlushConfig,
+    /// Segment tuning configuration (presets and overrides).
+    #[serde(default)]
+    pub segment_tuning: SegmentTuningConfig,
+    /// Parallel PUT workers configuration.
+    #[serde(default)]
+    pub parallel_put: ParallelPutConfig,
+    /// Compression configuration.
+    #[serde(default)]
+    pub compression: CompressionConfig,
     /// Sync policy. Forced to `GroupCommit`/`Periodic` at the store level;
     /// `PerEntry` is rejected at config-load time.
     #[serde(default)]
@@ -241,7 +396,51 @@ pub mod duration_serde {
     }
 }
 
-use std::time::Duration;
+/// Duration serde for Option<Duration> fields.
+pub mod duration_serde_option {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(duration) => s.serialize_str(&format!("{}ms", duration.as_millis())),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawOption {
+            Str(String),
+            Int(u64),
+            None,
+        }
+        match RawOption::deserialize(d)? {
+            RawOption::Str(s) => Ok(parse_human(&s)),
+            RawOption::Int(ms) => Ok(Some(Duration::from_millis(ms))),
+            RawOption::None => Ok(None),
+        }
+    }
+
+    fn parse_human(s: &str) -> Option<Duration> {
+        let s = s.trim();
+        if let Some(rest) = s.strip_suffix("ms") {
+            return rest.parse::<u64>().ok().map(Duration::from_millis);
+        }
+        if let Some(rest) = s.strip_suffix('s') {
+            if let Ok(secs) = rest.parse::<f64>() {
+                return Some(Duration::from_secs_f64(secs));
+            }
+        }
+        if let Some(rest) = s.strip_suffix('m') {
+            if let Ok(mins) = rest.parse::<u64>() {
+                return Some(Duration::from_secs(mins * 60));
+            }
+        }
+        s.parse::<u64>().ok().map(Duration::from_millis)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -351,6 +550,9 @@ mod tests {
             },
             segment: SegmentConfig::default(),
             cursor: CursorFlushConfig::default(),
+            segment_tuning: SegmentTuningConfig::default(),
+            parallel_put: ParallelPutConfig::default(),
+            compression: CompressionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let cfg = WalConfig {
@@ -376,5 +578,187 @@ mod tests {
     fn local_backend_always_validates() {
         let cfg = WalConfig::local(true, "/tmp/wal".into(), SyncPolicy::PerEntry);
         cfg.validate().unwrap();
+    }
+
+    // --- New config field tests ---
+
+    #[test]
+    fn segment_strategy_defaults_are_correct() {
+        let aggressive = SegmentStrategy::Aggressive.defaults();
+        assert_eq!(aggressive.max_entries, 10000);
+        assert_eq!(aggressive.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(aggressive.flush_interval, Duration::from_secs(10));
+
+        let balanced = SegmentStrategy::Balanced.defaults();
+        assert_eq!(balanced.max_entries, 1000);
+        assert_eq!(balanced.max_bytes, 1024 * 1024);
+        assert_eq!(balanced.flush_interval, Duration::from_secs(1));
+
+        let low_latency = SegmentStrategy::LowLatency.defaults();
+        assert_eq!(low_latency.max_entries, 100);
+        assert_eq!(low_latency.max_bytes, 100 * 1024);
+        assert_eq!(low_latency.flush_interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn segment_tuning_resolves_with_strategy_only() {
+        let tuning = SegmentTuningConfig {
+            strategy: SegmentStrategy::Aggressive,
+            max_entries: None,
+            max_bytes: None,
+            flush_interval: None,
+        };
+        let resolved = tuning.resolve();
+        assert_eq!(resolved.max_entries, 10000);
+        assert_eq!(resolved.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(resolved.flush_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn segment_tuning_resolves_with_overrides() {
+        let tuning = SegmentTuningConfig {
+            strategy: SegmentStrategy::Aggressive,
+            max_entries: Some(5000),
+            max_bytes: None,
+            flush_interval: Some(Duration::from_secs(5)),
+        };
+        let resolved = tuning.resolve();
+        assert_eq!(resolved.max_entries, 5000); // overridden
+        assert_eq!(resolved.max_bytes, 10 * 1024 * 1024); // from strategy
+        assert_eq!(resolved.flush_interval, Duration::from_secs(5)); // overridden
+    }
+
+    #[test]
+    fn object_store_with_segment_tuning_strategy_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: aggressive
+              max_entries: 5000
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(matches!(
+            o.segment_tuning.strategy,
+            SegmentStrategy::Aggressive
+        ));
+        assert_eq!(o.segment_tuning.max_entries, Some(5000));
+    }
+
+    #[test]
+    fn object_store_with_parallel_put_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            parallel_put:
+              workers: 4
+              shutdown_timeout: 30s
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert_eq!(o.parallel_put.workers, 4);
+        assert_eq!(o.parallel_put.shutdown_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn object_store_with_zstd_compression_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            compression:
+              type: zstd
+              level: 5
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        match o.compression {
+            CompressionConfig::Zstd { level } => assert_eq!(level, 5),
+            _ => panic!("expected Zstd"),
+        }
+    }
+
+    #[test]
+    fn object_store_with_lz4_compression_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            compression:
+              type: lz4
+              level: 6
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        match o.compression {
+            CompressionConfig::Lz4 { level } => assert_eq!(level, 6),
+            _ => panic!("expected Lz4"),
+        }
+    }
+
+    #[test]
+    fn object_store_with_no_compression_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            compression:
+              type: none
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(matches!(o.compression, CompressionConfig::None));
+    }
+
+    #[test]
+    fn backward_compat_without_new_fields() {
+        // Old configs without new fields should still work
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        // Defaults should be applied
+        assert!(matches!(
+            o.segment_tuning.strategy,
+            SegmentStrategy::Balanced
+        ));
+        assert_eq!(o.parallel_put.workers, 1);
+        assert!(matches!(o.compression, CompressionConfig::None));
     }
 }

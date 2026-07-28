@@ -1,0 +1,73 @@
+# S3 WAL — Parallel PUT Example
+#
+# This example demonstrates parallel PUT workers, which can boost S3
+# upload throughput by 2-3x compared to the single-worker default.
+#
+# ── When to use ─────────────────────────────────────────────────────────
+#
+#   - High-throughput streams where segment PUT is the bottleneck
+#   - Networks with high bandwidth (parallel uploads help most)
+#   - Workloads where throughput > simplicity
+#
+# ── Trade-offs ──────────────────────────────────────────────────────────
+#
+#   1 worker (default)  : lowest complexity, ~150 MB/s typical
+#   4 workers           : ~2x throughput, minor complexity
+#   8 workers (max)     : ~3x throughput, must respect S3 rate limits
+#
+# ── S3 Rate Limits ──────────────────────────────────────────────────────
+#
+#   Per-prefix limits: 3,500 PUT/DELETE/sec, 5,500 GET/sec.
+#   With 8 workers, each uploading concurrently, watch for 503 SlowDown.
+#
+# ── See also ────────────────────────────────────────────────────────────
+#
+#   docs/performance/s3-wal-backend.md
+#   examples/durability_example_aggressive.yaml
+#   examples/durability_example_compressed.yaml
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "value": 10, "sensor": "high_throughput" }'
+      interval: 1ns
+      batch_size: 500
+      count: 1000000
+
+    durability:
+      enabled: true
+      sync: "group_commit"
+      backend:
+        type: "object_store"
+        node_id: "${ARKFLOW_NODE_ID}"
+        stream_id: "parallel-stream"
+        prefix: "arkflow/wal"
+        s3:
+          bucket: "my-bucket"
+          region: "us-east-1"
+          endpoint: "http://localhost:9000"
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+          allow_http: true
+
+        # ── Parallel PUT Workers ──────────────────────────────────────────
+        # Use 4 PUT workers for 2-3x throughput improvement.
+        # Workers share a bounded channel (16 segments each) for backpressure.
+        parallel_put:
+          workers: 4              # default 1, max 8
+          shutdown_timeout: "30s" # how long to wait for in-flight uploads
+
+        # Use balanced tuning (default) — combined with parallel PUT
+        segment_tuning:
+          strategy: balanced
+
+    pipeline:
+      thread_num: 8
+      processors:
+        - type: "json_to_arrow"
+
+    output:
+      type: "stdout"

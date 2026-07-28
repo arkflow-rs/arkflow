@@ -96,6 +96,9 @@ fn osc(s3: ObjectStoreS3Config) -> ObjectStoreWalConfig {
             max_entries: 1000,
             interval: std::time::Duration::from_millis(50),
         },
+        segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+        parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+        compression: arkflow_core::wal::config::CompressionConfig::default(),
         sync: SyncPolicy::GroupCommit,
     }
 }

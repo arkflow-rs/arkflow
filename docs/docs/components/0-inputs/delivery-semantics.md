@@ -45,6 +45,10 @@ is persisted locally first.
   boundary so the message body survives a crash and can be replayed on restart.
   This is Phase 1 of `add-input-durability` (the per-stream `durability:` option).
 
+For configuration guidance — choosing segment tuning strategy, parallel PUT
+worker count, and compression algorithm — see
+[WAL Durability & Performance](wal-optimization.md).
+
 ## At-least-once contract
 
 ArkFlow provides **at-least-once** delivery. After a crash and recovery,
