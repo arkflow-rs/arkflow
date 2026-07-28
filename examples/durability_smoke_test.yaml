@@ -1,0 +1,46 @@
+# Smoke test configuration for comprehensive WAL optimization
+# Runs briefly to verify the engine starts up correctly with all optimizations
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "value": 42, "sensor": "smoke_test" }'
+      interval: 10ms
+      batch_size: 10
+      count: 100
+
+    durability:
+      enabled: true
+      sync: "group_commit"
+      backend:
+        type: "object_store"
+        node_id: "smoke-test-pod"
+        stream_id: "smoke-test-stream"
+        prefix: "arkflow/smoke-test"
+        s3:
+          bucket: "smoke-test-bucket"
+          region: "us-east-1"
+          endpoint: "http://localhost:9000"
+          access_key_id: "minioadmin"
+          secret_access_key: "minioadmin"
+          allow_http: true
+        # Use aggressive tuning
+        segment_tuning:
+          strategy: aggressive
+        # Use 2 parallel workers
+        parallel_put:
+          workers: 2
+        # Use zstd compression
+        compression:
+          type: zstd
+          level: 3
+
+    pipeline:
+      thread_num: 2
+      processors: []
+
+    output:
+      type: "drop"

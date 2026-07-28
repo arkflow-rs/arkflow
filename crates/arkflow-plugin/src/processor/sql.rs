@@ -92,10 +92,7 @@ impl SqlProcessor {
         let ctx = SessionContext::new();
         let statement = ctx
             .state()
-            .sql_to_statement(
-                &config.query,
-                &ctx.state().options().sql_parser.dialect,
-            )
+            .sql_to_statement(&config.query, &ctx.state().options().sql_parser.dialect)
             .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
         Ok(Self {
             config,

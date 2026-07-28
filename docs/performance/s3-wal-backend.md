@@ -144,6 +144,111 @@ cursor:
 
 **Optimization**: Increase `segment.max_entries` and `cursor.interval` to reduce PUT costs further. Batching is already applied automatically (8 segments or 100ms).
 
+## Performance Tuning Strategies (since 2026-07-28)
+
+The S3 WAL backend supports three preset strategies via `segment_tuning.strategy`:
+
+### Aggressive Strategy
+
+For high throughput, low cost — tolerates a larger crash window.
+
+```yaml
+segment_tuning:
+  strategy: aggressive
+```
+
+Defaults:
+- `max_entries: 10000`
+- `max_bytes: 10MB`
+- `flush_interval: 10s`
+
+**Crash window @ 10K msg/s**: ~100,000 messages at risk on node loss
+**PUT cost reduction**: ~10x vs balanced
+**Throughput**: Up to 200 MB/s
+
+### Balanced Strategy (default)
+
+Default trade-off between throughput and crash window.
+
+```yaml
+segment_tuning:
+  strategy: balanced
+```
+
+Defaults:
+- `max_entries: 1000`
+- `max_bytes: 1MB`
+- `flush_interval: 1s`
+
+**Crash window @ 10K msg/s**: ~10,000 messages at risk
+**Throughput**: 100-150 MB/s
+
+### Low-Latency Strategy
+
+For minimal crash window — highest PUT frequency.
+
+```yaml
+segment_tuning:
+  strategy: low_latency
+```
+
+Defaults:
+- `max_entries: 100`
+- `max_bytes: 100KB`
+- `flush_interval: 100ms`
+
+**Crash window @ 10K msg/s**: ~1,000 messages at risk
+**Throughput**: Lower due to frequent flushes
+
+### Custom Overrides
+
+Override individual parameters of any preset:
+
+```yaml
+segment_tuning:
+  strategy: aggressive
+  max_entries: 20000      # override default 10000
+  flush_interval: "30s"   # override default 10s
+```
+
+## Parallel PUT Workers
+
+Configure multiple PUT workers for 2-3x throughput improvement.
+
+```yaml
+parallel_put:
+  workers: 4              # 1-8, default 1
+  shutdown_timeout: "30s" # how long to wait for in-flight uploads
+```
+
+**Benefits:**
+- Workers operate in parallel via independent channels
+- Round-robin assignment (oldest segments first)
+- Per-worker backpressure (16 segments each)
+
+**Watch for S3 rate limits**: 8 workers can hit per-prefix limits.
+
+## Compression
+
+Reduce S3 storage and network costs by 50-70% via segment compression.
+
+```yaml
+compression:
+  type: zstd  # or "lz4", "none"
+  level: 3    # algorithm-specific
+```
+
+**Algorithm comparison:**
+
+| Algorithm | Compression Ratio | CPU Cost | Best For |
+|-----------|-------------------|----------|----------|
+| `none` | 1.0x | 0% | Default, low CPU |
+| `lz4` | 2-3x | 2-5% | Fast compression |
+| `zstd-3` | 3-5x | 5-10% | Balanced (default for compression) |
+| `zstd-9` | 5-8x | 20-30% | Maximum compression |
+
+**Min size threshold**: Segments smaller than 10KB are uploaded uncompressed.
+
 ## Failure Scenarios
 
 ### S3 Unavailable

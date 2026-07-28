@@ -18,6 +18,7 @@
 //! under the kind name `"object_store"`. The local `redb` backend lives in
 //! `arkflow-core` and is auto-registered.
 
+mod compression;
 mod crc;
 mod manifest;
 mod s3;

@@ -275,6 +275,7 @@ dependencies = [
  "hdfs-native-object-store",
  "humantime",
  "lazy_static",
+ "lz4_flex 0.11.6",
  "mockall",
  "num_cpus",
  "object_store",
@@ -310,6 +311,7 @@ dependencies = [
  "tracing",
  "url",
  "vrl",
+ "zstd",
 ]
 
 [[package]]
