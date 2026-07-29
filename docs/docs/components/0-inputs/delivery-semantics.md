@@ -67,6 +67,23 @@ availability across nodes (replicated WAL / consensus) is out of scope. For
 HA-grade durability, run on replicated storage or front the stream with a
 durable, replayable source (e.g. Kafka).
 
+## S3 WAL manifest write coordination
+
+When the durable WAL uses the object-store (S3-compatible) backend with
+`parallel_put.workers > 1`, multiple PUT workers can finish a segment upload
+and seal it concurrently. Each seal rewrites the small `manifest.json` that
+records the ack cursor and the sealed-segment list. To keep those concurrent
+rewrites from silently overwriting each other — which would regress the cursor
+and cause duplicate replay on recovery — manifest writes are coordinated with
+ETag-based optimistic concurrency: each PUT carries the ETag it read, and on a
+mismatch the writer re-reads, re-applies its change, and retries (up to 8
+attempts, covering the configured worker ceiling).
+
+This is invisible to single-writer setups (`parallel_put.workers = 1`, the
+default): there is no contention, the first PUT succeeds, and no retries
+occur. The at-least-once contract is unchanged. See
+`docs/performance/s3-wal-backend.md` for backend performance details.
+
 ## WAL recovery failure (fail-fast)
 
 If a durability-enabled stream fails to recover its WAL at startup — either
