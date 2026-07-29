@@ -766,6 +766,29 @@ impl WalStore for S3Store {
     }
 }
 
+/// Record a sealed segment in the manifest, keeping the chronologically-newest
+/// segment as the active one. Segment names are 0-padded `{:08}.wal`, so
+/// lexical order == chronological order. An out-of-order seal — a worker whose
+/// manifest write lost the ETag race and retries after a *newer* segment has
+/// already landed — must not regress the active pointer; it records its older
+/// segment in `sealed_segments` instead. Idempotent on `sealed_segments`.
+fn apply_seal(m: &mut Manifest, sealed_name: &str) {
+    let install_as_active = match &m.active_segment {
+        Some(current) => sealed_name > current.as_str(),
+        None => true,
+    };
+    if install_as_active {
+        if let Some(prev) = m.active_segment.take() {
+            if !m.sealed_segments.contains(&prev) {
+                m.sealed_segments.push(prev);
+            }
+        }
+        m.active_segment = Some(sealed_name.to_string());
+    } else if !m.sealed_segments.iter().any(|s| s.as_str() == sealed_name) {
+        m.sealed_segments.push(sealed_name.to_string());
+    }
+}
+
 /// Seal the current active segment: write it to a fresh `NNNNNNNN.wal`
 /// filename, rotate the in-memory state, and update the manifest.
 async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
@@ -801,13 +824,10 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     // parallel PUT workers don't lose each other's updates.
     let name_for_mutator = name.clone();
     write_manifest_with_etag(store, move |m| {
-        // Demote the previous active segment, idempotently.
-        if let Some(prev) = m.active_segment.take() {
-            if !m.sealed_segments.contains(&prev) {
-                m.sealed_segments.push(prev);
-            }
-        }
-        m.active_segment = Some(name_for_mutator.clone());
+        // Record the sealed segment, keeping the chronologically-newest segment
+        // active (`apply_seal` guards against out-of-order seals regressing
+        // the active pointer), then bump the high-water mark.
+        apply_seal(m, &name_for_mutator);
         if last_seq > m.max_sealed_seq {
             m.max_sealed_seq = last_seq;
         }
@@ -1804,5 +1824,51 @@ mod tests {
             "expected retry-exhaustion error, got: {}",
             msg
         );
+    }
+
+    /// T5: an out-of-order seal must not regress the active pointer. A worker
+    /// whose manifest write retries after a *newer* segment has landed records
+    /// its older segment in `sealed_segments` without overwriting the newer
+    /// active pointer. Exercises `apply_seal` — the same path
+    /// `seal_active_segment` uses inside its `write_manifest_with_etag` closure.
+    #[test]
+    fn manifest_race_out_of_order_seal_keeps_newest_active() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            // Newer segment sealed first (won the manifest race).
+            write_manifest_with_etag(&inner, |m| {
+                m.active_segment = Some("00000002.wal".to_string());
+            })
+            .await
+            .unwrap();
+
+            // Older segment (00000001) retries via the same `apply_seal` path
+            // seal_active_segment uses. It must NOT overwrite the newer active.
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000001.wal"))
+                .await
+                .unwrap();
+
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000002.wal"));
+            assert!(
+                m.sealed_segments.contains(&"00000001.wal".to_string()),
+                "older sealed segment must be recorded: {:?}",
+                m.sealed_segments
+            );
+
+            // Symmetric: an even newer seal (00000003) takes active and demotes
+            // 00000002 into sealed_segments.
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000003.wal"))
+                .await
+                .unwrap();
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000003.wal"));
+            assert!(
+                m.sealed_segments.contains(&"00000002.wal".to_string()),
+                "demoted active must be recorded: {:?}",
+                m.sealed_segments
+            );
+        });
     }
 }

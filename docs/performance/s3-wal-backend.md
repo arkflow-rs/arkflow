@@ -237,10 +237,12 @@ segment upload and seal it concurrently, each rewriting `manifest.json`. These
 concurrent rewrites are coordinated with ETag-based optimistic concurrency
 (read ETag → conditional PUT → retry on mismatch, up to 8 attempts covering the
 worker ceiling), so no worker's cursor advancement or sealed-segment entry is
-silently overwritten. This is invisible at `workers: 1` (the default): no
-contention, no retries, behavior unchanged. See
-`docs/docs/components/0-inputs/delivery-semantics.md` for the delivery-contract
-details.
+silently overwritten — provided the backend supports conditional PUT. S3 and
+S3-compatible stores do; a backend that does not (e.g. `LocalFileSystem`)
+falls back to a single-writer unconditional write, so keep `workers: 1` there.
+This is invisible at `workers: 1` (the default): no contention, no retries,
+behavior unchanged. See `docs/docs/components/0-inputs/delivery-semantics.md`
+for the delivery-contract details.
 
 ## Compression
 

@@ -79,6 +79,13 @@ ETag-based optimistic concurrency: each PUT carries the ETag it read, and on a
 mismatch the writer re-reads, re-applies its change, and retries (up to 8
 attempts, covering the configured worker ceiling).
 
+This coordination requires the object-store backend to support conditional
+PUT (`If-Match` / if-none-exists). S3 and S3-compatible stores (and the
+in-memory test backend) support it. A backend that does not support
+conditional PUT falls back to an unconditional write, which is safe only with
+a single writer — so `parallel_put.workers > 1` must not be configured
+against such a backend.
+
 This is invisible to single-writer setups (`parallel_put.workers = 1`, the
 default): there is no contention, the first PUT succeeds, and no retries
 occur. The at-least-once contract is unchanged. See

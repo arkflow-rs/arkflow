@@ -23,7 +23,7 @@
 - [x] 4.3 Implement T2 (concurrent seal stress): spawn 8 tasks concurrently each sealing a unique segment name (`{:08}.wal` with distinct `i`). After join, assert `m.sealed_segments` contains exactly all 8 names, in any order, with no duplicates.
 - [x] 4.4 Implement T3 (single-writer baseline): 8 sequential writes of `m.cursor += 1`. Assert final `m.cursor == 8`. This guards against the mutator losing the "freshly-read base" property.
 - [x] 4.5 Implement T4 (retry budget exceeded): wrap the in-memory store in a small adapter that returns `PreconditionFailed` on every PUT, regardless of ETag. Call the writer with a closure that sets `cursor = 1`, assert the call returns `Err(Error::Process(_))` and that the error message identifies the retry exhaustion.
-- [x] 4.6 Verify: `cargo test -p arkflow-plugin --test wal_manifest_race` passes all four test cases.
+- [x] 4.6 Verify: `cargo test -p arkflow-plugin --lib manifest_race` passes all four T1–T4 cases (the tests live in `s3.rs`'s internal `#[cfg(test)] mod tests`, not a `--test` integration target).
 
 ## 5. Existing test sweep and lint
 
