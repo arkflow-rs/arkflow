@@ -59,7 +59,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore as _, ObjectStoreExt, PutPayload};
+use object_store::{
+    ObjectStore as _, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 
@@ -764,12 +766,55 @@ impl WalStore for S3Store {
     }
 }
 
+/// Record a sealed segment in the manifest, keeping the chronologically-newest
+/// segment as the active one. Ordering is by the numeric segment index parsed
+/// from the `NNNNNNNN.wal` name (not lexical order), so it stays correct past
+/// the 8-digit zero-padding boundary. An out-of-order seal — a worker whose
+/// manifest write lost the ETag race and retries after a *newer* segment has
+/// already landed — must not regress the active pointer; it records its older
+/// segment in `sealed_segments` instead. A segment that is already active is
+/// left untouched (a segment is either active or sealed, never both).
+/// Idempotent on `sealed_segments`.
+fn apply_seal(m: &mut Manifest, sealed_name: &str) {
+    // Already the active segment — nothing to do. In particular, do NOT add it
+    // to sealed_segments: a segment is either active or sealed, never both.
+    // This covers the retry path (read base → apply_seal → PUT re-run after a
+    // precondition failure), where the freshly-read base already reflects this
+    // segment as active.
+    if m.active_segment.as_deref() == Some(sealed_name) {
+        return;
+    }
+    let install_as_active = match &m.active_segment {
+        Some(current) => segment_index(sealed_name) > segment_index(current),
+        None => true,
+    };
+    if install_as_active {
+        if let Some(prev) = m.active_segment.take() {
+            if !m.sealed_segments.contains(&prev) {
+                m.sealed_segments.push(prev);
+            }
+        }
+        m.active_segment = Some(sealed_name.to_string());
+    } else if !m.sealed_segments.iter().any(|s| s.as_str() == sealed_name) {
+        m.sealed_segments.push(sealed_name.to_string());
+    }
+}
+
+/// Parse the numeric index out of a `NNNNNNNN.wal` segment name for
+/// chronological comparison. Returns 0 for names that don't match the scheme
+/// (treated as chronologically oldest — a safe default).
+fn segment_index(name: &str) -> u64 {
+    name.strip_suffix(".wal")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Seal the current active segment: write it to a fresh `NNNNNNNN.wal`
 /// filename, rotate the in-memory state, and update the manifest.
 async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     // Move the bytes out of the active lock so the encode + PUT doesn't
     // hold the lock across the network call.
-    let (sealed_bytes, first_seq, last_seq, next_index) = {
+    let (sealed_bytes, first_seq, last_seq, next_index, entry_count) = {
         let mut active = store.active.lock().unwrap();
         if active.entries == 0 {
             return Ok(());
@@ -778,114 +823,236 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
         let first = active.first_seq;
         let last = active.last_seq;
         let idx = active.next_index;
+        let count = active.entries;
         active.first_seq = 0;
         active.last_seq = 0;
         active.entries = 0;
         active.next_index += 1;
-        (bytes, first, last, idx)
+        (bytes, first, last, idx, count)
     };
 
     let name = format!("{:08}.wal", next_index);
     let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
-    store
+    // Clone for the PUT so the original bytes survive a failed upload and can be
+    // restored to the active segment below. Without this, a transient segment
+    // PUT failure would permanently lose the entries (they were already moved
+    // out of the active segment above).
+    if let Err(e) = store
         .client
-        .put(&key, PutPayload::from(Bytes::from(sealed_bytes)))
+        .put(&key, PutPayload::from(Bytes::from(sealed_bytes.clone())))
         .await
-        .map_err(|e| Error::Process(format!("S3 PUT segment {}: {}", name, e)))?;
+    {
+        let mut active = store.active.lock().unwrap();
+        active.bytes = sealed_bytes;
+        active.first_seq = first_seq;
+        active.last_seq = last_seq;
+        active.entries = entry_count;
+        active.next_index = next_index; // undo the pre-increment
+        return Err(Error::Process(format!("S3 PUT segment {}: {}", name, e)));
+    }
 
     // Bump the manifest's `max_sealed_seq` and add the new segment to
     // `sealed_segments`. If we had an active segment before, demote it.
-    let manifest = read_manifest_or_fresh(store).await?;
-    let mut m = manifest;
-    if let Some(prev_active) = m.active_segment.take() {
-        m.sealed_segments.push(prev_active);
-    }
-    m.active_segment = Some(name);
-    if last_seq > m.max_sealed_seq {
-        m.max_sealed_seq = last_seq;
-    }
+    // Use the ETag-coordinated writer so concurrent seal callbacks from
+    // parallel PUT workers don't lose each other's updates.
+    let name_for_mutator = name.clone();
+    write_manifest_with_etag(store, move |m| {
+        // Record the sealed segment, keeping the chronologically-newest segment
+        // active (`apply_seal` guards against out-of-order seals regressing
+        // the active pointer), then bump the high-water mark.
+        apply_seal(m, &name_for_mutator);
+        if last_seq > m.max_sealed_seq {
+            m.max_sealed_seq = last_seq;
+        }
+    })
+    .await?;
     let _ = first_seq; // (we track via sealed_segments index; could go into manifest for diagnostics)
-    write_manifest(store, &m).await?;
     Ok(())
 }
 
-/// Flush the in-memory cursor watermark to the manifest, with batching and
-/// truncation (D6 + D7).
+/// Flush the in-memory cursor watermark to the manifest (D6).
+///
+/// Truncation of sealed segments past the cursor (D7) is intentionally not
+/// performed here: a correct implementation needs per-segment last-seq tracking,
+/// which the manifest does not yet carry. The previous in-mutator truncation was
+/// a broken placeholder that emptied `sealed_segments` without deleting the
+/// objects (orphans), so it has been removed; sealed segments stay listed in the
+/// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
-    let mut m = read_manifest_or_fresh(store).await?;
-    // Update the in-memory cursor: take the maximum observed by reading the
-    // active segment's last entry, plus the segment index we last sealed.
+    // Read the active segment's last seq before the mutator runs; this value
+    // is conservative (may be 0 if no entry has been sealed since startup).
     let active = store.active.lock().unwrap();
     let active_last = active.last_seq;
     drop(active);
 
-    // The cursor stored on the store from `advance_cursor` is implicit — we
-    // bump it from the high-water of `advance_cursor` calls accumulated via
-    // `cursor_pending`. Reset the counter and the timestamp on flush.
+    // Advance the committed cursor under ETag coordination so concurrent flush
+    // calls (flusher thread vs ingestion thread) don't lose each other's
+    // updates. The cursor is clamped to `max_sealed_seq` so it never advances
+    // past data that has actually been sealed to object storage.
+    write_manifest_with_etag(store, |m| {
+        if active_last > m.cursor {
+            m.cursor = active_last.min(m.max_sealed_seq);
+        }
+    })
+    .await?;
+
+    // Reset the in-memory flush counters. This happens after the manifest write
+    // so a crash between the write and the reset would replay the same entries
+    // on restart — safe.
     store.cursor_pending.store(0, Ordering::Release);
     store
         .cursor_last_flush_ms
         .store(now_ms(), Ordering::Release);
 
-    // `advance_cursor` does not carry the sequence number today (it's a
-    // monotonic bump). The store tracks `cursor_pending` as a count, not a
-    // value. To keep `m.cursor` monotonic without expanding the trait, we
-    // use `max_sealed_seq` as a proxy: the cursor never advances past the
-    // highest sealed entry, which is conservative (more replay) but safe.
-    if active_last > m.cursor {
-        m.cursor = active_last.min(m.max_sealed_seq);
-    }
-    // Truncate: delete sealed segments whose last seq is `<= cursor`.
-    // Best-effort; failures are silently ignored (D7).
-    let to_delete: Vec<String> = m
-        .sealed_segments
-        .iter()
-        .filter(|_| m.cursor > 0) // placeholder; we don't track per-seg last seq here
-        .cloned()
-        .collect();
-    for name in &to_delete {
-        let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
-        let _ = store.client.delete(&key).await; // best-effort
-    }
-    m.sealed_segments.retain(|name| !to_delete.contains(name));
-
-    write_manifest(store, &m).await
+    Ok(())
 }
 
-async fn read_manifest_or_fresh(store: &S3Store) -> Result<Manifest, Error> {
+/// Maximum number of attempts the ETag-coordinated manifest writer makes
+/// before surfacing the contention as an error. This covers the worst case
+/// of `parallel_put.workers` (up to 8) sealing concurrently: in the fully
+/// contended regime each round lets exactly one writer win, so N concurrent
+/// writers need up to N attempts to all converge. Exceeding 8 almost
+/// certainly indicates cross-process contention or an object-store
+/// misconfiguration that retries cannot paper over.
+const MANIFEST_WRITE_MAX_RETRIES: usize = 8;
+
+/// Read the manifest object and return it together with the current ETag.
+///
+/// `NotFound` is treated as a fresh manifest and returns `None` for the
+/// ETag — a fresh manifest has no version to match, so the first write
+/// proceeds with `PutMode::Create` (if-none-exists).
+async fn read_manifest_with_etag(store: &S3Store) -> Result<(Manifest, Option<String>), Error> {
     match store
         .client
         .get(&ObjectPath::from(store.manifest_key.as_str()))
         .await
     {
         Ok(r) => {
+            // `GetResult::meta.e_tag` carries the object's ETag (HTTP `ETag`
+            // header). Stores are inconsistent about whether the value
+            // includes the surrounding quotes — AWS SDK keeps them and
+            // most others don't. `object_store`'s PUT path normalizes this
+            // for `If-Match` matching.
+            let etag = r.meta.e_tag.clone();
             let bytes = r
                 .bytes()
                 .await
                 .map_err(|e| Error::Process(format!("S3 GET manifest body: {}", e)))?;
-            Manifest::from_json(&bytes).map_err(|e| Error::Process(format!("manifest JSON: {}", e)))
+            let m = Manifest::from_json(&bytes)
+                .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))?;
+            Ok((m, etag))
         }
-        Err(object_store::Error::NotFound { .. }) => Ok(Manifest::fresh(
-            store_ns_node_id(store),
-            store_ns_stream_id(store),
+        Err(object_store::Error::NotFound { .. }) => Ok((
+            Manifest::fresh(store_ns_node_id(store), store_ns_stream_id(store)),
+            None,
         )),
         Err(e) => Err(Error::Process(format!("S3 GET manifest: {}", e))),
     }
 }
 
-async fn write_manifest(store: &S3Store, m: &Manifest) -> Result<(), Error> {
-    let bytes = m
-        .to_json()
-        .map_err(|e| Error::Process(format!("manifest serialize: {}", e)))?;
-    store
-        .client
-        .put(
-            &ObjectPath::from(store.manifest_key.as_str()),
-            PutPayload::from(Bytes::from(bytes)),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| Error::Process(format!("S3 PUT manifest: {}", e)))
+/// Apply a mutator closure to the manifest under ETag-coordinated PUT
+/// coordination. Each attempt re-reads the manifest, runs the mutator
+/// against the freshly-read base, and PUTs the result with an `If-Match`
+/// precondition. `Precondition` / `NotModified` failures (HTTP 412/304)
+/// trigger a retry with a re-read base. After `MANIFEST_WRITE_MAX_RETRIES`
+/// attempts the failure is surfaced as an error.
+///
+/// The mutator pattern is essential: it prevents the caller from composing
+/// a mutated `Manifest` outside the coordination window (which would
+/// silently overwrite a concurrent writer's later update). The mutator
+/// receives the latest base on every attempt.
+async fn write_manifest_with_etag<F>(store: &S3Store, mut mutate: F) -> Result<(), Error>
+where
+    F: FnMut(&mut Manifest),
+{
+    for attempt in 0..MANIFEST_WRITE_MAX_RETRIES {
+        let (mut m, etag) = read_manifest_with_etag(store).await?;
+        mutate(&mut m);
+        let bytes = m
+            .to_json()
+            .map_err(|e| Error::Process(format!("manifest serialize: {}", e)))?;
+
+        // When the manifest already exists, condition the PUT on its ETag so a
+        // concurrent writer's intervening update forces this one to retry. When
+        // it does not yet exist (fresh bucket / first run), use `Create`
+        // (if-none-exists): concurrent first-writers race, exactly one wins,
+        // and the rest get `AlreadyExists` and retry against the now-existing
+        // object. This closes the fresh-manifest window that `Overwrite` would
+        // leave open, where N concurrent first-writers each silently clobber
+        // the others' manifests.
+        let mode = match etag {
+            Some(e) => PutMode::Update(UpdateVersion {
+                e_tag: Some(e),
+                version: None,
+            }),
+            None => PutMode::Create,
+        };
+        let opts = PutOptions {
+            mode,
+            ..PutOptions::default()
+        };
+
+        let path = ObjectPath::from(store.manifest_key.as_str());
+        let payload = PutPayload::from(Bytes::from(bytes));
+
+        match store.client.put_opts(&path, payload.clone(), opts).await {
+            Ok(_) => {
+                if attempt >= 2 {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        "manifest write recovered after contention"
+                    );
+                }
+                return Ok(());
+            }
+            // `Precondition` = ETag mismatch on `Update`; `AlreadyExists` =
+            // lost the first-write race on `Create`. Both mean "the manifest
+            // moved underneath us; re-read and retry".
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. },
+            ) => {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    "manifest ETag precondition failed, re-reading base and retrying"
+                );
+                if attempt + 1 >= 3 {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        "manifest write experiencing sustained contention (>= 3 retries)"
+                    );
+                }
+                continue;
+            }
+            // The backend does not implement conditional PUT (`PutMode::Update`),
+            // e.g. `LocalFileSystem` or an S3-compatible store with conditional
+            // writes disabled. Fall back to an unconditional `Overwrite` so the
+            // write still lands, but warn: coordination is now OFF, and the
+            // flusher thread + ingestion thread are two concurrent manifest
+            // writers that can silently clobber each other on such a backend.
+            // Production S3 supports conditional PUT and never reaches here.
+            Err(object_store::Error::NotImplemented { .. }) => {
+                tracing::warn!(
+                    "manifest backend does not support conditional PUT; falling \
+                     back to unconditional Overwrite — coordination disabled, \
+                     concurrent writers may lose updates"
+                );
+                store
+                    .client
+                    .put_opts(&path, payload, PutOptions::default())
+                    .await
+                    .map_err(|e| Error::Process(format!("S3 PUT manifest: {}", e)))?;
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::Process(format!("S3 PUT manifest: {}", e)));
+            }
+        }
+    }
+    Err(Error::Process(format!(
+        "manifest write failed after {} retries (concurrent writers contending?)",
+        MANIFEST_WRITE_MAX_RETRIES
+    )))
 }
 
 fn spawn_flusher(store: Arc<S3Store>) -> FlusherHandle {
@@ -939,10 +1106,12 @@ mod tests {
     use arkflow_core::wal::store::{deserialize, serialize};
     use arkflow_core::wal::SyncPolicy;
     use arkflow_core::MessageBatch;
+    use async_trait::async_trait;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1412,5 +1581,405 @@ mod tests {
         let store =
             S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap();
         store.close().unwrap();
+    }
+
+    // ===== Manifest write-coordination (ETag + retry) regression tests =====
+    //
+    // These tests exercise `write_manifest_with_etag` directly against an
+    // in-memory object store. The in-memory backend implements ETag-based
+    // conditional PUTs (`PutMode::Update`), so concurrent writers genuinely
+    // contend and the retry path is what converges them. They live in this
+    // internal module because the coordinated writer is `pub(crate)`.
+
+    /// Build an `S3Store` backed by a caller-provided object store (no MinIO
+    /// required). Each call gets a fresh namespace so tests are independent.
+    fn build_race_store(client: Arc<dyn object_store::ObjectStore>) -> Arc<S3Store> {
+        let runtime = Runtime::new().unwrap();
+        let unique = SEQ.fetch_add(1, Ordering::SeqCst);
+        let osc = ObjectStoreWalConfig {
+            node_id: format!("race-pod-{}", unique),
+            stream_id: "race".into(),
+            prefix: "arkflow/race".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig {
+                max_entries: 4,
+                max_bytes: 1024,
+                // Long interval so the background flusher does not interleave
+                // its own manifest writes into the race under test.
+                flush_interval: std::time::Duration::from_secs(3600),
+            },
+            cursor: CursorFlushConfig {
+                max_entries: 1000,
+                interval: std::time::Duration::from_secs(3600),
+            },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::default(),
+            sync: SyncPolicy::GroupCommit,
+        };
+        S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap()
+    }
+
+    fn build_inmemory_store() -> Arc<S3Store> {
+        build_race_store(Arc::new(InMemory::new()))
+    }
+
+    /// Test-only `ObjectStore` whose `put_opts` always fails with
+    /// `Precondition`, regardless of the supplied ETag/mode. Used to exhaust
+    /// the manifest writer's retry budget (T4).
+    #[derive(Debug)]
+    struct AlwaysPreconditionStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+    }
+
+    impl std::fmt::Display for AlwaysPreconditionStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "AlwaysPreconditionStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for AlwaysPreconditionStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Err(object_store::Error::Precondition {
+                path: location.to_string(),
+                source: "injected precondition failure (test)".to_string().into(),
+            })
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn build_failing_store() -> Arc<S3Store> {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        build_race_store(Arc::new(AlwaysPreconditionStore { inner }))
+    }
+
+    /// T1: 8 concurrent writers each advance the cursor to a distinct value
+    /// (via `max`, idempotent). The final cursor must equal the maximum,
+    /// proving no writer's advance was silently overwritten by another.
+    #[test]
+    fn manifest_race_concurrent_cursor_keeps_max() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            let mut handles = Vec::new();
+            for i in 1u64..=8 {
+                let s = inner.clone();
+                handles.push(tokio::spawn(async move {
+                    write_manifest_with_etag(&s, move |m| {
+                        let v = i * 10;
+                        if v > m.cursor {
+                            m.cursor = v;
+                        }
+                    })
+                    .await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(
+                m.cursor, 80,
+                "cursor must converge to the max of all concurrent writers"
+            );
+        });
+    }
+
+    /// T2: 8 concurrent writers each seal a unique segment name. The final
+    /// `sealed_segments` must contain exactly all 8, with no duplicates or
+    /// loss — the idempotency guard plus retry must converge.
+    #[test]
+    fn manifest_race_concurrent_seal_keeps_all_segments() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            let mut handles = Vec::new();
+            for i in 0u64..8 {
+                let s = inner.clone();
+                let name = format!("{:08}.wal", i);
+                handles.push(tokio::spawn(async move {
+                    write_manifest_with_etag(&s, move |m| {
+                        if !m.sealed_segments.contains(&name) {
+                            m.sealed_segments.push(name.clone());
+                        }
+                    })
+                    .await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            let mut seen = HashSet::new();
+            for n in &m.sealed_segments {
+                assert!(
+                    seen.insert(n.clone()),
+                    "duplicate segment {} in manifest",
+                    n
+                );
+            }
+            for i in 0u64..8 {
+                assert!(
+                    seen.contains(&format!("{:08}.wal", i)),
+                    "segment {:08}.wal missing from manifest",
+                    i
+                );
+            }
+            assert_eq!(m.sealed_segments.len(), 8);
+        });
+    }
+
+    /// T3: single-writer baseline — 8 sequential cursor increments must yield
+    /// cursor == 8. Guards against the mutator losing the freshly-read base
+    /// on the non-contended path.
+    #[test]
+    fn manifest_race_single_writer_baseline() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            for _ in 0..8 {
+                write_manifest_with_etag(&inner, |m| {
+                    m.cursor += 1;
+                })
+                .await
+                .unwrap();
+            }
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.cursor, 8);
+        });
+    }
+
+    /// T4: retry budget exceeded — a store whose PUTs always fail with
+    /// `Precondition` must surface `Error::Process` after exhausting the
+    /// budget, rather than hanging or silently succeeding.
+    #[test]
+    fn manifest_race_retry_budget_exceeded() {
+        let store = build_failing_store();
+        let inner = store.clone();
+        let err = store
+            .runtime
+            .block_on(async move {
+                write_manifest_with_etag(&inner, |m| {
+                    m.cursor = 1;
+                })
+                .await
+            })
+            .expect_err("must surface an error when precondition always fails");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest write failed") || msg.contains("retries"),
+            "expected retry-exhaustion error, got: {}",
+            msg
+        );
+    }
+
+    /// T5: an out-of-order seal must not regress the active pointer. A worker
+    /// whose manifest write retries after a *newer* segment has landed records
+    /// its older segment in `sealed_segments` without overwriting the newer
+    /// active pointer. Exercises `apply_seal` — the same path
+    /// `seal_active_segment` uses inside its `write_manifest_with_etag` closure.
+    #[test]
+    fn manifest_race_out_of_order_seal_keeps_newest_active() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            // Newer segment sealed first (won the manifest race).
+            write_manifest_with_etag(&inner, |m| {
+                m.active_segment = Some("00000002.wal".to_string());
+            })
+            .await
+            .unwrap();
+
+            // Older segment (00000001) retries via the same `apply_seal` path
+            // seal_active_segment uses. It must NOT overwrite the newer active.
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000001.wal"))
+                .await
+                .unwrap();
+
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000002.wal"));
+            assert!(
+                m.sealed_segments.contains(&"00000001.wal".to_string()),
+                "older sealed segment must be recorded: {:?}",
+                m.sealed_segments
+            );
+
+            // Symmetric: an even newer seal (00000003) takes active and demotes
+            // 00000002 into sealed_segments.
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000003.wal"))
+                .await
+                .unwrap();
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000003.wal"));
+            assert!(
+                m.sealed_segments.contains(&"00000002.wal".to_string()),
+                "demoted active must be recorded: {:?}",
+                m.sealed_segments
+            );
+        });
+    }
+
+    /// T6: applying the same seal repeatedly must not push the segment into
+    /// `sealed_segments` — it stays active only. Exercises `apply_seal`'s
+    /// early return for `sealed_name == active_segment` (a segment is either
+    /// active or sealed, never both).
+    #[test]
+    fn manifest_race_repeat_same_seal_keeps_it_active_only() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            // First application installs it as active (fresh manifest).
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000005.wal"))
+                .await
+                .unwrap();
+
+            // Repeated applications — the retry path for the same seal — must
+            // be a no-op: the segment stays active and never enters
+            // sealed_segments.
+            for _ in 0..3 {
+                write_manifest_with_etag(&inner, |m| apply_seal(m, "00000005.wal"))
+                    .await
+                    .unwrap();
+            }
+
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000005.wal"));
+            assert!(
+                !m.sealed_segments.iter().any(|s| s == "00000005.wal"),
+                "active segment must not appear in sealed_segments: {:?}",
+                m.sealed_segments
+            );
+            assert!(
+                m.sealed_segments.is_empty(),
+                "no other segments sealed: {:?}",
+                m.sealed_segments
+            );
+        });
+    }
+
+    /// T7: a failed segment PUT must restore the in-memory active segment so the
+    /// entries are not lost. Guards the rollback added to `seal_active_segment`
+    /// (previously a PUT failure after `std::mem::take` permanently dropped the
+    /// data).
+    #[test]
+    fn seal_put_failure_restores_active_segment() {
+        let store = build_failing_store();
+        // Prime the in-memory active segment, as `append_batch` would.
+        {
+            let mut active = store.active.lock().unwrap();
+            active.first_seq = 1;
+            active.last_seq = 3;
+            active.entries = 3;
+            active.bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+            active.next_index = 5;
+        }
+        let inner = store.clone();
+        let result = store
+            .runtime
+            .block_on(async move { seal_active_segment(&inner).await });
+        assert!(result.is_err(), "seal must surface the segment PUT failure");
+
+        // The active segment must be fully restored (entries + next_index), so
+        // the next seal attempt re-uploads the same data.
+        let active = store.active.lock().unwrap();
+        assert_eq!(active.entries, 3, "entries restored after PUT failure");
+        assert_eq!(active.first_seq, 1);
+        assert_eq!(active.last_seq, 3);
+        assert_eq!(active.next_index, 5, "next_index rolled back");
+        assert!(!active.bytes.is_empty(), "bytes restored");
+    }
+
+    /// T8: concurrent `apply_seal` of distinct segments converges — the
+    /// chronologically-newest segment wins active, all older ones end up in
+    /// `sealed_segments` exactly once. Exercises the numeric-index comparison
+    /// in `apply_seal` under real concurrency.
+    #[test]
+    fn manifest_race_concurrent_apply_seal_converges() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            let mut handles = Vec::new();
+            for i in 0u64..8 {
+                let s = inner.clone();
+                handles.push(tokio::spawn(async move {
+                    let name = format!("{:08}.wal", i);
+                    write_manifest_with_etag(&s, move |m| apply_seal(m, &name)).await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(
+                m.active_segment.as_deref(),
+                Some("00000007.wal"),
+                "newest segment must be active"
+            );
+            let mut seen = HashSet::new();
+            for n in &m.sealed_segments {
+                assert!(seen.insert(n.clone()), "duplicate segment {}", n);
+            }
+            for i in 0u64..7 {
+                assert!(
+                    seen.contains(&format!("{:08}.wal", i)),
+                    "segment {:08}.wal missing from sealed_segments",
+                    i
+                );
+            }
+            assert_eq!(m.sealed_segments.len(), 7);
+        });
     }
 }
