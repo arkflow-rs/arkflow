@@ -771,8 +771,18 @@ impl WalStore for S3Store {
 /// lexical order == chronological order. An out-of-order seal — a worker whose
 /// manifest write lost the ETag race and retries after a *newer* segment has
 /// already landed — must not regress the active pointer; it records its older
-/// segment in `sealed_segments` instead. Idempotent on `sealed_segments`.
+/// segment in `sealed_segments` instead. A segment that is already active is
+/// left untouched (a segment is either active or sealed, never both).
+/// Idempotent on `sealed_segments`.
 fn apply_seal(m: &mut Manifest, sealed_name: &str) {
+    // Already the active segment — nothing to do. In particular, do NOT add it
+    // to sealed_segments: a segment is either active or sealed, never both.
+    // This covers the retry path (read base → apply_seal → PUT re-run after a
+    // precondition failure), where the freshly-read base already reflects this
+    // segment as active.
+    if m.active_segment.as_deref() == Some(sealed_name) {
+        return;
+    }
     let install_as_active = match &m.active_segment {
         Some(current) => sealed_name > current.as_str(),
         None => true,
@@ -1867,6 +1877,44 @@ mod tests {
             assert!(
                 m.sealed_segments.contains(&"00000002.wal".to_string()),
                 "demoted active must be recorded: {:?}",
+                m.sealed_segments
+            );
+        });
+    }
+
+    /// T6: applying the same seal repeatedly must not push the segment into
+    /// `sealed_segments` — it stays active only. Exercises `apply_seal`'s
+    /// early return for `sealed_name == active_segment` (a segment is either
+    /// active or sealed, never both).
+    #[test]
+    fn manifest_race_repeat_same_seal_keeps_it_active_only() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            // First application installs it as active (fresh manifest).
+            write_manifest_with_etag(&inner, |m| apply_seal(m, "00000005.wal"))
+                .await
+                .unwrap();
+
+            // Repeated applications — the retry path for the same seal — must
+            // be a no-op: the segment stays active and never enters
+            // sealed_segments.
+            for _ in 0..3 {
+                write_manifest_with_etag(&inner, |m| apply_seal(m, "00000005.wal"))
+                    .await
+                    .unwrap();
+            }
+
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(m.active_segment.as_deref(), Some("00000005.wal"));
+            assert!(
+                !m.sealed_segments.iter().any(|s| s == "00000005.wal"),
+                "active segment must not appear in sealed_segments: {:?}",
+                m.sealed_segments
+            );
+            assert!(
+                m.sealed_segments.is_empty(),
+                "no other segments sealed: {:?}",
                 m.sealed_segments
             );
         });
