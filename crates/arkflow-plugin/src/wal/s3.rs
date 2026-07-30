@@ -847,8 +847,14 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     Ok(())
 }
 
-/// Flush the in-memory cursor watermark to the manifest, with batching and
-/// truncation (D6 + D7).
+/// Flush the in-memory cursor watermark to the manifest (D6).
+///
+/// Truncation of sealed segments past the cursor (D7) is intentionally not
+/// performed here: a correct implementation needs per-segment last-seq tracking,
+/// which the manifest does not yet carry. The previous in-mutator truncation was
+/// a broken placeholder that emptied `sealed_segments` without deleting the
+/// objects (orphans), so it has been removed; sealed segments stay listed in the
+/// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
     // Read the active segment's last seq before the mutator runs; this value
     // is conservative (may be 0 if no entry has been sealed since startup).
@@ -856,65 +862,20 @@ async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
     let active_last = active.last_seq;
     drop(active);
 
-    // Use the ETag-coordinated manifest writer for cursor advancement so
-    // concurrent flush_manifest calls (from parallel PUT workers) don't
-    // lose each other's updates. The mutator only updates cursor; truncation
-    // happens below outside the synchronous mutator.
+    // Advance the committed cursor under ETag coordination so concurrent flush
+    // calls (flusher thread vs ingestion thread) don't lose each other's
+    // updates. The cursor is clamped to `max_sealed_seq` so it never advances
+    // past data that has actually been sealed to object storage.
     write_manifest_with_etag(store, |m| {
-        // The cursor stored on the store from `advance_cursor` is implicit — we
-        // bump it from the high-water of `advance_cursor` calls accumulated via
-        // `cursor_pending`. The counters are reset after this call (outside the
-        // mutator), preserving the existing flush behavior.
         if active_last > m.cursor {
             m.cursor = active_last.min(m.max_sealed_seq);
         }
-
-        // Truncate: remove sealed segments that would be deleted by D7. This
-        // is performed on the manifest's in-memory list here; actual object
-        // DELETEs happen outside the synchronous mutator (below) after the
-        // manifest write lands. Because the filter condition is a placeholder
-        // (cursor > 0 is almost always false), this is a no-op in the common case.
-        let to_delete: Vec<String> = m
-            .sealed_segments
-            .iter()
-            .filter(|_| m.cursor > 0) // placeholder; we don't track per-seg last seq here
-            .cloned()
-            .collect();
-        m.sealed_segments.retain(|name| !to_delete.contains(name));
-
-        // NOTE: We cannot return `to_delete` from this synchronous mutator to
-        // perform DELETEs inside `async fn flush_manifest`. Instead, we
-        // re-read the manifest below (after the write) and perform DELETEs based
-        // on the latest sealed_segments list. This is safe because DELETE is
-        // best-effort and the placeholder filter means we rarely delete anything.
-        //
-        // A future change that makes truncation functional would need to either:
-        // - redesign the coordination to allow async mutators, or
-        // - pass a channel out of the mutator to send `to_delete` downstream.
     })
     .await?;
 
-    // Perform object DELETEs based on the latest manifest state. Best-effort;
-    // failures are silently ignored (D7). We re-read the manifest to obtain the
-    // `sealed_segments` list as it exists after the coordinated write (which may
-    // have been updated concurrently by another worker). The filter condition is
-    // the same placeholder as before (cursor > 0), so this loop is effectively
-    // a no-op today.
-    let (m, _etag) = read_manifest_with_etag(store).await?;
-    let to_delete: Vec<String> = m
-        .sealed_segments
-        .iter()
-        .filter(|_| m.cursor > 0) // placeholder; we don't track per-seg last seq here
-        .cloned()
-        .collect();
-    for name in &to_delete {
-        let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
-        let _ = store.client.delete(&key).await; // best-effort
-    }
-
-    // Reset the in-memory counters. This happens after the manifest write
-    // (same timing as before the refactor) so a crash between the write and the
-    // counter reset would replay the same entries on restart — safe.
+    // Reset the in-memory flush counters. This happens after the manifest write
+    // so a crash between the write and the reset would replay the same entries
+    // on restart — safe.
     store.cursor_pending.store(0, Ordering::Release);
     store
         .cursor_last_flush_ms
@@ -1041,12 +1002,18 @@ where
                 continue;
             }
             // The backend does not implement conditional PUT (`PutMode::Update`),
-            // e.g. `LocalFileSystem` (used in tests for persistence). Fall back to
-            // an unconditional `Overwrite` so the write still lands. Coordination
-            // is best-effort: it engages on backends that support conditional
-            // PUT (S3, in-memory) and degrades to single-writer `Overwrite`
-            // elsewhere — safe because such backends see only a single writer.
+            // e.g. `LocalFileSystem` or an S3-compatible store with conditional
+            // writes disabled. Fall back to an unconditional `Overwrite` so the
+            // write still lands, but warn: coordination is now OFF, and the
+            // flusher thread + ingestion thread are two concurrent manifest
+            // writers that can silently clobber each other on such a backend.
+            // Production S3 supports conditional PUT and never reaches here.
             Err(object_store::Error::NotImplemented { .. }) => {
+                tracing::warn!(
+                    "manifest backend does not support conditional PUT; falling \
+                     back to unconditional Overwrite — coordination disabled, \
+                     concurrent writers may lose updates"
+                );
                 store
                     .client
                     .put_opts(&path, payload, PutOptions::default())
