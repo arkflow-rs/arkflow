@@ -767,8 +767,9 @@ impl WalStore for S3Store {
 }
 
 /// Record a sealed segment in the manifest, keeping the chronologically-newest
-/// segment as the active one. Segment names are 0-padded `{:08}.wal`, so
-/// lexical order == chronological order. An out-of-order seal — a worker whose
+/// segment as the active one. Ordering is by the numeric segment index parsed
+/// from the `NNNNNNNN.wal` name (not lexical order), so it stays correct past
+/// the 8-digit zero-padding boundary. An out-of-order seal — a worker whose
 /// manifest write lost the ETag race and retries after a *newer* segment has
 /// already landed — must not regress the active pointer; it records its older
 /// segment in `sealed_segments` instead. A segment that is already active is
@@ -784,7 +785,7 @@ fn apply_seal(m: &mut Manifest, sealed_name: &str) {
         return;
     }
     let install_as_active = match &m.active_segment {
-        Some(current) => sealed_name > current.as_str(),
+        Some(current) => segment_index(sealed_name) > segment_index(current),
         None => true,
     };
     if install_as_active {
@@ -799,12 +800,21 @@ fn apply_seal(m: &mut Manifest, sealed_name: &str) {
     }
 }
 
+/// Parse the numeric index out of a `NNNNNNNN.wal` segment name for
+/// chronological comparison. Returns 0 for names that don't match the scheme
+/// (treated as chronologically oldest — a safe default).
+fn segment_index(name: &str) -> u64 {
+    name.strip_suffix(".wal")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Seal the current active segment: write it to a fresh `NNNNNNNN.wal`
 /// filename, rotate the in-memory state, and update the manifest.
 async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     // Move the bytes out of the active lock so the encode + PUT doesn't
     // hold the lock across the network call.
-    let (sealed_bytes, first_seq, last_seq, next_index) = {
+    let (sealed_bytes, first_seq, last_seq, next_index, entry_count) = {
         let mut active = store.active.lock().unwrap();
         if active.entries == 0 {
             return Ok(());
@@ -813,20 +823,33 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
         let first = active.first_seq;
         let last = active.last_seq;
         let idx = active.next_index;
+        let count = active.entries;
         active.first_seq = 0;
         active.last_seq = 0;
         active.entries = 0;
         active.next_index += 1;
-        (bytes, first, last, idx)
+        (bytes, first, last, idx, count)
     };
 
     let name = format!("{:08}.wal", next_index);
     let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
-    store
+    // Clone for the PUT so the original bytes survive a failed upload and can be
+    // restored to the active segment below. Without this, a transient segment
+    // PUT failure would permanently lose the entries (they were already moved
+    // out of the active segment above).
+    if let Err(e) = store
         .client
-        .put(&key, PutPayload::from(Bytes::from(sealed_bytes)))
+        .put(&key, PutPayload::from(Bytes::from(sealed_bytes.clone())))
         .await
-        .map_err(|e| Error::Process(format!("S3 PUT segment {}: {}", name, e)))?;
+    {
+        let mut active = store.active.lock().unwrap();
+        active.bytes = sealed_bytes;
+        active.first_seq = first_seq;
+        active.last_seq = last_seq;
+        active.entries = entry_count;
+        active.next_index = next_index; // undo the pre-increment
+        return Err(Error::Process(format!("S3 PUT segment {}: {}", name, e)));
+    }
 
     // Bump the manifest's `max_sealed_seq` and add the new segment to
     // `sealed_segments`. If we had an active segment before, demote it.
@@ -1884,6 +1907,79 @@ mod tests {
                 "no other segments sealed: {:?}",
                 m.sealed_segments
             );
+        });
+    }
+
+    /// T7: a failed segment PUT must restore the in-memory active segment so the
+    /// entries are not lost. Guards the rollback added to `seal_active_segment`
+    /// (previously a PUT failure after `std::mem::take` permanently dropped the
+    /// data).
+    #[test]
+    fn seal_put_failure_restores_active_segment() {
+        let store = build_failing_store();
+        // Prime the in-memory active segment, as `append_batch` would.
+        {
+            let mut active = store.active.lock().unwrap();
+            active.first_seq = 1;
+            active.last_seq = 3;
+            active.entries = 3;
+            active.bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+            active.next_index = 5;
+        }
+        let inner = store.clone();
+        let result = store
+            .runtime
+            .block_on(async move { seal_active_segment(&inner).await });
+        assert!(result.is_err(), "seal must surface the segment PUT failure");
+
+        // The active segment must be fully restored (entries + next_index), so
+        // the next seal attempt re-uploads the same data.
+        let active = store.active.lock().unwrap();
+        assert_eq!(active.entries, 3, "entries restored after PUT failure");
+        assert_eq!(active.first_seq, 1);
+        assert_eq!(active.last_seq, 3);
+        assert_eq!(active.next_index, 5, "next_index rolled back");
+        assert!(!active.bytes.is_empty(), "bytes restored");
+    }
+
+    /// T8: concurrent `apply_seal` of distinct segments converges — the
+    /// chronologically-newest segment wins active, all older ones end up in
+    /// `sealed_segments` exactly once. Exercises the numeric-index comparison
+    /// in `apply_seal` under real concurrency.
+    #[test]
+    fn manifest_race_concurrent_apply_seal_converges() {
+        let store = build_inmemory_store();
+        let inner = store.clone();
+        store.runtime.block_on(async move {
+            let mut handles = Vec::new();
+            for i in 0u64..8 {
+                let s = inner.clone();
+                handles.push(tokio::spawn(async move {
+                    let name = format!("{:08}.wal", i);
+                    write_manifest_with_etag(&s, move |m| apply_seal(m, &name)).await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+            let (m, _) = read_manifest_with_etag(&inner).await.unwrap();
+            assert_eq!(
+                m.active_segment.as_deref(),
+                Some("00000007.wal"),
+                "newest segment must be active"
+            );
+            let mut seen = HashSet::new();
+            for n in &m.sealed_segments {
+                assert!(seen.insert(n.clone()), "duplicate segment {}", n);
+            }
+            for i in 0u64..7 {
+                assert!(
+                    seen.contains(&format!("{:08}.wal", i)),
+                    "segment {:08}.wal missing from sealed_segments",
+                    i
+                );
+            }
+            assert_eq!(m.sealed_segments.len(), 7);
         });
     }
 }
