@@ -246,6 +246,15 @@ pub(crate) struct S3Store {
     cursor_pending: AtomicU64,
     /// Timestamp of the last manifest PUT (for the interval trigger).
     cursor_last_flush_ms: AtomicU64,
+    /// Highest acknowledged sequence observed via `advance_cursor` (D1/D4).
+    /// Purely in-memory; folded into the manifest `cursor` at flush time,
+    /// clamped to `max_sealed_seq` so the cursor never passes unsealed data.
+    acked_hwm: AtomicU64,
+    /// Highest sequence ever written (sealed or in the active segment).
+    /// Seeded by `recover` from `max_seq_seen` and kept current in
+    /// `append_batch`; `next_seq_hint` returns this + 1 so a restart never
+    /// reuses a sequence already on the store.
+    max_written_seq: AtomicU64,
     flusher: StdMutex<Option<FlusherHandle>>,
 }
 
@@ -397,6 +406,8 @@ impl S3Store {
             }),
             cursor_pending: AtomicU64::new(0),
             cursor_last_flush_ms: AtomicU64::new(now_ms()),
+            acked_hwm: AtomicU64::new(0),
+            max_written_seq: AtomicU64::new(0),
             flusher: StdMutex::new(None),
         });
 
@@ -572,6 +583,13 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
         }
     }
 
+    // Cache the highest written sequence so `next_seq_hint` can return
+    // `max_seq + 1` (matching redb) instead of `cursor() + 1`, which would
+    // reuse sequence numbers whenever sealed-but-unacked entries exist.
+    store
+        .max_written_seq
+        .store(max_seq_seen, Ordering::Release);
+
     let mut active = store.active.lock().unwrap();
     active.next_index = max_idx_seen + 1;
 
@@ -621,6 +639,11 @@ impl WalStore for S3Store {
                 active.first_seq = entries.first().unwrap().0;
             }
             active.last_seq = entries.last().unwrap().0;
+            // Keep the cached high-water mark current so `next_seq_hint`
+            // stays accurate across appends (defence in depth; the hint is
+            // only consulted once at open, where `recover` already set it).
+            self.max_written_seq
+                .fetch_max(active.last_seq, Ordering::AcqRel);
 
             // Check seal triggers.
             if active.entries >= self.segment_cfg.max_entries
@@ -641,15 +664,12 @@ impl WalStore for S3Store {
     }
 
     fn advance_cursor(&self, seq: u64) -> Result<(), Error> {
-        // Always update the in-memory manifest immediately so a subsequent
-        // `cursor()` reads the right value. Flush to the manifest async /
-        // batched (D6).
-        let mut active = self.active.lock().unwrap();
-        // Store the latest cursor in `active.first_seq` place. Cleaner:
-        // use a separate field, but for now we fold it via a JSON rebuild
-        // when we flush.
-        let _ = seq; // (cursor in-memory tracking is implicit; flush reads store)
-        drop(active);
+        // Record the acknowledged sequence (D1). The previous implementation
+        // discarded `seq` (`let _ = seq;`), which decoupled the cursor from
+        // acks entirely. `fetch_max` keeps the watermark monotonic without
+        // touching the `active` lock. Flushing the manifest is async/batched
+        // (D6): triggered by the configured cursor threshold or interval.
+        self.acked_hwm.fetch_max(seq, Ordering::AcqRel);
         let n = self.cursor_pending.fetch_add(1, Ordering::AcqRel);
         if n + 1 >= self.cursor_cfg.max_entries as u64 || self.cursor_should_flush() {
             self.runtime.block_on(flush_manifest(self))?;
@@ -745,12 +765,16 @@ impl WalStore for S3Store {
     }
 
     fn next_seq_hint(&self) -> u64 {
-        // For S3, `cursor() + 1` is conservative but safe — any sealed
-        // segments past the cursor are surfaced by `read_after_cursor()` on
-        // recovery. The active segment may also have entries past the
-        // cursor; that gets picked up via LIST. The hint is just the next
-        // seq to assign; the store never actually requires it to be exact.
-        self.cursor().saturating_add(1)
+        // Return `max_written_seq + 1` (matching redb's `max_seq() + 1`),
+        // NOT `cursor() + 1`. When sealed-but-unacked entries exist
+        // (`cursor < max_written_seq`), `cursor() + 1` would reuse a
+        // sequence number already on the store. `recover` seeds
+        // `max_written_seq` from `max_seq_seen`; `append_batch` keeps it
+        // current, so this is O(1) with no object-store LIST.
+        self.max_written_seq
+            .load(Ordering::Acquire)
+            .saturating_add(1)
+            .max(1)
     }
 
     fn close(&self) -> Result<(), Error> {
@@ -879,19 +903,17 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 /// objects (orphans), so it has been removed; sealed segments stay listed in the
 /// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
-    // Read the active segment's last seq before the mutator runs; this value
-    // is conservative (may be 0 if no entry has been sealed since startup).
-    let active = store.active.lock().unwrap();
-    let active_last = active.last_seq;
-    drop(active);
-
-    // Advance the committed cursor under ETag coordination so concurrent flush
-    // calls (flusher thread vs ingestion thread) don't lose each other's
-    // updates. The cursor is clamped to `max_sealed_seq` so it never advances
-    // past data that has actually been sealed to object storage.
+    // Advance the committed cursor to the highest acknowledged sequence,
+    // clamped to `max_sealed_seq` (D2). The clamp is the safety guarantee:
+    // the cursor never advances past data that has actually been sealed to
+    // object storage, so an acked-but-unsealed entry remains replayable on
+    // restart (at-least-once, never loss). The ETag-coordinated mutator
+    // keeps concurrent flushes (flusher vs ingestion) from losing updates.
+    let acked_hwm = store.acked_hwm.load(Ordering::Acquire);
     write_manifest_with_etag(store, |m| {
-        if active_last > m.cursor {
-            m.cursor = active_last.min(m.max_sealed_seq);
+        let target = acked_hwm.min(m.max_sealed_seq);
+        if target > m.cursor {
+            m.cursor = target;
         }
     })
     .await?;
@@ -1704,6 +1726,199 @@ mod tests {
     fn build_failing_store() -> Arc<S3Store> {
         let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         build_race_store(Arc::new(AlwaysPreconditionStore { inner }))
+    }
+
+    /// Build an `S3Store` at a FIXED `(node_id, stream_id)` namespace backed by
+    /// the given object store. Unlike `build_race_store` (which mints a fresh
+    /// random namespace per call), this lets a test close one store and reopen
+    /// another at the same namespace to exercise recovery / restart.
+    fn build_store_at(
+        node_id: &str,
+        stream_id: &str,
+        client: Arc<dyn object_store::ObjectStore>,
+        segment_max_entries: usize,
+        cursor_max_entries: usize,
+    ) -> Arc<S3Store> {
+        let runtime = Runtime::new().unwrap();
+        let osc = ObjectStoreWalConfig {
+            node_id: node_id.into(),
+            stream_id: stream_id.into(),
+            prefix: "arkflow/reopen".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            // Large segment cap by default so appends stay in the active
+            // segment and the test exercises cursor tracking in isolation,
+            // not seal triggers. Callers shrink these to force seal/flush.
+            segment: SegmentConfig {
+                max_entries: segment_max_entries,
+                max_bytes: 1024 * 1024,
+                flush_interval: std::time::Duration::from_secs(3600),
+            },
+            cursor: CursorFlushConfig {
+                max_entries: cursor_max_entries,
+                interval: std::time::Duration::from_secs(3600),
+            },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::None,
+            sync: SyncPolicy::GroupCommit,
+        };
+        S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap()
+    }
+
+    /// Regression: the S3 backend's committed cursor does NOT track acks.
+    ///
+    /// `advance_cursor(seq)` discards its `seq` argument (`let _ = seq;`), so
+    /// the watermark is derived only from the active segment's `last_seq` at
+    /// flush time — decoupled from which messages were actually acknowledged.
+    /// After a clean restart of a fully-acknowledged WAL:
+    ///
+    ///   - `next_seq_hint()` returns `cursor()+1 == 1` instead of `max_seq+1`,
+    ///     so the next append reuses seq numbers already present on the store
+    ///     (the "seq reuse" symptom of the original report).
+    ///   - `read_after_cursor()` returns every previously-acknowledged entry,
+    ///     so they are replayed again on every restart.
+    ///
+    /// The local `redb` backend does NOT have this bug: its `advance_cursor`
+    /// stores `seq` precisely, so both assertions pass there. This test is a
+    /// regression guard for the S3 fix — it failed before `advance_cursor`
+    /// started recording `seq`.
+    #[test]
+    fn s3_cursor_does_not_track_acked_seq_after_restart() {
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let payload = sample_payload(None);
+
+        // Phase 1: ingest seq 1..=5, then acknowledge ALL of them.
+        let store = build_store_at("pod-a", "stream-1", client.clone(), 100, 1000);
+        store
+            .append_batch((1..=5u64).map(|s| (s, payload.clone())).collect())
+            .unwrap();
+        for seq in 1..=5u64 {
+            store.advance_cursor(seq).unwrap();
+        }
+        store.close().unwrap();
+        drop(store);
+
+        // Phase 2: reopen at the same namespace (a process restart).
+        let store2 = build_store_at("pod-a", "stream-1", client.clone(), 100, 1000);
+
+        // Expected (correct): acked up to 5 ⇒ next seq is 6.
+        let hint = store2.next_seq_hint();
+        assert_eq!(
+            hint, 6,
+            "after acking seq 1..=5, next_seq_hint must be max_seq+1 = 6; \
+             got {} — the S3 cursor ignores acks and stays at 0, so the next \
+             append reuses seq numbers already on the store",
+            hint,
+        );
+
+        // Expected (correct): fully acked ⇒ nothing pending for replay.
+        let pending = store2.read_after_cursor().unwrap();
+        let pending_seqs: Vec<u64> = pending.iter().map(|(s, _)| *s).collect();
+        assert!(
+            pending.is_empty(),
+            "after acking seq 1..=5, read_after_cursor must be empty; \
+             got {} entries {:?} — the S3 cursor never advanced past 0, so \
+             already-acknowledged data is replayed on every restart",
+            pending.len(),
+            pending_seqs,
+        );
+    }
+
+    /// Regression (spec scenario "Next sequence hint does not reuse a
+    /// sealed-but-unacked sequence"): seal up to M but ack only up to K<M,
+    /// then reopen. `next_seq_hint` must return M+1 (not K+1), and only the
+    /// unacked K+1..=M entries may be pending — proving acks are tracked AND
+    /// sequence numbers are not reused.
+    #[test]
+    fn s3_next_seq_hint_does_not_reuse_sealed_unacked_seq() {
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let payload = sample_payload(None);
+
+        // Phase 1: ingest seq 1..=5, acknowledge only 1..=3, then close.
+        // close seals all five (max_sealed_seq = 5); cursor advances to 3.
+        let store = build_store_at("pod-b", "stream-2", client.clone(), 100, 1000);
+        store
+            .append_batch((1..=5u64).map(|s| (s, payload.clone())).collect())
+            .unwrap();
+        for seq in 1..=3u64 {
+            store.advance_cursor(seq).unwrap();
+        }
+        store.close().unwrap();
+        drop(store);
+
+        // Phase 2: reopen at the same namespace.
+        let store2 = build_store_at("pod-b", "stream-2", client.clone(), 100, 1000);
+
+        // Next seq is M+1 = 6, NOT cursor()+1 = 4 — no reuse of sealed 4,5.
+        assert_eq!(
+            store2.next_seq_hint(),
+            6,
+            "next_seq_hint must be max_written_seq+1 = 6, not cursor()+1 = 4"
+        );
+
+        // Only the unacked seq 4,5 are pending; the acked 1..=3 are not.
+        let pending: Vec<u64> = store2
+            .read_after_cursor()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(pending, vec![4, 5], "only unacked seq 4,5 may be pending");
+    }
+
+    /// Regression (spec scenario "Cursor does not advance past unsealed
+    /// data"): when an ack arrives for an entry still in the active (unsealed)
+    /// segment, the cursor MUST clamp to `max_sealed_seq` and not advance past
+    /// it — otherwise a restart would skip the unsealed entry (data loss).
+    #[test]
+    fn s3_cursor_clamps_to_max_sealed_seq_for_unsealed_ack() {
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+
+        // segment.max_entries = 100 ⇒ appends stay unsealed; cursor.max_entries
+        // = 1 ⇒ every advance_cursor flushes the manifest immediately.
+        let store = build_store_at("pod-c", "stream-3", client.clone(), 100, 1);
+        let payload = sample_payload(None);
+        store
+            .append_batch((1..=3u64).map(|s| (s, payload.clone())).collect())
+            .unwrap();
+        // Ack seq 3 while it is still unsealed (max_sealed_seq = 0). The flush
+        // triggered here must clamp the cursor to 0, NOT advance it to 3.
+        store.advance_cursor(3).unwrap();
+
+        store.runtime.block_on(async {
+            let (m, _) = read_manifest_with_etag(&store).await.unwrap();
+            assert_eq!(
+                m.cursor, 0,
+                "cursor must clamp to max_sealed_seq=0 while seq 3 is unsealed, not advance to 3"
+            );
+            assert!(
+                m.cursor <= m.max_sealed_seq,
+                "cursor ({}) must never exceed max_sealed_seq ({})",
+                m.cursor,
+                m.max_sealed_seq
+            );
+        });
+
+        // After close seals the data, the cursor catches up to the ack.
+        store.close().unwrap();
+        drop(store);
+
+        let store2 = build_store_at("pod-c", "stream-3", client.clone(), 100, 1);
+        store2.runtime.block_on(async {
+            let (m, _) = read_manifest_with_etag(&store2).await.unwrap();
+            assert_eq!(m.cursor, 3, "cursor catches up to 3 once seq 1..=3 are sealed");
+        });
+        assert!(
+            store2.read_after_cursor().unwrap().is_empty(),
+            "once sealed and acked, nothing is pending for replay"
+        );
     }
 
     /// T1: 8 concurrent writers each advance the cursor to a distinct value
