@@ -24,6 +24,7 @@
 //! Nested message / repeated / map / oneof / proto3 optional fields are NOT
 //! supported and produce an error.
 
+use async_trait::async_trait;
 use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
 };
@@ -88,14 +89,16 @@ impl ProtobufCodec {
     }
 }
 
+#[async_trait]
 impl Encoder for ProtobufCodec {
-    fn encode(&self, b: MessageBatch) -> Result<Vec<Bytes>, Error> {
+    async fn encode(&self, b: MessageBatch) -> Result<Vec<Bytes>, Error> {
         arrow_to_protobuf(&self.descriptor, &b)
     }
 }
 
+#[async_trait]
 impl Decoder for ProtobufCodec {
-    fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
+    async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         let mut batches = Vec::with_capacity(b.len());
 
         for data in b {
@@ -171,8 +174,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_protobuf_codec_config_deserialization() {
+    #[tokio::test]
+    async fn test_protobuf_codec_config_deserialization() {
         let config_json = serde_json::json!({
             "proto_inputs": ["/path/to/file.proto"],
             "message_type": "MyMessage"
@@ -184,8 +187,8 @@ mod tests {
         assert!(config.proto_includes.is_none());
     }
 
-    #[test]
-    fn test_protobuf_codec_config_with_includes() {
+    #[tokio::test]
+    async fn test_protobuf_codec_config_with_includes() {
         let config_json = serde_json::json!({
             "proto_inputs": ["/path/to/file.proto"],
             "proto_includes": ["/include/path"],
@@ -199,8 +202,8 @@ mod tests {
         assert_eq!(config.proto_includes.unwrap(), vec!["/include/path"]);
     }
 
-    #[test]
-    fn test_protobuf_codec_builder_with_valid_config() {
+    #[tokio::test]
+    async fn test_protobuf_codec_builder_with_valid_config() {
         let config_json = serde_json::json!({
             "proto_inputs": ["/path/to/file.proto"],
             "message_type": "MyMessage"
@@ -212,8 +215,8 @@ mod tests {
         assert_eq!(config.message_type, "MyMessage");
     }
 
-    #[test]
-    fn test_protobuf_codec_builder_without_config() {
+    #[tokio::test]
+    async fn test_protobuf_codec_builder_without_config() {
         let builder = ProtobufCodecBuilder;
         let result = builder.build(
             Some(&"test-codec".to_string()),
@@ -225,8 +228,8 @@ mod tests {
         assert!(matches!(result, Err(Error::Config(_))));
     }
 
-    #[test]
-    fn test_protobuf_codec_config_impl() {
+    #[tokio::test]
+    async fn test_protobuf_codec_config_impl() {
         let config = ProtobufCodecConfig {
             proto_inputs: vec!["test.proto".to_string()],
             proto_includes: Some(vec!["/include".to_string()]),
@@ -237,8 +240,8 @@ mod tests {
         assert_eq!(config.proto_includes(), &Some(vec!["/include".to_string()]));
     }
 
-    #[test]
-    fn test_protobuf_codec_builder_invalid_json() {
+    #[tokio::test]
+    async fn test_protobuf_codec_builder_invalid_json() {
         let builder = ProtobufCodecBuilder;
         let invalid_json = serde_json::json!({
             "proto_inputs": "should_be_array"
@@ -278,8 +281,8 @@ message TestMessage {
         Ok((dir, proto_dir))
     }
 
-    #[test]
-    fn test_codec_round_trip() -> Result<(), Error> {
+    #[tokio::test]
+    async fn test_codec_round_trip() -> Result<(), Error> {
         let (_x, proto_dir) = create_test_proto_file()?;
         let config = serde_json::json!({
             "proto_inputs": [proto_dir.to_string_lossy()],
@@ -303,9 +306,9 @@ message TestMessage {
         .map_err(|e| Error::Process(format!("Failed to create record batch: {}", e)))?;
         let original = MessageBatch::new_arrow(rb);
 
-        let encoded = codec.encode(original)?;
+        let encoded = codec.encode(original).await?;
         assert_eq!(encoded.len(), 1, "one row → one encoded message");
-        let decoded = codec.decode(encoded)?;
+        let decoded = codec.decode(encoded).await?;
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded.column(0).data_type(), &DataType::Int64);
 

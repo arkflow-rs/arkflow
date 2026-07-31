@@ -138,7 +138,7 @@ impl Output for NatsOutput {
             .ok_or_else(|| Error::Connection("NATS client not connected".to_string()))?;
 
         // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }

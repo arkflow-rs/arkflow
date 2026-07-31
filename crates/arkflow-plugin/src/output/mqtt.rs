@@ -148,7 +148,7 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .ok_or_else(|| Error::Connection("The MQTT client is not initialized".to_string()))?;
 
         // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }

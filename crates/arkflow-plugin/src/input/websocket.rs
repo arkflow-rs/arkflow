@@ -170,7 +170,7 @@ impl Input for WebSocketInput {
                                 let mut msg = crate::input::codec_helper::apply_codec_to_payload(
                                     &payload,
                                     &self.codec,
-                                )?;
+                                ).await?;
                                 msg.set_input_name(self.input_name.clone());
 
                                 Ok((Arc::new(msg), Arc::new(NoopAck)))

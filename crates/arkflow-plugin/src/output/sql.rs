@@ -266,7 +266,7 @@ impl Output for SqlOutput {
 
         // Apply codec encoding if configured, otherwise use the message as-is
         let processed_msg = if let Some(codec) = &self.codec {
-            let encoded = codec.encode((*msg).clone())?;
+            let encoded = codec.encode((*msg).clone()).await?;
             // Convert encoded bytes back to MessageBatch for SQL insertion
             // This is a simplified approach - in practice, you might need more sophisticated handling
             MessageBatch::new_binary(encoded)?

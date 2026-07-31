@@ -59,7 +59,14 @@ impl MemoryInput {
             for msg_str in messages {
                 // Apply codec if configured
                 let msg_batch = if let Some(c) = &codec {
-                    c.decode(vec![msg_str.as_bytes().to_vec()])?
+                    // Codec decode is async; `new()` is sync (called from `InputBuilder::build`).
+                    // Block-on the runtime to decode initial messages at construction.
+                    // Requires a multi-thread tokio runtime; memory input is a test component
+                    // and this path is only hit when a codec + initial messages are configured.
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(c.decode(vec![msg_str.as_bytes().to_vec()]))
+                    })?
                 } else {
                     MessageBatch::from_string(msg_str)?
                 };
@@ -84,7 +91,7 @@ impl MemoryInput {
 
     /// Add raw bytes to the memory input (codec will be applied if configured)
     pub async fn push_bytes(&self, data: Vec<u8>) -> Result<(), Error> {
-        let msg_batch = crate::input::codec_helper::apply_codec_to_payload(&data, &self.codec)?;
+        let msg_batch = crate::input::codec_helper::apply_codec_to_payload(&data, &self.codec).await?;
         let mut queue = self.queue.lock().await;
         queue.push_back(msg_batch);
         Ok(())

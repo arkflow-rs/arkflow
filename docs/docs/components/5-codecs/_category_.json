@@ -1,0 +1,7 @@
+{
+  "label": "Codecs",
+  "link": {
+    "type": "generated-index",
+    "description": "Codec components handle serialization/deserialization between byte payloads and columnar Arrow batches at the input/output boundary."
+  }
+}

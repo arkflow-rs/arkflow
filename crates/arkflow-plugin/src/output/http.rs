@@ -101,7 +101,7 @@ impl Output for HttpOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }

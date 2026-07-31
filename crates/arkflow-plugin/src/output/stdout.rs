@@ -68,7 +68,7 @@ where
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
 
         // Write each payload to stdout
         let mut writer_std = self.writer.lock().await;
