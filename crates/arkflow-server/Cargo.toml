@@ -12,5 +12,10 @@ license.workspace = true
 arkflow-core = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower-http = { workspace = true }
 
+[dev-dependencies]
+tower = { workspace = true }

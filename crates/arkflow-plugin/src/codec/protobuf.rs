@@ -24,13 +24,13 @@
 //! Nested message / repeated / map / oneof / proto3 optional fields are NOT
 //! supported and produce an error.
 
-use async_trait::async_trait;
 use crate::component::protobuf::{
     arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
 };
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
+use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;

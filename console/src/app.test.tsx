@@ -34,4 +34,11 @@ describe('console application', () => {
     expect(screen.getByLabelText('Configuration editor')).toBeInTheDocument()
     expect(screen.queryByText('api_token')).not.toBeInTheDocument()
   })
+
+  it('shows stale state when the control plane becomes unavailable', async () => {
+    fetchMock.mockRejectedValue(new Error('connection refused'))
+    render(<App />)
+    expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
+    expect(screen.getByText(/connection refused/i)).toBeInTheDocument()
+  })
 })

@@ -118,7 +118,9 @@ impl HttpInput {
 
         // Apply codec if configured
         let msg =
-            match crate::input::codec_helper::apply_codec_to_payload(&json_bytes, &state.codec).await {
+            match crate::input::codec_helper::apply_codec_to_payload(&json_bytes, &state.codec)
+                .await
+            {
                 Ok(msg) => msg,
                 Err(_) => return StatusCode::BAD_REQUEST,
             };

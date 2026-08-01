@@ -11,11 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use async_trait::async_trait;
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
+use async_trait::async_trait;
 use datafusion::arrow;
 use serde_json::Value;
 use std::sync::Arc;

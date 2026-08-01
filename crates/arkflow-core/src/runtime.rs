@@ -2,7 +2,8 @@
 
 use crate::config::EngineConfig;
 use crate::control::{
-    ControlEvent, RuntimeErrorEvent, StreamMetricsSnapshot, StreamState, StreamStatus,
+    ControlEvent, DesiredState, OperationRecord, OperationState, RuntimeErrorEvent,
+    StreamMetricsSnapshot, StreamState, StreamStatus,
 };
 use crate::stream::StreamConfig;
 use crate::Error;
@@ -18,12 +19,112 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_RECENT_ERRORS: usize = 32;
 const MAX_EVENTS: usize = 128;
+const MAX_OPERATIONS: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 pub struct EventStore {
     events: Arc<Mutex<VecDeque<ControlEvent>>>,
 }
+
+/// Bounded in-memory administrative operation registry. The domain layer owns
+/// lifecycle execution; transport layers only observe these records.
+#[derive(Clone, Default)]
+pub struct OperationStore {
+    operations: Arc<RwLock<BTreeMap<String, OperationRecord>>>,
+}
+
+impl OperationStore {
+    pub async fn create(
+        &self,
+        operation: impl Into<String>,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+        correlation_id: Option<String>,
+    ) -> OperationRecord {
+        let now = now_ms();
+        let id = format!("op-{}", OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        let record = OperationRecord {
+            id: id.clone(),
+            operation: operation.into(),
+            resource_type: resource_type.into(),
+            resource_id: resource_id.into(),
+            state: OperationState::Queued,
+            progress: 0,
+            created_at_ms: now,
+            started_at_ms: None,
+            finished_at_ms: None,
+            correlation_id,
+            error: None,
+            result: None,
+        };
+        let mut operations = self.operations.write().await;
+        if operations.len() >= MAX_OPERATIONS {
+            if let Some(oldest) = operations.keys().next().cloned() {
+                operations.remove(&oldest);
+            }
+        }
+        operations.insert(id, record.clone());
+        record
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+        state: OperationState,
+        progress: u8,
+        error: Option<String>,
+    ) -> Option<OperationRecord> {
+        let mut operations = self.operations.write().await;
+        let record = operations.get_mut(id)?;
+        if matches!(
+            record.state,
+            OperationState::Cancelled | OperationState::TimedOut
+        ) && !matches!(state, OperationState::Cancelled | OperationState::TimedOut)
+        {
+            return Some(record.clone());
+        }
+        let now = now_ms();
+        record.state = state;
+        record.progress = progress;
+        if record.started_at_ms.is_none() && state == OperationState::Running {
+            record.started_at_ms = Some(now);
+        }
+        if matches!(
+            state,
+            OperationState::Succeeded
+                | OperationState::Failed
+                | OperationState::Cancelled
+                | OperationState::TimedOut
+        ) {
+            record.finished_at_ms = Some(now);
+        }
+        record.error = error;
+        Some(record.clone())
+    }
+
+    pub async fn get(&self, id: &str) -> Option<OperationRecord> {
+        self.operations.read().await.get(id).cloned()
+    }
+
+    pub async fn list(&self) -> Vec<OperationRecord> {
+        let mut records: Vec<_> = self.operations.read().await.values().cloned().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
+        records
+    }
+
+    pub async fn cancel(&self, id: &str) -> Option<OperationRecord> {
+        self.update(
+            id,
+            OperationState::Cancelled,
+            100,
+            Some("Cancelled by operator".into()),
+        )
+        .await
+    }
+}
+
+static OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl EventStore {
     pub async fn record(&self, event: ControlEvent) {
@@ -94,6 +195,8 @@ pub struct RuntimeEntry {
     pub handle: Option<JoinHandle<Result<(), Error>>>,
     pub metrics: Arc<RuntimeMetrics>,
     pub started_at_ms: Option<u64>,
+    pub active_operation_id: Option<String>,
+    pub node_id: String,
     pub recent_errors: VecDeque<RuntimeErrorEvent>,
 }
 
@@ -107,6 +210,8 @@ impl RuntimeEntry {
             handle: None,
             metrics: Arc::new(RuntimeMetrics::default()),
             started_at_ms: None,
+            active_operation_id: None,
+            node_id: "local-node".to_string(),
             recent_errors: VecDeque::with_capacity(MAX_RECENT_ERRORS),
         }
     }
@@ -126,6 +231,15 @@ impl RuntimeEntry {
         StreamStatus {
             id: self.id.clone(),
             state: self.state,
+            desired_state: Some(match self.state {
+                StreamState::Running | StreamState::Starting | StreamState::Restarting => {
+                    DesiredState::Running
+                }
+                _ => DesiredState::Stopped,
+            }),
+            transition_started_at_ms: self.started_at_ms,
+            active_operation_id: self.active_operation_id.clone(),
+            node_id: Some(self.node_id.clone()),
             started_at_ms: self.started_at_ms,
             last_error: self.recent_errors.back().cloned(),
             metrics: self.metrics.snapshot(),
@@ -164,6 +278,12 @@ impl RuntimeManager {
         self.entries.read().await.get(id).cloned()
     }
 
+    pub async fn set_active_operation(&self, id: &str, operation_id: Option<String>) {
+        if let Some(entry) = self.get(id).await {
+            entry.lock().await.active_operation_id = operation_id;
+        }
+    }
+
     pub async fn remove(&self, id: &str) -> Option<Arc<Mutex<RuntimeEntry>>> {
         self.entries.write().await.remove(id)
     }
@@ -190,6 +310,8 @@ impl RuntimeManager {
                 stream_id,
                 outcome: outcome.into(),
                 message,
+                operation_id: None,
+                correlation_id: None,
             })
             .await;
     }
@@ -303,6 +425,8 @@ impl RuntimeManager {
                     stream_id: Some(event.1),
                     outcome: event.2.to_string(),
                     message: event.3,
+                    operation_id: None,
+                    correlation_id: None,
                 })
                 .await;
             result
@@ -564,6 +688,26 @@ mod tests {
             durability: None,
             temporary: None,
         }
+    }
+
+    #[tokio::test]
+    async fn operation_store_is_idempotently_terminal() {
+        let store = OperationStore::default();
+        let record = store
+            .create("start", "stream", "orders", Some("corr-1".into()))
+            .await;
+        assert_eq!(record.state, OperationState::Queued);
+        store
+            .update(&record.id, OperationState::Running, 10, None)
+            .await;
+        let cancelled = store.cancel(&record.id).await.unwrap();
+        assert_eq!(cancelled.state, OperationState::Cancelled);
+        let unchanged = store
+            .update(&record.id, OperationState::Succeeded, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.state, OperationState::Cancelled);
+        assert_eq!(unchanged.correlation_id.as_deref(), Some("corr-1"));
     }
 
     #[tokio::test]

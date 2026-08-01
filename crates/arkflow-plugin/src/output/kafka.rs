@@ -345,10 +345,7 @@ impl KafkaOutput {
     /// replays the whole batch — which re-begins a fresh transaction. Zombie
     /// producers from a crashed run are fenced by the broker via the stable
     /// transactional.id on restart.
-    async fn write_batch_transactional(
-        &self,
-        msgs: &[MessageBatchRef],
-    ) -> Result<(), Error> {
+    async fn write_batch_transactional(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
         let producer_guard = self.inner_kafka_output.producer.read().await;
         let producer = match producer_guard.as_ref() {
             Some(p) => p,
@@ -410,8 +407,7 @@ impl KafkaOutput {
         producer: &FutureProducer,
         msg: MessageBatchRef,
     ) -> Result<(), Error> {
-        let payloads =
-            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -548,12 +544,10 @@ mod tests {
             "topic": {"type": "value", "value": "t"},
             "exactly_once": true
         });
-        let err = match KafkaOutputBuilder
-            .build(None, &Some(config), None, &resource())
-        {
-            Ok(_) => panic!(
-                "expected build to fail when exactly_once is set without a transactional_id"
-            ),
+        let err = match KafkaOutputBuilder.build(None, &Some(config), None, &resource()) {
+            Ok(_) => {
+                panic!("expected build to fail when exactly_once is set without a transactional_id")
+            }
             Err(e) => e,
         };
         let msg = format!("{err}");

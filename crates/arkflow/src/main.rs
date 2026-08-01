@@ -13,7 +13,10 @@
  */
 
 use arkflow_core::cli::Cli;
+use arkflow_core::engine::Engine;
 use arkflow_plugin::{buffer, codec, input, output, processor, temporary, wal};
+use arkflow_server::{serve, ServerConfig};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,5 +29,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wal::init()?;
     let mut cli = Cli::default();
     cli.parse()?;
-    cli.run().await
+    let Some(config) = cli.config() else {
+        return cli.run().await;
+    };
+    arkflow_core::cli::init_logging(&config);
+    let engine = Engine::new(config.clone());
+    let cancellation = CancellationToken::new();
+    let server_task = tokio::spawn(serve(
+        engine.control_plane(),
+        ServerConfig::from_engine(&config),
+        cancellation.clone(),
+    ));
+    let engine_result = engine.run_with_cancellation(cancellation.clone()).await;
+    cancellation.cancel();
+    let server_result = server_task.await?;
+    engine_result?;
+    server_result.map_err(|error| -> Box<dyn std::error::Error> { error })?;
+    Ok(())
 }

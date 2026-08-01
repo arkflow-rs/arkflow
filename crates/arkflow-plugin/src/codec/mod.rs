@@ -13,9 +13,9 @@
  */
 use arkflow_core::Error;
 
+pub mod debezium;
 pub mod json;
 pub mod protobuf;
-pub mod debezium;
 pub mod schema_registry;
 
 pub fn init() -> Result<(), Error> {

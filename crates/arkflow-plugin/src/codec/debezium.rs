@@ -23,11 +23,11 @@
 //! CDC offset is NOT managed here: it is the Kafka input's ack-gated offset (see
 //! the `input-durability` capability). This codec only parses payloads.
 
-use async_trait::async_trait;
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{Bytes, Error, MessageBatch, Resource};
+use async_trait::async_trait;
 use datafusion::arrow;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -140,7 +140,10 @@ impl CodecBuilder for DebeziumJsonCodecBuilder {
 }
 
 pub(crate) fn init() -> Result<(), Error> {
-    arkflow_core::codec::register_codec_builder("debezium_json", Arc::new(DebeziumJsonCodecBuilder))?;
+    arkflow_core::codec::register_codec_builder(
+        "debezium_json",
+        Arc::new(DebeziumJsonCodecBuilder),
+    )?;
     register_codec_metadata(
         ComponentMetadata::with_schema(
             "debezium_json",
@@ -165,10 +168,7 @@ mod tests {
 
     async fn decode_one(json: &str) -> MessageBatch {
         let codec = DebeziumJsonCodec;
-        codec
-            .decode(vec![json.as_bytes().to_vec()])
-            .await
-            .unwrap()
+        codec.decode(vec![json.as_bytes().to_vec()]).await.unwrap()
     }
 
     fn str_col<'a>(batch: &'a MessageBatch, name: &str, row: usize) -> &'a str {

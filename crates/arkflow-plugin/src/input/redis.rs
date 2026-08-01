@@ -409,7 +409,8 @@ impl Input for RedisInput {
             Ok(RedisMsg::Message(_channel, payload)) => {
                 // Apply codec if configured
                 let mut msg =
-                    crate::input::codec_helper::apply_codec_to_payload(&payload, &self.codec).await
+                    crate::input::codec_helper::apply_codec_to_payload(&payload, &self.codec)
+                        .await
                         .map_err(|e| {
                             Error::Connection(format!("Failed to create message batch: {}", e))
                         })?;

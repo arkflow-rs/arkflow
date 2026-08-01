@@ -219,7 +219,9 @@ version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
+ "arkflow-server",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -327,7 +329,11 @@ dependencies = [
  "arkflow-core",
  "axum",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.0",
 ]
 
 [[package]]
@@ -9906,6 +9912,7 @@ dependencies = [
  "bytes",
  "http 1.4.2",
  "http-body 1.1.0",
+ "http-body-util",
  "percent-encoding",
  "pin-project-lite",
  "tower-layer",

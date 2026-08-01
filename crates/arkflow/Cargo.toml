@@ -11,7 +11,9 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true}
+tokio-util = { workspace = true }
 
 # arkflow
 arkflow-core = { workspace = true }
 arkflow-plugin = { workspace = true }
+arkflow-server = { workspace = true }

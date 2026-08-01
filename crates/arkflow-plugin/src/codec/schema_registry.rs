@@ -19,10 +19,10 @@
 //! are cached per id so each schema version is fetched at most once.
 
 use crate::component::protobuf::{parse_proto_source, protobuf_to_arrow};
-use async_trait::async_trait;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{Bytes, Error, MessageBatch, Resource};
+use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
@@ -76,9 +76,9 @@ impl Encoder for SchemaRegistryCodec {
         writer
             .write(&batch)
             .map_err(|e| Error::Process(format!("Schema registry codec encode error: {}", e)))?;
-        writer
-            .finish()
-            .map_err(|e| Error::Process(format!("Schema registry codec encode finish error: {}", e)))?;
+        writer.finish().map_err(|e| {
+            Error::Process(format!("Schema registry codec encode finish error: {}", e))
+        })?;
         let s = String::from_utf8(buf)
             .map_err(|e| Error::Process(format!("UTF-8 conversion failed: {}", e)))?;
         Ok(s.lines().map(|l| l.as_bytes().to_vec()).collect())
@@ -161,11 +161,7 @@ struct SchemaResponse {
 #[async_trait]
 impl SchemaResolver for RestSchemaResolver {
     async fn fetch_schema(&self, id: u32) -> Result<String, Error> {
-        let url = format!(
-            "{}/schemas/ids/{}",
-            self.base_url.trim_end_matches('/'),
-            id
-        );
+        let url = format!("{}/schemas/ids/{}", self.base_url.trim_end_matches('/'), id);
         let mut req = self
             .client
             .get(&url)
@@ -230,25 +226,34 @@ impl CodecBuilder for SchemaRegistryCodecBuilder {
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {
-        let config = config
-            .as_ref()
-            .ok_or_else(|| Error::Config("schema_registry codec configuration is missing".to_string()))?;
+        let config = config.as_ref().ok_or_else(|| {
+            Error::Config("schema_registry codec configuration is missing".to_string())
+        })?;
         let config: SchemaRegistryCodecConfig = serde_json::from_value(config.clone())?;
         let auth = match config.auth {
             None => None,
             Some(a) => Some(match a.auth_type.as_str() {
-                "basic" => Auth::Basic(a.username.unwrap_or_default(), a.password.unwrap_or_default()),
+                "basic" => Auth::Basic(
+                    a.username.unwrap_or_default(),
+                    a.password.unwrap_or_default(),
+                ),
                 "bearer" => Auth::Bearer(a.token.unwrap_or_default()),
                 other => return Err(Error::Config(format!("Unsupported auth type: {}", other))),
             }),
         };
         let resolver = Arc::new(RestSchemaResolver::new(config.registry_url, auth)?);
-        Ok(Arc::new(SchemaRegistryCodec::new(config.message_type, resolver)))
+        Ok(Arc::new(SchemaRegistryCodec::new(
+            config.message_type,
+            resolver,
+        )))
     }
 }
 
 pub(crate) fn init() -> Result<(), Error> {
-    arkflow_core::codec::register_codec_builder("schema_registry", Arc::new(SchemaRegistryCodecBuilder))?;
+    arkflow_core::codec::register_codec_builder(
+        "schema_registry",
+        Arc::new(SchemaRegistryCodecBuilder),
+    )?;
     register_codec_metadata(
         ComponentMetadata::with_schema(
             "schema_registry",
@@ -433,7 +438,9 @@ mod tests {
             .and(path("/schemas/ids/2"))
             .and(header("authorization", "Bearer tok"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"schema": "syntax = \"proto3\"; message M {}"})),
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"schema": "syntax = \"proto3\"; message M {}"}),
+                ),
             )
             .mount(&server)
             .await;

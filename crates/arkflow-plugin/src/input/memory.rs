@@ -91,7 +91,8 @@ impl MemoryInput {
 
     /// Add raw bytes to the memory input (codec will be applied if configured)
     pub async fn push_bytes(&self, data: Vec<u8>) -> Result<(), Error> {
-        let msg_batch = crate::input::codec_helper::apply_codec_to_payload(&data, &self.codec).await?;
+        let msg_batch =
+            crate::input::codec_helper::apply_codec_to_payload(&data, &self.codec).await?;
         let mut queue = self.queue.lock().await;
         queue.push_back(msg_batch);
         Ok(())

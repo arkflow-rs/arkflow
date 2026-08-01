@@ -16,3 +16,14 @@ Nginx. Its `/api/` and `/metrics` locations proxy to an `arkflow:8080`
 service; deploy it on a private network with TLS and an authentication layer.
 Do not expose the API or the token-bearing console directly to the public
 internet. The ArkFlow default bind address is local-only.
+
+## Migration from the health-centric console
+
+The old UI treated the backend as a health and aggregate-stream monitor. The
+resource-oriented console uses `/api/v1/system`, `/nodes`, `/streams`,
+`/operations`, `/events`, `/configuration`, and `/components`. Lifecycle
+requests are asynchronous and must be polled by operation ID. Existing
+`/health`, `/readiness`, `/liveness`, `/metrics`, `/status`, and `/config*`
+routes remain as compatibility aliases, but new integrations should use the
+resource endpoints. Operation and event history is process-local; configuration
+versions remain durable under `.arkflow/config-history`.

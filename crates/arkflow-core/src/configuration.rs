@@ -95,7 +95,7 @@ impl ConfigVersionStore {
             let stored: StoredConfigVersion = serde_json::from_slice(&fs::read(path)?)?;
             versions.push(stored.metadata);
         }
-        versions.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        versions.sort_by_key(|version| std::cmp::Reverse(version.created_at_ms));
         Ok(versions)
     }
 

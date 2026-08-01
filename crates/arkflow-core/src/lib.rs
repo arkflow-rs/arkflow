@@ -34,6 +34,7 @@ pub mod component;
 pub mod config;
 pub mod configuration;
 pub mod control;
+pub mod control_plane;
 pub mod engine;
 pub mod error_helpers;
 pub mod input;

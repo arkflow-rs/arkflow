@@ -586,9 +586,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
     // Cache the highest written sequence so `next_seq_hint` can return
     // `max_seq + 1` (matching redb) instead of `cursor() + 1`, which would
     // reuse sequence numbers whenever sealed-but-unacked entries exist.
-    store
-        .max_written_seq
-        .store(max_seq_seen, Ordering::Release);
+    store.max_written_seq.store(max_seq_seen, Ordering::Release);
 
     let mut active = store.active.lock().unwrap();
     active.next_index = max_idx_seen + 1;
@@ -1913,7 +1911,10 @@ mod tests {
         let store2 = build_store_at("pod-c", "stream-3", client.clone(), 100, 1);
         store2.runtime.block_on(async {
             let (m, _) = read_manifest_with_etag(&store2).await.unwrap();
-            assert_eq!(m.cursor, 3, "cursor catches up to 3 once seq 1..=3 are sealed");
+            assert_eq!(
+                m.cursor, 3,
+                "cursor catches up to 3 once seq 1..=3 are sealed"
+            );
         });
         assert!(
             store2.read_after_cursor().unwrap().is_empty(),
