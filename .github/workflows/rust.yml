@@ -1,4 +1,5 @@
-name: Rust
+# Faster Rust CI: cache cargo registry/git and target; use stable toolchain; keep PR fast (debug).
+name: Rust (fast CI)
 
 on:
   push:
@@ -11,16 +12,65 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
 jobs:
-  build:
+  build-and-test:
+    name: Build and Test (fast)
     runs-on: ubuntu-latest
+    # Keep PR builds fast by default (debug). Add a separate release job for pushes/tags if needed.
+    strategy:
+      matrix:
+        profile: [ debug ]
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Install System Dependencies
-      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
-    - name: Set PROTOC Environment Variable
-      run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache cargo registry & git index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target dir (per profile)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-${{ matrix.profile }}-
+            ${{ runner.os }}-cargo-target-
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: clippy, rustfmt
+
+      # Optional: enable sccache for larger repos to speed up repeated compilations.
+      # - name: Install and enable sccache
+      #   uses: actions-rs/sccache@v1
+      #   with:
+      #     install: true
+      #     version: latest
+      # After this step, the action will set RUSTC_WRAPPER to sccache automatically.
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Build (debug)
+        run: cargo build --workspace --all-targets --verbose
+
+      - name: Run tests
+        # cargo runs tests in parallel by default; adjust flags if you want per-crate parallelism control
+        run: cargo test --workspace --all-targets --verbose
