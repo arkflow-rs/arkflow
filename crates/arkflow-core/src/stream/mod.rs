@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
@@ -46,6 +47,10 @@ pub struct Stream {
     resource: Resource,
     sequence_counter: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
+    /// Signaled by `do_output` each time it advances `next_seq`, so a
+    /// `do_processor` worker blocked on backpressure wakes immediately
+    /// instead of sleep-polling.
+    next_seq_notify: Arc<Notify>,
 }
 
 enum ProcessorData {
@@ -76,6 +81,7 @@ impl Stream {
             thread_num,
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
+            next_seq_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -141,6 +147,7 @@ impl Stream {
                 output_sender.clone(),
                 self.sequence_counter.clone(),
                 self.next_seq.clone(),
+                self.next_seq_notify.clone(),
             ));
         }
 
@@ -150,6 +157,7 @@ impl Stream {
 
         tracker.spawn(Self::do_output(
             self.next_seq.clone(),
+            self.next_seq_notify.clone(),
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
@@ -336,21 +344,23 @@ impl Stream {
         output_sender: Sender<(ProcessorData, Arc<dyn Ack>, u64)>,
         sequence_counter: Arc<AtomicU64>,
         next_seq: Arc<AtomicU64>,
+        next_seq_notify: Arc<Notify>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
         loop {
-            // Backpressure control
+            // Backpressure: wait until the output drains enough in-flight
+            // messages. Take the notified() future BEFORE checking `pending`
+            // so a notify_one() issued between the check and the await is not
+            // lost (it stores a permit the await then consumes).
+            let notified = next_seq_notify.notified();
             let pending_messages =
                 sequence_counter.load(Ordering::Acquire) - next_seq.load(Ordering::Acquire);
             if pending_messages > BACKPRESSURE_THRESHOLD {
-                let wait_time = std::cmp::min(
-                    500,
-                    100 + (pending_messages - BACKPRESSURE_THRESHOLD) / 100 * 10,
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(wait_time)).await;
+                notified.await;
                 continue;
             }
+            drop(notified);
 
             let Ok((msg, ack)) = input_receiver.recv_async().await else {
                 break;
@@ -400,6 +410,7 @@ impl Stream {
 
     async fn do_output(
         next_seq: Arc<AtomicU64>,
+        next_seq_notify: Arc<Notify>,
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
@@ -431,6 +442,7 @@ impl Stream {
 
                 Self::output(data, &ack, &output, err_output.as_ref()).await;
                 next_seq.fetch_add(1, Ordering::Release);
+                next_seq_notify.notify_one();
             }
         }
 
@@ -1271,6 +1283,116 @@ mod tests {
         );
 
         wal.close().await.unwrap();
+    }
+
+    /// Under backpressure (in-flight > `BACKPRESSURE_THRESHOLD`) the processor
+    /// worker MUST wait on the `next_seq_notify` signal instead of consuming
+    /// input; once `next_seq` advances and the signal fires, it resumes and
+    /// emits the processed batch. Closing the input while it is still blocked
+    /// MUST let it observe EOF and exit (no deadlock). Covers the in-flight
+    /// bound, signal-driven release, and liveness requirements.
+    #[tokio::test]
+    async fn processor_worker_waits_on_notify_under_backpressure() {
+        // In-flight is already 2× the threshold.
+        let sequence_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(2 * BACKPRESSURE_THRESHOLD));
+        let next_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let notify: Arc<Notify> = Arc::new(Notify::new());
+        let pipeline: Arc<Pipeline> = Arc::new(Pipeline::new(vec![]));
+        let (input_tx, input_rx) =
+            flume::bounded::<(MessageBatchRef, Arc<dyn crate::input::Ack>)>(4);
+        let (output_tx, output_rx) =
+            flume::bounded::<(ProcessorData, Arc<dyn crate::input::Ack>, u64)>(4);
+
+        // Stage one input message; under backpressure it MUST stay unconsumed.
+        input_tx
+            .send_async((
+                Arc::new(sample_batch()) as MessageBatchRef,
+                Arc::new(NoopAck) as Arc<dyn crate::input::Ack>,
+            ))
+            .await
+            .unwrap();
+
+        let next_seq_task = next_seq.clone();
+        let notify_task = notify.clone();
+        let worker = tokio::spawn(async move {
+            Stream::do_processor(
+                0,
+                pipeline,
+                input_rx,
+                output_tx,
+                sequence_counter,
+                next_seq,
+                notify,
+            )
+            .await
+        });
+
+        // Let the worker reach the backpressure await.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            output_rx.is_empty(),
+            "processor must not emit while in-flight exceeds the threshold"
+        );
+
+        // Drain in-flight below the threshold and fire the signal.
+        next_seq_task.store(2 * BACKPRESSURE_THRESHOLD, Ordering::Release);
+        notify_task.notify_one();
+
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            output_rx.recv_async(),
+        )
+        .await
+        .expect("processor did not resume within timeout after notify")
+        .unwrap();
+        match recv.0 {
+            ProcessorData::Ok(_) => {}
+            _ => panic!("expected ProcessorData::Ok after resume"),
+        }
+
+        // Closing the input lets the worker observe EOF and exit — a blocked
+        // processor must not strand the shutdown.
+        drop(input_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), worker)
+            .await
+            .expect("processor worker did not exit after input EOF");
+    }
+
+    /// `do_output` SHALL fire `next_seq_notify` each time it advances `next_seq`
+    /// on an in-order write. Feeding seq=0 (== next_seq) drives one write, one
+    /// advance, and one notify.
+    #[tokio::test]
+    async fn output_worker_notifies_on_next_seq_advance() {
+        let next_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let notify: Arc<Notify> = Arc::new(Notify::new());
+        let output: Arc<dyn Output> = Arc::new(CountingOutput::new());
+        let (output_tx, output_rx) =
+            flume::bounded::<(ProcessorData, Arc<dyn crate::input::Ack>, u64)>(4);
+
+        output_tx
+            .send_async((
+                ProcessorData::Ok(vec![Arc::new(sample_batch()) as MessageBatchRef]),
+                Arc::new(CountingAck(std::sync::atomic::AtomicBool::new(false)))
+                    as Arc<dyn crate::input::Ack>,
+                0,
+            ))
+            .await
+            .unwrap();
+        drop(output_tx);
+
+        let next_seq_check = next_seq.clone();
+        let notify_check = notify.clone();
+        tokio::spawn(async move {
+            Stream::do_output(next_seq, notify, output_rx, output, None).await
+        });
+
+        // do_output writes seq=0, advances next_seq to 1, fires notify_one.
+        notify_check.notified().await;
+        assert_eq!(
+            next_seq_check.load(Ordering::Acquire),
+            1,
+            "next_seq must advance after the in-order write"
+        );
     }
 }
 
