@@ -1,4 +1,9 @@
 /.git
 /.idea
+/.codex
 /target
 /docs
+/examples
+/openspec
+**/*.md
+**/tests
