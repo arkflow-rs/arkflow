@@ -86,7 +86,7 @@ This is a Cargo workspace with three crates:
   - Output plugins: Drop, HTTP, InfluxDB, Kafka, MQTT, NATS, Pulsar, Redis, SQL, Stdout
   - Processor plugins: Batch, JSON, Protobuf, Python UDF, SQL, VRL
   - Buffer plugins: Memory, Session Window, Sliding Window, Tumbling Window, Join
-  - Codec plugins: JSON, Protobuf
+  - Codec plugins: JSON, Protobuf, Debezium, Schema Registry
 
 - **`arkflow`** (`crates/arkflow/`) - Main binary executable
 
@@ -337,6 +337,7 @@ When creating new plugins, the registration pattern is consistent across all com
    - Key-based partitioning
    - Compression options
    - Acknowledgment levels
+   - Exactly-once transactional production (L2): opt-in via `exactly_once: true` + `transactional_id`; one ack range = one Kafka transaction (see `examples/eos-kafka.yaml`)
 
 5. **MQTT** - MQTT publisher
    - QoS levels
@@ -439,6 +440,16 @@ When creating new plugins, the registration pattern is consistent across all com
    - Binary format support
    - Schema files (.proto)
    - Descriptor sets
+
+3. **Debezium (JSON)** - Debezium CDC Envelope decoding
+   - Decodes change events (op/before/after/source/ts_ms) into columnar Arrow
+   - Attach to a Kafka input; CDC offset is the Kafka input's ack-gated offset
+   - Covers MySQL/PostgreSQL/MongoDB/SQLServer via Debezium
+
+4. **Schema Registry** - Confluent wire-format Protobuf decoding
+   - Decodes messages by resolving schema id from a Schema Registry (REST)
+   - Per-id descriptor cache; supports multi-version schema evolution
+   - Attach to a Kafka input consuming Confluent-serialized Protobuf
 
 ## Advanced Features
 

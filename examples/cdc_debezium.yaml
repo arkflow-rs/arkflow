@@ -1,0 +1,46 @@
+## CDC via Debezium (Kafka → ArkFlow)
+#
+# Consumes a Kafka topic written by Debezium (MySQL/PostgreSQL/MongoDB/...),
+# decodes each Debezium Envelope into a columnar batch with `debezium_json` codec,
+# then routes by operation type in SQL.
+#
+# CDC offset is the Kafka input's ack-gated offset (at-least-once).
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - shop.users
+      consumer_group: arkflow-cdc
+      client_id: arkflow-cdc
+      start_from_latest: true
+      # Decode Debezium Envelope JSON into a columnar Arrow batch.
+      # Produces: business columns (from `after`, or `before` on delete),
+      # plus `op`, `ts_ms`, `source_db`, `source_table`, `before`, `source`.
+      codec:
+        type: debezium_json
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: sql
+          query: |
+            SELECT
+              op,
+              id,
+              name,
+              source_db,
+              source_table,
+              ts_ms
+            FROM flow
+            WHERE op IN ('c', 'u')
+
+    output:
+      type: stdout
+    error_output:
+      type: stdout

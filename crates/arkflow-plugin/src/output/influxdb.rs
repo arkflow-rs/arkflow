@@ -443,7 +443,7 @@ impl Output for InfluxDBOutput {
 
         // Apply codec encoding if configured
         let processed_msgs = if let Some(codec) = &self.codec {
-            codec.encode((*msg).clone())?
+            codec.encode((*msg).clone()).await?
         } else {
             // No codec: extract binary data and re-create MessageBatch
             let binary_data = msg.to_binary("")?;

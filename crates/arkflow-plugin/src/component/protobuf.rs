@@ -123,6 +123,51 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
     Ok(file_descriptor_set)
 }
 
+/// Parse a Protobuf schema from a source string (e.g. obtained from a Schema Registry)
+/// and return the `MessageDescriptor` for `message_type`. Used by codecs that resolve
+/// schemas dynamically at runtime rather than from local files.
+pub fn parse_proto_source(schema: &str, message_type: &str) -> Result<MessageDescriptor, Error> {
+    let dir = tempfile::tempdir()
+        .map_err(|e| Error::Config(format!("Failed to create temp dir: {}", e)))?;
+    let proto_path = dir.path().join("registry_schema.proto");
+    fs::write(&proto_path, schema)
+        .map_err(|e| Error::Config(format!("Failed to write proto source: {}", e)))?;
+
+    let proto_input = proto_path
+        .to_str()
+        .ok_or_else(|| Error::Config("Invalid temp proto path".to_string()))?
+        .to_string();
+    let include_dir = dir
+        .path()
+        .to_str()
+        .ok_or_else(|| Error::Config("Invalid temp include path".to_string()))?
+        .to_string();
+
+    let file_descriptor_protos = protobuf_parse::Parser::new()
+        .pure()
+        .inputs(&[proto_input])
+        .includes(&[include_dir])
+        .parse_and_typecheck()
+        .map_err(|e| Error::Config(format!("Failed to parse proto source: {}", e)))?
+        .file_descriptors;
+
+    let mut file_descriptor_set = FileDescriptorSet { file: Vec::new() };
+    for proto in file_descriptor_protos {
+        let proto_bytes = proto
+            .write_to_bytes()
+            .map_err(|e| Error::Config(format!("Failed to serialize FileDescriptorProto: {}", e)))?;
+        let prost_proto =
+            prost_reflect::prost_types::FileDescriptorProto::decode(proto_bytes.as_slice())
+                .map_err(|e| Error::Config(format!("Failed to convert FileDescriptorProto: {}", e)))?;
+        file_descriptor_set.file.push(prost_proto);
+    }
+
+    let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(file_descriptor_set)
+        .map_err(|e| Error::Config(format!("Failed to create descriptor pool: {}", e)))?;
+    pool.get_message_by_name(message_type)
+        .ok_or_else(|| Error::Config(format!("Message type not found in schema: {}", message_type)))
+}
+
 /// Convert Protobuf data to Arrow format
 ///
 /// The schema is driven by the message descriptor's full field set (every field

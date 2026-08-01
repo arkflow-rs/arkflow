@@ -451,7 +451,7 @@ impl Stream {
                     }
                     error!("{e}");
                 }
-                Some(err_output) => match err_output.write(msg).await {
+                Some(err_output) => match err_output.write_batch(&[msg]).await {
                     Ok(_) => {
                         if let Err(err) = ack.ack().await {
                             error!("Failed to ack errored message: {}", err);
@@ -463,22 +463,14 @@ impl Stream {
                 },
             },
             ProcessorData::Ok(msgs) => {
-                let size = msgs.len();
-                let mut success_cnt = 0;
-                for msg in msgs {
-                    match output.write(msg).await {
-                        Ok(_) => {
-                            success_cnt += 1;
-                        }
-                        Err(e) => {
-                            error!("{}", e);
+                match output.write_batch(&msgs).await {
+                    Ok(_) => {
+                        if let Err(e) = ack.ack().await {
+                            error!("Failed to ack message: {}", e);
                         }
                     }
-                }
-
-                if success_cnt >= size {
-                    if let Err(e) = ack.ack().await {
-                        error!("Failed to ack message: {}", e);
+                    Err(e) => {
+                        error!("{}", e);
                     }
                 }
             }
@@ -603,6 +595,125 @@ mod tests {
         async fn close(&self) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    /// Output that counts `write_batch` / `write` calls. `write_batch` is
+    /// overridden (it does not delegate to `write`) so tests can assert that
+    /// the output worker routes a whole ack range through exactly one
+    /// `write_batch` call rather than looping `write`.
+    struct CountingOutput {
+        batch_calls: std::sync::atomic::AtomicU32,
+        batch_len: std::sync::atomic::AtomicU32,
+        write_calls: std::sync::atomic::AtomicU32,
+        fail_batch: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingOutput {
+        fn new() -> Self {
+            Self {
+                batch_calls: std::sync::atomic::AtomicU32::new(0),
+                batch_len: std::sync::atomic::AtomicU32::new(0),
+                write_calls: std::sync::atomic::AtomicU32::new(0),
+                fail_batch: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn failing() -> Self {
+            let o = Self::new();
+            o.fail_batch
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            o
+        }
+    }
+
+    #[async_trait]
+    impl Output for CountingOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            self.write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.batch_len
+                .store(msgs.len() as u32, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_batch.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(Error::Process("counting output failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Ack that records whether it was invoked.
+    struct CountingAck(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl crate::input::Ack for CountingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn output_worker_calls_write_batch_once_per_ack_range() {
+        let output: Arc<CountingOutput> = Arc::new(CountingOutput::new());
+        let out_ref: Arc<dyn Output> = output.clone();
+        let counting = Arc::new(CountingAck(std::sync::atomic::AtomicBool::new(false)));
+        let ack: Arc<dyn crate::input::Ack> = counting.clone();
+        let msgs = vec![
+            Arc::new(sample_batch()) as MessageBatchRef,
+            Arc::new(sample_batch()),
+            Arc::new(sample_batch()),
+        ];
+
+        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None).await;
+
+        assert_eq!(
+            output.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "write_batch must be called exactly once per ack range"
+        );
+        assert_eq!(
+            output.batch_len.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "write_batch must receive all messages of the ack range"
+        );
+        assert_eq!(
+            output.write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the output worker must route through write_batch, not write"
+        );
+        assert!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            "ack must fire on full success"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_failure_withholds_ack() {
+        let output: Arc<CountingOutput> = Arc::new(CountingOutput::failing());
+        let out_ref: Arc<dyn Output> = output.clone();
+        let counting = Arc::new(CountingAck(std::sync::atomic::AtomicBool::new(false)));
+        let ack: Arc<dyn crate::input::Ack> = counting.clone();
+        let msgs = vec![Arc::new(sample_batch()) as MessageBatchRef];
+
+        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None).await;
+
+        assert_eq!(
+            output.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            !counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            "ack MUST be withheld when write_batch fails, so the WAL cursor does not advance and the range is replayed"
+        );
     }
 
     fn sample_batch() -> MessageBatch {

@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use async_trait::async_trait;
 use crate::{Bytes, Error, MessageBatch, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,12 +21,14 @@ lazy_static::lazy_static! {
     static ref CODEC_BUILDERS: RwLock<HashMap<String, Arc<dyn CodecBuilder>>> = RwLock::new(HashMap::new());
 }
 
+#[async_trait]
 pub trait Encoder: Send + Sync {
-    fn encode(&self, b: MessageBatch) -> Result<Vec<Bytes>, Error>;
+    async fn encode(&self, b: MessageBatch) -> Result<Vec<Bytes>, Error>;
 }
 
+#[async_trait]
 pub trait Decoder: Send + Sync {
-    fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error>;
+    async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error>;
 }
 
 pub trait Codec: Encoder + Decoder {}

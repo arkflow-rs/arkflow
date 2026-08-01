@@ -11,6 +11,7 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+use async_trait::async_trait;
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
@@ -21,8 +22,9 @@ use std::sync::Arc;
 
 struct JsonCodec;
 
+#[async_trait]
 impl Encoder for JsonCodec {
-    fn encode(&self, batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+    async fn encode(&self, batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
         let mut buf = Vec::new();
         let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
         writer
@@ -38,8 +40,9 @@ impl Encoder for JsonCodec {
     }
 }
 
+#[async_trait]
 impl Decoder for JsonCodec {
-    fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
+    async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         let json_data: Vec<u8> = b.join(b"\n" as &[u8]);
 
         let arrow = component::json::try_to_arrow(&json_data, None)?;
@@ -86,8 +89,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_json_codec_encode() {
+    #[tokio::test]
+    async fn test_json_codec_encode() {
         let codec = JsonCodec;
 
         // Create a simple message batch
@@ -97,7 +100,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = codec.encode(batch);
+        let result = codec.encode(batch).await;
         assert!(result.is_ok());
         let encoded = result.unwrap();
 
@@ -105,8 +108,8 @@ mod tests {
         assert!(!encoded.is_empty());
     }
 
-    #[test]
-    fn test_json_codec_decode() {
+    #[tokio::test]
+    async fn test_json_codec_decode() {
         let codec = JsonCodec;
 
         let json_data = vec![
@@ -114,7 +117,7 @@ mod tests {
             br#"{"name":"Bob","age":25}"#.to_vec(),
         ];
 
-        let result = codec.decode(json_data);
+        let result = codec.decode(json_data).await;
         assert!(result.is_ok());
         let batch = result.unwrap();
 
@@ -122,8 +125,8 @@ mod tests {
         assert!(batch.len() > 0);
     }
 
-    #[test]
-    fn test_json_codec_encode_decode_roundtrip() {
+    #[tokio::test]
+    async fn test_json_codec_encode_decode_roundtrip() {
         let codec = JsonCodec;
 
         let original_data = vec![
@@ -132,36 +135,36 @@ mod tests {
         ];
 
         // Decode
-        let batch = codec.decode(original_data.clone()).unwrap();
+        let batch = codec.decode(original_data.clone()).await.unwrap();
 
         // Encode
-        let encoded = codec.encode(batch.clone()).unwrap();
+        let encoded = codec.encode(batch.clone()).await.unwrap();
 
         // Decode again
-        let final_batch = codec.decode(encoded).unwrap();
+        let final_batch = codec.decode(encoded).await.unwrap();
 
         // Both batches should have the same number of rows
         assert_eq!(batch.len(), final_batch.len());
     }
 
-    #[test]
-    fn test_json_codec_decode_empty() {
+    #[tokio::test]
+    async fn test_json_codec_decode_empty() {
         let codec = JsonCodec;
-        let result = codec.decode(vec![]);
+        let result = codec.decode(vec![]).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_json_codec_decode_invalid_json() {
+    #[tokio::test]
+    async fn test_json_codec_decode_invalid_json() {
         let codec = JsonCodec;
         let invalid_data = vec![b"{invalid json}".to_vec()];
-        let result = codec.decode(invalid_data);
+        let result = codec.decode(invalid_data).await;
         // Should handle invalid JSON gracefully or return error
         assert!(result.is_err() || result.is_ok());
     }
 
-    #[test]
-    fn test_json_codec_builder() {
+    #[tokio::test]
+    async fn test_json_codec_builder() {
         let builder = JsonCodecBuilder;
         let result = builder.build(
             Some(&"test-codec".to_string()),
@@ -172,8 +175,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_json_codec_builder_with_config() {
+    #[tokio::test]
+    async fn test_json_codec_builder_with_config() {
         let builder = JsonCodecBuilder;
         let config = serde_json::json!({});
 
@@ -186,20 +189,20 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_json_codec_encode_single_message() {
+    #[tokio::test]
+    async fn test_json_codec_encode_single_message() {
         let codec = JsonCodec;
         let batch = MessageBatch::new_binary(vec![br#"{"test":"data"}"#.to_vec()]).unwrap();
 
-        let result = codec.encode(batch);
+        let result = codec.encode(batch).await;
         assert!(result.is_ok());
         let encoded = result.unwrap();
 
         assert!(!encoded.is_empty());
     }
 
-    #[test]
-    fn test_json_codec_decode_complex_json() {
+    #[tokio::test]
+    async fn test_json_codec_decode_complex_json() {
         let codec = JsonCodec;
 
         let complex_json = vec![
@@ -207,7 +210,7 @@ mod tests {
             br#"{"user":{"name":"Bob","tags":["user"]},"active":false}"#.to_vec(),
         ];
 
-        let result = codec.decode(complex_json);
+        let result = codec.decode(complex_json).await;
         assert!(result.is_ok());
         let batch = result.unwrap();
 

@@ -7,3 +7,6 @@
 examples/output.txt
 
 .run
+# local git worktrees
+.claude/worktrees/
+.dev/worktree/

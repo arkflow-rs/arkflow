@@ -140,7 +140,7 @@ impl JoinOperation {
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
         let mut result =
-            codec.decode(result.into_iter().map(|x| x.to_vec()).collect::<Vec<_>>())?;
+            codec.decode(result.into_iter().map(|x| x.to_vec()).collect::<Vec<_>>()).await?;
         result.set_input_name(option);
         Ok(result)
     }

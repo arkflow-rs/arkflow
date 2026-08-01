@@ -1,0 +1,39 @@
+## Schema Registry (Confluent wire-format Protobuf)
+#
+# Consumes a Kafka topic whose messages are encoded in Confluent wire format
+# (0x00 magic + 4-byte schema id + Protobuf payload), and decodes each message
+# by resolving its schema id from a Confluent Schema Registry.
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - test-topic
+      consumer_group: arkflow-sr
+      client_id: arkflow-sr
+      start_from_latest: true
+      codec:
+        type: schema_registry
+        registry_url: http://localhost:8081
+        message_type: com.example.User
+        # Optional authentication:
+        # auth:
+        #   type: basic            # or bearer
+        #   username: ${SR_USER}
+        #   password: ${SR_PASS}
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: sql
+          query: "SELECT * FROM flow"
+
+    output:
+      type: stdout
+    error_output:
+      type: stdout

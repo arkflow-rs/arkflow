@@ -90,7 +90,7 @@ impl Output for RedisOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Apply codec encoding if configured
-        let data = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let data = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         let client_lock = self.client.lock().await;
         let Some(cli) = client_lock.as_ref() else {
             return Err(Error::Process(

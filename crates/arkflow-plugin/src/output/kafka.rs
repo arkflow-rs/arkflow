@@ -76,6 +76,29 @@ struct KafkaOutputConfig {
     acks: Option<String>,
     /// Value type
     value_field: Option<String>,
+    /// Enable exactly-once transactional production (L2). Default false.
+    exactly_once: Option<bool>,
+    /// Transactional id (required when exactly_once is true). Must be stable
+    /// across restarts so the broker can fence prior producer epochs.
+    transactional_id: Option<String>,
+}
+
+/// Map a Kafka transaction error to an `Error`, logging which of rdkafka's
+/// three transactional states it is in. Failures return `Err` so the stream
+/// withholds the ack and replays the whole batch (which re-begins a fresh
+/// transaction); the broker fences zombie producers via the stable
+/// transactional.id on restart.
+fn map_kafka_txn_error(e: KafkaError, ctx: &str) -> Error {
+    if let KafkaError::Transaction(rd) = &e {
+        if rd.is_fatal() {
+            error!("Kafka {} fatal (producer must be discarded): {:?}", ctx, e);
+        } else if rd.txn_requires_abort() {
+            error!("Kafka {} requires abort (will replay): {:?}", ctx, e);
+        } else if rd.is_retriable() {
+            error!("Kafka {} retriable (will replay): {:?}", ctx, e);
+        }
+    }
+    Error::Connection(format!("Kafka {} failed: {}", ctx, e))
 }
 
 /// Kafka output component
@@ -165,10 +188,35 @@ impl Output for KafkaOutput {
             client_config.set("acks", acks);
         }
 
+        let exactly_once = self.config.exactly_once.unwrap_or(false);
+
+        // Configure the transactional producer when exactly_once is enabled.
+        // Idempotence is implied by transactional.id but set explicitly.
+        if exactly_once {
+            client_config.set(
+                "transactional.id",
+                self.config.transactional_id.as_ref().expect(
+                    "transactional_id presence is validated by the builder when exactly_once is on",
+                ),
+            );
+            client_config.set("enable.idempotence", "true");
+        }
+
         // Create a producer
-        let producer = client_config
+        let producer: FutureProducer = client_config
             .create()
             .map_err(|e| Error::Connection(format!("A Kafka producer cannot be created: {}", e)))?;
+
+        // Initialize transactions once (blocking broker round-trip).
+        if exactly_once {
+            let p = producer.clone();
+            tokio::task::spawn_blocking(move || {
+                p.init_transactions(Timeout::After(Duration::from_secs(60)))
+            })
+            .await
+            .map_err(|e| Error::Connection(format!("init_transactions task join failed: {}", e)))?
+            .map_err(|e| Error::Connection(format!("Kafka init_transactions failed: {}", e)))?;
+        }
 
         // Save the producer instance
         let producer_arc = self.inner_kafka_output.producer.clone();
@@ -186,7 +234,7 @@ impl Output for KafkaOutput {
         })?;
 
         // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -242,6 +290,24 @@ impl Output for KafkaOutput {
         Ok(())
     }
 
+    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        if !self.config.exactly_once.unwrap_or(false) {
+            // Non-transactional path: default per-message behavior
+            // (continue-on-error), inlined to avoid a Default-trait dance.
+            let mut err = None;
+            for msg in msgs {
+                if let Err(e) = self.write(msg.clone()).await {
+                    err = Some(e);
+                }
+            }
+            return match err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+        }
+        self.write_batch_transactional(msgs).await
+    }
+
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
         // Get the producer and close
@@ -274,6 +340,115 @@ impl Output for KafkaOutput {
     }
 }
 impl KafkaOutput {
+    /// Transactional write: begin → send all → commit. On any failure, abort
+    /// (best-effort) and return Err so the stream withholds the ack and
+    /// replays the whole batch — which re-begins a fresh transaction. Zombie
+    /// producers from a crashed run are fenced by the broker via the stable
+    /// transactional.id on restart.
+    async fn write_batch_transactional(
+        &self,
+        msgs: &[MessageBatchRef],
+    ) -> Result<(), Error> {
+        let producer_guard = self.inner_kafka_output.producer.read().await;
+        let producer = match producer_guard.as_ref() {
+            Some(p) => p,
+            None => {
+                return Err(Error::Connection(
+                    "The Kafka producer is not initialized".to_string(),
+                ));
+            }
+        };
+
+        if let Err(e) = producer.begin_transaction() {
+            return Err(map_kafka_txn_error(e, "begin_transaction"));
+        }
+
+        let mut failed: Option<Error> = None;
+        for msg in msgs {
+            if let Err(e) = self.send_in_transaction(producer, msg.clone()).await {
+                error!("Kafka transactional send failed: {}", e);
+                failed = Some(e);
+                break;
+            }
+        }
+
+        if let Some(e) = failed {
+            // Best-effort abort; the broker fences zombies on restart anyway.
+            let p = producer.clone();
+            drop(producer_guard);
+            if let Err(ab) = tokio::task::spawn_blocking(move || {
+                p.abort_transaction(Timeout::After(Duration::from_secs(30)))
+            })
+            .await
+            {
+                error!("Kafka abort_transaction task join failed: {}", ab);
+            }
+            return Err(e);
+        }
+
+        // Commit (blocking broker round-trip → spawn_blocking).
+        let p = producer.clone();
+        drop(producer_guard);
+        match tokio::task::spawn_blocking(move || {
+            p.commit_transaction(Timeout::After(Duration::from_secs(30)))
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(map_kafka_txn_error(e, "commit_transaction")),
+            Err(e) => Err(Error::Connection(format!(
+                "commit_transaction task join failed: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Send one message's records into the current transaction. Does not
+    /// collect delivery futures — commit_transaction flushes the queue.
+    async fn send_in_transaction(
+        &self,
+        producer: &FutureProducer,
+        msg: MessageBatchRef,
+    ) -> Result<(), Error> {
+        let payloads =
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let topic = self.get_topic(&msg).await?;
+        let key = self.get_key(&msg).await?;
+
+        for (i, x) in payloads.into_iter().enumerate() {
+            let mut record = match &topic {
+                EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+            };
+            match &key {
+                Some(EvaluateResult::Scalar(s)) => record = record.key(s),
+                Some(EvaluateResult::Vec(v)) if i < v.len() => {
+                    record = record.key(&v[i]);
+                }
+                _ => {}
+            }
+
+            loop {
+                match producer.send_result(record) {
+                    Ok(_future) => break,
+                    Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), f)) => {
+                        record = f;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err((e, _)) => {
+                        return Err(Error::Connection(format!(
+                            "Failed to write to Kafka transaction: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn get_topic(&self, msg: &MessageBatch) -> Result<EvaluateResult<String>, Error> {
         self.config.topic.evaluate_expr(msg).await
     }
@@ -304,6 +479,22 @@ impl OutputBuilder for KafkaOutputBuilder {
 
         // Parse the configuration
         let config: KafkaOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+
+        // D5: exactly_once requires a non-empty transactional_id (spec:
+        // "Explicit stable transactional identity").
+        if config.exactly_once.unwrap_or(false) {
+            match &config.transactional_id {
+                Some(id) if !id.trim().is_empty() => {}
+                _ => {
+                    return Err(Error::Config(
+                        "Kafka output: transactional_id is required and must be \
+                         non-empty when exactly_once is true"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
         Ok(Arc::new(KafkaOutput::new(config, codec)?))
     }
 }
@@ -323,7 +514,9 @@ pub fn init() -> Result<(), Error> {
                 "client_id": {"type": "string", "description": "Optional client identifier."},
                 "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4", "zstd"], "description": "Compression algorithm."},
                 "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
-                "value_field": {"type": "string", "description": "Record field used as the message payload."}
+                "value_field": {"type": "string", "description": "Record field used as the message payload."},
+                "exactly_once": {"type": "boolean", "default": false, "description": "Enable exactly-once transactional production (L2)."},
+                "transactional_id": {"type": "string", "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."}
             },
             "required": ["brokers", "topic"]
         }),
@@ -331,4 +524,57 @@ pub fn init() -> Result<(), Error> {
         "brokers": ["localhost:9092"],
         "topic": "events"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: HashMap::new(),
+            input_names: RefCell::new(vec![]),
+        }
+    }
+
+    /// Spec "Explicit stable transactional identity": the builder rejects
+    /// `exactly_once: true` without a non-empty `transactional_id`.
+    #[test]
+    fn rejects_exactly_once_without_transactional_id() {
+        let config = serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"},
+            "exactly_once": true
+        });
+        let err = match KafkaOutputBuilder
+            .build(None, &Some(config), None, &resource())
+        {
+            Ok(_) => panic!(
+                "expected build to fail when exactly_once is set without a transactional_id"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transactional_id"),
+            "expected transactional_id in error, got: {msg}"
+        );
+    }
+
+    /// `exactly_once: true` with a `transactional_id` builds successfully
+    /// (the producer itself is only created at `connect` time).
+    #[tokio::test]
+    async fn accepts_exactly_once_with_transactional_id() {
+        let config = serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"},
+            "exactly_once": true,
+            "transactional_id": "my-tx-id"
+        });
+        let _output = KafkaOutputBuilder
+            .build(None, &Some(config), None, &resource())
+            .expect("build should succeed; producer is created at connect");
+    }
 }

@@ -90,7 +90,7 @@ impl Input for GenerateInput {
 
         // Apply codec if configured
         let mut message_batch =
-            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec)?;
+            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec).await?;
         message_batch.set_input_name(self.input_name.clone());
         Ok((Arc::new(message_batch), Arc::new(NoopAck)))
     }

@@ -1,0 +1,53 @@
+# End-to-end exactly-once (effectively-once) example: Kafka → Kafka.
+#
+# The Kafka output is configured for transactional production (L2):
+#   exactly_once: true + transactional_id
+# All messages within one ack range are committed in a single Kafka transaction,
+# so a read_committed downstream consumer observes them atomically (all or none).
+# On any failure the batch is not acknowledged, the WAL cursor does not advance,
+# and the range is replayed (which re-begins a fresh transaction).
+#
+# transactional_id MUST be stable across restarts: on restart the broker fences
+# the prior producer epoch and aborts its in-flight (zombie) transaction.
+#
+# Honest L2 boundary: a crash AFTER the producer commits but BEFORE the source
+# offset auto-commits can still duplicate (window bounded by the auto-commit
+# interval). A downstream dedup key is recommended for duplicate-intolerant
+# consumers; true end-to-end EOS (L3, send_offsets_to_transaction) is future work.
+#
+# `durability:` persists input messages to a WAL so a crash between read and
+# output does not lose data.
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - orders
+      consumer_group: arkflow-eos
+      start_from_latest: true
+
+    durability:
+      enabled: true
+      path: "./data/wal-eos"
+      sync: group_commit
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: arrow_to_json
+
+    output:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topic:
+        type: value
+        value: orders-copy
+      exactly_once: true
+      transactional_id: arkflow-orders-copy-0   # stable across restarts; unique per producer

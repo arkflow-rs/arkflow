@@ -37,6 +37,27 @@ pub trait Output: Send + Sync {
 
     /// Close the output destination connection
     async fn close(&self) -> Result<(), Error>;
+
+    /// Write a batch of messages that share one acknowledgement.
+    ///
+    /// One `write_batch` call corresponds to one ack range and therefore one
+    /// transaction unit. The default implementation writes each message via
+    /// [`write`](Self::write) in order and returns `Err` if any write failed
+    /// (continue-on-error, retaining the last error), preserving the
+    /// historical per-message behavior. Outputs that need exactly-once
+    /// semantics override this to commit the whole batch atomically.
+    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        let mut err = None;
+        for msg in msgs {
+            if let Err(e) = self.write(msg.clone()).await {
+                err = Some(e);
+            }
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Output configuration

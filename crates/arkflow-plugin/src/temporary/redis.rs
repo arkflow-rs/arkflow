@@ -116,7 +116,7 @@ impl Temporary for RedisTemporary {
             .flatten()
             .map(|s| s.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        let result = self.codec.decode(data)?;
+        let result = self.codec.decode(data).await?;
         Ok(Some(result))
     }
 

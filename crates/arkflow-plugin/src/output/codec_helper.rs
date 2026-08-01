@@ -27,14 +27,14 @@ use std::sync::Arc;
 /// # Returns
 /// * `Ok(Vec<Bytes>)` - Encoded bytes or binary representation
 /// * `Err(Error)` - If codec application fails
-pub fn apply_codec_encode(
+pub async fn apply_codec_encode(
     msg: &MessageBatchRef,
     codec: &Option<Arc<dyn Codec>>,
 ) -> Result<Vec<Bytes>, Error> {
     if let Some(c) = codec {
         // Clone the MessageBatch for encoding
         let msg_clone = (**msg).clone();
-        c.encode(msg_clone)
+        c.encode(msg_clone).await
     } else {
         // Default: convert to binary
         let binary_data = msg.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
@@ -48,14 +48,14 @@ mod tests {
     use super::*;
     use arkflow_core::MessageBatch;
 
-    #[test]
-    fn test_apply_codec_encode_no_codec() {
+    #[tokio::test]
+    async fn test_apply_codec_encode_no_codec() {
         // Create a simple message batch
         let batch = MessageBatch::new_binary(vec![b"test data".to_vec()]).unwrap();
         let msg_ref = std::sync::Arc::new(batch);
         let codec: Option<Arc<dyn Codec>> = None;
 
-        let result = apply_codec_encode(&msg_ref, &codec);
+        let result = apply_codec_encode(&msg_ref, &codec).await;
         assert!(result.is_ok());
 
         let bytes = result.unwrap();

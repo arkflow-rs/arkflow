@@ -367,7 +367,7 @@ impl Input for NatsInput {
                                 let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
                                     &payload,
                                     &self.codec,
-                                )?;
+                                ).await?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
                                 Ok((Arc::new(msg_batch), Arc::new(NatsAck::Regular)))
@@ -379,7 +379,7 @@ impl Input for NatsInput {
                                 let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
                                     &payload,
                                     &self.codec,
-                                )?;
+                                ).await?;
                                 msg_batch.set_input_name(self.input_name.clone());
 
                                 let ack = NatsAck::JetStream {

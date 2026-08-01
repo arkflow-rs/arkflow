@@ -27,12 +27,12 @@ use std::sync::Arc;
 /// # Returns
 /// * `Ok(MessageBatch)` - Decoded or binary-wrapped message batch
 /// * `Err(Error)` - If codec application fails
-pub fn apply_codec_to_payload(
+pub async fn apply_codec_to_payload(
     payload: &[u8],
     codec: &Option<Arc<dyn Codec>>,
 ) -> Result<MessageBatch, Error> {
     if let Some(c) = codec {
-        c.decode(vec![payload.to_vec()])
+        c.decode(vec![payload.to_vec()]).await
     } else {
         MessageBatch::new_binary(vec![payload.to_vec()])
     }
@@ -47,12 +47,12 @@ pub fn apply_codec_to_payload(
 /// # Returns
 /// * `Ok(MessageBatch)` - Decoded or binary-wrapped message batch
 /// * `Err(Error)` - If codec application fails
-pub fn apply_codec_to_payloads(
+pub async fn apply_codec_to_payloads(
     payloads: Vec<Bytes>,
     codec: &Option<Arc<dyn Codec>>,
 ) -> Result<MessageBatch, Error> {
     if let Some(c) = codec {
-        c.decode(payloads)
+        c.decode(payloads).await
     } else {
         MessageBatch::new_binary(payloads)
     }
@@ -62,24 +62,24 @@ pub fn apply_codec_to_payloads(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_apply_codec_to_payload_no_codec() {
+    #[tokio::test]
+    async fn test_apply_codec_to_payload_no_codec() {
         let payload = b"test data";
         let codec: Option<Arc<dyn Codec>> = None;
 
-        let result = apply_codec_to_payload(payload, &codec);
+        let result = apply_codec_to_payload(payload, &codec).await;
         assert!(result.is_ok());
 
         let batch = result.unwrap();
         assert_eq!(batch.len(), 1);
     }
 
-    #[test]
-    fn test_apply_codec_to_payloads_no_codec() {
+    #[tokio::test]
+    async fn test_apply_codec_to_payloads_no_codec() {
         let payloads = vec![b"data1".to_vec(), b"data2".to_vec()];
         let codec: Option<Arc<dyn Codec>> = None;
 
-        let result = apply_codec_to_payloads(payloads, &codec);
+        let result = apply_codec_to_payloads(payloads, &codec).await;
         assert!(result.is_ok());
 
         let batch = result.unwrap();
