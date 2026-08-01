@@ -109,4 +109,6 @@ num_cpus = "1.17.0"
 
 [dev-dependencies]
 mockall = { workspace = true }
+serial_test = "4.0.1"
+testcontainers = "0.27.3"
 wiremock = "0.6"

@@ -181,7 +181,7 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 | **1 CDC** | ✅ 全流程闭环 | `changes/archive/2026-07-31-add-cdc-debezium`；spec `debezium-cdc-parsing` 已合并 `openspec/specs/` | `debezium_json` codec，复用 Kafka input + ack-gated offset |
 | **前置 refactor** | ✅ 全流程闭环 | `changes/archive/2026-07-31-refactor-codec-async`；spec `async-codec-contract` 已合并 | Codec trait async 化，**纯重构无行为变更**；为 schema_registry 解锁 reqwest async |
 | **2 Schema Registry** | ✅ 全流程闭环 | `changes/archive/2026-07-31-add-schema-registry`；spec `schema-registry-integration` 已合并 | reqwest async + `SchemaResolver` trait；认证 HTTP mock 测试（wiremock） |
-| **3 端到端 EOS** | ⏳ 待 propose | — | 聚焦 output 幂等适配 |
+| **3 端到端 EOS** | 🚧 实现 done，待 verify/archive | `changes/add-end-to-end-exactly-once` | Phase 1（write_batch 地基）✅ + Phase 2（Kafka 事务 producer）✅ + Phase 3（cp-kafka testcontainers 集成测试：smoke/atomic/fencing/dup，4 项本地通过）✅ + Phase 4（example/CLAUDE.md）✅ |
 | **4 状态 checkpoint** | ⏳ 待 propose | — | 最重、推最后；守单节点 |
 
 ### 已确认决策
@@ -189,6 +189,7 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。
 - 状态 checkpoint（Change 4）保留完整内容、推最后；守「单节点、不引入分布式」。
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
+- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 复用现有 upsert（零代码）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future。
 
 ### 下一步
-propose Change 3（端到端 EOS）→ Change 4（状态 checkpoint）。
+Change 3 EOS：实现完成（Phase 1-4 全 done；Phase 3 用 cp-kafka testcontainers 替代 redpanda——Kafka 事务参考实现 + CI 可拉 + 协议兼容，EOS 语义等价）。下一步 `openspec verify` → archive（spec `exactly-once-output` 合并主 specs）→ propose Change 4（状态 checkpoint）。

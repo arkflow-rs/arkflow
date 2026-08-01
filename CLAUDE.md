@@ -337,6 +337,7 @@ When creating new plugins, the registration pattern is consistent across all com
    - Key-based partitioning
    - Compression options
    - Acknowledgment levels
+   - Exactly-once transactional production (L2): opt-in via `exactly_once: true` + `transactional_id`; one ack range = one Kafka transaction (see `examples/eos-kafka.yaml`)
 
 5. **MQTT** - MQTT publisher
    - QoS levels
