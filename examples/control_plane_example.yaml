@@ -1,0 +1,21 @@
+logging:
+  level: info
+health_check:
+  enabled: true
+  address: "127.0.0.1:8080"
+  api_prefix: "/api/v1"
+  # Set this in deployments exposed beyond localhost.
+  # api_token: "replace-me"
+streams:
+  - id: demo-events
+    input:
+      type: generate
+      context: '{"value": 1}'
+      interval: 1s
+      batch_size: 1
+      count: 10
+    pipeline:
+      thread_num: 1
+      processors: []
+    output:
+      type: stdout

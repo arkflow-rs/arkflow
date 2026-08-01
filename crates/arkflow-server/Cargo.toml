@@ -1,0 +1,16 @@
+[package]
+name = "arkflow-server"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+arkflow-core = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+

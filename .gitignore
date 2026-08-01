@@ -10,3 +10,8 @@ examples/output.txt
 # local git worktrees
 .claude/worktrees/
 .dev/worktree/
+
+# Node / frontend
+node_modules/
+console/dist/
+*.tsbuildinfo

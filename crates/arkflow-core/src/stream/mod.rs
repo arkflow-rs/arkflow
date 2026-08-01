@@ -18,6 +18,7 @@
 
 use crate::buffer::Buffer;
 use crate::input::{Ack, NoopAck};
+use crate::runtime::RuntimeMetrics;
 use crate::wal::{Wal, WalAck, WalConfig};
 use crate::{
     input::Input, output::Output, pipeline::Pipeline, Error, MessageBatchRef, ProcessResult,
@@ -51,6 +52,7 @@ pub struct Stream {
     /// `do_processor` worker blocked on backpressure wakes immediately
     /// instead of sleep-polling.
     next_seq_notify: Arc<Notify>,
+    metrics: Option<Arc<RuntimeMetrics>>,
 }
 
 enum ProcessorData {
@@ -82,7 +84,14 @@ impl Stream {
             sequence_counter: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
             next_seq_notify: Arc::new(Notify::new()),
+            metrics: None,
         }
+    }
+
+    /// Attach non-blocking runtime counters before starting the Stream.
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Running stream processing
@@ -148,6 +157,7 @@ impl Stream {
                 self.sequence_counter.clone(),
                 self.next_seq.clone(),
                 self.next_seq_notify.clone(),
+                self.metrics.clone(),
             ));
         }
 
@@ -161,6 +171,7 @@ impl Stream {
             output_receiver,
             self.output.clone(),
             self.error_output.clone(),
+            self.metrics.clone(),
         ));
 
         // WAL recovery. Failures here MUST cancel already-spawned workers
@@ -203,6 +214,7 @@ impl Stream {
             input_sender,
             self.buffer.clone(),
             self.wal.clone(),
+            self.metrics.clone(),
         ));
 
         tracker.close();
@@ -235,6 +247,7 @@ impl Stream {
         input_sender: Sender<(MessageBatchRef, Arc<dyn Ack>)>,
         buffer_option: Option<Arc<dyn Buffer>>,
         wal: Option<Arc<Wal>>,
+        metrics: Option<Arc<RuntimeMetrics>>,
     ) {
         loop {
             tokio::select! {
@@ -244,6 +257,10 @@ impl Stream {
                 result = input.read() =>{
                     match result {
                     Ok((msg, ack)) => {
+                            if let Some(metrics) = &metrics {
+                                metrics.input_batches.fetch_add(1, Ordering::Relaxed);
+                                metrics.input_messages.fetch_add(msg.len() as u64, Ordering::Relaxed);
+                            }
                             let ack: Arc<dyn Ack> = if let Some(wal) = &wal {
                                 match wal.append(&msg).await {
                                     Ok(seq) => Arc::new(WalAck::new(wal.clone(), seq, ack)),
@@ -271,20 +288,32 @@ impl Stream {
                             Error::Disconnection => loop {
                                 match input.connect().await {
                                     Ok(_) => {
+                                        if let Some(metrics) = &metrics {
+                                            metrics.input_reconnects.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         info!("input reconnected");
                                         break;
                                     }
                                     Err(e) => {
+                                        if let Some(metrics) = &metrics {
+                                            metrics.input_errors.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         error!("{}", e);
                                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                     }
                                 };
                             },
                             Error::Config(e) => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.input_errors.fetch_add(1, Ordering::Relaxed);
+                                }
                                 error!("{}", e);
                                 break;
                             }
                             _ => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.input_errors.fetch_add(1, Ordering::Relaxed);
+                                }
                                 error!("{}", e);
                             }
                         };
@@ -345,6 +374,7 @@ impl Stream {
         sequence_counter: Arc<AtomicU64>,
         next_seq: Arc<AtomicU64>,
         next_seq_notify: Arc<Notify>,
+        metrics: Option<Arc<RuntimeMetrics>>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
@@ -395,6 +425,9 @@ impl Stream {
                     }
                 }
                 Err(e) => {
+                    if let Some(metrics) = &metrics {
+                        metrics.processing_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Err(e) = output_sender
                         .send_async((ProcessorData::Err(msg, e), ack, seq))
                         .await
@@ -414,13 +447,14 @@ impl Stream {
         output_receiver: Receiver<(ProcessorData, Arc<dyn Ack>, u64)>,
         output: Arc<dyn Output>,
         err_output: Option<Arc<dyn Output>>,
+        metrics: Option<Arc<RuntimeMetrics>>,
     ) {
         let mut tree_map: BTreeMap<u64, (ProcessorData, Arc<dyn Ack>)> = BTreeMap::new();
 
         loop {
             let Ok((data, new_ack, new_seq)) = output_receiver.recv_async().await else {
                 for (_, (data, x)) in tree_map {
-                    Self::output(data, &x, &output, err_output.as_ref()).await;
+                    Self::output(data, &x, &output, err_output.as_ref(), metrics.as_ref()).await;
                 }
                 break;
             };
@@ -440,7 +474,7 @@ impl Stream {
                     break;
                 };
 
-                Self::output(data, &ack, &output, err_output.as_ref()).await;
+                Self::output(data, &ack, &output, err_output.as_ref(), metrics.as_ref()).await;
                 next_seq.fetch_add(1, Ordering::Release);
                 next_seq_notify.notify_one();
             }
@@ -454,10 +488,14 @@ impl Stream {
         ack: &Arc<dyn Ack>,
         output: &Arc<dyn Output>,
         err_output: Option<&Arc<dyn Output>>,
+        metrics: Option<&Arc<RuntimeMetrics>>,
     ) {
         match data {
             ProcessorData::Err(msg, e) => match err_output {
                 None => {
+                    if let Some(metrics) = metrics {
+                        metrics.output_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Err(err) = ack.ack().await {
                         error!("Failed to ack errored message: {}", err);
                     }
@@ -470,11 +508,21 @@ impl Stream {
                         }
                     }
                     Err(e) => {
+                        if let Some(metrics) = metrics {
+                            metrics.output_errors.fetch_add(1, Ordering::Relaxed);
+                        }
                         error!("{}", e);
                     }
                 },
             },
             ProcessorData::Ok(msgs) => {
+                if let Some(metrics) = metrics {
+                    metrics.output_batches.fetch_add(1, Ordering::Relaxed);
+                    metrics.output_messages.fetch_add(
+                        msgs.iter().map(|msg| msg.len() as u64).sum(),
+                        Ordering::Relaxed,
+                    );
+                }
                 match output.write_batch(&msgs).await {
                     Ok(_) => {
                         if let Err(e) = ack.ack().await {
@@ -482,6 +530,9 @@ impl Stream {
                         }
                     }
                     Err(e) => {
+                        if let Some(metrics) = metrics {
+                            metrics.output_errors.fetch_add(1, Ordering::Relaxed);
+                        }
                         error!("{}", e);
                     }
                 }
@@ -685,7 +736,7 @@ mod tests {
             Arc::new(sample_batch()),
         ];
 
-        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None).await;
+        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None, None).await;
 
         assert_eq!(
             output.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -716,7 +767,7 @@ mod tests {
         let ack: Arc<dyn crate::input::Ack> = counting.clone();
         let msgs = vec![Arc::new(sample_batch()) as MessageBatchRef];
 
-        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None).await;
+        Stream::output(ProcessorData::Ok(msgs), &ack, &out_ref, None, None).await;
 
         assert_eq!(
             output.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1323,6 +1374,7 @@ mod tests {
                 sequence_counter,
                 next_seq,
                 notify,
+                None,
             )
             .await
         });
@@ -1383,7 +1435,7 @@ mod tests {
         let next_seq_check = next_seq.clone();
         let notify_check = notify.clone();
         tokio::spawn(async move {
-            Stream::do_output(next_seq, notify, output_rx, output, None).await
+            Stream::do_output(next_seq, notify, output_rx, output, None, None).await
         });
 
         // do_output writes seq=0, advances next_seq to 1, fires notify_one.
@@ -1399,6 +1451,11 @@ mod tests {
 /// Stream configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamConfig {
+    /// Stable logical identifier used by the control plane. Older
+    /// configurations may omit this field and receive a deterministic
+    /// `stream-<index>` identifier at runtime.
+    #[serde(default)]
+    pub id: Option<String>,
     pub input: crate::input::InputConfig,
     pub pipeline: crate::pipeline::PipelineConfig,
     pub output: crate::output::OutputConfig,
@@ -1409,6 +1466,32 @@ pub struct StreamConfig {
 }
 
 impl StreamConfig {
+    /// Return the configured ID, or the deterministic compatibility ID for a
+    /// legacy configuration that does not contain one.
+    pub fn effective_id(&self, index: usize) -> String {
+        self.id.clone().unwrap_or_else(|| format!("stream-{index}"))
+    }
+
+    /// Validate the configured ID when present. IDs are intentionally kept
+    /// URL-safe because they are also used as control-plane resource names.
+    pub fn validate_id(&self, index: usize) -> Result<(), Error> {
+        let Some(id) = &self.id else {
+            return Ok(());
+        };
+
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(Error::Config(format!(
+                "Invalid stream id '{}' at index {}; use non-empty letters, numbers, '-' or '_'",
+                id, index
+            )));
+        }
+        Ok(())
+    }
+
     /// Build stream based on configuration
     pub fn build(&self) -> Result<Stream, Error> {
         let mut resource = Resource {
