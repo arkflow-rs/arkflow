@@ -83,7 +83,7 @@ async-nats = "0.46"
 
 # Pulsar
 pulsar = "6.6"
-rand = "0.9"
+rand = "0.10"
 
 
 # modbus
