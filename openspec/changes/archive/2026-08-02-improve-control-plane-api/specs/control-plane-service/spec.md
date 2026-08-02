@@ -1,20 +1,4 @@
-# Purpose
-
-Define the dedicated ArkFlow control-plane service boundary, resource API, runtime operations, and transport security behavior.
-
-# Requirements
-
-### Requirement: Dedicated control-plane service boundary
-
-The system SHALL expose control-plane HTTP transport from arkflow-server through a domain facade, and arkflow-core::Engine SHALL remain usable without constructing an HTTP Router. Health, readiness, and liveness endpoints SHALL remain available for compatibility.
-
-#### Scenario: Start the control-plane service
-- **WHEN** the ArkFlow binary starts with control-plane settings enabled
-- **THEN** it starts the Engine domain and the dedicated server using one configured listener
-
-#### Scenario: Embed the Engine without HTTP
-- **WHEN** a caller constructs and runs the Engine domain in a library context
-- **THEN** no Axum Router or listener is required
+## MODIFIED Requirements
 
 ### Requirement: Resource-oriented system API
 
@@ -22,7 +6,7 @@ The API SHALL expose versioned resources for system identity, runtime nodes, Str
 
 #### Scenario: Discover the control-plane resources
 - **WHEN** a client requests /api/v1/system and /api/v1/nodes
-- **THEN** it receives node identity, version, capabilities, health state, and runtime summary
+- **THEN** it receives node identity, version, capabilities, health state, and runtime summary in stable resource/envelope shapes
 
 #### Scenario: List many Streams
 - **WHEN** a client requests /api/v1/streams?page=2&page_size=20
@@ -35,18 +19,6 @@ The API SHALL expose versioned resources for system identity, runtime nodes, Str
 #### Scenario: Read metrics through the versioned API
 - **WHEN** a client requests /api/v1/metrics
 - **THEN** it receives aggregate and per-node metrics using the same authentication, correlation, and routing rules as other control resources
-
-### Requirement: Desired and observed lifecycle state
-
-Each Stream resource SHALL expose desired state, observed state, transition timestamps, active operation ID, metrics, and bounded recent errors. Lifecycle commands SHALL be idempotent and SHALL return an operation representation.
-
-#### Scenario: Start a stopped Stream
-- **WHEN** a client posts a start command for a stopped Stream
-- **THEN** the API returns an operation ID and the Stream transitions from stopped to starting to running
-
-#### Scenario: Repeat an active command
-- **WHEN** a client repeats the same lifecycle command while an equivalent operation is active
-- **THEN** the API returns the existing operation or a conflict response without spawning a duplicate task
 
 ### Requirement: Operations and events
 

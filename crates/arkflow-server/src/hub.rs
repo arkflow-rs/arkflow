@@ -505,6 +505,34 @@ impl Hub {
     pub async fn operation(&self, id: &str) -> Option<HubOperation> {
         self.operations.read().await.get(id).cloned()
     }
+
+    pub async fn cancel_operation(&self, id: &str) -> Option<HubOperation> {
+        let mut operations = self.operations.write().await;
+        let operation = operations.get_mut(id)?;
+        if matches!(
+            operation.state,
+            HubOperationState::Succeeded
+                | HubOperationState::Failed
+                | HubOperationState::TimedOut
+                | HubOperationState::NodeUnavailable
+                | HubOperationState::Cancelled
+        ) {
+            return Some(operation.clone());
+        }
+        operation.state = HubOperationState::Cancelled;
+        operation.finished_at_ms = Some(now_ms());
+        let node_id = operation.node_id.clone();
+        let command_id = operation.command_id.clone();
+        let cancelled = operation.clone();
+        drop(operations);
+
+        let mut nodes = self.nodes.write().await;
+        if let Some(node) = nodes.get_mut(&node_id) {
+            node.commands.retain(|command| command.id != command_id);
+        }
+        Some(cancelled)
+    }
+
     pub async fn events(&self, node_id: Option<&str>) -> Vec<HubEvent> {
         self.events
             .read()

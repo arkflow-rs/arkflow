@@ -11,7 +11,7 @@ use arkflow_core::configuration::redacted_config;
 use arkflow_core::configuration::{parse_and_validate, ConfigCandidate};
 use arkflow_core::control::{ApiError, Page};
 use arkflow_core::control_plane::ControlPlane;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -147,12 +147,29 @@ struct DiffQuery {
     to: String,
 }
 
+fn page_items<T>(items: Vec<T>, query: &PageQuery) -> Page<T> {
+    let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    Page {
+        items: items
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .collect(),
+        page,
+        page_size,
+        total,
+    }
+}
+
 pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
     let prefix = config.api_prefix.trim_end_matches('/');
     let api = Router::new()
         .route("/system", get(system))
         .route("/status", get(status))
-        .route("/nodes", get(node))
+        .route("/nodes", get(nodes))
+        .route("/node", get(node))
         .route("/streams", get(streams))
         .route("/streams/{id}", get(stream))
         .route("/streams/{id}/start", post(start_stream))
@@ -180,6 +197,7 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
         .route("/components", get(components))
         .route("/components/{kind}/{name}", get(component))
         .route("/schema", get(schema))
+        .route("/metrics", get(metrics))
         .with_state(control_plane.clone());
 
     let mut app = Router::new()
@@ -248,6 +266,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         )
         .route("/operations", get(hub_operations))
         .route("/operations/{id}", get(hub_operation))
+        .route("/operations/{id}", delete(hub_cancel_operation))
         .route("/events", get(hub_events))
         .route("/metrics", get(hub_metrics))
         .route("/agent/register", post(agent_register))
@@ -318,7 +337,11 @@ async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
     ).into_response()
 }
 
-async fn hub_nodes(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+async fn hub_nodes(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !hub.operator_authorized(bearer(&headers)) {
         return problem(
             StatusCode::UNAUTHORIZED,
@@ -326,15 +349,7 @@ async fn hub_nodes(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response 
             "A valid operator token is required".into(),
         );
     }
-    let items = hub.nodes().await;
-    let total = items.len();
-    Json(Page {
-        items,
-        page: 1,
-        page_size: total.max(1),
-        total,
-    })
-    .into_response()
+    Json(page_items(hub.nodes().await, &query)).into_response()
 }
 
 async fn hub_streams(
@@ -589,6 +604,28 @@ async fn hub_operation(
     }
 }
 
+async fn hub_cancel_operation(
+    State(hub): State<hub::Hub>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.cancel_operation(&id).await {
+        Some(operation) => Json(operation).into_response(),
+        None => problem(
+            StatusCode::NOT_FOUND,
+            "operation_not_found",
+            format!("Unknown operation: {id}"),
+        ),
+    }
+}
+
 async fn hub_events(
     State(hub): State<hub::Hub>,
     Query(query): Query<EventQuery>,
@@ -729,6 +766,13 @@ async fn status(State(cp): State<ControlPlane>) -> Json<arkflow_core::control::E
 }
 async fn node(State(cp): State<ControlPlane>) -> Json<arkflow_core::control::NodeResource> {
     Json(cp.node().await)
+}
+
+async fn nodes(
+    State(cp): State<ControlPlane>,
+    Query(query): Query<PageQuery>,
+) -> Json<Page<arkflow_core::control::NodeResource>> {
+    Json(page_items(vec![cp.node().await], &query))
 }
 
 async fn streams(
@@ -1146,11 +1190,44 @@ async fn correlation_middleware(mut request: Request<Body>, next: Next) -> Respo
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         request.headers_mut().insert("x-correlation-id", value);
     }
-    let mut response = next.run(request).await;
-    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
-        response.headers_mut().insert("x-correlation-id", value);
+    let response = next.run(request).await;
+    let (mut parts, body) = response.into_parts();
+    let body_bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+    let mut replacement = None;
+    if parts.status.is_client_error() || parts.status.is_server_error() {
+        match serde_json::from_slice::<ApiError>(&body_bytes) {
+            Ok(mut error) => {
+                if error.correlation_id.is_none() {
+                    error.correlation_id = Some(correlation_id.clone());
+                }
+                replacement = serde_json::to_vec(&error).ok();
+            }
+            Err(_) if parts.status == StatusCode::BAD_REQUEST => {
+                replacement = serde_json::to_vec(&ApiError {
+                    code: "invalid_query".into(),
+                    message: "Request query or body is invalid".into(),
+                    field: None,
+                    stream_id: None,
+                    correlation_id: Some(correlation_id.clone()),
+                })
+                .ok();
+            }
+            Err(_) => {}
+        }
     }
-    response
+    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+        parts.headers.insert("x-correlation-id", value);
+    }
+    if replacement.is_some() {
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    Response::from_parts(
+        parts,
+        Body::from(replacement.unwrap_or_else(|| body_bytes.to_vec())),
+    )
 }
 
 #[cfg(test)]
@@ -1193,6 +1270,22 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes?page=1&page_size=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let nodes: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes["total"], 1);
+        assert_eq!(nodes["items"].as_array().unwrap().len(), 1);
+        assert_eq!(nodes["items"][0]["id"], "local-node");
         assert_eq!(
             app.oneshot(
                 axum::http::Request::get("/health")
@@ -1236,6 +1329,24 @@ mod tests {
         assert_eq!(value["page"], 2);
         assert_eq!(value["page_size"], 1);
         assert!(value["items"].is_array());
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes?page=not-a-number")
+                    .header("x-correlation-id", "invalid-page")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "invalid_query");
+        assert_eq!(error["correlation_id"], "invalid-page");
 
         let response = app
             .oneshot(
@@ -1598,6 +1709,23 @@ mod tests {
             .map(|stream| stream["node_id"].as_str().unwrap())
             .collect();
         assert_eq!(stream_nodes, vec!["node-a", "node-b"]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes?page=2&page_size=1")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let nodes_page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes_page["total"], 2);
+        assert_eq!(nodes_page["items"].as_array().unwrap().len(), 1);
 
         let response = app
             .clone()
