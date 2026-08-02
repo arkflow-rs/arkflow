@@ -59,9 +59,7 @@ const KAFKA_HOST_PORT: u16 = 9092;
 static BROKER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 
 async fn broker() {
-    BROKER
-        .get_or_init(start_broker)
-        .await;
+    BROKER.get_or_init(start_broker).await;
 }
 
 /// Register all output builders exactly once.
@@ -244,7 +242,7 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
                 }
             }
             Ok(Err(_)) => {} // transient (mid-rebalance); keep going
-            Err(_) => {}    // per-poll timeout; keep going until overall deadline
+            Err(_) => {}     // per-poll timeout; keep going until overall deadline
         }
     }
     n
@@ -284,11 +282,7 @@ async fn atomic_commit_observes_whole_batch() {
 
     let output = build_output(&topic, true, Some(&tx_id)).await;
     output
-        .write_batch(&[
-            binary_batch(b"a"),
-            binary_batch(b"b"),
-            binary_batch(b"c"),
-        ])
+        .write_batch(&[binary_batch(b"a"), binary_batch(b"b"), binary_batch(b"c")])
         .await
         .expect("transactional write_batch");
     output.close().await.expect("output close");

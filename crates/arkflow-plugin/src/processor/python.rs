@@ -59,7 +59,7 @@ impl Processor for PythonProcessor {
                     .call1((py_batch,))
                     .map_err(|e| Error::Process(format!("Python function call failed: {}", e)))?;
 
-                let py_list = result.downcast::<PyList>().map_err(|_| {
+                let py_list = result.cast::<PyList>().map_err(|_| {
                     Error::Process("Failed to downcast Python result to PyList".to_string())
                 })?;
                 let vec_rb = py_list
@@ -81,7 +81,7 @@ impl Processor for PythonProcessor {
 
         let vec_mb = result
             .into_iter()
-            .map(|rb| MessageBatch::new_arrow(rb))
+            .map(MessageBatch::new_arrow)
             .collect::<Vec<_>>();
 
         if vec_mb.is_empty() {
@@ -112,7 +112,7 @@ impl PythonProcessor {
                 .getattr("path")
                 .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
             let path = binding
-                .downcast::<PyList>()
+                .cast::<PyList>()
                 .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
             path.insert(0, ".").unwrap();
             let _ = &config
@@ -122,7 +122,7 @@ impl PythonProcessor {
 
             // Get the Python module either from the script or from an imported module
             let py_module = py.import(&config.module).map_err(|e| {
-                Error::Process(format!("Failed to import {} module: {}", &config.module, e))
+                Error::Process(format!("Failed to import {} module: {}", config.module, e))
             })?;
 
             if let Some(script) = &config.script {
@@ -136,7 +136,7 @@ impl PythonProcessor {
             let func = py_module.getattr(&config.function).map_err(|e| {
                 Error::Process(format!(
                     "Failed to get function '{}': {}",
-                    &config.function, e
+                    config.function, e
                 ))
             })?;
 

@@ -27,7 +27,7 @@ pub(crate) fn try_to_arrow(
     let (mut inferred_schema, _) =
         arrow_json::reader::infer_json_schema(&mut cursor_for_inference, Some(1))
             .map_err(|e| Error::Process(format!("Schema inference error: {}", e)))?;
-    if let Some(ref set) = fields_to_include {
+    if let Some(set) = fields_to_include {
         inferred_schema = inferred_schema
             .project(
                 &set.iter()
@@ -43,9 +43,7 @@ pub(crate) fn try_to_arrow(
         .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
 
     let result = reader
-        .map(|batch| {
-            Ok(batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?)
-        })
+        .map(|batch| batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e))))
         .collect::<Result<Vec<RecordBatch>, Error>>()?;
     if result.is_empty() {
         return Ok(RecordBatch::new_empty(inferred_schema));

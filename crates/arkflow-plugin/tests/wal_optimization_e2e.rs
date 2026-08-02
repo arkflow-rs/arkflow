@@ -135,17 +135,16 @@ fn run_with_config(label: &str, osc: ObjectStoreWalConfig) {
 
     let payload = make_payload();
     for i in 1u64..=20 {
-        store.append_batch(vec![(i, payload.clone())]).expect("append");
+        store
+            .append_batch(vec![(i, payload.clone())])
+            .expect("append");
     }
 
     // Wait for PUT workers to drain
     std::thread::sleep(Duration::from_millis(500));
 
     let replayed = store.read_after_cursor().expect("read_after_cursor");
-    println!(
-        "    replayed {} entries (expected 20)",
-        replayed.len()
-    );
+    println!("    replayed {} entries (expected 20)", replayed.len());
     assert_eq!(replayed.len(), 20);
 
     store.close().expect("close");

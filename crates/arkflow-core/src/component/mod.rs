@@ -332,10 +332,13 @@ pub fn build_config_schema() -> serde_json::Value {
                 "additionalProperties": false,
                 "properties": {
                     "enabled": {"type": "boolean", "default": true},
-                    "address": {"type": "string", "default": "0.0.0.0:8080"},
+                    "address": {"type": "string", "default": "127.0.0.1:8080"},
                     "health_path": {"type": "string", "default": "/health"},
                     "readiness_path": {"type": "string", "default": "/readiness"},
-                    "liveness_path": {"type": "string", "default": "/liveness"}
+                    "liveness_path": {"type": "string", "default": "/liveness"},
+                    "api_prefix": {"type": "string", "default": "/api/v1"},
+                    "api_token": {"type": "string", "writeOnly": true},
+                    "cors_origins": {"type": "array", "items": {"type": "string"}, "default": []}
                 }
             },
             "streams": {
@@ -415,6 +418,11 @@ pub fn build_config_schema() -> serde_json::Value {
             "additionalProperties": false,
             "required": ["input", "output", "pipeline"],
             "properties": {
+                "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                    "description": "Stable logical identifier for control-plane operations."
+                },
                 "input": {"$ref": "#/$defs/input"},
                 "output": {"$ref": "#/$defs/output"},
                 "error_output": {"$ref": "#/$defs/output"},

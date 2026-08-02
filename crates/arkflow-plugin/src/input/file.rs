@@ -23,7 +23,7 @@ use arkflow_core::{
 use async_trait::async_trait;
 use ballista::prelude::SessionContextExt;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::execution::options::{ArrowReadOptions, NdJsonReadOptions};
+use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::{
     AvroReadOptions, CsvReadOptions, DataFrame, ParquetReadOptions, SQLOptions, SessionContext,
@@ -154,6 +154,7 @@ struct FileInput {
     config: FileInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
+    #[allow(dead_code)]
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -216,7 +217,7 @@ impl FileInput {
                 }
             }
             InputType::Json(ref c) => {
-                let options = NdJsonReadOptions::default();
+                let options = JsonReadOptions::default();
                 if let Some(ref query) = self.config.query {
                     ctx.register_json(&query.table, &c.path, options)
                         .await
@@ -286,9 +287,8 @@ impl FileInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
 
-        let object_store_url =
-            ObjectStoreUrl::parse(format!("s3://{}", &aws_s3_config.bucket_name))
-                .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
+        let object_store_url = ObjectStoreUrl::parse(format!("s3://{}", aws_s3_config.bucket_name))
+            .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(s3));
         Ok(())
@@ -326,7 +326,7 @@ impl FileInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create GCS client: {}", e)))?;
 
-        let object_store_url = ObjectStoreUrl::parse(format!("gs://{}", &config.bucket_name))
+        let object_store_url = ObjectStoreUrl::parse(format!("gs://{}", config.bucket_name))
             .map_err(|e| Error::Config(format!("Failed to parse GCS URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(google_cloud_storage));
@@ -358,7 +358,7 @@ impl FileInput {
             .build()
             .map_err(|e| Error::Config(format!("Failed to create AZ client: {}", e)))?;
 
-        let object_store_url = ObjectStoreUrl::parse(format!("az://{}", &config.container_name))
+        let object_store_url = ObjectStoreUrl::parse(format!("az://{}", config.container_name))
             .map_err(|e| Error::Config(format!("Failed to parse AZ URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(azure_storage));

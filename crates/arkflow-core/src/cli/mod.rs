@@ -26,6 +26,10 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn config(&self) -> Option<EngineConfig> {
+        self.config.clone()
+    }
+
     pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let matches = Command::new("arkflow")
             .version("0.4.0-rc1")
@@ -263,7 +267,7 @@ fn print_component_details(
 }
 
 use crate::Error;
-fn init_logging(config: &EngineConfig) {
+pub fn init_logging(config: &EngineConfig) {
     let log_level = match config.logging.level.as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,

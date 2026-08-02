@@ -22,7 +22,7 @@ use arkflow_core::{
     codec::Codec,
     component::{register_output_metadata, ComponentMetadata},
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatch, MessageBatchRef, Resource,
 };
 
 use crate::expr::{EvaluateResult, Expr};
@@ -171,7 +171,7 @@ impl Output for KafkaOutput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the client ID
         if let Some(client_id) = &self.config.client_id {
@@ -247,7 +247,7 @@ impl Output for KafkaOutput {
             // Create record
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
             };
 
             // Add key if available
@@ -345,10 +345,7 @@ impl KafkaOutput {
     /// replays the whole batch — which re-begins a fresh transaction. Zombie
     /// producers from a crashed run are fenced by the broker via the stable
     /// transactional.id on restart.
-    async fn write_batch_transactional(
-        &self,
-        msgs: &[MessageBatchRef],
-    ) -> Result<(), Error> {
+    async fn write_batch_transactional(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
         let producer_guard = self.inner_kafka_output.producer.read().await;
         let producer = match producer_guard.as_ref() {
             Some(p) => p,
@@ -410,8 +407,7 @@ impl KafkaOutput {
         producer: &FutureProducer,
         msg: MessageBatchRef,
     ) -> Result<(), Error> {
-        let payloads =
-            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
             return Ok(());
         }
@@ -421,7 +417,7 @@ impl KafkaOutput {
         for (i, x) in payloads.into_iter().enumerate() {
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
             };
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
@@ -548,12 +544,10 @@ mod tests {
             "topic": {"type": "value", "value": "t"},
             "exactly_once": true
         });
-        let err = match KafkaOutputBuilder
-            .build(None, &Some(config), None, &resource())
-        {
-            Ok(_) => panic!(
-                "expected build to fail when exactly_once is set without a transactional_id"
-            ),
+        let err = match KafkaOutputBuilder.build(None, &Some(config), None, &resource()) {
+            Ok(_) => {
+                panic!("expected build to fail when exactly_once is set without a transactional_id")
+            }
             Err(e) => e,
         };
         let msg = format!("{err}");

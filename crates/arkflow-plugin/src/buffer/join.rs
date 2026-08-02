@@ -125,10 +125,8 @@ impl JoinOperation {
             return Ok(result_batches[0].clone());
         }
 
-        Ok(
-            arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
-        )
+        arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
+            .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))
     }
 
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {
@@ -139,8 +137,9 @@ impl JoinOperation {
                 .as_deref()
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
-        let mut result =
-            codec.decode(result.into_iter().map(|x| x.to_vec()).collect::<Vec<_>>()).await?;
+        let mut result = codec
+            .decode(result.into_iter().map(|x| x.to_vec()).collect::<Vec<_>>())
+            .await?;
         result.set_input_name(option);
         Ok(result)
     }

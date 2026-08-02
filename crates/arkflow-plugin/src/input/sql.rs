@@ -129,6 +129,7 @@ pub struct SqlInput {
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
+    #[allow(dead_code)]
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -242,16 +243,14 @@ impl SqlInput {
             InputType::Duckdb(ref c) => {
                 let duckdb_pool = Arc::new(
                     DuckDbConnectionPool::new_file(&c.path, &AccessMode::ReadOnly).map_err(
-                        |e| {
-                            return Error::Config(format!("Failed to create duckdb pool: {}", e));
-                        },
+                        |e| Error::Config(format!("Failed to create duckdb pool: {}", e)),
                     )?,
                 );
 
                 let catalog = DatabaseCatalogProvider::try_new(duckdb_pool)
                     .await
                     .map_err(|e| {
-                        return Error::Config(format!("Failed to create duckdb catalog: {}", e));
+                        Error::Config(format!("Failed to create duckdb catalog: {}", e))
                     })?;
                 let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog));
@@ -270,14 +269,14 @@ impl SqlInput {
                     PostgresConnectionPool::new(postgres_params)
                         .await
                         .map_err(|e| {
-                            return Error::Config(format!("Failed to create postgres pool: {}", e));
+                            Error::Config(format!("Failed to create postgres pool: {}", e))
                         })?,
                 );
 
                 let catalog = DatabaseCatalogProvider::try_new(postgres_pool)
                     .await
                     .map_err(|e| {
-                        return Error::Config(format!("Failed to create postgres catalog: {}", e));
+                        Error::Config(format!("Failed to create postgres catalog: {}", e))
                     })?;
                 let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog));
@@ -292,15 +291,13 @@ impl SqlInput {
                     )
                     .build()
                     .await
-                    .map_err(|e| {
-                        return Error::Config(format!("Failed to create sqlite pool: {}", e));
-                    })?,
+                    .map_err(|e| Error::Config(format!("Failed to create sqlite pool: {}", e)))?,
                 );
 
                 let catalog_provider = DatabaseCatalogProvider::try_new(sqlite_pool)
                     .await
                     .map_err(|e| {
-                        return Error::Config(format!("Failed to create sqlite catalog: {}", e));
+                        Error::Config(format!("Failed to create sqlite catalog: {}", e))
                     })?;
                 let name = c.name.as_deref().unwrap_or(DEFAULT_NAME);
                 ctx.register_catalog(name, Arc::new(catalog_provider));

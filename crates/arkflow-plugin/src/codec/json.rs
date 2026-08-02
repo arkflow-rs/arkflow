@@ -11,11 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-use async_trait::async_trait;
 use crate::component;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
+use async_trait::async_trait;
 use datafusion::arrow;
 use serde_json::Value;
 use std::sync::Arc;
@@ -122,7 +122,7 @@ mod tests {
         let batch = result.unwrap();
 
         // Should have decoded to a message batch
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
     }
 
     #[tokio::test]
@@ -214,6 +214,6 @@ mod tests {
         assert!(result.is_ok());
         let batch = result.unwrap();
 
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
     }
 }

@@ -45,6 +45,8 @@
 //!   manifest rewrite (D7). Deletion is best-effort and never blocks
 //!   ingestion.
 
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -159,7 +161,7 @@ impl ParallelPutWorkers {
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
-        let capped = count.min(8).max(1);
+        let capped = count.clamp(1, 8);
         if count > 8 {
             tracing::warn!("parallel_put.workers capped at 8 (requested: {})", count);
         }
@@ -207,7 +209,7 @@ impl ParallelPutWorkers {
 
     /// Wait for all workers to drain their current queues (best-effort).
     pub fn shutdown(&self) {
-        for w in &self.workers {
+        for _w in &self.workers {
             // Drop the sender to signal the worker to stop after draining.
             // We don't have the original sender here; rely on the worker
             // exit when all senders are dropped.
@@ -297,7 +299,7 @@ impl S3Store {
     /// across multiple WAL instances). Performs the same validation +
     /// recovery + flusher spawn as `build`.
     fn build_with_client(
-        cfg: &WalConfig,
+        _cfg: &WalConfig,
         osc: arkflow_core::wal::config::ObjectStoreWalConfig,
         runtime: Runtime,
         client: Arc<dyn object_store::ObjectStore>,
@@ -586,9 +588,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
     // Cache the highest written sequence so `next_seq_hint` can return
     // `max_seq + 1` (matching redb) instead of `cursor() + 1`, which would
     // reuse sequence numbers whenever sealed-but-unacked entries exist.
-    store
-        .max_written_seq
-        .store(max_seq_seen, Ordering::Release);
+    store.max_written_seq.store(max_seq_seen, Ordering::Release);
 
     let mut active = store.active.lock().unwrap();
     active.next_index = max_idx_seen + 1;
@@ -1125,7 +1125,7 @@ pub(crate) fn register() -> Result<(), Error> {
 mod tests {
     use super::*;
     use arkflow_core::wal::config::{ObjectStoreS3Config, ObjectStoreWalConfig};
-    use arkflow_core::wal::store::{deserialize, serialize};
+    use arkflow_core::wal::store::serialize;
     use arkflow_core::wal::SyncPolicy;
     use arkflow_core::MessageBatch;
     use async_trait::async_trait;
@@ -1281,7 +1281,7 @@ mod tests {
         let payload = sample_payload(None);
         let mut seg_bytes = Vec::new();
         super::super::segment::encode(&[(42u64, payload.clone())], &mut seg_bytes).unwrap();
-        let key = format!("arkflow/wal/pod-a/main/segments/00000001.wal");
+        let key = "arkflow/wal/pod-a/main/segments/00000001.wal".to_string();
         runtime
             .block_on(client.put(
                 &ObjectPath::from(key.as_str()),
@@ -1499,7 +1499,7 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
         let runtime = Runtime::new().unwrap();
 
-        let mut osc = ObjectStoreWalConfig {
+        let osc = ObjectStoreWalConfig {
             node_id: "pod-a".into(),
             stream_id: "main".into(),
             prefix: "arkflow/wal".into(),
@@ -1913,7 +1913,10 @@ mod tests {
         let store2 = build_store_at("pod-c", "stream-3", client.clone(), 100, 1);
         store2.runtime.block_on(async {
             let (m, _) = read_manifest_with_etag(&store2).await.unwrap();
-            assert_eq!(m.cursor, 3, "cursor catches up to 3 once seq 1..=3 are sealed");
+            assert_eq!(
+                m.cursor, 3,
+                "cursor catches up to 3 once seq 1..=3 are sealed"
+            );
         });
         assert!(
             store2.read_after_cursor().unwrap().is_empty(),

@@ -219,7 +219,9 @@ version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
+ "arkflow-server",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -240,10 +242,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "subtle",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "toml",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -315,6 +320,25 @@ dependencies = [
  "vrl",
  "wiremock",
  "zstd",
+]
+
+[[package]]
+name = "arkflow-server"
+version = "0.5.0"
+dependencies = [
+ "arkflow-core",
+ "axum",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -9893,6 +9917,7 @@ dependencies = [
  "bytes",
  "http 1.4.2",
  "http-body 1.1.0",
+ "http-body-util",
  "percent-encoding",
  "pin-project-lite",
  "tower-layer",

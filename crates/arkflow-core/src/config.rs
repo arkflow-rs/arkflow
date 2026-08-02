@@ -69,6 +69,27 @@ pub struct HealthCheckConfig {
     /// Path for liveness check endpoint
     #[serde(default = "default_liveness_path")]
     pub liveness_path: String,
+    /// Prefix for the versioned control-plane API.
+    #[serde(default = "default_api_prefix")]
+    pub api_prefix: String,
+    /// Optional Bearer token for control-plane operations and configuration.
+    #[serde(default)]
+    pub api_token: Option<String>,
+    /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Hub URL for compute-node Agent mode. When absent, standalone mode is used.
+    #[serde(default)]
+    pub hub_url: Option<String>,
+    /// Stable identity used when this process reports to a Hub.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Shared node registration credential. Never included in reports.
+    #[serde(default)]
+    pub node_token: Option<String>,
+    /// Lease duration advertised by a compute node to its Hub.
+    #[serde(default = "default_agent_lease_ttl_ms")]
+    pub agent_lease_ttl_ms: u64,
 }
 
 /// Engine configuration
@@ -85,6 +106,27 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// Validate stable Stream IDs and return the IDs used by the runtime.
+    /// Missing IDs are deterministic compatibility IDs for legacy configs.
+    pub fn stream_ids(&self) -> Result<Vec<String>, Error> {
+        let mut ids = std::collections::HashSet::with_capacity(self.streams.len());
+        let mut resolved = Vec::with_capacity(self.streams.len());
+
+        for (index, stream) in self.streams.iter().enumerate() {
+            stream.validate_id(index)?;
+            let id = stream.effective_id(index);
+            if !ids.insert(id.clone()) {
+                return Err(Error::Config(format!(
+                    "Duplicate stream id '{}' at index {}",
+                    id, index
+                )));
+            }
+            resolved.push(id);
+        }
+
+        Ok(resolved)
+    }
+
     /// Load configuration from file
     pub fn from_file(path: &str) -> Result<Self, Error> {
         let content = std::fs::read_to_string(path)
@@ -122,7 +164,7 @@ fn get_format_from_path(path: &str) -> Option<ConfigFormat> {
 
 /// Default address for health check server
 fn default_address() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
 }
 
 /// Default value for health check path
@@ -139,9 +181,18 @@ fn default_readiness_path() -> String {
 fn default_liveness_path() -> String {
     "/liveness".to_string()
 }
+
+/// Default prefix for versioned control-plane routes.
+fn default_api_prefix() -> String {
+    "/api/v1".to_string()
+}
 /// Default value for health check enabled
 fn default_enabled() -> bool {
     true
+}
+
+fn default_agent_lease_ttl_ms() -> u64 {
+    15_000
 }
 
 impl Default for HealthCheckConfig {
@@ -152,6 +203,13 @@ impl Default for HealthCheckConfig {
             health_path: default_health_path(),
             readiness_path: default_readiness_path(),
             liveness_path: default_liveness_path(),
+            api_prefix: default_api_prefix(),
+            api_token: None,
+            cors_origins: Vec::new(),
+            hub_url: None,
+            node_id: None,
+            node_token: None,
+            agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
         }
     }
 }
@@ -188,7 +246,7 @@ mod tests {
     #[test]
     fn test_default_address() {
         let address = default_address();
-        assert_eq!(address, "0.0.0.0:8080");
+        assert_eq!(address, "127.0.0.1:8080");
     }
 
     #[test]
@@ -218,8 +276,8 @@ mod tests {
     #[test]
     fn test_health_check_config_default() {
         let config = HealthCheckConfig::default();
-        assert_eq!(config.enabled, true);
-        assert_eq!(config.address, "0.0.0.0:8080");
+        assert!(config.enabled);
+        assert_eq!(config.address, "127.0.0.1:8080");
         assert_eq!(config.health_path, "/health");
         assert_eq!(config.readiness_path, "/readiness");
         assert_eq!(config.liveness_path, "/liveness");
@@ -282,16 +340,25 @@ mod tests {
             health_path: "/healthz".to_string(),
             readiness_path: "/ready".to_string(),
             liveness_path: "/live".to_string(),
+            api_prefix: "/api/v1".to_string(),
+            api_token: Some("test-token".to_string()),
+            cors_origins: Vec::new(),
+            hub_url: None,
+            node_id: None,
+            node_token: None,
+            agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: HealthCheckConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, false);
+        assert!(!deserialized.enabled);
         assert_eq!(deserialized.address, "127.0.0.1:9090");
         assert_eq!(deserialized.health_path, "/healthz");
         assert_eq!(deserialized.readiness_path, "/ready");
         assert_eq!(deserialized.liveness_path, "/live");
+        assert_eq!(deserialized.api_prefix, "/api/v1");
+        assert_eq!(deserialized.api_token.as_deref(), Some("test-token"));
     }
 
     #[test]
@@ -369,7 +436,7 @@ streams: []
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.file_path, Some("/tmp/test.log".to_string()));
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "127.0.0.1:9090");
         assert!(config.streams.is_empty());
 
@@ -402,7 +469,7 @@ streams: []
 
         assert_eq!(config.logging.level, "info");
         assert!(matches!(config.logging.format, LogFormat::PLAIN));
-        assert_eq!(config.health_check.enabled, true);
+        assert!(config.health_check.enabled);
         assert_eq!(config.health_check.address, "0.0.0.0:8080");
         assert!(config.streams.is_empty());
 
@@ -446,7 +513,7 @@ type = "stdout"
 
         assert_eq!(config.logging.level, "warn");
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "192.168.1.1:8888");
         assert_eq!(config.streams.len(), 1);
 
@@ -521,7 +588,73 @@ type = "stdout"
 
         assert_eq!(deserialized.logging.level, "info");
         assert!(matches!(deserialized.logging.format, LogFormat::PLAIN));
-        assert_eq!(deserialized.health_check.enabled, true);
-        assert_eq!(deserialized.health_check.address, "0.0.0.0:8080");
+        assert!(deserialized.health_check.enabled);
+        assert_eq!(deserialized.health_check.address, "127.0.0.1:8080");
+    }
+
+    fn test_stream(id: Option<&str>) -> crate::stream::StreamConfig {
+        crate::stream::StreamConfig {
+            id: id.map(str::to_string),
+            input: crate::input::InputConfig {
+                input_type: "generate".to_string(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            pipeline: crate::pipeline::PipelineConfig {
+                thread_num: 1,
+                processors: vec![],
+            },
+            output: crate::output::OutputConfig {
+                output_type: "stdout".to_string(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: None,
+            durability: None,
+            temporary: None,
+        }
+    }
+
+    #[test]
+    fn test_stream_ids_assign_legacy_ids() {
+        let config = EngineConfig {
+            streams: vec![test_stream(None), test_stream(None)],
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        };
+
+        assert_eq!(config.stream_ids().unwrap(), ["stream-0", "stream-1"]);
+    }
+
+    #[test]
+    fn test_stream_ids_reject_invalid_and_duplicate_ids() {
+        let invalid = EngineConfig {
+            streams: vec![test_stream(Some("bad id"))],
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        };
+        assert!(invalid.stream_ids().is_err());
+
+        let duplicate = EngineConfig {
+            streams: vec![test_stream(Some("orders")), test_stream(Some("orders"))],
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        };
+        assert!(duplicate.stream_ids().is_err());
+    }
+
+    #[test]
+    fn test_stream_id_serializes_and_schema_exposes_id() {
+        let serialized = serde_json::to_value(test_stream(Some("orders"))).unwrap();
+        assert_eq!(serialized["id"], "orders");
+
+        let schema = crate::component::build_config_schema();
+        assert_eq!(
+            schema["$defs"]["stream"]["properties"]["id"]["type"],
+            "string"
+        );
     }
 }

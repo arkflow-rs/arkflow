@@ -29,6 +29,7 @@ pub(crate) struct BaseWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
     /// Using DashMap instead of nested RwLock for better performance
     /// This eliminates the nested lock bottleneck: Arc<RwLock<HashMap<String, Arc<RwLock<VecDeque...>>>>
+    #[allow(clippy::type_complexity)]
     queue: Arc<DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
@@ -75,7 +76,7 @@ impl BaseWindow {
                     .input_names
                     .borrow()
                     .iter()
-                    .map(|name| name.clone())
+                    .cloned()
                     .collect::<HashSet<String>>();
 
                 JoinOperation::new(
@@ -183,7 +184,7 @@ impl BaseWindow {
         // No nested locks needed - this is a major performance improvement
         self.queue
             .entry(input_name)
-            .or_insert_with(|| VecDeque::new())
+            .or_default()
             .push_front((msg, ack));
 
         Ok(())

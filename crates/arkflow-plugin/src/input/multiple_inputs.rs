@@ -66,7 +66,7 @@ impl Input for MultipleInputs {
                         result = input.read() => {
                             match result {
                                 Ok((batch, ack)) => {
-                                    if let Err(_) = sender.send_async(Msg::Message(batch, ack)).await {
+                                    if sender.send_async(Msg::Message(batch, ack)).await.is_err() {
                                         return;
                                     }
                                 }
@@ -77,7 +77,7 @@ impl Input for MultipleInputs {
                                             return;
                                         }
                                         _ => {
-                                            if let Err(_) = sender.send_async(Msg::Err(e)).await {
+                                            if sender.send_async(Msg::Err(e)).await.is_err() {
                                                 return;
                                             }
                                         }

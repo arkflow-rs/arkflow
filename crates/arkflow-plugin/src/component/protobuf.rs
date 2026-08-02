@@ -153,19 +153,25 @@ pub fn parse_proto_source(schema: &str, message_type: &str) -> Result<MessageDes
 
     let mut file_descriptor_set = FileDescriptorSet { file: Vec::new() };
     for proto in file_descriptor_protos {
-        let proto_bytes = proto
-            .write_to_bytes()
-            .map_err(|e| Error::Config(format!("Failed to serialize FileDescriptorProto: {}", e)))?;
+        let proto_bytes = proto.write_to_bytes().map_err(|e| {
+            Error::Config(format!("Failed to serialize FileDescriptorProto: {}", e))
+        })?;
         let prost_proto =
             prost_reflect::prost_types::FileDescriptorProto::decode(proto_bytes.as_slice())
-                .map_err(|e| Error::Config(format!("Failed to convert FileDescriptorProto: {}", e)))?;
+                .map_err(|e| {
+                    Error::Config(format!("Failed to convert FileDescriptorProto: {}", e))
+                })?;
         file_descriptor_set.file.push(prost_proto);
     }
 
     let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(file_descriptor_set)
         .map_err(|e| Error::Config(format!("Failed to create descriptor pool: {}", e)))?;
-    pool.get_message_by_name(message_type)
-        .ok_or_else(|| Error::Config(format!("Message type not found in schema: {}", message_type)))
+    pool.get_message_by_name(message_type).ok_or_else(|| {
+        Error::Config(format!(
+            "Message type not found in schema: {}",
+            message_type
+        ))
+    })
 }
 
 /// Convert Protobuf data to Arrow format

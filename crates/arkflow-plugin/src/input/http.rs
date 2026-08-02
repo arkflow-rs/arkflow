@@ -62,6 +62,7 @@ pub struct HttpInputConfig {
 pub struct HttpInput {
     input_name: Option<String>,
     config: HttpInputConfig,
+    #[allow(clippy::type_complexity)]
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
     sender: Arc<Sender<MessageBatch>>,
     receiver: Arc<Receiver<MessageBatch>>,
@@ -118,7 +119,9 @@ impl HttpInput {
 
         // Apply codec if configured
         let msg =
-            match crate::input::codec_helper::apply_codec_to_payload(&json_bytes, &state.codec).await {
+            match crate::input::codec_helper::apply_codec_to_payload(&json_bytes, &state.codec)
+                .await
+            {
                 Ok(msg) => msg,
                 Err(_) => return StatusCode::BAD_REQUEST,
             };
@@ -149,7 +152,7 @@ impl Input for HttpInput {
             .route(&path, post(Self::handle_request))
             .with_state(app_state);
 
-        let mut app = if self.config.cors_enabled.unwrap_or(false) {
+        let app = if self.config.cors_enabled.unwrap_or(false) {
             app.layer(CorsLayer::very_permissive())
         } else {
             app
@@ -405,11 +408,7 @@ mod tests {
         assert!(!result_wrong, "Wrong credentials should fail");
 
         // 验证时间差异在合理范围内（<10ms）
-        let time_diff = if time_valid > time_wrong {
-            time_valid - time_wrong
-        } else {
-            time_wrong - time_valid
-        };
+        let time_diff = time_valid.abs_diff(time_wrong);
         assert!(
             time_diff.as_millis() < 10,
             "Time difference too large: {:?}",
@@ -446,11 +445,7 @@ mod tests {
         assert!(!result_bearer_wrong, "Wrong bearer token should fail");
 
         // 验证时间差异在合理范围内（<10ms）
-        let time_diff = if time_bearer_valid > time_bearer_wrong {
-            time_bearer_valid - time_bearer_wrong
-        } else {
-            time_bearer_wrong - time_bearer_valid
-        };
+        let time_diff = time_bearer_valid.abs_diff(time_bearer_wrong);
         assert!(
             time_diff.as_millis() < 10,
             "Bearer time difference too large: {:?}",

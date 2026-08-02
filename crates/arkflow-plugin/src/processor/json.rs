@@ -33,8 +33,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Arrow format conversion processor configuration
-
 /// Arrow Format Conversion Processor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonProcessorConfig {
@@ -212,7 +210,7 @@ mod tests {
             "bool_field": true,
             "int_field": 42,
             "uint_field": 18446744073709551615u64,
-            "float_field": 3.14,
+            "float_field": std::f64::consts::PI,
             "string_field": "hello",
             "array_field": [1, 2, 3],
             "object_field": {"key": "value"}

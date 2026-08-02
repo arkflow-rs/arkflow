@@ -51,6 +51,7 @@ struct MemoryBuffer {
     /// Configuration parameters for the memory buffer
     config: MemoryBufferConfig,
     /// Thread-safe queue to store message batches and their acknowledgments
+    #[allow(clippy::type_complexity)]
     queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
@@ -69,7 +70,7 @@ impl MemoryBuffer {
     fn new(config: MemoryBufferConfig) -> Result<Self, Error> {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
-        let duration = config.timeout.clone();
+        let duration = config.timeout;
         let close = CancellationToken::new();
         let close_clone = close.clone();
 
@@ -156,9 +157,10 @@ impl Buffer for MemoryBuffer {
         queue_lock.push_front((msg, arc));
 
         // Calculate the total number of messages in the buffer
-        let cnt = queue_lock.iter().map(|x| x.0.len()).reduce(|acc, x| {
-            return acc + x;
-        });
+        let cnt = queue_lock
+            .iter()
+            .map(|x| x.0.len())
+            .reduce(|acc, x| acc + x);
         let cnt = cnt.unwrap_or(0);
 
         // If capacity threshold is reached, notify readers to process the batch

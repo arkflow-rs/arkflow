@@ -1,0 +1,21 @@
+logging:
+  level: info
+health_check:
+  enabled: false
+  hub_url: "http://127.0.0.1:8080"
+  api_prefix: "/api/v1"
+  node_id: "node-a"
+  node_token: "replace-with-node-token"
+  agent_lease_ttl_ms: 15000
+streams:
+  - id: demo-events
+    input:
+      type: generate
+      context: '{"value": 1}'
+      interval: 1s
+      batch_size: 1
+    pipeline:
+      thread_num: 1
+      processors: []
+    output:
+      type: stdout

@@ -95,7 +95,7 @@ impl KafkaInput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the consumer group ID
         client_config.set("group.id", &self.config.consumer_group);
@@ -197,7 +197,8 @@ impl Input for KafkaInput {
 
                 // Apply codec if configured
                 let mut msg_batch =
-                    crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec).await?;
+                    crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec)
+                        .await?;
                 msg_batch.set_input_name(self.input_name.clone());
 
                 // Convert to RecordBatch to add metadata

@@ -422,9 +422,8 @@ message TestMessage {
         let binary_data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
         assert_eq!(binary_data.len(), 1);
 
-        let decoded_msg =
-            DynamicMessage::decode(processor.descriptor.clone(), binary_data[0].as_ref())
-                .map_err(|e| Error::Process(format!("Failed to decode protobuf: {}", e)))?;
+        let decoded_msg = DynamicMessage::decode(processor.descriptor.clone(), binary_data[0])
+            .map_err(|e| Error::Process(format!("Failed to decode protobuf: {}", e)))?;
 
         let timestamp = decoded_msg.get_field_by_name("timestamp").unwrap();
         let value = decoded_msg.get_field_by_name("value").unwrap();
@@ -598,7 +597,7 @@ message Sub {
             _ => panic!("Expected single result"),
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
-        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0])
             .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
         assert_eq!(
             decoded.get_field_by_name("timestamp").unwrap().as_ref(),
@@ -726,7 +725,7 @@ message Sub {
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
         // Row 1 (all null) → fields unset → decoded message has no timestamp field.
-        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[1].as_ref())
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[1])
             .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
         // proto3 does not distinguish unset from default on the wire; assert the null row
         // decodes to the default (0) and never carries another row's value.
@@ -779,7 +778,7 @@ message Sub {
             _ => panic!("Expected single result"),
         };
         let data = batch.to_binary(DEFAULT_BINARY_VALUE_FIELD)?;
-        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0].as_ref())
+        let decoded = DynamicMessage::decode(processor.descriptor.clone(), data[0])
             .map_err(|e| Error::Process(format!("Failed to decode: {}", e)))?;
         assert_eq!(
             decoded.get_field_by_name("timestamp").unwrap().as_ref(),
@@ -819,7 +818,7 @@ message Sub {
             .map_err(|e| Error::Process(format!("encode: {}", e)))?;
         let msg_batch = MessageBatch::new_binary(vec![buf])?;
         let result = processor.process(Arc::new(msg_batch)).await;
-        let err = result.err().expect("nested field must error");
+        let err = result.expect_err("nested field must error");
         assert!(
             format!("{:?}", err).to_lowercase().contains("kind"),
             "error should mention field kind, got: {:?}",

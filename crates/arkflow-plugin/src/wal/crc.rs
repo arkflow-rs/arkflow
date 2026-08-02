@@ -25,6 +25,8 @@
 //! transitive tree via `object_store`) would do the same, but pulling it
 //! directly just for this is not worth the dep entry.
 
+#![allow(dead_code)]
+
 /// Initial CRC value (all-ones).
 const INIT: u32 = 0xFFFF_FFFF;
 /// Final XOR (post-complement).

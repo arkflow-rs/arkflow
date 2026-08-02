@@ -23,7 +23,7 @@ use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
@@ -52,6 +52,7 @@ pub struct PulsarInputConfig {
 }
 
 /// Pulsar message type for async processing
+#[allow(clippy::large_enum_variant)]
 enum PulsarMsg {
     Message(pulsar::consumer::Message<Vec<u8>>),
     Err(Error),
@@ -62,6 +63,7 @@ pub struct PulsarInput {
     input_name: Option<String>,
     config: PulsarInputConfig,
     client: Arc<RwLock<Option<Pulsar<TokioExecutor>>>>,
+    #[allow(clippy::type_complexity)]
     consumer:
         Arc<RwLock<Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>>>,
     sender: Sender<PulsarMsg>,
@@ -306,6 +308,7 @@ pub struct PulsarAck {
     // Store the full message for acknowledgment
     message: Option<pulsar::consumer::Message<Vec<u8>>>,
     // Reference to consumer for acknowledgment
+    #[allow(clippy::type_complexity)]
     consumer: Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>,
 }
 

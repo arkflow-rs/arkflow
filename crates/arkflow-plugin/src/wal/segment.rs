@@ -30,6 +30,8 @@
 //! return the prefix. The decoder never errors on a torn tail — that's a
 //! recovery expectation, not a corruption.
 
+#![allow(dead_code)]
+
 use arkflow_core::wal::store::deserialize;
 use arkflow_core::{Error, MessageBatchRef};
 use std::sync::Arc;

@@ -52,21 +52,17 @@ use tokio_util::sync::CancellationToken;
 /// Sync (fsync) policy for appends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SyncPolicy {
     /// Commit (fsync) a transaction on every append. Fully durable; slowest.
     /// Not supported on remote backends (one PUT per message is not viable).
     PerEntry,
     /// Coalesce concurrent appends into shared transactions flushed as soon as
     /// pending data is available.
+    #[default]
     GroupCommit,
     /// Flush pending appends on a fixed interval.
     Periodic(Duration),
-}
-
-impl Default for SyncPolicy {
-    fn default() -> Self {
-        SyncPolicy::GroupCommit
-    }
 }
 
 fn default_enabled() -> bool {
