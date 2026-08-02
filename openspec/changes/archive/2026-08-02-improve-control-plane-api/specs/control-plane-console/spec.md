@@ -1,8 +1,4 @@
-# Purpose
-
-Define the operator-facing Console for discovering, observing, and administering ArkFlow control-plane resources.
-
-# Requirements
+## MODIFIED Requirements
 
 ### Requirement: Operations application shell
 
@@ -26,7 +22,7 @@ The Runtime page SHALL support filtering and pagination over Streams, topology/r
 
 #### Scenario: Operate one Stream from the runtime page
 - **WHEN** an operator starts, stops, or restarts a Stream
-- **THEN** the UI confirms the action, tracks its operation ID, refreshes the affected resource, and reports success or failure without blocking other Streams
+- **THEN** the UI confirms the action, tracks its operation ID and target node, refreshes the affected resource, and reports success or failure without blocking other Streams
 
 #### Scenario: Inspect a failed Stream
 - **WHEN** an operator opens a failed Stream
