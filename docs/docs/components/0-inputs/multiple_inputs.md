@@ -1,82 +1,46 @@
+---
+sidebar_label: Multiple Inputs
+---
+
 # Multiple Inputs
 
-The Multiple Inputs component allows you to combine multiple input sources into a single stream. It reads from multiple input components concurrently and merges their outputs into a unified message stream.
+Multiple Inputs merges several independent input components into a single logical stream. All child inputs are read concurrently, and messages enter the same pipeline in arrival order. Each child input may carry a `name`, which is written to `__meta_source` so downstream stages can distinguish the origin.
 
 ## Configuration
 
-### **inputs**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"multiple_inputs"` |
+| inputs | array&lt;object&gt; | yes | — | Array of child input configurations; element structure is described below |
 
-A list of input configurations to be combined. Each input in the list follows the standard input configuration format.
+### inputs[]
 
-type: `array` of `InputConfig`
+Each element is a standard input configuration (with its own `type` and fields) plus an optional `name`:
 
-required: `true`
-
-## Features
-
-- **Concurrent Processing**: All input sources are processed concurrently using async tasks
-- **Message Merging**: Messages from different inputs are merged into a single output stream
-- **Error Handling**: Handles disconnections and errors from individual inputs gracefully
-- **Unique Naming**: Ensures all input names are unique to prevent conflicts
-- **Proper Cleanup**: Uses cancellation tokens and task tracking for clean shutdown
-
-## Internal Mechanism
-
-- Uses Flume channels for efficient message passing between input tasks and the main reader
-- Each input runs in its own async task managed by a TaskTracker
-- Messages and errors are sent through a unified channel using an internal Msg enum
-- Implements proper cancellation handling using CancellationToken
-- Validates input name uniqueness to prevent SQL table name conflicts
-- Maintains input name registry for downstream components
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | Child input type, e.g. `kafka`, `http` |
+| name | string | no | Logical name for this source; when non-empty and globally unique, it is written to `__meta_source` |
+| ... | ... | ... | The configuration fields specific to this input type |
 
 ## Examples
 
-### Basic Multiple Inputs
-
 ```yaml
-- input:
-    type: "multiple_inputs"
-    inputs:
-      - name: "kafka_source"
-        type: "kafka"
-        brokers: ["localhost:9092"]
-        topics: ["topic1"]
-        consumer_group: "group1"
-      - name: "redis_source"
-        type: "redis"
-        url: "redis://localhost:6379"
-        redis_type: "subscribe"
-        channels: ["channel1"]
+input:
+  type: "multiple_inputs"
+  inputs:
+    - name: "kafka_source"
+      type: "kafka"
+      brokers: ["localhost:9092"]
+      topics: ["topic1"]
+      consumer_group: "group1"
+    - name: "http_api"
+      type: "http"
+      address: "0.0.0.0:8080"
+      path: "/webhook"
 ```
 
-### Multiple Inputs with Different Types
+## Notes
 
-```yaml
-- input:
-    type: "multiple_inputs"
-    inputs:
-      - name: "http_api"
-        type: "http"
-        address: "0.0.0.0:8080"
-        path: "/webhook"
-      - name: "file_source"
-        type: "sql"
-        select_sql: "SELECT * FROM data"
-        input_type:
-          type: "csv"
-          path: "/path/to/data.csv"
-      - name: "memory_source"
-        type: "memory"
-        messages:
-          - "static message 1"
-          - "static message 2"
-```
-
-## Important Notes
-
-- All inputs must have unique names when specified
-- Empty input names are not allowed
-- The component will fail if there are duplicate input names
-- Each input maintains its own connection and error handling
-- Messages are processed as they arrive from any input source
-- The component stops when all input sources are closed or encounter terminal errors
+- Every non-empty `name` must be unique; duplicates or empty names cause the build to fail.
+- If any child input returns `EOF` or `Disconnection`, that sub-stream ends while the others continue.

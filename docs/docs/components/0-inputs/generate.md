@@ -1,50 +1,28 @@
+---
+sidebar_label: Generate
+---
+
 # Generate
 
-Generate is an input component that generates test data.
+The Generate input produces synthetic text messages at a fixed interval, primarily for testing, demos, and benchmarking. Each read returns `batch_size` copies of the same `context` string.
 
 ## Configuration
 
-### **context**
-
-The context is a JSON object that will be used to generate the data. The JSON object will be serialized to bytes and sent as message content.
-
-type: `string`
-
-optional: `true`
-
-### **count**
-
-The total number of data points to generate. If not specified, the generator will run indefinitely until manually stopped.
-
-type: `integer`
-
-optional: `true`
-
-### **interval**
-
-The interval is the time between each data point.
-
-type: `string`
-
-example: `1ms`, `1s`, `1m`, `1h`, `1d`
-
-optional: `false`
-
-### **batch_size**
-
-The batch size is the number of data points to generate at each interval. If the remaining count is less than batch_size, only the remaining messages will be sent.
-
-type: `integer`
-
-optional: `false`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"generate"` |
+| context | string | yes | — | Payload text for each message |
+| interval | duration | yes | — | Interval between reads, e.g. `1ms`, `1s`, `1m` (the first read is immediate) |
+| count | integer | no | — | Total number of messages; returns EOF once reached. Unset means unlimited |
+| batch_size | integer | no | `1` | Number of messages returned per read |
 
 ## Examples
 
 ```yaml
-  - input:
-      type: "generate"
-      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
-      interval: 1ms
-      batch_size: 1000
-      count: 10000  # Optional: generate 10000 messages in total
+input:
+  type: "generate"
+  context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+  interval: 1ms
+  batch_size: 1000
+  count: 10000
 ```

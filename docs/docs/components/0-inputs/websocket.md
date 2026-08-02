@@ -1,130 +1,38 @@
+---
+sidebar_label: WebSocket
+---
+
 # WebSocket
 
-The WebSocket input component consumes messages from WebSocket connections. It supports both server and client modes for real-time bidirectional communication.
+The WebSocket input connects to a remote WebSocket server as a client, decodes each inbound message, and forwards it into the pipeline. The current implementation supports client mode only.
 
 ## Configuration
 
-### **url**
-
-WebSocket server URL (for client mode) or bind address (for server mode).
-
-type: `string`
-
-optional: `false`
-
-### **mode**
-
-Operation mode.
-
-Supported values:
-- `server`: Act as WebSocket server, listen for incoming connections
-- `client`: Act as WebSocket client, connect to a WebSocket server
-
-type: `string`
-
-default: `"client"`
-
-optional: `true`
-
-### **path** (server mode)
-
-URL path to accept connections on (server mode only).
-
-type: `string`
-
-default: `"/"`
-
-optional: `true`
-
-### **host** (server mode)
-
-Host address to bind to (server mode only).
-
-type: `string`
-
-default: `"0.0.0.0"`
-
-optional: `true`
-
-### **headers** (optional)
-
-Additional headers to include in the WebSocket handshake.
-
-type: `object`
-
-default: `{}`
-
-optional: `true`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"websocket"` |
+| url | string | yes | — | WebSocket server URL, e.g. `ws://host:8080/path` or `wss://host:8443/path` |
+| headers | map&lt;string, string&gt; | no | — | Request headers attached during the handshake |
+| timeout | integer | no | — | Connection timeout (seconds) |
 
 ## Examples
 
-### WebSocket Server
+```yaml
+input:
+  type: "websocket"
+  url: "ws://localhost:8080/ws"
+```
 
 ```yaml
-- input:
-    type: "websocket"
-    mode: "server"
-    host: "0.0.0.0"
-    port: 8080
-    path: "/ws"
+input:
+  type: "websocket"
+  url: "wss://secure.example.com/ws"
+  headers:
+    Authorization: "Bearer ${TOKEN}"
+  timeout: 10
 ```
 
-### WebSocket Client
+## Notes
 
-```yaml
-- input:
-    type: "websocket"
-    mode: "client"
-    url: "ws://localhost:8080/ws"
-```
-
-### Secure WebSocket (WSS)
-
-```yaml
-- input:
-    type: "websocket"
-    mode: "client"
-    url: "wss://secure.example.com/ws"
-    headers:
-      Authorization: "Bearer ${TOKEN}"
-```
-
-### WebSocket Server with Custom Path
-
-```yaml
-- input:
-    type: "websocket"
-    mode: "server"
-    host: "127.0.0.1"
-    port: 9000
-    path: "/stream"
-```
-
-## Features
-
-- **Bidirectional Communication**: Support for both server and client modes
-- **Real-time Data**: Low-latency message delivery
-- **Message Metadata**: Automatic extraction of metadata including:
-  - `__meta_source`: WebSocket endpoint identifier
-  - `__meta_ingest_time`: Message reception timestamp
-- **Multiple Connections**: Server mode can handle multiple concurrent connections
-
-## Use Cases
-
-- **Real-time Analytics**: Stream live analytics data
-- **Chat Applications**: Process chat messages in real-time
-- **IoT Data**: Collect sensor data from IoT devices
-- **Live Monitoring**: Monitor system events and metrics
-- **Event Streaming**: Process live event streams
-
-## Message Format
-
-Messages received via WebSocket are expected to be in a format compatible with the configured codec. For example, with JSON codec:
-
-```json
-{
-  "sensor_id": "temp_001",
-  "temperature": 23.5,
-  "timestamp": 1625000000000
-}
-```
+- Client mode only: the component actively calls `connect_async` against `url`; it does not listen on a port. Server-side fields such as `mode`/`host`/`port`/`path` do not exist in the code, and the related descriptions from the old docs have been removed.
+- Automatically attaches the `__meta_source` and `__meta_ingest_time` metadata columns.

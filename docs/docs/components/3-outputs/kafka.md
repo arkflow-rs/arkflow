@@ -1,88 +1,35 @@
 # Kafka
 
-The Kafka output component writes messages to a Kafka topic.
+The Kafka output produces messages to an Apache Kafka topic using librdkafka. It supports key-based partitioning, compression, configurable acknowledgments, and optional exactly-once transactional production.
 
 ## Configuration
 
-### **brokers**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"kafka"` |
+| brokers | `array<string>` | yes | — | List of Kafka broker addresses. |
+| topic | object | yes | — | Destination topic (expression; see below). |
+| key | object | no | — | Message key for partitioning (expression; see below). |
+| client_id | string | no | — | Client identifier. |
+| compression | string | no | — | One of `none`, `gzip`, `snappy`, `lz4`. |
+| acks | string | no | — | Acknowledgment level: `0`, `1`, or `all`. |
+| value_field | string | no | — | Record field used as the message payload. |
+| exactly_once | boolean | no | `false` | Enable exactly-once transactional production (L2). |
+| transactional_id | string | no | — | Stable transactional id; required when `exactly_once` is `true`. |
 
-A list of broker addresses to connect to.
+### Expression objects
 
-type: `array` of `string`
+`topic` and `key` are `Expr<String>` objects with one of these shapes:
 
-### **topic**
-
-The topic to write messages to. Supports both static values and SQL expressions.
-
-type: `object`
-
-One of:
-- `type: "value"` with `value: string` - Static topic name
-- `type: "expr"` with `expr: string` - SQL expression to evaluate topic name
-
-### **key**
-
-The key to set for each message (optional). Supports both static values and SQL expressions.
-
-type: `object`
-
-One of:
-- `type: "value"` with `value: string` - Static key value
-- `type: "expr"` with `expr: string` - SQL expression to evaluate key
-
-### **client_id**
-
-The client ID to use when connecting to Kafka.
-
-type: `string`
-
-### **compression**
-
-The compression type to use for messages.
-
-type: `string`
-
-One of:
-- `none` - No compression
-- `gzip` - Gzip compression
-- `snappy` - Snappy compression
-- `lz4` - LZ4 compression
-
-### **acks**
-
-The number of acknowledgments the producer requires the leader to have received before considering a request complete.
-
-type: `string`
-
-One of:
-- `0` - No acknowledgment
-- `1` - Leader acknowledgment only
-- `all` - All replicas acknowledgment
-
-### **value_field**
-
-The field to use as the message value. If not specified, uses the default binary value field.
-
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static string value. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
 ## Examples
 
-```yaml
-output:
-  type: "kafka"
-  brokers:
-    - "localhost:9092"
-  topic:
-    type: "expr"
-    expr: "concat('1','x')"
-  key:
-    type: "value"
-    value: "my-key"
-  client_id: "my-client"
-  compression: "gzip"
-  acks: "all"
-  value_field: "message"
-```
+### Static topic and key
 
 ```yaml
 output:
@@ -92,6 +39,45 @@ output:
   topic:
     type: "value"
     value: "my-topic"
+  key:
+    type: "value"
+    value: "my-key"
+  client_id: "my-client"
   compression: "snappy"
   acks: "1"
 ```
+
+### Dynamic topic via SQL expression
+
+```yaml
+output:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topic:
+    type: "expr"
+    expr: "concat('1','x')"
+  acks: "all"
+  value_field: "message"
+```
+
+### Exactly-once production
+
+```yaml
+output:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topic:
+    type: "value"
+    value: "events"
+  exactly_once: true
+  transactional_id: "arkflow-events-tx"
+  acks: "all"
+```
+
+## Notes
+
+- When `exactly_once: true`, `transactional_id` must be a non-empty value that is stable across restarts so the broker can fence stale producer epochs (zombie fencing). The builder rejects the configuration otherwise.
+- With exactly-once enabled, each acknowledged message batch is produced inside one Kafka transaction (begin → send → commit). On failure the transaction is aborted and the batch is replayed.
+- See [Exactly-once processing](../../concepts/6-exactly-once.md) for the end-to-end delivery-semantics contract.

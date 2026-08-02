@@ -1,21 +1,24 @@
+---
+sidebar_label: Memory
+---
+
 # Memory
 
-The Memory input component reads data from an in-memory message queue.
+The Memory input reads messages from an in-memory queue that can be pre-seeded with initial messages in configuration. Mainly used for testing and development.
 
 ## Configuration
 
-### **messages**
-
-The initial list of messages in the memory queue (optional).
-
-type: `array` of `string`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"memory"` |
+| messages | array&lt;string&gt; | no | — | Initial list of messages enqueued at startup |
 
 ## Examples
 
 ```yaml
-- input:
-    type: "memory"
-    messages:
-      - "Hello"
-      - "World"
+input:
+  type: "memory"
+  messages:
+    - "Hello"
+    - "World"
 ```

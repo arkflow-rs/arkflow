@@ -1,21 +1,18 @@
 # Stdout
 
-The Stdout output component writes messages to the standard output stream.
+The Stdout output writes each message payload to standard output. It is handy for debugging, demos, and small local pipelines.
 
 ## Configuration
 
-### **append_newline**
-
-Whether to add a line break after each message (optional).
-
-type: `bool`
-
-default: `true`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"stdout"` |
+| append_newline | boolean | no | `true` | Whether to append a line break after each message. |
 
 ## Examples
 
 ```yaml
-- output:
-    type: "stdout"
-    append_newline: true
+output:
+  type: "stdout"
+  append_newline: true
 ```

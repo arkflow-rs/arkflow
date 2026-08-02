@@ -1,0 +1,9 @@
+{
+  "label": "Concepts",
+  "position": 3,
+  "link": {
+    "title": "Concepts",
+    "type": "generated-index",
+    "description": "Core concepts behind ArkFlow: the engine architecture, data flow, backpressure and ordered delivery, message metadata, and delivery semantics."
+  }
+}

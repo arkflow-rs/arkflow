@@ -7,9 +7,7 @@ three optimization dimensions introduced in 2026-07-28:
 **segment tuning**, **parallel PUT**, and **compression**.
 
 For background on the at-least-once contract and replay semantics, see
-[Input Delivery Semantics](delivery-semantics.md). For detailed
-performance characteristics and tuning rationale, see the S3 WAL backend
-performance guide at `docs/performance/s3-wal-backend.md` in the repository.
+[Input Delivery Semantics](4-delivery-semantics.md).
 
 ## Quick Start
 
@@ -273,6 +271,3 @@ Key metrics to watch after enabling these optimizations:
 - `segment_put_frequency` — should drop with `aggressive` strategy
 - `cursor_lag` — should stay under 10,000 entries
 - `recovery_latency` — should be under 5 s on restart
-
-See the S3 WAL backend performance guide (`docs/performance/s3-wal-backend.md`)
-in the repository for the full metrics list and alert thresholds.

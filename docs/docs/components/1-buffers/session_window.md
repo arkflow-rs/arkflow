@@ -1,62 +1,25 @@
 # Session Window
 
-The Session Window buffer component provides a session-based message grouping mechanism where messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of inactivity.
+The Session Window buffer groups messages into sessions defined by activity gaps. A new message extends the current session; if no message arrives within the configured `gap` duration the session is closed and all of its accumulated messages are emitted as a single batch. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.
 
 ## Configuration
 
-### **gap**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `session_window` |
+| gap | duration | yes | — | Maximum idle time between messages in a session. When the gap elapses with no new messages, the session is flushed. Examples: `1ms`, `1s`, `1m`, `1h`. |
+| join | object | no | — | Optional SQL join configuration applied to emitted batches. |
 
-The maximum time gap between messages in a session. If no new messages arrive within this duration, the session is considered complete and all accumulated messages are emitted.
+### `join`
 
-type: `string`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| query | string | yes | — | SQL query joining batch data from different input sources. |
+| value_field | string | no | — | Name of the binary field holding the message payload. Defaults to the engine default binary value field. |
+| codec | object | yes | — | Codec used to decode message batches before joining. |
+| thread_num | integer | no | — | Number of worker threads used for parallel decoding during the join. |
 
-required: `true`
-
-example: `1ms`, `1s`, `1m`, `1h`, `1d`
-
-### **join**
-
-Optional join configuration for SQL join operations on message batches. When specified, allows joining multiple message sources using SQL queries.
-
-type: `object`
-
-required: `false`
-
-#### **query**
-
-The SQL query to execute for joining message batches from different input sources.
-
-type: `string`
-
-required: `true` (when join is specified)
-
-#### **value_field**
-
-The field name to use for binary data values. Defaults to the system default binary value field.
-
-type: `string`
-
-required: `false`
-
-#### **codec**
-
-The codec configuration for decoding message batches before joining.
-
-type: `object`
-
-required: `true` (when join is specified)
-
-## Internal Mechanism
-
-- Built on top of the `BaseWindow` component which provides core windowing functionality
-- Messages are grouped by session keys using `RwLock<HashMap<String, Arc<RwLock<VecDeque>>>>`
-- Each session maintains its own message queue with independent timeout tracking
-- When a session exceeds the configured gap duration without new messages, it triggers window emission
-- Messages within the same session are batched and concatenated during processing using Arrow's concat_batches
-- Optional SQL join operations are performed using DataFusion's query engine with parallel decoding
-- Uses Tokio's async runtime with cancellation tokens for efficient timeout management
-- Implements proper session cleanup to prevent memory leaks from inactive sessions
-- Join operations validate that all required input tables are present before executing SQL queries
+The `codec` field is a `CodecConfig` object: a `type` string selecting the codec plus any codec-specific fields.
 
 ## Examples
 
@@ -65,29 +28,17 @@ required: `true` (when join is specified)
 ```yaml
 buffer:
   type: "session_window"
-  gap: "5s" # Close session after 5 seconds of inactivity
+  gap: "5s"
 ```
-
-This example configures a session window buffer that will:
-- Group messages into sessions
-- Close the session and process messages when no new messages arrive for 5 seconds
-
-The buffer helps group related messages that occur close together in time while separating unrelated messages that have gaps between them.
 
 ### With Join Configuration
 
 ```yaml
 buffer:
   type: "session_window"
-  gap: "10s"  # Close session after 10 seconds of inactivity
+  gap: "10s"
   join:
     query: "SELECT a.user_id, a.event_type, b.metadata FROM events a JOIN metadata b ON a.user_id = b.user_id"
     codec:
       type: "json"
 ```
-
-This example configures a session window buffer with SQL join operations that:
-- Groups messages into sessions with 10-second inactivity gap
-- Joins event data with metadata using SQL
-- Uses JSON codec for message decoding
-- Processes joined data when session closes

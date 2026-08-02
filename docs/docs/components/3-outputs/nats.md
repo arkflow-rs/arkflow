@@ -1,49 +1,47 @@
 # NATS
 
-The NATS output component writes messages to a NATS subject.
+The NATS output publishes messages to a NATS server, either to a regular subject or to a JetStream stream. It supports optional username/password or token authentication.
 
 ## Configuration
 
-### **url**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"nats"` |
+| url | string | yes | — | NATS server URL (e.g. `nats://localhost:4222`). |
+| mode | object | yes | — | Publishing mode (see below). |
+| auth | object | no | — | Authentication configuration (see below). |
+| value_field | string | no | — | Record field used as the message payload. |
 
-The NATS server URL to connect to.
+### mode
 
-type: `string`
+`mode` is a tagged object (selected by its `type` field).
 
-### **mode**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `regular` or `jet_stream`. |
+| subject | object | yes | — | NATS subject to publish to (expression; see below). |
 
-The NATS operation mode.
+### subject (`Expr<String>`)
 
-type: `object`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static subject name. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
-One of:
-- `type: "regular"` with:
-  - `subject: object` - The subject to publish to, with:
-    - `type: "value"` with `value: string` - Static subject name
-    - `type: "expr"` with `expr: string` - SQL expression to evaluate subject
-- `type: "jetstream"` with:
-  - `subject: object` - The subject to publish to, with:
-    - `type: "value"` with `value: string` - Static subject name
-    - `type: "expr"` with `expr: string` - SQL expression to evaluate subject
+### auth
 
-### **auth**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| username | string | no | — | Username (use with `password`). |
+| password | string | no | — | Password (use with `username`). |
+| token | string | no | — | Authentication token. |
 
-Authentication configuration (optional).
-
-type: `object`
-
-Fields:
-- `username: string` - Username for authentication (optional)
-- `password: string` - Password for authentication (optional)
-- `token: string` - Authentication token (optional)
-
-### **value_field**
-
-The field to use as the message value. If not specified, uses the default binary value field.
-
-type: `string`
+Only one of username/password or token should be configured; if both are present, username/password takes precedence.
 
 ## Examples
+
+### Regular subject with username/password
 
 ```yaml
 output:
@@ -60,12 +58,14 @@ output:
   value_field: "message"
 ```
 
+### JetStream with token
+
 ```yaml
 output:
   type: "nats"
   url: "nats://localhost:4222"
   mode:
-    type: "jetstream"
+    type: "jet_stream"
     subject:
       type: "value"
       value: "orders.new"

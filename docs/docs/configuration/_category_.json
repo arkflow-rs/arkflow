@@ -1,0 +1,9 @@
+{
+  "label": "Configuration",
+  "position": 4,
+  "link": {
+    "title": "Configuration",
+    "type": "generated-index",
+    "description": "The top-level YAML structure that configures the ArkFlow engine."
+  }
+}

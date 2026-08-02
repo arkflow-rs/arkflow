@@ -1,21 +1,25 @@
-# schema_registry
+---
+sidebar_label: Schema Registry
+---
 
-`schema_registry` is a **codec** that decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry at runtime. It supports schema evolution: each schema version (id) is fetched once and cached, so multiple versions can coexist in the same stream.
+# Schema Registry
 
-## When to use
-
-- Consuming Protobuf messages produced by Confluent serializers (Kafka ecosystem standard wire format).
-- CDC / pipeline scenarios where the source schema evolves and producers register new versions to a Schema Registry.
-
-## Wire format
-
-```
-[0x00 magic][4-byte big-endian schema id][Protobuf payload]
-```
-
-The codec validates the magic byte and strips the id + payload; the id is resolved to a Protobuf schema via the registry.
+The `schema_registry` codec decodes Confluent wire-format Protobuf messages by resolving the embedded schema id from a Confluent Schema Registry at runtime. Each schema version (id) is fetched at most once and cached per codec instance, so multi-version schema evolution is supported within the same stream.
 
 ## Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Fixed value `"schema_registry"` |
+| registry_url | string | yes | — | Confluent Schema Registry root URL, e.g. `http://localhost:8081` |
+| message_type | string | yes | — | Fully qualified Protobuf message type name |
+| auth | object | no | — | Registry authentication configuration |
+| auth.type | string | yes (if `auth`) | — | Authentication method: `basic` or `bearer` |
+| auth.username | string | no | — | Username for `basic` mode |
+| auth.password | string | no | — | Password for `basic` mode |
+| auth.token | string | no | — | Token for `bearer` mode |
+
+## Examples
 
 ```yaml
 input:
@@ -29,33 +33,54 @@ input:
     type: schema_registry
     registry_url: http://localhost:8081
     message_type: com.example.User
-    auth:                       # optional
-      type: basic               # or bearer
-      username: ${SR_USER}
-      password: ${SR_PASS}
 ```
 
-| Field | Description |
-| --- | --- |
-| `registry_url` | Confluent Schema Registry base URL |
-| `message_type` | Fully-qualified Protobuf message type |
-| `auth` | Optional `basic` (username/password) or `bearer` (token) |
+```yaml
+codec:
+  type: schema_registry
+  registry_url: http://registry:8081
+  message_type: com.example.User
+  auth:
+    type: basic
+    username: ${SR_USER}
+    password: ${SR_PASS}
+```
 
-## How it works
+Bearer form:
 
-1. Parse the Confluent wire format (magic + id + payload).
-2. Resolve `id` to a Protobuf schema (`GET {registry}/schemas/ids/{id}`), cached per id.
-3. Build the `MessageDescriptor` and decode the payload into a columnar Arrow batch.
-
-The schema fetch is pluggable via a `SchemaResolver` trait (`RestSchemaResolver` for production, in-memory for tests), so the wire-format / caching / multi-version logic is unit-testable without a live registry.
-
-## Non-goals
-
-- Avro / JSON Schema types (Protobuf only for now).
-- Writing/registering schemas (read-only consumer).
-- Explicit BACKWARD/FORWARD compatibility checking (enforced by the registry).
-- Protobuf schema references (imports) — single-file schemas only.
-
-## Example
+```yaml
+codec:
+  type: schema_registry
+  registry_url: http://registry:8081
+  message_type: com.example.User
+  auth:
+    type: bearer
+    token: ${SR_TOKEN}
+```
 
 See `examples/schema_registry.yaml`.
+
+## Semantics
+
+### Wire format
+
+```
+[0x00 magic][4-byte big-endian schema id][Protobuf payload]
+```
+
+The codec validates the magic byte, splits out the id and payload, then resolves the schema from the registry using the id.
+
+### Workflow
+
+1. Parse the Confluent wire format (magic + id + payload).
+2. Resolve the Protobuf schema by id (`GET {registry}/schemas/ids/{id}`), caching the descriptor per id.
+3. Build a `MessageDescriptor` and decode the payload into a columnar Arrow batch.
+
+Schema resolution is abstracted behind a pluggable `SchemaResolver` trait (`RestSchemaResolver` for production, an in-memory implementation for tests), so the wire format / caching / multi-version logic can be unit-tested without a real registry.
+
+## Notes / Non-goals
+
+- Only Protobuf schemas are supported; Avro / JSON Schema are not supported.
+- It only resolves schemas on the consumer side; it never writes or registers new schemas.
+- It does not explicitly validate BACKWARD/FORWARD compatibility (enforced by the registry).
+- Protobuf schema references (imports) are not supported — only single-file schemas.
