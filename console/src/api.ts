@@ -37,6 +37,22 @@ export const api = {
   system: () => request<SystemResource>('/system'), status: () => request<EngineStatus>('/status'), node: () => request<NodeResource>('/node'), metrics: (nodeId?: string) => request<MetricsResponse>(`/metrics${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
   nodes: (page = 1, pageSize = 50) => request<Page<ControlNode>>(`/nodes?page=${page}&page_size=${pageSize}`), streams: (nodeId?: string) => request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`), events: (nodeId?: string) => request<Page<ControlEvent>>(`/events${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`), operations: (nodeId?: string) => request<Page<Operation>>(`/operations${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`), operation: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`),
   config: (nodeId?: string) => request<Record<string, unknown>>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration` : '/configuration'), draft: () => request<ConfigCandidate | undefined>('/configuration/draft'), saveDraft: (candidate: ConfigCandidate) => request<ConfigCandidate>('/configuration/draft', { method: 'PUT', body: JSON.stringify(candidate) }), validateConfig: (candidate: ConfigCandidate) => request<ConfigValidationReport>('/configuration/validate', { method: 'POST', body: JSON.stringify(candidate) }), diff: (from: string, to: string) => request<ConfigDiff>(`/configuration/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
-  applyConfig: (candidate: ConfigCandidate, nodeId?: string) => request(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/apply` : '/configuration/apply', { method: 'POST', body: JSON.stringify(candidate) }), versions: (nodeId?: string) => request<ConfigVersion[]>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/versions` : '/configuration/versions'), rollback: (id: string, nodeId?: string) => request(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/rollback/${encodeURIComponent(id)}` : `/configuration/rollback/${encodeURIComponent(id)}`, { method: 'POST' }),
+  applyConfig: (candidate: ConfigCandidate, nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/apply` : '/configuration/apply', { method: 'POST', body: JSON.stringify(candidate) }), versions: (nodeId?: string) => request<ConfigVersion[]>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/versions` : '/configuration/versions'), rollback: (id: string, nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/rollback/${encodeURIComponent(id)}` : `/configuration/rollback/${encodeURIComponent(id)}`, { method: 'POST' }),
   components: () => request<Component[]>('/components'), schema: () => request<unknown>('/schema'), command: (id: string, action: 'start' | 'stop' | 'restart', nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/streams/${encodeURIComponent(id)}/${action}` : `/streams/${encodeURIComponent(id)}/${action}`, { method: 'POST' }), cancel: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+}
+
+export async function waitForOperation(id: string): Promise<Operation> {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const operation = await api.operation(id)
+    const terminalIntent = ['converged', 'blocked', 'cancelled', 'superseded'].includes(operation.intent_state ?? '')
+    const terminalState = ['succeeded', 'failed', 'cancelled', 'timed_out', 'node_unavailable'].includes(operation.state)
+    if (terminalIntent || terminalState) {
+      if ((operation.intent_state && operation.intent_state !== 'converged') || (!operation.intent_state && operation.state !== 'succeeded')) {
+        throw new Error(operation.error ?? `Operation ${operation.intent_state ?? operation.state}`)
+      }
+      return operation
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 250))
+  }
+  throw new Error('Operation timed out')
 }
