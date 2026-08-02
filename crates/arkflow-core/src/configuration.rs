@@ -127,18 +127,48 @@ pub enum ConfigFormat {
 impl ConfigCandidate {
     pub fn parse(&self) -> Result<EngineConfig, ConfigIssue> {
         match self.format {
-            ConfigFormat::Yaml => serde_yaml::from_str(&self.content).map_err(parse_error),
-            ConfigFormat::Json => serde_json::from_str(&self.content).map_err(parse_error),
-            ConfigFormat::Toml => toml::from_str(&self.content).map_err(parse_error),
+            ConfigFormat::Yaml => serde_yaml::from_str(&self.content).map_err(|error| {
+                let path = error
+                    .location()
+                    .map(|location| {
+                        format!("line {}, column {}", location.line(), location.column())
+                    })
+                    .unwrap_or_else(|| "document".to_string());
+                parse_error_at(path, error)
+            }),
+            ConfigFormat::Json => serde_json::from_str(&self.content).map_err(|error| {
+                parse_error_at(
+                    format!("line {}, column {}", error.line(), error.column()),
+                    error,
+                )
+            }),
+            ConfigFormat::Toml => toml::from_str(&self.content).map_err(|error| {
+                let path = error
+                    .span()
+                    .map(|span| location_for_offset(&self.content, span.start))
+                    .unwrap_or_else(|| "document".to_string());
+                parse_error_at(path, error)
+            }),
         }
     }
 }
 
-fn parse_error(error: impl std::fmt::Display) -> ConfigIssue {
+fn parse_error_at(path: String, error: impl std::fmt::Display) -> ConfigIssue {
     ConfigIssue {
-        path: "".to_string(),
+        path,
         message: error.to_string(),
     }
+}
+
+fn location_for_offset(content: &str, offset: usize) -> String {
+    let prefix = &content[..offset.min(content.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map_or(0, |line| line.chars().count())
+        + 1;
+    format!("line {line}, column {column}")
 }
 
 /// Validate syntax, Stream identities, and component construction without
@@ -237,7 +267,11 @@ mod tests {
             format: ConfigFormat::Json,
             content: "not-json".to_string(),
         };
-        assert_eq!(invalid.parse().unwrap_err().path, "");
+        assert!(invalid
+            .parse()
+            .unwrap_err()
+            .path
+            .starts_with("line 1, column"));
     }
 
     #[test]
