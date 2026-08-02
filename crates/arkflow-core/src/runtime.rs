@@ -2,8 +2,8 @@
 
 use crate::config::EngineConfig;
 use crate::control::{
-    ControlEvent, DesiredState, OperationRecord, OperationState, RuntimeErrorEvent,
-    StreamMetricsSnapshot, StreamState, StreamStatus,
+    ControlEvent, ConvergenceState, DesiredState, OperationRecord, OperationState,
+    RuntimeErrorEvent, StreamMetricsSnapshot, StreamState, StreamStatus,
 };
 use crate::stream::StreamConfig;
 use crate::Error;
@@ -256,6 +256,17 @@ pub struct RuntimeEntry {
     pub metrics: Arc<RuntimeMetrics>,
     pub started_at_ms: Option<u64>,
     pub active_operation_id: Option<String>,
+    pub desired_state: DesiredState,
+    pub desired_generation: u64,
+    pub desired_config_version: Option<String>,
+    pub observed_generation: Option<u64>,
+    pub observed_config_version: Option<String>,
+    pub convergence: ConvergenceState,
+    pub intent_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub last_completed_action_id: Option<String>,
+    pub retry_count: u32,
+    pub next_retry_at_ms: Option<u64>,
     pub node_id: String,
     pub recent_errors: VecDeque<RuntimeErrorEvent>,
 }
@@ -271,6 +282,17 @@ impl RuntimeEntry {
             metrics: Arc::new(RuntimeMetrics::default()),
             started_at_ms: None,
             active_operation_id: None,
+            desired_state: DesiredState::Stopped,
+            desired_generation: 0,
+            desired_config_version: None,
+            observed_generation: None,
+            observed_config_version: None,
+            convergence: ConvergenceState::InSync,
+            intent_id: None,
+            attempt_id: None,
+            last_completed_action_id: None,
+            retry_count: 0,
+            next_retry_at_ms: None,
             node_id: "local-node".to_string(),
             recent_errors: VecDeque::with_capacity(MAX_RECENT_ERRORS),
         }
@@ -291,12 +313,17 @@ impl RuntimeEntry {
         StreamStatus {
             id: self.id.clone(),
             state: self.state,
-            desired_state: Some(match self.state {
-                StreamState::Running | StreamState::Starting | StreamState::Restarting => {
-                    DesiredState::Running
-                }
-                _ => DesiredState::Stopped,
-            }),
+            desired_state: Some(self.desired_state),
+            desired_generation: self.desired_generation,
+            desired_config_version: self.desired_config_version.clone(),
+            observed_generation: self.observed_generation,
+            observed_config_version: self.observed_config_version.clone(),
+            convergence: self.convergence,
+            intent_id: self.intent_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            last_completed_action_id: self.last_completed_action_id.clone(),
+            retry_count: self.retry_count,
+            next_retry_at_ms: self.next_retry_at_ms,
             transition_started_at_ms: self.started_at_ms,
             active_operation_id: self.active_operation_id.clone(),
             node_id: Some(self.node_id.clone()),
@@ -312,6 +339,7 @@ impl RuntimeEntry {
 pub struct RuntimeManager {
     entries: Arc<RwLock<BTreeMap<String, Arc<Mutex<RuntimeEntry>>>>>,
     events: EventStore,
+    observed_config_version: Arc<RwLock<Option<String>>>,
 }
 
 impl RuntimeManager {
@@ -344,6 +372,24 @@ impl RuntimeManager {
         }
     }
 
+    pub async fn set_last_completed_action(&self, id: &str, action_id: String) {
+        if let Some(entry) = self.get(id).await {
+            entry.lock().await.last_completed_action_id = Some(action_id);
+        }
+    }
+
+    pub async fn set_observed_config_version(&self, version: String) {
+        *self.observed_config_version.write().await = Some(version.clone());
+        let entries = self.entries.read().await;
+        for entry in entries.values() {
+            entry.lock().await.observed_config_version = Some(version.clone());
+        }
+    }
+
+    pub async fn observed_config_version(&self) -> Option<String> {
+        self.observed_config_version.read().await.clone()
+    }
+
     pub async fn remove(&self, id: &str) -> Option<Arc<Mutex<RuntimeEntry>>> {
         self.entries.write().await.remove(id)
     }
@@ -372,6 +418,7 @@ impl RuntimeManager {
                 message,
                 operation_id: None,
                 correlation_id: None,
+                actor: None,
             })
             .await;
     }
@@ -487,6 +534,7 @@ impl RuntimeManager {
                     message: event.3,
                     operation_id: None,
                     correlation_id: None,
+                    actor: None,
                 })
                 .await;
             result
