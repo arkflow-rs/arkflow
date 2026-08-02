@@ -30,9 +30,11 @@ ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/
 ## Features
 
 - **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency
-- **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, and other input/output sources
-- **Powerful Processing Capabilities**: Built-in SQL queries, Python script, JSON processing, Protobuf encoding/decoding, batch
-  processing, and other processors
+- **Durable Delivery**: At-least-once by default via per-stream WAL durability, with optional exactly-once for transactional sinks
+- **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, SQL databases, and many other input/output sources
+- **Powerful Processing**: Built-in SQL queries, Python UDFs, JSON processing, Protobuf encoding/decoding, batch processing, and VRL
+- **Streaming Codecs**: JSON and Protobuf codecs, plus Debezium CDC envelopes and Confluent Schema Registry wire-format
+- **Control Plane**: An optional Hub and web console to observe, configure, and operate multiple ArkFlow compute nodes as a fleet
 - **Extensible**: Modular design, easy to extend with new input, buffer, output, and processor components
 
 ## Installation
@@ -114,13 +116,16 @@ ArkFlow supports multiple input sources:
 - **Kafka**: Read data from Kafka topics
 - **MQTT**: Subscribe to messages from MQTT topics
 - **HTTP**: Receive data via HTTP
-- **File**: Reading data from files(Csv,Json, Parquet, Avro, Arrow) using SQL
-- **Generator**: Generate test data
-- **Database**: Query data from databases(MySQL, PostgreSQL, SQLite, Duckdb)
-- **Nats**: Subscribe to messages from Nats topics
-- **Redis**: Subscribe to messages from Redis channels or lists
-- **Websocket**: Subscribe to messages from WebSocket connections
+- **File**: Reading data from files (CSV, JSON, Parquet, Avro, Arrow) with cloud storage support
+- **Generate**: Generate synthetic test data
+- **SQL**: Query data from SQL databases (MySQL, PostgreSQL, SQLite)
+- **NATS**: Subscribe to messages from NATS topics with JetStream support
+- **Pulsar**: Subscribe to messages from Pulsar topics
+- **Redis**: Subscribe to messages from Redis streams, lists, or pub/sub channels
+- **WebSocket**: Subscribe to messages from WebSocket connections
 - **Modbus**: Read data from Modbus devices
+- **Memory**: In-memory data source for testing
+- **Multiple Inputs**: Combine multiple input streams into one pipeline
 
 Example:
 
@@ -144,7 +149,8 @@ ArkFlow provides multiple data processors:
 - **SQL**: Process data using SQL queries
 - **Protobuf**: Protobuf encoding/decoding
 - **Batch Processing**: Process messages in batches
-- **Vrl**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
+- **VRL**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
+- **Python**: Run Python user-defined functions over the batch
 
 Example:
 
@@ -164,9 +170,13 @@ ArkFlow supports multiple output targets:
 - **Kafka**: Write data to Kafka topics
 - **MQTT**: Publish messages to MQTT topics
 - **HTTP**: Send data via HTTP
+- **InfluxDB**: Write time-series data to InfluxDB 2.x
+- **NATS**: Publish messages to NATS topics
+- **Pulsar**: Publish messages to Pulsar topics
+- **Redis**: Write to Redis streams, lists, or pub/sub channels
+- **SQL**: Write to SQL databases (MySQL, PostgreSQL, SQLite) with batch inserts and UPSERT
 - **Standard Output**: Output data to the console
 - **Drop**: Discard data
-- **Nats**: Publish messages to Nats topics
 
 Example:
 
@@ -185,14 +195,9 @@ output:
 
 ### Error Output Components
 
-ArkFlow supports multiple error output targets:
-
-- **Kafka**: Write error data to Kafka topics
-- **MQTT**: Publish error messages to MQTT topics
-- **HTTP**: Send error data via HTTP
-- **Standard Output**: Output error data to the console
-- **Drop**: Discard error data
-- **Nats**: Publish messages to Nats topics
+The `error_output` accepts any of the [output components](#output-components)
+listed above and receives messages that failed processing. The most common
+choices are Kafka, HTTP, and Standard Output for debugging.
 
 Example:
 

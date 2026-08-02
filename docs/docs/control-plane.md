@@ -32,6 +32,17 @@ commands; lifecycle commands target `/api/v1/nodes/{node_id}/streams/{stream_id}
 Node configuration is read from `/api/v1/nodes/{node_id}/configuration`; apply and rollback are
 dispatched through the selected node's Agent session. Configuration snapshots are redacted before
 they are retained by the Hub.
+
+The Hub reconciles **desired versus observed** state at two levels: the node (registered
+capabilities and lease status versus the last reported runtime snapshot) and each Stream
+(configured spec versus running task). Reconciliation is driven by the durable desired state, so a
+node that reconnects after a disconnect resumes toward the same desired configuration rather than
+a stale one. If a compute node cannot reach the Hub, it keeps its local data-plane policy, retries
+registration and heartbeats with bounded backoff, and surfaces a disconnected status locally; its
+in-flight Streams continue running against the configured inputs and outputs. The console presents
+fleet health and per-node summaries first; select a node to scope runtime, configuration, events,
+and operations views to it. A node marked stale shows its last-seen time, and mutating actions
+that require Agent dispatch are disabled or explained rather than silently queued.
 The existing WAL remains at-least-once: restarting a Stream replays unacknowledged
 entries according to its configured WAL cursor semantics. The compatibility
 health routes `/health`, `/readiness`, `/liveness`, `/metrics`, and the legacy
