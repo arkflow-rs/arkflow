@@ -1,96 +1,58 @@
+---
+sidebar_label: Kafka
+---
+
 # Kafka
 
-The Kafka input component consumes messages from a Kafka topic. It provides reliable message consumption with consumer group support and configurable offset management.
+The Kafka input consumes messages from one or more Apache Kafka topics using a consumer group. Offsets are only advanced after the downstream output acknowledges the write (`enable.auto.offset.store=false`), giving at-least-once delivery across crashes.
 
 ## Configuration
 
-### **brokers**
-
-List of Kafka server addresses.
-
-- Format: `["host1:port1", "host2:port2"]`
-- At least one broker address must be specified
-- Multiple brokers can be specified for high availability
-
-type: `array` of `string`
-
-optional: `false`
-
-### **topics**
-
-Subscribed to topics.
-
-- Format: `["topic1", "topic2"]`
-- Multiple topics can be subscribed
-- Topics must exist in the Kafka cluster
-- The consumer will receive messages from all specified topics
-
-type: `array` of `string`
-
-optional: `false`
-
-### **consumer_group**
-
-Consumer group ID.
-
-- Consumers within the same consumer group will share message consumption
-- Different consumer groups will independently consume the same messages
-- It is recommended to set a unique consumer group ID for each application
-- Used for distributed message processing and load balancing
-
-type: `string`
-
-optional: `false`
-
-### **client_id**
-
-Client ID (optional).
-
-- If not specified, the system will automatically generate a random ID
-- It is recommended to set an explicit client ID for monitoring in production environments
-- Used to identify the client in Kafka logs and metrics
-
-type: `string`
-
-optional: `true`
-
-### **start_from_latest**
-
-Start with the most recent messages.
-
-- When set to true, the consumer will start consuming from the latest messages
-- When set to false, the consumer will start from the earliest available messages
-- Useful for controlling message replay behavior on consumer startup
-
-type: `boolean`
-
-default: `false`
-
-optional: `true`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"kafka"` |
+| brokers | array&lt;string&gt; | yes | — | List of Kafka broker addresses, e.g. `["host1:9092","host2:9092"]` |
+| topics | array&lt;string&gt; | yes | — | List of topics to subscribe to |
+| consumer_group | string | yes | — | Consumer group ID, used for offset coordination and load balancing |
+| client_id | string | no | — | Client ID, used for monitoring and logging |
+| start_from_latest | boolean | no | `false` | When `true`, ignores committed offsets and starts consuming from the latest messages |
+| fetch_min_bytes | integer | no | — | Minimum bytes required for the broker to respond to a fetch request |
+| fetch_max_bytes | integer | no | — | Maximum bytes returned by a single fetch request |
+| fetch_max_partition_bytes | integer | no | — | Maximum bytes returned per partition in a single fetch |
+| fetch_wait_max_ms | integer | no | — | Maximum time (ms) the broker waits for enough data to accumulate before responding |
 
 ## Examples
 
 ```yaml
-- input:
-    type: kafka
-    brokers:
-      - localhost:9092
-    topics:
-      - my_topic
-    consumer_group: my_consumer_group
-    client_id: my_client
-    start_from_latest: false
+input:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topics:
+    - "my_topic"
+  consumer_group: "my_consumer_group"
+  client_id: "my_client"
+  start_from_latest: false
 ```
 
 ```yaml
-- input:
-    type: kafka
-    brokers:
-      - kafka1:9092
-      - kafka2:9092
-    topics:
-      - topic1
-      - topic2
-    consumer_group: app1_group
-    start_from_latest: true
+input:
+  type: "kafka"
+  brokers:
+    - "kafka1:9092"
+    - "kafka2:9092"
+  topics:
+    - "topic1"
+    - "topic2"
+  consumer_group: "app1_group"
+  start_from_latest: true
+  fetch_min_bytes: 1
+  fetch_max_bytes: 52428800
+  fetch_max_partition_bytes: 1048576
+  fetch_wait_max_ms: 500
 ```
+
+## Notes
+
+- Messages automatically carry metadata columns such as `__meta_source`, `__meta_partition`, `__meta_offset`, `__meta_key`, `__meta_timestamp`, and `__meta_ingest_time`, plus the extended `__meta_ext.topic`.
+- Offsets are advanced via `store_offset` only when `ack()` is called (after a successful downstream write), combined with periodic auto-commit to achieve at-least-once delivery.

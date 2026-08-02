@@ -1,213 +1,148 @@
 # Redis
 
-The Redis output component writes messages to Redis data structures including Streams, Lists, and Pub/Sub channels.
+The Redis output writes messages to Redis using one of four data-structure operations: Pub/Sub publish, List push, Hash set, or String set. It supports single-node and cluster connections.
 
 ## Configuration
 
-### **type**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"redis"` |
+| mode | object | yes | — | Connection mode (see below). |
+| redis_type | object | yes | — | Redis operation to perform (see below). |
+| value_field | string | no | — | Record field used as the message payload. |
 
-Redis data structure type.
+### mode
 
-Supported values: `stream`, `list`, `pubsub`
+`mode` is a tagged object (selected by its `type` field).
 
-type: `string`
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `single` or `cluster`. |
+| url | string | yes (`single`) | — | Redis server URL (e.g. `redis://localhost:6379`). |
+| urls | `array<string>` | yes (`cluster`) | — | Redis cluster node URLs. |
 
-optional: `false`
+### redis_type
 
-### **address**
+`redis_type` is a tagged object (selected by its `type` field). All keys/fields/channels are `Expr<String>` (see [Expression objects](#expression-objects)).
 
-Redis server address.
+#### publish
 
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `publish`. |
+| channel | object | yes | Pub/Sub channel to publish to (expression). |
 
-example: `"localhost:6379"`
+#### list
 
-optional: `false`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `list`. |
+| key | object | yes | List key; values are appended with `RPUSH` (expression). |
 
-### **password** (optional)
+#### hashes
 
-Redis password for authentication.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `hashes`. |
+| key | object | yes | Hash key (expression). |
+| field | object | yes | Hash field name (expression). |
 
-type: `string`
+#### strings
 
-optional: `true`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `strings`. |
+| key | object | yes | String key (expression). |
 
-### **db** (optional)
+### Expression objects
 
-Redis database number.
+`channel`, `key`, and `field` are `Expr<String>` objects:
 
-type: `integer`
-
-default: `0`
-
-optional: `true`
-
-### **key** (list, pubsub)
-
-Redis key for list or pubsub operations.
-
-type: `string`
-
-optional: `false` (for list and pubsub types)
-
-### **stream** (stream)
-
-Stream key name.
-
-type: `string`
-
-optional: `false` (for stream type)
-
-### **stream_max_len** (stream)
-
-Maximum length of the stream. When exceeded, old entries are evicted.
-
-type: `integer`
-
-optional: `true`
-
-### **channel** (pubsub)
-
-Pub/Sub channel name.
-
-type: `string`
-
-optional: `false` (for pubsub type)
-
-### **list_operation** (list)
-
-List operation type.
-
-Supported values: `lpush`, `rpush`
-
-type: `string`
-
-default: `"lpush"`
-
-optional: `true`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static value. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
 ## Examples
 
-### Write to Redis Stream
+### Publish to a channel
 
 ```yaml
-- output:
-    type: "redis"
-    type: "stream"
-    address: "localhost:6379"
-    stream: "sensor_data"
-    stream_max_len: 10000
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "publish"
+    channel:
+      type: "value"
+      value: "notifications"
 ```
 
-### Write to Redis List (LPUSH)
+### Push to a List
 
 ```yaml
-- output:
-    type: "redis"
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
     type: "list"
-    address: "localhost:6379"
-    key: "events"
-    list_operation: "lpush"
+    key:
+      type: "value"
+      value: "events"
 ```
 
-### Write to Redis List (RPUSH)
+### Set a Hash field
 
 ```yaml
-- output:
-    type: "redis"
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "hashes"
+    key:
+      type: "value"
+      value: "user:1"
+    field:
+      type: "value"
+      value: "status"
+```
+
+### Set a String
+
+```yaml
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "strings"
+    key:
+      type: "expr"
+      expr: "concat('key:', id)"
+```
+
+### Cluster connection
+
+```yaml
+output:
+  type: "redis"
+  mode:
+    type: "cluster"
+    urls:
+      - "redis://redis-1:6379"
+      - "redis://redis-2:6379"
+      - "redis://redis-3:6379"
+  redis_type:
     type: "list"
-    address: "redis-cluster:6379"
-    key: "logs"
-    list_operation: "rpush"
+    key:
+      type: "value"
+      value: "logs"
 ```
-
-### Publish to Redis Channel
-
-```yaml
-- output:
-    type: "redis"
-    type: "pubsub"
-    address: "localhost:6379"
-    channel: "notifications"
-```
-
-### With Authentication
-
-```yaml
-- output:
-    type: "redis"
-    type: "stream"
-    address: "secure-redis:6379"
-    password: "${REDIS_PASSWORD}"
-    db: 2
-    stream: "secure_data"
-```
-
-### Stream with Consumer Group
-
-```yaml
-- output:
-    type: "redis"
-    type: "stream"
-    address: "localhost:6379"
-    stream: "events_stream"
-    stream_max_len: 100000
-```
-
-## Features
-
-- **Multiple Data Types**: Support for Streams, Lists, and Pub/Sub
-- **Authentication**: Password-based authentication
-- **Database Selection**: Support for multiple Redis databases
-- **Stream Limits**: Configurable maximum stream length with automatic eviction
-- **Connection Pooling**: Efficient connection management
-
-## Data Type Usage
-
-### Stream
-Use for time-series data, event logs, and message queues.
-
-```yaml
-type: "stream"
-stream: "my_stream"
-stream_max_len: 10000  # Optional: limit stream size
-```
-
-Features:
-- Automatic timestamp
-- Consumer group support
-- Automatic eviction when max_len is reached
-
-### List
-Use for queues, stacks, and ordered collections.
-
-```yaml
-type: "list"
-key: "my_list"
-list_operation: "lpush"  # or "rpush"
-```
-
-Operations:
-- `lpush`: Add to the left (head) of the list
-- `rpush`: Add to the right (tail) of the list
-
-### Pub/Sub
-Use for real-time messaging and notifications.
-
-```yaml
-type: "pubsub"
-channel: "my_channel"
-```
-
-Use cases:
-- Broadcast messages
-- Real-time notifications
-- Event distribution
-
-## Best Practices
-
-1. **Use Streams for Message Queues**: Streams provide better persistence and consumer group support
-2. **Set Max Length on Streams**: Prevent unbounded memory growth with `stream_max_len`
-3. **Use Lists for Simple Queues**: Lists are ideal for simple FIFO/LIFO queues
-4. **Use Pub/Sub for Broadcasting**: Publish messages to multiple consumers
-5. **Monitor Memory**: Watch Redis memory usage, especially for unbounded lists

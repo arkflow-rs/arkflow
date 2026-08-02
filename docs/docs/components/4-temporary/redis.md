@@ -1,114 +1,54 @@
+---
+sidebar_label: Redis
+---
+
 # Redis
 
-The Redis temporary component provides temporary storage capabilities using Redis as the backend. It supports both list and string data types and can be used in SQL queries as lookup tables.
+The Redis temporary provides lookup storage backed by Redis for SQL processors. It exposes a `Temporary` resource that the SQL processor joins against via `temporary_list`. Two Redis data shapes are supported: `string` (MGET) and `list` (LRANGE). Results are passed through a codec (typically JSON) to produce an Arrow batch registered as a query-side table.
 
 ## Configuration
 
-#### **mode** (required)
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Fixed value `"redis"` |
+| mode | object | yes | — | Redis connection configuration (single or cluster) |
+| mode.type | string | yes | — | Connection type: `single` or `cluster` |
+| mode.url | string | yes (single) | — | Redis URL in `single` mode, e.g. `redis://host:port` or `rediss://...` (TLS) |
+| mode.urls | array&lt;string&gt; | yes (cluster) | — | List of node URLs in `cluster` mode |
+| redis_type | object | yes | — | Redis data structure selection |
+| redis_type.type | string | yes | — | Data type: `string` (MGET) or `list` (LRANGE) |
+| codec | object | yes | — | Codec configuration for deserializing data (structure matches each codec; typically `{ type: json }`) |
+| codec.type | string | yes | — | Codec type, e.g. `json` |
 
-Redis connection configuration. Supports both single instance and cluster modes.
+## Usage in SQL queries
 
-type: `object`
+The Redis temporary serves as a query-side lookup table via the SQL processor's `temporary_list`. The actual schema of `temporary_list[].key` is `Expr<String>` (`#[serde(tag = "type")]`), one of:
 
-##### Single Mode
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| key.type | string | yes | — | `value` (static string literal) or `expr` (DataFusion expression) |
+| key.value | string | yes (value) | — | Static key value when `key.type = value` |
+| key.expr | string | yes (expr) | — | DataFusion expression evaluated against the current batch (returning a string) when `key.type = expr` |
 
-```yaml
-mode:
-  type: "single"
-  url: "redis://127.0.0.1:6379"
-```
+## Examples
 
-###### **type** (required)
-
-Connection type, must be `"single"` for single instance mode.
-
-type: `string`
-
-###### **url** (required)
-
-Redis server URL in the format `redis://host:port` or `rediss://host:port` for SSL/TLS connections.
-
-type: `string`
-
-##### Cluster Mode
-
-```yaml
-mode:
-  type: "cluster"
-  urls:
-    - "redis://127.0.0.1:6379"
-    - "redis://127.0.0.1:6380"
-    - "redis://127.0.0.1:6381"
-```
-
-###### **type** (required)
-
-Connection type, must be `"cluster"` for cluster mode.
-
-type: `string`
-
-###### **urls** (required)
-
-List of Redis cluster node URLs.
-
-type: `array` of `string`
-
-#### **redis_type** (required)
-
-Redis data type configuration. Supports both list and string types.
-
-type: `object`
-
-##### String Type
-
-```yaml
-redis_type:
-  type: "string"
-```
-
-Uses Redis string operations (GET/MGET) to retrieve data.
-
-##### List Type
-
-```yaml
-redis_type:
-  type: "list"
-```
-
-Uses Redis list operations (LRANGE) to retrieve data.
-
-#### **codec** (required)
-
-Codec configuration for data serialization/deserialization.
-
-type: `object`
-
-```yaml
-codec:
-  type: "json"
-```
-
-Currently supports JSON codec for data encoding/decoding.
-
-## Usage in SQL Queries
-
-The Redis temporary component can be used as a lookup table in SQL queries:
+Declaring a temporary resource and referencing it with a static key in the SQL processor:
 
 ```yaml
 temporary:
   - name: redis_temporary
-    type: "redis"
-    codec:
-      type: json
+    type: redis
     mode:
       type: single
       url: redis://127.0.0.1:6379
     redis_type:
       type: string
+    codec:
+      type: json
 
 pipeline:
   processors:
-    - type: "sql"
+    - type: sql
       query: "SELECT * FROM flow RIGHT JOIN redis_table ON (flow.sensor = redis_table.x)"
       temporary_list:
         - name: redis_temporary
@@ -118,7 +58,18 @@ pipeline:
             value: 'test'
 ```
 
-## Complete Example
+Computing the key dynamically with an expression (using the `device_id` column of the batch as the Redis key):
+
+```yaml
+temporary_list:
+  - name: redis_temporary
+    table_name: redis_table
+    key:
+      type: expr
+      expr: device_id
+```
+
+Full example (generate → SQL join Redis → stdout):
 
 ```yaml
 logging:
@@ -126,27 +77,27 @@ logging:
 
 streams:
   - input:
-      type: "generate"
+      type: generate
       context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
       interval: 5s
       batch_size: 2
 
     temporary:
       - name: redis_temporary
-        type: "redis"
-        codec:
-          type: json
+        type: redis
         mode:
           type: single
           url: redis://127.0.0.1:6379
         redis_type:
           type: string
+        codec:
+          type: json
 
     pipeline:
       thread_num: 10
       processors:
-        - type: "json_to_arrow"
-        - type: "sql"
+        - type: json_to_arrow
+        - type: sql
           query: "SELECT * FROM flow RIGHT JOIN redis_table ON (flow.sensor = redis_table.x)"
           temporary_list:
             - name: redis_temporary
@@ -156,21 +107,12 @@ streams:
                 value: 'test'
 
     output:
-      type: "stdout"
+      type: stdout
 ```
-
-## Features
-
-- **Multiple Redis Types**: Supports both string and list data types
-- **Connection Modes**: Works with both single Redis instances and Redis clusters
-- **SQL Integration**: Can be used as lookup tables in SQL queries
-- **Flexible Codec**: Supports JSON codec for data serialization
-- **Async Operations**: Fully asynchronous Redis operations for better performance
 
 ## Notes
 
-- The component automatically handles connection management and reconnection
-- When used in SQL queries, the key parameter determines which Redis key(s) to query
-- List type uses LRANGE to get all elements from Redis lists
-- String type uses MGET for efficient batch retrieval of multiple keys
-- All Redis operations are performed asynchronously for optimal performance
+- The `list` type uses `LRANGE key 0 -1` to fetch all elements; the `string` type uses `MGET` against the deduplicated set of keys.
+- A single query supports only a single key column (`keys.len() == 1`); when an `expr` evaluation returns an array, each entry is queried as a separate key.
+- The codec must be able to deserialize the bytes/strings fetched from Redis into an Arrow batch; it is typically configured as `json`.
+- Connection management is handled by an internal `ConnectionManager` with automatic reconnection.

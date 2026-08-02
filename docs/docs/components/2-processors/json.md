@@ -1,67 +1,45 @@
 # JSON
 
-The JSON processor component provides two processors for converting between JSON and Arrow formats.
+The JSON processor converts between JSON and Apache Arrow columnar formats. It registers two processor types: `json_to_arrow` decodes JSON bytes into an Arrow `RecordBatch`, and `arrow_to_json` serializes an Arrow batch back into JSON bytes.
 
-## JSON to Arrow
+## Configuration
 
-The `json_to_arrow` processor converts JSON objects to Arrow format.
+The two types share the same configuration fields. `value_field` selects the binary column holding JSON data (defaults to the engine default binary value field); `fields_to_include` restricts which columns appear in the output.
 
-### Configuration
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `json_to_arrow` \| `arrow_to_json` |
+| value_field | string | no | — | Name of the binary field containing JSON data (used by `json_to_arrow`). |
+| fields_to_include | array&lt;string&gt; | no | — | Restrict the output to the listed column names. When omitted, all fields are included. |
 
-#### **value_field**
+## Examples
 
-Specifies the JSON field name to process.
-
-type: `string`
-
-optional: `true`
-
-#### **fields_to_include**
-
-Specifies a set of field names to include in the output. If not specified, all fields will be included.
-
-type: `array[string]`
-
-optional: `true`
-
-### Example
+### JSON to Arrow
 
 ```yaml
 - processor:
     type: "json_to_arrow"
     value_field: "data"
     fields_to_include:
-    - "field1"
-    - "field2"
+      - "field1"
+      - "field2"
 ```
 
-## Arrow to JSON
-
-The `arrow_to_json` processor converts Arrow format data to JSON format.
-
-### Configuration
-
-#### **fields_to_include**
-
-Specifies a set of field names to include in the output. If not specified, all fields will be included.
-
-type: `array[string]`
-
-optional: `true`
-
-### Example
+### Arrow to JSON
 
 ```yaml
 - processor:
     type: "arrow_to_json"
     fields_to_include:
-    - "field1"
-    - "field2"
+      - "field1"
+      - "field2"
 ```
 
-## Data Type Mapping
+## Notes
 
-The processor supports the following JSON to Arrow data type conversions:
+### Data Type Mapping
+
+JSON to Arrow type conversions:
 
 | JSON Type | Arrow Type | Notes |
 |-----------|------------|--------|

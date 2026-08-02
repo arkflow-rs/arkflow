@@ -1,26 +1,14 @@
 # VRL
 
-The VRL (Vector Remap Language) processor component allows you to process and transform data using the VRL language. It supports rich data type conversion and processing operations, enabling you to flexibly modify and transform messages in the data stream.
+The VRL processor transforms messages using Vector Remap Language (VRL), a safe expression language designed for observability data pipelines. Each incoming batch is mapped to VRL objects; the result of the configured statement is projected back into the columnar batch. See the VRL syntax reference at https://vector.dev/docs/reference/vrl/.
 
 ## Configuration
 
-### **statement**
-
-VRL statement used to perform data transformation operations.
-
-type: `string`
-
-## Supported Data Types
-
-The VRL processor supports the conversion of the following data types:
-
-- **String**
-- **Integer**: Supports Int8, Int16, Int32, Int64
-- **Float**: Supports Float32, Float64
-- **Boolean**
-- **Binary**
-- **Timestamp**
-- **Null**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `vrl` |
+| statement | string | yes | — | VRL program used to transform each message. |
+| timezone | string | no | — | Time zone used when parsing/formatming time values in the program (e.g. `UTC`, `Asia/Shanghai`). |
 
 ## Examples
 
@@ -29,8 +17,6 @@ The VRL processor supports the conversion of the following data types:
     type: "vrl"
     statement: ".v2, err = .value * 2; ."
 ```
-
-In this example, the VRL processor multiplies the `value` field in the input message by 2 and stores the result in a new `v2` field.
 
 ### Complete Pipeline Example
 
@@ -48,15 +34,23 @@ streams:
         - type: "json_to_arrow"
         - type: "vrl"
           statement: ".v2, err = .value * 2; ."
+          timezone: "UTC"
         - type: "arrow_to_json"
 
     output:
       type: "stdout"
 ```
 
-This example demonstrates a complete pipeline where:
-1. First, it generates a JSON message containing timestamp, value, and sensor information
-2. Converts the JSON to Arrow format
-3. Uses the VRL processor to transform the data
-4. Converts the processed data back to JSON format
-5. Finally outputs to standard output
+## Notes
+
+### Supported Data Types
+
+VRL values map to and from the following Arrow types:
+
+- **String** (Utf8)
+- **Integer**: Int8, Int16, Int32, Int64
+- **Float**: Float32, Float64
+- **Boolean**
+- **Binary**
+- **Timestamp**
+- **Null**

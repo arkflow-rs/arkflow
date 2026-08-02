@@ -1,5 +1,5 @@
 ---
-sidebar_position: 0
+sidebar_position: 6
 ---
 
 # Exactly-once delivery
@@ -9,10 +9,6 @@ are replayed and MAY be redelivered to outputs. For duplicate-intolerant sinks,
 ArkFlow can deliver **exactly-once** (more precisely, *effectively-once*) opt-in,
 via a transactional Kafka output. This page describes what that guarantees,
 how to configure it, and where its boundary lies.
-
-The contract is specified in
-`openspec/specs/exactly-once-output/spec.md`; this page is the user-facing
-description of the same semantics.
 
 ## How it works
 
@@ -75,7 +71,7 @@ A complete runnable example is in
 
 ## The honest boundary (read this)
 
-The Kafka transactional output (this L2 mechanism) eliminates two specific
+The Kafka transactional output eliminates two specific
 sources of duplicates:
 
 - **in-transaction partial writes** — the transaction commits atomically, so a

@@ -1,80 +1,35 @@
 # SQL
 
-The SQL processor component allows you to process data using SQL queries. It uses DataFusion as the query engine to execute SQL statements on the data.
-
-Reference to [SQL](../../category/sql).
+The SQL processor runs SQL queries against the incoming message batch using DataFusion as the query engine. Each batch is registered as a temporary table (named `flow` by default, or `table_name` when set) so it can be filtered, projected, joined with temporary data sources, or aggregated in SQL.
 
 ## Configuration
 
-### **query**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `sql` |
+| query | string | yes | — | SQL query statement to execute against the incoming batch. |
+| table_name | string | no | `flow` | Table name used to reference the incoming batch inside the query. |
+| temporary_list | array&lt;object&gt; | no | — | Additional temporary data sources to reference in the query. |
 
-The SQL query statement to execute on the data.
+### `temporary_list` item
 
-type: `string`
+Each entry registers one external source as a named table.
 
-### **table_name**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| name | string | yes | — | Name of the temporary source registered with the engine. |
+| table_name | string | yes | — | Table name to use for this source inside the SQL query. |
+| key | object | yes | — | Key used to look up data in the temporary source. |
 
-The table name to use in SQL queries. This is the name that will be used to reference the data in your SQL queries.
+### `key`
 
-type: `string`
+Tagged union (`type` field selects the variant, snake_cased):
 
-default: `flow`
-
-### **ballista (experimental)**
-
-Optional configuration for distributed computing using Ballista. When configured, SQL queries will be executed in a distributed manner.
-
-type: `object`
-
-required: `false`
-
-properties:
-- `remote_url`: Ballista server URL (e.g., "df://localhost:50050")
-
-  type: `string`
-
-  required: `true`
-
-### **temporary_list**
-
-Optional list of temporary data sources that can be referenced in SQL queries. Each temporary source allows you to access external data during query execution.
-
-type: `array`
-
-required: `false`
-
-properties:
-- `name`: Name of the temporary data source to reference
-
-  type: `string`
-
-  required: `true`
-
-- `table_name`: Table name to use for this temporary data in SQL queries
-
-  type: `string`
-
-  required: `true`
-
-- `key`: Key expression or value used to retrieve data from the temporary source
-
-  type: `object`
-
-  required: `true`
-
-  properties:
-  - `expr`: Expression string to evaluate for the key
-  
-    type: `string`
-    
-    required: `false`
-    
-  - `value`: Static string value to use as the key
-  
-    type: `string`
-    
-    required: `false`
-
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `expr` \| `value` |
+| expr | string | no | — | Expression to evaluate per row against the batch (used when `type: expr`). |
+| value | string | no | — | Static string value used as the key (used when `type: value`). |
 
 ## Examples
 
@@ -83,8 +38,8 @@ properties:
 ```yaml
 - processor:
     type: "sql"
-    query: "SELECT id, name, age FROM users WHERE age > 18"
-    table_name: "users"
+    query: "SELECT id, name, age FROM flow WHERE age > 18"
+    table_name: "flow"
 ```
 
 ### SQL Query with Temporary Data Sources
@@ -101,22 +56,12 @@ properties:
 
   processor:
     type: "sql"
-    query: "SELECT u.id, u.name, p.title FROM users u JOIN profiles p ON u.id = p.user_id"
-    table_name: "users"
+    query: "SELECT u.id, u.name, p.title FROM flow u JOIN profiles p ON u.id = p.user_id"
+    table_name: "flow"
     temporary_list:
       - name: "user_profiles"
         table_name: "profiles"
         key:
+          type: "expr"
           expr: "user_id"
-```
-
-### SQL Query with Ballista (Distributed Computing)
-
-```yaml
-- processor:
-    type: "sql"
-    query: "SELECT COUNT(*) as total FROM large_dataset"
-    table_name: "large_dataset"
-    ballista:
-      remote_url: "df://localhost:50050"
 ```

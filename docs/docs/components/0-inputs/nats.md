@@ -1,145 +1,66 @@
+---
+sidebar_label: NATS
+---
+
 # NATS
 
-The NATS input component receives data from a NATS server, supporting both regular NATS and JetStream modes.
+The NATS input connects to a NATS server and supports two modes: regular subscriptions (regular) and JetStream pull consumers (jet_stream).
 
 ## Configuration
 
-#### **url** (required)
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"nats"` |
+| url | string | yes | — | NATS server URL, e.g. `nats://host:4222`; multiple servers separated by commas |
+| mode | object | yes | — | Operating mode, see table below (tagged enum, distinguished by the `type` field) |
+| auth | object | no | — | Authentication configuration, see table below |
 
-NATS server URL in the format `nats://host:port` or `tls://host:port`. For clustering/failover, multiple servers can be specified as a comma-separated list (e.g., `nats://server1:4222,nats://server2:4222`).
+### mode (regular)
 
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"regular"` |
+| subject | string | yes | NATS subject to subscribe to |
+| queue_group | string | no | Queue group name |
 
-#### **mode** (required)
+### mode (jet_stream)
 
-NATS operation mode. Must be specified with a `type` of either `"regular"` or `"jet_stream"`.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"jet_stream"` |
+| stream | string | yes | Stream name |
+| consumer_name | string | yes | Consumer name |
+| durable_name | string | no | Durable consumer name |
 
-type: `object`
+### auth
 
-##### Regular Mode
-
-```yaml
-mode:
-  type: "regular"
-  subject: "my.subject"
-  queue_group: "my_group"
-```
-
-###### **subject** (required)
-
-NATS subject to subscribe to.
-
-type: `string`
-
-###### **queue_group**
-
-NATS queue group. If omitted, no queue group will be used.
-
-type: `string`
-
-##### JetStream Mode
-
-```yaml
-mode:
-  type: "jet_stream"
-  stream: "my_stream"
-  consumer_name: "my_consumer"
-  durable_name: "my_durable"
-```
-
-###### **stream** (required)
-
-Stream name.
-
-type: `string`
-
-###### **consumer_name** (required)
-
-Consumer name.
-
-type: `string`
-
-###### **durable_name**
-
-Durable name. If omitted, the system will not use a durable consumer. For most production scenarios, specifying a durable name is recommended to ensure message delivery across restarts.
-
-type: `string`
-
-#### **auth**
-
-Authentication credentials. If omitted, no authentication will be used.
-
-type: `object`
-
-##### **username**
-
-Username for authentication.
-
-type: `string`
-
-##### **password**
-
-Password for authentication. Only used when `username` is specified.
-
-type: `string`
-
-##### **token**
-
-Token for authentication. If both token and username/password are specified, token authentication takes precedence.
-
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| username | string | no | Username |
+| password | string | no | Password (used together with username) |
+| token | string | no | Token; takes precedence over username/password when both are present |
 
 ## Examples
 
-### Regular Mode Example (Minimal)
-
 ```yaml
-- input:
-    type: "nats"
-    url: "nats://localhost:4222"
-    mode:
-      type: "regular"
-      subject: "my.subject"
+input:
+  type: "nats"
+  url: "nats://localhost:4222"
+  mode:
+    type: "regular"
+    subject: "my.subject"
+    queue_group: "my_group"
 ```
 
-### Regular Mode Example (Complete)
-
 ```yaml
-- input:
-    type: "nats"
-    url: "nats://localhost:4222"
-    mode:
-      type: "regular"
-      subject: "my.subject"
-      queue_group: "my_group"
-    auth:
-      username: "user"
-      password: "pass"
-```
-
-### JetStream Mode Example (Minimal)
-
-```yaml
-- input:
-    type: "nats"
-    url: "nats://localhost:4222"
-    mode:
-      type: "jet_stream"
-      stream: "my_stream"
-      consumer_name: "my_consumer"
-```
-
-### JetStream Mode Example (Complete)
-
-```yaml
-- input:
-    type: "nats"
-    url: "nats://localhost:4222"
-    mode:
-      type: "jet_stream"
-      stream: "my_stream"
-      consumer_name: "my_consumer"
-      durable_name: "my_durable"
-    auth:
-      token: "my_token"
+input:
+  type: "nats"
+  url: "nats://localhost:4222"
+  mode:
+    type: "jet_stream"
+    stream: "my_stream"
+    consumer_name: "my_consumer"
+    durable_name: "my_durable"
+  auth:
+    token: "my_token"
 ```

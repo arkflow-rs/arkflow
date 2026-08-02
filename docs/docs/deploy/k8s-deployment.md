@@ -4,7 +4,7 @@ This document describes how to deploy ArkFlow in a Kubernetes cluster.
 
 ## Prerequisites
 
-- Kubernetes cluster (version >= 1.16)
+- Kubernetes cluster (version >= 1.27)
 - kubectl command-line tool
 - Built ArkFlow Docker image
 
@@ -22,6 +22,10 @@ metadata:
 data:
   config.yaml: |
     # Place your ArkFlow configuration here
+    # The HTTP server (health + control API) must bind to an address
+    # reachable by kubelet probes, e.g. 0.0.0.0:8080:
+    # health_check:
+    #   address: "0.0.0.0:8080"
 ```
 
 ### Deployment
@@ -47,7 +51,7 @@ spec:
       - name: arkflow
         image: arkflow:latest  # Replace with your image address
         ports:
-        - containerPort: 8000
+        - containerPort: 8080
           name: http
         env:
         - name: RUST_LOG
@@ -92,8 +96,8 @@ spec:
   selector:
     app: arkflow
   ports:
-  - port: 8000
-    targetPort: 8000
+  - port: 8080
+    targetPort: 8080
   type: ClusterIP  # Can be changed to NodePort or LoadBalancer as needed
 ```
 
@@ -133,7 +137,7 @@ kubectl get svc arkflow
 
 - **Image Configuration**: In the Deployment configuration, replace `image: arkflow:latest` with your actual image address
 - **Environment Variables**: Environment variables can be configured through the env field, currently configured with RUST_LOG=info
-- **Port Configuration**: Service exposes port 8000 by default
+- **Port Configuration**: Service exposes port 8080 by default (the ArkFlow HTTP server default). Make sure `health_check.address` binds to `0.0.0.0:8080` so kubelet probes can reach it.
 - **Configuration File**: Mounted to the container's /app/etc directory via ConfigMap
 - **Resource Limits**: Default resource requests and limits are set to prevent resource contention
 - **Health Checks**: Liveness and readiness probes are configured to ensure proper application health monitoring
@@ -173,7 +177,7 @@ volumes:
     claimName: arkflow-data
 
 # Add to the volumeMounts section of your container
-volumeMount:
+volumeMounts:
 - name: data
   mountPath: /app/data
 ```

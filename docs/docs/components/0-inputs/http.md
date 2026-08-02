@@ -1,74 +1,59 @@
+---
+sidebar_label: HTTP
+---
+
 # HTTP
 
-The HTTP input component receives data from HTTP endpoints.
+The HTTP input runs as an Axum HTTP server and accepts POST requests sent to `address`+`path`. The request body (JSON) is decoded and forwarded into the stream processing pipeline. Optional CORS and Basic/Bearer authentication are supported.
 
 ## Configuration
 
-### **address**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"http"` |
+| address | string | yes | — | Listen address, e.g. `0.0.0.0:8080` |
+| path | string | yes | — | URL path that receives messages, e.g. `/data` |
+| cors_enabled | boolean | no | `false` | Whether to enable CORS |
+| auth | object | no | — | Authentication configuration, see table below |
 
-Listening address for the HTTP server.
+### auth
 
-type: `string`
+`auth` is a tagged enum (distinguished by the `type` field) with two mutually exclusive forms:
 
-### **path**
-
-The endpoint path to receive data.
-
-type: `string`
-
-### **cors_enabled**
-
-Whether to enable CORS (Cross-Origin Resource Sharing).
-
-type: `boolean`
-
-default: `false`
-
-### **auth**
-
-Authentication configuration.
-
-type: `object`
-
-properties:
-- **type**: Authentication type (`basic` or `bearer`)
-- **username**: Username for basic authentication
-- **password**: Password for basic authentication
-- **token**: Token for bearer authentication
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"basic"` or `"bearer"` |
+| username | string | yes (basic) | Basic auth username |
+| password | string | yes (basic) | Basic auth password |
+| token | string | yes (bearer) | Bearer token |
 
 ## Examples
 
-### Basic HTTP Server
-
 ```yaml
-- input:
-    type: "http"
-    address: "0.0.0.0:8080"
-    path: "/data"
-    cors_enabled: true
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  cors_enabled: true
 ```
 
-### With Basic Authentication
-
 ```yaml
-- input:
-    type: "http"
-    address: "0.0.0.0:8080"
-    path: "/data"
-    auth:
-      type: "basic"
-      username: "user"
-      password: "pass"
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  auth:
+    type: "basic"
+    username: "user"
+    password: "pass"
 ```
 
-### With Bearer Token Authentication
-
 ```yaml
-- input:
-    type: "http"
-    address: "0.0.0.0:8080"
-    path: "/data"
-    auth:
-      type: "bearer"
-      token: "your-token"
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  auth:
+    type: "bearer"
+    token: "your-token"
 ```

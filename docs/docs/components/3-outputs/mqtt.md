@@ -1,93 +1,37 @@
 # MQTT
 
-The MQTT output component publishes messages to an MQTT broker.
+The MQTT output publishes each message to an MQTT broker topic. It supports QoS 0/1/2, clean sessions, keep-alive, retained messages, and optional username/password authentication.
 
 ## Configuration
 
-### **host**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"mqtt"` |
+| host | string | yes | — | MQTT broker hostname. |
+| port | integer | yes | — | MQTT broker port. |
+| client_id | string | yes | — | Client identifier. |
+| username | string | no | — | Username for authentication. |
+| password | string | no | — | Password for authentication. |
+| topic | object | yes | — | Destination topic (expression; see below). |
+| qos | integer | no | — | Quality of Service: `0`, `1`, or `2`. |
+| clean_session | boolean | no | — | Whether to use a clean session. |
+| keep_alive | integer | no | — | Keep-alive interval in seconds. |
+| retain | boolean | no | — | Whether to retain the message on the broker. |
+| value_field | string | no | — | Record field used as the message payload. |
 
-MQTT broker address.
+### topic
 
-type: `string`
+`topic` is an `Expr<String>` object with one of these shapes:
 
-### **port**
-
-MQTT broker port.
-
-type: `integer`
-
-### **client_id**
-
-The client ID to use when connecting to the broker.
-
-type: `string`
-
-### **username**
-
-Username for authentication (optional).
-
-type: `string`
-
-### **password**
-
-Password for authentication (optional).
-
-type: `string`
-
-### **topic**
-
-The topic to publish messages to. Supports both static values and SQL expressions.
-
-type: `object`
-
-One of:
-- `type: "value"` with `value: string` - Static topic name
-- `type: "expr"` with `expr: string` - SQL expression to evaluate topic name
-
-### **qos**
-
-The Quality of Service level to use.
-
-type: `integer`
-
-One of:
-- `0` - At most once delivery
-- `1` - At least once delivery
-- `2` - Exactly once delivery
-
-default: `1`
-
-### **clean_session**
-
-Whether to use clean session.
-
-type: `boolean`
-
-default: `true`
-
-### **keep_alive**
-
-Keep alive interval in seconds.
-
-type: `integer`
-
-default: `60`
-
-### **retain**
-
-Whether to set the retain flag on published messages.
-
-type: `boolean`
-
-default: `false`
-
-### **value_field**
-
-The field to use as the message value. If not specified, uses the default binary value field.
-
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static topic name. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
 ## Examples
+
+### Static topic
 
 ```yaml
 output:
@@ -107,11 +51,14 @@ output:
   value_field: "message"
 ```
 
+### Dynamic topic via SQL expression
+
 ```yaml
 output:
   type: "mqtt"
   host: "localhost"
   port: 1883
+  client_id: "sensor-client"
   topic:
     type: "expr"
     expr: "concat('sensor/', id)"

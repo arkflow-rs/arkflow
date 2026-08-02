@@ -1,187 +1,56 @@
+---
+sidebar_label: SQL
+---
+
 # SQL
 
-The SQL input component allows you to query data from various input sources using SQL. It supports both local file-based data sources and database connections, with optional distributed computing capabilities through Ballista.
+The SQL input executes a `select_sql` query through DataFusion to read from a database (MySQL, PostgreSQL, SQLite, DuckDB) or file format. Ballista is optional for distributed queries.
 
-Reference to [SQL](../../category/sql).
 ## Configuration
 
-### **select_sql**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"sql"` |
+| select_sql | string | yes | — | SQL query statement |
+| input_type | object | yes | — | Data source type and configuration (tagged enum), see table below |
+| ballista | object | no | — | Distributed query configuration, see table below |
 
-The SQL query statement to execute. This query will be applied to the data source specified in `input_type`.
+### ballista
 
-type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| remote_url | string | yes | Ballista server URL |
 
-required: `true`
+### input_type
 
-### **ballista (experimental)**
+`input_type` is a tagged enum (distinguished by the `type` field). The variants are below.
 
-Optional configuration for distributed computing using Ballista. When configured, SQL queries will be executed in a distributed manner.
+#### mysql / postgres
 
-type: `object`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"mysql"` or `"postgres"` |
+| uri | string | yes | Database connection URI |
+| name | string | no | Registered table name (used to reference it in queries) |
+| ssl | object | yes | SSL configuration, see below |
 
-required: `false`
+`ssl`:
 
-properties:
-- `remote_url`: Ballista server URL (e.g., "df://localhost:50050")
-  
-  type: `string`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| ssl_mode | string | yes | SSL mode |
+| root_cert | string | no | Path to the root certificate |
 
-  required: `true`
+#### duckdb / sqlite
 
-### **input_type**
-
-Specifies the type and configuration of the input source to query from.
-
-type: `object`
-
-required: `true`
-
-The configuration varies based on the input type selected. Available input types are detailed below.
-
-## Input Type Configurations
-
-### **Avro**
-- `table_name`: Optional table name used in SQL queries (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-- `path`: Path to Avro file
-  
-  type: `string`
-
-  required: `true`
-
-### **Arrow**
-- `table_name`: Optional table name used in SQL queries (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-- `path`: Path to Arrow file
-  
-  type: `string`
-
-  required: `true`
-
-### **Json**
-- `table_name`: Optional table name used in SQL queries (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-- `path`: Path to JSON file
-  
-  type: `string`
-
-  required: `true`
-
-### **Csv**
-- `table_name`: Optional table name used in SQL queries (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-- `path`: Path to CSV file
-  
-  type: `string`
-
-  required: `true`
-
-### **Parquet**
-- `table_name`: Optional table name used in SQL queries (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-
-- `path`: Path to Parquet file
-  
-  type: `string`
-
-  required: `true`
-
-### **Mysql**
-- `name`: Optional connection name (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-
-- `uri`: MySQL connection URI
-  
-  type: `string`
-
-  required: `true`
-
-- `ssl`:
-  - `ssl_mode`: SSL mode for connection security
-    
-    type: `string`
-
-    required: `true`
-
-  - `root_cert`: Optional root certificate path
-    
-    type: `string`
-
-    required: `false`
-
-### **DuckDB**
-- `name`: Optional connection name (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-
-- `path`: Path to DuckDB file
-  
-  type: `string`
-
-  required: `true`
-
-### **Postgres**
-- `name`: Optional connection name (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-
-- `uri`: PostgreSQL connection URI
-  
-  type: `string`
-
-  required: `true`
-
-- `ssl`:
-  - `ssl_mode`: SSL mode for connection security
-    
-    type: `string`
-
-    required: `true`
-
-  - `root_cert`: Optional root certificate path
-    
-    type: `string`
-
-    required: `false`
-
-### **Sqlite**
-- `name`: Optional connection name (defaults to "flow")
-  
-  type: `string`
-
-  required: `false`
-
-- `path`: Path to SQLite file
-  
-  type: `string`
-
-  required: `true`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"duckdb"` or `"sqlite"` |
+| path | string | yes | Database file path |
+| name | string | no | Registered table name |
 
 ## Examples
 
-### Basic MySQL Connection
 ```yaml
 input:
   type: "sql"
@@ -195,7 +64,6 @@ input:
       root_cert: "/path/to/cert.pem"
 ```
 
-### Distributed Query with Ballista
 ```yaml
 input:
   type: "sql"
@@ -203,7 +71,6 @@ input:
   ballista:
     remote_url: "df://localhost:50050"
   input_type:
-    type: "parquet"
-    table_name: "parquet_table"
-    path: "/path/to/data.parquet"
+    type: "sqlite"
+    path: "/path/to/data.db"
 ```

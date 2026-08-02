@@ -1,23 +1,20 @@
-# debezium_json
+---
+sidebar_label: Debezium JSON
+---
 
-`debezium_json` is a **codec** that decodes Debezium CDC (Change Data Capture) Envelope JSON into a columnar Arrow batch. Attach it to a Kafka input that consumes a topic written by Debezium to turn database change events into queryable rows.
+# Debezium JSON
 
-## When to use
-
-- Real-time database change synchronization from MySQL / PostgreSQL / MongoDB / SQLServer / ... via Debezium.
-- CDC pipelines that need `op`-aware routing (`c` / `u` / `d` / `r`) in downstream SQL.
-
-## Deployment shape
-
-Debezium writes change events to Kafka; ArkFlow consumes them with this codec:
-
-```
-Database → Debezium (Kafka Connect / Debezium Server) → Kafka topic → ArkFlow (kafka input + debezium_json codec)
-```
+The `debezium_json` codec decodes Debezium CDC (Change Data Capture) Envelope JSON into a columnar Arrow `MessageBatch`. Attach it to a Kafka input that consumes a topic written by Debezium to turn database change events (`c`/`u`/`d`/`r`) into queryable rows. CDC offset is **not** managed here — it is the Kafka input's ack-gated offset.
 
 ## Configuration
 
-The codec takes no options today:
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Fixed value `"debezium_json"` |
+
+> This codec takes no configuration fields; `build` ignores `config`. It is only attached as a `codec` hook on a Kafka input.
+
+## Examples
 
 ```yaml
 input:
@@ -31,30 +28,37 @@ input:
     type: debezium_json
 ```
 
-## Output schema
+Deployment topology:
 
-Each Debezium Envelope `{ before, after, op, source, ts_ms }` is flattened into a row:
-
-| Column | Source | Notes |
-| --- | --- | --- |
-| `<business fields>` | `after` (or `before` for `op="d"`) | promoted to top-level columns |
-| `op` | `op` | `c` / `u` / `d` / `r` |
-| `ts_ms` | `ts_ms` | change timestamp |
-| `source_db`, `source_table` | `source.db`, `source.table` | scalar top-level columns |
-| `before` | full `before` object | JSON text column (use SQL JSON functions to inspect) |
-| `source` | full `source` object | JSON text column |
-
-`before` / `source` are kept as JSON text (rather than nested structs) so that a `null`-vs-object mix within a batch (e.g. `before` is null on inserts but an object on updates) decodes uniformly.
-
-## Delivery semantics
-
-CDC offset is **not** managed by this codec — it is the Kafka input's ack-gated offset (see `input-durability`), providing at-least-once. Make downstream sinks idempotent (end-to-end exactly-once is tracked as a separate change).
-
-## Example
+```
+Database → Debezium (Kafka Connect / Debezium Server) → Kafka topic → ArkFlow (kafka input + debezium_json codec)
+```
 
 See `examples/cdc_debezium.yaml`.
 
-## Non-goals
+## Semantics
 
-- MySQL binlog / PostgreSQL logical replication **direct** connection (future independent input).
-- Debezium Avro / Protobuf formats (JSON only for now; Avro depends on Schema Registry).
+### Output schema
+
+Each Debezium Envelope `{ before, after, op, source, ts_ms }` is flattened into one row:
+
+| Column | Source | Notes |
+| --- | --- | --- |
+| `<business fields>` | `after` (falls back to `before` on deletes) | Promoted to top-level columns |
+| `op` | `op` | `c` / `u` / `d` / `r` |
+| `ts_ms` | `ts_ms` | Change timestamp |
+| `source_db`, `source_table` | `source.db`, `source.table` | Top-level scalar columns |
+| `before` | Full `before` object | JSON text column (parse with SQL JSON functions) |
+| `source` | Full `source` object | JSON text column |
+
+`before` / `source` are kept as JSON text (rather than nested structs) because mixing nulls and objects within the same batch (e.g. an insert's `before` is null while an update's is an object) would conflict with the Arrow JSON reader's single-pass schema inference.
+
+### Delivery semantics
+
+- The CDC offset is provided by the Kafka input's ack-gated offset (at-least-once). Ensure downstream sinks are idempotent.
+- When `op="d"`, `after` is null and business fields are taken from `before`.
+
+## Notes / Non-goals
+
+- Does not connect directly to MySQL binlog / PostgreSQL logical replication (planned as a separate input in the future).
+- Only Debezium JSON is supported; Avro / Protobuf formats are not supported yet (Avro requires a Schema Registry).

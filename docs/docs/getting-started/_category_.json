@@ -1,0 +1,9 @@
+{
+  "label": "Getting started",
+  "position": 2,
+  "link": {
+    "title": "Getting started",
+    "type": "generated-index",
+    "description": "Install ArkFlow, validate a config, and discover available components from the CLI."
+  }
+}

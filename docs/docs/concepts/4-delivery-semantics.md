@@ -36,18 +36,14 @@ is persisted locally first.
 
 ## What this means for durability
 
-- **Replayable sources** are crash-safe today (Phase 0 of `add-input-durability`):
-  the source only commits/acks on ack, so on restart it re-delivers any
-  in-flight messages that were never confirmed. No local persistence is needed.
-  The Kafka input, for example, sets `enable.auto.offset.store=false` so the
-  offset advances only inside `ack()`.
+- **Replayable sources** are crash-safe by design: the source only commits/acks
+  on ack, so on restart it re-delivers any in-flight messages that were never
+  confirmed. No local persistence is needed. The Kafka input, for example, sets
+  `enable.auto.offset.store=false` so the offset advances only inside `ack()`.
 - **Non-replayable sources** need a durable write-ahead log (WAL) at the input
   boundary so the message body survives a crash and can be replayed on restart.
-  This is Phase 1 of `add-input-durability` (the per-stream `durability:` option).
-
-For configuration guidance — choosing segment tuning strategy, parallel PUT
-worker count, and compression algorithm — see
-[WAL Durability & Performance](wal-optimization.md).
+  Enable it per stream with the `durability:` option (see
+  [WAL Durability & Performance](5-wal-optimization.md)).
 
 ## At-least-once contract
 
@@ -61,7 +57,7 @@ output configured with `exactly_once: true` commits each acknowledged batch as a
 single Kafka transaction, so a `read_committed` downstream consumer observes it
 atomically. This eliminates in-transaction partial writes and zombie-producer
 duplicates; residual duplicates at the post-commit boundary still require
-downstream idempotency. See [Exactly-once delivery](../exactly-once) for the
+downstream idempotency. See [Exactly-once delivery](./6-exactly-once.md) for the
 full contract and its honest boundary.
 
 ## Single-node boundary
@@ -94,16 +90,14 @@ against such a backend.
 
 This is invisible to single-writer setups (`parallel_put.workers = 1`, the
 default): there is no contention, the first PUT succeeds, and no retries
-occur. The at-least-once contract is unchanged. See
-`docs/performance/s3-wal-backend.md` for backend performance details.
+occur. The at-least-once contract is unchanged.
 
 ## WAL recovery failure (fail-fast)
 
 If a durability-enabled stream fails to recover its WAL at startup — either
 because the WAL file is unreadable, or because replaying a pending entry into
 the downstream buffer/channel fails — the stream **fails to start** rather
-than silently continuing with potentially lost data. This is the fail-fast
-contract introduced by `harden-wal-recovery-semantics`.
+than silently continuing with potentially lost data (fail-fast).
 
 In practice:
 

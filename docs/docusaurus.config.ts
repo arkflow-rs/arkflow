@@ -105,7 +105,7 @@ const config: Config = {
           position: 'right',
         },
         {
-          href: 'https://github.com/ark-flow/arkflow',
+          href: 'https://github.com/arkflow-rs/arkflow',
           label: 'GitHub',
           position: 'right',
         },
@@ -119,7 +119,7 @@ const config: Config = {
           title: 'Docs',
           items: [
             {
-              label: 'Tutorial',
+              label: 'Introduction',
               to: '/docs/intro',
             },
           ],
@@ -142,7 +142,7 @@ const config: Config = {
             },
             {
               label: 'GitHub',
-              href: 'https://github.com/ark-flow/arkflow',
+              href: 'https://github.com/arkflow-rs/arkflow',
             },
           ],
         },

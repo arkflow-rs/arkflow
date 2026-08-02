@@ -1,9 +1,9 @@
 {
   "label": "Components",
-  "position": 1,
+  "position": 5,
   "link": {
     "title": "Components",
     "type": "generated-index",
-    "description": "Components "
+    "description": "Inputs, outputs, processors, buffers, codecs, and temporary storage components available in ArkFlow streams."
   }
 }

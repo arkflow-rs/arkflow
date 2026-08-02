@@ -1,66 +1,50 @@
 # Protobuf
 
-The Protobuf processor component provides functionality for converting between Protobuf and Arrow formats.
+The Protobuf processor converts between Apache Arrow batches and Protocol Buffers messages. It registers two processor types: `arrow_to_protobuf` serializes Arrow columns into Protobuf binary data, and `protobuf_to_arrow` decodes Protobuf binary data into an Arrow batch. Message descriptors are loaded from `.proto` source files (or prebuilt descriptor sets).
 
 ## Configuration
 
-### **type**
+Both types share `proto_inputs`, `proto_includes`, and `message_type`. Additional fields apply only to one direction of conversion, as noted below.
 
-The type of Protobuf conversion to perform.
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `arrow_to_protobuf` \| `protobuf_to_arrow` |
+| proto_inputs | array&lt;string&gt; | yes | — | Paths to `.proto` files (or descriptor set binaries) describing the message type. |
+| proto_includes | array&lt;string&gt; | no | — | Directories to search when resolving Protobuf imports. |
+| message_type | string | yes | — | Fully qualified Protobuf message type name (e.g. `example.MyMessage`). |
+| value_field | string | no | — | Name of the binary field holding Protobuf data. Applies to `protobuf_to_arrow` only; defaults to the engine default binary value field. |
+| fields_to_include | array&lt;string&gt; | no | — | Restrict the columns serialized to Protobuf. Applies to `arrow_to_protobuf` only; when omitted all fields are included. |
 
-type: `string`
+## Examples
 
-required: `true`
+### Arrow to Protobuf
 
-Available options:
-- `arrow_to_protobuf`: Convert Arrow format to Protobuf data
-- `protobuf_to_arrow`: Convert Protobuf data to Arrow format
+```yaml
+- processor:
+    type: "arrow_to_protobuf"
+    proto_inputs: ["./protos/example.proto"]
+    message_type: "example.MyMessage"
+    fields_to_include:
+      - "field1"
+      - "field2"
+```
 
-### **proto_inputs**
+### Protobuf to Arrow
 
-A list of directories containing Protobuf message type descriptor files (*.proto).
+```yaml
+- processor:
+    type: "protobuf_to_arrow"
+    proto_inputs: ["./protos/example.proto"]
+    proto_includes: ["./protos/"]
+    message_type: "example.MyMessage"
+    value_field: "data"
+```
 
-type: `array[string]`
+## Notes
 
-required: `true`
+### Data Type Mapping
 
-### **proto_includes**
-
-A list of directories to search for imported Protobuf files.
-
-type: `array[string]`
-
-optional: `true`
-
-default: Same as proto_inputs
-
-### **message_type**
-
-The Protobuf message type name (e.g. "example.MyMessage").
-
-type: `string`
-
-required: `true`
-
-### **value_field**
-
-Specifies the field name containing the Protobuf binary data when converting from Protobuf to Arrow.
-
-type: `string`
-
-optional: `true`
-
-### **fields_to_include**
-
-Specifies a set of field names to include when converting from Arrow to Protobuf. If not specified, all fields will be included.
-
-type: `array[string]`
-
-optional: `true`
-
-## Data Type Mapping
-
-The processor supports the following Protobuf to Arrow data type conversions:
+Protobuf to Arrow type conversions:
 
 | Protobuf Type | Arrow Type | Notes |
 |--------------|------------|--------|
@@ -74,24 +58,3 @@ The processor supports the following Protobuf to Arrow data type conversions:
 | string | Utf8 | |
 | bytes | Binary | |
 | enum | Int32 | Stored as enum number |
-
-## Examples
-
-```yaml
-# Convert Arrow to Protobuf
-- processor:
-    type: "arrow_to_protobuf"
-    proto_inputs: ["./protos/"]
-    message_type: "example.MyMessage"
-    fields_to_include:
-      - "field1"
-      - "field2"
-
-# Convert Protobuf to Arrow
-- processor:
-    type: "protobuf_to_arrow"
-    proto_inputs: ["./protos/"]
-    proto_includes: ["./includes/"]
-    message_type: "example.MyMessage"
-    value_field: "data"
-```
