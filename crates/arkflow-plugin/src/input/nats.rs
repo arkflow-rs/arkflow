@@ -20,7 +20,7 @@ use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
 use async_nats::{Client, ConnectOptions, Message};
@@ -76,6 +76,7 @@ pub struct NatsAuth {
 }
 
 /// NATS message type for async processing
+#[allow(clippy::large_enum_variant)]
 enum NatsMsg {
     /// Regular NATS message with original message for acknowledgment
     Regular(Message),
@@ -440,6 +441,7 @@ impl InputBuilder for NatsInputBuilder {
 }
 
 /// NATS message acknowledgment
+#[allow(clippy::large_enum_variant)]
 enum NatsAck {
     /// Regular NATS message acknowledgment
     Regular,

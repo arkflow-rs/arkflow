@@ -27,10 +27,12 @@ use crate::wal::SyncPolicy;
 /// Preset segment tuning strategies for the S3 WAL backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SegmentStrategy {
     /// High throughput, large crash window (max_entries: 10000, max_bytes: 10MB, flush_interval: 10s)
     Aggressive,
     /// Balanced trade-offs (max_entries: 1000, max_bytes: 1MB, flush_interval: 1s) - default
+    #[default]
     Balanced,
     /// Small crash window, high PUT frequency (max_entries: 100, max_bytes: 100KB, flush_interval: 100ms)
     LowLatency,
@@ -52,12 +54,6 @@ impl SegmentStrategy {
                 flush_interval: Duration::from_millis(100),
             },
         }
-    }
-}
-
-impl Default for SegmentStrategy {
-    fn default() -> Self {
-        Self::Balanced
     }
 }
 
@@ -130,8 +126,10 @@ impl Default for ParallelPutConfig {
 /// Compression configuration for the S3 WAL backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompressionConfig {
     /// No compression (default).
+    #[default]
     None,
     /// Zstandard compression with configurable level (0-22, default 3).
     #[serde(rename = "zstd")]
@@ -163,12 +161,6 @@ impl CompressionConfig {
     pub const MIN_COMPRESSION_SIZE: usize = 10 * 1024; // 10 KB
 }
 
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 /// Backend selection for the WAL.
 ///
 /// The default (and legacy) shape is `Local` (when `backend:` is omitted or
@@ -177,6 +169,7 @@ impl Default for CompressionConfig {
 /// error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum WalBackend {
     /// Embedded `redb` database on local disk (default).
     Local {

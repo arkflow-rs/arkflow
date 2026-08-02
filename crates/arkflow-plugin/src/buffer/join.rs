@@ -125,10 +125,8 @@ impl JoinOperation {
             return Ok(result_batches[0].clone());
         }
 
-        Ok(
-            arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
-        )
+        arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
+            .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))
     }
 
     async fn decode_batch(&self, batch: MessageBatch) -> Result<MessageBatch, Error> {

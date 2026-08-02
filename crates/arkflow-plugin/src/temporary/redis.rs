@@ -143,12 +143,11 @@ impl RedisTemporary {
                     vec.push(s.unwrap());
                 }
             }
-            ColumnarValue::Scalar(s) => match &s {
-                ScalarValue::Utf8(str) => {
+            ColumnarValue::Scalar(s) => {
+                if let ScalarValue::Utf8(str) = &s {
                     vec.push(str.as_ref().unwrap());
                 }
-                _ => {}
-            },
+            }
         }
         vec
     }

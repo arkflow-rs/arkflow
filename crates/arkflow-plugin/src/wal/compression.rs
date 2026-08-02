@@ -18,6 +18,8 @@
 //! [`CompressionConfig`](arkflow_core::wal::config::CompressionConfig).
 //! Round-trip is verified by the unit tests.
 
+#![allow(dead_code)]
+
 use arkflow_core::Error;
 
 /// Compress `data` using the algorithm associated with `kind`.

@@ -63,6 +63,7 @@ struct ModbusInput {
     name: Option<String>,
     first_read: AtomicBool,
     client: Arc<Mutex<Option<tokio_modbus::client::Context>>>,
+    #[allow(dead_code)]
     codec: Option<Arc<dyn Codec>>,
 }
 

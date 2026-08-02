@@ -121,6 +121,8 @@ pub fn map_datafusion_error<T>(error: impl std::error::Error, operation: &str) -
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
+
     use super::*;
     use serde_json::json;
 
@@ -128,6 +130,7 @@ mod tests {
     fn test_parse_config_success() {
         let config = Some(json!({"host": "localhost", "port": 8080}));
 
+        #[allow(dead_code)]
         #[derive(serde::Deserialize)]
         struct TestConfig {
             host: String,

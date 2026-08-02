@@ -62,6 +62,7 @@ enum ProcessorData {
 
 impl Stream {
     /// Create a new stream.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn Input>,
         pipeline: Pipeline,
@@ -366,6 +367,7 @@ impl Stream {
         info!("Buffer stopped");
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_processor(
         i: u32,
         pipeline: Arc<Pipeline>,
@@ -461,10 +463,7 @@ impl Stream {
 
             tree_map.insert(new_seq, (data, new_ack));
 
-            loop {
-                let Some((current_seq, _)) = tree_map.first_key_value() else {
-                    break;
-                };
+            while let Some((current_seq, _)) = tree_map.first_key_value() {
                 let next_seq_val = next_seq.load(Ordering::Acquire);
                 if next_seq_val != *current_seq {
                     break;
@@ -852,7 +851,7 @@ mod tests {
         });
         // Stream exits on EOF (the stub input returns EOF after the single
         // queued message is consumed). Wait for run() to return.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
             .await
             .expect("stream did not terminate in time")
             .unwrap()
@@ -913,7 +912,7 @@ mod tests {
             let cancel = cancel.clone();
             async move { stream.run(cancel).await }
         });
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
             .await
             .expect("stream did not terminate in time")
             .unwrap()

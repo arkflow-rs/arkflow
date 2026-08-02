@@ -340,7 +340,7 @@ impl InfluxDBOutput {
         if let Some(interval_secs) = self.config.flush_interval {
             let last_flush = self.last_flush.lock().await;
             let elapsed = last_flush.elapsed().as_secs();
-            if elapsed >= interval_secs as u64 {
+            if elapsed >= interval_secs {
                 return true;
             }
         }

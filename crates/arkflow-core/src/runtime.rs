@@ -35,6 +35,53 @@ pub struct OperationStore {
 }
 
 impl OperationStore {
+    pub async fn find_or_create(
+        &self,
+        operation: impl Into<String>,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+        correlation_id: Option<String>,
+    ) -> OperationRecord {
+        let operation = operation.into();
+        let resource_type = resource_type.into();
+        let resource_id = resource_id.into();
+        let mut operations = self.operations.write().await;
+        if let Some(active) = operations.values().find(|record| {
+            record.operation == operation
+                && record.resource_type == resource_type
+                && record.resource_id == resource_id
+                && matches!(
+                    record.state,
+                    OperationState::Queued | OperationState::Running
+                )
+        }) {
+            return active.clone();
+        }
+        let now = now_ms();
+        let id = format!("op-{}", OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        let record = OperationRecord {
+            id: id.clone(),
+            operation,
+            resource_type,
+            resource_id,
+            state: OperationState::Queued,
+            progress: 0,
+            created_at_ms: now,
+            started_at_ms: None,
+            finished_at_ms: None,
+            correlation_id,
+            error: None,
+            result: None,
+        };
+        if operations.len() >= MAX_OPERATIONS {
+            if let Some(oldest) = operations.keys().next().cloned() {
+                operations.remove(&oldest);
+            }
+        }
+        operations.insert(id, record.clone());
+        record
+    }
+
     pub async fn create(
         &self,
         operation: impl Into<String>,
@@ -79,9 +126,11 @@ impl OperationStore {
         let record = operations.get_mut(id)?;
         if matches!(
             record.state,
-            OperationState::Cancelled | OperationState::TimedOut
-        ) && !matches!(state, OperationState::Cancelled | OperationState::TimedOut)
-        {
+            OperationState::Succeeded
+                | OperationState::Failed
+                | OperationState::Cancelled
+                | OperationState::TimedOut
+        ) {
             return Some(record.clone());
         }
         let now = now_ms();
@@ -100,6 +149,17 @@ impl OperationStore {
             record.finished_at_ms = Some(now);
         }
         record.error = error;
+        Some(record.clone())
+    }
+
+    pub async fn set_result(
+        &self,
+        id: &str,
+        result: std::collections::BTreeMap<String, String>,
+    ) -> Option<OperationRecord> {
+        let mut operations = self.operations.write().await;
+        let record = operations.get_mut(id)?;
+        record.result = Some(result);
         Some(record.clone())
     }
 
@@ -708,6 +768,94 @@ mod tests {
             .unwrap();
         assert_eq!(unchanged.state, OperationState::Cancelled);
         assert_eq!(unchanged.correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[tokio::test]
+    async fn operation_store_covers_success_failure_concurrency_timeout_and_isolation() {
+        let store = OperationStore::default();
+        let orders = store
+            .find_or_create("start", "stream", "orders", Some("orders-corr".into()))
+            .await;
+        store
+            .update(&orders.id, OperationState::Running, 10, None)
+            .await;
+        let succeeded = store
+            .update(&orders.id, OperationState::Succeeded, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(succeeded.state, OperationState::Succeeded);
+        assert_eq!(succeeded.progress, 100);
+
+        let metrics = store
+            .find_or_create("start", "stream", "metrics", Some("metrics-corr".into()))
+            .await;
+        let (duplicate_left, duplicate_right) = tokio::join!(
+            store.find_or_create("stop", "stream", "metrics", None),
+            store.find_or_create("stop", "stream", "metrics", None),
+        );
+        assert_eq!(duplicate_left.id, duplicate_right.id);
+        assert_ne!(duplicate_left.id, orders.id);
+        assert_eq!(metrics.resource_id, "metrics");
+
+        let failed = store
+            .update(
+                &duplicate_left.id,
+                OperationState::Failed,
+                100,
+                Some("expected failure".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.state, OperationState::Failed);
+        assert_eq!(failed.error.as_deref(), Some("expected failure"));
+
+        let timed_out = store.create("restart", "stream", "orders", None).await;
+        store
+            .update(
+                &timed_out.id,
+                OperationState::TimedOut,
+                100,
+                Some("operation deadline exceeded".into()),
+            )
+            .await;
+        let stable_timeout = store
+            .update(&timed_out.id, OperationState::Succeeded, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(stable_timeout.state, OperationState::TimedOut);
+        assert_eq!(
+            stable_timeout.error.as_deref(),
+            Some("operation deadline exceeded")
+        );
+        let terminal_cancel = store.cancel(&timed_out.id).await.unwrap();
+        assert_eq!(terminal_cancel.state, OperationState::TimedOut);
+        let mut observed = std::collections::BTreeMap::new();
+        observed.insert("observed_state".into(), "stopped".into());
+        let reconciled = store.set_result(&timed_out.id, observed).await.unwrap();
+        assert_eq!(
+            reconciled
+                .result
+                .as_ref()
+                .and_then(|result| result.get("observed_state"))
+                .map(String::as_str),
+            Some("stopped")
+        );
+
+        let records = store.list().await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.resource_id == "orders")
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.resource_id == "metrics")
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

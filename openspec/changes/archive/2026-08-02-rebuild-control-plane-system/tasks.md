@@ -12,8 +12,8 @@
 - [x] 2.2 Implement bounded operation storage with queued/running/succeeded/failed/cancelled states, progress, timestamps, and affected resource IDs.
 - [x] 2.3 Connect RuntimeManager supervisor completion to operation completion and ordered control events.
 - [x] 2.4 Make lifecycle commands idempotent and prevent duplicate equivalent operations under concurrent requests.
-- [ ] 2.5 Implement operation query and cancellation/reconciliation behavior with explicit timeout outcomes.
-- [ ] 2.6 Add tests for operation success, failure, duplicate commands, concurrent commands, timeout, and unrelated Stream isolation.
+- [x] 2.5 Implement operation query and cancellation/reconciliation behavior with explicit timeout outcomes.
+- [x] 2.6 Add tests for operation success, failure, duplicate commands, concurrent commands, timeout, and unrelated Stream isolation.
 
 ## 3. Resource-oriented backend API
 
@@ -24,17 +24,17 @@
 - [x] 3.5 Implement component catalogue, component detail, schema, and example endpoints through the server boundary.
 - [x] 3.6 Add metrics resource/query support while retaining Prometheus exposition.
 - [x] 3.7 Add request correlation middleware, structured access logging, request-size limits, CORS policy, and centralized authentication/problem handling.
-- [ ] 3.8 Add integration tests covering every resource route, invalid filters, unknown resources, auth failures, redaction, and compatibility aliases.
+- [x] 3.8 Add integration tests covering every resource route, invalid filters, unknown resources, auth failures, redaction, and compatibility aliases.
 
 ## 4. Console application architecture
 
 - [x] 4.1 Split the Console into application shell, typed API client, query/cache, shared UI state, and feature modules.
 - [x] 4.2 Add route-aware navigation for Overview, Runtime, Configuration, Components, Events, and Settings.
 - [x] 4.3 Implement centralized request/cache refresh with stale-data indicators, retry, permission, conflict, empty, and loading states.
-- [ ] 4.4 Implement Overview with system identity, node health, runtime totals, active operations, recent events, and aggregate metrics.
-- [ ] 4.5 Implement Runtime list/detail views with filters, pagination, topology summary, desired/observed state, errors, metrics, and operation history.
+- [x] 4.4 Implement Overview with system identity, node health, runtime totals, active operations, recent events, and aggregate metrics.
+- [x] 4.5 Implement Runtime list/detail views with filters, pagination, topology summary, desired/observed state, errors, metrics, and operation history.
 - [x] 4.6 Implement operation confirmation, progress, polling, terminal result, and conflict feedback for lifecycle commands.
-- [ ] 4.7 Implement Configuration draft editor with YAML/JSON modes, schema-aware validation, path errors, publish, version diff, and rollback.
+- [x] 4.7 Implement Configuration draft editor with YAML/JSON modes, schema-aware validation, path errors, publish, version diff, and rollback.
 - [x] 4.8 Implement Components catalogue/schema/examples, Events audit filters/details, and Settings security/capability status.
 - [x] 4.9 Enforce frontend secret/redaction rules and add component tests for stale data, permissions, validation errors, operations, and redaction.
 
@@ -47,8 +47,16 @@
 
 ## 6. Verification and rollout
 
-- [ ] 6.1 Run Rust formatting, clippy, core/server tests, and workspace tests; distinguish pre-existing external integration failures.
+- [x] 6.1 Run Rust formatting, clippy, core/server tests, and workspace tests; distinguish pre-existing external integration failures.
 - [x] 6.2 Run Console typecheck, unit/component tests, and production build.
-- [ ] 6.3 Run an end-to-end smoke test for startup, resource discovery, lifecycle operation polling, configuration validation/publish, events, and graceful shutdown.
-- [ ] 6.4 Verify WAL replay, health compatibility, redaction, and unrelated OpenSpec changes are not regressed.
-- [ ] 6.5 Review the API/design/spec/task audit and record remaining warnings before archive.
+- [x] 6.3 Run an end-to-end smoke test for startup, resource discovery, lifecycle operation polling, configuration validation/publish, events, and graceful shutdown.
+- [x] 6.4 Verify WAL replay, health compatibility, redaction, and unrelated OpenSpec changes are not regressed.
+- [x] 6.5 Review the API/design/spec/task audit and record remaining warnings before archive.
+
+## Verification notes
+
+- cargo fmt --all -- --check and git diff --check pass.
+- cargo test --workspace --all-targets passes, including the four Docker-backed Kafka EOS tests after releasing the stale Testcontainers listener on port 9092.
+- Core WAL replay/recovery, server health/redaction/API, and Hub regression tests pass. The local smoke test covers startup, health/resource discovery, restart operation polling with observed-state reconciliation, configuration validation/publish, event queries, and SIGINT shutdown.
+- Strict Clippy passes with -D warnings. The cleanup uses targeted allowances for intentional high-arity runtime constructors, protocol/configuration enum layout, and currently reserved WAL worker paths; no global warning suppression was added.
+- Operations/events remain bounded in memory by design; configuration history is file-backed. A process or Hub restart does not provide durable administrative operation history.

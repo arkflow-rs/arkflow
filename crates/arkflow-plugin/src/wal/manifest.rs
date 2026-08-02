@@ -30,19 +30,15 @@ use serde::{Deserialize, Serialize};
 /// manifest so recovery knows how to decode the bytes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SegmentCompression {
     /// No compression.
+    #[default]
     None,
     /// Zstandard.
     Zstd,
     /// LZ4.
     Lz4,
-}
-
-impl Default for SegmentCompression {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// The manifest object. Public for round-trip and tests; the rest of the

@@ -68,7 +68,6 @@ impl Engine {
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
         let token_clone = token.clone();
-        let runtime_manager = self.runtime_manager.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = sigint.recv() => info!("Received SIGINT, exiting..."),
@@ -76,11 +75,13 @@ impl Engine {
                 _ = token_clone.cancelled() => info!("Cancellation requested, exiting..."),
             }
             token_clone.cancel();
-            if let Err(error) = runtime_manager.stop_all().await {
-                error!("Failed to stop all Stream runtimes: {}", error);
-            }
         });
 
+        token.cancelled().await;
+        if let Err(error) = self.runtime_manager.stop_all().await {
+            error!("Failed to stop all Stream runtimes: {}", error);
+            return Err(Box::new(error));
+        }
         self.runtime_manager.wait_all().await?;
         self.control_plane.health().set_running(false);
         info!("All flow tasks have been complete");

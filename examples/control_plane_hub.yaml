@@ -1,0 +1,7 @@
+logging:
+  level: info
+health_check:
+  enabled: true
+  address: "127.0.0.1:8080"
+  api_prefix: "/api/v1"
+streams: []

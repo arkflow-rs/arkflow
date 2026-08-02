@@ -13,12 +13,16 @@ use crate::control::{
 };
 use crate::runtime::{EventStore, OperationStore, RuntimeManager};
 use crate::Error;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
+
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct ControlHealth {
@@ -212,9 +216,6 @@ impl ControlPlane {
 
     pub async fn cancel_operation(&self, id: &str) -> Option<OperationRecord> {
         let record = self.operations.cancel(id).await?;
-        self.runtime_manager
-            .set_active_operation(&record.resource_id, None)
-            .await;
         self.events
             .record(ControlEvent {
                 occurred_at_ms: now_ms(),
@@ -238,20 +239,13 @@ impl ControlPlane {
         if self.runtime_manager.get(id).await.is_none() {
             return Err(Error::Config(format!("Unknown stream runtime: {id}")));
         }
-        if let Some(active) = self.operations.list().await.into_iter().find(|record| {
-            record.resource_id == id
-                && record.operation == operation
-                && matches!(
-                    record.state,
-                    OperationState::Queued | OperationState::Running
-                )
-        }) {
-            return Ok(active);
-        }
         let record = self
             .operations
-            .create(operation, "stream", id, correlation_id)
+            .find_or_create(operation, "stream", id, correlation_id)
             .await;
+        if !matches!(record.state, OperationState::Queued) {
+            return Ok(record);
+        }
         let store = self.operations.clone();
         let manager = self.runtime_manager.clone();
         let events = self.events.clone();
@@ -266,22 +260,50 @@ impl ControlPlane {
             store
                 .update(&operation_id, OperationState::Running, 10, None)
                 .await;
-            let result = match operation_name.as_str() {
-                "start" => manager.start(&stream_id).await,
-                "stop" => manager.stop(&stream_id).await,
-                "restart" => manager.restart(&stream_id).await,
-                _ => Err(Error::Config(format!(
-                    "Unknown lifecycle operation: {operation_name}"
-                ))),
-            };
-            let (state, outcome, message) = match result {
-                Ok(()) => {
+            let result = timeout(LIFECYCLE_TIMEOUT, async {
+                match operation_name.as_str() {
+                    "start" => manager.start(&stream_id).await,
+                    "stop" => manager.stop(&stream_id).await,
+                    "restart" => manager.restart(&stream_id).await,
+                    _ => Err(Error::Config(format!(
+                        "Unknown lifecycle operation: {operation_name}"
+                    ))),
+                }
+            })
+            .await;
+            let observed_state = manager
+                .snapshots()
+                .await
+                .into_iter()
+                .find(|stream| stream.id == stream_id)
+                .map(|stream| format!("{:?}", stream.state).to_lowercase())
+                .unwrap_or_else(|| "unknown".into());
+            let mut reconciliation = BTreeMap::new();
+            reconciliation.insert("observed_state".into(), observed_state.clone());
+            let cancelled = store
+                .get(&operation_id)
+                .await
+                .is_some_and(|record| record.state == OperationState::Cancelled);
+            store.set_result(&operation_id, reconciliation).await;
+            let (_state, outcome, message) = match result {
+                Ok(Ok(())) => {
                     store
                         .update(&operation_id, OperationState::Succeeded, 100, None)
                         .await;
-                    (OperationState::Succeeded, "succeeded", None)
+                    if cancelled {
+                        (
+                            OperationState::Cancelled,
+                            "cancelled_reconciled",
+                            Some(format!(
+                                "Cancellation requested; lifecycle completed with observed state {}",
+                                observed_state
+                            )),
+                        )
+                    } else {
+                        (OperationState::Succeeded, "succeeded", None)
+                    }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     store
                         .update(
                             &operation_id,
@@ -290,10 +312,43 @@ impl ControlPlane {
                             Some(error.to_string()),
                         )
                         .await;
-                    (OperationState::Failed, "failed", Some(error.to_string()))
+                    if cancelled {
+                        (
+                            OperationState::Cancelled,
+                            "cancelled_reconciled",
+                            Some(format!(
+                                "Cancellation requested; lifecycle ended with error: {}",
+                                error
+                            )),
+                        )
+                    } else {
+                        (OperationState::Failed, "failed", Some(error.to_string()))
+                    }
+                }
+                Err(_elapsed) => {
+                    store
+                        .update(
+                            &operation_id,
+                            OperationState::TimedOut,
+                            100,
+                            Some("Lifecycle operation timed out".into()),
+                        )
+                        .await;
+                    if cancelled {
+                        (
+                            OperationState::Cancelled,
+                            "cancelled_reconciled",
+                            Some("Cancellation requested; lifecycle operation timed out".into()),
+                        )
+                    } else {
+                        (
+                            OperationState::TimedOut,
+                            "timed_out",
+                            Some("Lifecycle operation timed out".into()),
+                        )
+                    }
                 }
             };
-            let _ = state;
             events
                 .record(ControlEvent {
                     occurred_at_ms: now_ms(),

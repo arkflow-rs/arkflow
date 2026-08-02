@@ -328,12 +328,17 @@ version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "axum",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "subtle",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "tower",
  "tower-http 0.7.0",
+ "tracing",
+ "url",
 ]
 
 [[package]]

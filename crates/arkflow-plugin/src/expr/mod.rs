@@ -97,7 +97,7 @@ pub async fn evaluate_expr(
 
     {
         if let Some(expr) = EXPR_CACHE.read().await.get(expr_str) {
-            return expr.evaluate(&batch);
+            return expr.evaluate(batch);
         }
     }
 
@@ -115,7 +115,7 @@ pub async fn evaluate_expr(
         }
     };
 
-    physical_expr.evaluate(&batch)
+    physical_expr.evaluate(batch)
 }
 
 #[cfg(test)]

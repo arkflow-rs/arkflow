@@ -513,7 +513,7 @@ fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageB
     Ok(MessageBatch::new_arrow(result))
 }
 
-fn insert(i: usize, vrl_values: &mut Vec<ObjectMap>, name: &str, val: VrlValue) {
+fn insert(i: usize, vrl_values: &mut [ObjectMap], name: &str, val: VrlValue) {
     if let Some(obj) = vrl_values.get_mut(i) {
         obj.insert(name.to_string().into(), val);
     }

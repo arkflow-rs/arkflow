@@ -3,6 +3,9 @@
 //! HTTP transport lives here; the domain facade consumed by this crate is
 //! `arkflow_core::control_plane::ControlPlane` and contains no Axum types.
 
+pub mod agent;
+pub mod hub;
+
 use arkflow_core::component::{self, ComponentKind};
 use arkflow_core::configuration::redacted_config;
 use arkflow_core::configuration::{parse_and_validate, ConfigCandidate};
@@ -42,6 +45,12 @@ pub struct ServerConfig {
     pub liveness_path: String,
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub node_token: Option<String>,
+    #[serde(default = "default_lease_ttl_ms")]
+    pub lease_ttl_ms: u64,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 impl ServerConfig {
@@ -55,6 +64,9 @@ impl ServerConfig {
             readiness_path: health.readiness_path.clone(),
             liveness_path: health.liveness_path.clone(),
             cors_origins: health.cors_origins.clone(),
+            node_token: health.node_token.clone(),
+            lease_ttl_ms: health.agent_lease_ttl_ms,
+            poll_interval_ms: default_poll_interval_ms(),
         }
     }
 }
@@ -69,6 +81,9 @@ impl Default for ServerConfig {
             readiness_path: default_readiness_path(),
             liveness_path: default_liveness_path(),
             cors_origins: Vec::new(),
+            node_token: None,
+            lease_ttl_ms: default_lease_ttl_ms(),
+            poll_interval_ms: default_poll_interval_ms(),
         }
     }
 }
@@ -91,11 +106,18 @@ fn default_readiness_path() -> String {
 fn default_liveness_path() -> String {
     "/liveness".into()
 }
+fn default_lease_ttl_ms() -> u64 {
+    15_000
+}
+fn default_poll_interval_ms() -> u64 {
+    1_000
+}
 
 #[derive(Debug, Deserialize)]
 struct PageQuery {
     page: Option<usize>,
     page_size: Option<usize>,
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +128,7 @@ struct OperationQuery {
     operation: Option<String>,
     state: Option<arkflow_core::control::OperationState>,
     correlation_id: Option<String>,
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +138,7 @@ struct EventQuery {
     event_type: Option<String>,
     stream_id: Option<String>,
     correlation_id: Option<String>,
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +218,507 @@ pub async fn serve(
         .with_graceful_shutdown(cancellation.cancelled_owned())
         .await?;
     Ok(())
+}
+
+/// Build the external Hub API. Unlike `router`, this router has no local
+/// Engine state; all node-owned resources come from authenticated Agent
+/// reports stored in `Hub`.
+pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
+    let prefix = config.api_prefix.trim_end_matches('/');
+    let api = Router::new()
+        .route("/system", get(hub_system))
+        .route("/nodes", get(hub_nodes))
+        .route("/streams", get(hub_streams))
+        .route("/nodes/{node_id}/configuration", get(hub_configuration))
+        .route(
+            "/nodes/{node_id}/configuration/versions",
+            get(hub_configuration_versions),
+        )
+        .route(
+            "/nodes/{node_id}/configuration/apply",
+            post(hub_apply_configuration),
+        )
+        .route(
+            "/nodes/{node_id}/configuration/rollback/{version}",
+            post(hub_rollback_configuration),
+        )
+        .route(
+            "/nodes/{node_id}/streams/{id}/{action}",
+            post(hub_targeted_command),
+        )
+        .route("/operations", get(hub_operations))
+        .route("/operations/{id}", get(hub_operation))
+        .route("/events", get(hub_events))
+        .route("/metrics", get(hub_metrics))
+        .route("/agent/register", post(agent_register))
+        .route("/agent/heartbeat", post(agent_heartbeat))
+        .route("/agent/report", post(agent_report))
+        .route("/agent/commands", get(agent_commands))
+        .route("/agent/commands/{id}/result", post(agent_command_result))
+        .with_state(hub.clone());
+    let app = Router::new()
+        .route(&config.health_path, get(hub_health))
+        .route(&config.readiness_path, get(hub_readiness))
+        .route(&config.liveness_path, get(hub_liveness))
+        .nest(prefix, api)
+        .with_state(hub)
+        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
+        .layer(middleware::from_fn(correlation_middleware))
+        .layer(TraceLayer::new_for_http());
+    if config.cors_origins.is_empty() {
+        app
+    } else {
+        let mut cors = CorsLayer::new();
+        for origin in &config.cors_origins {
+            if let Ok(value) = origin.parse::<HeaderValue>() {
+                cors = cors.allow_origin(value);
+            }
+        }
+        app.layer(cors.allow_methods(Any))
+    }
+}
+
+pub async fn serve_hub(
+    hub: hub::Hub,
+    config: ServerConfig,
+    cancellation: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let address: SocketAddr = config.address.parse()?;
+    let listener = TcpListener::bind(address).await?;
+    let sweep_hub = hub.clone();
+    let sweep_cancel = cancellation.clone();
+    let sweep_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tokio::select! { _ = interval.tick() => sweep_hub.mark_stale().await, _ = sweep_cancel.cancelled() => break }
+        }
+    });
+    let result = axum::serve(listener, hub_router(hub, &config).into_make_service())
+        .with_graceful_shutdown(cancellation.cancelled_owned())
+        .await;
+    sweep_task.abort();
+    result?;
+    Ok(())
+}
+
+async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let nodes = hub.nodes().await;
+    Json(
+        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"]}),
+    ).into_response()
+}
+
+async fn hub_nodes(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let items = hub.nodes().await;
+    let total = items.len();
+    Json(Page {
+        items,
+        page: 1,
+        page_size: total.max(1),
+        total,
+    })
+    .into_response()
+}
+
+async fn hub_streams(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let all = hub.streams(query.node_id.as_deref()).await;
+    let total = all.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let items = all
+        .into_iter()
+        .map(|(node_id, stream)| {
+            let mut value = serde_json::to_value(stream).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("node_id".into(), serde_json::Value::String(node_id));
+            }
+            value
+        })
+        .skip((page - 1) * page_size)
+        .take(page_size)
+        .collect();
+    Json(Page {
+        items,
+        page,
+        page_size,
+        total,
+    })
+    .into_response()
+}
+
+async fn hub_configuration(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.configuration(&node_id).await {
+        Some(configuration) => Json(configuration).into_response(),
+        None => problem(
+            StatusCode::NOT_FOUND,
+            "node_configuration_unavailable",
+            "Node has not reported configuration".into(),
+        ),
+    }
+}
+
+async fn hub_configuration_versions(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    if hub.configuration(&node_id).await.is_none() {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "node_configuration_unavailable",
+            "Node has not reported configuration".into(),
+        );
+    }
+    Json(Vec::<serde_json::Value>::new()).into_response()
+}
+
+async fn hub_apply_configuration(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(candidate): Json<ConfigCandidate>,
+) -> Response {
+    hub_configuration_command(&hub, node_id, "apply_configuration", candidate, &headers).await
+}
+
+async fn hub_rollback_configuration(
+    State(hub): State<hub::Hub>,
+    Path((node_id, version)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    hub_configuration_command(
+        &hub,
+        node_id,
+        "rollback_configuration",
+        serde_json::json!({"id": version}),
+        &headers,
+    )
+    .await
+}
+
+async fn hub_configuration_command<T: Serialize>(
+    hub: &hub::Hub,
+    node_id: String,
+    operation: &str,
+    payload: T,
+    headers: &HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let payload = match serde_json::to_value(payload) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_configuration",
+                "Configuration payload is not serializable".into(),
+            )
+        }
+    };
+    match hub
+        .enqueue_with_payload(
+            node_id,
+            operation.into(),
+            "configuration".into(),
+            correlation_id,
+            Some(payload),
+        )
+        .await
+    {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(hub::HubError::NodeUnavailable) => problem(
+            StatusCode::CONFLICT,
+            "node_unavailable",
+            "Target node is stale or offline".into(),
+        ),
+        _ => problem(
+            StatusCode::BAD_REQUEST,
+            "command_rejected",
+            "Invalid configuration command".into(),
+        ),
+    }
+}
+
+async fn hub_targeted_command(
+    State(hub): State<hub::Hub>,
+    Path((node_id, id, action)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    if !matches!(action.as_str(), "start" | "stop" | "restart") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation",
+            "Unsupported node operation".into(),
+        );
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match hub.enqueue(node_id, action, id, correlation_id).await {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(hub::HubError::NodeUnavailable) => problem(
+            StatusCode::CONFLICT,
+            "node_unavailable",
+            "Target node is stale or offline".into(),
+        ),
+        Err(error) => problem(
+            StatusCode::BAD_REQUEST,
+            "command_rejected",
+            error.to_string(),
+        ),
+    }
+}
+
+async fn hub_operations(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<OperationQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let mut items = hub.operations(query.node_id.as_deref()).await;
+    if let Some(resource_id) = query.resource_id.as_deref() {
+        items.retain(|item| item.resource_id == resource_id);
+    }
+    if let Some(value) = query.operation {
+        items.retain(|item| item.operation == value);
+    }
+    let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    Json(Page {
+        items: items
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .collect::<Vec<_>>(),
+        page,
+        page_size,
+        total,
+    })
+    .into_response()
+}
+
+async fn hub_operation(
+    State(hub): State<hub::Hub>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.operation(&id).await {
+        Some(operation) => Json(operation).into_response(),
+        None => problem(
+            StatusCode::NOT_FOUND,
+            "operation_not_found",
+            format!("Unknown operation: {id}"),
+        ),
+    }
+}
+
+async fn hub_events(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<EventQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let mut items = hub.events(query.node_id.as_deref()).await;
+    if let Some(event_type) = query.event_type.as_deref() {
+        items.retain(|item| item.event.event_type == event_type);
+    }
+    if let Some(stream_id) = query.stream_id.as_deref() {
+        items.retain(|item| item.event.stream_id.as_deref() == Some(stream_id));
+    }
+    if let Some(correlation_id) = query.correlation_id.as_deref() {
+        items.retain(|item| item.event.correlation_id.as_deref() == Some(correlation_id));
+    }
+    let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    Json(Page {
+        items: items
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .collect::<Vec<_>>(),
+        page,
+        page_size,
+        total,
+    })
+    .into_response()
+}
+
+async fn hub_metrics(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    Json(serde_json::json!({
+        "items": hub.metrics_by_node(query.node_id.as_deref()).await,
+        "aggregate": hub.metrics(query.node_id.as_deref()).await,
+    }))
+    .into_response()
+}
+
+async fn agent_register(
+    State(hub): State<hub::Hub>,
+    Json(request): Json<hub::RegisterRequest>,
+) -> Response {
+    match hub.register(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+async fn agent_heartbeat(
+    State(hub): State<hub::Hub>,
+    Json(request): Json<hub::HeartbeatRequest>,
+) -> Response {
+    match hub.heartbeat(request).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+async fn agent_report(
+    State(hub): State<hub::Hub>,
+    Json(request): Json<hub::NodeReport>,
+) -> Response {
+    match hub.report(request).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+async fn agent_commands(
+    State(hub): State<hub::Hub>,
+    Query(auth): Query<hub::AgentAuth>,
+) -> Response {
+    match hub.commands(auth).await {
+        Ok(commands) => Json(commands).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+async fn agent_command_result(
+    State(hub): State<hub::Hub>,
+    Path(_id): Path<String>,
+    Query(auth): Query<hub::AgentAuth>,
+    Json(result): Json<hub::CommandResult>,
+) -> Response {
+    match hub.command_result(auth, result).await {
+        Ok(operation) => Json(operation).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_health(State(hub): State<hub::Hub>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status":"healthy","nodes":hub.nodes().await.len()}))
+}
+async fn hub_readiness(State(hub): State<hub::Hub>) -> Json<serde_json::Value> {
+    let _ = hub;
+    Json(serde_json::json!({"status":"ready","ready":true}))
+}
+async fn hub_liveness() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status":"alive","alive":true}))
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+fn hub_problem(error: hub::HubError) -> Response {
+    let status = match error {
+        hub::HubError::Unauthorized => StatusCode::UNAUTHORIZED,
+        hub::HubError::NodeUnavailable => StatusCode::CONFLICT,
+        hub::HubError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    problem(status, "agent_request_rejected", error.to_string())
 }
 
 async fn system(State(cp): State<ControlPlane>) -> Json<arkflow_core::control::SystemResource> {
@@ -345,7 +870,7 @@ async fn events(
     if let Some(value) = query.correlation_id {
         items.retain(|item| item.correlation_id.as_deref() == Some(value.as_str()));
     }
-    items.sort_by(|left, right| right.occurred_at_ms.cmp(&left.occurred_at_ms));
+    items.sort_by_key(|event| std::cmp::Reverse(event.occurred_at_ms));
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
@@ -730,8 +1255,10 @@ mod tests {
 
     #[tokio::test]
     async fn protected_routes_reject_missing_credentials() {
-        let mut health = HealthCheckConfig::default();
-        health.api_token = Some("secret".into());
+        let health = HealthCheckConfig {
+            api_token: Some("secret".into()),
+            ..Default::default()
+        };
         let engine = Engine::new(EngineConfig {
             streams: vec![],
             logging: LoggingConfig::default(),
@@ -747,5 +1274,577 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn resource_api_integration_covers_routes_filters_redaction_and_aliases() {
+        let health = HealthCheckConfig {
+            api_token: Some("secret-token".into()),
+            ..Default::default()
+        };
+        let engine = Engine::new(EngineConfig {
+            streams: vec![],
+            logging: LoggingConfig::default(),
+            health_check: health,
+        });
+        let control_plane = engine.control_plane();
+        control_plane.health().set_ready(true);
+        control_plane.health().set_running(true);
+        let app = router(control_plane, &ServerConfig::default());
+        let auth = "Bearer secret-token";
+
+        for path in [
+            "/api/v1/system",
+            "/api/v1/status",
+            "/api/v1/nodes",
+            "/api/v1/streams?page=1&page_size=10",
+            "/api/v1/operations?page=1&page_size=10",
+            "/api/v1/events?page=1&page_size=10",
+            "/api/v1/components",
+            "/api/v1/schema",
+            "/api/v1/metrics",
+            "/health",
+            "/readiness",
+            "/liveness",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header("authorization", auth)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.status().is_server_error(), "route failed: {path}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/operations?state=not-a-real-state")
+                    .header("authorization", auth)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/streams/missing")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/configuration")
+                    .header("authorization", auth)
+                    .header("x-correlation-id", "resource-contract")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-correlation-id").unwrap(),
+            "resource-contract"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let configuration = String::from_utf8(body.to_vec()).unwrap();
+        assert!(configuration.contains("******"));
+        assert!(!configuration.contains("secret-token"));
+
+        let draft = serde_json::json!({"format":"json","content":"{\"streams\":[]}"});
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/configuration/draft")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(draft.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/configuration/draft")
+                    .header("authorization", auth)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/configuration/validate")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"format":"json","content":"not-json"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(validation["valid"], false);
+        for path in ["/api/v1/config", "/api/v1/config/versions"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header("authorization", auth)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "alias failed: {path}");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/config/validate")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"format":"json","content":"{\"streams\":[]}"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/configuration/diff?from=missing&to=missing")
+                    .header("authorization", auth)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/components")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/components/input/generate")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::NOT_FOUND
+        ));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/unknown-resource")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn hub_http_contract_registers_and_routes_a_targeted_command() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node-secret".into()),
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+        });
+        let app = hub_router(hub, &ServerConfig::default());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/agent/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"node_id":"node-a","node_token":"node-secret"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session: hub::RegisterResponse = serde_json::from_slice(&body).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/start")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/agent/commands?node_id=node-a&session_token={}",
+                    session.session_token
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let commands: Vec<hub::AgentCommand> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].resource_id, "orders");
+    }
+
+    #[tokio::test]
+    async fn hub_end_to_end_two_nodes_aggregate_target_reconnect_and_drain() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node-secret".into()),
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 10,
+        });
+        let app = hub_router(hub.clone(), &ServerConfig::default());
+
+        let node_a = register_hub_node(&app, "node-a").await;
+        let node_b = register_hub_node(&app, "node-b").await;
+        report_hub_node(&app, &node_a, "orders", "online").await;
+        report_hub_node(&app, &node_b, "orders", "online").await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/system")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let system: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(system["node_count"], 2);
+        assert_eq!(system["online_nodes"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/streams")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let streams: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stream_nodes: Vec<&str> = streams["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stream| stream["node_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(stream_nodes, vec!["node-a", "node-b"]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/start")
+                    .header("authorization", "Bearer operator")
+                    .header("x-correlation-id", "two-node-start")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let operation: hub::HubOperation = serde_json::from_slice(&body).unwrap();
+        assert_eq!(operation.node_id, "node-a");
+        assert_eq!(operation.correlation_id.as_deref(), Some("two-node-start"));
+
+        let commands_a = agent_commands(&app, &node_a).await;
+        let commands_b = agent_commands(&app, &node_b).await;
+        assert_eq!(commands_a.len(), 1);
+        assert!(commands_b.is_empty());
+        assert_eq!(commands_a[0].node_id, "node-a");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/api/v1/agent/commands/{}/result?node_id={}&session_token={}",
+                    commands_a[0].id, node_a.node_id, node_a.session_token
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_string(&hub::CommandResult {
+                        command_id: commands_a[0].id.clone(),
+                        operation_id: operation.id.clone(),
+                        state: hub::HubOperationState::Succeeded,
+                        progress: 100,
+                        error: None,
+                        correlation_id: Some("two-node-start".into()),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let operation_after_result = get_hub_operation(&app, &operation.id).await;
+        assert_eq!(
+            operation_after_result.state,
+            hub::HubOperationState::Succeeded
+        );
+
+        let old_session = node_a.session_token.clone();
+        let node_a_reconnected = register_hub_node(&app, "node-a").await;
+        assert_ne!(old_session, node_a_reconnected.session_token);
+        let old_session_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/agent/commands?node_id=node-a&session_token={old_session}"
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_session_response.status(), StatusCode::UNAUTHORIZED);
+
+        let streams_after_reconnect = get_hub_streams(&app).await;
+        assert_eq!(streams_after_reconnect["total"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/agent/heartbeat")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "node_id": "node-a",
+                            "session_token": node_a_reconnected.session_token,
+                            "state": "draining"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let nodes = get_hub_nodes(&app).await;
+        assert_eq!(
+            nodes.iter().find(|node| node.id == "node-a").unwrap().state,
+            hub::NodeConnectionState::Draining
+        );
+        assert_eq!(
+            nodes.iter().find(|node| node.id == "node-b").unwrap().state,
+            hub::NodeConnectionState::Online
+        );
+    }
+
+    async fn register_hub_node(app: &Router, node_id: &str) -> hub::RegisterResponse {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/agent/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"node_id": node_id, "node_token": "node-secret"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn report_hub_node(
+        app: &Router,
+        session: &hub::RegisterResponse,
+        stream_id: &str,
+        state: &str,
+    ) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/agent/report")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "node_id": session.node_id,
+                            "session_token": session.session_token,
+                            "version": "test-node",
+                            "state": state,
+                            "capabilities": ["stream_lifecycle", "metrics"],
+                            "streams": [{
+                                "id": stream_id,
+                                "state": "running",
+                                "desired_state": "running",
+                                "started_at_ms": 1,
+                                "last_error": null,
+                                "metrics": {
+                                    "input_batches": 1,
+                                    "input_messages": 3,
+                                    "processing_errors": 0,
+                                    "output_batches": 1,
+                                    "output_messages": 2,
+                                    "input_errors": 0,
+                                    "input_reconnects": 0,
+                                    "output_errors": 0,
+                                    "restarts": 0
+                                }
+                            }],
+                            "operations": [],
+                            "events": [],
+                            "metrics": {"input_messages": 3.0},
+                            "configuration": {"token": "[REDACTED]"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    async fn agent_commands(
+        app: &Router,
+        session: &hub::RegisterResponse,
+    ) -> Vec<hub::AgentCommand> {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/agent/commands?node_id={}&session_token={}",
+                    session.node_id, session.session_token
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn get_hub_operation(app: &Router, id: &str) -> hub::HubOperation {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/operations/{id}"))
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn get_hub_streams(app: &Router) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/streams")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn get_hub_nodes(app: &Router) -> Vec<hub::HubNode> {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Page<hub::HubNode> = serde_json::from_slice(&body).unwrap();
+        page.items
     }
 }

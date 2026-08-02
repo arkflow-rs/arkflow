@@ -262,7 +262,7 @@ impl Output for SqlOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
-        let conn = conn_guard.as_mut().ok_or_else(|| Error::Disconnection)?;
+        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
 
         // Apply codec encoding if configured, otherwise use the message as-is
         let processed_msg = if let Some(codec) = &self.codec {

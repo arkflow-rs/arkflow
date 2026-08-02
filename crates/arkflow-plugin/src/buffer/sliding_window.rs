@@ -55,6 +55,7 @@ struct SlidingWindow {
     /// Configuration parameters for the sliding window
     config: SlidingWindowConfig,
     /// Thread-safe queue to store message batches and their acknowledgments
+    #[allow(clippy::type_complexity)]
     queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,

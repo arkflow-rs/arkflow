@@ -13,6 +13,11 @@ arkflow-core = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+url = "2.5.8"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tower-http = { workspace = true }

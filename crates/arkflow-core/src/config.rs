@@ -78,6 +78,18 @@ pub struct HealthCheckConfig {
     /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Hub URL for compute-node Agent mode. When absent, standalone mode is used.
+    #[serde(default)]
+    pub hub_url: Option<String>,
+    /// Stable identity used when this process reports to a Hub.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Shared node registration credential. Never included in reports.
+    #[serde(default)]
+    pub node_token: Option<String>,
+    /// Lease duration advertised by a compute node to its Hub.
+    #[serde(default = "default_agent_lease_ttl_ms")]
+    pub agent_lease_ttl_ms: u64,
 }
 
 /// Engine configuration
@@ -179,6 +191,10 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_agent_lease_ttl_ms() -> u64 {
+    15_000
+}
+
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
@@ -190,6 +206,10 @@ impl Default for HealthCheckConfig {
             api_prefix: default_api_prefix(),
             api_token: None,
             cors_origins: Vec::new(),
+            hub_url: None,
+            node_id: None,
+            node_token: None,
+            agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
         }
     }
 }
@@ -256,7 +276,7 @@ mod tests {
     #[test]
     fn test_health_check_config_default() {
         let config = HealthCheckConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.address, "127.0.0.1:8080");
         assert_eq!(config.health_path, "/health");
         assert_eq!(config.readiness_path, "/readiness");
@@ -323,12 +343,16 @@ mod tests {
             api_prefix: "/api/v1".to_string(),
             api_token: Some("test-token".to_string()),
             cors_origins: Vec::new(),
+            hub_url: None,
+            node_id: None,
+            node_token: None,
+            agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: HealthCheckConfig = serde_json::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.enabled, false);
+        assert!(!deserialized.enabled);
         assert_eq!(deserialized.address, "127.0.0.1:9090");
         assert_eq!(deserialized.health_path, "/healthz");
         assert_eq!(deserialized.readiness_path, "/ready");
@@ -412,7 +436,7 @@ streams: []
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.file_path, Some("/tmp/test.log".to_string()));
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "127.0.0.1:9090");
         assert!(config.streams.is_empty());
 
@@ -445,7 +469,7 @@ streams: []
 
         assert_eq!(config.logging.level, "info");
         assert!(matches!(config.logging.format, LogFormat::PLAIN));
-        assert_eq!(config.health_check.enabled, true);
+        assert!(config.health_check.enabled);
         assert_eq!(config.health_check.address, "0.0.0.0:8080");
         assert!(config.streams.is_empty());
 
@@ -489,7 +513,7 @@ type = "stdout"
 
         assert_eq!(config.logging.level, "warn");
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert_eq!(config.health_check.enabled, false);
+        assert!(!config.health_check.enabled);
         assert_eq!(config.health_check.address, "192.168.1.1:8888");
         assert_eq!(config.streams.len(), 1);
 
@@ -564,7 +588,7 @@ type = "stdout"
 
         assert_eq!(deserialized.logging.level, "info");
         assert!(matches!(deserialized.logging.format, LogFormat::PLAIN));
-        assert_eq!(deserialized.health_check.enabled, true);
+        assert!(deserialized.health_check.enabled);
         assert_eq!(deserialized.health_check.address, "127.0.0.1:8080");
     }
 

@@ -95,7 +95,7 @@ impl KafkaInput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the consumer group ID
         client_config.set("group.id", &self.config.consumer_group);

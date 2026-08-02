@@ -193,3 +193,93 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 
 ### 下一步
 Change 3 EOS：实现完成（Phase 1-4 全 done；Phase 3 用 cp-kafka testcontainers 替代 redpanda——Kafka 事务参考实现 + CI 可拉 + 协议兼容，EOS 语义等价）。下一步 `openspec verify` → archive（spec `exactly-once-output` 合并主 specs）→ propose Change 4（状态 checkpoint）。
+
+---
+
+## 五、Hub 平台路线（2026-08-02）
+
+### 5.1 当前进展
+
+Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的基础转型：
+
+- `add-control-plane` 已完成，建立了本地 `ControlPlane`、资源 API 和 Console 基础。
+- `make-control-plane-hub` 已完成 32/33 项：节点注册、租约、Agent 心跳与报告、节点资源聚合、目标命令派发、配置转发、Hub Console 基础能力均已实现；剩余一个 Hub + 两节点端到端 Smoke Test。
+- `rebuild-control-plane-system` 已完成 27/37 项：服务边界、资源 API、操作模型和 Console 架构已完成；剩余操作取消/重协调、完整 API 集成测试、Runtime/Configuration Console 完整体验，以及最终验证审计。
+- 当前 Hub 的边界仍明确保持为单 Hub、多 Compute Node；暂不引入 Raft、跨 Hub 共识或分布式调度。
+
+核心职责划分：Hub 管理节点目录、聚合资源和期望操作；Compute Node Agent 管理本地执行、观测状态和命令结果。
+
+### 5.2 当前生产化缺口
+
+1. Hub 的节点会话、操作记录、事件和资源快照目前主要在内存中，Hub 重启后会丢失运行历史。
+2. 操作取消、超时、重试和节点重连后的 reconciliation 尚未形成完整状态机闭环。
+3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。
+4. Agent 命令轮询使用 URL 查询参数携带 session token，需要改为 Authorization Header，避免被代理访问日志记录。
+5. 配置以节点最新快照为主，尚缺少完整的版本化发布、批量发布、审批和回滚策略。
+6. Console 的 Overview、Runtime 详情和配置编辑/发布工作流仍需补全。
+7. 尚无覆盖注册、聚合、定向操作、重连和优雅关闭的双节点端到端测试。
+
+### 5.3 推荐交付顺序
+
+```text
+阶段 1  Hub 当前版本收口
+        E2E Smoke Test、操作重协调、API/脱敏测试、Console Runtime/配置补齐
+          ↓
+阶段 2  Hub 生产基础
+        持久化、幂等操作状态机、认证加固、指标与审计
+          ↓
+阶段 3  多节点运营
+        节点生命周期、标签能力、批量操作、滚动发布、配置版本治理
+          ↓
+阶段 4  平台化扩展
+        RBAC、OIDC、Secret Manager、告警、Webhook、GitOps、Hub 高可用
+```
+
+### 5.4 阶段 1：当前版本收口
+
+- 完成一个 Hub + 两个 Compute Node 的端到端 Smoke Test。
+- 补齐操作取消、超时、重试、节点离线和重连恢复测试。
+- 完成所有资源 API 的集成测试，包括分页、非法过滤器、认证失败、脱敏和兼容健康接口。
+- 完成 Console Overview、Runtime 详情以及配置 YAML/JSON 编辑、校验、diff、发布和回滚。
+- 验证 Rust workspace、WAL 行为、Console 构建和 Hub 断连时本地数据面不受影响。
+
+### 5.5 阶段 2：Hub 生产基础
+
+建议新增独立 OpenSpec change `harden-hub-production-foundation`，重点包括：
+
+- 使用 SQLite 或其他嵌入式存储持久化节点身份、配置版本、操作记录和审计事件。
+- 固化 `Queued → Dispatched → Acknowledged → Running → terminal` 操作状态机。
+- 所有命令支持幂等键、过期时间、重试次数和重连 reconciliation。
+- 将 Agent session token 改为短期凭证，并通过 Authorization Header 传输。
+- 增加节点标签、能力、版本、租约状态和协议兼容性信息。
+- 增加 Hub/Agent、命令延迟、失败率、租约和资源聚合的 Prometheus 指标。
+- 审计事件默认不记录 token、密码和未脱敏配置。
+
+### 5.6 阶段 3：多节点运营
+
+- 节点注册、禁用、排空、维护、驱逐和删除。
+- 按节点标签或能力批量启动、停止、重启 Stream。
+- 支持滚动发布、分批发布、失败自动暂停和回滚。
+- 配置草稿、schema 校验、diff、审批、发布和版本回滚。
+- 节点版本检查、Agent 升级状态和能力不兼容检测。
+- 展示节点、Stream、输入、处理器、输出之间的拓扑关系。
+
+### 5.7 阶段 4：平台化扩展
+
+- 多用户、RBAC、团队/租户隔离和 OIDC/OAuth2。
+- 外部 Secret Manager、Webhook、Slack/邮件告警和事件订阅。
+- GitOps 配置同步和审计追踪。
+- OpenTelemetry trace 与跨节点故障诊断。
+- 在单 Hub 模型验证稳定后，再评估外部数据库和 Hub 高可用。
+
+### 5.8 设计边界
+
+Hub 的近期目标是成为可靠的单 Hub、多节点运营控制面，而不是立即演化为分布式调度系统。优先保证资源模型、操作一致性、配置治理、可观测性和安全边界，再考虑共识、高可用和跨 Hub 调度。
+
+推荐 OpenSpec 顺序：
+
+1. Hub E2E 收口与验证。
+2. Hub 操作一致性与持久化。
+3. 配置发布与批量节点运营。
+4. RBAC、审计与告警。
+5. Hub 高可用与外部存储。

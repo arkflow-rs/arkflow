@@ -22,7 +22,7 @@ use arkflow_core::{
     codec::Codec,
     component::{register_output_metadata, ComponentMetadata},
     output::{register_output_builder, Output, OutputBuilder},
-    Error, MessageBatch, MessageBatchRef, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    Error, MessageBatch, MessageBatchRef, Resource,
 };
 
 use crate::expr::{EvaluateResult, Expr};
@@ -171,7 +171,7 @@ impl Output for KafkaOutput {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
-        client_config.set("bootstrap.servers", &self.config.brokers.join(","));
+        client_config.set("bootstrap.servers", self.config.brokers.join(","));
 
         // Set the client ID
         if let Some(client_id) = &self.config.client_id {
@@ -247,7 +247,7 @@ impl Output for KafkaOutput {
             // Create record
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
             };
 
             // Add key if available
@@ -417,7 +417,7 @@ impl KafkaOutput {
         for (i, x) in payloads.into_iter().enumerate() {
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&*v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
             };
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
