@@ -418,6 +418,7 @@ impl RuntimeManager {
                 message,
                 operation_id: None,
                 correlation_id: None,
+                actor: None,
             })
             .await;
     }
@@ -533,6 +534,7 @@ impl RuntimeManager {
                     message: event.3,
                     operation_id: None,
                     correlation_id: None,
+                    actor: None,
                 })
                 .await;
             result

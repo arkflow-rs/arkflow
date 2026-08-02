@@ -36,6 +36,32 @@ pub struct NodeMutation {
     pub report_seq: Option<u64>,
     pub last_seen_at_ms: u64,
     pub lease_expires_at_ms: u64,
+    pub maintenance_state: Option<String>,
+    pub maintenance_updated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeMaintenanceMutation {
+    pub node_id: String,
+    pub state: String,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OperationalAggregates {
+    pub node_states: Vec<(String, u64)>,
+    pub maintenance_states: Vec<(String, u64)>,
+    pub intent_states: Vec<(String, u64)>,
+    pub convergence_states: Vec<(String, u64)>,
+    pub attempt_states: Vec<(String, u64)>,
+    pub failure_classes: Vec<(String, u64)>,
+    pub outbox_pending: u64,
+    pub outbox_claimed: u64,
+    pub stale_nodes: u64,
+    pub active_attempts: u64,
+    pub non_terminal_intents: u64,
+    pub oldest_pending_age_seconds: Option<u64>,
 }
 
 impl Default for DesiredMutation {
@@ -143,6 +169,7 @@ pub struct StoredEvent {
     pub generation: Option<u64>,
     pub correlation_id: Option<String>,
     pub occurred_at_ms: u64,
+    pub actor: Option<String>,
 }
 
 /// Storage-neutral contract used by Hub/Reconciler code.
@@ -175,6 +202,13 @@ pub trait ControlPlaneRepository: Send + Sync {
         now_ms: u64,
     ) -> Result<Option<OutboxRecord>, StorageError>;
     fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError>;
+    fn set_node_maintenance(
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError>;
+    fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError>;
+    fn operational_aggregates(&self, now_ms: u64) -> Result<OperationalAggregates, StorageError>;
 }
 
 #[derive(Debug, Error)]
@@ -263,6 +297,19 @@ enum StorageCommand {
         outbox_id: i64,
         now_ms: u64,
         response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    SetNodeMaintenance {
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+        response: oneshot::Sender<Result<bool, StorageError>>,
+    },
+    GetNodeMaintenance {
+        node_id: String,
+        response: oneshot::Sender<Result<Option<String>, StorageError>>,
+    },
+    OperationalAggregates {
+        now_ms: u64,
+        response: oneshot::Sender<Result<OperationalAggregates, StorageError>>,
     },
 }
 
@@ -357,6 +404,19 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response.send(store.mark_outbox_processed(outbox_id, now_ms));
+                    }
+                    StorageCommand::SetNodeMaintenance {
+                        mutation,
+                        now_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.set_node_maintenance(mutation, now_ms));
+                    }
+                    StorageCommand::GetNodeMaintenance { node_id, response } => {
+                        let _ = response.send(store.get_node_maintenance(&node_id));
+                    }
+                    StorageCommand::OperationalAggregates { now_ms, response } => {
+                        let _ = response.send(store.operational_aggregates(now_ms));
                     }
                 }
             }
@@ -554,6 +614,50 @@ impl StorageActor {
                 failure_class,
                 response,
             })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn set_node_maintenance(
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::SetNodeMaintenance {
+                mutation,
+                now_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_node_maintenance(
+        &self,
+        node_id: impl Into<String>,
+    ) -> Result<Option<String>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetNodeMaintenance {
+                node_id: node_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn operational_aggregates(
+        &self,
+        now_ms: u64,
+    ) -> Result<OperationalAggregates, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::OperationalAggregates { now_ms, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -775,7 +879,7 @@ impl ControlPlaneStore {
     pub fn upsert_node(&self, mutation: NodeMutation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO cp_nodes (node_id, role, protocol_version, node_version, state, capabilities_json, boot_id, last_report_seq, last_seen_at_ms, lease_expires_at_ms, created_at_ms, updated_at_ms) VALUES (?1, 'compute', 'v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?7, ?7) ON CONFLICT(node_id) DO UPDATE SET node_version = excluded.node_version, state = excluded.state, capabilities_json = excluded.capabilities_json, boot_id = excluded.boot_id, last_report_seq = excluded.last_report_seq, last_seen_at_ms = excluded.last_seen_at_ms, lease_expires_at_ms = excluded.lease_expires_at_ms, updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO cp_nodes (node_id, role, protocol_version, node_version, state, capabilities_json, boot_id, last_report_seq, last_seen_at_ms, lease_expires_at_ms, maintenance_state, maintenance_updated_at_ms, created_at_ms, updated_at_ms) VALUES (?1, 'compute', 'v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, 'active'), ?10, ?7, ?7) ON CONFLICT(node_id) DO UPDATE SET node_version = excluded.node_version, state = excluded.state, capabilities_json = excluded.capabilities_json, boot_id = excluded.boot_id, last_report_seq = excluded.last_report_seq, last_seen_at_ms = excluded.last_seen_at_ms, lease_expires_at_ms = excluded.lease_expires_at_ms, updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
                     mutation.node_id,
                     mutation.version,
@@ -785,9 +889,88 @@ impl ControlPlaneStore {
                     mutation.report_seq,
                     mutation.last_seen_at_ms,
                     mutation.lease_expires_at_ms,
+                    mutation.maintenance_state,
+                    mutation.maintenance_updated_at_ms,
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn set_node_maintenance(
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let state = mutation.state.as_str();
+        if !matches!(state, "active" | "draining" | "maintenance") {
+            return Ok(false);
+        }
+        self.immediate_transaction(|transaction| {
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT COALESCE(maintenance_state, 'active') FROM cp_nodes WHERE node_id = ?1",
+                    [&mutation.node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(previous) = previous else { return Ok(false) };
+            if previous != state {
+                transaction.execute(
+                    "UPDATE cp_nodes SET maintenance_state = ?1, maintenance_updated_at_ms = ?2, updated_at_ms = ?2 WHERE node_id = ?3",
+                    rusqlite::params![state, now_ms, mutation.node_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_maintenance_changed', 'succeeded', ?2, ?3, ?4, ?5)",
+                    rusqlite::params![mutation.node_id, format!("{previous}->{state}"), mutation.correlation_id, mutation.actor, now_ms],
+                )?;
+            }
+            Ok(true)
+        })
+    }
+
+    pub fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT COALESCE(maintenance_state, 'active') FROM cp_nodes WHERE node_id = ?1",
+                    [node_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+    }
+
+    pub fn operational_aggregates(
+        &self,
+        now_ms: u64,
+    ) -> Result<OperationalAggregates, StorageError> {
+        self.with_connection(|connection| {
+            let grouped = |sql: &str| -> Result<Vec<(String, u64)>, rusqlite::Error> {
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
+                rows.collect()
+            };
+            let scalar = |sql: &str| -> Result<u64, rusqlite::Error> {
+                connection.query_row(sql, [], |row| row.get::<_, i64>(0)).map(|v| v as u64)
+            };
+            let oldest: Option<i64> = connection.query_row(
+                "SELECT MIN(created_at_ms) FROM cp_outbox WHERE processed_at_ms IS NULL", [], |row| row.get(0)
+            ).optional()?.flatten();
+            Ok(OperationalAggregates {
+                node_states: grouped("SELECT state, COUNT(*) FROM cp_nodes GROUP BY state")?,
+                maintenance_states: grouped("SELECT COALESCE(maintenance_state, 'active'), COUNT(*) FROM cp_nodes GROUP BY COALESCE(maintenance_state, 'active')")?,
+                intent_states: grouped("SELECT state, COUNT(*) FROM cp_intents GROUP BY state")?,
+                convergence_states: grouped("SELECT convergence_state, COUNT(*) FROM cp_intents GROUP BY convergence_state")?,
+                attempt_states: grouped("SELECT state, COUNT(*) FROM cp_attempts GROUP BY state")?,
+                failure_classes: grouped("SELECT COALESCE(last_failure_class, 'none'), COUNT(*) FROM cp_intents GROUP BY COALESCE(last_failure_class, 'none')")?,
+                outbox_pending: scalar("SELECT COUNT(*) FROM cp_outbox WHERE processed_at_ms IS NULL")?,
+                outbox_claimed: scalar("SELECT COUNT(*) FROM cp_outbox WHERE processed_at_ms IS NULL AND claimed_at_ms IS NOT NULL")?,
+                stale_nodes: connection.query_row("SELECT COUNT(*) FROM cp_nodes WHERE state = 'stale' OR lease_expires_at_ms <= ?1", [now_ms], |row| row.get::<_, i64>(0)).map(|v| v as u64)?,
+                active_attempts: scalar("SELECT COUNT(*) FROM cp_attempts WHERE state IN ('queued','dispatched','acknowledged','running')")?,
+                non_terminal_intents: scalar("SELECT COUNT(*) FROM cp_intents WHERE state IN ('accepted','converging','retrying')")?,
+                oldest_pending_age_seconds: oldest.map(|created| now_ms.saturating_sub(created as u64) / 1000),
+            })
         })
     }
 
@@ -936,7 +1119,7 @@ impl ControlPlaneStore {
     pub fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, message, generation, correlation_id, occurred_at_ms FROM cp_events WHERE (?1 IS NULL OR node_id = ?1) ORDER BY occurred_at_ms DESC, event_id DESC LIMIT 2048",
+                "SELECT node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, message, generation, correlation_id, occurred_at_ms, actor FROM cp_events WHERE (?1 IS NULL OR node_id = ?1) ORDER BY occurred_at_ms DESC, event_id DESC LIMIT 2048",
             )?;
             let rows = statement.query_map([node_id], |row| {
                 Ok(StoredEvent {
@@ -951,6 +1134,7 @@ impl ControlPlaneStore {
                     generation: row.get(8)?,
                     correlation_id: row.get(9)?,
                     occurred_at_ms: row.get(10)?,
+                    actor: row.get(11)?,
                 })
             })?;
             rows.collect()
@@ -1344,6 +1528,8 @@ impl ControlPlaneStore {
                 last_report_seq INTEGER,
                 last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
                 lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+                maintenance_state TEXT NOT NULL DEFAULT 'active',
+                maintenance_updated_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -1458,6 +1644,7 @@ impl ControlPlaneStore {
                 message TEXT,
                 generation INTEGER,
                 correlation_id TEXT,
+                actor TEXT,
                 occurred_at_ms INTEGER NOT NULL
             );
 
@@ -1515,6 +1702,32 @@ impl ControlPlaneStore {
                 [],
             )?;
         }
+        let node_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_nodes)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !node_columns.iter().any(|name| name == "maintenance_state") {
+            connection.execute(
+                "ALTER TABLE cp_nodes ADD COLUMN maintenance_state TEXT NOT NULL DEFAULT 'active'",
+                [],
+            )?;
+        }
+        if !node_columns
+            .iter()
+            .any(|name| name == "maintenance_updated_at_ms")
+        {
+            connection.execute(
+                "ALTER TABLE cp_nodes ADD COLUMN maintenance_updated_at_ms INTEGER",
+                [],
+            )?;
+        }
+        let event_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !event_columns.iter().any(|name| name == "actor") {
+            connection.execute("ALTER TABLE cp_events ADD COLUMN actor TEXT", [])?;
+        }
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             [],
@@ -1561,6 +1774,66 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_transitions_are_durable_and_audited() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-a".into(),
+                version: "v1".into(),
+                state: "online".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: 10,
+                lease_expires_at_ms: 1000,
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .unwrap();
+        assert!(store
+            .set_node_maintenance(
+                NodeMaintenanceMutation {
+                    node_id: "node-a".into(),
+                    state: "draining".into(),
+                    actor: Some("operator".into()),
+                    correlation_id: Some("corr-1".into())
+                },
+                20
+            )
+            .unwrap());
+        assert_eq!(
+            store.get_node_maintenance("node-a").unwrap().as_deref(),
+            Some("draining")
+        );
+        let events = store.list_events(Some("node-a")).unwrap();
+        assert_eq!(events[0].event_type, "node_maintenance_changed");
+        assert_eq!(events[0].actor.as_deref(), Some("operator"));
+        assert_eq!(events[0].correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[test]
+    fn operational_aggregates_are_bounded_and_include_pending_age() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-a".into(),
+                version: "v1".into(),
+                state: "stale".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: 10,
+                lease_expires_at_ms: 10,
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .unwrap();
+        let status = store.operational_aggregates(10_010).unwrap();
+        assert_eq!(status.stale_nodes, 1);
+        assert_eq!(status.node_states, vec![("stale".into(), 1)]);
+    }
+
+    #[test]
     fn legacy_node_observation_initialization_does_not_create_operator_intent() {
         let store = ControlPlaneStore::in_memory().unwrap();
         store
@@ -1573,6 +1846,8 @@ mod tests {
                 report_seq: Some(1),
                 last_seen_at_ms: 1,
                 lease_expires_at_ms: 100,
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
             })
             .unwrap();
         store

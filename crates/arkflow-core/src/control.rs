@@ -7,6 +7,55 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Operator-controlled mode for a compute node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeMaintenanceState {
+    Active,
+    Draining,
+    Maintenance,
+}
+
+impl Default for NodeMaintenanceState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+/// Bounded health of the Hub's reconciliation loop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReconciliationHealth {
+    pub state: String,
+    pub runs_total: u64,
+    pub failures_total: u64,
+    pub last_success_at_ms: Option<u64>,
+    pub last_error_at_ms: Option<u64>,
+    pub last_duration_ms: Option<u64>,
+    pub last_failure_class: Option<String>,
+}
+
+/// Safe operational snapshot used by JSON diagnostics and metric rendering.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperationalStatus {
+    pub status: String,
+    pub ready: bool,
+    pub recovered: bool,
+    pub storage_ready: bool,
+    pub reconciliation: ReconciliationHealth,
+    pub node_states: BTreeMap<String, u64>,
+    pub maintenance_states: BTreeMap<String, u64>,
+    pub intent_states: BTreeMap<String, u64>,
+    pub convergence_states: BTreeMap<String, u64>,
+    pub attempt_states: BTreeMap<String, u64>,
+    pub failure_classes: BTreeMap<String, u64>,
+    pub outbox_pending: u64,
+    pub outbox_claimed: u64,
+    pub stale_nodes: u64,
+    pub active_attempts: u64,
+    pub non_terminal_intents: u64,
+    pub oldest_pending_age_seconds: Option<u64>,
+}
+
 /// Lifecycle state of a configured Stream runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +222,8 @@ pub struct NodeResource {
     pub streams_total: usize,
     pub streams_running: usize,
     pub streams_failed: usize,
+    #[serde(default)]
+    pub maintenance_state: NodeMaintenanceState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +311,8 @@ pub struct ControlEvent {
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 #[cfg(test)]

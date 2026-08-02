@@ -281,6 +281,12 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/operations/{id}", get(hub_operation))
         .route("/operations/{id}", delete(hub_cancel_operation))
         .route("/events", get(hub_events))
+        .route("/operations/status", get(hub_operational_status))
+        .route("/nodes/{node_id}/drain", post(hub_drain_node))
+        .route(
+            "/nodes/{node_id}/maintenance",
+            post(hub_maintain_node).delete(hub_resume_node),
+        )
         .route("/metrics", get(hub_metrics))
         .route("/agent/register", post(agent_register))
         .route("/agent/heartbeat", post(agent_heartbeat))
@@ -339,7 +345,9 @@ pub async fn serve_hub(
             tokio::select! {
                 _ = interval.tick() => {
                     let _ = reconcile_hub.expire_attempts().await;
-                    let _ = reconcile_hub.reconcile_once("hub-reconciler").await;
+                    let started = crate::hub::now_ms_for_metrics();
+                    let result = reconcile_hub.reconcile_once("hub-reconciler").await;
+                    reconcile_hub.record_reconcile_result(started, &result).await;
                 }
                 _ = reconcile_cancel.cancelled() => break,
             }
@@ -1049,7 +1057,7 @@ async fn hub_events(
 
 async fn hub_metrics(
     State(hub): State<hub::Hub>,
-    Query(query): Query<PageQuery>,
+    Query(_query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
     if !hub.operator_authorized(bearer(&headers)) {
@@ -1059,11 +1067,122 @@ async fn hub_metrics(
             "A valid operator token is required".into(),
         );
     }
-    Json(serde_json::json!({
-        "items": hub.metrics_by_node(query.node_id.as_deref()).await,
-        "aggregate": hub.metrics(query.node_id.as_deref()).await,
-    }))
-    .into_response()
+    let status = hub.operational_status().await;
+    let mut body = String::new();
+    if let Ok(status) = status {
+        body.push_str(&format!(
+            "arkflow_control_plane_ready {}\n",
+            status.ready as u8
+        ));
+        body.push_str(&format!(
+            "arkflow_reconciliation_runs_total {}\narkflow_reconciliation_failures_total {}\n",
+            status.reconciliation.runs_total, status.reconciliation.failures_total
+        ));
+        body.push_str(&format!("arkflow_outbox_pending {}\narkflow_outbox_claimed {}\narkflow_stale_nodes {}\narkflow_active_attempts {}\narkflow_non_terminal_intents {}\n", status.outbox_pending, status.outbox_claimed, status.stale_nodes, status.active_attempts, status.non_terminal_intents));
+        for (state, count) in status.node_states {
+            body.push_str(&format!(
+                "arkflow_nodes_state{{state=\"{state}\"}} {count}\n"
+            ));
+        }
+        for (state, count) in status.maintenance_states {
+            body.push_str(&format!(
+                "arkflow_nodes_maintenance_state{{state=\"{state}\"}} {count}\n"
+            ));
+        }
+        for (state, count) in status.intent_states {
+            body.push_str(&format!(
+                "arkflow_intents_state{{state=\"{state}\"}} {count}\n"
+            ));
+        }
+        for (state, count) in status.attempt_states {
+            body.push_str(&format!(
+                "arkflow_attempts_state{{state=\"{state}\"}} {count}\n"
+            ));
+        }
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+}
+
+async fn hub_operational_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.operational_status().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_drain_node(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    hub_set_maintenance(
+        hub,
+        node_id,
+        arkflow_core::control::NodeMaintenanceState::Draining,
+        headers,
+    )
+    .await
+}
+
+async fn hub_maintain_node(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    hub_set_maintenance(
+        hub,
+        node_id,
+        arkflow_core::control::NodeMaintenanceState::Maintenance,
+        headers,
+    )
+    .await
+}
+
+async fn hub_resume_node(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    hub_set_maintenance(
+        hub,
+        node_id,
+        arkflow_core::control::NodeMaintenanceState::Active,
+        headers,
+    )
+    .await
+}
+
+async fn hub_set_maintenance(
+    hub: hub::Hub,
+    node_id: String,
+    state: arkflow_core::control::NodeMaintenanceState,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let correlation = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match hub
+        .set_node_maintenance(&node_id, state, Some("operator".into()), correlation)
+        .await
+    {
+        Ok(node) => Json(node).into_response(),
+        Err(error) => hub_problem(error),
+    }
 }
 
 async fn agent_register(
@@ -1114,12 +1233,19 @@ async fn agent_command_result(
     }
 }
 
-async fn hub_health(State(hub): State<hub::Hub>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status":"healthy","nodes":hub.nodes().await.len()}))
+async fn hub_health(State(hub): State<hub::Hub>) -> Response {
+    let status = hub.operational_status().await.ok();
+    let body = Json(
+        serde_json::json!({"status": status.as_ref().map(|s| s.status.as_str()).unwrap_or("degraded"), "nodes":hub.nodes().await.len(), "ready": status.as_ref().is_some_and(|s| s.ready)}),
+    );
+    if status.is_some_and(|s| s.ready) {
+        (StatusCode::OK, body).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    }
 }
-async fn hub_readiness(State(hub): State<hub::Hub>) -> Json<serde_json::Value> {
-    let _ = hub;
-    Json(serde_json::json!({"status":"ready","ready":true}))
+async fn hub_readiness(State(hub): State<hub::Hub>) -> Response {
+    match hub.operational_status().await { Ok(status) if status.ready => (StatusCode::OK, Json(serde_json::json!({"status":"ready","ready":true}))).into_response(), Ok(_status) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"startup_recovery"}))).into_response(), Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"storage_unavailable"}))).into_response() }
 }
 async fn hub_liveness() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive","alive":true}))

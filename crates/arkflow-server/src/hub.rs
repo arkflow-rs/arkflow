@@ -8,7 +8,10 @@ use crate::storage::{
     AttemptRecord, DesiredMutation, IntentRecord, NodeMutation, ObservedMutation, StorageActor,
     StorageError,
 };
-use arkflow_core::control::{ControlEvent, OperationRecord, StreamStatus};
+use arkflow_core::control::{
+    ControlEvent, NodeMaintenanceState, OperationRecord, OperationalStatus, ReconciliationHealth,
+    StreamStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +102,8 @@ pub struct HubNode {
     pub streams_total: usize,
     pub streams_running: usize,
     pub streams_failed: usize,
+    #[serde(default)]
+    pub maintenance_state: NodeMaintenanceState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +248,18 @@ pub struct Hub {
     operations: Arc<RwLock<BTreeMap<String, HubOperation>>>,
     events: Arc<RwLock<VecDeque<HubEvent>>>,
     storage: Option<StorageActor>,
+    lifecycle: Arc<RwLock<HubLifecycle>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HubLifecycle {
+    recovered: bool,
+    runs_total: u64,
+    failures_total: u64,
+    last_success_at_ms: Option<u64>,
+    last_error_at_ms: Option<u64>,
+    last_duration_ms: Option<u64>,
+    last_failure_class: Option<String>,
 }
 
 impl Hub {
@@ -253,6 +270,7 @@ impl Hub {
             operations: Arc::new(RwLock::new(BTreeMap::new())),
             events: Arc::new(RwLock::new(VecDeque::new())),
             storage: None,
+            lifecycle: Arc::new(RwLock::new(HubLifecycle::default())),
         }
     }
 
@@ -273,7 +291,74 @@ impl Hub {
                 .await
                 .map_err(HubError::from)?;
         }
+        self.lifecycle.write().await.recovered = true;
         Ok(())
+    }
+
+    pub async fn record_reconcile_result(
+        &self,
+        started_at_ms: u64,
+        result: &Result<Option<HubOperation>, HubError>,
+    ) {
+        let mut lifecycle = self.lifecycle.write().await;
+        lifecycle.runs_total += 1;
+        lifecycle.last_duration_ms = Some(now_ms().saturating_sub(started_at_ms));
+        match result {
+            Ok(_) => {
+                lifecycle.last_success_at_ms = Some(now_ms());
+                lifecycle.last_failure_class = None;
+            }
+            Err(error) => {
+                lifecycle.failures_total += 1;
+                lifecycle.last_error_at_ms = Some(now_ms());
+                lifecycle.last_failure_class = Some(error.failure_class().into());
+            }
+        }
+    }
+
+    pub async fn operational_status(&self) -> Result<OperationalStatus, HubError> {
+        let lifecycle = self.lifecycle.read().await.clone();
+        let aggregates = self
+            .storage
+            .as_ref()
+            .ok_or(HubError::StorageUnavailable)?
+            .operational_aggregates(now_ms())
+            .await
+            .map_err(HubError::from)?;
+        let map = |items: Vec<(String, u64)>| items.into_iter().collect();
+        let degraded = lifecycle.failures_total > 0 || aggregates.stale_nodes > 0;
+        Ok(OperationalStatus {
+            status: if degraded { "degraded" } else { "healthy" }.into(),
+            ready: lifecycle.recovered,
+            recovered: lifecycle.recovered,
+            storage_ready: true,
+            reconciliation: ReconciliationHealth {
+                state: if lifecycle.failures_total > 0 {
+                    "degraded"
+                } else {
+                    "healthy"
+                }
+                .into(),
+                runs_total: lifecycle.runs_total,
+                failures_total: lifecycle.failures_total,
+                last_success_at_ms: lifecycle.last_success_at_ms,
+                last_error_at_ms: lifecycle.last_error_at_ms,
+                last_duration_ms: lifecycle.last_duration_ms,
+                last_failure_class: lifecycle.last_failure_class,
+            },
+            node_states: map(aggregates.node_states),
+            maintenance_states: map(aggregates.maintenance_states),
+            intent_states: map(aggregates.intent_states),
+            convergence_states: map(aggregates.convergence_states),
+            attempt_states: map(aggregates.attempt_states),
+            failure_classes: map(aggregates.failure_classes),
+            outbox_pending: aggregates.outbox_pending,
+            outbox_claimed: aggregates.outbox_claimed,
+            stale_nodes: aggregates.stale_nodes,
+            active_attempts: aggregates.active_attempts,
+            non_terminal_intents: aggregates.non_terminal_intents,
+            oldest_pending_age_seconds: aggregates.oldest_pending_age_seconds,
+        })
     }
 
     pub async fn expire_attempts(&self) -> Result<usize, HubError> {
@@ -417,6 +502,7 @@ impl Hub {
             streams_total: 0,
             streams_running: 0,
             streams_failed: 0,
+            maintenance_state: NodeMaintenanceState::Active,
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
@@ -463,6 +549,8 @@ impl Hub {
                     report_seq: None,
                     last_seen_at_ms: now,
                     lease_expires_at_ms: now + self.config.lease_ttl_ms,
+                    maintenance_state: None,
+                    maintenance_updated_at_ms: None,
                 })
                 .await
                 .map_err(HubError::from)?;
@@ -470,6 +558,20 @@ impl Hub {
                 .wake_node(&request.node_id, now)
                 .await
                 .map_err(HubError::from)?;
+            if let Some(state) = storage
+                .get_node_maintenance(&request.node_id)
+                .await
+                .map_err(HubError::from)?
+            {
+                let maintenance_state = match state.as_str() {
+                    "draining" => NodeMaintenanceState::Draining,
+                    "maintenance" => NodeMaintenanceState::Maintenance,
+                    _ => NodeMaintenanceState::Active,
+                };
+                if let Some(node) = self.nodes.write().await.get_mut(&request.node_id) {
+                    node.resource.maintenance_state = maintenance_state;
+                }
+            }
         }
         Ok(RegisterResponse {
             node_id: request.node_id,
@@ -550,6 +652,8 @@ impl Hub {
                     report_seq: persisted_report_seq,
                     last_seen_at_ms: now,
                     lease_expires_at_ms: persisted_lease,
+                    maintenance_state: None,
+                    maintenance_updated_at_ms: None,
                 })
                 .await
                 .map_err(HubError::from)?;
@@ -776,6 +880,7 @@ impl Hub {
         let node = nodes.get_mut(&node_id).ok_or(HubError::NodeUnavailable)?;
         if node.resource.state != NodeConnectionState::Online
             || node.resource.lease_expires_at_ms <= now
+            || node.resource.maintenance_state != NodeMaintenanceState::Active
         {
             return Err(HubError::NodeUnavailable);
         }
@@ -922,6 +1027,40 @@ impl Hub {
             .values()
             .map(|node| node.resource.clone())
             .collect()
+    }
+
+    pub async fn set_node_maintenance(
+        &self,
+        node_id: &str,
+        state: NodeMaintenanceState,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+    ) -> Result<HubNode, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let state_name = match state {
+            NodeMaintenanceState::Active => "active",
+            NodeMaintenanceState::Draining => "draining",
+            NodeMaintenanceState::Maintenance => "maintenance",
+        };
+        if !storage
+            .set_node_maintenance(
+                crate::storage::NodeMaintenanceMutation {
+                    node_id: node_id.into(),
+                    state: state_name.into(),
+                    actor,
+                    correlation_id,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(HubError::from)?
+        {
+            return Err(HubError::NotFound);
+        }
+        let mut nodes = self.nodes.write().await;
+        let node = nodes.get_mut(node_id).ok_or(HubError::NotFound)?;
+        node.resource.maintenance_state = state;
+        Ok(node.resource.clone())
     }
     pub async fn streams(&self, node_id: Option<&str>) -> Vec<(String, StreamStatus)> {
         self.nodes
@@ -1085,6 +1224,7 @@ impl Hub {
                             message: event.message,
                             operation_id: event.intent_id.or(event.attempt_id),
                             correlation_id: event.correlation_id,
+                            actor: event.actor,
                         },
                     })
                 }));
@@ -1190,6 +1330,18 @@ pub enum HubError {
     Storage(String),
 }
 
+impl HubError {
+    pub fn failure_class(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "authorization",
+            Self::NodeUnavailable => "node_unavailable",
+            Self::StorageUnavailable | Self::Storage(_) => "repository",
+            Self::NotFound => "not_found",
+            _ => "invalid",
+        }
+    }
+}
+
 impl From<StorageError> for HubError {
     fn from(error: StorageError) -> Self {
         match error {
@@ -1292,6 +1444,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+pub fn now_ms_for_metrics() -> u64 {
+    now_ms()
 }
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);

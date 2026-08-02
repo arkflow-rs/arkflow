@@ -155,6 +155,7 @@ impl ControlPlane {
             streams_total: status.streams_total,
             streams_running: status.streams_running,
             streams_failed: status.streams_failed,
+            maintenance_state: Default::default(),
         }
     }
 
@@ -225,6 +226,7 @@ impl ControlPlane {
                 message: record.error.clone(),
                 operation_id: Some(record.id.clone()),
                 correlation_id: record.correlation_id.clone(),
+                actor: None,
             })
             .await;
         Some(record)
@@ -358,6 +360,7 @@ impl ControlPlane {
                     message,
                     operation_id: Some(operation_id.clone()),
                     correlation_id,
+                    actor: None,
                 })
                 .await;
             manager.set_active_operation(&stream_id, None).await;
