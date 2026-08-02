@@ -56,7 +56,13 @@ in-flight messages MAY be delivered more than once. Outputs MUST tolerate
 duplicates (for example, UPSERT-style SQL/InfluxDB sinks are naturally
 idempotent; HTTP and Kafka outputs should expect possible duplicates).
 
-Exactly-once delivery is not provided.
+**Exactly-once delivery is available opt-in** for transactional sinks. A Kafka
+output configured with `exactly_once: true` commits each acknowledged batch as a
+single Kafka transaction, so a `read_committed` downstream consumer observes it
+atomically. This eliminates in-transaction partial writes and zombie-producer
+duplicates; residual duplicates at the post-commit boundary still require
+downstream idempotency. See [Exactly-once delivery](../exactly-once) for the
+full contract and its honest boundary.
 
 ## Single-node boundary
 

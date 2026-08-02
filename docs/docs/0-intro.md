@@ -8,11 +8,19 @@ logo: ./logo.svg
 ArkFlow is a high-performance Rust stream processing engine that provides powerful data stream processing capabilities, supporting various input/output sources and processors.
 
 :::tip
-Currently, ArkFlow is **stateless**, but it can still help you solve most data engineering problems. It implements transaction-based resilience and features backpressure. 
+ArkFlow delivers **at-least-once** by default. With per-stream WAL durability
+enabled, every message read by an input is persisted and flushed to a
+write-ahead log before it enters the pipeline, so a crash between read and
+output does not lose data; the source is committed only after the downstream
+output confirms the write. Replayable sources (Kafka, MQTT QoS ≥ 1, NATS
+JetStream, Pulsar, Redis Streams) provide this guarantee even without a local
+WAL.
 
-Therefore, when connected to input and output sources that provide at-least-once semantics, it can guarantee at-least-once delivery without needing to retain messages in transit.
-
-In the future, we will gradually improve the functions of ArkFlow to enable it to have transactional and state management capabilities, so as to better meet various data processing needs.
+For duplicate-intolerant sinks, **exactly-once** is available opt-in via
+transactional outputs — a Kafka output configured with `exactly_once: true`
+commits each acknowledged batch as one Kafka transaction, so a `read_committed`
+downstream consumer observes it atomically. See
+[Exactly-once delivery](./components/exactly-once) for the precise boundary.
 
 :::
 
@@ -25,8 +33,11 @@ logo([Logo Usage Guidelines](./about-logo)）:
 ## Core Features
 
 - **High Performance**: Built on Rust and Tokio async runtime, delivering exceptional performance and low latency
+- **Durable Delivery**: At-least-once by default via per-stream WAL durability; opt-in exactly-once for transactional sinks (see [Exactly-once delivery](./components/exactly-once))
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, and other input/output sources
-- **Powerful Processing**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch processing, and other processors
+- **Powerful Processing**: Built-in SQL queries, JSON processing, Protobuf encoding/decoding, batch processing, Python UDFs, and VRL
+- **Streaming Codecs**: JSON and Protobuf codecs plus Debezium CDC envelopes and Confluent Schema Registry wire-format
+- **Control Plane**: An optional Hub and console to observe, configure, and operate multiple ArkFlow compute nodes as a fleet
 - **Extensibility**: Modular design, easy to extend with new input, output, and processor components
 
 ## Installation
@@ -145,7 +156,8 @@ ArkFlow provides multiple data processors:
 - **SQL**: Process data using SQL queries
 - **Protobuf**: Protobuf encoding/decoding
 - **Batch Processing**: Process messages in batches
-- **Vrl**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
+- **VRL**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
+- **Python**: Run Python user-defined functions over each batch
 
 Example:
 
@@ -216,7 +228,8 @@ ArkFlow provides buffer capabilities to handle backpressure, windowing, and join
 - **Tumbling Window**: Fixed-size, non-overlapping time windows
 - **Sliding Window**: Overlapping time windows with configurable size and slide interval
 - **Session Window**: Dynamic windows based on activity gaps
-- **Join**: SQL join operations across multiple input sources within a window
+
+The window buffers (tumbling and session) additionally support **SQL joins** across input sources within a window; see the Buffers reference.
 
 Example:
 

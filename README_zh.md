@@ -28,9 +28,11 @@ ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landsc
 ## 特性
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
-- **智能分析**：无缝集成AI模型，提供强大的智能分析功能
-- **多种数据源**：支持Kafka、MQTT、HTTP、文件等多种输入输出源
-- **强大的处理能力**：内置SQL查询、Python脚本、JSON处理、Protobuf编解码、批处理等多种处理器
+- **可靠投递**：默认通过每流 WAL 持久化提供 at-least-once，可选地为事务型 sink 启用 exactly-once
+- **多种数据源**：支持Kafka、MQTT、HTTP、文件、SQL 数据库等多种输入输出源
+- **强大的处理能力**：内置SQL查询、Python UDF、JSON处理、Protobuf编解码、批处理和 VRL 等处理器
+- **流编解码**：JSON 与 Protobuf 编解码，以及 Debezium CDC 信封和 Confluent Schema Registry 线格式
+- **控制面**：可选的 Hub 与 Web 控制台，可作为一个集群对多个 ArkFlow 计算节点进行观测、配置与运维
 - **可扩展**：模块化设计，易于扩展新的输入、缓冲区、输出和处理器组件
 
 ## 安装
@@ -112,13 +114,16 @@ ArkFlow支持多种输入源：
 - **Kafka**：从Kafka主题读取数据
 - **MQTT**：从MQTT主题订阅消息
 - **HTTP**：通过HTTP接收数据
-- **文件**：使用SQL从文件(Csv、Json、Parquet、Avro、Arrow)读取数据
-- **生成器**：生成测试数据
-- **数据库**：从数据库(MySQL、PostgreSQL、SQLite、Duckdb)查询数据
-- **Nats**: 订阅来自 Nats 主题的消息
-- **Redis**: 订阅来自 Redis 频道或列表的消息
-- **Websocket**: 订阅来自 WebSocket 连接的消息
-- **Modbus**: 从 Modbus 设备读取数据
+- **文件**：从文件（CSV、JSON、Parquet、Avro、Arrow）读取数据，支持云存储
+- **生成器（Generate）**：生成测试数据
+- **SQL**：从 SQL 数据库（MySQL、PostgreSQL、SQLite）查询数据
+- **NATS**：订阅来自 NATS 主题的消息，支持 JetStream
+- **Pulsar**：订阅来自 Pulsar 主题的消息
+- **Redis**：订阅来自 Redis 流、列表或发布/订阅频道的消息
+- **WebSocket**：订阅来自 WebSocket 连接的消息
+- **Modbus**：从 Modbus 设备读取数据
+- **内存（Memory）**：用于测试的内存数据源
+- **多输入（Multiple Inputs）**：将多个输入流合并到一个管道
 
 示例：
 
@@ -142,7 +147,8 @@ ArkFlow提供多种数据处理器：
 - **SQL**：使用SQL查询处理数据
 - **Protobuf**：Protobuf编解码
 - **批处理**：将消息批量处理
-- **Vrl**: 使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
+- **VRL**：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
+- **Python**：对每个批次运行用户自定义的 Python 函数
 
 示例：
 
@@ -162,9 +168,13 @@ ArkFlow支持多种输出目标：
 - **Kafka**：将数据写入Kafka主题
 - **MQTT**：将消息发布到MQTT主题
 - **HTTP**：通过HTTP发送数据
+- **InfluxDB**：将时序数据写入 InfluxDB 2.x
+- **NATS**：将消息发布到 NATS 主题
+- **Pulsar**：将消息发布到 Pulsar 主题
+- **Redis**：写入 Redis 流、列表或发布/订阅频道
+- **SQL**：写入 SQL 数据库（MySQL、PostgreSQL、SQLite），支持批量插入与 UPSERT
 - **标准输出**：将数据输出到控制台
-- **Drop**: 丢弃数据
-- **Nats**: 将消息发布到 Nats 主题
+- **Drop**：丢弃数据
 
 示例：
 
@@ -181,12 +191,7 @@ output:
 
 ### 错误输出组件
 
-- **Kafka**：将错误数据写入 Kafka 主题
-- **MQTT**：将错误消息发布到 MQTT 主题
-- **HTTP**：通过 HTTP 发送错误数据
-- **标准输出**：将错误数据输出到控制台
-- **丢弃**：丢弃错误数据
-- **Nats**: 将消息发布到 Nats 主题
+`error_output` 接受上述任意一种[输出组件](#输出组件)，用于接收处理失败的消息。最常用的是 Kafka、HTTP 和标准输出（便于调试）。
 
 示例：
 
