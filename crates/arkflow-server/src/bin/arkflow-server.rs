@@ -1,6 +1,8 @@
 use arkflow_server::{
     hub::{Hub, HubConfig},
-    serve_hub, ServerConfig,
+    serve_hub,
+    storage::{ControlPlaneStore, StorageActor},
+    ServerConfig,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -17,11 +19,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         node_token: std::env::var("ARKFLOW_NODE_TOKEN").ok(),
         ..ServerConfig::default()
     };
-    let hub = Hub::new(HubConfig {
+    let hub_config = HubConfig {
         operator_token: std::env::var("ARKFLOW_OPERATOR_TOKEN").ok(),
         node_token: config.node_token.clone(),
         lease_ttl_ms: config.lease_ttl_ms,
         poll_interval_ms: config.poll_interval_ms,
-    });
+    };
+    let hub = if let Ok(path) = std::env::var("ARKFLOW_HUB_STORAGE") {
+        let store = ControlPlaneStore::open(path)?;
+        Hub::with_storage(hub_config, StorageActor::start(store, 128))
+    } else {
+        Hub::new(hub_config)
+    };
     serve_hub(hub, config, cancellation).await
 }

@@ -50,6 +50,26 @@ pub struct StreamStatus {
     #[serde(default)]
     pub desired_state: Option<DesiredState>,
     #[serde(default)]
+    pub desired_generation: u64,
+    #[serde(default)]
+    pub desired_config_version: Option<String>,
+    #[serde(default)]
+    pub observed_generation: Option<u64>,
+    #[serde(default)]
+    pub observed_config_version: Option<String>,
+    #[serde(default)]
+    pub convergence: ConvergenceState,
+    #[serde(default)]
+    pub intent_id: Option<String>,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub last_completed_action_id: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub next_retry_at_ms: Option<u64>,
+    #[serde(default)]
     pub transition_started_at_ms: Option<u64>,
     #[serde(default)]
     pub active_operation_id: Option<String>,
@@ -66,6 +86,72 @@ pub struct StreamStatus {
 pub enum DesiredState {
     Running,
     Stopped,
+}
+
+impl Default for DesiredState {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+/// Whether a resource's observed state has converged to its desired state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvergenceState {
+    Unknown,
+    Pending,
+    Applying,
+    InSync,
+    Degraded,
+    Blocked,
+}
+
+impl Default for ConvergenceState {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Durable operator intent lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentState {
+    Accepted,
+    Converging,
+    Retrying,
+    Converged,
+    Blocked,
+    Superseded,
+}
+
+/// One command delivery/execution attempt for an Intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptState {
+    Queued,
+    Dispatched,
+    Acknowledged,
+    Running,
+    Succeeded,
+    Failed,
+    Expired,
+    Ambiguous,
+    Superseded,
+}
+
+/// Stable failure category used by reconciliation and API clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Validation,
+    Authorization,
+    NodeUnavailable,
+    Transport,
+    TemporaryExecution,
+    PermanentExecution,
+    Ambiguous,
+    StaleGeneration,
+    Repository,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +244,8 @@ pub struct ApiError {
     pub stream_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Lifecycle or operational event retained for console polling.
@@ -191,6 +279,7 @@ mod tests {
             field: None,
             stream_id: Some("orders".into()),
             correlation_id: None,
+            details: None,
         };
         let value = serde_json::to_value(error).unwrap();
         assert_eq!(value["stream_id"], "orders");

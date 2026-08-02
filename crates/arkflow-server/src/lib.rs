@@ -4,8 +4,12 @@
 //! `arkflow_core::control_plane::ControlPlane` and contains no Axum types.
 
 pub mod agent;
+pub mod api_contract;
 pub mod hub;
+pub mod storage;
 
+use crate::api_contract::{AcceptedIntentResponse, DesiredStateRequest, RestartActionRequest};
+use crate::storage::DesiredMutation;
 use arkflow_core::component::{self, ComponentKind};
 use arkflow_core::configuration::redacted_config;
 use arkflow_core::configuration::{parse_and_validate, ConfigCandidate};
@@ -16,7 +20,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -247,6 +251,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/system", get(hub_system))
         .route("/nodes", get(hub_nodes))
         .route("/streams", get(hub_streams))
+        .route("/nodes/{node_id}/streams/{id}", get(hub_stream))
         .route("/nodes/{node_id}/configuration", get(hub_configuration))
         .route(
             "/nodes/{node_id}/configuration/versions",
@@ -263,6 +268,14 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route(
             "/nodes/{node_id}/streams/{id}/{action}",
             post(hub_targeted_command),
+        )
+        .route(
+            "/nodes/{node_id}/streams/{id}/desired-state",
+            put(hub_desired_state),
+        )
+        .route(
+            "/nodes/{node_id}/streams/{id}/actions/restart",
+            post(hub_restart_action),
         )
         .route("/operations", get(hub_operations))
         .route("/operations/{id}", get(hub_operation))
@@ -305,6 +318,7 @@ pub async fn serve_hub(
     if !config.enabled {
         return Ok(());
     }
+    hub.recover_persisted_state().await?;
     let address: SocketAddr = config.address.parse()?;
     let listener = TcpListener::bind(address).await?;
     let sweep_hub = hub.clone();
@@ -315,10 +329,27 @@ pub async fn serve_hub(
             tokio::select! { _ = interval.tick() => sweep_hub.mark_stale().await, _ = sweep_cancel.cancelled() => break }
         }
     });
+    let reconcile_hub = hub.clone();
+    let reconcile_cancel = cancellation.clone();
+    let reconcile_interval = config.poll_interval_ms.max(50);
+    let reconcile_task = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(reconcile_interval));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let _ = reconcile_hub.expire_attempts().await;
+                    let _ = reconcile_hub.reconcile_once("hub-reconciler").await;
+                }
+                _ = reconcile_cancel.cancelled() => break,
+            }
+        }
+    });
     let result = axum::serve(listener, hub_router(hub, &config).into_make_service())
         .with_graceful_shutdown(cancellation.cancelled_owned())
         .await;
     sweep_task.abort();
+    reconcile_task.abort();
     result?;
     Ok(())
 }
@@ -387,6 +418,38 @@ async fn hub_streams(
         total,
     })
     .into_response()
+}
+
+async fn hub_stream(
+    State(hub): State<hub::Hub>,
+    Path((node_id, stream_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.stream_resource(&node_id, &stream_id).await {
+        Ok(Some(resource)) => Json(resource).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "stream_not_found",
+            format!("Unknown stream {node_id}/{stream_id}"),
+        ),
+        Err(hub::HubError::StorageUnavailable) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository_unavailable",
+            "Durable control-plane storage is unavailable".into(),
+        ),
+        Err(error) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository_unavailable",
+            error.to_string(),
+        ),
+    }
 }
 
 async fn hub_configuration(
@@ -485,6 +548,81 @@ async fn hub_configuration_command<T: Serialize>(
             )
         }
     };
+    if hub.has_storage() {
+        let config_version_id = if operation == "apply_configuration" {
+            headers
+                .get("x-config-version")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or_default();
+                    format!("cfg-{timestamp}-{}", std::process::id())
+                })
+        } else {
+            payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+        let payload_json = (operation == "apply_configuration").then(|| payload.to_string());
+        match hub
+            .set_desired_state(DesiredMutation {
+                node_id,
+                stream_id: "__configuration__".into(),
+                desired_state: "configured".into(),
+                config_version_id: Some(config_version_id),
+                action_id: None,
+                expected_generation: headers
+                    .get("if-match")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_generation_etag),
+                actor: Some("operator".into()),
+                correlation_id,
+                idempotency_key: headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                intent_type: Some("apply_configuration".into()),
+                payload_json,
+            })
+            .await
+        {
+            Ok(intent) => return intent_response(StatusCode::ACCEPTED, intent),
+            Err(hub::HubError::GenerationConflict { expected, current }) => {
+                return problem(
+                    StatusCode::PRECONDITION_FAILED,
+                    "generation_conflict",
+                    format!("Expected generation {expected}, current generation {current}"),
+                )
+            }
+            Err(hub::HubError::StorageUnavailable) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    "Durable control-plane storage is unavailable".into(),
+                )
+            }
+            Err(hub::HubError::IdempotencyKeyReused) => {
+                return problem(
+                    StatusCode::CONFLICT,
+                    "idempotency_key_reused",
+                    "Idempotency-Key was already used for a different mutation".into(),
+                )
+            }
+            Err(error) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    error.to_string(),
+                )
+            }
+        }
+    }
     match hub
         .enqueue_with_payload(
             node_id,
@@ -532,6 +670,126 @@ async fn hub_targeted_command(
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    if hub.has_storage() && matches!(action.as_str(), "start" | "stop") {
+        match hub
+            .set_desired_state(DesiredMutation {
+                node_id: node_id.clone(),
+                stream_id: id.clone(),
+                desired_state: if action == "start" {
+                    "running".into()
+                } else {
+                    "stopped".into()
+                },
+                config_version_id: None,
+                action_id: None,
+                expected_generation: headers
+                    .get("if-match")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_generation_etag),
+                actor: Some("operator".into()),
+                correlation_id,
+                idempotency_key: headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                intent_type: None,
+                payload_json: None,
+            })
+            .await
+        {
+            Ok(intent) => return intent_response(StatusCode::ACCEPTED, intent),
+            Err(hub::HubError::GenerationConflict { expected, current }) => {
+                return problem(
+                    StatusCode::PRECONDITION_FAILED,
+                    "generation_conflict",
+                    format!("Expected generation {expected}, current generation {current}"),
+                )
+            }
+            Err(hub::HubError::StorageUnavailable) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    "Durable control-plane storage is unavailable".into(),
+                )
+            }
+            Err(hub::HubError::IdempotencyKeyReused) => {
+                return problem(
+                    StatusCode::CONFLICT,
+                    "idempotency_key_reused",
+                    "Idempotency-Key was already used for a different mutation".into(),
+                )
+            }
+            Err(error) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    error.to_string(),
+                )
+            }
+        }
+    }
+    if hub.has_storage() && action == "restart" {
+        let action_id = headers
+            .get("x-action-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or_default();
+                format!("restart-{timestamp}-{}", std::process::id())
+            });
+        match hub
+            .restart_state(
+                node_id,
+                id,
+                action_id,
+                headers
+                    .get("if-match")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_generation_etag),
+                Some("operator".into()),
+                correlation_id,
+                headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            )
+            .await
+        {
+            Ok(intent) => return intent_response(StatusCode::ACCEPTED, intent),
+            Err(hub::HubError::GenerationConflict { expected, current }) => {
+                return problem(
+                    StatusCode::PRECONDITION_FAILED,
+                    "generation_conflict",
+                    format!("Expected generation {expected}, current generation {current}"),
+                )
+            }
+            Err(hub::HubError::StorageUnavailable) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    "Durable control-plane storage is unavailable".into(),
+                )
+            }
+            Err(hub::HubError::IdempotencyKeyReused) => {
+                return problem(
+                    StatusCode::CONFLICT,
+                    "idempotency_key_reused",
+                    "Idempotency-Key was already used for a different mutation".into(),
+                )
+            }
+            Err(error) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository_unavailable",
+                    error.to_string(),
+                )
+            }
+        }
+    }
     match hub.enqueue(node_id, action, id, correlation_id).await {
         Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
         Err(hub::HubError::NodeUnavailable) => problem(
@@ -545,6 +803,131 @@ async fn hub_targeted_command(
             error.to_string(),
         ),
     }
+}
+
+fn intent_response(status: StatusCode, intent: storage::IntentRecord) -> Response {
+    let location = format!("/api/v1/operations/{}", intent.intent_id);
+    let etag = format!("\"generation-{}\"", intent.generation);
+    (
+        status,
+        [(header::LOCATION, location), (header::ETAG, etag)],
+        Json(AcceptedIntentResponse::from(intent)),
+    )
+        .into_response()
+}
+
+async fn hub_restart_action(
+    State(hub): State<hub::Hub>,
+    Path((node_id, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<RestartActionRequest>>,
+) -> Response {
+    let Some(action_id) = body.and_then(|Json(request)| request.action_id) else {
+        return hub_targeted_command(State(hub), Path((node_id, id, "restart".into())), headers)
+            .await;
+    };
+    let Ok(action_header) = HeaderValue::from_str(&action_id) else {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "action_id must be a valid header value".into(),
+        );
+    };
+    let mut headers = headers;
+    headers.insert("x-action-id", action_header);
+    hub_targeted_command(State(hub), Path((node_id, id, "restart".into())), headers).await
+}
+
+async fn hub_desired_state(
+    State(hub): State<hub::Hub>,
+    Path((node_id, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<DesiredStateRequest>,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    if !matches!(request.state.as_str(), "running" | "stopped") {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "state must be running or stopped".into(),
+        );
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let expected_generation = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_generation_etag);
+    match hub
+        .set_desired_state(DesiredMutation {
+            node_id: node_id.clone(),
+            stream_id: id.clone(),
+            desired_state: request.state,
+            config_version_id: request.config_version,
+            action_id: request.action_id,
+            expected_generation,
+            actor: Some("operator".into()),
+            correlation_id,
+            idempotency_key: headers
+                .get("idempotency-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            intent_type: None,
+            payload_json: None,
+        })
+        .await
+    {
+        Ok(intent) => {
+            let location = format!("/api/v1/operations/{}", intent.intent_id);
+            let etag = format!("\"generation-{}\"", intent.generation);
+            (
+                StatusCode::ACCEPTED,
+                [(header::LOCATION, location), (header::ETAG, etag)],
+                Json(AcceptedIntentResponse::from(intent)),
+            )
+                .into_response()
+        }
+        Err(hub::HubError::GenerationConflict { expected, current }) => problem_with_details(
+            StatusCode::PRECONDITION_FAILED,
+            "generation_conflict",
+            format!("Expected generation {expected}, current generation {current}"),
+            Some(serde_json::json!({
+                "expected_generation": expected,
+                "current_generation": current,
+                "resource": { "node_id": node_id, "stream_id": id }
+            })),
+        ),
+        Err(hub::HubError::StorageUnavailable) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository_unavailable",
+            "Durable control-plane storage is unavailable".into(),
+        ),
+        Err(hub::HubError::IdempotencyKeyReused) => problem(
+            StatusCode::CONFLICT,
+            "idempotency_key_reused",
+            "Idempotency-Key was already used for a different mutation".into(),
+        ),
+        Err(error) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository_unavailable",
+            error.to_string(),
+        ),
+    }
+}
+
+fn parse_generation_etag(value: &str) -> Option<u64> {
+    value
+        .trim_matches('"')
+        .strip_prefix("generation-")
+        .and_then(|value| value.parse().ok())
 }
 
 async fn hub_operations(
@@ -1164,6 +1547,15 @@ fn authorized(cp: &ControlPlane, headers: &HeaderMap) -> bool {
 }
 
 fn problem(status: StatusCode, code: &str, message: String) -> Response {
+    problem_with_details(status, code, message, None)
+}
+
+fn problem_with_details(
+    status: StatusCode,
+    code: &str,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> Response {
     (
         status,
         Json(ApiError {
@@ -1172,6 +1564,7 @@ fn problem(status: StatusCode, code: &str, message: String) -> Response {
             field: None,
             stream_id: None,
             correlation_id: None,
+            details,
         }),
     )
         .into_response()
@@ -1209,6 +1602,7 @@ async fn correlation_middleware(mut request: Request<Body>, next: Next) -> Respo
                     field: None,
                     stream_id: None,
                     correlation_id: Some(correlation_id.clone()),
+                    details: None,
                 })
                 .ok();
             }
@@ -1501,7 +1895,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let response = app
             .clone()
             .oneshot(
@@ -1547,7 +1940,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let response = app
             .clone()
             .oneshot(
@@ -1653,6 +2045,432 @@ mod tests {
         let commands: Vec<hub::AgentCommand> = serde_json::from_slice(&body).unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].resource_id, "orders");
+    }
+
+    #[tokio::test]
+    async fn desired_state_route_persists_offline_intent_and_rejects_stale_generation() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage::StorageActor::start(store, 8),
+        );
+        let app = hub_router(hub, &ServerConfig::default());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "desired-orders-1")
+                    .body(axum::body::Body::from(r#"{"state":"running"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .starts_with("/api/v1/operations/intent-"));
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            "\"generation-1\""
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["generation"], 1);
+        assert_eq!(value["convergence"], "pending");
+        assert_eq!(value["desired_state"], "running");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes/node-a/streams/orders")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resource: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resource["desired"]["state"], "running");
+        assert_eq!(resource["desired"]["generation"], 1);
+        assert_eq!(resource["state"], "unknown");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/events?node_id=node-a")
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(events["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "intent_created"));
+
+        let operation_id = value["operation_id"].as_str().unwrap().to_owned();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/operations/{operation_id}"))
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let operation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(operation["intent_id"], value["operation_id"]);
+        assert_eq!(operation["intent_state"], "accepted");
+        assert_eq!(operation["convergence_state"], "pending");
+        assert_eq!(operation["retry_count"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "desired-orders-1")
+                    .body(axum::body::Body::from(r#"{"state":"stopped"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay_error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay_error["code"], "idempotency_key_reused");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "desired-orders-1")
+                    .body(axum::body::Body::from(r#"{"state":"running"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay["generation"], 1);
+        assert_eq!(replay["desired_state"], "running");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/restart")
+                    .header("authorization", "Bearer operator")
+                    .header("if-match", "\"generation-1\"")
+                    .header("idempotency-key", "restart-orders-1")
+                    .header("x-action-id", "restart-action-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let restart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(restart["generation"], 2);
+        assert_eq!(restart["desired_state"], "running");
+        assert_eq!(restart["action_id"], "restart-action-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/actions/restart")
+                    .header("authorization", "Bearer operator")
+                    .header("if-match", "\"generation-2\"")
+                    .header("idempotency-key", "restart-orders-2")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"action_id":"restart-action-2"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let canonical_restart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(canonical_restart["generation"], 3);
+        assert_eq!(canonical_restart["action_id"], "restart-action-2");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("x-correlation-id", "generation-conflict-test")
+                    .header("if-match", "\"generation-0\"")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"state":"stopped"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "generation_conflict");
+        assert_eq!(error["correlation_id"], "generation-conflict-test");
+        assert_eq!(error["details"]["current_generation"], 3);
+    }
+
+    #[tokio::test]
+    async fn configuration_apply_persists_target_and_reconciles_offline_write() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = storage::StorageActor::start(store, 8);
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage.clone(),
+        );
+        let app = hub_router(hub.clone(), &ServerConfig::default());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/configuration/apply")
+                    .header("authorization", "Bearer operator")
+                    .header("idempotency-key", "config-apply-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"format":"json","content":"{\"streams\":[]}"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let intent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(intent["generation"], 1);
+        assert_eq!(intent["desired_state"], "configured");
+        let intent_id = intent["intent_id"].as_str().unwrap().to_owned();
+        let config_version = intent["config_version"].as_str().unwrap().to_owned();
+
+        let session = hub
+            .register(hub::RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+            })
+            .await
+            .unwrap();
+        let operation = hub
+            .reconcile_once("config-reconciler")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.operation, "apply_configuration");
+        assert_eq!(
+            operation.config_version_id.as_deref(),
+            Some(config_version.as_str())
+        );
+        let commands = hub
+            .commands(hub::AgentAuth {
+                node_id: "node-a".into(),
+                session_token: session.session_token.clone(),
+            })
+            .await;
+        let commands = commands.unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].operation, "apply_configuration");
+        assert_eq!(
+            commands[0].config_version_id.as_deref(),
+            Some(config_version.as_str())
+        );
+        assert!(commands[0].payload.is_some());
+
+        hub.report(hub::NodeReport {
+            auth: hub::AgentAuth {
+                node_id: "node-a".into(),
+                session_token: session.session_token,
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec!["configuration".into()],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: Default::default(),
+            configuration: None,
+            configuration_version: Some(config_version),
+            boot_id: Some("boot-config".into()),
+            report_seq: 1,
+        })
+        .await
+        .unwrap();
+        let persisted = storage.get_intent(intent_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, "converged");
+    }
+
+    #[tokio::test]
+    async fn operation_resource_exposes_retry_superseded_and_blocked_states() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = storage::StorageActor::start(store, 8);
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage.clone(),
+        );
+        let app = hub_router(hub, &ServerConfig::default());
+        let first = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "state-matrix-1")
+                    .body(axum::body::Body::from(r#"{"state":"running"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let first_id = first["intent_id"].as_str().unwrap().to_owned();
+        let attempt = storage.claim_attempt(&first_id).await.unwrap().unwrap();
+        storage
+            .complete_attempt(
+                &attempt.attempt_id,
+                "timed_out",
+                Some("temporary_execution".into()),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/operations/{first_id}"))
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retrying: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(retrying["intent_state"], "retrying");
+        assert_eq!(retrying["convergence_state"], "degraded");
+        assert_eq!(retrying["retry_count"], 1);
+        assert_eq!(retrying["failure_class"], "temporary_execution");
+
+        let second = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer operator")
+                    .header("content-type", "application/json")
+                    .header("if-match", "\"generation-1\"")
+                    .header("idempotency-key", "state-matrix-2")
+                    .body(axum::body::Body::from(r#"{"state":"stopped"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let second_id = second["intent_id"].as_str().unwrap().to_owned();
+        let attempt = storage.claim_attempt(&second_id).await.unwrap().unwrap();
+        storage
+            .complete_attempt(
+                &attempt.attempt_id,
+                "failed",
+                Some("permanent_execution".into()),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/operations/{first_id}"))
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let superseded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(superseded["intent_state"], "superseded");
+        assert_eq!(superseded["superseded_generation"], 2);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/operations/{second_id}"))
+                    .header("authorization", "Bearer operator")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let blocked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(blocked["intent_state"], "blocked");
+        assert_eq!(blocked["convergence_state"], "blocked");
+        assert_eq!(blocked["failure_class"], "permanent_execution");
     }
 
     #[tokio::test]
@@ -1768,6 +2586,11 @@ mod tests {
                         progress: 100,
                         error: None,
                         correlation_id: Some("two-node-start".into()),
+                        generation: 0,
+                        observed_generation: None,
+                        action_id: None,
+                        failure_class: None,
+                        config_version_id: None,
                     })
                     .unwrap(),
                 ))
