@@ -1,25 +1,29 @@
+
+
 # Session Window
 
 The Session Window buffer groups messages into sessions defined by activity gaps. A new message extends the current session; if no message arrives within the configured `gap` duration the session is closed and all of its accumulated messages are emitted as a single batch. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `session_window` |
-| gap | duration | yes | — | Maximum idle time between messages in a session. When the gap elapses with no new messages, the session is flushed. Examples: `1ms`, `1s`, `1m`, `1h`. |
-| join | object | no | — | Optional SQL join configuration applied to emitted batches. |
+Stable
 
-### `join`
+## When to use
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| query | string | yes | — | SQL query joining batch data from different input sources. |
-| value_field | string | no | — | Name of the binary field holding the message payload. Defaults to the engine default binary value field. |
-| codec | object | yes | — | Codec used to decode message batches before joining. |
-| thread_num | integer | no | — | Number of worker threads used for parallel decoding during the join. |
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-The `codec` field is a `CodecConfig` object: a `type` string selecting the codec plus any codec-specific fields.
+## Common fields
+
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+
+## Full reference
+
+<!-- BEGIN AUTO: buffer-session_window-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| gap | string | yes | — | no | Maximum idle time before a session is closed (humantime). |
+| join | object | no | — | no | Optional SQL join across input sources. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -42,3 +46,19 @@ buffer:
     codec:
       type: "json"
 ```
+
+## Output schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

@@ -1,43 +1,31 @@
+
+
 # NATS
 
 The NATS output publishes messages to a NATS server, either to a regular subject or to a JetStream stream. It supports optional username/password or token authentication.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type  | string | yes | — | Fixed value `"nats"` |
-| url | string | yes | — | NATS server URL (e.g. `nats://localhost:4222`). |
-| mode | object | yes | — | Publishing mode (see below). |
-| auth | object | no | — | Authentication configuration (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+Stable
 
-### mode
+## When to use
 
-`mode` is a tagged object (selected by its `type` field).
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `regular` or `jet_stream`. |
-| subject | object | yes | — | NATS subject to publish to (expression; see below). |
+## Common fields
 
-### subject (`Expr<String>`)
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `value` (static) or `expr` (SQL expression). |
-| value | string | yes (`value`) | Static subject name. |
-| expr | string | yes (`expr`) | SQL expression evaluated per message. |
+## Full reference
 
-### auth
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| username | string | no | — | Username (use with `password`). |
-| password | string | no | — | Password (use with `username`). |
-| token | string | no | — | Authentication token. |
-
-Only one of username/password or token should be configured; if both are present, username/password takes precedence.
+<!-- BEGIN AUTO: output-nats-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| auth | object | no | — | no | NATS authentication configuration. |
+| mode | object | yes | — | no | Select regular or JetStream publishing. |
+| url | string | yes | — | yes | NATS server URL. |
+| value_field | string | no | — | no | Record field used as the payload. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -72,3 +60,19 @@ output:
   auth:
     token: "secret-token"
 ```
+
+## Input schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

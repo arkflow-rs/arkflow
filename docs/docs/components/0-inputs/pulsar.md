@@ -6,38 +6,30 @@ sidebar_label: Pulsar
 
 The Pulsar input subscribes to an Apache Pulsar topic and supports four subscription types — exclusive / shared / failover / key_shared — with optional Token or OAuth2 authentication.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | Constant value `"pulsar"` |
-| service_url | string | yes | — | Pulsar service URL, e.g. `pulsar://host:6650` or `pulsar+ssl://host:6651`; cluster URLs separated by commas |
-| topic | string | yes | — | Topic, e.g. `persistent://tenant/namespace/topic` or a short name |
-| subscription_name | string | yes | — | Subscription name |
-| subscription_type | string | no | `"exclusive"` | Subscription type: `exclusive` / `shared` / `failover` / `key_shared` |
-| auth | object | no | — | Authentication configuration, see table below (tagged enum) |
-| retry_config | object | no | — | Retry configuration, see table below |
+Stable
 
-### auth
+## When to use
 
-`auth` is a tagged enum (distinguished by the `type` field) with two mutually exclusive forms:
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"token"` or `"oauth2"` |
-| token | string | yes (token) | Token string |
-| issuer_url | string | yes (oauth2) | OAuth2 issuer URL |
-| credentials_url | string | yes (oauth2) | OAuth2 credentials URL |
-| audience | string | yes (oauth2) | OAuth2 audience |
+## Common fields
 
-### retry_config
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| max_attempts | integer | yes | — | Maximum number of retry attempts |
-| initial_delay_ms | integer | yes | — | Initial backoff delay (ms) |
-| max_delay_ms | integer | yes | — | Maximum backoff delay (ms) |
-| backoff_multiplier | number | yes | — | Exponential backoff multiplier |
+## Full reference
+
+<!-- BEGIN AUTO: input-pulsar-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| auth | object | no | — | no | Pulsar authentication configuration. |
+| retry_config | object | no | — | no | Retry behaviour for failed messages. |
+| service_url | string | yes | — | no | Pulsar service URL (e.g. pulsar://localhost:6650). |
+| subscription_name | string | yes | — | no | Subscription name. |
+| subscription_type | string | no | — | no | Subscription type. |
+| topic | string | yes | — | no | Topic to subscribe to. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -82,7 +74,18 @@ input:
     audience: "pulsar-cluster"
 ```
 
-## Notes
+## Output schema
 
-- Metadata: `__meta_topic`, `__meta_message_id`, `__meta_publish_time`, `__meta_ingest_time`.
-- Subscription types: `exclusive` (single consumer, ordered), `shared` (round-robin, unordered), `failover` (primary/standby, ordered), `key_shared` (routed by key, ordered within the same key).
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

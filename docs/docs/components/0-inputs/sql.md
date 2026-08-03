@@ -6,48 +6,28 @@ sidebar_label: SQL
 
 The SQL input executes a `select_sql` query through DataFusion to read from a database (MySQL, PostgreSQL, SQLite, DuckDB) or file format. Ballista is optional for distributed queries.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | Constant value `"sql"` |
-| select_sql | string | yes | — | SQL query statement |
-| input_type | object | yes | — | Data source type and configuration (tagged enum), see table below |
-| ballista | object | no | — | Distributed query configuration, see table below |
+Stable
 
-### ballista
+## When to use
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| remote_url | string | yes | Ballista server URL |
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-### input_type
+## Common fields
 
-`input_type` is a tagged enum (distinguished by the `type` field). The variants are below.
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-#### mysql / postgres
+## Full reference
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"mysql"` or `"postgres"` |
-| uri | string | yes | Database connection URI |
-| name | string | no | Registered table name (used to reference it in queries) |
-| ssl | object | yes | SSL configuration, see below |
-
-`ssl`:
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| ssl_mode | string | yes | SSL mode |
-| root_cert | string | no | Path to the root certificate |
-
-#### duckdb / sqlite
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"duckdb"` or `"sqlite"` |
-| path | string | yes | Database file path |
-| name | string | no | Registered table name |
+<!-- BEGIN AUTO: input-sql-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| ballista | object | no | — | no | Optional Ballista distributed compute configuration. |
+| input_type | object | yes | — | no | Database connection settings. |
+| poll_interval | string | no | — | no | Optional poll interval (humantime). |
+| select_sql | string | yes | — | no | SELECT statement to execute on every poll. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -74,3 +54,19 @@ input:
     type: "sqlite"
     path: "/path/to/data.db"
 ```
+
+## Output schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

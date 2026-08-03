@@ -1,68 +1,30 @@
+
+
 # Redis
 
 The Redis output writes messages to Redis using one of four data-structure operations: Pub/Sub publish, List push, Hash set, or String set. It supports single-node and cluster connections.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type  | string | yes | — | Fixed value `"redis"` |
-| mode | object | yes | — | Connection mode (see below). |
-| redis_type | object | yes | — | Redis operation to perform (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+Stable
 
-### mode
+## When to use
 
-`mode` is a tagged object (selected by its `type` field).
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `single` or `cluster`. |
-| url | string | yes (`single`) | — | Redis server URL (e.g. `redis://localhost:6379`). |
-| urls | `array<string>` | yes (`cluster`) | — | Redis cluster node URLs. |
+## Common fields
 
-### redis_type
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-`redis_type` is a tagged object (selected by its `type` field). All keys/fields/channels are `Expr<String>` (see [Expression objects](#expression-objects)).
+## Full reference
 
-#### publish
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `publish`. |
-| channel | object | yes | Pub/Sub channel to publish to (expression). |
-
-#### list
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `list`. |
-| key | object | yes | List key; values are appended with `RPUSH` (expression). |
-
-#### hashes
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `hashes`. |
-| key | object | yes | Hash key (expression). |
-| field | object | yes | Hash field name (expression). |
-
-#### strings
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `strings`. |
-| key | object | yes | String key (expression). |
-
-### Expression objects
-
-`channel`, `key`, and `field` are `Expr<String>` objects:
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `value` (static) or `expr` (SQL expression). |
-| value | string | yes (`value`) | Static value. |
-| expr | string | yes (`expr`) | SQL expression evaluated per message. |
+<!-- BEGIN AUTO: output-redis-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| mode | object | yes | — | no | Connection mode (single or cluster). |
+| redis_type | object | yes | — | no | Destination data structure. |
+| value_field | string | no | — | no | Record field used as the payload. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -146,3 +108,19 @@ output:
       type: "value"
       value: "logs"
 ```
+
+## Input schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

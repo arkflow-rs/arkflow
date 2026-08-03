@@ -1,0 +1,8 @@
+{
+  "label": "Cookbook",
+  "position": 8,
+  "link": {
+    "type": "doc",
+    "id": "cookbook/index"
+  }
+}

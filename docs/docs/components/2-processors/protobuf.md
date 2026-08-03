@@ -1,19 +1,31 @@
+
+
 # Protobuf
 
 The Protobuf processor converts between Apache Arrow batches and Protocol Buffers messages. It registers two processor types: `arrow_to_protobuf` serializes Arrow columns into Protobuf binary data, and `protobuf_to_arrow` decodes Protobuf binary data into an Arrow batch. Message descriptors are loaded from `.proto` source files (or prebuilt descriptor sets).
 
-## Configuration
+## Status
 
-Both types share `proto_inputs`, `proto_includes`, and `message_type`. Additional fields apply only to one direction of conversion, as noted below.
+Stable
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `arrow_to_protobuf` \| `protobuf_to_arrow` |
-| proto_inputs | array&lt;string&gt; | yes | — | Paths to `.proto` files (or descriptor set binaries) describing the message type. |
-| proto_includes | array&lt;string&gt; | no | — | Directories to search when resolving Protobuf imports. |
-| message_type | string | yes | — | Fully qualified Protobuf message type name (e.g. `example.MyMessage`). |
-| value_field | string | no | — | Name of the binary field holding Protobuf data. Applies to `protobuf_to_arrow` only; defaults to the engine default binary value field. |
-| fields_to_include | array&lt;string&gt; | no | — | Restrict the columns serialized to Protobuf. Applies to `arrow_to_protobuf` only; when omitted all fields are included. |
+## When to use
+
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+
+## Common fields
+
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+
+## Full reference
+
+<!-- BEGIN AUTO: processor-protobuf_to_arrow-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| message_type | string | yes | — | no | Fully-qualified Protobuf message type name. |
+| proto_includes | array | no | — | no | Include paths for proto resolution. |
+| proto_inputs | array | yes | — | no | Paths to .proto files. |
+| value_field | string | no | — | no | Name of the binary column holding the Protobuf wire-format bytes (defaults to '__value'). |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -40,21 +52,18 @@ Both types share `proto_inputs`, `proto_includes`, and `message_type`. Additiona
     value_field: "data"
 ```
 
-## Notes
+## Output schema
 
-### Data Type Mapping
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
 
-Protobuf to Arrow type conversions:
+## Error handling
 
-| Protobuf Type | Arrow Type | Notes |
-|--------------|------------|--------|
-| bool | Boolean | |
-| int32, sint32, sfixed32 | Int32 | |
-| int64, sint64, sfixed64 | Int64 | |
-| uint32, fixed32 | UInt32 | |
-| uint64, fixed64 | UInt64 | |
-| float | Float32 | |
-| double | Float64 | |
-| string | Utf8 | |
-| bytes | Binary | |
-| enum | Int32 | Stored as enum number |
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
