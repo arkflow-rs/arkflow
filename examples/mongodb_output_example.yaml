@@ -1,6 +1,30 @@
 # Writes each Arrow row as a BSON document.
-output:
-  type: "mongodb"
-  uri: "mongodb://localhost:27017"
-  database: "arkflow"
-  collection: "events"
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "generate"
+      context: '{ "id": 1, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 10
+      count: 10
+
+    buffer:
+      type: "memory"
+      capacity: 100
+      timeout: 1s
+
+    pipeline:
+      thread_num: 1
+      processors:
+        - type: "json_to_arrow"
+
+    output:
+      type: "mongodb"
+      uri: "mongodb://localhost:27017"
+      database: "arkflow"
+      collection: "events"
+
+    error_output:
+      type: "stdout"
