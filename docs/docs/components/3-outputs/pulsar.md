@@ -1,31 +1,46 @@
-
-
 # Pulsar
 
 The Pulsar output publishes messages to an Apache Pulsar topic. It supports token and OAuth2 authentication and uses a single shared producer per output.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"pulsar"` |
+| service_url | string | yes | — | Pulsar service URL (e.g. `pulsar://localhost:6650`). |
+| topic | object | yes | — | Destination topic (expression; see below). |
+| auth | object | no | — | Authentication configuration (see below). |
+| value_field | string | no | — | Record field used as the message payload. |
 
-## When to use
+### topic
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+`topic` is an `Expr<String>` object with one of these shapes:
 
-## Common fields
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static topic name (e.g. `persistent://tenant/namespace/topic`). |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+### auth
 
-## Full reference
+`auth` is a tagged object (selected by its `type` field). Supported variants: `token` and `oauth2`.
 
-<!-- BEGIN AUTO: output-pulsar-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| auth | object | no | — | no | Pulsar authentication configuration. |
-| service_url | string | yes | — | no | Pulsar service URL. |
-| topic | string | yes | — | no | Destination topic (supports \{field\} placeholders). |
-| value_field | string | no | — | no | Record field used as the payload. |
-<!-- END AUTO -->
+#### token
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `token`. |
+| token | string | yes | Authentication token. |
+
+#### oauth2
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `oauth2`. |
+| issuer_url | string | yes | OAuth2 issuer URL. |
+| credentials_url | string | yes | URL to the client credentials file. |
+| audience | string | yes | OAuth2 audience. |
 
 ## Examples
 
@@ -70,18 +85,7 @@ output:
     audience: "urn:pulsar:cluster"
 ```
 
-## Input schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- The output validates the service URL and auth fields at build and connect time; misconfiguration fails fast.
+- Pulsar authentication supports `token` and `oauth2` (client credentials). Basic username/password authentication is not supported.

@@ -1,37 +1,39 @@
-
-
 # InfluxDB
 
 The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, buffers writes in configurable batches, and retries failures with exponential backoff.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"influxdb"` |
+| url | string | yes | — | InfluxDB server URL (e.g. `http://localhost:8086`). |
+| org | string | yes | — | Organization name. |
+| bucket | string | yes | — | Destination bucket. |
+| token | string | yes | — | Authentication token. |
+| measurement | string | yes | — | Measurement name. |
+| tags | `array<object>` | no | — | Tag mappings (indexed fields). |
+| fields | `array<object>` | yes | — | Field mappings (value fields). |
+| timestamp_field | string | no | — | Source column for the point timestamp (nanoseconds). Defaults to current time. |
+| batch_size | integer | no | `1000` | Number of lines to buffer before flushing. |
+| flush_interval | integer | no | — | Flush interval in seconds. |
+| retry_count | integer | no | `3` | Number of retry attempts on failure. |
+| timeout_ms | integer | no | `5000` | HTTP request timeout in milliseconds. |
 
-## When to use
+### tags[]
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| field | string | yes | — | Source column name in the message batch. |
+| tag_name | string | yes | — | Tag name written to InfluxDB. |
 
-## Common fields
+### fields[]
 
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
-
-## Full reference
-
-<!-- BEGIN AUTO: output-influxdb-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| batch_size | integer | no | — | no | Batch size for write requests. |
-| bucket | string | yes | — | no | Destination bucket. |
-| fields | array | yes | — | no | Field mappings (value fields). |
-| flush_interval | string | no | — | no | Maximum time to wait before flushing a partial batch. |
-| measurement | string | yes | — | no | Measurement name. |
-| org | string | yes | — | no | Organization name. |
-| tags | array | no | — | no | Tag mappings (label fields). |
-| timestamp_field | string | no | — | no | Source field for the point timestamp. |
-| token | string | yes | — | no | Authentication token. |
-| url | string | yes | — | yes | InfluxDB server URL (e.g. http://localhost:8086). |
-<!-- END AUTO -->
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| field | string | yes | — | Source column name in the message batch. |
+| field_name | string | yes | — | Field name written to InfluxDB. |
+| field_type | string | no | `string` | One of `float`, `integer`, `boolean`, `string`. |
 
 ## Examples
 
@@ -106,18 +108,8 @@ output:
   timeout_ms: 10000
 ```
 
-## Input schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- Measurement, tag, and field identifiers are escaped per Line Protocol rules automatically.
+- When `field_type` is omitted it is treated as a string field.
+- Retries use exponential backoff starting at 100 ms.

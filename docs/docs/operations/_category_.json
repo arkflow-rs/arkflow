@@ -1,9 +1,0 @@
-{
-  "label": "Operations",
-  "position": 10,
-  "link": {
-    "title": "Operations",
-    "type": "generated-index",
-    "description": "Deploy, run, and operate ArkFlow: Kubernetes deployment, the control plane (Hub, console, agent reconciliation, HTTP API), and performance tuning."
-  }
-}

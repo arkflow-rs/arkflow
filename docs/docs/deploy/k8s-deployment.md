@@ -1,7 +1,3 @@
----
-sidebar_position: 1
----
-
 # Kubernetes Deployment Guide
 
 This document describes how to deploy ArkFlow in a Kubernetes cluster.

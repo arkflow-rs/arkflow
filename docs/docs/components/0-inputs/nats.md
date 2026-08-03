@@ -6,27 +6,39 @@ sidebar_label: NATS
 
 The NATS input connects to a NATS server and supports two modes: regular subscriptions (regular) and JetStream pull consumers (jet_stream).
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"nats"` |
+| url | string | yes | — | NATS server URL, e.g. `nats://host:4222`; multiple servers separated by commas |
+| mode | object | yes | — | Operating mode, see table below (tagged enum, distinguished by the `type` field) |
+| auth | object | no | — | Authentication configuration, see table below |
 
-## When to use
+### mode (regular)
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"regular"` |
+| subject | string | yes | NATS subject to subscribe to |
+| queue_group | string | no | Queue group name |
 
-## Common fields
+### mode (jet_stream)
 
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"jet_stream"` |
+| stream | string | yes | Stream name |
+| consumer_name | string | yes | Consumer name |
+| durable_name | string | no | Durable consumer name |
 
-## Full reference
+### auth
 
-<!-- BEGIN AUTO: input-nats-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| auth | object | no | — | no | NATS authentication configuration. |
-| mode | object | yes | — | no | Select between plain NATS and JetStream subscriptions. |
-| url | string | yes | — | yes | NATS server URL (e.g. nats://localhost:4222). |
-<!-- END AUTO -->
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| username | string | no | Username |
+| password | string | no | Password (used together with username) |
+| token | string | no | Token; takes precedence over username/password when both are present |
 
 ## Examples
 
@@ -52,19 +64,3 @@ input:
   auth:
     token: "my_token"
 ```
-
-## Output schema
-
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

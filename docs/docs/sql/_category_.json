@@ -1,8 +1,8 @@
 {
-  "label": "SQL Reference",
+  "label": "SQL",
   "position": 6,
   "link": {
-    "title": "SQL Reference",
+    "title": "SQL",
     "type": "generated-index",
     "description": "SQL query engine documentation, including comprehensive coverage of data types, operators, query syntax, subqueries, aggregate functions, window functions, and more"
   }

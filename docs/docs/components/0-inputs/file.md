@@ -6,27 +6,82 @@ sidebar_label: File
 
 The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. It supports local paths and cloud object storage (S3, GCS, Azure, HTTP, HDFS), with optional SQL over the file data or integration with the Ballista distributed engine.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | File format: `json` / `csv` / `parquet` / `avro` / `arrow` |
+| path | string | yes | — | File path or object storage URL |
+| store | object | no | — | Object storage configuration (tagged enum), see table below |
+| query | object | no | — | SQL to run over the file data, see table below |
+| ballista | object | no | — | Distributed query configuration, see table below |
 
-## When to use
+> Note: the field name in the code is `store` (not `object_store` as in the old docs). The format is specified by the top-level `type` field.
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+### store
 
-## Common fields
+`store` is a tagged enum (distinguished by the `type` field).
 
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+#### S3
 
-## Full reference
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `"s3"` |
+| bucket_name | string | yes | — | S3 bucket name |
+| access_key_id | string | yes | — | AWS access key ID |
+| secret_access_key | string | yes | — | AWS secret access key |
+| endpoint | string | no | — | Custom endpoint (MinIO, etc.) |
+| region | string | no | — | AWS region |
+| allow_http | boolean | no | `false` | Whether to allow HTTP (non-TLS) connections |
 
-<!-- BEGIN AUTO: input-file-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| ballista | object | no | — | no | Optional Ballista distributed compute configuration. |
-| input_type | object | yes | — | no | Format-specific input settings (type: csv/json/parquet/avro/arrow). |
-| query | object | no | — | yes | Optional SQL query and table name to filter the read. |
-<!-- END AUTO -->
+#### GCS (gs)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"gs"` |
+| bucket_name | string | yes | GCS bucket name |
+| url | string | no | Custom endpoint |
+| service_account_path | string | no | Path to the service account JSON key file |
+| service_account_key | string | no | Raw service account JSON content |
+
+#### Azure (az)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"az"` |
+| account | string | yes | Storage account name |
+| container_name | string | yes | Container name |
+| endpoint | string | no | Endpoint |
+| url | string | no | Blob endpoint URL |
+| access_key | string | no | Storage access key |
+
+#### HTTP
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"http"` |
+| url | string | yes | HTTP endpoint URL |
+
+#### HDFS
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"hdfs"` |
+| url | string | yes | HDFS namenode URL |
+| ha_config | map&lt;string, string&gt; | no | High-availability configuration |
+
+### query
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| query | string | yes | — | SQL query statement |
+| table | string | no | `"flow"` | Table name under which the file data is registered |
+
+### ballista
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| remote_url | string | yes | Ballista server URL |
 
 ## Examples
 
@@ -81,19 +136,3 @@ input:
     container_name: "my-container"
     access_key: "${AZURE_STORAGE_ACCESS_KEY}"
 ```
-
-## Output schema
-
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

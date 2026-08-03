@@ -1,30 +1,35 @@
-
-
 # SQL
 
 The SQL processor runs SQL queries against the incoming message batch using DataFusion as the query engine. Each batch is registered as a temporary table (named `flow` by default, or `table_name` when set) so it can be filtered, projected, joined with temporary data sources, or aggregated in SQL.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `sql` |
+| query | string | yes | — | SQL query statement to execute against the incoming batch. |
+| table_name | string | no | `flow` | Table name used to reference the incoming batch inside the query. |
+| temporary_list | array&lt;object&gt; | no | — | Additional temporary data sources to reference in the query. |
 
-## When to use
+### `temporary_list` item
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+Each entry registers one external source as a named table.
 
-## Common fields
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| name | string | yes | — | Name of the temporary source registered with the engine. |
+| table_name | string | yes | — | Table name to use for this source inside the SQL query. |
+| key | object | yes | — | Key used to look up data in the temporary source. |
 
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+### `key`
 
-## Full reference
+Tagged union (`type` field selects the variant, snake_cased):
 
-<!-- BEGIN AUTO: processor-sql-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| query | string | yes | — | yes | SQL query to run on every batch. |
-| table_name | string | no | — | no | Name used for the batch table in the query (default 'flow'). |
-| temporary_list | array | no | — | no | Temporary tables to register before running the query. |
-<!-- END AUTO -->
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `expr` \| `value` |
+| expr | string | no | — | Expression to evaluate per row against the batch (used when `type: expr`). |
+| value | string | no | — | Static string value used as the key (used when `type: value`). |
 
 ## Examples
 
@@ -60,19 +65,3 @@ The `type` field selects this component. The fields marked `common?` are the fie
           type: "expr"
           expr: "user_id"
 ```
-
-## Output schema
-
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

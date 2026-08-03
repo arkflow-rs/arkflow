@@ -1,29 +1,14 @@
-
-
 # VRL
 
 The VRL processor transforms messages using Vector Remap Language (VRL), a safe expression language designed for observability data pipelines. Each incoming batch is mapped to VRL objects; the result of the configured statement is projected back into the columnar batch. See the VRL syntax reference at https://vector.dev/docs/reference/vrl/.
 
-## Status
+## Configuration
 
-Stable
-
-## When to use
-
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
-
-## Common fields
-
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
-
-## Full reference
-
-<!-- BEGIN AUTO: processor-vrl-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| statement | string | yes | — | yes | VRL program source. |
-| timezone | string | no | — | no | Optional timezone for VRL timestamp operations (e.g. 'Asia/Shanghai', 'UTC', 'local'). Defaults to the platform local timezone; invalid values fall back to the default with a warning. |
-<!-- END AUTO -->
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `vrl` |
+| statement | string | yes | — | VRL program used to transform each message. |
+| timezone | string | no | — | Time zone used when parsing/formatming time values in the program (e.g. `UTC`, `Asia/Shanghai`). |
 
 ## Examples
 
@@ -56,18 +41,16 @@ streams:
       type: "stdout"
 ```
 
-## Output schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+### Supported Data Types
 
-## Error handling
+VRL values map to and from the following Arrow types:
 
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- **String** (Utf8)
+- **Integer**: Int8, Int16, Int32, Int64
+- **Float**: Float32, Float64
+- **Boolean**
+- **Binary**
+- **Timestamp**
+- **Null**

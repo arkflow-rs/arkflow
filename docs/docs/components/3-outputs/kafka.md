@@ -1,36 +1,31 @@
-
-
 # Kafka
 
 The Kafka output produces messages to an Apache Kafka topic using librdkafka. It supports key-based partitioning, compression, configurable acknowledgments, and optional exactly-once transactional production.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"kafka"` |
+| brokers | `array<string>` | yes | — | List of Kafka broker addresses. |
+| topic | object | yes | — | Destination topic (expression; see below). |
+| key | object | no | — | Message key for partitioning (expression; see below). |
+| client_id | string | no | — | Client identifier. |
+| compression | string | no | — | One of `none`, `gzip`, `snappy`, `lz4`. |
+| acks | string | no | — | Acknowledgment level: `0`, `1`, or `all`. |
+| value_field | string | no | — | Record field used as the message payload. |
+| exactly_once | boolean | no | `false` | Enable exactly-once transactional production (L2). |
+| transactional_id | string | no | — | Stable transactional id; required when `exactly_once` is `true`. |
 
-## When to use
+### Expression objects
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+`topic` and `key` are `Expr<String>` objects with one of these shapes:
 
-## Common fields
-
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
-
-## Full reference
-
-<!-- BEGIN AUTO: output-kafka-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| acks | string | no | — | no | Acknowledgment level. |
-| brokers | array | yes | — | yes | List of Kafka broker addresses. |
-| client_id | string | no | — | no | Optional client identifier. |
-| compression | string | no | — | no | Compression algorithm. |
-| exactly_once | boolean | no | `false` | no | Enable exactly-once transactional production (L2). |
-| key | string | no | — | no | Field used as the message key for partitioning. |
-| topic | string | yes | — | no | Destination topic (supports \{field\} placeholders). |
-| transactional_id | string | no | — | no | Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing. |
-| value_field | string | no | — | no | Record field used as the message payload. |
-<!-- END AUTO -->
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static string value. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
 ## Examples
 
@@ -81,18 +76,8 @@ output:
   acks: "all"
 ```
 
-## Input schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- When `exactly_once: true`, `transactional_id` must be a non-empty value that is stable across restarts so the broker can fence stale producer epochs (zombie fencing). The builder rejects the configuration otherwise.
+- With exactly-once enabled, each acknowledged message batch is produced inside one Kafka transaction (begin → send → commit). On failure the transaction is aborted and the batch is replayed.
+- See [Exactly-once processing](../../concepts/6-exactly-once.md) for the end-to-end delivery-semantics contract.
