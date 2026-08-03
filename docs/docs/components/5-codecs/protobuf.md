@@ -6,14 +6,27 @@ sidebar_label: Protobuf
 
 The Protobuf codec converts between binary Protobuf messages and columnar Arrow `RecordBatch`es using a descriptor compiled from `.proto` files at startup. Decoding parses each byte payload against the configured `MessageDescriptor`; encoding reverses the process. Use it when an input emits raw Protobuf (no Confluent schema-id prefix).
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | Fixed value `"protobuf"` |
-| message_type | string | yes | — | Fully qualified Protobuf message type name (including package), e.g. `com.example.User` |
-| proto_inputs | array&lt;string&gt; | yes | — | List of `.proto` source file paths |
-| proto_includes | array&lt;string&gt; | no | — | Include search paths used when parsing `.proto` files |
+Stable
+
+## When to use
+
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+
+## Common fields
+
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+
+## Full reference
+
+<!-- BEGIN AUTO: codec-protobuf-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| message_type | string | yes | — | no | Fully-qualified Protobuf message type name. |
+| proto_includes | array | no | — | no | Include paths for proto resolution. |
+| proto_inputs | array | yes | — | no | Paths to .proto files. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -42,8 +55,18 @@ codec:
     - /usr/include/protos
 ```
 
-## Notes
+## Output schema
 
-- Only proto3 scalar fields are supported: `bool`, `int32`/`sint32`/`sfixed32`, `int64`/`sint64`/`sfixed64`, `uint32`/`fixed32`, `uint64`/`fixed64`, `float`, `double`, `string`, `bytes`, and `enum` (mapped to Arrow `Int32`).
-- Nested messages, `repeated`, `map`, `oneof`, and proto3 `optional` fields are **not** supported; encountering them returns an error during encoding/decoding.
-- When decoding multiple messages, the batch is merged (`concat_batches`) using the schema of the first message; fields across messages must be compatible.
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

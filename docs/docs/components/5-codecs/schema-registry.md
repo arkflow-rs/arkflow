@@ -6,18 +6,27 @@ sidebar_label: Schema Registry
 
 The `schema_registry` codec decodes Confluent wire-format Protobuf messages by resolving the embedded schema id from a Confluent Schema Registry at runtime. Each schema version (id) is fetched at most once and cached per codec instance, so multi-version schema evolution is supported within the same stream.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | Fixed value `"schema_registry"` |
-| registry_url | string | yes | — | Confluent Schema Registry root URL, e.g. `http://localhost:8081` |
-| message_type | string | yes | — | Fully qualified Protobuf message type name |
-| auth | object | no | — | Registry authentication configuration |
-| auth.type | string | yes (if `auth`) | — | Authentication method: `basic` or `bearer` |
-| auth.username | string | no | — | Username for `basic` mode |
-| auth.password | string | no | — | Password for `basic` mode |
-| auth.token | string | no | — | Token for `bearer` mode |
+Stable
+
+## When to use
+
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+
+## Common fields
+
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
+
+## Full reference
+
+<!-- BEGIN AUTO: codec-schema_registry-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| auth | object | no | — | no | Optional registry authentication. |
+| message_type | string | yes | — | no | Fully-qualified Protobuf message type. |
+| registry_url | string | yes | — | no | Confluent Schema Registry base URL. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -84,3 +93,19 @@ Schema resolution is abstracted behind a pluggable `SchemaResolver` trait (`Rest
 - It only resolves schemas on the consumer side; it never writes or registers new schemas.
 - It does not explicitly validate BACKWARD/FORWARD compatibility (enforced by the registry).
 - Protobuf schema references (imports) are not supported — only single-file schemas.
+
+## Output schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

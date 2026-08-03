@@ -1,43 +1,32 @@
+
+
 # SQL
 
 The SQL output batch-inserts records into a MySQL or PostgreSQL database. Each row is converted from Arrow to a typed SQL value and inserted in a single parameterized statement.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type  | string | yes | — | Fixed value `"sql"` |
-| output_type | object | yes | — | Database driver and connection settings (see below). |
-| table_name | string | yes | — | Destination table name. |
+Stable
 
-### output_type
+## When to use
 
-`output_type` is a tagged object (selected by its `type` field). Supported drivers: `mysql` and `postgres`.
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-#### mysql
+## Common fields
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `mysql`. |
-| uri | string | yes | — | MySQL connection URI (e.g. `mysql://user:pass@host:3306/db`). |
-| ssl | object | no | — | Optional SSL configuration (see below). |
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-#### postgres
+## Full reference
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | `postgres`. |
-| uri | string | yes | — | PostgreSQL connection URI (e.g. `postgres://user:pass@host:5432/db`). |
-| ssl | object | no | — | Optional SSL configuration (see below). |
-
-### ssl
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| ssl_mode | string | yes | — | SSL mode (driver-specific, e.g. `preferred`, `require`, `verify_ca`, `verify_full`). |
-| root_cert | string | no | — | Path to the root CA certificate. |
-| client_cert | string | no | — | Path to the client certificate. |
-| client_key | string | no | — | Path to the client key. |
+<!-- BEGIN AUTO: output-sql-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| batch_size | integer | no | — | no | Number of rows per insert batch. |
+| connection | object | yes | — | no | Database connection settings (type, uri, etc.). |
+| table | string | yes | — | no | Destination table. |
+| upsert | boolean | no | `false` | no | Use upsert (ON CONFLICT) instead of plain insert. |
+| upsert_keys | array | no | — | no | Columns used to detect conflicts for upsert. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -79,7 +68,18 @@ output:
   table_name: "daily_stats"
 ```
 
-## Notes
+## Input schema
 
-- Supported column types: Utf8, Int64, UInt64, Float64, Boolean. Other Arrow types are rejected with a process error.
-- Identifier quoting follows each dialect: backticks for MySQL, double quotes for PostgreSQL.
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.

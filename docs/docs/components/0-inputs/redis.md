@@ -6,43 +6,26 @@ sidebar_label: Redis
 
 The Redis input reads from Redis with both standalone and cluster connection modes, and supports Subscribe (channels / patterns) and List consumption modes.
 
-## Configuration
+## Status
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| type | string | yes | — | Constant value `"redis"` |
-| mode | object | yes | — | Connection mode (tagged enum), see table below |
-| redis_type | object | yes | — | Consumption mode (tagged enum), see table below |
+Stable
 
-### mode
+## When to use
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"single"` or `"cluster"` |
-| url | string | yes (single) | Standalone URL, e.g. `redis://host:6379` |
-| urls | array&lt;string&gt; | yes (cluster) | List of cluster node URLs |
+Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
 
-### redis_type (subscribe)
+## Common fields
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"subscribe"` |
-| subscribe | object | yes | Subscription configuration, see below |
+The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
 
-`subscribe`:
+## Full reference
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"channels"` or `"patterns"` |
-| channels | array&lt;string&gt; | yes (channels) | List of channels |
-| patterns | array&lt;string&gt; | yes (patterns) | List of patterns |
-
-### redis_type (list)
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| type | string | yes | `"list"` |
-| list | array&lt;string&gt; | yes | List of Redis list keys to consume |
+<!-- BEGIN AUTO: input-redis-fields -->
+| Field | Type | Required | Default | common? | Description |
+|-------|------|----------|---------|---------|-------------|
+| mode | object | yes | — | no | Connection mode. |
+| redis_type | object | yes | — | no | Data structure to consume from. |
+<!-- END AUTO -->
 
 ## Examples
 
@@ -73,3 +56,19 @@ input:
       - "tasks"
       - "notifications"
 ```
+
+## Output schema
+
+The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
+
+## Error handling
+
+Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
+
+## Metrics
+
+Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
+
+## See also
+
+Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
