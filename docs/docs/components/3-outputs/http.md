@@ -1,34 +1,30 @@
-
-
 # HTTP
 
 The HTTP output sends each message as an HTTP request to a configured URL. It supports custom headers, retry with exponential backoff, and Basic or Bearer authentication.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"http"` |
+| url | string | yes | — | Destination URL. |
+| method | string | yes | — | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`. |
+| timeout_ms | integer | yes | — | Request timeout in milliseconds. |
+| retry_count | integer | yes | — | Number of retry attempts on failure. |
+| headers | `map<string, string>` | no | — | Custom HTTP headers. |
+| body_field | string | no | — | Record field whose value is used as the request body. |
+| auth | object | no | — | Authentication configuration (see below). |
 
-## When to use
+### auth
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+`auth` is a tagged object (selected by its `type` field).
 
-## Common fields
-
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
-
-## Full reference
-
-<!-- BEGIN AUTO: output-http-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| auth | object | no | — | no | Authentication configuration. |
-| body_field | string | no | — | no | Record field that holds the request body. |
-| headers | object | no | — | no | Custom HTTP headers. |
-| method | string | no | `"POST"` | no | HTTP method. |
-| retry_count | integer | no | — | no | Number of retry attempts on failure. |
-| timeout_ms | integer | no | — | no | Request timeout in milliseconds. |
-| url | string | yes | — | yes | Destination URL. |
-<!-- END AUTO -->
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `basic` or `bearer`. |
+| username | string | yes (basic) | — | Username (basic auth). |
+| password | string | yes (basic) | — | Password (basic auth). |
+| token | string | yes (bearer) | — | Token (bearer auth). |
 
 ## Examples
 
@@ -74,18 +70,7 @@ output:
     token: "your-token"
 ```
 
-## Input schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- `Content-Type: application/json` is added automatically when not set in `headers`.
+- Retries use exponential backoff (`100 * 2^(attempt-1)` ms) and require the request body to be cloneable.

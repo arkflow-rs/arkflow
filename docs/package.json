@@ -6,8 +6,6 @@
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
     "build": "docusaurus build",
-    "components:generate": "node scripts/normalize-components.mjs",
-    "docs:check": "node scripts/docs-check.mjs",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",

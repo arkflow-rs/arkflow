@@ -44,7 +44,7 @@ streams:
 Runs an HTTP server with `/health`, `/readiness`, and `/liveness` endpoints
 (useful for Kubernetes). The same server also hosts the optional control-plane
 API and the Hub agent when `hub_url` is set (see
-[Control plane](../operations/control-plane/1-overview.md)).
+[Control plane](../control-plane/1-overview.md)).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

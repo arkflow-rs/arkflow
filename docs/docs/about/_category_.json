@@ -1,0 +1,9 @@
+{
+  "label": "About",
+  "position": 9,
+  "link": {
+    "title": "About",
+    "type": "generated-index",
+    "description": "Brand assets and project information."
+  }
+}

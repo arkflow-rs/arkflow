@@ -6,25 +6,29 @@ sidebar_label: Redis
 
 The Redis temporary provides lookup storage backed by Redis for SQL processors. It exposes a `Temporary` resource that the SQL processor joins against via `temporary_list`. Two Redis data shapes are supported: `string` (MGET) and `list` (LRANGE). Results are passed through a codec (typically JSON) to produce an Arrow batch registered as a query-side table.
 
-## Status
+## Configuration
 
-Stable
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Fixed value `"redis"` |
+| mode | object | yes | — | Redis connection configuration (single or cluster) |
+| mode.type | string | yes | — | Connection type: `single` or `cluster` |
+| mode.url | string | yes (single) | — | Redis URL in `single` mode, e.g. `redis://host:port` or `rediss://...` (TLS) |
+| mode.urls | array&lt;string&gt; | yes (cluster) | — | List of node URLs in `cluster` mode |
+| redis_type | object | yes | — | Redis data structure selection |
+| redis_type.type | string | yes | — | Data type: `string` (MGET) or `list` (LRANGE) |
+| codec | object | yes | — | Codec configuration for deserializing data (structure matches each codec; typically `{ type: json }`) |
+| codec.type | string | yes | — | Codec type, e.g. `json` |
 
-## When to use
+## Usage in SQL queries
 
-Use this component when its role matches the surrounding stream topology. Choose another component when the workload requires a different transport, state boundary, or delivery contract.
+The Redis temporary serves as a query-side lookup table via the SQL processor's `temporary_list`. The actual schema of `temporary_list[].key` is `Expr<String>` (`#[serde(tag = "type")]`), one of:
 
-## Common fields
-
-The `type` field selects this component. The fields marked `common?` are the fields most often tuned in a first deployment.
-
-## Full reference
-
-<!-- BEGIN AUTO: temporary-component-fields -->
-| Field | Type | Required | Default | common? | Description |
-|-------|------|----------|---------|---------|-------------|
-| — | object | no | — | no | No additional configuration fields. |
-<!-- END AUTO -->
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| key.type | string | yes | — | `value` (static string literal) or `expr` (DataFusion expression) |
+| key.value | string | yes (value) | — | Static key value when `key.type = value` |
+| key.expr | string | yes (expr) | — | DataFusion expression evaluated against the current batch (returning a string) when `key.type = expr` |
 
 ## Examples
 
@@ -106,18 +110,9 @@ streams:
       type: stdout
 ```
 
-## Output schema
+## Notes
 
-The component preserves ArkFlow message metadata and uses the batch schema documented by the surrounding input or output.
-
-## Error handling
-
-Configuration errors are reported during validation. Runtime connection, decoding, or processing errors are logged with the component name; use the Troubleshooting guide to identify the failing boundary.
-
-## Metrics
-
-Monitor throughput, errors, retries, and end-to-end acknowledgement latency for this component. The deployment's metrics endpoint exposes the runtime counters when the control plane is enabled.
-
-## See also
-
-Use the generated reference as the source of truth for configuration. Validate a complete stream configuration before deployment.
+- The `list` type uses `LRANGE key 0 -1` to fetch all elements; the `string` type uses `MGET` against the deduplicated set of keys.
+- A single query supports only a single key column (`keys.len() == 1`); when an `expr` evaluation returns an array, each entry is queried as a separate key.
+- The codec must be able to deserialize the bytes/strings fetched from Redis into an Arrow batch; it is typically configured as `json`.
+- Connection management is handled by an internal `ConnectionManager` with automatic reconnection.
