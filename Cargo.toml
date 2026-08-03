@@ -46,7 +46,7 @@ lazy_static = "1.4"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
 clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
 flume = "=0.11"
