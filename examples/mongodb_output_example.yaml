@@ -1,0 +1,6 @@
+# Writes each Arrow row as a BSON document.
+output:
+  type: "mongodb"
+  uri: "mongodb://localhost:27017"
+  database: "arkflow"
+  collection: "events"
