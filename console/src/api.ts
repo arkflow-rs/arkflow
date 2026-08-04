@@ -7,7 +7,7 @@ export type StreamStatus = { id: string; state: StreamState; desired_state?: Des
 export type Page<T> = { items: T[]; page: number; page_size: number; total: number }
 export type EngineStatus = { version: string; state: string; uptime_seconds: number; streams_total: number; streams_running: number; streams_failed: number }
 export type SystemResource = { id: string; version: string; state: string; node_count: number; stream_count: number; active_operations: number; capabilities: string[] }
-export type ControlNode = { id: string; version: string; state: string; capabilities: string[]; streams_total: number; streams_running: number; streams_failed: number; role?: string; uptime_seconds?: number; last_seen_at_ms?: number; lease_expires_at_ms?: number }
+export type ControlNode = { id: string; protocol_version?: string; version: string; state: string; capabilities: string[]; streams_total: number; streams_running: number; streams_failed: number; role?: string; uptime_seconds?: number; last_seen_at_ms?: number; lease_expires_at_ms?: number }
 export type NodeResource = ControlNode
 export type HubNode = ControlNode
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
@@ -21,6 +21,11 @@ export type ConfigVersion = { id: string; created_at_ms: number; format: ConfigC
 export type ConfigDiff = { from: string; to: string; changed: boolean; from_format?: string; to_format?: string }
 export type Component = { kind: string; name: string; description?: string; schema?: unknown; example?: unknown }
 export type MetricsResponse = { items: { node_id: string; metrics: Record<string, number> }[]; aggregate: Record<string, number> }
+export type RolloutState = 'pending' | 'applying' | 'paused' | 'converged' | 'cancelled' | 'rolled_back'
+export type RolloutTarget = { rollout_id: string; node_id: string; ordinal: number; state: string; attempt_id?: string; error?: string; observed_config_version?: string; updated_at_ms: number }
+export type Rollout = { rollout_id: string; config_version_id: string; state: RolloutState|string; batch_size: number; current_batch: number; total_targets: number; actor?: string; correlation_id?: string; created_at_ms: number; updated_at_ms: number }
+export type RolloutDetail = { rollout: Rollout; targets: RolloutTarget[] }
+export type AuditRecord = { event_id: number; actor?: string; action: string; resource_type: string; resource_id?: string; node_id?: string; stream_id?: string; correlation_id?: string; outcome: string; failure_code?: string; message?: string; occurred_at_ms: number }
 
 const base = import.meta.env.VITE_API_BASE ?? '/api/v1'
 const token = import.meta.env.VITE_API_TOKEN
@@ -39,6 +44,31 @@ export const api = {
   config: (nodeId?: string) => request<Record<string, unknown>>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration` : '/configuration'), draft: () => request<ConfigCandidate | undefined>('/configuration/draft'), saveDraft: (candidate: ConfigCandidate) => request<ConfigCandidate>('/configuration/draft', { method: 'PUT', body: JSON.stringify(candidate) }), validateConfig: (candidate: ConfigCandidate) => request<ConfigValidationReport>('/configuration/validate', { method: 'POST', body: JSON.stringify(candidate) }), diff: (from: string, to: string) => request<ConfigDiff>(`/configuration/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
   applyConfig: (candidate: ConfigCandidate, nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/apply` : '/configuration/apply', { method: 'POST', body: JSON.stringify(candidate) }), versions: (nodeId?: string) => request<ConfigVersion[]>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/versions` : '/configuration/versions'), rollback: (id: string, nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/rollback/${encodeURIComponent(id)}` : `/configuration/rollback/${encodeURIComponent(id)}`, { method: 'POST' }),
   components: () => request<Component[]>('/components'), schema: () => request<unknown>('/schema'), command: (id: string, action: 'start' | 'stop' | 'restart', nodeId?: string) => request<Operation>(nodeId ? `/nodes/${encodeURIComponent(nodeId)}/streams/${encodeURIComponent(id)}/${action}` : `/streams/${encodeURIComponent(id)}/${action}`, { method: 'POST' }), cancel: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  rollouts: () => request<Rollout[]>('/rollouts'), rollout: (id: string) => request<RolloutDetail>(`/rollouts/${encodeURIComponent(id)}`), createRollout: (configVersion: string, nodeIds: string[], batchSize: number) => request<Rollout>('/rollouts', { method: 'POST', body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }) }), rolloutAction: (id: string, action: 'pause'|'resume'|'cancel'|'rollback', configVersion?: string) => request<Rollout>(`/rollouts/${encodeURIComponent(id)}/actions`, { method: 'POST', body: JSON.stringify({ action, ...(configVersion ? { config_version: configVersion } : {}) }) }), audit: (resourceId?: string) => request<Page<AuditRecord>>(`/audit${resourceId ? `?resource_id=${encodeURIComponent(resourceId)}` : ''}`),
+}
+
+export function streamEvents(onEvent: (event: ControlEvent) => void, onState?: (state: 'connected'|'disconnected') => void, nodeId?: string): AbortController {
+  const controller = new AbortController()
+  const path = `/events/stream${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`
+  void (async () => {
+    let lastEventId: string | undefined
+    while (!controller.signal.aborted) {
+      try {
+        const response = await fetch(`${base}${path}`, { headers: { Accept: 'text/event-stream', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}) }, signal: controller.signal })
+        if (!response.ok || !response.body) throw new Error(`SSE connection failed (${response.status})`)
+        onState?.('connected')
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let eventType = 'message'; let data = ''
+        const emit = () => { if (!data) return; if (eventType !== 'resync') { try { onEvent(JSON.parse(data) as ControlEvent) } catch { /* bounded server payload; ignore malformed frames */ } } data = ''; eventType = 'message' }
+        while (!controller.signal.aborted) {
+          const next = await reader.read(); if (next.done) break; buffer += decoder.decode(next.value, { stream: true })
+          const frames = buffer.split(/\r?\n\r?\n/); buffer = frames.pop() ?? ''
+          for (const frame of frames) { for (const line of frame.split(/\r?\n/)) { if (line.startsWith('id:')) lastEventId = line.slice(3).trim(); if (line.startsWith('event:')) eventType = line.slice(6).trim(); if (line.startsWith('data:')) data += line.slice(5).trim() } emit() }
+        }
+      } catch { if (!controller.signal.aborted) onState?.('disconnected') }
+      if (!controller.signal.aborted) await new Promise(resolve => window.setTimeout(resolve, 1000))
+    }
+  })()
+  return controller
 }
 
 export async function waitForOperation(id: string): Promise<Operation> {

@@ -42,11 +42,15 @@ The Hub SHALL increment a resource generation for every desired-state mutation, 
 
 ### Requirement: Reconciliation triggers and recovery
 
-The Hub SHALL trigger reconciliation after desired-state changes, node registration, valid reports, lease recovery, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism.
+The Hub SHALL trigger reconciliation after desired-state changes, rollout batch changes, node registration, valid reports, lease recovery, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism. Recovery SHALL restore unfinished Operations and Rollouts from durable state before reporting readiness.
 
 #### Scenario: Agent reconnects with stale observed state
 - **WHEN** a node reconnects and its full report does not match the persisted desired state
 - **THEN** the Hub creates or resumes one eligible Attempt for the current generation
+
+#### Scenario: Hub restarts with an unfinished rollout
+- **WHEN** the Hub loads a persisted rollout that is not converged, cancelled, or rolled back
+- **THEN** it restores the current batch and resumes only eligible current-generation intents after storage recovery
 
 #### Scenario: Hub restarts with an unfinished intent
 - **WHEN** the Hub loads a persisted Intent that is not converged or superseded
@@ -82,7 +86,7 @@ The Agent and Hub SHALL support idempotent lifecycle commands and SHALL identify
 
 ### Requirement: Configuration convergence
 
-The Hub SHALL treat a target configuration version as part of desired state and SHALL mark configuration publication converged only after the target node reports that version applied and the affected Streams satisfy their desired lifecycle states.
+The Hub SHALL treat a target configuration version as part of desired state and SHALL mark a node-level configuration publication converged only after the target node reports that version applied and affected Streams satisfy their desired lifecycle states. A Fleet rollout SHALL additionally require completion of its batch health gates before advancing or converging.
 
 #### Scenario: Publish configuration to a connected node
 - **WHEN** an authorized operator publishes a validated configuration version
@@ -91,3 +95,7 @@ The Hub SHALL treat a target configuration version as part of desired state and 
 #### Scenario: Configuration application is blocked
 - **WHEN** a node cannot apply a validly stored configuration because of a permanent component error
 - **THEN** the Hub preserves the previous observed version, marks the configuration Intent blocked with the failure reason, and leaves rollback or a new version available
+
+#### Scenario: Advance after batch health gates
+- **WHEN** every node in a rollout batch reports the target version and passes its configured health gates
+- **THEN** the Hub marks the batch complete and dispatches no more than the configured next batch

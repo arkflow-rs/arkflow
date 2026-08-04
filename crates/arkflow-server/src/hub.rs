@@ -4,8 +4,10 @@
 //! the transport-neutral state machine used by the HTTP handlers and Agent
 //! client protocol.
 
+use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
 use crate::storage::{
-    AttemptRecord, DesiredMutation, IntentRecord, NodeMutation, ObservedMutation, StorageActor,
+    AttemptRecord, DesiredMutation, IntentRecord, NodeMutation, ObservedMutation,
+    PersistedOperation, RolloutRecord, RolloutTargetRecord, RolloutTargetUpdate, StorageActor,
     StorageError,
 };
 use arkflow_core::control::{
@@ -18,12 +20,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 const MAX_NODES: usize = 256;
 const MAX_COMMANDS_PER_NODE: usize = 128;
 const MAX_OPERATIONS: usize = 1024;
 const MAX_EVENTS: usize = 2048;
+const SUPPORTED_PROTOCOL_VERSION: &str = "v1";
+const ALLOWED_NODE_METRICS: &[&str] = &[
+    "input_batches",
+    "input_messages",
+    "processing_errors",
+    "output_batches",
+    "output_messages",
+    "input_errors",
+    "input_reconnects",
+    "output_errors",
+    "restarts",
+    "streams_total",
+    "streams_running",
+];
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -63,6 +79,14 @@ pub struct HeartbeatRequest {
     #[serde(flatten)]
     pub auth: AgentAuth,
     pub state: String,
+    #[serde(default)]
+    pub protocol_version: Option<String>,
+    #[serde(default)]
+    pub software_version: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub rollout_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +118,7 @@ pub struct NodeReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubNode {
     pub id: String,
+    pub protocol_version: String,
     pub version: String,
     pub state: NodeConnectionState,
     pub capabilities: Vec<String>,
@@ -108,6 +133,8 @@ pub struct HubNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<i64>,
     pub node_id: String,
     #[serde(flatten)]
     pub event: ControlEvent,
@@ -144,9 +171,13 @@ pub struct AgentCommand {
     pub config_version_id: Option<String>,
     #[serde(default)]
     pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub rollout_id: Option<String>,
     pub correlation_id: Option<String>,
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +198,8 @@ pub struct CommandResult {
     pub failure_class: Option<String>,
     #[serde(default)]
     pub config_version_id: Option<String>,
+    #[serde(default)]
+    pub rollout_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +279,9 @@ pub struct Hub {
     config: Arc<HubConfig>,
     nodes: Arc<RwLock<BTreeMap<String, NodeRecord>>>,
     operations: Arc<RwLock<BTreeMap<String, HubOperation>>>,
+    rollouts: Arc<RwLock<BTreeMap<String, RolloutRecord>>>,
     events: Arc<RwLock<VecDeque<HubEvent>>>,
+    updates: broadcast::Sender<HubEvent>,
     storage: Option<StorageActor>,
     lifecycle: Arc<RwLock<HubLifecycle>>,
 }
@@ -264,11 +299,14 @@ struct HubLifecycle {
 
 impl Hub {
     pub fn new(config: HubConfig) -> Self {
+        let (updates, _) = broadcast::channel(256);
         Self {
             config: Arc::new(config),
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(RwLock::new(BTreeMap::new())),
+            rollouts: Arc::new(RwLock::new(BTreeMap::new())),
             events: Arc::new(RwLock::new(VecDeque::new())),
+            updates,
             storage: None,
             lifecycle: Arc::new(RwLock::new(HubLifecycle::default())),
         }
@@ -284,12 +322,21 @@ impl Hub {
         self.storage.is_some()
     }
 
+    pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
+        self.updates.subscribe()
+    }
+
     pub async fn recover_persisted_state(&self) -> Result<(), HubError> {
         if let Some(storage) = self.storage.as_ref() {
             storage
                 .recover_reconciliation(now_ms())
                 .await
                 .map_err(HubError::from)?;
+            let recovered = storage.recover_rollouts().await.map_err(HubError::from)?;
+            let mut rollouts = self.rollouts.write().await;
+            for rollout in recovered {
+                rollouts.insert(rollout.rollout_id.clone(), rollout);
+            }
         }
         self.lifecycle.write().await.recovered = true;
         Ok(())
@@ -379,6 +426,7 @@ impl Hub {
         storage.set_desired(mutation).await.map_err(HubError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn restart_state(
         &self,
         node_id: String,
@@ -472,10 +520,39 @@ impl Hub {
     }
 
     pub fn operator_authorized(&self, supplied: Option<&str>) -> bool {
+        self.operator_principal(supplied).is_some()
+    }
+
+    pub fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
         let Some(expected) = self.config.operator_token.as_deref() else {
-            return true;
+            return Some(OperatorPrincipal::legacy_operator());
         };
-        supplied.is_some_and(|value| value.as_bytes().ct_eq(expected.as_bytes()).into())
+        let (id, role, secret, scopes) = parse_operator_credential(expected);
+        let supplied = supplied?;
+        if !bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
+            return None;
+        }
+        Some(OperatorPrincipal {
+            id: id.to_owned(),
+            roles: vec![role],
+            scopes,
+        })
+    }
+
+    pub fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
+        self.operator_principal(supplied)
+            .is_some_and(|principal| principal.can(action))
+    }
+
+    pub fn operator_can_scope(
+        &self,
+        supplied: Option<&str>,
+        action: OperatorAction,
+        resource_type: &str,
+        resource_id: Option<&str>,
+    ) -> bool {
+        self.operator_principal(supplied)
+            .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id))
     }
 
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse, HubError> {
@@ -487,6 +564,26 @@ impl Hub {
         if request.node_id.trim().is_empty() {
             return Err(HubError::Invalid("node_id must not be empty".into()));
         }
+        if request.protocol_version != SUPPORTED_PROTOCOL_VERSION {
+            let message = format!("unsupported protocol version: {}", request.protocol_version);
+            let _ = self
+                .record_audit_event(crate::storage::AuditRecord {
+                    event_id: 0,
+                    actor: None,
+                    action: "agent.register".into(),
+                    resource_type: "node".into(),
+                    resource_id: Some(request.node_id.clone()),
+                    node_id: Some(request.node_id.clone()),
+                    stream_id: None,
+                    correlation_id: None,
+                    outcome: "rejected".into(),
+                    failure_code: Some("incompatible_protocol".into()),
+                    message: Some(message.clone()),
+                    occurred_at_ms: now_ms(),
+                })
+                .await;
+            return Err(HubError::Invalid(message));
+        }
         let now = now_ms();
         let session_token = format!(
             "node-session-{}",
@@ -494,9 +591,10 @@ impl Hub {
         );
         let resource = HubNode {
             id: request.node_id.clone(),
+            protocol_version: request.protocol_version.clone(),
             version: "unknown".into(),
             state: NodeConnectionState::Online,
-            capabilities: request.capabilities.clone(),
+            capabilities: sanitize_capabilities(request.capabilities.clone()),
             last_seen_at_ms: now,
             lease_expires_at_ms: now + self.config.lease_ttl_ms,
             streams_total: 0,
@@ -543,8 +641,10 @@ impl Hub {
                     node_id: request.node_id.clone(),
                     version: "unknown".into(),
                     state: "online".into(),
-                    capabilities_json: serde_json::to_string(&request.capabilities)
-                        .unwrap_or_else(|_| "[]".into()),
+                    capabilities_json: serde_json::to_string(&sanitize_capabilities(
+                        request.capabilities,
+                    ))
+                    .unwrap_or_else(|_| "[]".into()),
                     boot_id: None,
                     report_seq: None,
                     last_seen_at_ms: now,
@@ -583,6 +683,13 @@ impl Hub {
     }
 
     pub async fn heartbeat(&self, request: HeartbeatRequest) -> Result<(), HubError> {
+        if let Some(protocol_version) = request.protocol_version.as_deref() {
+            if protocol_version != SUPPORTED_PROTOCOL_VERSION {
+                return Err(HubError::Invalid(format!(
+                    "unsupported protocol version: {protocol_version}"
+                )));
+            }
+        }
         let mut nodes = self.nodes.write().await;
         let node = authenticated_node(&mut nodes, &request.auth)?;
         let now = now_ms();
@@ -592,6 +699,12 @@ impl Hub {
             "draining" => NodeConnectionState::Draining,
             _ => NodeConnectionState::Online,
         };
+        if let Some(version) = request.software_version {
+            node.resource.version = version;
+        }
+        if !request.capabilities.is_empty() {
+            node.resource.capabilities = sanitize_capabilities(request.capabilities);
+        }
         Ok(())
     }
 
@@ -616,7 +729,7 @@ impl Hub {
             NodeConnectionState::Online
         };
         node.resource.version = report.version;
-        node.resource.capabilities = report.capabilities;
+        node.resource.capabilities = sanitize_capabilities(report.capabilities);
         node.resource.streams_total = report.streams.len();
         node.resource.streams_running = report
             .streams
@@ -631,7 +744,7 @@ impl Hub {
         node.streams = report.streams;
         node.operations = report.operations;
         node.events = report.events.clone();
-        node.metrics = report.metrics;
+        node.metrics = sanitize_metrics(report.metrics);
         node.configuration = report.configuration;
         let persisted_version = node.resource.version.clone();
         let persisted_state = format!("{:?}", node.resource.state).to_lowercase();
@@ -659,14 +772,19 @@ impl Hub {
                 .map_err(HubError::from)?;
         }
         let mut events = self.events.write().await;
-        for event in report.events {
+        for mut event in report.events {
             if events.len() >= MAX_EVENTS {
                 events.pop_front();
             }
+            event.message = event.message.map(|message| bounded_text(&message, 512));
             events.push_back(HubEvent {
+                event_id: None,
                 node_id: report.auth.node_id.clone(),
                 event,
             });
+            if let Some(event) = events.back().cloned() {
+                let _ = self.updates.send(event);
+            }
         }
         if let Some(storage) = self.storage.as_ref() {
             for stream in &reported_streams {
@@ -856,11 +974,15 @@ impl Hub {
                     .write()
                     .await
                     .insert(operation.id.clone(), operation.clone());
+                persist_operation(storage, &operation)
+                    .await
+                    .map_err(HubError::from)?;
             }
         }
         Ok(operation)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_with_metadata(
         &self,
         node_id: String,
@@ -883,6 +1005,55 @@ impl Hub {
             || node.resource.maintenance_state != NodeMaintenanceState::Active
         {
             return Err(HubError::NodeUnavailable);
+        }
+        let required_capabilities = required_capabilities(&operation);
+        let rollout_id = if operation == "apply_configuration" && resource_id == "__configuration__"
+        {
+            self.rollouts
+                .read()
+                .await
+                .values()
+                .find(|rollout| {
+                    config_version_id
+                        .as_deref()
+                        .is_some_and(|id| rollout.config_version_id == id)
+                        && !matches!(
+                            rollout.state.as_str(),
+                            "converged" | "cancelled" | "rolled_back"
+                        )
+                })
+                .map(|rollout| rollout.rollout_id.clone())
+        } else {
+            None
+        };
+        if !node.resource.capabilities.is_empty()
+            && required_capabilities.iter().any(|required| {
+                !node
+                    .resource
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            })
+        {
+            let message = format!("node lacks capability for {operation}");
+            drop(nodes);
+            let _ = self
+                .record_audit_event(crate::storage::AuditRecord {
+                    event_id: 0,
+                    actor: None,
+                    action: "command.dispatch".into(),
+                    resource_type: "stream".into(),
+                    resource_id: Some(resource_id),
+                    node_id: Some(node_id),
+                    stream_id: None,
+                    correlation_id,
+                    outcome: "rejected".into(),
+                    failure_code: Some("incompatible_capability".into()),
+                    message: Some(message.clone()),
+                    occurred_at_ms: now,
+                })
+                .await;
+            return Err(HubError::Invalid(message));
         }
         let mut operations = self.operations.write().await;
         if let Some(operation_id) = operation_id_override.as_deref() {
@@ -950,8 +1121,10 @@ impl Hub {
             action_id,
             config_version_id,
             attempt_id: attempt_id.clone(),
+            rollout_id,
             correlation_id,
             payload,
+            required_capabilities,
         };
         node.commands.push_back(command);
         if operations.len() >= MAX_OPERATIONS {
@@ -960,6 +1133,13 @@ impl Hub {
             }
         }
         operations.insert(operation_record.id.clone(), operation_record.clone());
+        drop(operations);
+        drop(nodes);
+        if let Some(storage) = self.storage.as_ref() {
+            persist_operation(storage, &operation_record)
+                .await
+                .map_err(HubError::from)?;
+        }
         Ok(operation_record)
     }
 
@@ -1014,6 +1194,11 @@ impl Hub {
                 .unwrap_or_else(|| "failed".into());
             storage
                 .complete_attempt(&attempt_id, &state, result.failure_class.clone())
+                .await
+                .map_err(HubError::from)?;
+        }
+        if let Some(storage) = self.storage.as_ref() {
+            persist_operation(storage, &updated)
                 .await
                 .map_err(HubError::from)?;
         }
@@ -1151,6 +1336,19 @@ impl Hub {
                         .map(operation_from_intent),
                 );
             }
+            if let Ok(persisted) = storage.list_operations(node_id.map(str::to_owned)).await {
+                let known = operations
+                    .iter()
+                    .map(|operation| operation.id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                operations.extend(persisted.into_iter().filter_map(|stored| {
+                    if known.contains(&stored.operation_id) {
+                        None
+                    } else {
+                        serde_json::from_str(&stored.operation_json).ok()
+                    }
+                }));
+            }
         }
         operations.sort_by_key(|operation| std::cmp::Reverse(operation.created_at_ms));
         operations.truncate(MAX_OPERATIONS);
@@ -1169,8 +1367,15 @@ impl Hub {
             return Some(operation);
         }
         let storage = self.storage.as_ref()?;
-        let intent = storage.get_intent(id.to_owned()).await.ok()??;
-        Some(operation_from_intent(intent))
+        if let Ok(Some(intent)) = storage.get_intent(id.to_owned()).await {
+            return Some(operation_from_intent(intent));
+        }
+        storage
+            .get_operation(id.to_owned())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|stored| serde_json::from_str(&stored.operation_json).ok())
     }
 
     pub async fn cancel_operation(&self, id: &str) -> Option<HubOperation> {
@@ -1198,6 +1403,10 @@ impl Hub {
         if let Some(node) = nodes.get_mut(&node_id) {
             node.commands.retain(|command| command.id != command_id);
         }
+        drop(nodes);
+        if let Some(storage) = self.storage.as_ref() {
+            let _ = persist_operation(storage, &cancelled).await;
+        }
         Some(cancelled)
     }
 
@@ -1215,13 +1424,14 @@ impl Hub {
                 events.extend(stored.into_iter().filter_map(|event| {
                     let node_id = event.node_id?;
                     Some(HubEvent {
+                        event_id: Some(event.event_id),
                         node_id,
                         event: ControlEvent {
                             occurred_at_ms: event.occurred_at_ms,
                             event_type: event.event_type,
                             stream_id: event.stream_id,
                             outcome: event.outcome,
-                            message: event.message,
+                            message: event.message.map(|message| bounded_text(&message, 512)),
                             operation_id: event.intent_id.or(event.attempt_id),
                             correlation_id: event.correlation_id,
                             actor: event.actor,
@@ -1233,6 +1443,610 @@ impl Hub {
         events.sort_by_key(|event| std::cmp::Reverse(event.event.occurred_at_ms));
         events.truncate(MAX_EVENTS);
         events
+    }
+
+    pub async fn audit(
+        &self,
+        resource_id: Option<&str>,
+    ) -> Result<Vec<crate::storage::AuditRecord>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage
+            .list_audit(resource_id.map(str::to_owned))
+            .await
+            .map_err(HubError::from)
+    }
+
+    pub async fn record_audit_event(
+        &self,
+        record: crate::storage::AuditRecord,
+    ) -> Result<i64, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage.record_audit(record).await.map_err(HubError::from)
+    }
+
+    pub async fn prune_events(&self, retain: usize) -> Result<usize, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage.prune_events(retain).await.map_err(HubError::from)
+    }
+
+    pub async fn create_rollout(
+        &self,
+        config_version_id: String,
+        node_ids: Vec<String>,
+        batch_size: u32,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+    ) -> Result<RolloutRecord, HubError> {
+        let batch_size = batch_size.clamp(1, 256);
+        if node_ids.is_empty() || node_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(HubError::Invalid("rollout requires nodes".into()));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if node_ids.iter().any(|id| !unique.insert(id.clone())) {
+            return Err(HubError::Invalid("rollout contains duplicate nodes".into()));
+        }
+        let now = now_ms();
+        let rollout = RolloutRecord {
+            rollout_id: format!("rollout-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            config_version_id,
+            state: "pending".into(),
+            batch_size,
+            current_batch: 0,
+            total_targets: node_ids.len() as u32,
+            actor: actor.clone(),
+            correlation_id: correlation_id.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let targets = node_ids
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, node_id)| RolloutTargetRecord {
+                rollout_id: rollout.rollout_id.clone(),
+                node_id,
+                ordinal: ordinal as u32,
+                state: "pending".into(),
+                attempt_id: None,
+                error: None,
+                observed_config_version: None,
+                updated_at_ms: now,
+            })
+            .collect::<Vec<_>>();
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        if storage
+            .get_config_version_content(rollout.config_version_id.clone())
+            .await
+            .map_err(HubError::from)?
+            .is_none()
+        {
+            return Err(HubError::Invalid("configuration version not found".into()));
+        }
+        storage
+            .create_rollout(rollout.clone(), targets)
+            .await
+            .map_err(HubError::from)?;
+        storage
+            .record_audit(crate::storage::AuditRecord {
+                event_id: 0,
+                actor,
+                action: "rollout.create".into(),
+                resource_type: "rollout".into(),
+                resource_id: Some(rollout.rollout_id.clone()),
+                node_id: None,
+                stream_id: None,
+                correlation_id,
+                outcome: "accepted".into(),
+                failure_code: None,
+                message: None,
+                occurred_at_ms: now,
+            })
+            .await
+            .map_err(HubError::from)?;
+        self.rollouts
+            .write()
+            .await
+            .insert(rollout.rollout_id.clone(), rollout.clone());
+        Ok(rollout)
+    }
+
+    pub async fn create_rollout_with_content(
+        &self,
+        config_version_id: String,
+        content: String,
+        node_ids: Vec<String>,
+        batch_size: u32,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+    ) -> Result<RolloutRecord, HubError> {
+        let batch_size = batch_size.clamp(1, 256);
+        if node_ids.len() != 1 || node_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(HubError::Invalid(
+                "single-node rollout requires exactly one node".into(),
+            ));
+        }
+        let now = now_ms();
+        let rollout = RolloutRecord {
+            rollout_id: format!("rollout-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            config_version_id,
+            state: "pending".into(),
+            batch_size,
+            current_batch: 0,
+            total_targets: 1,
+            actor: actor.clone(),
+            correlation_id: correlation_id.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let targets = vec![RolloutTargetRecord {
+            rollout_id: rollout.rollout_id.clone(),
+            node_id: node_ids[0].clone(),
+            ordinal: 0,
+            state: "pending".into(),
+            attempt_id: None,
+            error: None,
+            observed_config_version: None,
+            updated_at_ms: now,
+        }];
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage
+            .create_rollout_with_content(rollout.clone(), targets, content, actor.clone())
+            .await
+            .map_err(HubError::from)?;
+        storage
+            .record_audit(crate::storage::AuditRecord {
+                event_id: 0,
+                actor,
+                action: "rollout.create".into(),
+                resource_type: "rollout".into(),
+                resource_id: Some(rollout.rollout_id.clone()),
+                node_id: node_ids.into_iter().next(),
+                stream_id: None,
+                correlation_id,
+                outcome: "accepted".into(),
+                failure_code: None,
+                message: None,
+                occurred_at_ms: now,
+            })
+            .await
+            .map_err(HubError::from)?;
+        self.rollouts
+            .write()
+            .await
+            .insert(rollout.rollout_id.clone(), rollout.clone());
+        Ok(rollout)
+    }
+
+    pub async fn rollout(
+        &self,
+        rollout_id: &str,
+    ) -> Result<Option<(RolloutRecord, Vec<RolloutTargetRecord>)>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let Some(rollout) = storage
+            .get_rollout(rollout_id.to_owned())
+            .await
+            .map_err(HubError::from)?
+        else {
+            return Ok(None);
+        };
+        let targets = storage
+            .list_rollout_targets(rollout_id.to_owned())
+            .await
+            .map_err(HubError::from)?;
+        Ok(Some((rollout, targets)))
+    }
+
+    pub async fn rollouts(&self) -> Result<Vec<RolloutRecord>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage.list_rollouts().await.map_err(HubError::from)
+    }
+
+    pub async fn act_rollout(
+        &self,
+        rollout_id: &str,
+        action: &str,
+        rollback_config_version: Option<String>,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+    ) -> Result<RolloutRecord, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let Some(rollout) = storage
+            .get_rollout(rollout_id.to_owned())
+            .await
+            .map_err(HubError::from)?
+        else {
+            return Err(HubError::Invalid("rollout not found".into()));
+        };
+        let terminal = matches!(
+            rollout.state.as_str(),
+            "converged" | "cancelled" | "rolled_back"
+        );
+        if terminal {
+            return Err(HubError::Invalid("rollout is already terminal".into()));
+        }
+        let now = now_ms();
+        match action {
+            "pause" => {
+                storage
+                    .update_rollout(rollout_id, "paused", rollout.current_batch, now)
+                    .await
+                    .map_err(HubError::from)?;
+                let targets = storage
+                    .list_rollout_targets(rollout_id.to_owned())
+                    .await
+                    .map_err(HubError::from)?;
+                for target in targets
+                    .into_iter()
+                    .filter(|target| target.state == "pending")
+                {
+                    storage
+                        .update_rollout_target(RolloutTargetUpdate {
+                            rollout_id: rollout_id.to_owned(),
+                            node_id: target.node_id,
+                            state: "paused".into(),
+                            attempt_id: target.attempt_id,
+                            error: target.error,
+                            observed_config_version: target.observed_config_version,
+                            updated_at_ms: now,
+                        })
+                        .await
+                        .map_err(HubError::from)?;
+                }
+                self.record_rollout_audit(
+                    &rollout,
+                    "rollout.pause",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                    None,
+                )
+                .await?;
+                Ok(RolloutRecord {
+                    state: "paused".into(),
+                    updated_at_ms: now,
+                    ..rollout
+                })
+            }
+            "resume" => {
+                if rollout.state != "paused" {
+                    return Err(HubError::Invalid("only a paused rollout can resume".into()));
+                }
+                storage
+                    .update_rollout(rollout_id, "applying", rollout.current_batch, now)
+                    .await
+                    .map_err(HubError::from)?;
+                let targets = storage
+                    .list_rollout_targets(rollout_id.to_owned())
+                    .await
+                    .map_err(HubError::from)?;
+                for target in targets
+                    .into_iter()
+                    .filter(|target| target.state == "paused")
+                {
+                    storage
+                        .update_rollout_target(RolloutTargetUpdate {
+                            rollout_id: rollout_id.to_owned(),
+                            node_id: target.node_id,
+                            state: "pending".into(),
+                            attempt_id: target.attempt_id,
+                            error: target.error,
+                            observed_config_version: target.observed_config_version,
+                            updated_at_ms: now,
+                        })
+                        .await
+                        .map_err(HubError::from)?;
+                }
+                self.record_rollout_audit(
+                    &rollout,
+                    "rollout.resume",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                    None,
+                )
+                .await?;
+                Ok(RolloutRecord {
+                    state: "applying".into(),
+                    updated_at_ms: now,
+                    ..rollout
+                })
+            }
+            "cancel" => {
+                storage
+                    .update_rollout(rollout_id, "cancelled", rollout.current_batch, now)
+                    .await
+                    .map_err(HubError::from)?;
+                let targets = storage
+                    .list_rollout_targets(rollout_id.to_owned())
+                    .await
+                    .map_err(HubError::from)?;
+                for target in targets.into_iter().filter(|target| {
+                    matches!(target.state.as_str(), "pending" | "paused" | "applying")
+                }) {
+                    storage
+                        .update_rollout_target(RolloutTargetUpdate {
+                            rollout_id: rollout_id.to_owned(),
+                            node_id: target.node_id,
+                            state: "cancelled".into(),
+                            attempt_id: target.attempt_id,
+                            error: Some("rollout cancelled by operator".into()),
+                            observed_config_version: target.observed_config_version,
+                            updated_at_ms: now,
+                        })
+                        .await
+                        .map_err(HubError::from)?;
+                }
+                self.record_rollout_audit(
+                    &rollout,
+                    "rollout.cancel",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                    None,
+                )
+                .await?;
+                Ok(RolloutRecord {
+                    state: "cancelled".into(),
+                    updated_at_ms: now,
+                    ..rollout
+                })
+            }
+            "rollback" => {
+                let Some(config_version_id) = rollback_config_version else {
+                    return Err(HubError::Invalid("rollback requires config_version".into()));
+                };
+                let targets = storage
+                    .list_rollout_targets(rollout_id.to_owned())
+                    .await
+                    .map_err(HubError::from)?;
+                let rollback = self
+                    .create_rollout(
+                        config_version_id,
+                        targets.into_iter().map(|target| target.node_id).collect(),
+                        rollout.batch_size,
+                        actor.clone(),
+                        correlation_id.clone(),
+                    )
+                    .await?;
+                storage
+                    .update_rollout(rollout_id, "rolled_back", rollout.current_batch, now)
+                    .await
+                    .map_err(HubError::from)?;
+                self.record_rollout_audit(
+                    &rollout,
+                    "rollout.rollback",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                    Some(format!("created rollout {}", rollback.rollout_id)),
+                )
+                .await?;
+                Ok(rollback)
+            }
+            _ => Err(HubError::Invalid(
+                "action must be pause, resume, cancel, or rollback".into(),
+            )),
+        }
+    }
+
+    async fn record_rollout_audit(
+        &self,
+        rollout: &RolloutRecord,
+        action: &str,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+        outcome: &str,
+        message: Option<String>,
+    ) -> Result<(), HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage
+            .record_audit(crate::storage::AuditRecord {
+                event_id: 0,
+                actor,
+                action: action.into(),
+                resource_type: "rollout".into(),
+                resource_id: Some(rollout.rollout_id.clone()),
+                node_id: None,
+                stream_id: None,
+                correlation_id,
+                outcome: outcome.into(),
+                failure_code: None,
+                message: message.map(|value| value.chars().take(256).collect()),
+                occurred_at_ms: now_ms(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(HubError::from)
+    }
+
+    pub async fn reconcile_rollouts(&self) -> Result<usize, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let active = storage.recover_rollouts().await.map_err(HubError::from)?;
+        let mut changes = 0;
+        for rollout in active {
+            if rollout.state == "paused" {
+                continue;
+            }
+            let targets = storage
+                .list_rollout_targets(rollout.rollout_id.clone())
+                .await
+                .map_err(HubError::from)?;
+            let batch_start = rollout.current_batch * rollout.batch_size;
+            let batch_end = batch_start + rollout.batch_size;
+            let mut batch_failed = false;
+            for target in targets
+                .iter()
+                .filter(|target| target.ordinal >= batch_start && target.ordinal < batch_end)
+            {
+                match target.state.as_str() {
+                    "pending" => {
+                        let online =
+                            self.nodes
+                                .read()
+                                .await
+                                .get(&target.node_id)
+                                .is_some_and(|node| {
+                                    node.resource.state == NodeConnectionState::Online
+                                        && node.resource.lease_expires_at_ms > now_ms()
+                                        && node.resource.maintenance_state
+                                            == NodeMaintenanceState::Active
+                                });
+                        if !online {
+                            continue;
+                        }
+                        let Some(payload_json) = storage
+                            .get_config_version_content(rollout.config_version_id.clone())
+                            .await
+                            .map_err(HubError::from)?
+                        else {
+                            storage
+                                .update_rollout_target(RolloutTargetUpdate {
+                                    rollout_id: rollout.rollout_id.clone(),
+                                    node_id: target.node_id.clone(),
+                                    state: "failed".into(),
+                                    attempt_id: None,
+                                    error: Some("configuration version content is missing".into()),
+                                    observed_config_version: None,
+                                    updated_at_ms: now_ms(),
+                                })
+                                .await
+                                .map_err(HubError::from)?;
+                            batch_failed = true;
+                            changes += 1;
+                            continue;
+                        };
+                        let expected_generation = storage
+                            .get_desired(target.node_id.clone(), "__configuration__")
+                            .await
+                            .map_err(HubError::from)?
+                            .map(|desired| desired.generation)
+                            .unwrap_or(0);
+                        let intent = self
+                            .set_desired_state(DesiredMutation {
+                                node_id: target.node_id.clone(),
+                                stream_id: "__configuration__".into(),
+                                desired_state: "configured".into(),
+                                config_version_id: Some(rollout.config_version_id.clone()),
+                                action_id: None,
+                                expected_generation: Some(expected_generation),
+                                actor: rollout.actor.clone(),
+                                correlation_id: rollout.correlation_id.clone(),
+                                idempotency_key: Some(format!(
+                                    "{}:{}",
+                                    rollout.rollout_id, target.node_id
+                                )),
+                                intent_type: Some("apply_configuration".into()),
+                                payload_json: Some(payload_json),
+                            })
+                            .await?;
+                        storage
+                            .update_rollout_target(RolloutTargetUpdate {
+                                rollout_id: rollout.rollout_id.clone(),
+                                node_id: target.node_id.clone(),
+                                state: "applying".into(),
+                                attempt_id: Some(intent.intent_id),
+                                error: None,
+                                observed_config_version: None,
+                                updated_at_ms: now_ms(),
+                            })
+                            .await
+                            .map_err(HubError::from)?;
+                        changes += 1;
+                    }
+                    "applying" => {
+                        let Some(intent_id) = target.attempt_id.as_deref() else {
+                            continue;
+                        };
+                        let Some(intent) = storage
+                            .get_intent(intent_id.to_owned())
+                            .await
+                            .map_err(HubError::from)?
+                        else {
+                            continue;
+                        };
+                        if intent.state == "converged" {
+                            storage
+                                .update_rollout_target(RolloutTargetUpdate {
+                                    rollout_id: rollout.rollout_id.clone(),
+                                    node_id: target.node_id.clone(),
+                                    state: "succeeded".into(),
+                                    attempt_id: target.attempt_id.clone(),
+                                    error: None,
+                                    observed_config_version: intent.config_version_id.clone(),
+                                    updated_at_ms: now_ms(),
+                                })
+                                .await
+                                .map_err(HubError::from)?;
+                            changes += 1;
+                        } else if matches!(intent.state.as_str(), "blocked" | "superseded") {
+                            storage
+                                .update_rollout_target(RolloutTargetUpdate {
+                                    rollout_id: rollout.rollout_id.clone(),
+                                    node_id: target.node_id.clone(),
+                                    state: "failed".into(),
+                                    attempt_id: target.attempt_id.clone(),
+                                    error: intent.failure_class.clone(),
+                                    observed_config_version: intent.config_version_id.clone(),
+                                    updated_at_ms: now_ms(),
+                                })
+                                .await
+                                .map_err(HubError::from)?;
+                            batch_failed = true;
+                            changes += 1;
+                        }
+                    }
+                    "failed" => batch_failed = true,
+                    _ => {}
+                }
+            }
+            let refreshed = storage
+                .list_rollout_targets(rollout.rollout_id.clone())
+                .await
+                .map_err(HubError::from)?;
+            let current_batch = refreshed
+                .iter()
+                .filter(|target| target.ordinal >= batch_start && target.ordinal < batch_end)
+                .collect::<Vec<_>>();
+            if batch_failed {
+                storage
+                    .update_rollout(
+                        &rollout.rollout_id,
+                        "paused",
+                        rollout.current_batch,
+                        now_ms(),
+                    )
+                    .await
+                    .map_err(HubError::from)?;
+            } else if !current_batch.is_empty()
+                && current_batch
+                    .iter()
+                    .all(|target| target.state == "succeeded")
+            {
+                let next_batch = rollout.current_batch + 1;
+                let complete = next_batch * rollout.batch_size >= rollout.total_targets;
+                storage
+                    .update_rollout(
+                        &rollout.rollout_id,
+                        if complete { "converged" } else { "applying" },
+                        next_batch,
+                        now_ms(),
+                    )
+                    .await
+                    .map_err(HubError::from)?;
+                changes += 1;
+            } else if rollout.state == "pending" {
+                storage
+                    .update_rollout(
+                        &rollout.rollout_id,
+                        "applying",
+                        rollout.current_batch,
+                        now_ms(),
+                    )
+                    .await
+                    .map_err(HubError::from)?;
+                changes += 1;
+            }
+        }
+        Ok(changes)
     }
 
     pub async fn metrics(&self, node_id: Option<&str>) -> BTreeMap<String, f64> {
@@ -1439,6 +2253,105 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
 fn default_protocol_version() -> String {
     "v1".into()
 }
+
+fn sanitize_metrics(metrics: BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+    metrics
+        .into_iter()
+        .filter(|(key, value)| {
+            ALLOWED_NODE_METRICS.contains(&key.as_str()) && value.is_finite() && *value >= 0.0
+        })
+        .collect()
+}
+
+fn sanitize_capabilities(capabilities: Vec<String>) -> Vec<String> {
+    capabilities
+        .into_iter()
+        .filter(|capability| {
+            !capability.is_empty()
+                && capability.len() <= 64
+                && capability
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        })
+        .take(32)
+        .collect()
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn parse_operator_credential(configured: &str) -> (&str, OperatorRole, &str, Vec<ResourceScope>) {
+    let mut fields = configured.splitn(4, '|');
+    let Some(id) = fields.next() else {
+        return ("operator", OperatorRole::Admin, configured, Vec::new());
+    };
+    let Some(role) = fields.next() else {
+        return ("operator", OperatorRole::Admin, configured, Vec::new());
+    };
+    let Some(secret) = fields.next() else {
+        return ("operator", OperatorRole::Admin, configured, Vec::new());
+    };
+    let role = match role {
+        "admin" => OperatorRole::Admin,
+        "operator" => OperatorRole::Operator,
+        "viewer" => OperatorRole::Viewer,
+        _ => return ("operator", OperatorRole::Admin, configured, Vec::new()),
+    };
+    if id.trim().is_empty() || secret.is_empty() {
+        ("operator", OperatorRole::Admin, configured, Vec::new())
+    } else {
+        let scopes = fields
+            .next()
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .filter_map(parse_resource_scope)
+            .collect();
+        (id, role, secret, scopes)
+    }
+}
+
+fn parse_resource_scope(value: &str) -> Option<ResourceScope> {
+    let (resource_type, resource_id) = value.split_once('=')?;
+    if resource_type.trim().is_empty() {
+        return None;
+    }
+    Some(ResourceScope {
+        resource_type: resource_type.to_owned(),
+        resource_id: (!resource_id.is_empty()).then(|| resource_id.to_owned()),
+    })
+}
+
+fn required_capabilities(operation: &str) -> Vec<String> {
+    match operation {
+        "start" | "stop" | "restart" => vec!["stream_lifecycle".into()],
+        "apply_configuration" | "rollback_configuration" => vec!["configuration".into()],
+        _ => Vec::new(),
+    }
+}
+
+async fn persist_operation(
+    storage: &StorageActor,
+    operation: &HubOperation,
+) -> Result<(), StorageError> {
+    storage
+        .upsert_operation(PersistedOperation {
+            operation_id: operation.id.clone(),
+            node_id: operation.node_id.clone(),
+            resource_id: operation.resource_id.clone(),
+            operation: operation.operation.clone(),
+            state: serde_json::to_value(operation.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+            created_at_ms: operation.created_at_ms,
+            updated_at_ms: now_ms(),
+            operation_json: serde_json::to_string(operation)
+                .map_err(|_| StorageError::ActorClosed)?,
+        })
+        .await
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1467,6 +2380,66 @@ mod tests {
     }
 
     #[test]
+    fn node_metrics_accept_only_finite_whitelisted_values() {
+        let metrics = sanitize_metrics(BTreeMap::from([
+            ("input_messages".into(), 4.0),
+            ("arbitrary_label".into(), 99.0),
+            ("output_errors".into(), f64::NAN),
+            ("restarts".into(), -1.0),
+        ]));
+        assert_eq!(metrics.get("input_messages"), Some(&4.0));
+        assert!(!metrics.contains_key("arbitrary_label"));
+        assert!(!metrics.contains_key("output_errors"));
+        assert!(!metrics.contains_key("restarts"));
+    }
+
+    #[test]
+    fn capability_allowlist_is_bounded_and_label_safe() {
+        let long = "x".repeat(65);
+        let capabilities =
+            sanitize_capabilities(vec!["configuration".into(), "unsafe label".into(), long]);
+        assert_eq!(capabilities, vec!["configuration"]);
+    }
+
+    #[test]
+    fn compatibility_token_can_be_scoped_to_a_role() {
+        let hub = Hub::new(HubConfig {
+            operator_token: Some("readonly|viewer|viewer-secret".into()),
+            ..config()
+        });
+        assert!(hub.operator_authorized(Some("viewer-secret")));
+        assert!(hub.operator_can(Some("viewer-secret"), OperatorAction::Read));
+        assert!(!hub.operator_can(Some("viewer-secret"), OperatorAction::Operate));
+        assert!(!hub.operator_authorized(Some("operator")));
+    }
+
+    #[test]
+    fn operator_credential_can_limit_resource_scope() {
+        let hub = Hub::new(HubConfig {
+            operator_token: Some("ops|operator|operator-secret|node=node-a,rollout=".into()),
+            ..config()
+        });
+        assert!(hub.operator_can_scope(
+            Some("operator-secret"),
+            OperatorAction::Operate,
+            "node",
+            Some("node-a")
+        ));
+        assert!(!hub.operator_can_scope(
+            Some("operator-secret"),
+            OperatorAction::Operate,
+            "node",
+            Some("node-b")
+        ));
+        assert!(hub.operator_can_scope(
+            Some("operator-secret"),
+            OperatorAction::ManageRollouts,
+            "rollout",
+            Some("rollout-1")
+        ));
+    }
+
+    #[test]
     fn agent_wire_contract_round_trips_reconciliation_fields() {
         let command = AgentCommand {
             id: "cmd-1".into(),
@@ -1481,6 +2454,8 @@ mod tests {
             attempt_id: Some("attempt-7".into()),
             correlation_id: Some("corr-7".into()),
             payload: None,
+            required_capabilities: vec!["stream_lifecycle".into()],
+            rollout_id: None,
         };
         let encoded = serde_json::to_vec(&command).unwrap();
         let decoded: AgentCommand = serde_json::from_slice(&encoded).unwrap();
@@ -1575,6 +2550,478 @@ mod tests {
             .await
             .iter()
             .any(|value| value.intent_id.as_deref() == Some(intent.intent_id.as_str())));
+    }
+
+    #[tokio::test]
+    async fn rollout_actions_are_durable_and_audited() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-current', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let storage = StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage);
+        let rollout = hub
+            .create_rollout(
+                "cfg-current".into(),
+                vec!["node-a".into(), "node-b".into()],
+                1,
+                Some("operator".into()),
+                Some("corr-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let paused = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "pause",
+                None,
+                Some("operator".into()),
+                Some("corr-2".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused.state, "paused");
+        let resumed = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "resume",
+                None,
+                Some("operator".into()),
+                Some("corr-3".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.state, "applying");
+        let cancelled = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "cancel",
+                None,
+                Some("operator".into()),
+                Some("corr-4".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        let persisted = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(persisted.0.state, "cancelled");
+        assert_eq!(
+            persisted
+                .1
+                .iter()
+                .filter(|target| target.state == "cancelled")
+                .count(),
+            2
+        );
+        assert_eq!(hub.audit(Some(&rollout.rollout_id)).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn rollout_reconciler_dispatches_only_the_current_batch() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-batch', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        for node_id in ["node-a", "node-b"] {
+            hub.register(RegisterRequest {
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+            })
+            .await
+            .unwrap();
+        }
+        let rollout = hub
+            .create_rollout(
+                "cfg-batch".into(),
+                vec!["node-a".into(), "node-b".into()],
+                1,
+                Some("operator".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hub.reconcile_rollouts().await.unwrap(), 2);
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+        assert_eq!(targets[1].state, "pending");
+        assert_eq!(
+            hub.rollout(&rollout.rollout_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .current_batch,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_converges_only_after_target_configuration_is_observed() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-health', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+            })
+            .await
+            .unwrap();
+        let rollout = hub
+            .create_rollout(
+                "cfg-health".into(),
+                vec!["node-a".into()],
+                1,
+                Some("operator".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        assert_eq!(
+            hub.rollout(&rollout.rollout_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+            "applying"
+        );
+        hub.report(NodeReport {
+            auth: AgentAuth {
+                node_id: "node-a".into(),
+                session_token: session.session_token,
+            },
+            version: "agent-1".into(),
+            state: "online".into(),
+            capabilities: vec!["configuration".into()],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            configuration: None,
+            configuration_version: Some("cfg-health".into()),
+            boot_id: Some("boot-health".into()),
+            report_seq: 1,
+        })
+        .await
+        .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (rollout, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "succeeded");
+        assert_eq!(rollout.state, "converged");
+    }
+
+    #[tokio::test]
+    async fn rollout_state_machine_covers_gates_drain_restart_rollback_and_cancel() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                for version in ["cfg-state-a", "cfg-state-b"] {
+                    connection.execute(
+                        "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES (?1, 'digest', '{}', 'json', 1)",
+                        [version],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let storage = StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage.clone());
+        let node_a = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+            })
+            .await
+            .unwrap();
+        hub.register(RegisterRequest {
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+        })
+        .await
+        .unwrap();
+        hub.set_node_maintenance(
+            "node-b",
+            NodeMaintenanceState::Draining,
+            Some("operator".into()),
+            Some("drain-state".into()),
+        )
+        .await
+        .unwrap();
+
+        let rollout = hub
+            .create_rollout(
+                "cfg-state-a".into(),
+                vec!["node-a".into(), "node-b".into()],
+                1,
+                Some("operator".into()),
+                Some("state-machine".into()),
+            )
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+        assert_eq!(targets[1].state, "pending");
+
+        let paused = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "pause",
+                None,
+                Some("operator".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused.state, "paused");
+        let resumed = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "resume",
+                None,
+                Some("operator".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.state, "applying");
+
+        hub.report(NodeReport {
+            auth: AgentAuth {
+                node_id: "node-a".into(),
+                session_token: node_a.session_token,
+            },
+            version: "agent-state".into(),
+            state: "online".into(),
+            capabilities: vec!["configuration".into()],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            configuration: None,
+            configuration_version: Some("cfg-state-a".into()),
+            boot_id: Some("boot-state".into()),
+            report_seq: 1,
+        })
+        .await
+        .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        hub.set_node_maintenance(
+            "node-b",
+            NodeMaintenanceState::Active,
+            Some("operator".into()),
+            Some("resume-state".into()),
+        )
+        .await
+        .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "succeeded");
+        assert_eq!(targets[1].state, "applying");
+
+        let rollback = hub
+            .act_rollout(
+                &rollout.rollout_id,
+                "rollback",
+                Some("cfg-state-b".into()),
+                Some("operator".into()),
+                Some("rollback-state".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback.total_targets, 2);
+        assert_eq!(
+            hub.rollout(&rollout.rollout_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+            "rolled_back"
+        );
+
+        let failed = hub
+            .create_rollout(
+                "cfg-state-a".into(),
+                vec!["node-a".into()],
+                1,
+                Some("operator".into()),
+                Some("permanent-failure".into()),
+            )
+            .await
+            .unwrap();
+        storage
+            .update_rollout_target(RolloutTargetUpdate {
+                rollout_id: failed.rollout_id.clone(),
+                node_id: "node-a".into(),
+                state: "failed".into(),
+                attempt_id: None,
+                error: Some("permanent_execution".into()),
+                observed_config_version: None,
+                updated_at_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        assert_eq!(
+            hub.rollout(&failed.rollout_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+            "paused"
+        );
+
+        drop(hub);
+        let recovered = Hub::with_storage(config(), storage);
+        recovered.recover_persisted_state().await.unwrap();
+        assert_eq!(
+            recovered
+                .rollout(&rollback.rollout_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+            "applying"
+        );
+        let cancelled = recovered
+            .act_rollout(
+                &rollback.rollout_id,
+                "cancel",
+                None,
+                Some("operator".into()),
+                Some("cancel-state".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn multiple_agent_rollout_smoke_completes_through_commands_and_reports() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-e2e', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let mut sessions = Vec::new();
+        for node_id in ["agent-a", "agent-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: "v1".into(),
+                    capabilities: vec!["configuration".into()],
+                })
+                .await
+                .unwrap();
+            sessions.push((node_id.to_owned(), session.session_token));
+        }
+        let rollout = hub
+            .create_rollout(
+                "cfg-e2e".into(),
+                vec!["agent-a".into(), "agent-b".into()],
+                2,
+                Some("operator".into()),
+                Some("e2e-rollout".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hub.reconcile_rollouts().await.unwrap(), 3);
+
+        for (node_id, session_token) in sessions {
+            let worker_id = format!("e2e-reconcile-{node_id}");
+            let operation = hub.reconcile_once(&worker_id).await.unwrap().unwrap();
+            let auth = AgentAuth {
+                node_id: node_id.clone(),
+                session_token,
+            };
+            let commands = hub.commands(auth.clone()).await.unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(
+                commands[0].rollout_id.as_deref(),
+                Some(rollout.rollout_id.as_str())
+            );
+            hub.command_result(
+                auth.clone(),
+                CommandResult {
+                    command_id: commands[0].id.clone(),
+                    operation_id: operation.id,
+                    state: HubOperationState::Succeeded,
+                    progress: 100,
+                    error: None,
+                    correlation_id: commands[0].correlation_id.clone(),
+                    generation: commands[0].generation,
+                    observed_generation: None,
+                    action_id: commands[0].action_id.clone(),
+                    failure_class: None,
+                    config_version_id: Some("cfg-e2e".into()),
+                    rollout_id: commands[0].rollout_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            hub.report(NodeReport {
+                auth,
+                version: "agent-e2e".into(),
+                state: "online".into(),
+                capabilities: vec!["configuration".into()],
+                streams: vec![],
+                operations: vec![],
+                events: vec![],
+                metrics: BTreeMap::from([("streams_total".into(), 0.0)]),
+                configuration: None,
+                configuration_version: Some("cfg-e2e".into()),
+                boot_id: Some(format!("boot-{node_id}")),
+                report_seq: 1,
+            })
+            .await
+            .unwrap();
+        }
+        hub.reconcile_rollouts().await.unwrap();
+        let (rollout, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(rollout.state, "converged");
+        assert!(targets.iter().all(|target| target.state == "succeeded"));
     }
 
     #[tokio::test]
@@ -1743,6 +3190,7 @@ mod tests {
                     action_id: None,
                     failure_class: None,
                     config_version_id: None,
+                    rollout_id: None,
                 },
             )
             .await
@@ -1774,6 +3222,48 @@ mod tests {
         ));
         assert_eq!(hub.nodes().await[0].state, NodeConnectionState::Stale);
         assert!(!session.session_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_capability_is_rejected_before_dispatch() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = crate::storage::StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage.clone());
+        assert!(matches!(
+            hub.register(RegisterRequest {
+                node_id: "incompatible".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v0".into(),
+                capabilities: vec![],
+            })
+            .await,
+            Err(HubError::Invalid(message)) if message.contains("protocol")
+        ));
+        let protocol_audit = hub.audit(Some("incompatible")).await.unwrap();
+        assert_eq!(
+            protocol_audit[0].failure_code.as_deref(),
+            Some("incompatible_protocol")
+        );
+        hub.register(RegisterRequest {
+            node_id: "n1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            hub.enqueue("n1".into(), "start".into(), "orders".into(), None)
+                .await,
+            Err(HubError::Invalid(message)) if message.contains("capability")
+        ));
+        let audit = hub.audit(Some("orders")).await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].failure_code.as_deref(),
+            Some("incompatible_capability")
+        );
+        assert_eq!(audit[0].outcome, "rejected");
     }
 
     #[tokio::test]
@@ -1939,6 +3429,10 @@ mod tests {
                     session_token: first.session_token
                 },
                 state: "online".into(),
+                protocol_version: None,
+                software_version: None,
+                capabilities: vec![],
+                rollout_id: None,
             })
             .await,
             Err(HubError::Unauthorized)
@@ -1949,6 +3443,10 @@ mod tests {
                 session_token: second.session_token,
             },
             state: "online".into(),
+            protocol_version: None,
+            software_version: None,
+            capabilities: vec![],
+            rollout_id: None,
         })
         .await
         .unwrap();

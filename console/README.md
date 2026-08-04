@@ -25,6 +25,12 @@ singleton compatibility endpoint is `/api/v1/node`. Node-scoped mutations
 must include the target node in the URL, and stale/offline Hub nodes reject
 mutations with `node_unavailable`.
 
+The Rollouts view creates bounded configuration rollouts and exposes per-node
+progress, audit history, and pause/resume/cancel/rollback actions. The Console
+also opens `/api/v1/events/stream` with the configured Authorization header;
+SSE reconnects send `Last-Event-ID`, while REST polling remains a slower
+snapshot fallback when the stream is unavailable.
+
 For local Hub development, use the same value as `ARKFLOW_OPERATOR_TOKEN`:
 
 ```bash

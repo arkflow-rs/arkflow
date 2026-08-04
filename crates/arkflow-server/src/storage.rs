@@ -5,13 +5,14 @@
 //! the state machine can later move to a server database.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DesiredMutation {
     pub node_id: String,
     pub stream_id: String,
@@ -62,24 +63,6 @@ pub struct OperationalAggregates {
     pub active_attempts: u64,
     pub non_terminal_intents: u64,
     pub oldest_pending_age_seconds: Option<u64>,
-}
-
-impl Default for DesiredMutation {
-    fn default() -> Self {
-        Self {
-            node_id: String::new(),
-            stream_id: String::new(),
-            desired_state: String::new(),
-            config_version_id: None,
-            action_id: None,
-            expected_generation: None,
-            actor: None,
-            correlation_id: None,
-            idempotency_key: None,
-            intent_type: None,
-            payload_json: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +141,7 @@ pub struct OutboxRecord {
 
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
+    pub event_id: i64,
     pub node_id: Option<String>,
     pub stream_id: Option<String>,
     pub intent_id: Option<String>,
@@ -170,6 +154,71 @@ pub struct StoredEvent {
     pub correlation_id: Option<String>,
     pub occurred_at_ms: u64,
     pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditRecord {
+    pub event_id: i64,
+    pub actor: Option<String>,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub node_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub outcome: String,
+    pub failure_code: Option<String>,
+    pub message: Option<String>,
+    pub occurred_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RolloutRecord {
+    pub rollout_id: String,
+    pub config_version_id: String,
+    pub state: String,
+    pub batch_size: u32,
+    pub current_batch: u32,
+    pub total_targets: u32,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RolloutTargetRecord {
+    pub rollout_id: String,
+    pub node_id: String,
+    pub ordinal: u32,
+    pub state: String,
+    pub attempt_id: Option<String>,
+    pub error: Option<String>,
+    pub observed_config_version: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedOperation {
+    pub operation_id: String,
+    pub node_id: String,
+    pub resource_id: String,
+    pub operation: String,
+    pub state: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub operation_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RolloutTargetUpdate {
+    pub rollout_id: String,
+    pub node_id: String,
+    pub state: String,
+    pub attempt_id: Option<String>,
+    pub error: Option<String>,
+    pub observed_config_version: Option<String>,
+    pub updated_at_ms: u64,
 }
 
 /// Storage-neutral contract used by Hub/Reconciler code.
@@ -265,6 +314,10 @@ enum StorageCommand {
         node_id: Option<String>,
         response: oneshot::Sender<Result<Vec<StoredEvent>, StorageError>>,
     },
+    PruneEvents {
+        retain: usize,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
     ClaimAttempt {
         intent_id: String,
         response: oneshot::Sender<Result<Option<AttemptRecord>, StorageError>>,
@@ -310,6 +363,67 @@ enum StorageCommand {
     OperationalAggregates {
         now_ms: u64,
         response: oneshot::Sender<Result<OperationalAggregates, StorageError>>,
+    },
+    RecordAudit {
+        record: AuditRecord,
+        response: oneshot::Sender<Result<i64, StorageError>>,
+    },
+    ListAudit {
+        resource_id: Option<String>,
+        response: oneshot::Sender<Result<Vec<AuditRecord>, StorageError>>,
+    },
+    CreateRollout {
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    CreateRolloutWithContent {
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: String,
+        created_by: Option<String>,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    GetRollout {
+        rollout_id: String,
+        response: oneshot::Sender<Result<Option<RolloutRecord>, StorageError>>,
+    },
+    ListRolloutTargets {
+        rollout_id: String,
+        response: oneshot::Sender<Result<Vec<RolloutTargetRecord>, StorageError>>,
+    },
+    UpdateRollout {
+        rollout_id: String,
+        state: String,
+        current_batch: u32,
+        updated_at_ms: u64,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    UpdateRolloutTarget {
+        update: RolloutTargetUpdate,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    GetConfigVersionContent {
+        config_version_id: String,
+        response: oneshot::Sender<Result<Option<String>, StorageError>>,
+    },
+    RecoverRollouts {
+        response: oneshot::Sender<Result<Vec<RolloutRecord>, StorageError>>,
+    },
+    ListRollouts {
+        response: oneshot::Sender<Result<Vec<RolloutRecord>, StorageError>>,
+    },
+    UpsertOperation {
+        operation: PersistedOperation,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    GetOperation {
+        operation_id: String,
+        response: oneshot::Sender<Result<Option<PersistedOperation>, StorageError>>,
+    },
+    ListOperations {
+        node_id: Option<String>,
+        response: oneshot::Sender<Result<Vec<PersistedOperation>, StorageError>>,
     },
 }
 
@@ -358,6 +472,9 @@ impl StorageActor {
                     }
                     StorageCommand::ListEvents { node_id, response } => {
                         let _ = response.send(store.list_events(node_id.as_deref()));
+                    }
+                    StorageCommand::PruneEvents { retain, response } => {
+                        let _ = response.send(store.prune_events(retain));
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
@@ -417,6 +534,92 @@ impl StorageActor {
                     }
                     StorageCommand::OperationalAggregates { now_ms, response } => {
                         let _ = response.send(store.operational_aggregates(now_ms));
+                    }
+                    StorageCommand::RecordAudit { record, response } => {
+                        let _ = response.send(store.record_audit(record));
+                    }
+                    StorageCommand::ListAudit {
+                        resource_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.list_audit(resource_id.as_deref()));
+                    }
+                    StorageCommand::CreateRollout {
+                        rollout,
+                        targets,
+                        response,
+                    } => {
+                        let _ = response.send(store.create_rollout(rollout, targets));
+                    }
+                    StorageCommand::CreateRolloutWithContent {
+                        rollout,
+                        targets,
+                        content,
+                        created_by,
+                        response,
+                    } => {
+                        let _ = response.send(store.create_rollout_with_content(
+                            rollout,
+                            targets,
+                            &content,
+                            created_by.as_deref(),
+                        ));
+                    }
+                    StorageCommand::GetRollout {
+                        rollout_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.get_rollout(&rollout_id));
+                    }
+                    StorageCommand::ListRolloutTargets {
+                        rollout_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.list_rollout_targets(&rollout_id));
+                    }
+                    StorageCommand::UpdateRollout {
+                        rollout_id,
+                        state,
+                        current_batch,
+                        updated_at_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_rollout(
+                            &rollout_id,
+                            &state,
+                            current_batch,
+                            updated_at_ms,
+                        ));
+                    }
+                    StorageCommand::UpdateRolloutTarget { update, response } => {
+                        let _ = response.send(store.update_rollout_target(update));
+                    }
+                    StorageCommand::GetConfigVersionContent {
+                        config_version_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.get_config_version_content(&config_version_id));
+                    }
+                    StorageCommand::RecoverRollouts { response } => {
+                        let _ = response.send(store.recover_rollouts());
+                    }
+                    StorageCommand::ListRollouts { response } => {
+                        let _ = response.send(store.list_rollouts());
+                    }
+                    StorageCommand::UpsertOperation {
+                        operation,
+                        response,
+                    } => {
+                        let _ = response.send(store.upsert_operation(operation));
+                    }
+                    StorageCommand::GetOperation {
+                        operation_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.get_operation(&operation_id));
+                    }
+                    StorageCommand::ListOperations { node_id, response } => {
+                        let _ = response.send(store.list_operations(node_id.as_deref()));
                     }
                 }
             }
@@ -550,6 +753,15 @@ impl StorageActor {
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
+    pub async fn prune_events(&self, retain: usize) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneEvents { retain, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
     pub async fn claim_attempt(
         &self,
         intent_id: impl Into<String>,
@@ -673,6 +885,209 @@ impl StorageActor {
             .send(StorageCommand::MarkOutboxProcessed {
                 outbox_id,
                 now_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::RecordAudit { record, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_audit(
+        &self,
+        resource_id: Option<impl Into<String>>,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListAudit {
+                resource_id: resource_id.map(Into::into),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn create_rollout(
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::CreateRollout {
+                rollout,
+                targets,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn create_rollout_with_content(
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: impl Into<String>,
+        created_by: Option<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::CreateRolloutWithContent {
+                rollout,
+                targets,
+                content: content.into(),
+                created_by,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_rollout(
+        &self,
+        rollout_id: impl Into<String>,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetRollout {
+                rollout_id: rollout_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_rollout_targets(
+        &self,
+        rollout_id: impl Into<String>,
+    ) -> Result<Vec<RolloutTargetRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListRolloutTargets {
+                rollout_id: rollout_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_rollout(
+        &self,
+        rollout_id: impl Into<String>,
+        state: impl Into<String>,
+        current_batch: u32,
+        updated_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateRollout {
+                rollout_id: rollout_id.into(),
+                state: state.into(),
+                current_batch,
+                updated_at_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_rollout_target(
+        &self,
+        update: RolloutTargetUpdate,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateRolloutTarget { update, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_config_version_content(
+        &self,
+        config_version_id: impl Into<String>,
+    ) -> Result<Option<String>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetConfigVersionContent {
+                config_version_id: config_version_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::RecoverRollouts { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListRollouts { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn upsert_operation(
+        &self,
+        operation: PersistedOperation,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertOperation {
+                operation,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_operation(
+        &self,
+        operation_id: impl Into<String>,
+    ) -> Result<Option<PersistedOperation>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetOperation {
+                operation_id: operation_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_operations(
+        &self,
+        node_id: Option<impl Into<String>>,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListOperations {
+                node_id: node_id.map(Into::into),
                 response,
             })
             .await
@@ -853,6 +1268,18 @@ impl ControlPlaneStore {
                 "INSERT INTO cp_events (node_id, stream_id, intent_id, event_type, outcome, generation, correlation_id, occurred_at_ms) VALUES (?1, ?2, ?3, 'intent_created', 'accepted', ?4, ?5, ?6)",
                 (&mutation.node_id, &mutation.stream_id, &intent_id, generation, &mutation.correlation_id, now),
             )?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, occurred_at_ms) VALUES (?1, ?2, 'stream', ?3, ?4, ?5, ?6, 'accepted', ?7)",
+                rusqlite::params![
+                    mutation.actor,
+                    intent_type,
+                    format!("{}:{}", mutation.node_id, mutation.stream_id),
+                    mutation.node_id,
+                    mutation.stream_id,
+                    mutation.correlation_id,
+                    now,
+                ],
+            )?;
             Ok(IntentRecord {
                 intent_id,
                 node_id: mutation.node_id,
@@ -924,6 +1351,10 @@ impl ControlPlaneStore {
                     "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_maintenance_changed', 'succeeded', ?2, ?3, ?4, ?5)",
                     rusqlite::params![mutation.node_id, format!("{previous}->{state}"), mutation.correlation_id, mutation.actor, now_ms],
                 )?;
+                transaction.execute(
+                    "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'node.maintenance', 'node', ?2, ?2, ?3, 'accepted', ?4, ?5)",
+                    rusqlite::params![mutation.actor, mutation.node_id, mutation.correlation_id, format!("{previous}->{state}"), now_ms],
+                )?;
             }
             Ok(true)
         })
@@ -974,6 +1405,7 @@ impl ControlPlaneStore {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn claim_outbox(
         &self,
         worker_id: &str,
@@ -1119,28 +1551,40 @@ impl ControlPlaneStore {
     pub fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, message, generation, correlation_id, occurred_at_ms, actor FROM cp_events WHERE (?1 IS NULL OR node_id = ?1) ORDER BY occurred_at_ms DESC, event_id DESC LIMIT 2048",
+                "SELECT event_id, node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, message, generation, correlation_id, occurred_at_ms, actor FROM cp_events WHERE (?1 IS NULL OR node_id = ?1) ORDER BY event_id DESC LIMIT 2048",
             )?;
             let rows = statement.query_map([node_id], |row| {
                 Ok(StoredEvent {
-                    node_id: row.get(0)?,
-                    stream_id: row.get(1)?,
-                    intent_id: row.get(2)?,
-                    attempt_id: row.get(3)?,
-                    event_type: row.get(4)?,
-                    outcome: row.get(5)?,
-                    failure_class: row.get(6)?,
-                    message: row.get(7)?,
-                    generation: row.get(8)?,
-                    correlation_id: row.get(9)?,
-                    occurred_at_ms: row.get(10)?,
-                    actor: row.get(11)?,
+                    event_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    stream_id: row.get(2)?,
+                    intent_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    event_type: row.get(5)?,
+                    outcome: row.get(6)?,
+                    failure_class: row.get(7)?,
+                    message: row.get(8)?,
+                    generation: row.get(9)?,
+                    correlation_id: row.get(10)?,
+                    occurred_at_ms: row.get(11)?,
+                    actor: row.get(12)?,
                 })
             })?;
             rows.collect()
         })
     }
 
+    pub fn prune_events(&self, retain: usize) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let deleted = transaction.execute(
+                "DELETE FROM cp_events WHERE event_id NOT IN (SELECT event_id FROM cp_events ORDER BY event_id DESC LIMIT ?1)",
+                [retain as i64],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
     pub fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
         self.immediate_transaction(|transaction| {
             if let Some(attempt) = transaction
@@ -1513,6 +1957,357 @@ impl ControlPlaneStore {
         })
     }
 
+    pub fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    record.actor,
+                    record.action,
+                    record.resource_type,
+                    record.resource_id,
+                    record.node_id,
+                    record.stream_id,
+                    record.correlation_id,
+                    record.outcome,
+                    record.failure_code,
+                    record.message,
+                    record.occurred_at_ms,
+                ],
+            )?;
+            Ok(transaction.last_insert_rowid())
+        })
+    }
+
+    pub fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) ORDER BY event_id DESC LIMIT 1024",
+            )?;
+            let rows = statement.query_map([resource_id], |row| {
+                Ok(AuditRecord {
+                    event_id: row.get(0)?,
+                    actor: row.get(1)?,
+                    action: row.get(2)?,
+                    resource_type: row.get(3)?,
+                    resource_id: row.get(4)?,
+                    node_id: row.get(5)?,
+                    stream_id: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    outcome: row.get(8)?,
+                    failure_code: row.get(9)?,
+                    message: row.get(10)?,
+                    occurred_at_ms: row.get(11)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn create_rollout(
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+    ) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_rollouts (rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    rollout.rollout_id,
+                    rollout.config_version_id,
+                    rollout.state,
+                    rollout.batch_size,
+                    rollout.current_batch,
+                    rollout.total_targets,
+                    rollout.actor,
+                    rollout.correlation_id,
+                    rollout.created_at_ms,
+                    rollout.updated_at_ms,
+                ],
+            )?;
+            for target in targets {
+                transaction.execute(
+                    "INSERT INTO cp_rollout_targets (rollout_id, node_id, ordinal, state, attempt_id, error, observed_config_version, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        target.rollout_id,
+                        target.node_id,
+                        target.ordinal,
+                        target.state,
+                        target.attempt_id,
+                        target.error,
+                        target.observed_config_version,
+                        target.updated_at_ms,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_rollout_with_content(
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: &str,
+        created_by: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT OR IGNORE INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms, created_by) VALUES (?1, 'inline-json', ?2, 'json', ?3, ?4)",
+                rusqlite::params![
+                    rollout.config_version_id,
+                    content,
+                    rollout.created_at_ms,
+                    created_by,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_rollouts (rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    rollout.rollout_id,
+                    rollout.config_version_id,
+                    rollout.state,
+                    rollout.batch_size,
+                    rollout.current_batch,
+                    rollout.total_targets,
+                    rollout.actor,
+                    rollout.correlation_id,
+                    rollout.created_at_ms,
+                    rollout.updated_at_ms,
+                ],
+            )?;
+            for target in targets {
+                transaction.execute(
+                    "INSERT INTO cp_rollout_targets (rollout_id, node_id, ordinal, state, attempt_id, error, observed_config_version, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        target.rollout_id,
+                        target.node_id,
+                        target.ordinal,
+                        target.state,
+                        target.attempt_id,
+                        target.error,
+                        target.observed_config_version,
+                        target.updated_at_ms,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE rollout_id = ?1",
+                    [rollout_id],
+                    |row| {
+                        Ok(RolloutRecord {
+                            rollout_id: row.get(0)?,
+                            config_version_id: row.get(1)?,
+                            state: row.get(2)?,
+                            batch_size: row.get(3)?,
+                            current_batch: row.get(4)?,
+                            total_targets: row.get(5)?,
+                            actor: row.get(6)?,
+                            correlation_id: row.get(7)?,
+                            created_at_ms: row.get(8)?,
+                            updated_at_ms: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+
+    pub fn list_rollout_targets(
+        &self,
+        rollout_id: &str,
+    ) -> Result<Vec<RolloutTargetRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT rollout_id, node_id, ordinal, state, attempt_id, error, observed_config_version, updated_at_ms FROM cp_rollout_targets WHERE rollout_id = ?1 ORDER BY ordinal, node_id",
+            )?;
+            let rows = statement.query_map([rollout_id], |row| {
+                Ok(RolloutTargetRecord {
+                    rollout_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    ordinal: row.get(2)?,
+                    state: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    error: row.get(5)?,
+                    observed_config_version: row.get(6)?,
+                    updated_at_ms: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn update_rollout(
+        &self,
+        rollout_id: &str,
+        state: &str,
+        current_batch: u32,
+        updated_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE cp_rollouts SET state = ?1, current_batch = ?2, updated_at_ms = ?3 WHERE rollout_id = ?4",
+                rusqlite::params![state, current_batch, updated_at_ms, rollout_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE cp_rollout_targets SET state = ?1, attempt_id = ?2, error = ?3, observed_config_version = ?4, updated_at_ms = ?5 WHERE rollout_id = ?6 AND node_id = ?7",
+                rusqlite::params![
+                    update.state,
+                    update.attempt_id,
+                    update.error,
+                    update.observed_config_version,
+                    update.updated_at_ms,
+                    update.rollout_id,
+                    update.node_id,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_config_version_content(
+        &self,
+        config_version_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT content_ref FROM cp_config_versions WHERE config_version_id = ?1",
+                    [config_version_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+    }
+
+    pub fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE state NOT IN ('converged', 'cancelled', 'rolled_back') ORDER BY created_at_ms",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(RolloutRecord {
+                    rollout_id: row.get(0)?,
+                    config_version_id: row.get(1)?,
+                    state: row.get(2)?,
+                    batch_size: row.get(3)?,
+                    current_batch: row.get(4)?,
+                    total_targets: row.get(5)?,
+                    actor: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                    updated_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts ORDER BY created_at_ms DESC, rollout_id DESC LIMIT 1024",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(RolloutRecord {
+                    rollout_id: row.get(0)?,
+                    config_version_id: row.get(1)?,
+                    state: row.get(2)?,
+                    batch_size: row.get(3)?,
+                    current_batch: row.get(4)?,
+                    total_targets: row.get(5)?,
+                    actor: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                    updated_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_operations (operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(operation_id) DO UPDATE SET state = excluded.state, updated_at_ms = excluded.updated_at_ms, operation_json = excluded.operation_json",
+                rusqlite::params![
+                    operation.operation_id,
+                    operation.node_id,
+                    operation.resource_id,
+                    operation.operation,
+                    operation.state,
+                    operation.created_at_ms,
+                    operation.updated_at_ms,
+                    operation.operation_json,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<PersistedOperation>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE operation_id = ?1",
+                    [operation_id],
+                    |row| {
+                        Ok(PersistedOperation {
+                            operation_id: row.get(0)?,
+                            node_id: row.get(1)?,
+                            resource_id: row.get(2)?,
+                            operation: row.get(3)?,
+                            state: row.get(4)?,
+                            created_at_ms: row.get(5)?,
+                            updated_at_ms: row.get(6)?,
+                            operation_json: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+
+    pub fn list_operations(
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE (?1 IS NULL OR node_id = ?1) ORDER BY created_at_ms DESC, operation_id DESC LIMIT 1024",
+            )?;
+            let rows = statement.query_map([node_id], |row| {
+                Ok(PersistedOperation {
+                    operation_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    resource_id: row.get(2)?,
+                    operation: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
+                    operation_json: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute_batch(
@@ -1648,6 +2443,61 @@ impl ControlPlaneStore {
                 occurred_at_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cp_audit_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor TEXT,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT,
+                node_id TEXT,
+                stream_id TEXT,
+                correlation_id TEXT,
+                outcome TEXT NOT NULL,
+                failure_code TEXT,
+                message TEXT,
+                occurred_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_rollouts (
+                rollout_id TEXT PRIMARY KEY,
+                config_version_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                batch_size INTEGER NOT NULL,
+                current_batch INTEGER NOT NULL DEFAULT 0,
+                total_targets INTEGER NOT NULL,
+                actor TEXT,
+                correlation_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (config_version_id)
+                    REFERENCES cp_config_versions(config_version_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_rollout_targets (
+                rollout_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                attempt_id TEXT,
+                error TEXT,
+                observed_config_version TEXT,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (rollout_id, node_id),
+                FOREIGN KEY (rollout_id)
+                    REFERENCES cp_rollouts(rollout_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_operations (
+                operation_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                operation_json TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS cp_outbox (
                 outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
@@ -1668,6 +2518,12 @@ impl ControlPlaneStore {
                 ON cp_attempts(state, expires_at_ms);
             CREATE INDEX IF NOT EXISTS cp_events_resource
                 ON cp_events(node_id, stream_id, occurred_at_ms);
+            CREATE INDEX IF NOT EXISTS cp_audit_resource
+                ON cp_audit_events(resource_id, occurred_at_ms);
+            CREATE INDEX IF NOT EXISTS cp_rollout_targets_state
+                ON cp_rollout_targets(rollout_id, state, ordinal);
+            CREATE INDEX IF NOT EXISTS cp_operations_node_created
+                ON cp_operations(node_id, created_at_ms DESC);
             CREATE INDEX IF NOT EXISTS cp_outbox_ready
                 ON cp_outbox(processed_at_ms, available_at_ms);
             "#,
@@ -1771,6 +2627,154 @@ mod tests {
         let store = ControlPlaneStore::in_memory().unwrap();
         assert!(store.table_exists("cp_intents").unwrap());
         assert!(store.index_exists("cp_one_active_attempt").unwrap());
+        assert!(store.table_exists("cp_audit_events").unwrap());
+        assert!(store.table_exists("cp_rollouts").unwrap());
+        assert!(store.table_exists("cp_rollout_targets").unwrap());
+    }
+
+    #[test]
+    fn audit_and_rollout_records_survive_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "arkflow-control-plane-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = ControlPlaneStore::open(&path).unwrap();
+        let audit_id = store
+            .record_audit(AuditRecord {
+                event_id: 0,
+                actor: Some("operator".into()),
+                action: "rollout.create".into(),
+                resource_type: "rollout".into(),
+                resource_id: Some("rollout-1".into()),
+                node_id: None,
+                stream_id: None,
+                correlation_id: Some("corr-1".into()),
+                outcome: "accepted".into(),
+                failure_code: None,
+                message: None,
+                occurred_at_ms: 10,
+            })
+            .unwrap();
+        assert!(audit_id > 0);
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-1', 'digest', '{}', 'json', 10)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .create_rollout(
+                RolloutRecord {
+                    rollout_id: "rollout-1".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("operator".into()),
+                    correlation_id: Some("corr-1".into()),
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "rollout-1".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                }],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = ControlPlaneStore::open(&path).unwrap();
+        assert_eq!(reopened.list_audit(Some("rollout-1")).unwrap().len(), 1);
+        assert_eq!(
+            reopened.recover_rollouts().unwrap()[0].rollout_id,
+            "rollout-1"
+        );
+        assert_eq!(reopened.list_rollout_targets("rollout-1").unwrap().len(), 1);
+        reopened
+            .upsert_operation(PersistedOperation {
+                operation_id: "op-1".into(),
+                node_id: "node-a".into(),
+                resource_id: "orders".into(),
+                operation: "restart".into(),
+                state: "queued".into(),
+                created_at_ms: 10,
+                updated_at_ms: 10,
+                operation_json: r#"{"id":"op-1"}"#.into(),
+            })
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_operation("op-1")
+                .unwrap()
+                .unwrap()
+                .operation_json,
+            r#"{"id":"op-1"}"#
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollout_creation_is_atomic_when_a_target_conflicts() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-1', 'digest', '{}', 'json', 10)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let result = store.create_rollout(
+            RolloutRecord {
+                rollout_id: "rollout-1".into(),
+                config_version_id: "cfg-1".into(),
+                state: "applying".into(),
+                batch_size: 1,
+                current_batch: 0,
+                total_targets: 2,
+                actor: None,
+                correlation_id: None,
+                created_at_ms: 10,
+                updated_at_ms: 10,
+            },
+            vec![
+                RolloutTargetRecord {
+                    rollout_id: "rollout-1".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                },
+                RolloutTargetRecord {
+                    rollout_id: "rollout-1".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 1,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert!(store.get_rollout("rollout-1").unwrap().is_none());
     }
 
     #[test]
@@ -1809,6 +2813,27 @@ mod tests {
         assert_eq!(events[0].event_type, "node_maintenance_changed");
         assert_eq!(events[0].actor.as_deref(), Some("operator"));
         assert_eq!(events[0].correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[test]
+    fn event_retention_prunes_oldest_durable_ids() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                for timestamp in 1..=3 {
+                    connection.execute(
+                        "INSERT INTO cp_events (event_type, outcome, occurred_at_ms) VALUES ('test', 'accepted', ?1)",
+                        [timestamp],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.prune_events(2).unwrap(), 1);
+        let events = store.list_events(None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_id, 3);
+        assert_eq!(events[1].event_id, 2);
     }
 
     #[test]

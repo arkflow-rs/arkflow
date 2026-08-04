@@ -154,8 +154,24 @@ const config: Config = {
       darkTheme: prismThemes.dracula,
     },
   } satisfies Preset.ThemeConfig,
-  themes: [
-  ]
+  themes: [],
+  plugins: [
+    function disableIncompatibleWebpackBar() {
+      return {
+        name: 'disable-incompatible-webpackbar',
+        configureWebpack(config: any) {
+          return {
+            mergeStrategy: {plugins: 'replace'},
+            plugins: config.plugins?.filter(
+              (plugin) =>
+                (plugin as {constructor?: {name?: string}})?.constructor?.name !==
+                'WebpackBarPlugin',
+            ),
+          };
+        },
+      };
+    },
+  ],
 };
 
 export default config;

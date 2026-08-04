@@ -6,6 +6,90 @@
 use crate::storage::IntentRecord;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OperatorPrincipal {
+    pub id: String,
+    pub roles: Vec<OperatorRole>,
+    #[serde(default)]
+    pub scopes: Vec<ResourceScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResourceScope {
+    pub resource_type: String,
+    #[serde(default)]
+    pub resource_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorRole {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorAction {
+    Read,
+    Operate,
+    Configure,
+    ManageNodes,
+    ManageRollouts,
+    ReadAudit,
+}
+
+impl OperatorPrincipal {
+    pub fn legacy_operator() -> Self {
+        Self {
+            id: "operator".into(),
+            roles: vec![OperatorRole::Admin],
+            scopes: Vec::new(),
+        }
+    }
+
+    pub fn can(&self, action: OperatorAction) -> bool {
+        self.roles.iter().any(|role| match role {
+            OperatorRole::Admin => true,
+            OperatorRole::Operator => matches!(
+                action,
+                OperatorAction::Read
+                    | OperatorAction::Operate
+                    | OperatorAction::Configure
+                    | OperatorAction::ManageNodes
+                    | OperatorAction::ManageRollouts
+            ),
+            OperatorRole::Viewer => {
+                matches!(action, OperatorAction::Read | OperatorAction::ReadAudit)
+            }
+        })
+    }
+
+    pub fn can_scope(
+        &self,
+        action: OperatorAction,
+        resource_type: &str,
+        resource_id: Option<&str>,
+    ) -> bool {
+        self.can(action)
+            && (self.scopes.is_empty()
+                || self.scopes.iter().any(|scope| {
+                    let same_resource = scope.resource_type == resource_type
+                        && (scope.resource_id.is_none()
+                            || scope.resource_id.as_deref() == resource_id);
+                    let node_contains_stream = scope.resource_type == "node"
+                        && resource_type != "node"
+                        && scope.resource_id.as_ref().is_some_and(|node_id| {
+                            resource_id.is_some_and(|resource| {
+                                resource == node_id || resource.starts_with(&format!("{node_id}/"))
+                            })
+                        });
+                    same_resource || node_contains_stream
+                }))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DesiredStateRequest {
     pub state: String,
@@ -19,6 +103,25 @@ pub struct DesiredStateRequest {
 pub struct RestartActionRequest {
     #[serde(default)]
     pub action_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateRolloutRequest {
+    pub config_version: String,
+    pub node_ids: Vec<String>,
+    #[serde(default = "default_rollout_batch_size")]
+    pub batch_size: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RolloutActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub config_version: Option<String>,
+}
+
+fn default_rollout_batch_size() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,5 +205,23 @@ mod tests {
         let detail = serde_json::to_value(detail).unwrap();
         assert_eq!(detail["intent_id"], "intent-1");
         assert_eq!(detail["convergence"], "applying");
+    }
+
+    #[test]
+    fn operator_roles_have_explicit_action_boundaries() {
+        let viewer = OperatorPrincipal {
+            id: "viewer".into(),
+            roles: vec![OperatorRole::Viewer],
+            scopes: vec![ResourceScope {
+                resource_type: "node".into(),
+                resource_id: Some("node-a".into()),
+            }],
+        };
+        assert!(viewer.can(OperatorAction::Read));
+        assert!(viewer.can(OperatorAction::ReadAudit));
+        assert!(!viewer.can(OperatorAction::Operate));
+        assert!(viewer.can_scope(OperatorAction::Read, "node", Some("node-a")));
+        assert!(!viewer.can_scope(OperatorAction::Read, "node", Some("node-b")));
+        assert!(OperatorPrincipal::legacy_operator().can(OperatorAction::ManageRollouts));
     }
 }

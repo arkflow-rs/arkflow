@@ -136,8 +136,8 @@ async fn run_session(
     let mut report_seq = 0_u64;
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into() }).await; return Ok(()) },
-            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() } }).await?; }
+            _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into()], rollout_id: None }).await; return Ok(()) },
+            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into()], rollout_id: None }).await?; }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq).await).await?; }
             _ = poll.tick() => { let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish(); let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?; for command in commands { if let Some(result) = replay_cached_command(completed_commands, &command.id) { send_result(client, config, &auth, result).await?; continue; } let result = execute_command(client, cp, config, &auth, &command).await?; remember_completed_command(completed_commands, command.id, result); } }
         }
@@ -155,6 +155,31 @@ async fn report(cp: &ControlPlane, auth: &AgentAuth, boot_id: &str, report_seq: 
                 .iter()
                 .find_map(|stream| stream.observed_config_version.clone())
         });
+    let mut metrics = std::collections::BTreeMap::new();
+    for stream in &streams {
+        let values = [
+            ("input_batches", stream.metrics.input_batches),
+            ("input_messages", stream.metrics.input_messages),
+            ("processing_errors", stream.metrics.processing_errors),
+            ("output_batches", stream.metrics.output_batches),
+            ("output_messages", stream.metrics.output_messages),
+            ("input_errors", stream.metrics.input_errors),
+            ("input_reconnects", stream.metrics.input_reconnects),
+            ("output_errors", stream.metrics.output_errors),
+            ("restarts", stream.metrics.restarts),
+        ];
+        for (name, value) in values {
+            *metrics.entry(name.into()).or_insert(0.0) += value as f64;
+        }
+    }
+    metrics.insert("streams_total".into(), streams.len() as f64);
+    metrics.insert(
+        "streams_running".into(),
+        streams
+            .iter()
+            .filter(|stream| stream.state == arkflow_core::control::StreamState::Running)
+            .count() as f64,
+    );
     NodeReport {
         auth: auth.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -171,7 +196,7 @@ async fn report(cp: &ControlPlane, auth: &AgentAuth, boot_id: &str, report_seq: 
         streams,
         operations: cp.operations().await,
         events: cp.events().await,
-        metrics: Default::default(),
+        metrics,
         configuration: redacted_config(&cp.configuration().await).ok(),
         configuration_version,
         boot_id: Some(boot_id.into()),
@@ -198,6 +223,7 @@ async fn execute_command(
         action_id: command.action_id.clone(),
         failure_class: None,
         config_version_id: command.config_version_id.clone(),
+        rollout_id: command.rollout_id.clone(),
     };
     if command_expired(command.expires_at_ms, now_ms()) {
         result.state = HubOperationState::TimedOut;
@@ -291,6 +317,7 @@ async fn execute_command(
                 action_id: command.action_id.clone(),
                 failure_class,
                 config_version_id: command.config_version_id.clone(),
+                rollout_id: command.rollout_id.clone(),
             },
         )
         .await;
@@ -321,6 +348,7 @@ async fn execute_command(
                     action_id: command.action_id.clone(),
                     failure_class: Some("permanent_execution".into()),
                     config_version_id: command.config_version_id.clone(),
+                    rollout_id: command.rollout_id.clone(),
                 },
             )
             .await;
@@ -342,6 +370,7 @@ async fn execute_command(
             action_id: command.action_id.clone(),
             failure_class: None,
             config_version_id: command.config_version_id.clone(),
+            rollout_id: command.rollout_id.clone(),
         },
     )
     .await?;
@@ -385,6 +414,7 @@ async fn execute_command(
                             _ => None,
                         },
                         config_version_id: command.config_version_id.clone(),
+                        rollout_id: command.rollout_id.clone(),
                     },
                 )
                 .await;
@@ -522,6 +552,7 @@ mod tests {
             action_id: Some("restart-1".into()),
             failure_class: None,
             config_version_id: None,
+            rollout_id: None,
         };
         assert!(replay_cached_command(&cache, "cmd-1").is_none());
         remember_completed_command(&mut cache, "cmd-1".into(), result.clone());

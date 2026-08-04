@@ -8,18 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Operator-controlled mode for a compute node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeMaintenanceState {
+    #[default]
     Active,
     Draining,
     Maintenance,
-}
-
-impl Default for NodeMaintenanceState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 /// Bounded health of the Hub's reconciliation loop.
@@ -130,35 +125,25 @@ pub struct StreamStatus {
 }
 
 /// State requested by an operator or configuration reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DesiredState {
     Running,
+    #[default]
     Stopped,
 }
 
-impl Default for DesiredState {
-    fn default() -> Self {
-        Self::Stopped
-    }
-}
-
 /// Whether a resource's observed state has converged to its desired state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConvergenceState {
+    #[default]
     Unknown,
     Pending,
     Applying,
     InSync,
     Degraded,
     Blocked,
-}
-
-impl Default for ConvergenceState {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Durable operator intent lifecycle.

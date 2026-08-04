@@ -8,7 +8,10 @@ pub mod api_contract;
 pub mod hub;
 pub mod storage;
 
-use crate::api_contract::{AcceptedIntentResponse, DesiredStateRequest, RestartActionRequest};
+use crate::api_contract::{
+    AcceptedIntentResponse, CreateRolloutRequest, DesiredStateRequest, OperatorAction,
+    OperatorPrincipal, RestartActionRequest, RolloutActionRequest,
+};
 use crate::storage::DesiredMutation;
 use arkflow_core::component::{self, ComponentKind};
 use arkflow_core::configuration::redacted_config;
@@ -19,10 +22,13 @@ use axum::body::{to_bytes, Body};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
@@ -135,7 +141,7 @@ struct OperationQuery {
     node_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct EventQuery {
     page: Option<usize>,
     page_size: Option<usize>,
@@ -143,6 +149,13 @@ struct EventQuery {
     stream_id: Option<String>,
     correlation_id: Option<String>,
     node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    resource_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +294,11 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/operations/{id}", get(hub_operation))
         .route("/operations/{id}", delete(hub_cancel_operation))
         .route("/events", get(hub_events))
+        .route("/events/stream", get(hub_event_stream))
+        .route("/audit", get(hub_audit))
+        .route("/rollouts", get(hub_rollouts).post(create_rollout))
+        .route("/rollouts/{id}", get(hub_rollout))
+        .route("/rollouts/{id}/actions", post(rollout_action))
         .route("/operations/status", get(hub_operational_status))
         .route("/nodes/{node_id}/drain", post(hub_drain_node))
         .route(
@@ -348,6 +366,8 @@ pub async fn serve_hub(
                     let started = crate::hub::now_ms_for_metrics();
                     let result = reconcile_hub.reconcile_once("hub-reconciler").await;
                     reconcile_hub.record_reconcile_result(started, &result).await;
+                    let _ = reconcile_hub.reconcile_rollouts().await;
+                    let _ = reconcile_hub.prune_events(2048).await;
                 }
                 _ = reconcile_cancel.cancelled() => break,
             }
@@ -535,12 +555,16 @@ async fn hub_configuration_command<T: Serialize>(
     payload: T,
     headers: &HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(headers)) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
+    if let Err(response) = require_operator_action(
+        hub,
+        headers,
+        OperatorAction::Configure,
+        "configuration",
+        Some(node_id.clone()),
+    )
+    .await
+    {
+        return response;
     }
     let correlation_id = headers
         .get("x-correlation-id")
@@ -577,49 +601,42 @@ async fn hub_configuration_command<T: Serialize>(
                 .map(str::to_owned)
                 .unwrap_or_default()
         };
-        let payload_json = (operation == "apply_configuration").then(|| payload.to_string());
-        match hub
-            .set_desired_state(DesiredMutation {
-                node_id,
-                stream_id: "__configuration__".into(),
-                desired_state: "configured".into(),
-                config_version_id: Some(config_version_id),
-                action_id: None,
-                expected_generation: headers
-                    .get("if-match")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(parse_generation_etag),
-                actor: Some("operator".into()),
-                correlation_id,
-                idempotency_key: headers
-                    .get("idempotency-key")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned),
-                intent_type: Some("apply_configuration".into()),
-                payload_json,
-            })
+        let rollout = if operation == "apply_configuration" {
+            hub.create_rollout_with_content(
+                config_version_id,
+                payload.to_string(),
+                vec![node_id.clone()],
+                1,
+                Some("operator".into()),
+                correlation_id.clone(),
+            )
             .await
-        {
-            Ok(intent) => return intent_response(StatusCode::ACCEPTED, intent),
-            Err(hub::HubError::GenerationConflict { expected, current }) => {
-                return problem(
-                    StatusCode::PRECONDITION_FAILED,
-                    "generation_conflict",
-                    format!("Expected generation {expected}, current generation {current}"),
+        } else {
+            hub.create_rollout(
+                config_version_id,
+                vec![node_id.clone()],
+                1,
+                Some("operator".into()),
+                correlation_id.clone(),
+            )
+            .await
+        };
+        match rollout {
+            Ok(rollout) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(single_node_rollout_response(&rollout, &node_id)),
                 )
+                    .into_response()
+            }
+            Err(hub::HubError::Invalid(message)) => {
+                return problem(StatusCode::BAD_REQUEST, "invalid_configuration", message)
             }
             Err(hub::HubError::StorageUnavailable) => {
                 return problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "repository_unavailable",
                     "Durable control-plane storage is unavailable".into(),
-                )
-            }
-            Err(hub::HubError::IdempotencyKeyReused) => {
-                return problem(
-                    StatusCode::CONFLICT,
-                    "idempotency_key_reused",
-                    "Idempotency-Key was already used for a different mutation".into(),
                 )
             }
             Err(error) => {
@@ -655,17 +672,47 @@ async fn hub_configuration_command<T: Serialize>(
     }
 }
 
+fn single_node_rollout_response(
+    rollout: &storage::RolloutRecord,
+    node_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "rollout_id": rollout.rollout_id,
+        "config_version_id": rollout.config_version_id,
+        "config_version": rollout.config_version_id,
+        "state": rollout.state,
+        "batch_size": rollout.batch_size,
+        "current_batch": rollout.current_batch,
+        "total_targets": rollout.total_targets,
+        "actor": rollout.actor,
+        "correlation_id": rollout.correlation_id,
+        "created_at_ms": rollout.created_at_ms,
+        "updated_at_ms": rollout.updated_at_ms,
+        "resource_type": "configuration",
+        "resource_id": "__configuration__",
+        "node_id": node_id,
+        "intent_id": rollout.rollout_id,
+        "generation": 1,
+        "desired_state": "configured",
+        "convergence_state": "pending",
+    })
+}
+
 async fn hub_targeted_command(
     State(hub): State<hub::Hub>,
     Path((node_id, id, action)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "stream",
+        Some(format!("{node_id}/{id}")),
+    )
+    .await
+    {
+        return response;
     }
     if !matches!(action.as_str(), "start" | "stop" | "restart") {
         return problem(
@@ -852,12 +899,16 @@ async fn hub_desired_state(
     headers: HeaderMap,
     Json(request): Json<DesiredStateRequest>,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "stream",
+        Some(format!("{node_id}/{id}")),
+    )
+    .await
+    {
+        return response;
     }
     if !matches!(request.state.as_str(), "running" | "stopped") {
         return problem(
@@ -1000,12 +1051,16 @@ async fn hub_cancel_operation(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "operation",
+        Some(id.clone()),
+    )
+    .await
+    {
+        return response;
     }
     match hub.cancel_operation(&id).await {
         Some(operation) => Json(operation).into_response(),
@@ -1055,6 +1110,257 @@ async fn hub_events(
     .into_response()
 }
 
+async fn hub_event_stream(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<EventQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut replay = VecDeque::new();
+    let mut existing = hub.events(query.node_id.as_deref()).await;
+    existing.retain(|event| event_matches(event, &query));
+    if let Some(last_event_id) = last_event_id {
+        let last_event_id = last_event_id.min(i64::MAX as u64) as i64;
+        let oldest_id = existing.iter().filter_map(|event| event.event_id).min();
+        if oldest_id.is_some_and(|event_id| last_event_id < event_id.saturating_sub(1)) {
+            replay.push_back(None);
+        }
+        let mut pending = existing
+            .into_iter()
+            .filter(|event| {
+                event
+                    .event_id
+                    .is_some_and(|event_id| event_id > last_event_id)
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|event| event.event_id);
+        replay.extend(pending.into_iter().map(Some));
+    }
+    let receiver = hub.subscribe();
+    let stream = futures_util::stream::unfold(
+        (replay, receiver, query),
+        |(mut replay, mut receiver, query)| async move {
+            if let Some(update) = replay.pop_front() {
+                let event = update
+                    .map(|update| {
+                        SseEvent::default()
+                            .id(update
+                                .event_id
+                                .unwrap_or(update.event.occurred_at_ms as i64)
+                                .to_string())
+                            .event(update.event.event_type.clone())
+                            .json_data(update)
+                            .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"))
+                    })
+                    .unwrap_or_else(|| SseEvent::default().event("resync").data("{}"));
+                return Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+            }
+            loop {
+                match receiver.recv().await {
+                    Ok(update) if event_matches(&update, &query) => {
+                        let event = SseEvent::default()
+                            .id(update
+                                .event_id
+                                .unwrap_or(update.event.occurred_at_ms as i64)
+                                .to_string())
+                            .event(update.event.event_type.clone())
+                            .json_data(update)
+                            .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"));
+                        break Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let event = SseEvent::default().event("resync").data("{}");
+                        break Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+                }
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn event_matches(event: &hub::HubEvent, query: &EventQuery) -> bool {
+    query
+        .node_id
+        .as_deref()
+        .is_none_or(|node_id| event.node_id == node_id)
+        && query
+            .event_type
+            .as_deref()
+            .is_none_or(|event_type| event.event.event_type == event_type)
+        && query
+            .stream_id
+            .as_deref()
+            .is_none_or(|stream_id| event.event.stream_id.as_deref() == Some(stream_id))
+        && query
+            .correlation_id
+            .as_deref()
+            .is_none_or(|correlation_id| {
+                event.event.correlation_id.as_deref() == Some(correlation_id)
+            })
+}
+
+async fn hub_audit(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<AuditQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.audit(query.resource_id.as_deref()).await {
+        Ok(records) => Json(page_items(
+            records,
+            &PageQuery {
+                page: query.page,
+                page_size: query.page_size,
+                node_id: None,
+            },
+        ))
+        .into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn create_rollout(
+    State(hub): State<hub::Hub>,
+    headers: HeaderMap,
+    Json(request): Json<CreateRolloutRequest>,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageRollouts,
+        "rollout",
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    let actor = Some("operator".into());
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match hub
+        .create_rollout(
+            request.config_version,
+            request.node_ids,
+            request.batch_size,
+            actor,
+            correlation_id,
+        )
+        .await
+    {
+        Ok(rollout) => (StatusCode::ACCEPTED, Json(rollout)).into_response(),
+        Err(hub::HubError::Invalid(message)) => {
+            problem(StatusCode::BAD_REQUEST, "invalid_rollout", message)
+        }
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.rollouts().await {
+        Ok(rollouts) => Json(rollouts).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_rollout(
+    State(hub): State<hub::Hub>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.rollout(&id).await {
+        Ok(Some((rollout, targets))) => Json(serde_json::json!({
+            "rollout": rollout,
+            "targets": targets,
+        }))
+        .into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Rollout not found".into(),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn rollout_action(
+    State(hub): State<hub::Hub>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RolloutActionRequest>,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageRollouts,
+        "rollout",
+        Some(id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match hub
+        .act_rollout(
+            &id,
+            &request.action,
+            request.config_version,
+            Some("operator".into()),
+            correlation_id,
+        )
+        .await
+    {
+        Ok(rollout) => (StatusCode::ACCEPTED, Json(rollout)).into_response(),
+        Err(hub::HubError::Invalid(message)) => problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_rollout_action",
+            message,
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
 async fn hub_metrics(
     State(hub): State<hub::Hub>,
     Query(_query): Query<PageQuery>,
@@ -1100,6 +1406,32 @@ async fn hub_metrics(
             ));
         }
     }
+    if let Ok(rollouts) = hub.rollouts().await {
+        let mut states = std::collections::BTreeMap::<String, usize>::new();
+        for rollout in rollouts {
+            *states.entry(rollout.state).or_default() += 1;
+        }
+        for (state, count) in states {
+            body.push_str(&format!(
+                "arkflow_rollouts_state{{state=\"{state}\"}} {count}\n"
+            ));
+        }
+    }
+    for node in hub.nodes().await {
+        let node_id = prometheus_label(&node.id);
+        let protocol = prometheus_label(&node.protocol_version);
+        let software = prometheus_label(&node.version);
+        let state = prometheus_label(&format!("{:?}", node.state).to_lowercase());
+        body.push_str(&format!(
+            "arkflow_node_compatibility{{node_id=\"{node_id}\",protocol_version=\"{protocol}\",software_version=\"{software}\",state=\"{state}\"}} 1\n"
+        ));
+        for capability in node.capabilities {
+            body.push_str(&format!(
+                "arkflow_node_capability{{node_id=\"{node_id}\",capability=\"{}\"}} 1\n",
+                prometheus_label(&capability)
+            ));
+        }
+    }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -1112,7 +1444,26 @@ async fn hub_operational_status(State(hub): State<hub::Hub>, headers: HeaderMap)
         );
     }
     match hub.operational_status().await {
-        Ok(status) => Json(status).into_response(),
+        Ok(status) => {
+            let mut value = serde_json::to_value(status).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                let rollouts = hub.rollouts().await.unwrap_or_default();
+                object.insert(
+                    "rollouts".into(),
+                    serde_json::json!({
+                        "total": rollouts.len(),
+                        "states": rollouts.iter().fold(std::collections::BTreeMap::<String, usize>::new(), |mut states, rollout| { *states.entry(rollout.state.clone()).or_default() += 1; states }),
+                    }),
+                );
+                object.insert(
+                    "compatibility".into(),
+                    serde_json::json!({
+                        "nodes": hub.nodes().await.into_iter().map(|node| serde_json::json!({ "id": node.id, "protocol_version": node.protocol_version, "software_version": node.version, "capabilities": node.capabilities })).collect::<Vec<_>>()
+                    }),
+                );
+            }
+            Json(value).into_response()
+        }
         Err(error) => hub_problem(error),
     }
 }
@@ -1165,12 +1516,16 @@ async fn hub_set_maintenance(
     state: arkflow_core::control::NodeMaintenanceState,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageNodes,
+        "node",
+        Some(node_id.clone()),
+    )
+    .await
+    {
+        return response;
     }
     let correlation = headers
         .get("x-correlation-id")
@@ -1257,6 +1612,76 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
 }
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || "._-".contains(*character))
+        .take(64)
+        .collect()
+}
+
+fn operator_denied(hub: &hub::Hub, supplied: Option<&str>, action: OperatorAction) -> Response {
+    if hub.operator_principal(supplied).is_none() {
+        problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        )
+    } else {
+        problem(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("Operator is not authorized for {:?}", action),
+        )
+    }
+}
+
+async fn require_operator_action(
+    hub: &hub::Hub,
+    headers: &HeaderMap,
+    action: OperatorAction,
+    resource_type: &str,
+    resource_id: Option<String>,
+) -> Result<OperatorPrincipal, Response> {
+    let supplied = bearer(headers);
+    let principal = hub.operator_principal(supplied);
+    if principal
+        .as_ref()
+        .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id.as_deref()))
+    {
+        return Ok(principal.expect("principal checked above"));
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let _ = hub
+        .record_audit_event(crate::storage::AuditRecord {
+            event_id: 0,
+            actor: principal.as_ref().map(|principal| principal.id.clone()),
+            action: format!("operator.{action:?}").to_lowercase(),
+            resource_type: resource_type.to_owned(),
+            resource_id,
+            node_id: None,
+            stream_id: None,
+            correlation_id,
+            outcome: "rejected".into(),
+            failure_code: Some(
+                if principal.is_some() {
+                    "forbidden"
+                } else {
+                    "unauthorized"
+                }
+                .into(),
+            ),
+            message: None,
+            occurred_at_ms: hub::now_ms_for_metrics(),
+        })
+        .await;
+    Err(operator_denied(hub, supplied, action))
+}
+
 fn hub_problem(error: hub::HubError) -> Response {
     let status = match error {
         hub::HubError::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -1264,7 +1689,11 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::BAD_REQUEST,
     };
-    problem(status, "agent_request_rejected", error.to_string())
+    problem(
+        status,
+        "agent_request_rejected",
+        error.to_string().chars().take(256).collect(),
+    )
 }
 
 async fn system(State(cp): State<ControlPlane>) -> Json<arkflow_core::control::SystemResource> {
@@ -1755,6 +2184,7 @@ mod tests {
     use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
     use arkflow_core::engine::Engine;
+    use futures_util::StreamExt;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -2174,6 +2604,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hub_routes_distinguish_viewer_from_operator_actions() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("readonly|viewer|viewer-secret".into()),
+            node_token: Some("node-secret".into()),
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+        });
+        let app = hub_router(hub, &ServerConfig::default());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/nodes")
+                    .header("authorization", "Bearer viewer-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/start")
+                    .header("authorization", "Bearer viewer-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/events/stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn denied_mutation_is_visible_in_audit_history() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("viewer|viewer|viewer-secret".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage::StorageActor::start(store, 8),
+        );
+        let app = hub_router(hub, &ServerConfig::default());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/nodes/node-a/streams/orders/desired-state")
+                    .header("authorization", "Bearer viewer-secret")
+                    .header("content-type", "application/json")
+                    .header("x-correlation-id", "audit-test")
+                    .body(axum::body::Body::from(r#"{"state":"running"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/audit?resource_id=node-a%2Forders")
+                    .header("authorization", "Bearer viewer-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["items"][0]["outcome"], "rejected");
+        assert_eq!(value["items"][0]["correlation_id"], "audit-test");
+    }
+
+    #[tokio::test]
+    async fn sse_replays_durable_events_by_last_event_id() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_events (node_id, event_type, outcome, occurred_at_ms) VALUES ('node-a', 'rollout_changed', 'accepted', 10)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage::StorageActor::start(store, 8),
+        );
+        let response = hub_router(hub, &ServerConfig::default())
+            .oneshot(
+                axum::http::Request::get("/api/v1/events/stream")
+                    .header("authorization", "Bearer operator")
+                    .header("last-event-id", "0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(text.contains("id: 1"));
+        assert!(text.contains("event: rollout_changed"));
+    }
+
+    #[tokio::test]
     async fn desired_state_route_persists_offline_intent_and_rejects_stale_generation() {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
         let hub = hub::Hub::with_storage(
@@ -2417,8 +2976,8 @@ mod tests {
         let intent: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intent["generation"], 1);
         assert_eq!(intent["desired_state"], "configured");
-        let intent_id = intent["intent_id"].as_str().unwrap().to_owned();
         let config_version = intent["config_version"].as_str().unwrap().to_owned();
+        assert!(intent["rollout_id"].as_str().is_some());
 
         let session = hub
             .register(hub::RegisterRequest {
@@ -2429,6 +2988,7 @@ mod tests {
             })
             .await
             .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
         let operation = hub
             .reconcile_once("config-reconciler")
             .await
@@ -2473,8 +3033,62 @@ mod tests {
         })
         .await
         .unwrap();
+        let rollout_id = intent["rollout_id"].as_str().unwrap();
+        let (_, targets) = hub.rollout(rollout_id).await.unwrap().unwrap();
+        let intent_id = targets[0].attempt_id.clone().unwrap();
         let persisted = storage.get_intent(intent_id).await.unwrap().unwrap();
         assert_eq!(persisted.state, "converged");
+    }
+
+    #[tokio::test]
+    async fn node_level_rollback_returns_a_single_node_rollout() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-rollback', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let storage = storage::StorageActor::start(store, 8);
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage,
+        );
+        let app = hub_router(hub.clone(), &ServerConfig::default());
+        let response = app
+            .oneshot(
+                axum::http::Request::post(
+                    "/api/v1/nodes/node-a/configuration/rollback/cfg-rollback",
+                )
+                .header("authorization", "Bearer operator")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rollout: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(rollout["rollout_id"].as_str().is_some());
+        assert_eq!(rollout["config_version_id"], "cfg-rollback");
+        assert_eq!(rollout["total_targets"], 1);
+        let (_, targets) = hub
+            .rollout(rollout["rollout_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(targets[0].node_id, "node-a");
     }
 
     #[tokio::test]
@@ -2717,6 +3331,7 @@ mod tests {
                         action_id: None,
                         failure_class: None,
                         config_version_id: None,
+                        rollout_id: None,
                     })
                     .unwrap(),
                 ))
