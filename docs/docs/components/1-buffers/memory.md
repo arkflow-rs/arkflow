@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Memory
 
 The Memory buffer is an in-memory message queue that accumulates incoming message batches and releases them as a single merged batch when either a capacity threshold or a timeout is reached. It smooths out traffic spikes and provides backpressure when downstream processing cannot keep up.

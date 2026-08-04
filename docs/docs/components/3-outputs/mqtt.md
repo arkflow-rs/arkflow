@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # MQTT
 
 The MQTT output publishes each message to an MQTT broker topic. It supports QoS 0/1/2, clean sessions, keep-alive, retained messages, and optional username/password authentication.

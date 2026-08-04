@@ -35,10 +35,11 @@ const config: Config = {
   projectName: 'arkflow', // Usually your repo name.
 
   onBrokenLinks: 'throw',
+  onBrokenAnchors: 'throw',
 
   markdown: {
     hooks: {
-      onBrokenMarkdownLinks: 'warn',
+      onBrokenMarkdownLinks: 'throw',
     },
   },
 
@@ -119,7 +120,7 @@ const config: Config = {
           title: 'Docs',
           items: [
             {
-              label: 'Introduction',
+              label: 'Start here',
               to: '/docs/intro',
             },
           ],

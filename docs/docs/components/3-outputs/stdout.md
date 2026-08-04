@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Stdout
 
 The Stdout output writes each message payload to standard output. It is handy for debugging, demos, and small local pipelines.

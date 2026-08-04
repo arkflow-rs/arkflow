@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Control-plane operations
 
 The Hub exposes process liveness at `/liveness`, storage/recovery readiness at

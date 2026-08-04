@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # WAL Durability & Performance
 
 ArkFlow's WAL (Write-Ahead Log) persists messages at the input boundary so

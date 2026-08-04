@@ -64,13 +64,13 @@ API and the Hub agent when `hub_url` is set (see
 ## stream
 
 Each entry in `streams` is one independent processing pipeline. Stream fields
-are documented in depth in the [Components](../category/components) section;
+are documented in depth in the [Components](../reference/component-inventory.md) section;
 the shape is:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | string | no | `stream-<index>` | Stable stream identifier (must be unique; used for WAL identity and Hub reporting). |
-| `input` | object | yes | — | [Input](../category/components) component (source). |
+| `input` | object | yes | — | [Input](../reference/component-inventory.md) component (source). |
 | `pipeline` | object | yes | — | Processor pipeline. |
 | `output` | object | yes | — | Output component (sink). |
 | `error_output` | object | no | — | Output that receives batches a processor failed on. |

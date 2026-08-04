@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Protobuf
 
 The Protobuf processor converts between Apache Arrow batches and Protocol Buffers messages. It registers two processor types: `arrow_to_protobuf` serializes Arrow columns into Protobuf binary data, and `protobuf_to_arrow` decodes Protobuf binary data into an Arrow batch. Message descriptors are loaded from `.proto` source files (or prebuilt descriptor sets).

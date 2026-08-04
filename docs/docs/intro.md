@@ -4,6 +4,8 @@ sidebar_position: 1
 
 # Introduction
 
+> **Canonical entry point:** Start with [Start here](./start-here.md) for the current task-oriented documentation journey. This page remains as a stable compatibility route for existing links.
+
 ![ArkFlow logo](./logo.svg)
 
 ArkFlow is a high-performance stream processing engine written in Rust on the
@@ -27,6 +29,6 @@ or more sinks — all driven by a single YAML file.
 - [Getting started](./getting-started/2-quickstart.md) — install and run your first pipeline in minutes.
 - [Concepts](./concepts/1-architecture.md) — how the engine, streams, pipelines, backpressure, and metadata fit together.
 - [Configuration reference](./configuration/1-top-level.md) — the top-level YAML structure.
-- [Components](./category/components) — every input, output, processor, buffer, and codec.
+- [Components](./reference/component-inventory.md) — every input, output, processor, buffer, and codec.
 - [SQL reference](./sql/2-select.md) — query syntax and functions.
 - [Control plane](./control-plane/1-overview.md) — operate ArkFlow as a fleet.

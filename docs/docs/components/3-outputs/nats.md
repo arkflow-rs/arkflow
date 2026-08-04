@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # NATS
 
 The NATS output publishes messages to a NATS server, either to a regular subject or to a JetStream stream. It supports optional username/password or token authentication.

@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # JSON
 
 The JSON processor converts between JSON and Apache Arrow columnar formats. It registers two processor types: `json_to_arrow` decodes JSON bytes into an Arrow `RecordBatch`, and `arrow_to_json` serializes an Arrow batch back into JSON bytes.

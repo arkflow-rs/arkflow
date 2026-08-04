@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # VRL
 
 The VRL processor transforms messages using Vector Remap Language (VRL), a safe expression language designed for observability data pipelines. Each incoming batch is mapped to VRL objects; the result of the configured statement is projected back into the columnar batch. See the VRL syntax reference at https://vector.dev/docs/reference/vrl/.

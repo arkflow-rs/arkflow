@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Tumbling Window
 
 The Tumbling Window buffer groups messages into fixed-size, non-overlapping time windows. Every configured `interval`, all messages accumulated within the current window are emitted together as a single batch; each message belongs to exactly one window. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.

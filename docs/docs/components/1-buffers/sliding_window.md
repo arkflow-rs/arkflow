@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Sliding Window
 
 The Sliding Window buffer groups messages into overlapping windows that advance over time. Up to `window_size` messages are emitted as a single batch on each `interval`; after each emission the window slides forward by `slide_size` messages, so when `slide_size` is smaller than `window_size` the same message can appear in multiple consecutive emitted batches.

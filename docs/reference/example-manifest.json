@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "examples": [
+    {"name": "quickstart", "path": "../examples/generate_example.yaml", "kind": "yaml"},
+    {"name": "kafka-input", "path": "../examples/kafka_example.yaml", "kind": "yaml"},
+    {"name": "sql-output", "path": "../examples/sql_output_example.yaml", "kind": "yaml"},
+    {"name": "durability", "path": "../examples/durability_example.yaml", "kind": "yaml"},
+    {"name": "durability-s3", "path": "../examples/durability_example_s3.yaml", "kind": "yaml"},
+    {"name": "control-plane", "path": "../examples/control_plane_example.yaml", "kind": "yaml"},
+    {"name": "control-plane-hub", "path": "../examples/control_plane_hub.yaml", "kind": "yaml"},
+    {"name": "cdc-debezium", "path": "../examples/cdc_debezium.yaml", "kind": "yaml"}
+  ]
+}

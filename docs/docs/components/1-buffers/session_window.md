@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Session Window
 
 The Session Window buffer groups messages into sessions defined by activity gaps. A new message extends the current session; if no message arrives within the configured `gap` duration the session is closed and all of its accumulated messages are emitted as a single batch. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.
