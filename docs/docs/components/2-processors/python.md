@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Python
 
 The Python processor executes user-supplied Python code on each message batch via PyO3. The incoming `MessageBatch` is exposed to your function as a PyArrow `RecordBatch`, and the function returns one or more PyArrow batches that are converted back into the engine's columnar format. This lets you implement custom transformations using Python's data ecosystem (PyArrow, Pandas, Polars, NumPy, etc.).

@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Drop
 
 The Drop output discards every message it receives without performing any I/O. It is useful for performance benchmarks, dead-end pipelines, and testing.

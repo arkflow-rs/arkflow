@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Aggregate Functions
 
 Aggregate functions operate on a set of values to compute a single result.

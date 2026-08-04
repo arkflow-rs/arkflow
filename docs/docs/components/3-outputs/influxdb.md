@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # InfluxDB
 
 The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, buffers writes in configurable batches, and retries failures with exponential backoff.

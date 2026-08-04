@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Window Functions
 
 A _window function_ performs a calculation across a set of table rows that are somehow related to the current row.
@@ -120,7 +124,7 @@ RANGE and GROUPS modes require an ORDER BY clause (with RANGE the ORDER BY must 
 
 ## Aggregate functions
 
-All [aggregate functions](./aggregate_functions) can be used as window functions.
+All [aggregate functions](./5-aggregate_functions.md) can be used as window functions.
 
 ## Ranking Functions
 

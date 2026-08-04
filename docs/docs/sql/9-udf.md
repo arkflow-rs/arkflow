@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # User Defined Functions (UDFs)
 
 User Defined Functions (UDFs) allow you to extend the functionality of SQL by defining custom functions in Rust and then using them within your SQL queries.

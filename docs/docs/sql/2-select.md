@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # SELECT syntax
 
 The queries in DataFusion scan data from tables and return 0 or more rows.

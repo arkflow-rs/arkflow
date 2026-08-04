@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # SQL
 
 The SQL processor runs SQL queries against the incoming message batch using DataFusion as the query engine. Each batch is registered as a temporary table (named `flow` by default, or `table_name` when set) so it can be filtered, projected, joined with temporary data sources, or aggregated in SQL.

@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
+    "docs:check": "node scripts/docs-check.mjs && node scripts/generate-component-inventory.mjs --check",
+    "components:generate": "node scripts/generate-component-inventory.mjs",
+    "components:check": "node scripts/generate-component-inventory.mjs --check",
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
     "build": "docusaurus build",

@@ -1,12 +1,16 @@
+---
+description: ArkFlow SQL operators.
+---
+
 # Operators and Literals
 
 ## Numerical Operators
 
-- [+ (plus)](#op_plus)
-- [- (minus)](#op_minus)
-- [\* (multiply)](#op_multiply)
-- [/ (divide)](#op_divide)
-- [% (modulo)](#op_modulo)
+- + (plus)
+- - (minus)
+- \* (multiply)
+- / (divide)
+- % (modulo)
 
  
 
@@ -85,19 +89,19 @@ Modulo (remainder)
 
 ## Comparison Operators
 
-- [= (equal)](#op_eq)
-- [!= (not equal)](#op_neq)
-- [< (less than)](#op_lt)
-- [`<=` (less than or equal to)](#op_le)
-- [> (greater than)](#op_gt)
-- [>= (greater than or equal to)](#op_ge)
-- [`<=>` (three-way comparison, alias for IS NOT DISTINCT FROM)](#op_spaceship)
+- = (equal)
+- != (not equal)
+- < (less than)
+- `<=` (less than or equal to)
+- > (greater than)
+- >= (greater than or equal to)
+- `<=>` (three-way comparison, alias for IS NOT DISTINCT FROM)
 - [IS DISTINCT FROM](#is-distinct-from)
 - [IS NOT DISTINCT FROM](#is-not-distinct-from)
-- [~ (regex match)](#op_re_match)
-- [~\* (regex case-insensitive match)](#op_re_match_i)
-- [!~ (not regex match)](#op_re_not_match)
-- [!~\* (not regex case-insensitive match)](#op_re_not_match_i)
+- ~ (regex match)
+- ~\* (regex case-insensitive match)
+- !~ (not regex match)
+- !~\* (not regex case-insensitive match)
 
  
 
@@ -402,11 +406,11 @@ Logical Or
 
 ## Bitwise Operators
 
-- [& (bitwise and)](#op_bit_and)
-- [| (bitwise or)](#op_bit_or)
-- [# (bitwise xor)](#op_bit_xor)
-- [>> (bitwise shift right)](#op_shift_r)
-- [`<<` (bitwise shift left)](#op_shift_l)
+- & (bitwise and)
+- | (bitwise or)
+- # (bitwise xor)
+- >> (bitwise shift right)
+- `<<` (bitwise shift left)
 
 
 
@@ -485,9 +489,9 @@ Bitwise Shift Left
 
 ## Other Operators
 
-- [|| (string concatenation)](#op_str_cat)
-- [@> (array contains)](#op_arr_contains)
-- [`<@` (array is contained by)](#op_arr_contained_by)
+- || (string concatenation)
+- @> (array contains)
+- `<@` (array is contained by)
 
 
 

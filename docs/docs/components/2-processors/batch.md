@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Batch
 
 The Batch processor accumulates incoming message batches and flushes them as a single merged batch when either a configured message count is reached or a timeout elapses. It is useful for grouping small batches together to improve downstream throughput.

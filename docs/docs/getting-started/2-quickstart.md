@@ -60,4 +60,4 @@ What this does:
 
 - [Concepts](../concepts/1-architecture.md) — understand streams, pipelines, and data flow.
 - [Configuration reference](../configuration/1-top-level.md) — the full top-level YAML structure.
-- [Components](../category/components) — pick a real input and output.
+- [Components](../reference/component-inventory.md) — pick a real input and output.

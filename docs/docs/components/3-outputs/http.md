@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # HTTP
 
 The HTTP output sends each message as an HTTP request to a configured URL. It supports custom headers, retry with exponential backoff, and Basic or Bearer authentication.

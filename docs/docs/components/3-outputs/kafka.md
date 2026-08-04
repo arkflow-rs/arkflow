@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Kafka
 
 The Kafka output produces messages to an Apache Kafka topic using librdkafka. It supports key-based partitioning, compression, configurable acknowledgments, and optional exactly-once transactional production.

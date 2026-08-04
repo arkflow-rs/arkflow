@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Scalar Functions
 
 ## Math Functions
@@ -4411,7 +4415,6 @@ union_extract(union, field_name)
 - [arrow_cast](#arrow_cast)
 - [arrow_typeof](#arrow_typeof)
 - [get_field](#get_field)
-- [version](#version)
 
 ### `arrow_cast`
 

@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # Input Delivery Semantics
 
 How ArkFlow handles messages across crashes depends on whether an input can

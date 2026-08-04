@@ -1,3 +1,7 @@
+---
+description: ArkFlow documentation page.
+---
+
 # SQL
 
 The SQL output batch-inserts records into a MySQL or PostgreSQL database. Each row is converted from Arrow to a typed SQL value and inserted in a single parameterized statement.
