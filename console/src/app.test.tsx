@@ -92,4 +92,21 @@ describe('console application', () => {
     expect(operationReads).toBeGreaterThan(0)
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/nodes/node-a/streams/orders/start'), expect.objectContaining({ headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }) }))
   })
+
+  it('shows a permission failure without retrying the mutation', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start')) return Promise.resolve({ ok: false, status: 403, headers: new Headers(), json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }) })
+      if (url.endsWith('/system')) return Promise.resolve({ ok: true, json: async () => ({ version: 'hub', state: 'running', node_count: 1, capabilities: [] }) })
+      if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => page([{ id: 'node-a', state: 'online', capabilities: ['stream_lifecycle'], streams_total: 1, streams_running: 1, streams_failed: 0 }]) })
+      if (url.includes('/streams')) return Promise.resolve({ ok: true, json: async () => page([{ id: 'orders', node_id: 'node-a', state: 'running', metrics: { input_messages: 0, output_messages: 0 } }]) })
+      return Promise.resolve({ ok: true, json: async () => page([]) })
+    })
+    render(<App />)
+    fireEvent.change(await screen.findByLabelText('Compute node'), { target: { value: 'node-a' } })
+    fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
+    expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST')).toHaveLength(1)
+  })
 })

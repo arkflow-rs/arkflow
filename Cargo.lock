@@ -329,6 +329,7 @@ version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "axum",
+ "futures-util",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",
