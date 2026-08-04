@@ -60,7 +60,7 @@ sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "post
 rusqlite = "0.37"
 
 tempfile = "3.24.0"
-mockall = "0.14"
+mockall = "0.15"
 redb = "2"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
