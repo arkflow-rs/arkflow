@@ -126,13 +126,39 @@ fn extract_query(sql: &str) -> Result<String, Error> {
         return Err(Error::Config("streaming SQL must not be empty".into()));
     }
     let upper = trimmed.to_ascii_uppercase();
-    if let Some(index) = upper.find(" AS ") {
-        let query = trimmed[index + 4..].trim();
-        if !query.is_empty() {
-            return Ok(query.trim_end_matches(';').to_owned());
+    if upper.starts_with("CREATE STREAM") {
+        let prefix_len = "CREATE STREAM".len();
+        let declaration = &trimmed[prefix_len..];
+        let declaration_upper = &upper[prefix_len..];
+        if let Some(relative_index) = find_sql_keyword(declaration_upper, "AS") {
+            let query = declaration[relative_index + 2..].trim();
+            if !query.is_empty() {
+                return Ok(query.trim_end_matches(';').to_owned());
+            }
+            return Err(Error::Config(
+                "CREATE STREAM must include a query after AS".into(),
+            ));
         }
+        return Err(Error::Config(
+            "CREATE STREAM must include an AS query wrapper".into(),
+        ));
     }
     Ok(trimmed.trim_end_matches(';').to_owned())
+}
+
+fn find_sql_keyword(sql: &str, keyword: &str) -> Option<usize> {
+    sql.match_indices(keyword).find_map(|(index, _)| {
+        let before_is_boundary = sql[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+        let end = index + keyword.len();
+        let after_is_boundary = sql[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+        (before_is_boundary && after_is_boundary).then_some(index)
+    })
 }
 
 #[cfg(test)]
@@ -199,6 +225,20 @@ mod tests {
         .unwrap();
         assert_eq!(compiled.explain()["job_id"], "orders");
         assert_eq!(compiled.plan.tasks.len(), 2);
+    }
+
+    #[test]
+    fn preserves_aliases_inside_create_stream_query() {
+        let compiled = StreamingSqlCompiler::compile(
+            "CREATE STREAM orders AS SELECT amount AS total FROM flow",
+            spec(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.sql,
+            "CREATE STREAM orders AS SELECT amount AS total FROM flow"
+        );
     }
 
     #[test]

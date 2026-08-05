@@ -276,11 +276,6 @@ impl StateBackend for RedbStateBackend {
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
             let previous_bytes = previous.as_ref().map(|value| value.value.len() as u64);
-            let previous_is_live = previous.as_ref().is_some_and(|value| {
-                !value
-                    .expires_at_ms
-                    .is_some_and(|expires| expires <= now_ms())
-            });
             let current = previous
                 .filter(|value| {
                     !value
@@ -293,11 +288,7 @@ impl StateBackend for RedbStateBackend {
             let next = current.saturating_add(delta);
             let next_value = serde_json::to_vec(&next)?;
             if let Some(max_bytes) = self.max_bytes {
-                let accounted_previous = if previous_is_live {
-                    previous_bytes.unwrap_or_default()
-                } else {
-                    0
-                };
+                let accounted_previous = previous_bytes.unwrap_or_default();
                 let next_total = self
                     .bytes
                     .load(Ordering::Relaxed)
@@ -661,6 +652,21 @@ mod tests {
         assert!(counter.add(b"b", 22).is_err());
         assert_eq!(counter.get(b"a").unwrap(), Some(1));
         assert_eq!(counter.get(b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn keyed_counter_reclaims_expired_bytes_before_budget_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(
+            RedbStateBackend::open(dir.path(), 1)
+                .unwrap()
+                .with_max_bytes(1),
+        );
+        backend
+            .put_with_ttl("aggregate", b"expired", b"x", Some(1), 0)
+            .unwrap();
+        let counter = KeyedCounter::new(backend, "aggregate");
+        assert_eq!(counter.add(b"expired", 1).unwrap(), 1);
     }
 
     #[test]
