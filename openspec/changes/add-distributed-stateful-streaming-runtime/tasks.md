@@ -143,3 +143,8 @@
 - [x] 19.2 Handle null timestamps and resolve event-time windows along source DAG paths.
 - [x] 19.3 Require explicit Kafka topics during position recovery.
 - [x] 19.4 Require all assigned Job nodes to acknowledge a checkpoint before commit.
+
+## 20. Follow-up review remediation
+
+- [x] 20.1 Derive checkpoint participants from dispatched node operations for automatic placement.
+- [x] 20.2 Add automatic-placement checkpoint completion regression coverage.

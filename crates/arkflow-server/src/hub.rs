@@ -1743,13 +1743,6 @@ impl Hub {
                 "job_checkpoint" | "job_savepoint"
             ) {
                 let checkpoint_id = result.observed_checkpoint_id.as_deref();
-                let expected_nodes = self
-                    .jobs
-                    .read()
-                    .await
-                    .get(&updated.resource_id)
-                    .map(|job| job.node_ids.iter().cloned().collect::<BTreeSet<_>>())
-                    .unwrap_or_default();
                 let checkpoint_operations = self
                     .operations
                     .read()
@@ -1763,6 +1756,10 @@ impl Hub {
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let expected_nodes = checkpoint_operations
+                    .iter()
+                    .map(|operation| operation.node_id.clone())
+                    .collect::<BTreeSet<_>>();
                 let succeeded_nodes = checkpoint_operations
                     .iter()
                     .filter(|operation| operation.state == HubOperationState::Succeeded)
@@ -4317,7 +4314,7 @@ mod tests {
             observed_state: "starting".into(),
             convergence: "reconciling".into(),
             generation: 7,
-            node_ids: vec!["compute-1".into()],
+            node_ids: Vec::new(),
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
