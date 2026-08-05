@@ -195,8 +195,12 @@ pub struct StateSpec {
     pub namespace: Option<String>,
     #[serde(default)]
     pub ttl_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default = "default_state_format_version")]
     pub format_version: u32,
+}
+
+fn default_state_format_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +262,7 @@ fn default_parallelism() -> u32 {
 
 impl JobSpec {
     pub fn validate(&self) -> Result<(), Error> {
+        JobId::new(self.id.as_str())?;
         if self.sources.is_empty() {
             return Err(Error::Config(
                 "Job requires at least one executable source".into(),
@@ -356,6 +361,13 @@ impl JobSpec {
             if checkpoint.object_store_uri.trim().is_empty() {
                 return Err(Error::Config(
                     "checkpoint object_store_uri is required".into(),
+                ));
+            }
+        }
+        if let Some(state) = &self.state {
+            if state.format_version == 0 {
+                return Err(Error::Config(
+                    "Job state format_version must be positive".into(),
                 ));
             }
         }
@@ -796,6 +808,24 @@ mod tests {
     #[test]
     fn rejects_invalid_job_id() {
         assert!(JobId::new("bad id").is_err());
+        let mut job = base_job();
+        job.id = serde_json::from_value(serde_json::json!("../outside")).unwrap();
+        assert!(job.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_state_format_version_to_one() {
+        let mut value = serde_json::to_value(base_job()).unwrap();
+        value["state"] = serde_json::json!({"backend": "embedded_kv"});
+        let job: JobSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(job.state.unwrap().format_version, 1);
+    }
+
+    #[test]
+    fn rejects_zero_state_format_version() {
+        let mut job = base_job();
+        job.state.as_mut().unwrap().format_version = 0;
+        assert!(job.validate().is_err());
     }
 
     #[test]

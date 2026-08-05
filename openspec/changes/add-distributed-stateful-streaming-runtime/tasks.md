@@ -103,3 +103,10 @@
 - [x] 13.2 Aggregate per-agent checkpoint manifests before publishing the shared artifact.
 - [x] 13.3 Await the previous Job generation before starting its replacement.
 - [x] 13.4 Exclude expired TTL entries from state scans and add regression coverage.
+
+## 14. Follow-up review remediation
+
+- [x] 14.1 Revalidate deserialized Job IDs and default/reject invalid state format versions.
+- [x] 14.2 Build processor and sink instances per assigned task and route edges by task identity.
+- [x] 14.3 Stop and await the previous runtime before opening replacement state or connectors.
+- [x] 14.4 Add validation and task-isolation regression coverage.

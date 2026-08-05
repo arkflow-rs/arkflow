@@ -16,7 +16,7 @@ type InputRead = Result<(usize, crate::MessageBatchRef, Arc<dyn Ack>), Error>;
 
 pub struct SingleComputeJobRunner {
     inputs: Vec<Arc<dyn Input>>,
-    source_ids: Vec<String>,
+    source_task_ids: Vec<String>,
     processors: BTreeMap<String, Arc<dyn Processor>>,
     outputs: BTreeMap<String, Arc<dyn Output>>,
     edges: BTreeMap<String, Vec<String>>,
@@ -42,6 +42,7 @@ impl SingleComputeJobRunner {
         adapter: &A,
         resource: &Resource,
     ) -> Result<Self, Error> {
+        plan.spec.validate()?;
         let assigned_operators = task_ids
             .iter()
             .filter_map(|task_id| plan.task(task_id).map(|task| task.operator_id.clone()))
@@ -65,18 +66,26 @@ impl SingleComputeJobRunner {
                 Some((task, *source))
             })
             .collect::<Vec<_>>();
-        let source_ids = source_tasks
+        let source_task_ids = source_tasks
+            .iter()
+            .map(|(task, _)| task.id.clone())
+            .collect::<Vec<_>>();
+        let source_operator_ids = source_tasks
             .iter()
             .map(|(task, _)| task.operator_id.clone())
-            .collect::<Vec<_>>();
-        let source_id_set = source_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let sink_ids = plan
+            .collect::<BTreeSet<_>>();
+        let sink_operator_ids = plan
             .spec
             .sinks
             .iter()
             .filter(|sink| assigned_operators.contains(&sink.operator_id))
             .map(|sink| sink.operator_id.clone())
             .collect::<BTreeSet<_>>();
+        let assigned_task_by_operator_subtask = task_ids
+            .iter()
+            .filter_map(|task_id| plan.task(task_id))
+            .map(|task| ((task.operator_id.clone(), task.subtask), task.id.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut inputs = Vec::with_capacity(source_tasks.len());
         let mut source_task_counts = BTreeMap::<String, usize>::new();
         for (task, source) in &source_tasks {
@@ -106,47 +115,65 @@ impl SingleComputeJobRunner {
             .sinks
             .iter()
             .filter(|sink| assigned_operators.contains(&sink.operator_id))
-            .map(|sink| {
-                Ok((
-                    sink.operator_id.clone(),
-                    adapter.build_output(sink, resource)?,
-                ))
+            .flat_map(|sink| {
+                task_ids
+                    .iter()
+                    .filter_map(|task_id| plan.task(task_id))
+                    .filter(|task| task.operator_id == sink.operator_id)
+                    .map(|task| Ok((task.id.clone(), adapter.build_output(sink, resource)?)))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
-        let processors = plan
-            .spec
-            .operators
+        let processors = task_ids
             .iter()
-            .filter(|operator| assigned_operators.contains(&operator.id))
-            .filter(|operator| {
-                !source_id_set.contains(&operator.id) && !sink_ids.contains(&operator.id)
+            .filter_map(|task_id| plan.task(task_id))
+            .filter(|task| {
+                !source_operator_ids.contains(&task.operator_id)
+                    && !sink_operator_ids.contains(&task.operator_id)
             })
-            .map(|operator| {
+            .map(|task| {
+                let operator = plan
+                    .spec
+                    .operators
+                    .iter()
+                    .find(|operator| operator.id == task.operator_id)
+                    .ok_or_else(|| {
+                        Error::Config(format!("task '{}' references unknown operator", task.id))
+                    })?;
                 Ok((
-                    operator.id.clone(),
+                    task.id.clone(),
                     adapter.build_processor(operator, resource)?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
         let mut edges = BTreeMap::<String, Vec<String>>::new();
-        for edge in &plan.spec.edges {
-            if assigned_operators.contains(&edge.from) != assigned_operators.contains(&edge.to) {
-                return Err(Error::Config(format!(
-                    "Job assignment splits edge '{}' between nodes; connected tasks must be co-located",
-                    edge.id
-                )));
+        for task_id in task_ids {
+            let task = plan.task(task_id).ok_or_else(|| {
+                Error::Config(format!("Job assignment contains unknown task '{task_id}'"))
+            })?;
+            for edge in &plan.spec.edges {
+                if edge.from != task.operator_id {
+                    continue;
+                }
+                if assigned_operators.contains(&edge.to) != assigned_operators.contains(&edge.from)
+                {
+                    return Err(Error::Config(format!(
+                        "Job assignment splits edge '{}' between nodes; connected tasks must be co-located",
+                        edge.id
+                    )));
+                }
+                if let Some(downstream_id) =
+                    assigned_task_by_operator_subtask.get(&(edge.to.clone(), task.subtask))
+                {
+                    edges
+                        .entry(task.id.clone())
+                        .or_default()
+                        .push(downstream_id.clone());
+                }
             }
-            if !assigned_operators.contains(&edge.from) || !assigned_operators.contains(&edge.to) {
-                continue;
-            }
-            edges
-                .entry(edge.from.clone())
-                .or_default()
-                .push(edge.to.clone());
         }
         Ok(Self {
             inputs,
-            source_ids,
+            source_task_ids,
             processors,
             outputs,
             edges,
@@ -215,7 +242,7 @@ impl SingleComputeJobRunner {
                 return Ok(());
             };
             let (index, batch, ack) = read?;
-            self.dispatch_from_source(&self.source_ids[index], batch)
+            self.dispatch_from_source(&self.source_task_ids[index], batch)
                 .await?;
             ack.ack().await?;
             reads.push(read_input(index, self.inputs[index].clone()));
@@ -224,19 +251,19 @@ impl SingleComputeJobRunner {
 
     async fn dispatch_from_source(
         &self,
-        source_id: &str,
+        source_task_id: &str,
         batch: crate::MessageBatchRef,
     ) -> Result<(), Error> {
-        self.dispatch(source_id, batch).await
+        self.dispatch(source_task_id, batch).await
     }
 
     fn dispatch<'a>(
         &'a self,
-        operator_id: &'a str,
+        task_id: &'a str,
         batch: crate::MessageBatchRef,
     ) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
-            let results = if let Some(processor) = self.processors.get(operator_id) {
+            let results = if let Some(processor) = self.processors.get(task_id) {
                 match processor.process(batch).await? {
                     ProcessResult::Single(batch) => vec![batch],
                     ProcessResult::Multiple(batches) => batches,
@@ -245,13 +272,13 @@ impl SingleComputeJobRunner {
             } else {
                 vec![batch]
             };
-            if let Some(output) = self.outputs.get(operator_id) {
+            if let Some(output) = self.outputs.get(task_id) {
                 for batch in results {
                     output.write(batch).await?;
                 }
                 return Ok(());
             }
-            let downstream = self.edges.get(operator_id).cloned().unwrap_or_default();
+            let downstream = self.edges.get(task_id).cloned().unwrap_or_default();
             for batch in results {
                 for downstream_id in &downstream {
                     self.dispatch(downstream_id, batch.clone()).await?;

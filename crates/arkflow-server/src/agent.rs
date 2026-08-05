@@ -228,6 +228,25 @@ impl JobRuntime {
         if assignments.is_empty() {
             return Err("Job command contains no task assignments".into());
         }
+        let existing = {
+            let tasks = self.tasks.lock().await;
+            if tasks
+                .get(&job_id)
+                .is_some_and(|task| task.generation > generation)
+            {
+                return Err("job generation is stale".into());
+            }
+            drop(tasks);
+            let mut tasks = self.tasks.lock().await;
+            let existing = tasks.remove(&job_id);
+            if let Some(existing) = &existing {
+                existing.cancellation.cancel();
+            }
+            existing
+        };
+        if let Some(existing) = existing {
+            let _ = existing.handle.await;
+        }
         let task_ids = assignments
             .iter()
             .map(|assignment| assignment.task_id.clone())
@@ -275,20 +294,6 @@ impl JobRuntime {
             None
         };
         let cancellation = CancellationToken::new();
-        let existing = {
-            let mut tasks = self.tasks.lock().await;
-            let existing = tasks.remove(&job_id);
-            if let Some(existing) = &existing {
-                if existing.generation > generation {
-                    return Err("job generation is stale".into());
-                }
-                existing.cancellation.cancel();
-            }
-            existing
-        };
-        if let Some(existing) = existing {
-            let _ = existing.handle.await;
-        }
         let task_cancellation = cancellation.clone();
         let runner_for_task = runner.clone();
         let handle = tokio::spawn(async move {
