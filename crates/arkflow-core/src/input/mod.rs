@@ -66,6 +66,12 @@ pub trait Input: Send + Sync {
         Ok(())
     }
 
+    /// Return the latest durable source positions for checkpointing.
+    /// Legacy inputs remain compatible through the empty default.
+    async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
+        Ok(Vec::new())
+    }
+
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;
 }

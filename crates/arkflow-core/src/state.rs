@@ -276,6 +276,11 @@ impl StateBackend for RedbStateBackend {
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
             let previous_bytes = previous.as_ref().map(|value| value.value.len() as u64);
+            let previous_is_live = previous.as_ref().is_some_and(|value| {
+                !value
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= now_ms())
+            });
             let current = previous
                 .filter(|value| {
                     !value
@@ -287,6 +292,23 @@ impl StateBackend for RedbStateBackend {
                 .unwrap_or_default();
             let next = current.saturating_add(delta);
             let next_value = serde_json::to_vec(&next)?;
+            if let Some(max_bytes) = self.max_bytes {
+                let accounted_previous = if previous_is_live {
+                    previous_bytes.unwrap_or_default()
+                } else {
+                    0
+                };
+                let next_total = self
+                    .bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(accounted_previous)
+                    .saturating_add(next_value.len() as u64);
+                if next_total > max_bytes {
+                    return Err(Error::Process(format!(
+                        "state budget exceeded: {next_total} > {max_bytes} bytes"
+                    )));
+                }
+            }
             let encoded = encode_value(&next_value, None)?;
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
@@ -618,6 +640,21 @@ mod tests {
         assert!(backend.put("orders", b"b", b"22").is_err());
         assert_eq!(backend.purge_expired(109).unwrap(), 0);
         assert_eq!(backend.purge_expired(110).unwrap(), 1);
+    }
+
+    #[test]
+    fn enforces_state_budget_for_keyed_counter_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(
+            RedbStateBackend::open(dir.path(), 1)
+                .unwrap()
+                .with_max_bytes(2),
+        );
+        let counter = KeyedCounter::new(backend, "aggregate");
+        assert_eq!(counter.add(b"a", 1).unwrap(), 1);
+        assert!(counter.add(b"b", 22).is_err());
+        assert_eq!(counter.get(b"a").unwrap(), Some(1));
+        assert_eq!(counter.get(b"b").unwrap(), None);
     }
 
     #[test]

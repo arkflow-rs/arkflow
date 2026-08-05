@@ -24,6 +24,8 @@ pub struct TaskCheckpointAck {
     pub task_id: String,
     pub attempt_id: String,
     pub partition: u32,
+    pub checkpoint_id: String,
+    pub generation: u64,
     pub state: StateSnapshot,
     pub source_positions: Vec<SourcePosition>,
     pub watermark_ms: Option<i64>,
@@ -393,6 +395,16 @@ impl CheckpointCoordinator {
                 ack.task_id
             )));
         }
+        let barrier = self
+            .barrier
+            .as_ref()
+            .ok_or_else(|| Error::Process("checkpoint barrier is missing".into()))?;
+        if ack.checkpoint_id != barrier.checkpoint_id || ack.generation != barrier.generation {
+            return Err(Error::Process(format!(
+                "checkpoint acknowledgement for task '{}' belongs to a different barrier",
+                ack.task_id
+            )));
+        }
         if ack.state.format_version != self.format_version || !ack.state.verify() {
             return Err(Error::Process(format!(
                 "invalid state snapshot from task '{}'",
@@ -504,6 +516,8 @@ mod tests {
             task_id: task_id.into(),
             attempt_id: format!("{task_id}-attempt"),
             partition: if task_id == "task-0" { 0 } else { 1 },
+            checkpoint_id: "cp-1".into(),
+            generation: 7,
             state: state(),
             source_positions: vec![SourcePosition {
                 partition: 0,
@@ -547,11 +561,39 @@ mod tests {
             task_id: "unknown".into(),
             attempt_id: "attempt".into(),
             partition: 0,
+            checkpoint_id: "cp-1".into(),
+            generation: 1,
             state: state(),
             source_positions: vec![],
             watermark_ms: None,
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_acknowledgement_from_another_barrier() {
+        let mut coordinator = CheckpointCoordinator::new(
+            JobId::new("orders").unwrap(),
+            JobVersion(1),
+            9,
+            1,
+            ["task-0".into()],
+        );
+        coordinator.start("cp-current").unwrap();
+        let mut ack = TaskCheckpointAck {
+            task_id: "task-0".into(),
+            attempt_id: "attempt-0".into(),
+            partition: 0,
+            checkpoint_id: "cp-old".into(),
+            generation: 8,
+            state: state(),
+            source_positions: vec![],
+            watermark_ms: None,
+        };
+        assert!(coordinator.acknowledge(ack.clone()).is_err());
+        ack.checkpoint_id = "cp-current".into();
+        ack.generation = 9;
+        assert!(coordinator.acknowledge(ack).unwrap());
     }
 
     #[test]

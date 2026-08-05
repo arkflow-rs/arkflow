@@ -28,10 +28,34 @@ impl SingleComputeJobRunner {
         adapter: &A,
         resource: &Resource,
     ) -> Result<Self, Error> {
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        Self::build_for_tasks(plan, &task_ids, adapter, resource)
+    }
+
+    pub fn build_for_tasks<A: JobComponentAdapter>(
+        plan: &JobPlan,
+        task_ids: &[String],
+        adapter: &A,
+        resource: &Resource,
+    ) -> Result<Self, Error> {
+        let assigned_operators = task_ids
+            .iter()
+            .filter_map(|task_id| plan.task(task_id).map(|task| task.operator_id.clone()))
+            .collect::<BTreeSet<_>>();
+        if assigned_operators.is_empty() {
+            return Err(Error::Config(
+                "Job assignment contains no known tasks".into(),
+            ));
+        }
         let source_ids = plan
             .spec
             .sources
             .iter()
+            .filter(|source| assigned_operators.contains(&source.operator_id))
             .map(|source| source.operator_id.clone())
             .collect::<Vec<_>>();
         let source_id_set = source_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -39,18 +63,21 @@ impl SingleComputeJobRunner {
             .spec
             .sinks
             .iter()
+            .filter(|sink| assigned_operators.contains(&sink.operator_id))
             .map(|sink| sink.operator_id.clone())
             .collect::<BTreeSet<_>>();
         let inputs = plan
             .spec
             .sources
             .iter()
+            .filter(|source| assigned_operators.contains(&source.operator_id))
             .map(|source| adapter.build_input(source, resource))
             .collect::<Result<Vec<_>, _>>()?;
         let outputs = plan
             .spec
             .sinks
             .iter()
+            .filter(|sink| assigned_operators.contains(&sink.operator_id))
             .map(|sink| {
                 Ok((
                     sink.operator_id.clone(),
@@ -62,6 +89,7 @@ impl SingleComputeJobRunner {
             .spec
             .operators
             .iter()
+            .filter(|operator| assigned_operators.contains(&operator.id))
             .filter(|operator| {
                 !source_id_set.contains(&operator.id) && !sink_ids.contains(&operator.id)
             })
@@ -74,6 +102,9 @@ impl SingleComputeJobRunner {
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
         let mut edges = BTreeMap::<String, Vec<String>>::new();
         for edge in &plan.spec.edges {
+            if !assigned_operators.contains(&edge.from) || !assigned_operators.contains(&edge.to) {
+                continue;
+            }
             edges
                 .entry(edge.from.clone())
                 .or_default()
@@ -125,6 +156,16 @@ impl SingleComputeJobRunner {
             }
         }
         result
+    }
+
+    pub async fn current_source_positions(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+        let mut positions = Vec::new();
+        for input in &self.inputs {
+            positions.extend(input.current_positions().await?);
+        }
+        Ok(positions)
     }
 
     async fn run_connected(&self, cancellation: CancellationToken) -> Result<(), Error> {

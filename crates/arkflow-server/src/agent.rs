@@ -4,13 +4,20 @@ use crate::hub::{
     AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, HubOperationState, NodeReport,
     RegisterRequest, RegisterResponse,
 };
+use arkflow_core::checkpoint::{
+    CheckpointCoordinator, CheckpointRepository, FileCheckpointStore, StateSnapshotRef,
+    TaskAttemptSnapshot, TaskCheckpointAck,
+};
 use arkflow_core::configuration::redacted_config;
 use arkflow_core::control::OperationState;
 use arkflow_core::control_plane::ControlPlane;
 use arkflow_core::input::InputConfig;
-use arkflow_core::job::{JobComponentAdapter, JobPlan, OperatorSpec, SinkSpec, SourceSpec};
+use arkflow_core::job::{
+    JobComponentAdapter, JobPlan, OperatorSpec, SinkSpec, SourceSpec, TaskAttempt,
+};
 use arkflow_core::output::OutputConfig;
 use arkflow_core::processor::ProcessorConfig;
+use arkflow_core::state::{RedbStateBackend, StateBackend};
 use arkflow_core::temporary::Temporary;
 use arkflow_core::Resource;
 use reqwest::Client;
@@ -40,10 +47,13 @@ struct JobRuntime {
     tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
 }
 
-#[derive(Clone)]
 struct JobTask {
     generation: u64,
     cancellation: CancellationToken,
+    assignments: Vec<TaskAttempt>,
+    state: Arc<dyn StateBackend>,
+    runner: Arc<arkflow_core::job_runner::SingleComputeJobRunner>,
+    handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
 }
 
 impl JobRuntime {
@@ -55,18 +65,36 @@ impl JobRuntime {
             .map(|task| task.generation)
     }
 
-    async fn start(&self, plan: JobPlan, generation: u64) -> Result<(), String> {
+    async fn start(
+        &self,
+        plan: JobPlan,
+        assignments: Vec<TaskAttempt>,
+        generation: u64,
+    ) -> Result<(), String> {
         let job_id = plan.spec.id.to_string();
+        if assignments.is_empty() {
+            return Err("Job command contains no task assignments".into());
+        }
+        let task_ids = assignments
+            .iter()
+            .map(|assignment| assignment.task_id.clone())
+            .collect::<Vec<_>>();
         let resource = Resource {
             temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
             input_names: RefCell::new(Vec::new()),
         };
-        let runner = arkflow_core::job_runner::SingleComputeJobRunner::build(
-            &plan,
-            &RegistryJobAdapter,
-            &resource,
-        )
-        .map_err(|error| error.to_string())?;
+        let runner = Arc::new(
+            arkflow_core::job_runner::SingleComputeJobRunner::build_for_tasks(
+                &plan,
+                &task_ids,
+                &RegistryJobAdapter,
+                &resource,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let state_root = std::env::temp_dir().join("arkflow-job-state").join(&job_id);
+        let state: Arc<dyn StateBackend> =
+            Arc::new(RedbStateBackend::open(state_root, 1).map_err(|error| error.to_string())?);
         let cancellation = CancellationToken::new();
         let mut tasks = self.tasks.lock().await;
         if let Some(existing) = tasks.get(&job_id) {
@@ -75,19 +103,132 @@ impl JobRuntime {
             }
             existing.cancellation.cancel();
         }
+        let task_cancellation = cancellation.clone();
+        let runner_for_task = runner.clone();
+        let handle = tokio::spawn(async move { runner_for_task.run(task_cancellation).await });
         tasks.insert(
             job_id,
             JobTask {
                 generation,
                 cancellation: cancellation.clone(),
+                assignments,
+                state,
+                runner,
+                handle,
             },
         );
-        tokio::spawn(async move {
-            if let Err(error) = runner.run(cancellation).await {
-                tracing::error!(%error, "Job runtime stopped with an error");
-            }
-        });
         Ok(())
+    }
+
+    async fn checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+        generation: u64,
+        savepoint: bool,
+    ) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        let task = tasks
+            .get(job_id)
+            .ok_or_else(|| "Job is not running on this Agent".to_string())?;
+        if task.generation != generation {
+            return Err("checkpoint generation does not match running Job".into());
+        }
+        let snapshot = task.state.snapshot().map_err(|error| error.to_string())?;
+        let source_positions = task
+            .runner
+            .current_source_positions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let root = std::env::temp_dir()
+            .join("arkflow-job-checkpoints")
+            .join(job_id);
+        let store = FileCheckpointStore::new(&root).map_err(|error| error.to_string())?;
+        let repository = CheckpointRepository::new(store);
+        let state_ref = repository
+            .write_state_snapshot(checkpoint_id, &snapshot)
+            .map_err(|error| error.to_string())?;
+        let state_ref = StateSnapshotRef {
+            task_id: task
+                .assignments
+                .first()
+                .map(|assignment| assignment.task_id.clone())
+                .unwrap_or_default(),
+            ..state_ref
+        };
+        let mut coordinator = CheckpointCoordinator::new(
+            task.assignments[0].job_id.clone(),
+            task.assignments[0].job_version,
+            generation,
+            snapshot.format_version,
+            task.assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone()),
+        );
+        let barrier = coordinator
+            .start(checkpoint_id)
+            .map_err(|error| error.to_string())?;
+        for (index, assignment) in task.assignments.iter().enumerate() {
+            coordinator
+                .acknowledge(TaskCheckpointAck {
+                    task_id: assignment.task_id.clone(),
+                    attempt_id: assignment.id.clone(),
+                    partition: assignment.task_id.parse::<u32>().unwrap_or(0),
+                    checkpoint_id: barrier.checkpoint_id.clone(),
+                    generation: barrier.generation,
+                    state: snapshot.clone(),
+                    source_positions: if index == 0 {
+                        source_positions.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    watermark_ms: None,
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        let attempts = task
+            .assignments
+            .iter()
+            .map(|assignment| TaskAttemptSnapshot {
+                task_id: assignment.task_id.clone(),
+                attempt_id: assignment.id.clone(),
+                node_id: assignment.node_id.clone(),
+            })
+            .collect();
+        let manifest = coordinator
+            .complete(attempts, vec![state_ref])
+            .map_err(|error| error.to_string())?;
+        let artifact = if savepoint {
+            repository
+                .create_savepoint(&manifest)
+                .map_err(|error| error.to_string())?
+        } else {
+            repository
+                .write_checkpoint(&manifest)
+                .map_err(|error| error.to_string())?
+        };
+        Ok(root.join(artifact.manifest_key).display().to_string())
+    }
+
+    async fn take_finished(&self) -> Vec<(String, u64, Result<(), String>)> {
+        let mut finished = Vec::new();
+        let mut tasks = self.tasks.lock().await;
+        let ids = tasks
+            .iter()
+            .filter(|(_, task)| task.handle.is_finished())
+            .map(|(job_id, _)| job_id.clone())
+            .collect::<Vec<_>>();
+        for job_id in ids {
+            if let Some(task) = tasks.remove(&job_id) {
+                let result = match task.handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                finished.push((job_id, task.generation, result));
+            }
+        }
+        finished
     }
 
     async fn stop(&self, job_id: &str, generation: u64) -> Result<(), String> {
@@ -279,7 +420,28 @@ async fn run_session(
             _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await; return Ok(()) },
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq).await).await?; }
-            _ = poll.tick() => { let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish(); let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?; for command in commands { if let Some(result) = replay_cached_command(completed_commands, &command.id) { send_result(client, config, &auth, result).await?; continue; } let result = execute_command(client, cp, config, &auth, &command, &job_runtime).await?; remember_completed_command(completed_commands, command.id, result); } }
+            _ = poll.tick() => {
+                for (job_id, generation, outcome) in job_runtime.take_finished().await {
+                    let (state, error) = match outcome {
+                        Ok(()) => ("stopped".into(), None),
+                        Err(error) => ("failed".into(), Some(error)),
+                    };
+                    post_json(
+                        client,
+                        format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/job-observations"),
+                        &crate::hub::JobObservationRequest {
+                            auth: auth.clone(),
+                            job_id,
+                            generation,
+                            state,
+                            error,
+                        },
+                    ).await?;
+                }
+                let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish();
+                let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?;
+                for command in commands { if let Some(result) = replay_cached_command(completed_commands, &command.id) { send_result(client, config, &auth, result).await?; continue; } let result = execute_command(client, cp, config, &auth, &command, &job_runtime).await?; remember_completed_command(completed_commands, command.id, result); }
+            }
         }
     }
 }
@@ -368,6 +530,8 @@ async fn execute_command(
         failure_class: None,
         config_version_id: command.config_version_id.clone(),
         rollout_id: command.rollout_id.clone(),
+        observed_checkpoint_id: None,
+        checkpoint_manifest_uri: None,
     };
     if command_expired(command.expires_at_ms, now_ms()) {
         result.state = HubOperationState::TimedOut;
@@ -389,12 +553,24 @@ async fn execute_command(
                 let payload = command
                     .payload
                     .as_ref()
-                    .and_then(|payload| payload.get("plan"))
-                    .cloned()
                     .ok_or_else(|| "missing Job plan payload".to_string())?;
-                let plan = serde_json::from_value::<JobPlan>(payload)
-                    .map_err(|error| error.to_string())?;
-                job_runtime.start(plan, command.generation).await
+                let plan = serde_json::from_value::<JobPlan>(
+                    payload
+                        .get("plan")
+                        .cloned()
+                        .ok_or_else(|| "missing Job plan payload".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let assignments = serde_json::from_value(
+                    payload
+                        .get("assignments")
+                        .cloned()
+                        .ok_or_else(|| "missing Job task assignments".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                job_runtime
+                    .start(plan, assignments, command.generation)
+                    .await
             }
             "job_stop" => {
                 job_runtime
@@ -408,12 +584,45 @@ async fn execute_command(
                 let payload = command
                     .payload
                     .as_ref()
-                    .and_then(|payload| payload.get("plan"))
-                    .cloned()
                     .ok_or_else(|| "missing Job plan payload".to_string())?;
-                let plan = serde_json::from_value::<JobPlan>(payload)
-                    .map_err(|error| error.to_string())?;
-                job_runtime.start(plan, command.generation).await
+                let plan = serde_json::from_value::<JobPlan>(
+                    payload
+                        .get("plan")
+                        .cloned()
+                        .ok_or_else(|| "missing Job plan payload".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let assignments = serde_json::from_value(
+                    payload
+                        .get("assignments")
+                        .cloned()
+                        .ok_or_else(|| "missing Job task assignments".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                job_runtime
+                    .start(plan, assignments, command.generation)
+                    .await
+            }
+            "job_checkpoint" | "job_savepoint" => {
+                let payload = command
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| "missing checkpoint payload".to_string())?;
+                let checkpoint_id = payload
+                    .get("checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing checkpoint_id".to_string())?;
+                result.observed_checkpoint_id = Some(checkpoint_id.into());
+                let manifest_uri = job_runtime
+                    .checkpoint(
+                        &command.resource_id,
+                        checkpoint_id,
+                        command.generation,
+                        command.operation == "job_savepoint",
+                    )
+                    .await?;
+                result.checkpoint_manifest_uri = Some(manifest_uri);
+                Ok(())
             }
             _ => Err(format!("unknown Job operation {}", command.operation)),
         };
@@ -515,6 +724,8 @@ async fn execute_command(
                 failure_class,
                 config_version_id: command.config_version_id.clone(),
                 rollout_id: command.rollout_id.clone(),
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
             },
         )
         .await;
@@ -546,6 +757,8 @@ async fn execute_command(
                     failure_class: Some("permanent_execution".into()),
                     config_version_id: command.config_version_id.clone(),
                     rollout_id: command.rollout_id.clone(),
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
                 },
             )
             .await;
@@ -568,6 +781,8 @@ async fn execute_command(
             failure_class: None,
             config_version_id: command.config_version_id.clone(),
             rollout_id: command.rollout_id.clone(),
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
         },
     )
     .await?;
@@ -612,6 +827,8 @@ async fn execute_command(
                         },
                         config_version_id: command.config_version_id.clone(),
                         rollout_id: command.rollout_id.clone(),
+                        observed_checkpoint_id: None,
+                        checkpoint_manifest_uri: None,
                     },
                 )
                 .await;
@@ -750,6 +967,8 @@ mod tests {
             failure_class: None,
             config_version_id: None,
             rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
         };
         assert!(replay_cached_command(&cache, "cmd-1").is_none());
         remember_completed_command(&mut cache, "cmd-1".into(), result.clone());

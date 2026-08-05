@@ -74,3 +74,11 @@
 - [x] 9.4 Dispatch fenced Job lifecycle commands and task assignments from Hub to compatible Compute Agents.
 - [x] 9.5 Execute Job commands on Agents with generation-aware runtime lifecycle and report observed convergence.
 - [x] 9.6 Add regression tests for all reviewed failure modes and rerun repository validation.
+
+## 10. Follow-up review remediation
+
+- [x] 10.1 Dispatch per-node task assignments and restrict Agent execution to assigned tasks.
+- [x] 10.2 Execute checkpoint/savepoint commands through the coordinator, persist state snapshots/manifests, and aggregate multi-node completion.
+- [x] 10.3 Report asynchronous Job runtime termination back to Hub observations.
+- [x] 10.4 Enforce state budgets for atomic counter updates and fence acknowledgements to the active checkpoint barrier.
+- [x] 10.5 Add regression coverage and rerun focused repository validation.

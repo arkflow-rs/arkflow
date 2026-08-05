@@ -324,6 +324,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/agent/register", post(agent_register))
         .route("/agent/heartbeat", post(agent_heartbeat))
         .route("/agent/report", post(agent_report))
+        .route("/agent/job-observations", post(agent_job_observation))
         .route("/agent/commands", get(agent_commands))
         .route("/agent/commands/{id}/result", post(agent_command_result))
         .with_state(hub.clone());
@@ -1917,6 +1918,15 @@ async fn agent_report(
 ) -> Response {
     match hub.report(request).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+async fn agent_job_observation(
+    State(hub): State<hub::Hub>,
+    Json(request): Json<hub::JobObservationRequest>,
+) -> Response {
+    match hub.report_job_observation(request).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => hub_problem(error),
     }
 }
@@ -3685,6 +3695,8 @@ mod tests {
                         failure_class: None,
                         config_version_id: None,
                         rollout_id: None,
+                        observed_checkpoint_id: None,
+                        checkpoint_manifest_uri: None,
                     })
                     .unwrap(),
                 ))
