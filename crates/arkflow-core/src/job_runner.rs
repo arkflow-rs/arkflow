@@ -1,18 +1,114 @@
 //! Single-Compute execution adapter for a distributed Job plan.
 
 use crate::checkpoint::RecoveryPlan;
+use crate::event_time::{
+    window_action, FieldTimestampExtractor, TimestampExtractor, WatermarkTracker, WindowAction,
+};
 use crate::input::{Ack, Input};
 use crate::job::{JobComponentAdapter, JobPlan};
 use crate::output::Output;
 use crate::processor::Processor;
-use crate::{Error, ProcessResult, Resource};
+use crate::state::{KeyedCounter, StateBackend};
+use crate::{Error, MessageBatch, ProcessResult, Resource};
+use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray, UInt64Array};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 type InputRead = Result<(usize, crate::MessageBatchRef, Arc<dyn Ack>), Error>;
+
+struct SourceRuntime {
+    partition: u32,
+    extractor: FieldTimestampExtractor,
+    tracker: WatermarkTracker,
+    late_policy: crate::job::LateEventPolicy,
+    allowed_lateness_ms: u64,
+}
+
+struct StatefulProcessor {
+    inner: Arc<dyn Processor>,
+    counter: KeyedCounter,
+    key_field: String,
+}
+
+impl StatefulProcessor {
+    fn new(
+        inner: Arc<dyn Processor>,
+        backend: Arc<dyn StateBackend>,
+        namespace: String,
+        key_field: String,
+    ) -> Self {
+        Self {
+            inner,
+            counter: KeyedCounter::new(backend, namespace),
+            key_field,
+        }
+    }
+
+    fn keys_for_batch(&self, batch: &MessageBatch) -> Vec<Vec<u8>> {
+        let row_count = batch.len();
+        let Some(column) = batch.record_batch().column_by_name(&self.key_field) else {
+            return vec![b"__all__".to_vec(); row_count];
+        };
+        if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
+            return values
+                .iter()
+                .map(|value| {
+                    value
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| b"__null__".to_vec())
+                })
+                .collect();
+        }
+        if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+            return values
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| value.as_bytes().to_vec())
+                        .unwrap_or_else(|| b"__null__".to_vec())
+                })
+                .collect();
+        }
+        if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+            return values
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| value.to_be_bytes().to_vec())
+                        .unwrap_or_else(|| b"__null__".to_vec())
+                })
+                .collect();
+        }
+        if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
+            return values
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| value.to_be_bytes().to_vec())
+                        .unwrap_or_else(|| b"__null__".to_vec())
+                })
+                .collect();
+        }
+        vec![b"__all__".to_vec(); row_count]
+    }
+}
+
+#[async_trait::async_trait]
+impl Processor for StatefulProcessor {
+    async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+        for key in self.keys_for_batch(&batch) {
+            self.counter.add(&key, 1)?;
+        }
+        self.inner.process(batch).await
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        self.inner.close().await
+    }
+}
 
 pub struct SingleComputeJobRunner {
     inputs: Vec<Arc<dyn Input>>,
@@ -20,6 +116,8 @@ pub struct SingleComputeJobRunner {
     processors: BTreeMap<String, Arc<dyn Processor>>,
     outputs: BTreeMap<String, Arc<dyn Output>>,
     edges: BTreeMap<String, Vec<String>>,
+    source_runtimes: Mutex<BTreeMap<String, SourceRuntime>>,
+    window_sizes_ms: BTreeMap<String, i64>,
 }
 
 impl SingleComputeJobRunner {
@@ -41,6 +139,16 @@ impl SingleComputeJobRunner {
         task_ids: &[String],
         adapter: &A,
         resource: &Resource,
+    ) -> Result<Self, Error> {
+        Self::build_for_tasks_with_state(plan, task_ids, adapter, resource, None)
+    }
+
+    pub fn build_for_tasks_with_state<A: JobComponentAdapter>(
+        plan: &JobPlan,
+        task_ids: &[String],
+        adapter: &A,
+        resource: &Resource,
+        state_backend: Option<Arc<dyn StateBackend>>,
     ) -> Result<Self, Error> {
         plan.spec.validate()?;
         let assigned_operators = task_ids
@@ -139,10 +247,29 @@ impl SingleComputeJobRunner {
                     .ok_or_else(|| {
                         Error::Config(format!("task '{}' references unknown operator", task.id))
                     })?;
-                Ok((
-                    task.id.clone(),
-                    adapter.build_processor(operator, resource)?,
-                ))
+                let processor = adapter.build_processor(operator, resource)?;
+                let processor: Arc<dyn Processor> = if operator.stateful {
+                    let backend = state_backend.clone().ok_or_else(|| {
+                        Error::Config(format!(
+                            "stateful operator '{}' requires a Job state backend",
+                            operator.id
+                        ))
+                    })?;
+                    Arc::new(StatefulProcessor::new(
+                        processor,
+                        backend,
+                        format!("job:{}:task:{}", plan.spec.id, task.id),
+                        operator.key_field.clone().ok_or_else(|| {
+                            Error::Config(format!(
+                                "stateful operator '{}' requires key_field",
+                                operator.id
+                            ))
+                        })?,
+                    ))
+                } else {
+                    processor
+                };
+                Ok((task.id.clone(), processor))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
         let mut edges = BTreeMap::<String, Vec<String>>::new();
@@ -181,12 +308,50 @@ impl SingleComputeJobRunner {
                     .extend(downstream_ids);
             }
         }
+        let mut source_runtimes = BTreeMap::new();
+        for (task, source) in &source_tasks {
+            if source.time.mode == crate::job::TimeMode::EventTime {
+                source_runtimes.insert(
+                    task.id.clone(),
+                    SourceRuntime {
+                        partition: task.partitions.first().map(|p| p.id).unwrap_or_default(),
+                        extractor: FieldTimestampExtractor {
+                            field: source.time.timestamp_field.clone().ok_or_else(|| {
+                                Error::Config(format!(
+                                    "event-time source '{}' requires timestamp_field",
+                                    source.operator_id
+                                ))
+                            })?,
+                        },
+                        tracker: WatermarkTracker::from_time_spec(&source.time)?,
+                        late_policy: source.time.late_event_policy,
+                        allowed_lateness_ms: source.time.allowed_lateness_ms,
+                    },
+                );
+            }
+        }
+        let window_sizes_ms = plan
+            .spec
+            .operators
+            .iter()
+            .filter(|operator| operator.kind == crate::job::OperatorKind::Window)
+            .filter_map(|operator| {
+                operator
+                    .config
+                    .get("window_size_ms")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|size| *size > 0)
+                    .map(|size| (operator.id.clone(), size))
+            })
+            .collect();
         Ok(Self {
             inputs,
             source_task_ids,
             processors,
             outputs,
             edges,
+            source_runtimes: Mutex::new(source_runtimes),
+            window_sizes_ms,
         })
     }
 
@@ -252,11 +417,46 @@ impl SingleComputeJobRunner {
                 return Ok(());
             };
             let (index, batch, ack) = read?;
-            self.dispatch_from_source(&self.source_task_ids[index], batch)
-                .await?;
+            if let Some(batch) = self.prepare_event_time(&self.source_task_ids[index], batch)? {
+                self.dispatch_from_source(&self.source_task_ids[index], batch)
+                    .await?;
+            }
             ack.ack().await?;
             reads.push(read_input(index, self.inputs[index].clone()));
         }
+    }
+
+    fn prepare_event_time(
+        &self,
+        source_task_id: &str,
+        batch: crate::MessageBatchRef,
+    ) -> Result<Option<crate::MessageBatchRef>, Error> {
+        let mut runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        let Some(runtime) = runtimes.get_mut(source_task_id) else {
+            return Ok(Some(batch));
+        };
+        let event_time_ms = runtime.extractor.extract_timestamp_ms(&batch)?;
+        let now_ms = crate::state::now_ms() as i64;
+        let watermark_ms = runtime
+            .tracker
+            .observe(runtime.partition, event_time_ms, now_ms);
+        let window_action = self.window_sizes_ms.values().next().map(|window_size| {
+            let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
+            window_action(
+                window_start + *window_size,
+                event_time_ms,
+                Some(watermark_ms),
+                runtime.allowed_lateness_ms,
+                runtime.late_policy,
+            )
+        });
+        if matches!(window_action, Some(WindowAction::Drop)) {
+            return Ok(None);
+        }
+        Ok(Some(batch))
     }
 
     async fn dispatch_from_source(
@@ -315,6 +515,9 @@ mod tests {
     };
     use crate::temporary::Temporary;
     use async_trait::async_trait;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -482,5 +685,110 @@ mod tests {
         assert_eq!(runner.processors.len(), 2);
         assert_eq!(runner.edges["map-0"], vec!["sink-0", "sink-1"]);
         assert_eq!(runner.edges["map-1"], vec!["sink-0", "sink-1"]);
+    }
+
+    #[tokio::test]
+    async fn injects_task_scoped_state_into_stateful_processors() {
+        let mut plan = plan();
+        let map = plan
+            .spec
+            .operators
+            .iter_mut()
+            .find(|operator| operator.id == "map")
+            .unwrap();
+        map.stateful = true;
+        map.key_field = Some("key".into());
+
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let runner = SingleComputeJobRunner::build_for_tasks_with_state(
+            &plan,
+            &task_ids,
+            &TestAdapter,
+            &resource,
+            Some(backend.clone()),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "a"]))],
+        )
+        .unwrap();
+        runner.processors["map-0"]
+            .process(Arc::new(MessageBatch::new_arrow(batch)))
+            .await
+            .unwrap();
+
+        let entries = backend.scan("job:routing:task:map-0").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn applies_event_time_late_event_policy_before_dispatch() {
+        let mut plan = plan();
+        let source = plan.spec.sources.first_mut().unwrap();
+        source.time = TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(crate::job::WatermarkSpec {
+                strategy: crate::job::WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 0,
+            late_event_policy: LateEventPolicy::Drop,
+        };
+        plan.spec.operators[1].kind = OperatorKind::Window;
+        plan.spec.operators[1].config = serde_json::json!({"window_size_ms": 1_000});
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner =
+            SingleComputeJobRunner::build_for_tasks(&plan, &task_ids, &TestAdapter, &resource)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+        ]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_000])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        let late = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        assert!(runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(first)))
+            .unwrap()
+            .is_some());
+        assert!(runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(late)))
+            .unwrap()
+            .is_none());
     }
 }

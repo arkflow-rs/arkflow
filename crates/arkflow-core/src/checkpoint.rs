@@ -68,6 +68,8 @@ pub struct TaskAttemptSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshotRef {
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub uri: String,
     pub checksum: u64,
     pub bytes: u64,
@@ -243,6 +245,7 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         self.store.put(&key, &bytes)?;
         Ok(StateSnapshotRef {
             task_id: String::new(),
+            node_id: None,
             uri: key,
             checksum: snapshot_checksum(snapshot),
             bytes: bytes.len() as u64,
@@ -565,6 +568,7 @@ mod tests {
                 }],
                 vec![StateSnapshotRef {
                     task_id: "task-0".into(),
+                    node_id: None,
                     uri: "s3://bucket/cp-1/task-0".into(),
                     checksum: 1,
                     bytes: 10,

@@ -117,3 +117,10 @@
 - [x] 15.2 Apply compare-and-swap generation updates for concurrent Job actions.
 - [x] 15.3 Reject both stale and future-generation Job observations.
 - [x] 15.4 Add broadcast-routing and generation-fencing regression coverage.
+
+## 16. Follow-up review remediation
+
+- [x] 16.1 Inject task-scoped state into stateful Job processors and persist keyed updates.
+- [x] 16.2 Apply timestamp extraction, watermark tracking, window decisions, and late-event policy in the runner.
+- [x] 16.3 Bind state snapshots to Agent nodes and restore only the local snapshot set.
+- [x] 16.4 Await cancelled Job runtimes before restart replacement and add recovery isolation coverage.

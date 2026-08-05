@@ -222,6 +222,7 @@ impl JobRuntime {
         generation: u64,
         recovery_id: Option<String>,
         recovery_savepoint: bool,
+        node_id: &str,
     ) -> Result<(), String> {
         let _start_guard = self.starts.lock().await;
         let job_id = plan.spec.id.to_string();
@@ -255,15 +256,6 @@ impl JobRuntime {
             temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
             input_names: RefCell::new(Vec::new()),
         };
-        let runner = Arc::new(
-            arkflow_core::job_runner::SingleComputeJobRunner::build_for_tasks(
-                &plan,
-                &task_ids,
-                &RegistryJobAdapter,
-                &resource,
-            )
-            .map_err(|error| error.to_string())?,
-        );
         let state_root = std::env::temp_dir().join("arkflow-job-state").join(&job_id);
         let state_format_version = plan
             .spec
@@ -275,16 +267,50 @@ impl JobRuntime {
             RedbStateBackend::open(state_root, state_format_version)
                 .map_err(|error| error.to_string())?,
         );
+        let runner = Arc::new(
+            arkflow_core::job_runner::SingleComputeJobRunner::build_for_tasks_with_state(
+                &plan,
+                &task_ids,
+                &RegistryJobAdapter,
+                &resource,
+                Some(state.clone()),
+            )
+            .map_err(|error| error.to_string())?,
+        );
         let recovery = if let Some(checkpoint_id) = recovery_id {
             let repository = checkpoint_repository(&plan)?;
             let artifact = recovery_artifact(&plan, &checkpoint_id, recovery_savepoint)?;
             let manifest = repository
                 .read_manifest(&artifact)
                 .map_err(|error| error.to_string())?;
-            for snapshot_ref in &manifest.state_snapshots {
-                let snapshot = repository
-                    .read_state_snapshot(snapshot_ref)
+            let mut snapshots = manifest
+                .state_snapshots
+                .iter()
+                .filter(|snapshot_ref| {
+                    snapshot_ref.node_id.as_deref() == Some(node_id)
+                        || (snapshot_ref.node_id.is_none()
+                            && manifest
+                                .task_attempts
+                                .iter()
+                                .all(|attempt| attempt.node_id == node_id))
+                })
+                .map(|snapshot_ref| {
+                    repository
+                        .read_state_snapshot(snapshot_ref)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if snapshots.len() > 1 {
+                let entries = snapshots
+                    .drain(..)
+                    .flat_map(|snapshot| snapshot.entries)
+                    .collect();
+                let snapshot =
+                    arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+                state
+                    .restore(&snapshot)
                     .map_err(|error| error.to_string())?;
+            } else if let Some(snapshot) = snapshots.pop() {
                 state
                     .restore(&snapshot)
                     .map_err(|error| error.to_string())?;
@@ -355,6 +381,7 @@ impl JobRuntime {
                 .first()
                 .map(|assignment| assignment.task_id.clone())
                 .unwrap_or_default(),
+            node_id: Some(node_id.to_owned()),
             ..state_ref
         };
         let mut coordinator = CheckpointCoordinator::new(
@@ -537,14 +564,19 @@ impl JobRuntime {
     }
 
     async fn stop(&self, job_id: &str, generation: u64) -> Result<(), String> {
-        let mut tasks = self.tasks.lock().await;
-        if let Some(existing) = tasks.get(job_id) {
-            if existing.generation > generation {
-                return Err("job generation is stale".into());
+        let _start_guard = self.starts.lock().await;
+        let task = {
+            let mut tasks = self.tasks.lock().await;
+            if let Some(existing) = tasks.get(job_id) {
+                if existing.generation > generation {
+                    return Err("job generation is stale".into());
+                }
             }
-        }
-        if let Some(task) = tasks.remove(job_id) {
+            tasks.remove(job_id)
+        };
+        if let Some(task) = task {
             task.cancellation.cancel();
+            let _ = task.handle.await;
         }
         Ok(())
     }
@@ -881,6 +913,7 @@ async fn execute_command(
                         command.generation,
                         recovery_id,
                         recovery_savepoint,
+                        &config.node_id,
                     )
                     .await
             }
@@ -919,6 +952,7 @@ async fn execute_command(
                         command.generation,
                         recovery_id,
                         recovery_savepoint,
+                        &config.node_id,
                     )
                     .await
             }
