@@ -148,3 +148,9 @@
 
 - [x] 20.1 Derive checkpoint participants from dispatched node operations for automatic placement.
 - [x] 20.2 Add automatic-placement checkpoint completion regression coverage.
+
+## 21. Follow-up review remediation
+
+- [x] 21.1 Quiesce runner processing with a checkpoint barrier while capturing state and source positions.
+- [x] 21.2 Feed keyed state updates into stateful operator batches and add output-level regression coverage.
+- [x] 21.3 Schedule periodic checkpoints from the configured interval through Hub reconciliation.

@@ -361,10 +361,9 @@ impl JobRuntime {
         if task.generation != generation {
             return Err("checkpoint generation does not match running Job".into());
         }
-        let snapshot = task.state.snapshot().map_err(|error| error.to_string())?;
-        let source_positions = task
+        let (snapshot, source_positions) = task
             .runner
-            .current_source_positions()
+            .checkpoint_snapshot(task.state.as_ref())
             .await
             .map_err(|error| error.to_string())?;
         let store_uri = task

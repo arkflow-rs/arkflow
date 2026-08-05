@@ -840,6 +840,50 @@ impl Hub {
             .map_err(HubError::from)
     }
 
+    /// Enqueue periodic checkpoints for running Jobs whose configured interval
+    /// has elapsed. Scheduling lives in the Hub so the normal checkpoint
+    /// aggregation and fencing path is used for every Agent.
+    pub async fn schedule_periodic_checkpoints(&self) -> Result<usize, HubError> {
+        let now = now_ms();
+        let mut scheduled = 0;
+        for job in self.jobs().await? {
+            if job.desired_state != "running" {
+                continue;
+            }
+            let spec: arkflow_core::job::JobSpec =
+                serde_json::from_str(&job.spec_json).map_err(|error| {
+                    HubError::Invalid(format!("invalid persisted Job spec: {error}"))
+                })?;
+            let Some(checkpoint) = spec.checkpoint.as_ref() else {
+                continue;
+            };
+            if checkpoint.interval_ms == 0 {
+                continue;
+            }
+            let records = self.job_checkpoints(&job.job_id).await?;
+            let last_attempt = records.iter().map(|record| record.created_at_ms).max();
+            if last_attempt
+                .is_some_and(|created| now.saturating_sub(created) < checkpoint.interval_ms)
+            {
+                continue;
+            }
+            let checkpoint_id = format!("checkpoint-{}-{}-{}", job.job_id, job.generation, now);
+            let record = JobCheckpointRecord {
+                job_id: job.job_id.clone(),
+                checkpoint_id,
+                kind: "checkpoint".into(),
+                status: "pending".into(),
+                manifest_uri: None,
+                format_version: 1,
+                created_at_ms: now,
+                updated_at_ms: now,
+            };
+            self.record_job_checkpoint(record).await?;
+            scheduled += 1;
+        }
+        Ok(scheduled)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
         self.updates.subscribe()
     }

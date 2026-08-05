@@ -6,10 +6,14 @@ use crate::input::{Ack, Input};
 use crate::job::{JobComponentAdapter, JobPlan};
 use crate::output::Output;
 use crate::processor::Processor;
-use crate::state::{KeyedCounter, StateBackend};
+use crate::state::{KeyedCounter, StateBackend, StateSnapshot};
 use crate::{Error, MessageBatch, ProcessResult, Resource};
-use datafusion::arrow::array::{BinaryArray, BooleanArray, Int64Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, UInt64Array,
+};
 use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::datatypes::{DataType, Field};
+use datafusion::arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +35,7 @@ struct StatefulProcessor {
     inner: Arc<dyn Processor>,
     counter: KeyedCounter,
     key_field: String,
+    state_field: String,
 }
 
 impl StatefulProcessor {
@@ -39,11 +44,13 @@ impl StatefulProcessor {
         backend: Arc<dyn StateBackend>,
         namespace: String,
         key_field: String,
+        state_field: String,
     ) -> Self {
         Self {
             inner,
             counter: KeyedCounter::new(backend, namespace),
             key_field,
+            state_field,
         }
     }
 
@@ -99,10 +106,27 @@ impl StatefulProcessor {
 #[async_trait::async_trait]
 impl Processor for StatefulProcessor {
     async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
-        for key in self.keys_for_batch(&batch) {
-            self.counter.add(&key, 1)?;
-        }
-        self.inner.process(batch).await
+        let counts = self
+            .keys_for_batch(&batch)
+            .into_iter()
+            .map(|key| self.counter.add(&key, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+        fields.push(Arc::new(Field::new(
+            &self.state_field,
+            DataType::Int64,
+            false,
+        )));
+        columns.push(Arc::new(Int64Array::from(counts)) as ArrayRef);
+        let enriched = RecordBatch::try_new(
+            Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+            columns,
+        )
+        .map_err(|error| Error::Process(format!("build stateful batch: {error}")))?;
+        let mut enriched = MessageBatch::new_arrow(enriched);
+        enriched.set_input_name(batch.get_input_name());
+        self.inner.process(Arc::new(enriched)).await
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -117,6 +141,7 @@ pub struct SingleComputeJobRunner {
     outputs: BTreeMap<String, Arc<dyn Output>>,
     edges: BTreeMap<String, Vec<String>>,
     source_runtimes: Mutex<BTreeMap<String, SourceRuntime>>,
+    checkpoint_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl SingleComputeJobRunner {
@@ -264,6 +289,12 @@ impl SingleComputeJobRunner {
                                 operator.id
                             ))
                         })?,
+                        operator
+                            .config
+                            .get("state_output_field")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("__arkflow_state_count")
+                            .to_owned(),
                     ))
                 } else {
                     processor
@@ -380,6 +411,7 @@ impl SingleComputeJobRunner {
             outputs,
             edges,
             source_runtimes: Mutex::new(source_runtimes),
+            checkpoint_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -425,11 +457,28 @@ impl SingleComputeJobRunner {
     pub async fn current_source_positions(
         &self,
     ) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+        let _guard = self.checkpoint_gate.read().await;
+        self.current_source_positions_unlocked().await
+    }
+
+    async fn current_source_positions_unlocked(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
         let mut positions = Vec::new();
         for input in &self.inputs {
             positions.extend(input.current_positions().await?);
         }
         Ok(positions)
+    }
+
+    pub async fn checkpoint_snapshot(
+        &self,
+        state: &dyn StateBackend,
+    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>), Error> {
+        let _guard = self.checkpoint_gate.write().await;
+        let snapshot = state.snapshot()?;
+        let positions = self.current_source_positions_unlocked().await?;
+        Ok((snapshot, positions))
     }
 
     async fn run_connected(&self, cancellation: CancellationToken) -> Result<(), Error> {
@@ -445,11 +494,13 @@ impl SingleComputeJobRunner {
                 return Ok(());
             };
             let (index, batch, ack) = read?;
+            let _guard = self.checkpoint_gate.read().await;
             if let Some(batch) = self.prepare_event_time(&self.source_task_ids[index], batch)? {
                 self.dispatch_from_source(&self.source_task_ids[index], batch)
                     .await?;
             }
             ack.ack().await?;
+            drop(_guard);
             reads.push(read_input(index, self.inputs[index].clone()));
         }
     }
@@ -770,10 +821,21 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["a", "b", "a"]))],
         )
         .unwrap();
-        runner.processors["map-0"]
+        let result = runner.processors["map-0"]
             .process(Arc::new(MessageBatch::new_arrow(batch)))
             .await
             .unwrap();
+        let ProcessResult::Single(output) = result else {
+            panic!("stateful test processor should return one batch");
+        };
+        let counts = output
+            .record_batch()
+            .column_by_name("__arkflow_state_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.values(), &[1, 1, 2]);
 
         let entries = backend.scan("job:routing:task:map-0").unwrap();
         assert_eq!(entries.len(), 2);

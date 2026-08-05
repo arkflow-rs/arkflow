@@ -379,6 +379,7 @@ pub async fn serve_hub(
             tokio::select! {
                 _ = interval.tick() => {
                     let _ = reconcile_hub.expire_attempts().await;
+                    let _ = reconcile_hub.schedule_periodic_checkpoints().await;
                     let started = crate::hub::now_ms_for_metrics();
                     let result = reconcile_hub.reconcile_once("hub-reconciler").await;
                     reconcile_hub.record_reconcile_result(started, &result).await;
