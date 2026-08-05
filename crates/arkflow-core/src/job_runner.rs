@@ -140,6 +140,7 @@ pub struct SingleComputeJobRunner {
     processors: BTreeMap<String, Arc<dyn Processor>>,
     outputs: BTreeMap<String, Arc<dyn Output>>,
     edges: BTreeMap<String, Vec<String>>,
+    late_route_tasks: BTreeMap<String, String>,
     source_runtimes: Mutex<BTreeMap<String, SourceRuntime>>,
     checkpoint_gate: Arc<tokio::sync::RwLock<()>>,
 }
@@ -339,7 +340,24 @@ impl SingleComputeJobRunner {
             }
         }
         let mut source_runtimes = BTreeMap::new();
+        let mut late_route_tasks = BTreeMap::new();
         for (task, source) in &source_tasks {
+            if let Some(route_operator) = source.time.late_event_route.as_ref() {
+                let route_task = task_ids
+                    .iter()
+                    .filter_map(|task_id| plan.task(task_id))
+                    .find(|candidate| {
+                        candidate.operator_id == *route_operator
+                            && candidate.subtask == task.subtask
+                    })
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "late event route '{}' has no assigned task for source '{}'",
+                            route_operator, task.id
+                        ))
+                    })?;
+                late_route_tasks.insert(task.id.clone(), route_task.id.clone());
+            }
             if source.time.mode == crate::job::TimeMode::EventTime {
                 let operator_kinds = plan
                     .spec
@@ -410,6 +428,7 @@ impl SingleComputeJobRunner {
             processors,
             outputs,
             edges,
+            late_route_tasks,
             source_runtimes: Mutex::new(source_runtimes),
             checkpoint_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
@@ -483,21 +502,39 @@ impl SingleComputeJobRunner {
 
     async fn run_connected(&self, cancellation: CancellationToken) -> Result<(), Error> {
         let mut reads = FuturesUnordered::new();
+        let mut idle_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         for (index, input) in self.inputs.iter().enumerate() {
             reads.push(read_input(index, input.clone()));
         }
         loop {
             let Some(read) = (tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
+                _ = idle_tick.tick() => {
+                    self.refresh_idle_partitions()?;
+                    continue;
+                }
                 result = reads.next() => result,
             }) else {
                 return Ok(());
             };
             let (index, batch, ack) = read?;
             let _guard = self.checkpoint_gate.read().await;
-            if let Some(batch) = self.prepare_event_time(&self.source_task_ids[index], batch)? {
-                self.dispatch_from_source(&self.source_task_ids[index], batch)
-                    .await?;
+            for (batch, action) in self.prepare_event_time(&self.source_task_ids[index], batch)? {
+                match action {
+                    WindowAction::Route => {
+                        self.dispatch_late_event(&self.source_task_ids[index], batch)
+                            .await?;
+                    }
+                    WindowAction::Update => {
+                        self.dispatch_window_update(&self.source_task_ids[index], batch)
+                            .await?;
+                    }
+                    WindowAction::Hold | WindowAction::Emit => {
+                        self.dispatch_from_source(&self.source_task_ids[index], batch)
+                            .await?;
+                    }
+                    WindowAction::Drop => {}
+                }
             }
             ack.ack().await?;
             drop(_guard);
@@ -505,27 +542,43 @@ impl SingleComputeJobRunner {
         }
     }
 
+    fn refresh_idle_partitions(&self) -> Result<(), Error> {
+        let now_ms = crate::state::now_ms() as i64;
+        let mut runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        for runtime in runtimes.values_mut() {
+            runtime.tracker.refresh_idle(now_ms);
+        }
+        Ok(())
+    }
+
     fn prepare_event_time(
         &self,
         source_task_id: &str,
         batch: crate::MessageBatchRef,
-    ) -> Result<Option<crate::MessageBatchRef>, Error> {
+    ) -> Result<Vec<(crate::MessageBatchRef, WindowAction)>, Error> {
         let mut runtimes = self
             .source_runtimes
             .lock()
             .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
         let Some(runtime) = runtimes.get_mut(source_task_id) else {
-            return Ok(Some(batch));
+            return Ok(vec![(batch, WindowAction::Hold)]);
         };
         let event_times_ms = runtime.extractor.extract_timestamps_ms(&batch)?;
         let now_ms = crate::state::now_ms() as i64;
-        let mut keep = Vec::with_capacity(event_times_ms.len());
+        runtime.tracker.refresh_idle(now_ms);
+        let mut actions = Vec::with_capacity(event_times_ms.len());
         for event_time_ms in event_times_ms {
             let Some(event_time_ms) = event_time_ms else {
-                keep.push(!matches!(
-                    runtime.late_policy,
-                    crate::job::LateEventPolicy::Drop
-                ));
+                actions.push(
+                    if matches!(runtime.late_policy, crate::job::LateEventPolicy::Drop) {
+                        WindowAction::Drop
+                    } else {
+                        WindowAction::Hold
+                    },
+                );
                 continue;
             };
             let watermark_ms = runtime
@@ -541,19 +594,41 @@ impl SingleComputeJobRunner {
                     runtime.late_policy,
                 )
             });
-            keep.push(!matches!(action, Some(WindowAction::Drop)));
+            actions.push(action.unwrap_or(WindowAction::Hold));
         }
-        if keep.iter().all(|value| *value) {
-            return Ok(Some(batch));
+        let mut groups = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (index, action) in actions.into_iter().enumerate() {
+            let group = match action {
+                WindowAction::Hold => 0,
+                WindowAction::Emit => 1,
+                WindowAction::Update => 2,
+                WindowAction::Route => 3,
+                WindowAction::Drop => continue,
+            };
+            groups[group].push(index);
         }
-        if keep.iter().all(|value| !*value) {
-            return Ok(None);
-        }
-        let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
-            .map_err(|error| Error::Process(format!("filter late events: {error}")))?;
-        let mut filtered_batch = MessageBatch::new_arrow(filtered);
-        filtered_batch.set_input_name(batch.get_input_name());
-        Ok(Some(Arc::new(filtered_batch)))
+        let group_actions = [
+            WindowAction::Hold,
+            WindowAction::Emit,
+            WindowAction::Update,
+            WindowAction::Route,
+        ];
+        groups
+            .into_iter()
+            .zip(group_actions)
+            .filter(|(indices, _)| !indices.is_empty())
+            .map(|(indices, action)| {
+                let mut keep = vec![false; batch.len()];
+                for index in indices {
+                    keep[index] = true;
+                }
+                let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
+                    .map_err(|error| Error::Process(format!("filter late events: {error}")))?;
+                let mut filtered_batch = MessageBatch::new_arrow(filtered);
+                filtered_batch.set_input_name(batch.get_input_name());
+                Ok((Arc::new(filtered_batch), action))
+            })
+            .collect()
     }
 
     async fn dispatch_from_source(
@@ -562,6 +637,51 @@ impl SingleComputeJobRunner {
         batch: crate::MessageBatchRef,
     ) -> Result<(), Error> {
         self.dispatch(source_task_id, batch).await
+    }
+
+    async fn dispatch_late_event(
+        &self,
+        source_task_id: &str,
+        batch: crate::MessageBatchRef,
+    ) -> Result<(), Error> {
+        let target = self
+            .late_route_tasks
+            .get(source_task_id)
+            .map(String::as_str)
+            .unwrap_or(source_task_id);
+        let marked = self.mark_event_batch(batch, "__arkflow_late_event_route")?;
+        self.dispatch(target, marked).await
+    }
+
+    async fn dispatch_window_update(
+        &self,
+        source_task_id: &str,
+        batch: crate::MessageBatchRef,
+    ) -> Result<(), Error> {
+        let marker = "__arkflow_late_event_update";
+        let marked = self.mark_event_batch(batch, marker)?;
+        self.dispatch(source_task_id, marked).await
+    }
+
+    fn mark_event_batch(
+        &self,
+        batch: crate::MessageBatchRef,
+        marker: &str,
+    ) -> Result<crate::MessageBatchRef, Error> {
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+        if batch.record_batch().column_by_name(marker).is_none() {
+            fields.push(Arc::new(Field::new(marker, DataType::Boolean, false)));
+            columns.push(Arc::new(BooleanArray::from(vec![true; batch.len()])) as ArrayRef);
+        }
+        let marked = RecordBatch::try_new(
+            Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+            columns,
+        )
+        .map_err(|error| Error::Process(format!("mark late event batch: {error}")))?;
+        let mut marked = MessageBatch::new_arrow(marked);
+        marked.set_input_name(batch.get_input_name());
+        Ok(Arc::new(marked))
     }
 
     fn dispatch<'a>(
@@ -750,6 +870,7 @@ mod tests {
                     watermark: None,
                     allowed_lateness_ms: 0,
                     late_event_policy: LateEventPolicy::Drop,
+                    late_event_route: None,
                 },
             }],
             sinks: vec![SinkSpec {
@@ -855,6 +976,7 @@ mod tests {
             }),
             allowed_lateness_ms: 0,
             late_event_policy: LateEventPolicy::Drop,
+            late_event_route: None,
         };
         plan.spec.operators[1].kind = OperatorKind::Window;
         plan.spec.operators[1].config = serde_json::json!({"window_size_ms": 1_000});
@@ -885,8 +1007,58 @@ mod tests {
         let prepared = runner
             .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(mixed)))
             .unwrap()
-            .unwrap();
+            .into_iter()
+            .next()
+            .unwrap()
+            .0;
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared.record_batch().num_rows(), 1);
+    }
+
+    #[test]
+    fn separates_route_and_update_late_event_actions() {
+        let mut plan = plan();
+        let source = plan.spec.sources.first_mut().unwrap();
+        source.time = TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(crate::job::WatermarkSpec {
+                strategy: crate::job::WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 100,
+            late_event_policy: LateEventPolicy::Route,
+            late_event_route: None,
+        };
+        plan.spec.operators[1].kind = OperatorKind::Window;
+        plan.spec.operators[1].config = serde_json::json!({"window_size_ms": 1_000});
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner =
+            SingleComputeJobRunner::build_for_tasks(&plan, &task_ids, &TestAdapter, &resource)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_000]))],
+        )
+        .unwrap();
+        runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(first)))
+            .unwrap();
+        let late = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![0]))]).unwrap();
+        let actions = runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(late)))
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].1, WindowAction::Route);
     }
 }

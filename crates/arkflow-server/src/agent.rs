@@ -374,15 +374,15 @@ impl JobRuntime {
         let state_ref = repository
             .write_state_snapshot(checkpoint_id, &snapshot)
             .map_err(|error| error.to_string())?;
-        let state_ref = StateSnapshotRef {
-            task_id: task
-                .assignments
-                .first()
-                .map(|assignment| assignment.task_id.clone())
-                .unwrap_or_default(),
-            node_id: Some(node_id.to_owned()),
-            ..state_ref
-        };
+        let state_refs = task
+            .assignments
+            .iter()
+            .map(|assignment| StateSnapshotRef {
+                task_id: assignment.task_id.clone(),
+                node_id: Some(node_id.to_owned()),
+                ..state_ref.clone()
+            })
+            .collect::<Vec<_>>();
         let mut coordinator = CheckpointCoordinator::new(
             task.assignments[0].job_id.clone(),
             task.assignments[0].job_version,
@@ -423,7 +423,7 @@ impl JobRuntime {
             })
             .collect();
         let manifest = coordinator
-            .complete(attempts, vec![state_ref])
+            .complete(attempts, state_refs)
             .map_err(|error| error.to_string())?;
         let kind = if savepoint {
             RecoveryArtifactKind::Savepoint

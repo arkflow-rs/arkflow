@@ -201,6 +201,30 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
                 "cannot persist invalid recovery manifest".into(),
             ));
         }
+        let task_ids = manifest
+            .task_attempts
+            .iter()
+            .map(|attempt| attempt.task_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if task_ids.is_empty() || manifest.state_snapshots.is_empty() {
+            return Err(Error::Process(
+                "cannot complete recovery manifest without task attempts and state snapshots"
+                    .into(),
+            ));
+        }
+        let snapshot_tasks = manifest
+            .state_snapshots
+            .iter()
+            .map(|snapshot| snapshot.task_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if !task_ids.is_subset(&snapshot_tasks) {
+            return Err(Error::Process(
+                "recovery manifest is missing a state snapshot for a participating task".into(),
+            ));
+        }
+        for snapshot in &manifest.state_snapshots {
+            self.read_state_snapshot(snapshot)?;
+        }
         self.store.put(&key, &serde_json::to_vec(manifest)?)?;
         Ok(RecoveryArtifact {
             id: manifest.checkpoint_id.clone(),
@@ -458,6 +482,24 @@ impl CheckpointCoordinator {
                 "checkpoint cannot complete before all task acknowledgements".into(),
             ));
         }
+        let attempt_tasks = task_attempts
+            .iter()
+            .map(|attempt| attempt.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        if attempt_tasks != self.participants {
+            return Err(Error::Process(
+                "checkpoint task attempts do not cover all participating tasks".into(),
+            ));
+        }
+        let snapshot_tasks = state_snapshots
+            .iter()
+            .map(|snapshot| snapshot.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !self.participants.is_subset(&snapshot_tasks) {
+            return Err(Error::Process(
+                "checkpoint state snapshots do not cover all participating tasks".into(),
+            ));
+        }
         let barrier = self
             .barrier
             .clone()
@@ -561,18 +603,34 @@ mod tests {
         assert!(coordinator.acknowledge(ack("task-1")).unwrap());
         let manifest = coordinator
             .complete(
-                vec![TaskAttemptSnapshot {
-                    task_id: "task-0".into(),
-                    attempt_id: "task-0-attempt".into(),
-                    node_id: "node-a".into(),
-                }],
-                vec![StateSnapshotRef {
-                    task_id: "task-0".into(),
-                    node_id: None,
-                    uri: "s3://bucket/cp-1/task-0".into(),
-                    checksum: 1,
-                    bytes: 10,
-                }],
+                vec![
+                    TaskAttemptSnapshot {
+                        task_id: "task-0".into(),
+                        attempt_id: "task-0-attempt".into(),
+                        node_id: "node-a".into(),
+                    },
+                    TaskAttemptSnapshot {
+                        task_id: "task-1".into(),
+                        attempt_id: "task-1-attempt".into(),
+                        node_id: "node-a".into(),
+                    },
+                ],
+                vec![
+                    StateSnapshotRef {
+                        task_id: "task-0".into(),
+                        node_id: None,
+                        uri: "s3://bucket/cp-1/task-0".into(),
+                        checksum: 1,
+                        bytes: 10,
+                    },
+                    StateSnapshotRef {
+                        task_id: "task-1".into(),
+                        node_id: None,
+                        uri: "s3://bucket/cp-1/task-1".into(),
+                        checksum: 1,
+                        bytes: 10,
+                    },
+                ],
             )
             .unwrap();
         assert!(manifest.verify());
@@ -633,12 +691,17 @@ mod tests {
     fn persists_savepoints_and_selects_latest_valid_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+        let state_ref = repository.write_state_snapshot("cp-1", &state()).unwrap();
         let mut manifest = CheckpointManifest {
             checkpoint_id: "cp-1".into(),
             job_id: JobId::new("orders").unwrap(),
             job_version: JobVersion(1),
             generation: 1,
-            task_attempts: vec![],
+            task_attempts: vec![TaskAttemptSnapshot {
+                task_id: "task-0".into(),
+                attempt_id: "attempt-0".into(),
+                node_id: "node-a".into(),
+            }],
             source_positions: vec![SourcePosition {
                 topic: None,
                 partition: 0,
@@ -649,7 +712,11 @@ mod tests {
                 checkpoint_id: "cp-1".into(),
                 generation: 1,
             },
-            state_snapshots: vec![],
+            state_snapshots: vec![StateSnapshotRef {
+                task_id: "task-0".into(),
+                node_id: Some("node-a".into()),
+                ..state_ref
+            }],
             format_version: 1,
             checksum: 0,
         };
@@ -706,5 +773,39 @@ mod tests {
         assert!(repository
             .write_state_snapshot("cp-bad", &snapshot)
             .is_err());
+    }
+
+    #[test]
+    fn rejects_manifest_with_missing_state_object_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+        let mut manifest = CheckpointManifest {
+            checkpoint_id: "cp-missing-state".into(),
+            job_id: JobId::new("orders").unwrap(),
+            job_version: JobVersion(1),
+            generation: 1,
+            task_attempts: vec![TaskAttemptSnapshot {
+                task_id: "task-0".into(),
+                attempt_id: "attempt-0".into(),
+                node_id: "node-a".into(),
+            }],
+            source_positions: vec![],
+            watermarks_ms: BTreeMap::new(),
+            in_flight_barrier: CheckpointBarrier {
+                checkpoint_id: "cp-missing-state".into(),
+                generation: 1,
+            },
+            state_snapshots: vec![StateSnapshotRef {
+                task_id: "task-0".into(),
+                node_id: Some("node-a".into()),
+                uri: "checkpoints/cp-missing-state/state.json".into(),
+                checksum: state().checksum,
+                bytes: 1,
+            }],
+            format_version: 1,
+            checksum: 0,
+        };
+        manifest.seal();
+        assert!(repository.write_checkpoint(&manifest).is_err());
     }
 }

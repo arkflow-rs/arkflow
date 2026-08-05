@@ -174,6 +174,7 @@ mod tests {
                     watermark: None,
                     allowed_lateness_ms: 0,
                     late_event_policy: Default::default(),
+                    late_event_route: None,
                 },
             }],
             sinks: vec![SinkSpec {

@@ -154,3 +154,9 @@
 - [x] 21.1 Quiesce runner processing with a checkpoint barrier while capturing state and source positions.
 - [x] 21.2 Feed keyed state updates into stateful operator batches and add output-level regression coverage.
 - [x] 21.3 Schedule periodic checkpoints from the configured interval through Hub reconciliation.
+
+## 22. Follow-up review remediation
+
+- [x] 22.1 Validate checkpoint task coverage and every referenced state snapshot before publishing a completed artifact.
+- [x] 22.2 Refresh idle event-time partitions continuously and separate late-event update/route dispatch paths.
+- [x] 22.3 Include checkpoint identity in Hub operation deduplication and add regression coverage.

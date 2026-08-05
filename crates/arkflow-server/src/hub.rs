@@ -1630,6 +1630,10 @@ impl Hub {
             return Err(HubError::Invalid(message));
         }
         let mut operations = self.operations.write().await;
+        let requested_checkpoint_id = payload
+            .as_ref()
+            .and_then(|payload| payload.get("checkpoint_id"))
+            .and_then(serde_json::Value::as_str);
         if let Some(operation_id) = operation_id_override.as_deref() {
             if let Some(existing) = operations.get(operation_id) {
                 return Ok(existing.clone());
@@ -1638,6 +1642,9 @@ impl Hub {
             item.node_id == node_id
                 && item.resource_id == resource_id
                 && item.operation == operation
+                && (item.checkpoint_id.as_deref() == requested_checkpoint_id
+                    || (!operation.starts_with("job_checkpoint")
+                        && !operation.starts_with("job_savepoint")))
                 && matches!(
                     item.state,
                     HubOperationState::Queued

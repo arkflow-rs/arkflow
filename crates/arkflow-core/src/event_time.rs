@@ -255,6 +255,7 @@ mod tests {
             }),
             allowed_lateness_ms: 100,
             late_event_policy: LateEventPolicy::Update,
+            late_event_route: None,
         }
     }
 

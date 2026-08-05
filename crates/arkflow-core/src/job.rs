@@ -153,6 +153,8 @@ pub struct TimeSpec {
     pub allowed_lateness_ms: u64,
     #[serde(default)]
     pub late_event_policy: LateEventPolicy,
+    #[serde(default)]
+    pub late_event_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +818,7 @@ mod tests {
                     }),
                     allowed_lateness_ms: 500,
                     late_event_policy: LateEventPolicy::Route,
+                    late_event_route: None,
                 },
             }],
             sinks: vec![SinkSpec {
