@@ -412,6 +412,23 @@ impl Hub {
                 .collect::<Vec<_>>()
         };
         let assignments = plan.assignments_for_nodes(&targets, job.generation);
+        let recovery = self
+            .job_checkpoints(&job.job_id)
+            .await?
+            .into_iter()
+            .filter(|record| record.status == "completed")
+            .filter(|record| match spec.recovery {
+                arkflow_core::job::RecoveryPolicy::LatestCheckpoint => record.kind == "checkpoint",
+                arkflow_core::job::RecoveryPolicy::LatestSavepoint => record.kind == "savepoint",
+                arkflow_core::job::RecoveryPolicy::Fail => false,
+            })
+            .max_by_key(|record| record.created_at_ms)
+            .map(|record| {
+                serde_json::json!({
+                    "checkpoint_id": record.checkpoint_id,
+                    "savepoint": record.kind == "savepoint",
+                })
+            });
         let mut dispatched = 0;
         for node_id in targets {
             let node_assignments = assignments
@@ -428,6 +445,7 @@ impl Hub {
                 "plan": plan,
                 "assignments": node_assignments,
                 "generation": job.generation,
+                "recovery": recovery,
             }));
             self.enqueue_with_metadata(
                 node_id,

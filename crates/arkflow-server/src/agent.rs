@@ -5,7 +5,8 @@ use crate::hub::{
     RegisterRequest, RegisterResponse,
 };
 use arkflow_core::checkpoint::{
-    CheckpointCoordinator, CheckpointRepository, FileCheckpointStore, StateSnapshotRef,
+    recovery_manifest_key, CheckpointCoordinator, CheckpointRepository, CheckpointStatus,
+    CheckpointStore, RecoveryArtifact, RecoveryArtifactKind, RecoveryPlan, StateSnapshotRef,
     TaskAttemptSnapshot, TaskCheckpointAck,
 };
 use arkflow_core::configuration::redacted_config;
@@ -20,15 +21,19 @@ use arkflow_core::processor::ProcessorConfig;
 use arkflow_core::state::{RedbStateBackend, StateBackend};
 use arkflow_core::temporary::Temporary;
 use arkflow_core::Resource;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use reqwest::Client;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct NodeAgentConfig {
@@ -52,8 +57,152 @@ struct JobTask {
     cancellation: CancellationToken,
     assignments: Vec<TaskAttempt>,
     state: Arc<dyn StateBackend>,
+    checkpoint_store_uri: Option<String>,
     runner: Arc<arkflow_core::job_runner::SingleComputeJobRunner>,
     handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+}
+
+#[derive(Clone)]
+struct SharedCheckpointStore {
+    client: Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
+}
+
+impl SharedCheckpointStore {
+    fn from_uri(uri: &str) -> Result<Self, String> {
+        let url = Url::parse(uri)
+            .map_err(|error| format!("invalid checkpoint object_store_uri: {error}"))?;
+        let (client, prefix) = object_store::parse_url(&url)
+            .map_err(|error| format!("build checkpoint object store: {error}"))?;
+        Ok(Self {
+            client: Arc::from(client),
+            prefix,
+        })
+    }
+
+    fn path_for(&self, key: &str) -> Result<ObjectPath, arkflow_core::Error> {
+        if key.is_empty() || key.contains("..") || key.starts_with('/') {
+            return Err(arkflow_core::Error::Config(
+                "invalid checkpoint object key".into(),
+            ));
+        }
+        let prefix = self.prefix.to_string();
+        Ok(ObjectPath::from(if prefix.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{prefix}/{key}")
+        }))
+    }
+
+    fn block_on<T, F>(&self, future: F) -> Result<T, arkflow_core::Error>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, object_store::Error>> + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    arkflow_core::Error::Process(format!("build checkpoint runtime: {error}"))
+                })?
+                .block_on(future)
+                .map_err(|error| {
+                    arkflow_core::Error::Process(format!("checkpoint object store: {error}"))
+                })
+        })
+        .join()
+        .map_err(|_| {
+            arkflow_core::Error::Process("checkpoint object store thread panicked".into())
+        })?
+    }
+}
+
+impl CheckpointStore for SharedCheckpointStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), arkflow_core::Error> {
+        let path = self.path_for(key)?;
+        let client = self.client.clone();
+        let payload = bytes::Bytes::copy_from_slice(bytes);
+        self.block_on(async move { client.put(&path, payload.into()).await.map(|_| ()) })
+    }
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, arkflow_core::Error> {
+        let path = self.path_for(key)?;
+        let client = self.client.clone();
+        self.block_on(async move {
+            match client.get(&path).await {
+                Ok(result) => result.bytes().await.map(|bytes| Some(bytes.to_vec())),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn delete(&self, key: &str) -> Result<(), arkflow_core::Error> {
+        let path = self.path_for(key)?;
+        let client = self.client.clone();
+        self.block_on(async move { client.delete(&path).await })
+    }
+}
+
+fn checkpoint_repository(
+    plan: &JobPlan,
+) -> Result<CheckpointRepository<SharedCheckpointStore>, String> {
+    let uri = plan
+        .spec
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?
+        .object_store_uri
+        .clone();
+    Ok(CheckpointRepository::new(SharedCheckpointStore::from_uri(
+        &uri,
+    )?))
+}
+
+fn recovery_artifact(
+    plan: &JobPlan,
+    checkpoint_id: &str,
+    savepoint: bool,
+) -> Result<RecoveryArtifact, String> {
+    let kind = if savepoint {
+        RecoveryArtifactKind::Savepoint
+    } else {
+        RecoveryArtifactKind::Checkpoint
+    };
+    Ok(RecoveryArtifact {
+        id: checkpoint_id.to_owned(),
+        kind,
+        manifest_key: recovery_manifest_key(kind, checkpoint_id),
+        job_version: plan.spec.version,
+        format_version: plan
+            .spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1),
+        created_at_ms: 0,
+        status: CheckpointStatus::Completed,
+    })
+}
+
+fn parse_recovery_payload(payload: &serde_json::Value) -> Result<(Option<String>, bool), String> {
+    let Some(recovery) = payload.get("recovery") else {
+        return Ok((None, false));
+    };
+    if recovery.is_null() {
+        return Ok((None, false));
+    }
+    let checkpoint_id = recovery
+        .get("checkpoint_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "recovery payload is missing checkpoint_id".to_string())?;
+    let savepoint = recovery
+        .get("savepoint")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok((Some(checkpoint_id.to_owned()), savepoint))
 }
 
 impl JobRuntime {
@@ -70,6 +219,8 @@ impl JobRuntime {
         plan: JobPlan,
         assignments: Vec<TaskAttempt>,
         generation: u64,
+        recovery_id: Option<String>,
+        recovery_savepoint: bool,
     ) -> Result<(), String> {
         let job_id = plan.spec.id.to_string();
         if assignments.is_empty() {
@@ -93,8 +244,34 @@ impl JobRuntime {
             .map_err(|error| error.to_string())?,
         );
         let state_root = std::env::temp_dir().join("arkflow-job-state").join(&job_id);
-        let state: Arc<dyn StateBackend> =
-            Arc::new(RedbStateBackend::open(state_root, 1).map_err(|error| error.to_string())?);
+        let state_format_version = plan
+            .spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1);
+        let state: Arc<dyn StateBackend> = Arc::new(
+            RedbStateBackend::open(state_root, state_format_version)
+                .map_err(|error| error.to_string())?,
+        );
+        let recovery = if let Some(checkpoint_id) = recovery_id {
+            let repository = checkpoint_repository(&plan)?;
+            let artifact = recovery_artifact(&plan, &checkpoint_id, recovery_savepoint)?;
+            let manifest = repository
+                .read_manifest(&artifact)
+                .map_err(|error| error.to_string())?;
+            for snapshot_ref in &manifest.state_snapshots {
+                let snapshot = repository
+                    .read_state_snapshot(snapshot_ref)
+                    .map_err(|error| error.to_string())?;
+                state
+                    .restore(&snapshot)
+                    .map_err(|error| error.to_string())?;
+            }
+            Some(RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
         let cancellation = CancellationToken::new();
         let mut tasks = self.tasks.lock().await;
         if let Some(existing) = tasks.get(&job_id) {
@@ -105,7 +282,11 @@ impl JobRuntime {
         }
         let task_cancellation = cancellation.clone();
         let runner_for_task = runner.clone();
-        let handle = tokio::spawn(async move { runner_for_task.run(task_cancellation).await });
+        let handle = tokio::spawn(async move {
+            runner_for_task
+                .run_with_recovery(task_cancellation, recovery.as_ref())
+                .await
+        });
         tasks.insert(
             job_id,
             JobTask {
@@ -113,6 +294,11 @@ impl JobRuntime {
                 cancellation: cancellation.clone(),
                 assignments,
                 state,
+                checkpoint_store_uri: plan
+                    .spec
+                    .checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.object_store_uri.clone()),
                 runner,
                 handle,
             },
@@ -140,11 +326,11 @@ impl JobRuntime {
             .current_source_positions()
             .await
             .map_err(|error| error.to_string())?;
-        let root = std::env::temp_dir()
-            .join("arkflow-job-checkpoints")
-            .join(job_id);
-        let store = FileCheckpointStore::new(&root).map_err(|error| error.to_string())?;
-        let repository = CheckpointRepository::new(store);
+        let store_uri = task
+            .checkpoint_store_uri
+            .as_deref()
+            .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
+        let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(store_uri)?);
         let state_ref = repository
             .write_state_snapshot(checkpoint_id, &snapshot)
             .map_err(|error| error.to_string())?;
@@ -207,7 +393,12 @@ impl JobRuntime {
                 .write_checkpoint(&manifest)
                 .map_err(|error| error.to_string())?
         };
-        Ok(root.join(artifact.manifest_key).display().to_string())
+        let uri = format!(
+            "{}/{}",
+            store_uri.trim_end_matches('/'),
+            artifact.manifest_key
+        );
+        Ok(uri)
     }
 
     async fn take_finished(&self) -> Vec<(String, u64, Result<(), String>)> {
@@ -568,8 +759,15 @@ async fn execute_command(
                         .ok_or_else(|| "missing Job task assignments".to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
+                let (recovery_id, recovery_savepoint) = parse_recovery_payload(payload)?;
                 job_runtime
-                    .start(plan, assignments, command.generation)
+                    .start(
+                        plan,
+                        assignments,
+                        command.generation,
+                        recovery_id,
+                        recovery_savepoint,
+                    )
                     .await
             }
             "job_stop" => {
@@ -599,8 +797,15 @@ async fn execute_command(
                         .ok_or_else(|| "missing Job task assignments".to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
+                let (recovery_id, recovery_savepoint) = parse_recovery_payload(payload)?;
                 job_runtime
-                    .start(plan, assignments, command.generation)
+                    .start(
+                        plan,
+                        assignments,
+                        command.generation,
+                        recovery_id,
+                        recovery_savepoint,
+                    )
                     .await
             }
             "job_checkpoint" | "job_savepoint" => {
@@ -976,5 +1181,44 @@ mod tests {
         assert_eq!(replay.command_id, result.command_id);
         assert_eq!(replay.state, result.state);
         assert_eq!(replay.action_id, result.action_id);
+    }
+
+    #[test]
+    fn shared_checkpoint_store_uses_configured_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = Url::from_directory_path(directory.path()).unwrap();
+        let store = SharedCheckpointStore::from_uri(uri.as_str()).unwrap();
+        store
+            .put("checkpoints/cp-1/manifest.json", b"manifest")
+            .unwrap();
+        assert_eq!(
+            store
+                .get("checkpoints/cp-1/manifest.json")
+                .unwrap()
+                .as_deref(),
+            Some(b"manifest".as_slice())
+        );
+    }
+
+    #[test]
+    fn recovery_payload_requires_a_checkpoint_id() {
+        assert_eq!(
+            parse_recovery_payload(&serde_json::json!({})).unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            parse_recovery_payload(&serde_json::json!({
+                "recovery": {
+                    "checkpoint_id": "cp-1",
+                    "savepoint": true
+                }
+            }))
+            .unwrap(),
+            (Some("cp-1".into()), true)
+        );
+        assert!(parse_recovery_payload(&serde_json::json!({
+            "recovery": {}
+        }))
+        .is_err());
     }
 }

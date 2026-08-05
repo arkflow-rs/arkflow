@@ -9,8 +9,20 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub partition: u32,
     pub offset: u64,
+}
+
+impl SourcePosition {
+    pub fn for_partition(partition: u32, offset: u64) -> Self {
+        Self {
+            topic: None,
+            partition,
+            offset,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +180,7 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         if !manifest.verify() {
             return Err(Error::Process("cannot persist invalid checkpoint".into()));
         }
-        let key = format!("checkpoints/{}/manifest.json", manifest.checkpoint_id);
+        let key = recovery_manifest_key(RecoveryArtifactKind::Checkpoint, &manifest.checkpoint_id);
         let bytes = serde_json::to_vec(manifest)?;
         self.store.put(&key, &bytes)?;
         Ok(RecoveryArtifact {
@@ -242,7 +254,7 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         if !manifest.verify() {
             return Err(Error::Process("cannot persist invalid savepoint".into()));
         }
-        let key = format!("savepoints/{}/manifest.json", manifest.checkpoint_id);
+        let key = recovery_manifest_key(RecoveryArtifactKind::Savepoint, &manifest.checkpoint_id);
         self.store.put(&key, &serde_json::to_vec(manifest)?)?;
         Ok(RecoveryArtifact {
             id: manifest.checkpoint_id.clone(),
@@ -258,6 +270,14 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
     pub fn delete(&self, artifact: &RecoveryArtifact) -> Result<(), Error> {
         self.store.delete(&artifact.manifest_key)
     }
+}
+
+pub fn recovery_manifest_key(kind: RecoveryArtifactKind, checkpoint_id: &str) -> String {
+    let prefix = match kind {
+        RecoveryArtifactKind::Checkpoint => "checkpoints",
+        RecoveryArtifactKind::Savepoint => "savepoints",
+    };
+    format!("{prefix}/{checkpoint_id}/manifest.json")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -520,6 +540,7 @@ mod tests {
             generation: 7,
             state: state(),
             source_positions: vec![SourcePosition {
+                topic: None,
                 partition: 0,
                 offset: 10,
             }],
@@ -607,6 +628,7 @@ mod tests {
             generation: 1,
             task_attempts: vec![],
             source_positions: vec![SourcePosition {
+                topic: None,
                 partition: 0,
                 offset: 10,
             }],

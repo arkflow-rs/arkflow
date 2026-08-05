@@ -89,3 +89,10 @@
 - [x] 11.2 Bind source readers to assigned task partitions and reject unsupported parallel source execution.
 - [x] 11.3 Scope checkpoint completion aggregation by checkpoint ID.
 - [x] 11.4 Add regression coverage for edge locality, source partition ownership, and checkpoint identity.
+
+## 12. Follow-up review remediation
+
+- [x] 12.1 Apply the selected checkpoint or savepoint before Agent Job startup and restore operator state before input processing.
+- [x] 12.2 Persist checkpoint manifests and state snapshots through the configured shared object-store URI.
+- [x] 12.3 Capture and restore Kafka topic/partition offsets through the Input checkpoint position contract.
+- [x] 12.4 Add recovery, shared-artifact, and connector-position regression coverage.

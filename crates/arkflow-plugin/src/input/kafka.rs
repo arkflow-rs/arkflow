@@ -16,6 +16,7 @@
 //!
 //! Receive data from a Kafka topic
 
+use arkflow_core::checkpoint::SourcePosition;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -25,7 +26,7 @@ use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Message as KafkaMessage, Timestamp};
-use rdkafka::topic_partition_list::TopicPartitionList;
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -277,6 +278,68 @@ impl Input for KafkaInput {
                 e
             ))),
         }
+    }
+
+    async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let positions = consumer
+            .position()
+            .map_err(|error| Error::Process(format!("read Kafka positions: {error}")))?;
+        Ok(positions
+            .elements()
+            .into_iter()
+            .filter_map(|element| {
+                let offset = match element.offset() {
+                    Offset::Offset(offset) if offset >= 0 => u64::try_from(offset).ok()?,
+                    _ => return None,
+                };
+                let partition = u32::try_from(element.partition()).ok()?;
+                Some(SourcePosition {
+                    topic: Some(element.topic().to_owned()),
+                    partition,
+                    offset,
+                })
+            })
+            .collect())
+    }
+
+    async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
+        let mut assignment = TopicPartitionList::new();
+        for topic in &self.config.topics {
+            for position in positions.iter().filter(|position| {
+                position.partition < i32::MAX as u32
+                    && (position.topic.as_deref().is_none()
+                        || position.topic.as_deref() == Some(topic.as_str()))
+            }) {
+                assignment
+                    .add_partition_offset(
+                        topic,
+                        position.partition as i32,
+                        Offset::Offset(i64::try_from(position.offset).map_err(|_| {
+                            Error::Config("Kafka checkpoint offset exceeds i64".into())
+                        })?),
+                    )
+                    .map_err(|error| {
+                        Error::Process(format!("build Kafka restore assignment: {error}"))
+                    })?;
+            }
+        }
+        if assignment.count() == 0 {
+            return Ok(());
+        }
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Err(Error::Process(
+                "cannot restore Kafka positions before connect".into(),
+            ));
+        };
+        consumer
+            .assign(&assignment)
+            .map_err(|error| Error::Process(format!("restore Kafka positions: {error}")))?;
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
