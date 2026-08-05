@@ -187,38 +187,50 @@ pub struct FieldTimestampExtractor {
 
 impl TimestampExtractor for FieldTimestampExtractor {
     fn extract_timestamp_ms(&self, batch: &MessageBatch) -> Result<i64, Error> {
-        self.extract_timestamps_ms(batch)?
-            .into_iter()
-            .next()
+        self.extract_timestamp_at_zero(batch)?
             .ok_or_else(|| Error::Read("timestamp field contains no value".into()))
     }
 }
 
 impl FieldTimestampExtractor {
-    pub fn extract_timestamps_ms(&self, batch: &MessageBatch) -> Result<Vec<i64>, Error> {
+    fn timestamp_array<'a>(&self, batch: &'a MessageBatch) -> Result<&'a dyn Array, Error> {
         let Some(array) = batch.record_batch().column_by_name(&self.field) else {
             return Err(Error::Config(format!(
                 "timestamp field '{}' is missing",
                 self.field
             )));
         };
+        Ok(array.as_ref())
+    }
+
+    fn extract_timestamp_at_zero(&self, batch: &MessageBatch) -> Result<Option<i64>, Error> {
+        let array = self.timestamp_array(batch)?;
         if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-            return values
-                .iter()
-                .map(|value| {
-                    value.ok_or_else(|| Error::Read("timestamp field contains null value".into()))
-                })
-                .collect();
+            return Ok((!values.is_empty())
+                .then(|| (!values.is_null(0)).then(|| values.value(0)))
+                .flatten());
         }
         if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            return values
+            return Ok((!values.is_empty())
+                .then(|| (!values.is_null(0)).then(|| values.value(0) / 1_000_000))
+                .flatten());
+        }
+        Err(Error::Config(format!(
+            "timestamp field '{}' must be int64 or timestamp nanoseconds",
+            self.field
+        )))
+    }
+
+    pub fn extract_timestamps_ms(&self, batch: &MessageBatch) -> Result<Vec<Option<i64>>, Error> {
+        let array = self.timestamp_array(batch)?;
+        if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+            return Ok(values.iter().collect());
+        }
+        if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+            return Ok(values
                 .iter()
-                .map(|value| {
-                    value
-                        .map(|value| value / 1_000_000)
-                        .ok_or_else(|| Error::Read("timestamp field contains null value".into()))
-                })
-                .collect();
+                .map(|value| value.map(|value| value / 1_000_000))
+                .collect());
         }
         Err(Error::Config(format!(
             "timestamp field '{}' must be int64 or timestamp nanoseconds",

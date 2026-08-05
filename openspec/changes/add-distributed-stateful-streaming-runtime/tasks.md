@@ -136,3 +136,10 @@
 - [x] 18.1 Validate Kafka recovery offsets against broker low/high watermarks.
 - [x] 18.2 Centralize `object_store` and `bytes` dependency versions in workspace dependencies.
 - [x] 18.3 Add checkpoint offset boundary regression coverage.
+
+## 19. Follow-up review remediation
+
+- [x] 19.1 Reject cyclic Job operator graphs before runtime dispatch.
+- [x] 19.2 Handle null timestamps and resolve event-time windows along source DAG paths.
+- [x] 19.3 Require explicit Kafka topics during position recovery.
+- [x] 19.4 Require all assigned Job nodes to acknowledge a checkpoint before commit.

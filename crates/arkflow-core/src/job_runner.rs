@@ -24,6 +24,7 @@ struct SourceRuntime {
     tracker: WatermarkTracker,
     late_policy: crate::job::LateEventPolicy,
     allowed_lateness_ms: u64,
+    window_sizes_ms: Vec<i64>,
 }
 
 struct StatefulProcessor {
@@ -116,7 +117,6 @@ pub struct SingleComputeJobRunner {
     outputs: BTreeMap<String, Arc<dyn Output>>,
     edges: BTreeMap<String, Vec<String>>,
     source_runtimes: Mutex<BTreeMap<String, SourceRuntime>>,
-    window_sizes_ms: BTreeMap<String, i64>,
 }
 
 impl SingleComputeJobRunner {
@@ -310,6 +310,49 @@ impl SingleComputeJobRunner {
         let mut source_runtimes = BTreeMap::new();
         for (task, source) in &source_tasks {
             if source.time.mode == crate::job::TimeMode::EventTime {
+                let operator_kinds = plan
+                    .spec
+                    .operators
+                    .iter()
+                    .map(|operator| (operator.id.as_str(), operator.kind))
+                    .collect::<BTreeMap<_, _>>();
+                let window_sizes = plan
+                    .spec
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.from == source.operator_id)
+                    .map(|edge| edge.to.clone())
+                    .collect::<Vec<_>>();
+                let mut queue = window_sizes;
+                let mut visited = BTreeSet::new();
+                let mut applicable_window_sizes_ms = Vec::new();
+                while let Some(operator_id) = queue.pop() {
+                    if !visited.insert(operator_id.clone()) {
+                        continue;
+                    }
+                    if operator_kinds.get(operator_id.as_str())
+                        == Some(&crate::job::OperatorKind::Window)
+                    {
+                        if let Some(size) = plan
+                            .spec
+                            .operators
+                            .iter()
+                            .find(|operator| operator.id == operator_id)
+                            .and_then(|operator| operator.config.get("window_size_ms"))
+                            .and_then(serde_json::Value::as_i64)
+                            .filter(|size| *size > 0)
+                        {
+                            applicable_window_sizes_ms.push(size);
+                        }
+                    }
+                    queue.extend(
+                        plan.spec
+                            .edges
+                            .iter()
+                            .filter(|edge| edge.from == operator_id)
+                            .map(|edge| edge.to.clone()),
+                    );
+                }
                 source_runtimes.insert(
                     task.id.clone(),
                     SourceRuntime {
@@ -325,24 +368,11 @@ impl SingleComputeJobRunner {
                         tracker: WatermarkTracker::from_time_spec(&source.time)?,
                         late_policy: source.time.late_event_policy,
                         allowed_lateness_ms: source.time.allowed_lateness_ms,
+                        window_sizes_ms: applicable_window_sizes_ms,
                     },
                 );
             }
         }
-        let window_sizes_ms = plan
-            .spec
-            .operators
-            .iter()
-            .filter(|operator| operator.kind == crate::job::OperatorKind::Window)
-            .filter_map(|operator| {
-                operator
-                    .config
-                    .get("window_size_ms")
-                    .and_then(serde_json::Value::as_i64)
-                    .filter(|size| *size > 0)
-                    .map(|size| (operator.id.clone(), size))
-            })
-            .collect();
         Ok(Self {
             inputs,
             source_task_ids,
@@ -350,7 +380,6 @@ impl SingleComputeJobRunner {
             outputs,
             edges,
             source_runtimes: Mutex::new(source_runtimes),
-            window_sizes_ms,
         })
     }
 
@@ -441,10 +470,17 @@ impl SingleComputeJobRunner {
         let now_ms = crate::state::now_ms() as i64;
         let mut keep = Vec::with_capacity(event_times_ms.len());
         for event_time_ms in event_times_ms {
+            let Some(event_time_ms) = event_time_ms else {
+                keep.push(!matches!(
+                    runtime.late_policy,
+                    crate::job::LateEventPolicy::Drop
+                ));
+                continue;
+            };
             let watermark_ms = runtime
                 .tracker
                 .observe(runtime.partition, event_time_ms, now_ms);
-            let action = self.window_sizes_ms.values().next().map(|window_size| {
+            let action = runtime.window_sizes_ms.iter().min().map(|window_size| {
                 let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
                 window_action(
                     window_start + *window_size,

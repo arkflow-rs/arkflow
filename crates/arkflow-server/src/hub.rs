@@ -15,7 +15,7 @@ use arkflow_core::control::{
     StreamStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1743,34 +1743,45 @@ impl Hub {
                 "job_checkpoint" | "job_savepoint"
             ) {
                 let checkpoint_id = result.observed_checkpoint_id.as_deref();
-                let all_nodes_succeeded =
-                    if result.state == HubOperationState::Succeeded && checkpoint_id.is_some() {
-                        self.operations
-                            .read()
-                            .await
-                            .values()
-                            .filter(|operation| {
-                                operation.resource_id == updated.resource_id
-                                    && operation.operation == updated.operation
-                                    && operation.generation == updated.generation
-                                    && operation.checkpoint_id.as_deref() == checkpoint_id
-                            })
-                            .all(|operation| operation.state == HubOperationState::Succeeded)
-                    } else {
-                        false
-                    };
+                let expected_nodes = self
+                    .jobs
+                    .read()
+                    .await
+                    .get(&updated.resource_id)
+                    .map(|job| job.node_ids.iter().cloned().collect::<BTreeSet<_>>())
+                    .unwrap_or_default();
+                let checkpoint_operations = self
+                    .operations
+                    .read()
+                    .await
+                    .values()
+                    .filter(|operation| {
+                        operation.resource_id == updated.resource_id
+                            && operation.operation == updated.operation
+                            && operation.generation == updated.generation
+                            && operation.checkpoint_id.as_deref() == checkpoint_id
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let succeeded_nodes = checkpoint_operations
+                    .iter()
+                    .filter(|operation| operation.state == HubOperationState::Succeeded)
+                    .map(|operation| operation.node_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let all_nodes_succeeded = if result.state == HubOperationState::Succeeded
+                    && checkpoint_id.is_some()
+                    && !expected_nodes.is_empty()
+                {
+                    expected_nodes.is_subset(&succeeded_nodes)
+                } else {
+                    false
+                };
                 if all_nodes_succeeded {
-                    let completed_operations = self
-                        .operations
-                        .read()
-                        .await
-                        .values()
+                    let completed_operations = checkpoint_operations
+                        .iter()
                         .filter(|operation| {
-                            operation.resource_id == updated.resource_id
-                                && operation.operation == updated.operation
-                                && operation.generation == updated.generation
-                                && operation.checkpoint_id.as_deref() == checkpoint_id
-                                && operation.state == HubOperationState::Succeeded
+                            operation.state == HubOperationState::Succeeded
+                                && expected_nodes.contains(&operation.node_id)
                         })
                         .cloned()
                         .collect::<Vec<_>>();

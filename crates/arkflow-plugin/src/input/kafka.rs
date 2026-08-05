@@ -333,8 +333,7 @@ impl Input for KafkaInput {
             for position in positions.iter().filter(|position| {
                 position.partition < i32::MAX as u32
                     && assigned_partition.is_none_or(|partition| position.partition == partition)
-                    && (position.topic.as_deref().is_none()
-                        || position.topic.as_deref() == Some(topic.as_str()))
+                    && position.topic.as_deref() == Some(topic.as_str())
             }) {
                 let partition = position.partition as i32;
                 let (low, high) = consumer

@@ -308,6 +308,44 @@ impl JobSpec {
             }
         }
 
+        let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+        let mut indegree = operator_ids
+            .iter()
+            .map(|operator_id| (operator_id.clone(), 0usize))
+            .collect::<BTreeMap<_, _>>();
+        for edge in &self.edges {
+            outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+            if let Some(degree) = indegree.get_mut(&edge.to) {
+                *degree += 1;
+            }
+        }
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(operator_id, degree)| (*degree == 0).then_some(operator_id.clone()))
+            .collect::<std::collections::VecDeque<_>>();
+        let mut visited = 0usize;
+        while let Some(operator_id) = ready.pop_front() {
+            visited += 1;
+            for downstream in outgoing.get(&operator_id).into_iter().flatten() {
+                let degree = indegree
+                    .get_mut(downstream)
+                    .expect("edge endpoints were validated above");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(downstream.clone());
+                }
+            }
+        }
+        if visited != operator_ids.len() {
+            return Err(Error::Config(format!(
+                "Job '{}' operator graph must be acyclic",
+                self.id
+            )));
+        }
+
         for source in &self.sources {
             let Some(operator) = self
                 .operators
@@ -803,6 +841,19 @@ mod tests {
     #[test]
     fn validates_a_stateful_event_time_job() {
         assert!(base_job().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_cyclic_operator_graphs() {
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: "aggregate-source".into(),
+            from: "aggregate".into(),
+            to: "source".into(),
+            partitioned: true,
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("operator graph must be acyclic"));
     }
 
     #[test]
