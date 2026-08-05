@@ -509,6 +509,43 @@ impl Hub {
         Ok(updated)
     }
 
+    pub async fn update_job_desired_state(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, HubError> {
+        let updated = if let Some(storage) = &self.storage {
+            storage
+                .update_job_desired_state(job_id, desired_state, expected_generation)
+                .await
+                .map_err(HubError::from)?
+        } else {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(job_id) else {
+                return Ok(None);
+            };
+            if job.generation != expected_generation {
+                return Err(HubError::GenerationConflict {
+                    expected: expected_generation,
+                    current: job.generation,
+                });
+            }
+            job.desired_state = desired_state.into();
+            job.generation = expected_generation.saturating_add(1);
+            job.updated_at_ms = now_ms();
+            Some(job.clone())
+        };
+        if let Some(job) = &updated {
+            self.jobs
+                .write()
+                .await
+                .insert(job.job_id.clone(), job.clone());
+            self.reconcile_job(job).await?;
+        }
+        Ok(updated)
+    }
+
     pub async fn observe_job(
         &self,
         job_id: &str,
@@ -520,7 +557,7 @@ impl Hub {
         let Some(current) = self.job(job_id).await? else {
             return Ok(None);
         };
-        if generation < current.generation {
+        if generation != current.generation {
             return Ok(Some(current));
         }
         let convergence =
@@ -4179,6 +4216,13 @@ mod tests {
             .unwrap();
         assert_eq!(stale.generation, 3);
         assert_eq!(stale.observed_state, "starting");
+        let future = hub
+            .observe_job("orders", 4, "running", Some("forged"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(future.generation, 3);
+        assert_eq!(future.checkpoint_id, None);
         let converged = hub
             .observe_job("orders", 3, "running", Some("cp-1"), None)
             .await
@@ -4186,6 +4230,47 @@ mod tests {
             .unwrap();
         assert_eq!(converged.convergence, "converged");
         assert_eq!(converged.checkpoint_id.as_deref(), Some("cp-1"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_job_generation_updates_use_compare_and_swap() {
+        let hub = Hub::new(config());
+        let spec_json = serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }).to_string();
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json,
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 3,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let (first, second) = tokio::join!(
+            hub.update_job_desired_state("orders", "running", 3),
+            hub.update_job_desired_state("orders", "stopped", 3),
+        );
+        assert!(matches!(
+            (first, second),
+            (Ok(Some(_)), Err(HubError::GenerationConflict { .. }))
+                | (Err(HubError::GenerationConflict { .. }), Ok(Some(_)))
+        ));
+        assert_eq!(hub.job("orders").await.unwrap().unwrap().generation, 4);
     }
 
     #[tokio::test]

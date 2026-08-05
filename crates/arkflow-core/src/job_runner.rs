@@ -161,14 +161,24 @@ impl SingleComputeJobRunner {
                         edge.id
                     )));
                 }
-                if let Some(downstream_id) =
-                    assigned_task_by_operator_subtask.get(&(edge.to.clone(), task.subtask))
-                {
-                    edges
-                        .entry(task.id.clone())
-                        .or_default()
-                        .push(downstream_id.clone());
-                }
+                let downstream_ids = if edge.partitioned {
+                    assigned_task_by_operator_subtask
+                        .get(&(edge.to.clone(), task.subtask))
+                        .cloned()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    task_ids
+                        .iter()
+                        .filter_map(|task_id| plan.task(task_id))
+                        .filter(|downstream| downstream.operator_id == edge.to)
+                        .map(|downstream| downstream.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                edges
+                    .entry(task.id.clone())
+                    .or_default()
+                    .extend(downstream_ids);
             }
         }
         Ok(Self {
@@ -294,4 +304,183 @@ fn read_input(index: usize, input: Arc<dyn Input>) -> BoxFuture<'static, InputRe
         let (batch, ack) = input.read().await?;
         Ok((index, batch, ack))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::{
+        EdgeSpec, JobId, JobSpec, JobVersion, LateEventPolicy, OperatorKind, OperatorSpec,
+        SinkSpec, SourceSpec, TimeMode, TimeSpec,
+    };
+    use crate::temporary::Temporary;
+    use async_trait::async_trait;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    struct TestInput;
+
+    #[async_trait]
+    impl Input for TestInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::Process("test input is not readable".into()))
+        }
+
+        fn supports_partitioning(&self) -> bool {
+            true
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct TestOutput;
+
+    #[async_trait]
+    impl Output for TestOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct TestProcessor;
+
+    #[async_trait]
+    impl Processor for TestProcessor {
+        async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct TestAdapter;
+
+    impl JobComponentAdapter for TestAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(TestInput))
+        }
+
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(TestOutput))
+        }
+
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(TestProcessor))
+        }
+    }
+
+    fn plan() -> JobPlan {
+        JobPlan::compile(JobSpec {
+            id: JobId::new("routing").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 2,
+            parallelism: 2,
+            operators: vec![
+                OperatorSpec {
+                    id: "source".into(),
+                    kind: OperatorKind::Source,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
+                    id: "map".into(),
+                    kind: OperatorKind::Map,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
+                    id: "sink".into(),
+                    kind: OperatorKind::Sink,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![
+                EdgeSpec {
+                    id: "source-map".into(),
+                    from: "source".into(),
+                    to: "map".into(),
+                    partitioned: true,
+                },
+                EdgeSpec {
+                    id: "map-sink-broadcast".into(),
+                    from: "map".into(),
+                    to: "sink".into(),
+                    partitioned: false,
+                },
+            ],
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: "test".into(),
+                config: serde_json::json!({}),
+                time: TimeSpec {
+                    mode: TimeMode::ProcessingTime,
+                    timestamp_field: None,
+                    watermark: None,
+                    allowed_lateness_ms: 0,
+                    late_event_policy: LateEventPolicy::Drop,
+                },
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "test".into(),
+                config: serde_json::json!({}),
+            }],
+            state: None,
+            checkpoint: None,
+            recovery: Default::default(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn builds_processors_per_task_and_broadcasts_unpartitioned_edges() {
+        let plan = plan();
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner =
+            SingleComputeJobRunner::build_for_tasks(&plan, &task_ids, &TestAdapter, &resource)
+                .unwrap();
+        assert_eq!(runner.processors.len(), 2);
+        assert_eq!(runner.edges["map-0"], vec!["sink-0", "sink-1"]);
+        assert_eq!(runner.edges["map-1"], vec!["sink-0", "sink-1"]);
+    }
 }

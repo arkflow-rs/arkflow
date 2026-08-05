@@ -379,6 +379,12 @@ enum StorageCommand {
         last_error: Option<String>,
         response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
     },
+    UpdateJobDesiredState {
+        job_id: String,
+        desired_state: String,
+        expected_generation: u64,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
     UpsertJobCheckpoint {
         record: JobCheckpointRecord,
         response: oneshot::Sender<Result<(), StorageError>>,
@@ -572,6 +578,18 @@ impl StorageActor {
                             generation,
                             checkpoint_id.as_deref(),
                             last_error.as_deref(),
+                        ));
+                    }
+                    StorageCommand::UpdateJobDesiredState {
+                        job_id,
+                        desired_state,
+                        expected_generation,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job_desired_state(
+                            &job_id,
+                            &desired_state,
+                            expected_generation,
                         ));
                     }
                     StorageCommand::UpsertJobCheckpoint { record, response } => {
@@ -823,6 +841,25 @@ impl StorageActor {
                 generation,
                 checkpoint_id,
                 last_error,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_desired_state(
+        &self,
+        job_id: impl Into<String>,
+        desired_state: impl Into<String>,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobDesiredState {
+                job_id: job_id.into(),
+                desired_state: desired_state.into(),
+                expected_generation,
                 response,
             })
             .await
@@ -2608,6 +2645,49 @@ impl ControlPlaneStore {
                     row_to_job,
                 )
                 .optional()
+        })
+    }
+
+    pub fn update_job_desired_state(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET desired_state=?2, generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                rusqlite::params![
+                    job_id,
+                    desired_state,
+                    expected_generation.saturating_add(1),
+                    now_ms(),
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return match current {
+                    Some(current) => Err(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current,
+                    }),
+                    None => Ok(None),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
         })
     }
 

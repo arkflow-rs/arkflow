@@ -617,11 +617,7 @@ async fn hub_job_action(
         Err(error) => return hub_problem(error),
     };
     match hub
-        .update_job(
-            &job_id,
-            Some(state),
-            Some(current.generation.saturating_add(1)),
-        )
+        .update_job_desired_state(&job_id, state, current.generation)
         .await
     {
         Ok(Some(job)) => Json(job).into_response(),
@@ -817,11 +813,7 @@ async fn hub_job_desired_state(
         Err(error) => return hub_problem(error),
     };
     match hub
-        .update_job(
-            &job_id,
-            Some(request.state.as_str()),
-            Some(current.generation.saturating_add(1)),
-        )
+        .update_job_desired_state(&job_id, request.state.as_str(), current.generation)
         .await
     {
         Ok(Some(job)) => Json(job).into_response(),

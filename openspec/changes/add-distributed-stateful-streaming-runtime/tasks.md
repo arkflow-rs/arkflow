@@ -110,3 +110,10 @@
 - [x] 14.2 Build processor and sink instances per assigned task and route edges by task identity.
 - [x] 14.3 Stop and await the previous runtime before opening replacement state or connectors.
 - [x] 14.4 Add validation and task-isolation regression coverage.
+
+## 15. Follow-up review remediation
+
+- [x] 15.1 Route unpartitioned DAG edges to every assigned downstream subtask.
+- [x] 15.2 Apply compare-and-swap generation updates for concurrent Job actions.
+- [x] 15.3 Reject both stale and future-generation Job observations.
+- [x] 15.4 Add broadcast-routing and generation-fencing regression coverage.
