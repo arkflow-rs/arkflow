@@ -1722,19 +1722,93 @@ impl Hub {
                     } else {
                         false
                     };
-                if all_nodes_succeeded || result.state != HubOperationState::Succeeded {
+                if all_nodes_succeeded {
+                    let completed_operations = self
+                        .operations
+                        .read()
+                        .await
+                        .values()
+                        .filter(|operation| {
+                            operation.resource_id == updated.resource_id
+                                && operation.operation == updated.operation
+                                && operation.generation == updated.generation
+                                && operation.checkpoint_id.as_deref() == checkpoint_id
+                                && operation.state == HubOperationState::Succeeded
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let commit_operation = if updated.operation == "job_savepoint" {
+                        "job_savepoint_commit"
+                    } else {
+                        "job_checkpoint_commit"
+                    };
+                    let commit_exists = self.operations.read().await.values().any(|operation| {
+                        operation.resource_id == updated.resource_id
+                            && operation.operation == commit_operation
+                            && operation.generation == updated.generation
+                            && operation.checkpoint_id.as_deref() == checkpoint_id
+                            && !matches!(
+                                operation.state,
+                                HubOperationState::Failed
+                                    | HubOperationState::TimedOut
+                                    | HubOperationState::NodeUnavailable
+                                    | HubOperationState::Cancelled
+                                    | HubOperationState::Superseded
+                            )
+                    });
+                    if !commit_exists {
+                        let coordinator = completed_operations.first().ok_or_else(|| {
+                            HubError::Invalid("checkpoint has no successful agent".into())
+                        })?;
+                        self.enqueue_with_metadata(
+                            coordinator.node_id.clone(),
+                            commit_operation.into(),
+                            updated.resource_id.clone(),
+                            updated.correlation_id.clone(),
+                            Some(serde_json::json!({
+                                "checkpoint_id": checkpoint_id.unwrap_or_default(),
+                                "manifest_nodes": completed_operations
+                                    .iter()
+                                    .map(|operation| operation.node_id.clone())
+                                    .collect::<Vec<_>>(),
+                            })),
+                            updated.generation,
+                            None,
+                            updated.config_version_id.clone(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    }
+                } else if result.state != HubOperationState::Succeeded {
                     self.complete_job_checkpoint(
                         &updated.resource_id,
                         checkpoint_id.unwrap_or("unknown"),
-                        if result.state == HubOperationState::Succeeded {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
+                        "failed",
                         result.checkpoint_manifest_uri.clone(),
                     )
                     .await?;
                 }
+            } else if matches!(
+                updated.operation.as_str(),
+                "job_checkpoint_commit" | "job_savepoint_commit"
+            ) && result.observed_checkpoint_id.is_some()
+            {
+                self.complete_job_checkpoint(
+                    &updated.resource_id,
+                    result
+                        .observed_checkpoint_id
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    if result.state == HubOperationState::Succeeded {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    result.checkpoint_manifest_uri.clone(),
+                )
+                .await?;
             }
             let observed_state = if matches!(
                 result.state,
@@ -2882,7 +2956,13 @@ fn parse_resource_scope(value: &str) -> Option<ResourceScope> {
 fn required_capabilities(operation: &str) -> Vec<String> {
     match operation {
         "start" | "stop" | "restart" => vec!["stream_lifecycle".into()],
-        "job_start" | "job_stop" | "job_restart" | "job_checkpoint" | "job_savepoint" => {
+        "job_start"
+        | "job_stop"
+        | "job_restart"
+        | "job_checkpoint"
+        | "job_savepoint"
+        | "job_checkpoint_commit"
+        | "job_savepoint_commit" => {
             vec!["job_runtime".into(), "state_backend".into()]
         }
         "apply_configuration" | "rollback_configuration" => vec!["configuration".into()],
@@ -4217,7 +4297,7 @@ mod tests {
         hub.command_result(
             AgentAuth {
                 node_id: "compute-1".into(),
-                session_token: registration.session_token,
+                session_token: registration.session_token.clone(),
             },
             CommandResult {
                 command_id: checkpoint_command.id.clone(),
@@ -4238,7 +4318,64 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let commands = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token.clone(),
+            })
+            .await
+            .unwrap();
+        let commit_command = commands
+            .iter()
+            .find(|command| command.operation == "job_checkpoint_commit")
+            .expect("checkpoint commit command");
+        assert_eq!(
+            commit_command
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("checkpoint_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("checkpoint-7")
+        );
+        assert_eq!(
+            commit_command
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("manifest_nodes"))
+                .and_then(serde_json::Value::as_array)
+                .map(|nodes| nodes.len()),
+            Some(1)
+        );
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token,
+            },
+            CommandResult {
+                command_id: commit_command.id.clone(),
+                operation_id: commit_command.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: commit_command.correlation_id.clone(),
+                generation: commit_command.generation,
+                observed_generation: Some(commit_command.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: Some("checkpoint-7".into()),
+                checkpoint_manifest_uri: Some("/tmp/final/checkpoint-7/manifest.json".into()),
+            },
+        )
+        .await
+        .unwrap();
         let records = hub.job_checkpoints("orders").await.unwrap();
         assert_eq!(records[0].status, "completed");
+        assert_eq!(
+            records[0].manifest_uri.as_deref(),
+            Some("/tmp/final/checkpoint-7/manifest.json")
+        );
     }
 }

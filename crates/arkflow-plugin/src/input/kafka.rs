@@ -307,10 +307,15 @@ impl Input for KafkaInput {
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
+        let assigned_partition = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
         let mut assignment = TopicPartitionList::new();
         for topic in &self.config.topics {
             for position in positions.iter().filter(|position| {
                 position.partition < i32::MAX as u32
+                    && assigned_partition.is_none_or(|partition| position.partition == partition)
                     && (position.topic.as_deref().is_none()
                         || position.topic.as_deref() == Some(topic.as_str()))
             }) {

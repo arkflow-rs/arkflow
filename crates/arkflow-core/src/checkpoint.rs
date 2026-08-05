@@ -77,6 +77,10 @@ impl CheckpointManifest {
     pub fn verify(&self) -> bool {
         self.checksum == manifest_checksum(self)
     }
+
+    pub fn seal(&mut self) {
+        self.checksum = manifest_checksum(self);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,15 +181,28 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<RecoveryArtifact, Error> {
+        self.write_manifest(
+            manifest,
+            RecoveryArtifactKind::Checkpoint,
+            recovery_manifest_key(RecoveryArtifactKind::Checkpoint, &manifest.checkpoint_id),
+        )
+    }
+
+    pub fn write_manifest(
+        &self,
+        manifest: &CheckpointManifest,
+        kind: RecoveryArtifactKind,
+        key: String,
+    ) -> Result<RecoveryArtifact, Error> {
         if !manifest.verify() {
-            return Err(Error::Process("cannot persist invalid checkpoint".into()));
+            return Err(Error::Process(
+                "cannot persist invalid recovery manifest".into(),
+            ));
         }
-        let key = recovery_manifest_key(RecoveryArtifactKind::Checkpoint, &manifest.checkpoint_id);
-        let bytes = serde_json::to_vec(manifest)?;
-        self.store.put(&key, &bytes)?;
+        self.store.put(&key, &serde_json::to_vec(manifest)?)?;
         Ok(RecoveryArtifact {
             id: manifest.checkpoint_id.clone(),
-            kind: RecoveryArtifactKind::Checkpoint,
+            kind,
             manifest_key: key,
             job_version: manifest.job_version,
             format_version: manifest.format_version,
@@ -251,20 +268,11 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<RecoveryArtifact, Error> {
-        if !manifest.verify() {
-            return Err(Error::Process("cannot persist invalid savepoint".into()));
-        }
-        let key = recovery_manifest_key(RecoveryArtifactKind::Savepoint, &manifest.checkpoint_id);
-        self.store.put(&key, &serde_json::to_vec(manifest)?)?;
-        Ok(RecoveryArtifact {
-            id: manifest.checkpoint_id.clone(),
-            kind: RecoveryArtifactKind::Savepoint,
-            manifest_key: key,
-            job_version: manifest.job_version,
-            format_version: manifest.format_version,
-            created_at_ms: now_ms(),
-            status: CheckpointStatus::Completed,
-        })
+        self.write_manifest(
+            manifest,
+            RecoveryArtifactKind::Savepoint,
+            recovery_manifest_key(RecoveryArtifactKind::Savepoint, &manifest.checkpoint_id),
+        )
     }
 
     pub fn delete(&self, artifact: &RecoveryArtifact) -> Result<(), Error> {

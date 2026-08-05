@@ -96,3 +96,10 @@
 - [x] 12.2 Persist checkpoint manifests and state snapshots through the configured shared object-store URI.
 - [x] 12.3 Capture and restore Kafka topic/partition offsets through the Input checkpoint position contract.
 - [x] 12.4 Add recovery, shared-artifact, and connector-position regression coverage.
+
+## 13. Follow-up review remediation
+
+- [x] 13.1 Preserve task-local Kafka partition assignments during recovery.
+- [x] 13.2 Aggregate per-agent checkpoint manifests before publishing the shared artifact.
+- [x] 13.3 Await the previous Job generation before starting its replacement.
+- [x] 13.4 Exclude expired TTL entries from state scans and add regression coverage.

@@ -404,6 +404,12 @@ impl StateBackend for RedbStateBackend {
             let (entry_namespace, key) = Self::parse_key(storage_key.value())?;
             if entry_namespace == namespace {
                 let decoded = decode_value(value.value())?;
+                if decoded
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= now_ms())
+                {
+                    continue;
+                }
                 entries.push(StateEntry {
                     namespace: entry_namespace.to_owned(),
                     key,
@@ -707,6 +713,19 @@ mod tests {
             Some(b"1".to_vec())
         );
         assert_eq!(restored.snapshot_at(base + 1_001).unwrap().entries.len(), 0);
+    }
+
+    #[test]
+    fn scans_filter_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        backend.put("orders", b"live", b"1").unwrap();
+        backend
+            .put_with_ttl("orders", b"expired", b"2", Some(1), 0)
+            .unwrap();
+        let entries = backend.scan("orders").unwrap();
+        assert_eq!(backend.scan("orders").unwrap().len(), 1);
+        assert_eq!(entries[0].key, b"live");
     }
 
     #[test]

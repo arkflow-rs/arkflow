@@ -50,6 +50,7 @@ pub struct NodeAgentConfig {
 #[derive(Clone, Default)]
 struct JobRuntime {
     tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
+    starts: Arc<Mutex<()>>,
 }
 
 struct JobTask {
@@ -222,6 +223,7 @@ impl JobRuntime {
         recovery_id: Option<String>,
         recovery_savepoint: bool,
     ) -> Result<(), String> {
+        let _start_guard = self.starts.lock().await;
         let job_id = plan.spec.id.to_string();
         if assignments.is_empty() {
             return Err("Job command contains no task assignments".into());
@@ -273,12 +275,19 @@ impl JobRuntime {
             None
         };
         let cancellation = CancellationToken::new();
-        let mut tasks = self.tasks.lock().await;
-        if let Some(existing) = tasks.get(&job_id) {
-            if existing.generation > generation {
-                return Err("job generation is stale".into());
+        let existing = {
+            let mut tasks = self.tasks.lock().await;
+            let existing = tasks.remove(&job_id);
+            if let Some(existing) = &existing {
+                if existing.generation > generation {
+                    return Err("job generation is stale".into());
+                }
+                existing.cancellation.cancel();
             }
-            existing.cancellation.cancel();
+            existing
+        };
+        if let Some(existing) = existing {
+            let _ = existing.handle.await;
         }
         let task_cancellation = cancellation.clone();
         let runner_for_task = runner.clone();
@@ -287,7 +296,7 @@ impl JobRuntime {
                 .run_with_recovery(task_cancellation, recovery.as_ref())
                 .await
         });
-        tasks.insert(
+        self.tasks.lock().await.insert(
             job_id,
             JobTask {
                 generation,
@@ -312,6 +321,7 @@ impl JobRuntime {
         checkpoint_id: &str,
         generation: u64,
         savepoint: bool,
+        node_id: &str,
     ) -> Result<String, String> {
         let tasks = self.tasks.lock().await;
         let task = tasks
@@ -384,21 +394,120 @@ impl JobRuntime {
         let manifest = coordinator
             .complete(attempts, vec![state_ref])
             .map_err(|error| error.to_string())?;
-        let artifact = if savepoint {
-            repository
-                .create_savepoint(&manifest)
-                .map_err(|error| error.to_string())?
+        let kind = if savepoint {
+            RecoveryArtifactKind::Savepoint
         } else {
-            repository
-                .write_checkpoint(&manifest)
-                .map_err(|error| error.to_string())?
+            RecoveryArtifactKind::Checkpoint
         };
+        let prefix = if savepoint {
+            "savepoints"
+        } else {
+            "checkpoints"
+        };
+        let manifest_key = format!(
+            "{prefix}/{checkpoint_id}/manifests/{}.json",
+            node_id.replace('/', "_")
+        );
+        let artifact = repository
+            .write_manifest(&manifest, kind, manifest_key)
+            .map_err(|error| error.to_string())?;
         let uri = format!(
             "{}/{}",
             store_uri.trim_end_matches('/'),
             artifact.manifest_key
         );
         Ok(uri)
+    }
+
+    async fn aggregate_checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+        generation: u64,
+        savepoint: bool,
+        manifest_nodes: &[String],
+    ) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        let task = tasks
+            .get(job_id)
+            .ok_or_else(|| "Job is not running on this Agent".to_string())?;
+        if task.generation != generation {
+            return Err("checkpoint generation does not match running Job".into());
+        }
+        let store_uri = task
+            .checkpoint_store_uri
+            .as_deref()
+            .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
+        let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(store_uri)?);
+        let kind = if savepoint {
+            RecoveryArtifactKind::Savepoint
+        } else {
+            RecoveryArtifactKind::Checkpoint
+        };
+        let prefix = if savepoint {
+            "savepoints"
+        } else {
+            "checkpoints"
+        };
+        let mut aggregate: Option<arkflow_core::checkpoint::CheckpointManifest> = None;
+        let mut task_ids = std::collections::BTreeSet::new();
+        for node_id in manifest_nodes {
+            let key = format!(
+                "{prefix}/{checkpoint_id}/manifests/{}.json",
+                node_id.replace('/', "_")
+            );
+            let artifact = RecoveryArtifact {
+                id: checkpoint_id.to_owned(),
+                kind,
+                manifest_key: key,
+                job_version: task.assignments[0].job_version,
+                format_version: task.state.format_version(),
+                created_at_ms: 0,
+                status: CheckpointStatus::Completed,
+            };
+            let manifest = repository
+                .read_manifest(&artifact)
+                .map_err(|error| error.to_string())?;
+            if let Some(target) = aggregate.as_mut() {
+                if target.job_id != manifest.job_id
+                    || target.job_version != manifest.job_version
+                    || target.generation != manifest.generation
+                    || target.format_version != manifest.format_version
+                {
+                    return Err("checkpoint manifests do not share one job barrier".into());
+                }
+                for attempt in manifest.task_attempts {
+                    if !task_ids.insert(attempt.task_id.clone()) {
+                        return Err(format!(
+                            "duplicate task '{}' in checkpoint manifests",
+                            attempt.task_id
+                        ));
+                    }
+                    target.task_attempts.push(attempt);
+                }
+                target.source_positions.extend(manifest.source_positions);
+                target.watermarks_ms.extend(manifest.watermarks_ms);
+                target.state_snapshots.extend(manifest.state_snapshots);
+            } else {
+                for attempt in &manifest.task_attempts {
+                    task_ids.insert(attempt.task_id.clone());
+                }
+                aggregate = Some(manifest);
+            }
+        }
+        let mut manifest =
+            aggregate.ok_or_else(|| "checkpoint has no agent manifests".to_string())?;
+        manifest.checksum = 0;
+        manifest.seal();
+        let final_key = recovery_manifest_key(kind, checkpoint_id);
+        let artifact = repository
+            .write_manifest(&manifest, kind, final_key)
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "{}/{}",
+            store_uri.trim_end_matches('/'),
+            artifact.manifest_key
+        ))
     }
 
     async fn take_finished(&self) -> Vec<(String, u64, Result<(), String>)> {
@@ -824,9 +933,40 @@ async fn execute_command(
                         checkpoint_id,
                         command.generation,
                         command.operation == "job_savepoint",
+                        &config.node_id,
                     )
                     .await?;
                 result.checkpoint_manifest_uri = Some(manifest_uri);
+                Ok(())
+            }
+            "job_checkpoint_commit" | "job_savepoint_commit" => {
+                let payload = command
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| "missing checkpoint aggregation payload".to_string())?;
+                let checkpoint_id = payload
+                    .get("checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing checkpoint_id".to_string())?;
+                let manifest_nodes = serde_json::from_value::<Vec<String>>(
+                    payload
+                        .get("manifest_nodes")
+                        .cloned()
+                        .ok_or_else(|| "missing checkpoint manifest nodes".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                result.observed_checkpoint_id = Some(checkpoint_id.into());
+                result.checkpoint_manifest_uri = Some(
+                    job_runtime
+                        .aggregate_checkpoint(
+                            &command.resource_id,
+                            checkpoint_id,
+                            command.generation,
+                            command.operation == "job_savepoint_commit",
+                            &manifest_nodes,
+                        )
+                        .await?,
+                );
                 Ok(())
             }
             _ => Err(format!("unknown Job operation {}", command.operation)),
