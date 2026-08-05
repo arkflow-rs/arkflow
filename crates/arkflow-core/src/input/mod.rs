@@ -72,6 +72,18 @@ pub trait Input: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Bind this reader to a physical source partition owned by its task.
+    /// Connectors that do not support partition assignment remain compatible
+    /// with single-partition Jobs through the no-op default.
+    fn assign_partition(&self, _partition: u32) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Whether this connector enforces the assigned partition at the source.
+    fn supports_partitioning(&self) -> bool {
+        false
+    }
+
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;
 }

@@ -6,7 +6,7 @@
 
 use crate::{input::Input, output::Output, processor::Processor, Error, Resource};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -478,11 +478,49 @@ impl JobPlan {
         if node_ids.is_empty() {
             return Vec::new();
         }
+        // The current runner has no cross-node shuffle/transport. Co-locate
+        // every connected operator component so an edge can never disappear
+        // merely because its endpoints were assigned to different Agents.
+        let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
+        for operator in &self.spec.operators {
+            adjacency.entry(operator.id.clone()).or_default();
+        }
+        for edge in &self.spec.edges {
+            adjacency
+                .entry(edge.from.clone())
+                .or_default()
+                .insert(edge.to.clone());
+            adjacency
+                .entry(edge.to.clone())
+                .or_default()
+                .insert(edge.from.clone());
+        }
+        let mut component_by_operator = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        let mut component_index = 0;
+        for operator in &self.spec.operators {
+            if !visited.insert(operator.id.clone()) {
+                continue;
+            }
+            let mut pending = vec![operator.id.clone()];
+            while let Some(current) = pending.pop() {
+                component_by_operator.insert(current.clone(), component_index);
+                for neighbor in adjacency.get(&current).into_iter().flatten() {
+                    if visited.insert(neighbor.clone()) {
+                        pending.push(neighbor.clone());
+                    }
+                }
+            }
+            component_index += 1;
+        }
         self.tasks
             .iter()
-            .enumerate()
-            .map(|(index, task)| {
-                let node_id = &node_ids[index % node_ids.len()];
+            .map(|task| {
+                let component = component_by_operator
+                    .get(&task.operator_id)
+                    .copied()
+                    .unwrap_or_default();
+                let node_id = &node_ids[component % node_ids.len()];
                 TaskAttempt {
                     id: format!("{}:{node_id}:{generation}", task.id),
                     job_id: self.spec.id.clone(),
@@ -805,6 +843,24 @@ mod tests {
         assert_eq!(plan.tasks.len(), 6);
         let task = task_for_key(&plan, "aggregate", b"customer-1").unwrap();
         assert_eq!(task.operator_id, "aggregate");
+    }
+
+    #[test]
+    fn assignments_keep_connected_edges_on_one_node() {
+        let plan = JobPlan::compile(base_job()).unwrap();
+        let nodes = vec!["node-a".into(), "node-b".into()];
+        let assignments = plan.assignments_for_nodes(&nodes, 4);
+        for edge in &plan.spec.edges {
+            let from = assignments
+                .iter()
+                .find(|assignment| plan.task(&assignment.task_id).unwrap().operator_id == edge.from)
+                .unwrap();
+            let to = assignments
+                .iter()
+                .find(|assignment| plan.task(&assignment.task_id).unwrap().operator_id == edge.to)
+                .unwrap();
+            assert_eq!(from.node_id, to.node_id, "edge {} crosses nodes", edge.id);
+        }
     }
 
     #[test]

@@ -242,6 +242,8 @@ pub struct HubOperation {
     pub operation: String,
     pub resource_id: String,
     #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
     pub generation: u64,
     #[serde(default)]
     pub attempt_id: Option<String>,
@@ -1562,6 +1564,11 @@ impl Hub {
             node_id: node_id.clone(),
             operation: operation.clone(),
             resource_id: resource_id.clone(),
+            checkpoint_id: payload
+                .as_ref()
+                .and_then(|payload| payload.get("checkpoint_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             generation,
             attempt_id: attempt_id.clone(),
             config_version_id: config_version_id.clone(),
@@ -1680,27 +1687,27 @@ impl Hub {
                 updated.operation.as_str(),
                 "job_checkpoint" | "job_savepoint"
             ) {
-                let all_nodes_succeeded = if result.state == HubOperationState::Succeeded {
-                    self.operations
-                        .read()
-                        .await
-                        .values()
-                        .filter(|operation| {
-                            operation.resource_id == updated.resource_id
-                                && operation.operation == updated.operation
-                                && operation.generation == updated.generation
-                        })
-                        .all(|operation| operation.state == HubOperationState::Succeeded)
-                } else {
-                    false
-                };
+                let checkpoint_id = result.observed_checkpoint_id.as_deref();
+                let all_nodes_succeeded =
+                    if result.state == HubOperationState::Succeeded && checkpoint_id.is_some() {
+                        self.operations
+                            .read()
+                            .await
+                            .values()
+                            .filter(|operation| {
+                                operation.resource_id == updated.resource_id
+                                    && operation.operation == updated.operation
+                                    && operation.generation == updated.generation
+                                    && operation.checkpoint_id.as_deref() == checkpoint_id
+                            })
+                            .all(|operation| operation.state == HubOperationState::Succeeded)
+                    } else {
+                        false
+                    };
                 if all_nodes_succeeded || result.state != HubOperationState::Succeeded {
                     self.complete_job_checkpoint(
                         &updated.resource_id,
-                        result
-                            .observed_checkpoint_id
-                            .as_deref()
-                            .unwrap_or("unknown"),
+                        checkpoint_id.unwrap_or("unknown"),
                         if result.state == HubOperationState::Succeeded {
                             "completed"
                         } else {
@@ -2754,6 +2761,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
         node_id: intent.node_id,
         operation: "reconcile".into(),
         resource_id: intent.stream_id,
+        checkpoint_id: None,
         generation: intent.generation,
         attempt_id: None,
         config_version_id: intent.config_version_id,
@@ -4180,6 +4188,14 @@ mod tests {
             .iter()
             .find(|command| command.operation == "job_checkpoint")
             .unwrap();
+        assert_eq!(
+            hub.operation(&checkpoint_command.operation_id)
+                .await
+                .unwrap()
+                .checkpoint_id
+                .as_deref(),
+            Some("checkpoint-7")
+        );
         hub.command_result(
             AgentAuth {
                 node_id: "compute-1".into(),

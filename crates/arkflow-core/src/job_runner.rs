@@ -51,12 +51,23 @@ impl SingleComputeJobRunner {
                 "Job assignment contains no known tasks".into(),
             ));
         }
-        let source_ids = plan
+        let source_specs = plan
             .spec
             .sources
             .iter()
-            .filter(|source| assigned_operators.contains(&source.operator_id))
-            .map(|source| source.operator_id.clone())
+            .map(|source| (source.operator_id.as_str(), source))
+            .collect::<BTreeMap<_, _>>();
+        let source_tasks = task_ids
+            .iter()
+            .filter_map(|task_id| {
+                let task = plan.task(task_id)?;
+                let source = source_specs.get(task.operator_id.as_str())?;
+                Some((task, *source))
+            })
+            .collect::<Vec<_>>();
+        let source_ids = source_tasks
+            .iter()
+            .map(|(task, _)| task.operator_id.clone())
             .collect::<Vec<_>>();
         let source_id_set = source_ids.iter().cloned().collect::<BTreeSet<_>>();
         let sink_ids = plan
@@ -66,13 +77,30 @@ impl SingleComputeJobRunner {
             .filter(|sink| assigned_operators.contains(&sink.operator_id))
             .map(|sink| sink.operator_id.clone())
             .collect::<BTreeSet<_>>();
-        let inputs = plan
-            .spec
-            .sources
-            .iter()
-            .filter(|source| assigned_operators.contains(&source.operator_id))
-            .map(|source| adapter.build_input(source, resource))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut inputs = Vec::with_capacity(source_tasks.len());
+        let mut source_task_counts = BTreeMap::<String, usize>::new();
+        for (task, source) in &source_tasks {
+            let input = adapter.build_input(source, resource)?;
+            let count = source_task_counts
+                .entry(task.operator_id.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            if *count > 1 && !input.supports_partitioning() {
+                return Err(Error::Config(format!(
+                    "source '{}' does not support partitioned task execution",
+                    task.operator_id
+                )));
+            }
+            let partition = task
+                .partitions
+                .first()
+                .map(|partition| partition.id)
+                .ok_or_else(|| {
+                    Error::Config(format!("task '{}' has no source partition", task.id))
+                })?;
+            input.assign_partition(partition)?;
+            inputs.push(input);
+        }
         let outputs = plan
             .spec
             .sinks
@@ -102,6 +130,12 @@ impl SingleComputeJobRunner {
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
         let mut edges = BTreeMap::<String, Vec<String>>::new();
         for edge in &plan.spec.edges {
+            if assigned_operators.contains(&edge.from) != assigned_operators.contains(&edge.to) {
+                return Err(Error::Config(format!(
+                    "Job assignment splits edge '{}' between nodes; connected tasks must be co-located",
+                    edge.id
+                )));
+            }
             if !assigned_operators.contains(&edge.from) || !assigned_operators.contains(&edge.to) {
                 continue;
             }

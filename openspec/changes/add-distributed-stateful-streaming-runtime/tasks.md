@@ -82,3 +82,10 @@
 - [x] 10.3 Report asynchronous Job runtime termination back to Hub observations.
 - [x] 10.4 Enforce state budgets for atomic counter updates and fence acknowledgements to the active checkpoint barrier.
 - [x] 10.5 Add regression coverage and rerun focused repository validation.
+
+## 11. Follow-up review remediation
+
+- [x] 11.1 Co-locate connected operator components when no cross-node transport is available.
+- [x] 11.2 Bind source readers to assigned task partitions and reject unsupported parallel source execution.
+- [x] 11.3 Scope checkpoint completion aggregation by checkpoint ID.
+- [x] 11.4 Add regression coverage for edge locality, source partition ownership, and checkpoint identity.

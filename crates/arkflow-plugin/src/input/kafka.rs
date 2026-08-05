@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Message as KafkaMessage, Timestamp};
+use rdkafka::topic_partition_list::TopicPartitionList;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +60,7 @@ pub struct KafkaInput {
     input_name: Option<String>,
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
+    assigned_partition: Arc<RwLock<Option<u32>>>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -73,6 +75,7 @@ impl KafkaInput {
             input_name: name.cloned(),
             config,
             consumer: Arc::new(RwLock::new(None)),
+            assigned_partition: Arc::new(RwLock::new(None)),
             codec,
         })
     }
@@ -161,16 +164,30 @@ impl Input for KafkaInput {
             .create()
             .map_err(|e| Error::Connection(format!("Unable to create a Kafka consumer: {}", e)))?;
 
-        // Subscribe to a topic
-        let x: Vec<&str> = self
-            .config
-            .topics
-            .iter()
-            .map(|topic| topic.as_str())
-            .collect();
-        consumer.subscribe(&x).map_err(|e| {
-            Error::Connection(format!("You cannot subscribe to a Kafka topic: {}", e))
-        })?;
+        if let Some(partition) = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?
+        {
+            let mut assignment = TopicPartitionList::new();
+            for topic in &self.config.topics {
+                assignment.add_partition(topic, partition as i32);
+            }
+            consumer.assign(&assignment).map_err(|e| {
+                Error::Connection(format!("You cannot assign Kafka partitions: {}", e))
+            })?;
+        } else {
+            // Subscribe to all partitions for the legacy single-reader path.
+            let x: Vec<&str> = self
+                .config
+                .topics
+                .iter()
+                .map(|topic| topic.as_str())
+                .collect();
+            consumer.subscribe(&x).map_err(|e| {
+                Error::Connection(format!("You cannot subscribe to a Kafka topic: {}", e))
+            })?;
+        }
 
         // Update consumer and connection status
         let consumer_arc = self.consumer.clone();
@@ -270,6 +287,19 @@ impl Input for KafkaInput {
             }
         }
         Ok(())
+    }
+
+    fn assign_partition(&self, partition: u32) -> Result<(), Error> {
+        let mut assigned = self
+            .assigned_partition
+            .try_write()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        *assigned = Some(partition);
+        Ok(())
+    }
+
+    fn supports_partitioning(&self) -> bool {
+        true
     }
 }
 
