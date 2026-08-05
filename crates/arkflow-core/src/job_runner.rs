@@ -1,16 +1,15 @@
 //! Single-Compute execution adapter for a distributed Job plan.
 
 use crate::checkpoint::RecoveryPlan;
-use crate::event_time::{
-    window_action, FieldTimestampExtractor, TimestampExtractor, WatermarkTracker, WindowAction,
-};
+use crate::event_time::{window_action, FieldTimestampExtractor, WatermarkTracker, WindowAction};
 use crate::input::{Ack, Input};
 use crate::job::{JobComponentAdapter, JobPlan};
 use crate::output::Output;
 use crate::processor::Processor;
 use crate::state::{KeyedCounter, StateBackend};
 use crate::{Error, MessageBatch, ProcessResult, Resource};
-use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{BinaryArray, BooleanArray, Int64Array, StringArray, UInt64Array};
+use datafusion::arrow::compute::filter_record_batch;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -438,25 +437,36 @@ impl SingleComputeJobRunner {
         let Some(runtime) = runtimes.get_mut(source_task_id) else {
             return Ok(Some(batch));
         };
-        let event_time_ms = runtime.extractor.extract_timestamp_ms(&batch)?;
+        let event_times_ms = runtime.extractor.extract_timestamps_ms(&batch)?;
         let now_ms = crate::state::now_ms() as i64;
-        let watermark_ms = runtime
-            .tracker
-            .observe(runtime.partition, event_time_ms, now_ms);
-        let window_action = self.window_sizes_ms.values().next().map(|window_size| {
-            let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
-            window_action(
-                window_start + *window_size,
-                event_time_ms,
-                Some(watermark_ms),
-                runtime.allowed_lateness_ms,
-                runtime.late_policy,
-            )
-        });
-        if matches!(window_action, Some(WindowAction::Drop)) {
+        let mut keep = Vec::with_capacity(event_times_ms.len());
+        for event_time_ms in event_times_ms {
+            let watermark_ms = runtime
+                .tracker
+                .observe(runtime.partition, event_time_ms, now_ms);
+            let action = self.window_sizes_ms.values().next().map(|window_size| {
+                let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
+                window_action(
+                    window_start + *window_size,
+                    event_time_ms,
+                    Some(watermark_ms),
+                    runtime.allowed_lateness_ms,
+                    runtime.late_policy,
+                )
+            });
+            keep.push(!matches!(action, Some(WindowAction::Drop)));
+        }
+        if keep.iter().all(|value| *value) {
+            return Ok(Some(batch));
+        }
+        if keep.iter().all(|value| !*value) {
             return Ok(None);
         }
-        Ok(Some(batch))
+        let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
+            .map_err(|error| Error::Process(format!("filter late events: {error}")))?;
+        let mut filtered_batch = MessageBatch::new_arrow(filtered);
+        filtered_batch.set_input_name(batch.get_input_name());
+        Ok(Some(Arc::new(filtered_batch)))
     }
 
     async fn dispatch_from_source(
@@ -766,29 +776,19 @@ mod tests {
             Field::new("ts", DataType::Int64, false),
             Field::new("key", DataType::Utf8, false),
         ]));
-        let first = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1_000])),
-                Arc::new(StringArray::from(vec!["a"])),
-            ],
-        )
-        .unwrap();
-        let late = RecordBatch::try_new(
+        let mixed = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from(vec![0])),
-                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![1_000, 0])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
             ],
         )
         .unwrap();
-        assert!(runner
-            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(first)))
+        let prepared = runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(mixed)))
             .unwrap()
-            .is_some());
-        assert!(runner
-            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(late)))
-            .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared.record_batch().num_rows(), 1);
     }
 }

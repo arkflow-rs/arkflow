@@ -62,6 +62,7 @@ pub struct KafkaInput {
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
     assigned_partition: Arc<RwLock<Option<u32>>>,
+    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -77,6 +78,7 @@ impl KafkaInput {
             config,
             consumer: Arc::new(RwLock::new(None)),
             assigned_partition: Arc::new(RwLock::new(None)),
+            acknowledged_offsets: Arc::new(RwLock::new(HashMap::new())),
             codec,
         })
     }
@@ -230,6 +232,12 @@ impl Input for KafkaInput {
                 record_batch = metadata::with_partition(record_batch, partition as u32)?;
 
                 let offset = kafka_message.offset();
+                {
+                    let mut acknowledged = self.acknowledged_offsets.write().await;
+                    acknowledged
+                        .entry((kafka_message.topic().to_owned(), partition))
+                        .or_insert(offset);
+                }
                 record_batch = metadata::with_offset(record_batch, offset as u64)?;
 
                 // Add key if present
@@ -266,6 +274,7 @@ impl Input for KafkaInput {
                 // Create acknowledgment object
                 let ack = KafkaAck {
                     consumer: self.consumer.clone(),
+                    acknowledged_offsets: self.acknowledged_offsets.clone(),
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
@@ -281,26 +290,17 @@ impl Input for KafkaInput {
     }
 
     async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
-        let consumer_guard = self.consumer.read().await;
-        let Some(consumer) = consumer_guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let positions = consumer
-            .position()
-            .map_err(|error| Error::Process(format!("read Kafka positions: {error}")))?;
-        Ok(positions
-            .elements()
-            .into_iter()
-            .filter_map(|element| {
-                let offset = match element.offset() {
-                    Offset::Offset(offset) if offset >= 0 => u64::try_from(offset).ok()?,
-                    _ => return None,
-                };
-                let partition = u32::try_from(element.partition()).ok()?;
+        let acknowledged = self.acknowledged_offsets.read().await;
+        Ok(acknowledged
+            .iter()
+            .filter_map(|((topic, partition), offset)| {
+                if *partition < 0 || *offset < 0 {
+                    return None;
+                }
                 Some(SourcePosition {
-                    topic: Some(element.topic().to_owned()),
-                    partition,
-                    offset,
+                    topic: Some(topic.clone()),
+                    partition: u32::try_from(*partition).ok()?,
+                    offset: u64::try_from(*offset).ok()?,
                 })
             })
             .collect())
@@ -374,6 +374,7 @@ impl Input for KafkaInput {
 /// Kafka message acknowledgment
 pub struct KafkaAck {
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
+    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
     topic: String,
     partition: i32,
     offset: i64,
@@ -389,6 +390,12 @@ impl Ack for KafkaAck {
             v.store_offset(&self.topic, self.partition, self.offset)
                 .map_err(|e| Error::Process(format!("Failed to store Kafka offset: {}", e)))?;
         }
+        let mut acknowledged = self.acknowledged_offsets.write().await;
+        let next_offset = self.offset.saturating_add(1);
+        let entry = acknowledged
+            .entry((self.topic.clone(), self.partition))
+            .or_insert(next_offset);
+        *entry = (*entry).max(next_offset);
         Ok(())
     }
 }
@@ -508,6 +515,7 @@ mod tests {
         let input = KafkaInput::new(None, config, None).unwrap();
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
+            acknowledged_offsets: input.acknowledged_offsets.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
@@ -515,7 +523,11 @@ mod tests {
 
         // Test acknowledgment, should have no effect since there is no actual consumer
         let _ = ack.ack().await;
-        // This test mainly verifies that the ack method does not panic
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].topic.as_deref(), Some("test-topic"));
+        assert_eq!(positions[0].partition, 0);
+        assert_eq!(positions[0].offset, 101);
     }
 
     #[test]

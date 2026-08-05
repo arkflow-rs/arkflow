@@ -124,3 +124,9 @@
 - [x] 16.2 Apply timestamp extraction, watermark tracking, window decisions, and late-event policy in the runner.
 - [x] 16.3 Bind state snapshots to Agent nodes and restore only the local snapshot set.
 - [x] 16.4 Await cancelled Job runtimes before restart replacement and add recovery isolation coverage.
+
+## 17. Follow-up review remediation
+
+- [x] 17.1 Base Kafka checkpoint positions on acknowledged offsets rather than the fetch cursor.
+- [x] 17.2 Apply event-time lateness decisions independently to every record in a batch.
+- [x] 17.3 Add Kafka acknowledgement and mixed-timestamp batch regression coverage.
