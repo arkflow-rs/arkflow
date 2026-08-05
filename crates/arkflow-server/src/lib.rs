@@ -9,10 +9,11 @@ pub mod hub;
 pub mod storage;
 
 use crate::api_contract::{
-    AcceptedIntentResponse, CreateRolloutRequest, DesiredStateRequest, OperatorAction,
-    OperatorPrincipal, RestartActionRequest, RolloutActionRequest,
+    AcceptedIntentResponse, CreateJobRequest, CreateRolloutRequest, DesiredStateRequest,
+    JobDesiredStateRequest, OperatorAction, OperatorPrincipal, RestartActionRequest,
+    RolloutActionRequest,
 };
-use crate::storage::DesiredMutation;
+use crate::storage::{DesiredMutation, JobRecord};
 use arkflow_core::component::{self, ComponentKind};
 use arkflow_core::configuration::redacted_config;
 use arkflow_core::configuration::{parse_and_validate, ConfigCandidate};
@@ -264,6 +265,20 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/system", get(hub_system))
         .route("/nodes", get(hub_nodes))
         .route("/streams", get(hub_streams))
+        .route("/jobs", get(hub_jobs).post(hub_create_job))
+        .route("/jobs/{id}", get(hub_job))
+        .route("/jobs/{id}/plan", get(hub_job_plan))
+        .route("/jobs/{id}/status", get(hub_job))
+        .route(
+            "/jobs/{id}/checkpoints",
+            get(hub_job_checkpoints).post(hub_job_checkpoint),
+        )
+        .route(
+            "/jobs/{id}/savepoints",
+            get(hub_job_checkpoints).post(hub_job_savepoint),
+        )
+        .route("/jobs/{id}/desired-state", put(hub_job_desired_state))
+        .route("/jobs/{id}/actions/{action}", post(hub_job_action))
         .route("/nodes/{node_id}/streams/{id}", get(hub_stream))
         .route("/nodes/{node_id}/configuration", get(hub_configuration))
         .route(
@@ -477,6 +492,344 @@ async fn hub_stream(
             "repository_unavailable",
             error.to_string(),
         ),
+    }
+}
+
+async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.jobs().await {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.job(&job_id).await {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_plan(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let Some(job) = (match hub.job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return hub_problem(error),
+    }) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    };
+    let spec: arkflow_core::job::JobSpec = match serde_json::from_str(&job.spec_json) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_persisted_job",
+                error.to_string(),
+            )
+        }
+    };
+    match arkflow_core::job::JobPlan::compile(spec) {
+        Ok(plan) => {
+            Json(serde_json::json!({ "job_id": job.job_id, "version": job.version, "plan": plan }))
+                .into_response()
+        }
+        Err(error) => problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_job_plan",
+            error.to_string(),
+        ),
+    }
+}
+
+async fn hub_job_action(
+    State(hub): State<hub::Hub>,
+    Path((job_id, action)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let state = match action.as_str() {
+        "start" | "restart" => "running",
+        "stop" => "stopped",
+        _ => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_job_action",
+                "action must be start, stop, or restart".into(),
+            )
+        }
+    };
+    let current = match hub.job(&job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "job_not_found",
+                format!("Unknown Job {job_id}"),
+            )
+        }
+        Err(error) => return hub_problem(error),
+    };
+    match hub
+        .update_job(
+            &job_id,
+            Some(state),
+            Some(current.generation.saturating_add(1)),
+        )
+        .await
+    {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_checkpoint(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    hub_job_recovery_artifact(hub, job_id, headers, "checkpoint").await
+}
+
+async fn hub_job_savepoint(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    hub_job_recovery_artifact(hub, job_id, headers, "savepoint").await
+}
+
+async fn hub_job_checkpoints(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    match hub.job_checkpoints(&job_id).await {
+        Ok(records) => Json(records).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_recovery_artifact(
+    hub: hub::Hub,
+    job_id: String,
+    headers: HeaderMap,
+    kind: &str,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(current) = (match hub.job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return hub_problem(error),
+    }) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    };
+    let id = format!(
+        "{kind}-{}-{}",
+        current.generation,
+        hub::now_ms_for_metrics()
+    );
+    let record = crate::storage::JobCheckpointRecord {
+        job_id: job_id.clone(),
+        checkpoint_id: id,
+        kind: kind.into(),
+        status: "pending".into(),
+        manifest_uri: None,
+        format_version: 1,
+        created_at_ms: hub::now_ms_for_metrics(),
+        updated_at_ms: hub::now_ms_for_metrics(),
+    };
+    match hub.record_job_checkpoint(record).await {
+        Ok(Some(job)) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_create_job(
+    State(hub): State<hub::Hub>,
+    headers: HeaderMap,
+    Json(request): Json<CreateJobRequest>,
+) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Configure, "job", None).await
+    {
+        return response;
+    }
+    let spec: arkflow_core::job::JobSpec = match serde_json::from_value(request.spec.clone()) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_job_spec",
+                error.to_string(),
+            )
+        }
+    };
+    if let Err(error) = spec.validate() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_spec",
+            error.to_string(),
+        );
+    }
+    if let Err(error) = arkflow_core::job::JobPlan::compile(spec.clone()) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_plan",
+            error.to_string(),
+        );
+    }
+    if !matches!(request.desired_state.as_str(), "stopped" | "running") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_state",
+            "desired_state must be stopped or running".into(),
+        );
+    }
+    let job = JobRecord {
+        job_id: spec.id.to_string(),
+        version: spec.version.0,
+        spec_json: serde_json::to_string(&request.spec).unwrap_or_else(|_| "{}".into()),
+        desired_state: request.desired_state,
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: request.node_ids,
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: hub::now_ms_for_metrics(),
+    };
+    match hub.upsert_job(job).await {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_desired_state(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<JobDesiredStateRequest>,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    if !matches!(request.state.as_str(), "stopped" | "running") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_state",
+            "state must be stopped or running".into(),
+        );
+    }
+    let current = match hub.job(&job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "job_not_found",
+                format!("Unknown Job {job_id}"),
+            )
+        }
+        Err(error) => return hub_problem(error),
+    };
+    match hub
+        .update_job(
+            &job_id,
+            Some(request.state.as_str()),
+            Some(current.generation.saturating_add(1)),
+        )
+        .await
+    {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        ),
+        Err(error) => hub_problem(error),
     }
 }
 

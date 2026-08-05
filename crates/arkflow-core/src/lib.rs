@@ -28,6 +28,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 pub mod buffer;
+pub mod checkpoint;
 pub mod cli;
 pub mod codec;
 pub mod component;
@@ -37,12 +38,17 @@ pub mod control;
 pub mod control_plane;
 pub mod engine;
 pub mod error_helpers;
+pub mod event_time;
 pub mod input;
+pub mod job;
+pub mod job_runner;
 pub mod output;
 pub mod pipeline;
 pub mod processor;
 pub mod runtime;
+pub mod state;
 pub mod stream;
+pub mod streaming_sql;
 pub mod temporary;
 pub mod wal;
 

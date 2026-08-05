@@ -7,10 +7,19 @@ use crate::hub::{
 use arkflow_core::configuration::redacted_config;
 use arkflow_core::control::OperationState;
 use arkflow_core::control_plane::ControlPlane;
+use arkflow_core::input::InputConfig;
+use arkflow_core::job::{JobComponentAdapter, JobPlan, OperatorSpec, SinkSpec, SourceSpec};
+use arkflow_core::output::OutputConfig;
+use arkflow_core::processor::ProcessorConfig;
+use arkflow_core::temporary::Temporary;
+use arkflow_core::Resource;
 use reqwest::Client;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -24,6 +33,131 @@ pub struct NodeAgentConfig {
     pub heartbeat_interval: Duration,
     pub report_interval: Duration,
     pub poll_interval: Duration,
+}
+
+#[derive(Clone, Default)]
+struct JobRuntime {
+    tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
+}
+
+#[derive(Clone)]
+struct JobTask {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl JobRuntime {
+    async fn generation(&self, job_id: &str) -> Option<u64> {
+        self.tasks
+            .lock()
+            .await
+            .get(job_id)
+            .map(|task| task.generation)
+    }
+
+    async fn start(&self, plan: JobPlan, generation: u64) -> Result<(), String> {
+        let job_id = plan.spec.id.to_string();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner = arkflow_core::job_runner::SingleComputeJobRunner::build(
+            &plan,
+            &RegistryJobAdapter,
+            &resource,
+        )
+        .map_err(|error| error.to_string())?;
+        let cancellation = CancellationToken::new();
+        let mut tasks = self.tasks.lock().await;
+        if let Some(existing) = tasks.get(&job_id) {
+            if existing.generation > generation {
+                return Err("job generation is stale".into());
+            }
+            existing.cancellation.cancel();
+        }
+        tasks.insert(
+            job_id,
+            JobTask {
+                generation,
+                cancellation: cancellation.clone(),
+            },
+        );
+        tokio::spawn(async move {
+            if let Err(error) = runner.run(cancellation).await {
+                tracing::error!(%error, "Job runtime stopped with an error");
+            }
+        });
+        Ok(())
+    }
+
+    async fn stop(&self, job_id: &str, generation: u64) -> Result<(), String> {
+        let mut tasks = self.tasks.lock().await;
+        if let Some(existing) = tasks.get(job_id) {
+            if existing.generation > generation {
+                return Err("job generation is stale".into());
+            }
+        }
+        if let Some(task) = tasks.remove(job_id) {
+            task.cancellation.cancel();
+        }
+        Ok(())
+    }
+}
+
+struct RegistryJobAdapter;
+
+impl JobComponentAdapter for RegistryJobAdapter {
+    fn build_input(
+        &self,
+        source: &SourceSpec,
+        resource: &Resource,
+    ) -> Result<Arc<dyn arkflow_core::input::Input>, arkflow_core::Error> {
+        InputConfig {
+            input_type: source.input_type.clone(),
+            name: None,
+            codec: None,
+            config: Some(source.config.clone()),
+        }
+        .build(resource)
+    }
+
+    fn build_output(
+        &self,
+        sink: &SinkSpec,
+        resource: &Resource,
+    ) -> Result<Arc<dyn arkflow_core::output::Output>, arkflow_core::Error> {
+        OutputConfig {
+            output_type: sink.output_type.clone(),
+            name: None,
+            codec: None,
+            config: Some(sink.config.clone()),
+        }
+        .build(resource)
+    }
+
+    fn build_processor(
+        &self,
+        operator: &OperatorSpec,
+        resource: &Resource,
+    ) -> Result<Arc<dyn arkflow_core::processor::Processor>, arkflow_core::Error> {
+        let processor_type = operator
+            .config
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                arkflow_core::Error::Config(format!(
+                    "operator '{}' requires config.type",
+                    operator.id
+                ))
+            })?;
+        ProcessorConfig {
+            processor_type,
+            name: None,
+            config: Some(operator.config.clone()),
+        }
+        .build(resource)
+    }
 }
 
 impl NodeAgentConfig {
@@ -62,6 +196,7 @@ pub async fn run(
     let client = Client::new();
     let mut backoff = Duration::from_millis(250);
     let mut completed_commands = HashMap::<String, CommandResult>::new();
+    let job_runtime = JobRuntime::default();
     loop {
         if cancellation.is_cancelled() {
             return Ok(());
@@ -77,6 +212,7 @@ pub async fn run(
                     session,
                     cancellation.clone(),
                     &mut completed_commands,
+                    job_runtime.clone(),
                 )
                 .await
                 {
@@ -109,6 +245,9 @@ async fn register(
                 "stream_lifecycle".into(),
                 "configuration".into(),
                 "metrics".into(),
+                "job_runtime".into(),
+                "state_backend".into(),
+                "checkpoint_recovery".into(),
             ],
         })
         .send()
@@ -125,6 +264,7 @@ async fn run_session(
     session: RegisterResponse,
     cancellation: CancellationToken,
     completed_commands: &mut HashMap<String, CommandResult>,
+    job_runtime: JobRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
         node_id: config.node_id.clone(),
@@ -136,10 +276,10 @@ async fn run_session(
     let mut report_seq = 0_u64;
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into()], rollout_id: None }).await; return Ok(()) },
-            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into()], rollout_id: None }).await?; }
+            _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await; return Ok(()) },
+            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq).await).await?; }
-            _ = poll.tick() => { let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish(); let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?; for command in commands { if let Some(result) = replay_cached_command(completed_commands, &command.id) { send_result(client, config, &auth, result).await?; continue; } let result = execute_command(client, cp, config, &auth, &command).await?; remember_completed_command(completed_commands, command.id, result); } }
+            _ = poll.tick() => { let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish(); let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?; for command in commands { if let Some(result) = replay_cached_command(completed_commands, &command.id) { send_result(client, config, &auth, result).await?; continue; } let result = execute_command(client, cp, config, &auth, &command, &job_runtime).await?; remember_completed_command(completed_commands, command.id, result); } }
         }
     }
 }
@@ -192,6 +332,9 @@ async fn report(cp: &ControlPlane, auth: &AgentAuth, boot_id: &str, report_seq: 
             "stream_lifecycle".into(),
             "configuration".into(),
             "metrics".into(),
+            "job_runtime".into(),
+            "state_backend".into(),
+            "checkpoint_recovery".into(),
         ],
         streams,
         operations: cp.operations().await,
@@ -210,6 +353,7 @@ async fn execute_command(
     config: &NodeAgentConfig,
     auth: &AgentAuth,
     command: &AgentCommand,
+    job_runtime: &JobRuntime,
 ) -> Result<CommandResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut result = CommandResult {
         command_id: command.id.clone(),
@@ -229,6 +373,59 @@ async fn execute_command(
         result.state = HubOperationState::TimedOut;
         result.error = Some("Command expired before execution".into());
         result.failure_class = Some("temporary_execution".into());
+        return deliver_result(client, config, auth, result).await;
+    }
+    if command.operation.starts_with("job_") {
+        let latest_generation = job_runtime.generation(&command.resource_id).await;
+        if command_is_stale(command.generation, latest_generation) {
+            result.state = HubOperationState::Superseded;
+            result.error = Some("Job command generation is stale".into());
+            result.observed_generation = latest_generation;
+            result.failure_class = Some("stale_generation".into());
+            return deliver_result(client, config, auth, result).await;
+        }
+        let outcome: Result<(), String> = match command.operation.as_str() {
+            "job_start" => {
+                let payload = command
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("plan"))
+                    .cloned()
+                    .ok_or_else(|| "missing Job plan payload".to_string())?;
+                let plan = serde_json::from_value::<JobPlan>(payload)
+                    .map_err(|error| error.to_string())?;
+                job_runtime.start(plan, command.generation).await
+            }
+            "job_stop" => {
+                job_runtime
+                    .stop(&command.resource_id, command.generation)
+                    .await
+            }
+            "job_restart" => {
+                job_runtime
+                    .stop(&command.resource_id, command.generation)
+                    .await?;
+                let payload = command
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("plan"))
+                    .cloned()
+                    .ok_or_else(|| "missing Job plan payload".to_string())?;
+                let plan = serde_json::from_value::<JobPlan>(payload)
+                    .map_err(|error| error.to_string())?;
+                job_runtime.start(plan, command.generation).await
+            }
+            _ => Err(format!("unknown Job operation {}", command.operation)),
+        };
+        result.state = if outcome.is_ok() {
+            HubOperationState::Succeeded
+        } else {
+            HubOperationState::Failed
+        };
+        result.progress = 100;
+        result.error = outcome.err();
+        result.observed_generation = Some(command.generation);
+        result.failure_class = result.error.as_ref().map(|_| "permanent_execution".into());
         return deliver_result(client, config, auth, result).await;
     }
     let latest_generation = cp

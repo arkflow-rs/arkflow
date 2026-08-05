@@ -243,6 +243,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "subtle",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
