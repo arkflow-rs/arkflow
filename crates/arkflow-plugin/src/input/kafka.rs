@@ -30,7 +30,7 @@ use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 /// Kafka input configuration
@@ -67,6 +67,17 @@ pub struct KafkaInput {
 }
 
 impl KafkaInput {
+    fn validate_checkpoint_offset(offset: u64, low: i64, high: i64) -> Result<i64, Error> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| Error::Config("Kafka checkpoint offset exceeds i64".into()))?;
+        if offset < low || offset > high {
+            return Err(Error::Process(format!(
+                "Kafka checkpoint offset {offset} is outside broker range {low}..={high}"
+            )));
+        }
+        Ok(offset)
+    }
+
     /// Create a new Kafka input component
     pub fn new(
         name: Option<&String>,
@@ -311,6 +322,12 @@ impl Input for KafkaInput {
             .assigned_partition
             .try_read()
             .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Err(Error::Process(
+                "cannot restore Kafka positions before connect".into(),
+            ));
+        };
         let mut assignment = TopicPartitionList::new();
         for topic in &self.config.topics {
             for position in positions.iter().filter(|position| {
@@ -319,14 +336,17 @@ impl Input for KafkaInput {
                     && (position.topic.as_deref().is_none()
                         || position.topic.as_deref() == Some(topic.as_str()))
             }) {
+                let partition = position.partition as i32;
+                let (low, high) = consumer
+                    .fetch_watermarks(topic, partition, Duration::from_secs(10))
+                    .map_err(|error| {
+                        Error::Process(format!(
+                            "fetch Kafka watermarks for {topic}-{partition}: {error}"
+                        ))
+                    })?;
+                let offset = Self::validate_checkpoint_offset(position.offset, low, high)?;
                 assignment
-                    .add_partition_offset(
-                        topic,
-                        position.partition as i32,
-                        Offset::Offset(i64::try_from(position.offset).map_err(|_| {
-                            Error::Config("Kafka checkpoint offset exceeds i64".into())
-                        })?),
-                    )
+                    .add_partition_offset(topic, partition, Offset::Offset(offset))
                     .map_err(|error| {
                         Error::Process(format!("build Kafka restore assignment: {error}"))
                     })?;
@@ -335,12 +355,6 @@ impl Input for KafkaInput {
         if assignment.count() == 0 {
             return Ok(());
         }
-        let consumer_guard = self.consumer.read().await;
-        let Some(consumer) = consumer_guard.as_ref() else {
-            return Err(Error::Process(
-                "cannot restore Kafka positions before connect".into(),
-            ));
-        };
         consumer
             .assign(&assignment)
             .map_err(|error| Error::Process(format!("restore Kafka positions: {error}")))?;
@@ -578,6 +592,21 @@ mod tests {
         ext_meta.insert("topic".to_string(), "test-topic".to_string());
         let result = metadata::with_ext_metadata(batch, &ext_meta);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_checkpoint_offsets_outside_broker_range() {
+        assert!(KafkaInput::validate_checkpoint_offset(9, 10, 20).is_err());
+        assert!(KafkaInput::validate_checkpoint_offset(21, 10, 20).is_err());
+        assert!(KafkaInput::validate_checkpoint_offset(u64::MAX, 0, i64::MAX).is_err());
+        assert_eq!(
+            KafkaInput::validate_checkpoint_offset(10, 10, 20).unwrap(),
+            10
+        );
+        assert_eq!(
+            KafkaInput::validate_checkpoint_offset(20, 10, 20).unwrap(),
+            20
+        );
     }
 
     #[test]

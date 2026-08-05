@@ -130,3 +130,9 @@
 - [x] 17.1 Base Kafka checkpoint positions on acknowledged offsets rather than the fetch cursor.
 - [x] 17.2 Apply event-time lateness decisions independently to every record in a batch.
 - [x] 17.3 Add Kafka acknowledgement and mixed-timestamp batch regression coverage.
+
+## 18. Follow-up review remediation
+
+- [x] 18.1 Validate Kafka recovery offsets against broker low/high watermarks.
+- [x] 18.2 Centralize `object_store` and `bytes` dependency versions in workspace dependencies.
+- [x] 18.3 Add checkpoint offset boundary regression coverage.
