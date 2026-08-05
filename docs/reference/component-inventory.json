@@ -30,6 +30,7 @@
     {"kind": "output", "name": "influxdb", "doc": "components/3-outputs/influxdb"},
     {"kind": "output", "name": "kafka", "doc": "components/3-outputs/kafka"},
     {"kind": "output", "name": "mqtt", "doc": "components/3-outputs/mqtt"},
+    {"kind": "output", "name": "mongodb", "doc": "components/3-outputs/mongodb"},
     {"kind": "output", "name": "nats", "doc": "components/3-outputs/nats"},
     {"kind": "output", "name": "pulsar", "doc": "components/3-outputs/pulsar"},
     {"kind": "output", "name": "redis", "doc": "components/3-outputs/redis"},
