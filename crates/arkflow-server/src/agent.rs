@@ -203,6 +203,25 @@ fn recovery_artifact(
     })
 }
 
+fn validate_recovery_manifest(
+    plan: &JobPlan,
+    checkpoint_id: &str,
+    state_format_version: u32,
+    manifest: &arkflow_core::checkpoint::CheckpointManifest,
+) -> Result<(), String> {
+    if manifest.checkpoint_id != checkpoint_id
+        || manifest.job_id != plan.spec.id
+        || manifest.job_version != plan.spec.version
+        || manifest.format_version != state_format_version
+    {
+        return Err(format!(
+            "recovery artifact '{checkpoint_id}' is incompatible with Job '{}' version {} state format {}",
+            plan.spec.id, plan.spec.version.0, state_format_version
+        ));
+    }
+    Ok(())
+}
+
 fn parse_recovery_payload(payload: &serde_json::Value) -> Result<(Option<String>, bool), String> {
     let Some(recovery) = payload.get("recovery") else {
         return Ok((None, false));
@@ -315,6 +334,7 @@ impl JobRuntime {
             let manifest = repository
                 .read_manifest(&artifact)
                 .map_err(|error| error.to_string())?;
+            validate_recovery_manifest(&plan, &checkpoint_id, state_format_version, &manifest)?;
             let assigned_task_ids = assignments
                 .iter()
                 .map(|assignment| assignment.task_id.as_str())

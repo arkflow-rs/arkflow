@@ -181,3 +181,9 @@
 - [x] 25.2 Dispatch checkpoint commands only to nodes participating in the current Job generation.
 - [x] 25.3 Exclude and purge all expired state entries before enforcing keyed state budgets.
 - [x] 25.4 Apply checkpoint retention to both manual and periodic checkpoint completion paths.
+
+## 26. Follow-up review remediation
+
+- [x] 26.1 Persist Job version with checkpoint records, select only matching recovery artifacts, and verify the manifest before Agent restore.
+- [x] 26.2 Encode every supported Arrow integer key type distinctly and reject unsupported or absent state keys at runtime.
+- [x] 26.3 Reject unsupported stateful Source and Sink declarations during Job validation and add regression coverage.

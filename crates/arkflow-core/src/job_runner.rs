@@ -9,7 +9,8 @@ use crate::processor::Processor;
 use crate::state::{KeyedCounter, StateBackend, StateSnapshot};
 use crate::{Error, MessageBatch, ProcessResult, Resource};
 use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Int16Array, Int32Array, Int64Array, Int8Array,
+    StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field};
@@ -55,52 +56,59 @@ impl StatefulProcessor {
         }
     }
 
-    fn keys_for_batch(&self, batch: &MessageBatch) -> Vec<Vec<u8>> {
-        let row_count = batch.len();
+    fn keys_for_batch(&self, batch: &MessageBatch) -> Result<Vec<Vec<u8>>, Error> {
         let Some(column) = batch.record_batch().column_by_name(&self.key_field) else {
-            return vec![b"__all__".to_vec(); row_count];
+            return Err(Error::Process(format!(
+                "stateful operator key field '{}' is missing from input batch",
+                self.key_field
+            )));
         };
         if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
-            return values
+            return Ok(values
                 .iter()
                 .map(|value| {
                     value
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| b"__null__".to_vec())
+                        .map(|value| [b"binary:".as_slice(), value].concat())
+                        .unwrap_or_else(|| b"null:binary".to_vec())
                 })
-                .collect();
+                .collect());
         }
         if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
-            return values
+            return Ok(values
                 .iter()
                 .map(|value| {
                     value
-                        .map(|value| value.as_bytes().to_vec())
-                        .unwrap_or_else(|| b"__null__".to_vec())
+                        .map(|value| [b"utf8:".as_slice(), value.as_bytes()].concat())
+                        .unwrap_or_else(|| b"null:utf8".to_vec())
                 })
-                .collect();
+                .collect());
         }
-        if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
-            return values
-                .iter()
-                .map(|value| {
-                    value
-                        .map(|value| value.to_be_bytes().to_vec())
-                        .unwrap_or_else(|| b"__null__".to_vec())
-                })
-                .collect();
+        macro_rules! encode_integer_keys {
+            ($array:ty, $tag:literal) => {
+                if let Some(values) = column.as_any().downcast_ref::<$array>() {
+                    return Ok(values
+                        .iter()
+                        .map(|value| match value {
+                            Some(value) => [$tag.as_bytes(), &value.to_be_bytes()].concat(),
+                            None => concat!("null:", $tag).as_bytes().to_vec(),
+                        })
+                        .collect());
+                }
+            };
         }
-        if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
-            return values
-                .iter()
-                .map(|value| {
-                    value
-                        .map(|value| value.to_be_bytes().to_vec())
-                        .unwrap_or_else(|| b"__null__".to_vec())
-                })
-                .collect();
-        }
-        vec![b"__all__".to_vec(); row_count]
+        encode_integer_keys!(Int8Array, "i8");
+        encode_integer_keys!(Int16Array, "i16");
+        encode_integer_keys!(Int32Array, "i32");
+        encode_integer_keys!(Int64Array, "i64");
+        encode_integer_keys!(UInt8Array, "u8");
+        encode_integer_keys!(UInt16Array, "u16");
+        encode_integer_keys!(UInt32Array, "u32");
+        encode_integer_keys!(UInt64Array, "u64");
+        Err(Error::Process(format!(
+            "stateful operator key field '{}' has unsupported Arrow type {:?}",
+            self.key_field,
+            column.data_type()
+        )))
     }
 }
 
@@ -108,7 +116,7 @@ impl StatefulProcessor {
 impl Processor for StatefulProcessor {
     async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
         let counts = self
-            .keys_for_batch(&batch)
+            .keys_for_batch(&batch)?
             .into_iter()
             .map(|key| self.counter.add(&key, 1))
             .collect::<Result<Vec<_>, _>>()?;
@@ -768,7 +776,7 @@ mod tests {
     };
     use crate::temporary::Temporary;
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
@@ -996,6 +1004,54 @@ mod tests {
 
         let entries = backend.scan("job:routing:task:map-0").unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn preserves_distinct_non_64_bit_integer_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let processor = StatefulProcessor::new(
+            Arc::new(TestProcessor),
+            backend.clone(),
+            "integer-keys".into(),
+            "key".into(),
+            None,
+            "count".into(),
+        );
+        let int_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let uint_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                DataType::UInt32,
+                false,
+            )])),
+            vec![Arc::new(UInt32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+
+        for batch in [int_batch, uint_batch] {
+            let ProcessResult::Single(output) = processor
+                .process(Arc::new(MessageBatch::new_arrow(batch)))
+                .await
+                .unwrap()
+            else {
+                panic!("stateful processor should emit one batch");
+            };
+            let counts = output
+                .record_batch()
+                .column_by_name("count")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(counts.values(), &[1, 1]);
+        }
+        assert_eq!(backend.scan("integer-keys").unwrap().len(), 4);
     }
 
     #[tokio::test]

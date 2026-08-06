@@ -246,6 +246,9 @@ pub struct TaskAssignmentRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCheckpointRecord {
     pub job_id: String,
+    /// Job version that produced this artifact. Recovery must never reuse a
+    /// checkpoint from a prior deployment of the same logical Job id.
+    pub job_version: u64,
     pub checkpoint_id: String,
     pub kind: String,
     pub status: String,
@@ -2723,9 +2726,10 @@ impl ControlPlaneStore {
     pub fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO cp_job_checkpoints (job_id, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(job_id, checkpoint_id) DO UPDATE SET status=excluded.status, manifest_uri=excluded.manifest_uri, format_version=excluded.format_version, updated_at_ms=excluded.updated_at_ms",
+                "INSERT INTO cp_job_checkpoints (job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(job_id, checkpoint_id) DO UPDATE SET job_version=excluded.job_version, status=excluded.status, manifest_uri=excluded.manifest_uri, format_version=excluded.format_version, updated_at_ms=excluded.updated_at_ms",
                 rusqlite::params![
                     record.job_id,
+                    record.job_version,
                     record.checkpoint_id,
                     record.kind,
                     record.status,
@@ -2745,18 +2749,19 @@ impl ControlPlaneStore {
     ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT job_id, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms FROM cp_job_checkpoints WHERE job_id = ?1 ORDER BY created_at_ms DESC, checkpoint_id DESC",
+                "SELECT job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms FROM cp_job_checkpoints WHERE job_id = ?1 ORDER BY created_at_ms DESC, checkpoint_id DESC",
             )?;
             let rows = statement.query_map([job_id], |row| {
                 Ok(JobCheckpointRecord {
                     job_id: row.get(0)?,
-                    checkpoint_id: row.get(1)?,
-                    kind: row.get(2)?,
-                    status: row.get(3)?,
-                    manifest_uri: row.get(4)?,
-                    format_version: row.get(5)?,
-                    created_at_ms: row.get(6)?,
-                    updated_at_ms: row.get(7)?,
+                    job_version: row.get(1)?,
+                    checkpoint_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    status: row.get(4)?,
+                    manifest_uri: row.get(5)?,
+                    format_version: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -2826,7 +2831,8 @@ impl ControlPlaneStore {
                 updated_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, generation, task_id)
             );
             CREATE TABLE IF NOT EXISTS cp_job_checkpoints (
-                job_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, kind TEXT NOT NULL,
+                job_id TEXT NOT NULL, job_version INTEGER NOT NULL DEFAULT 0,
+                checkpoint_id TEXT NOT NULL, kind TEXT NOT NULL,
                 status TEXT NOT NULL, manifest_uri TEXT, format_version INTEGER NOT NULL,
                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (job_id, checkpoint_id)
@@ -3092,6 +3098,18 @@ impl ControlPlaneStore {
             .collect::<Result<Vec<_>, _>>()?;
         if !event_columns.iter().any(|name| name == "actor") {
             connection.execute("ALTER TABLE cp_events ADD COLUMN actor TEXT", [])?;
+        }
+        let checkpoint_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_job_checkpoints)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !checkpoint_columns.iter().any(|name| name == "job_version") {
+            // Existing checkpoints have no durable producer version. Mark them
+            // incompatible (0) so they are never auto-selected for recovery.
+            connection.execute(
+                "ALTER TABLE cp_job_checkpoints ADD COLUMN job_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",

@@ -418,6 +418,7 @@ impl Hub {
             .await?
             .into_iter()
             .filter(|record| record.status == "completed")
+            .filter(|record| recovery_record_is_compatible(&spec, record))
             .filter(|record| match spec.recovery {
                 arkflow_core::job::RecoveryPolicy::LatestCheckpoint => record.kind == "checkpoint",
                 arkflow_core::job::RecoveryPolicy::LatestSavepoint => record.kind == "savepoint",
@@ -821,6 +822,10 @@ impl Hub {
         } else {
             let record = JobCheckpointRecord {
                 job_id: job_id.into(),
+                // A completion without a previously persisted request is not
+                // safe to use for recovery because its producer version is
+                // unknown.
+                job_version: 0,
                 checkpoint_id: checkpoint_id.into(),
                 kind: kind.into(),
                 status: status.into(),
@@ -891,6 +896,7 @@ impl Hub {
             let checkpoint_id = format!("checkpoint-{}-{}-{}", job.job_id, job.generation, now);
             let record = JobCheckpointRecord {
                 job_id: job.job_id.clone(),
+                job_version: spec.version.0,
                 checkpoint_id,
                 kind: "checkpoint".into(),
                 status: "pending".into(),
@@ -3184,6 +3190,19 @@ fn now_ms() -> u64 {
 pub fn now_ms_for_metrics() -> u64 {
     now_ms()
 }
+
+fn recovery_record_is_compatible(
+    spec: &arkflow_core::job::JobSpec,
+    record: &JobCheckpointRecord,
+) -> bool {
+    record.job_version == spec.version.0
+        && record.format_version
+            == spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1)
+}
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -3191,6 +3210,37 @@ static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 mod tests {
     use super::*;
     use arkflow_core::control::{ConvergenceState, StreamMetricsSnapshot, StreamState};
+
+    #[test]
+    fn recovery_selection_requires_matching_job_and_state_versions() {
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 2,
+            "operators": [],
+            "sources": [],
+            "sinks": [],
+            "state": {"backend": "embedded_kv", "format_version": 3}
+        }))
+        .unwrap();
+        let compatible = JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 2,
+            checkpoint_id: "checkpoint-current".into(),
+            kind: "checkpoint".into(),
+            status: "completed".into(),
+            manifest_uri: None,
+            format_version: 3,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+        assert!(recovery_record_is_compatible(&spec, &compatible));
+        let mut old_version = compatible.clone();
+        old_version.job_version = 1;
+        assert!(!recovery_record_is_compatible(&spec, &old_version));
+        let mut old_format = compatible;
+        old_format.format_version = 2;
+        assert!(!recovery_record_is_compatible(&spec, &old_format));
+    }
 
     fn config() -> HubConfig {
         HubConfig {
@@ -4486,6 +4536,7 @@ mod tests {
 
         hub.record_job_checkpoint(JobCheckpointRecord {
             job_id: "orders".into(),
+            job_version: 1,
             checkpoint_id: "checkpoint-7".into(),
             kind: "checkpoint".into(),
             status: "pending".into(),

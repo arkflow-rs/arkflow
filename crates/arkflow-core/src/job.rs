@@ -299,6 +299,19 @@ impl JobSpec {
                     operator.id
                 )));
             }
+            if operator.stateful
+                && matches!(operator.kind, OperatorKind::Source | OperatorKind::Sink)
+            {
+                return Err(Error::Config(format!(
+                    "stateful {} operator '{}' is not supported",
+                    match operator.kind {
+                        OperatorKind::Source => "Source",
+                        OperatorKind::Sink => "Sink",
+                        _ => unreachable!("matched Source or Sink above"),
+                    },
+                    operator.id
+                )));
+            }
         }
 
         for edge in &self.edges {
@@ -920,6 +933,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("key_field"));
+    }
+
+    #[test]
+    fn rejects_stateful_sources_and_sinks() {
+        let mut source = base_job();
+        source.operators[0].stateful = true;
+        source.operators[0].key_field = Some("customer_id".into());
+        assert!(source
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("stateful Source"));
+
+        let mut sink = base_job();
+        sink.operators[2].stateful = true;
+        sink.operators[2].key_field = Some("customer_id".into());
+        assert!(sink
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("stateful Sink"));
     }
 
     #[test]

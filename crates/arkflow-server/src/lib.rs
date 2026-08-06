@@ -699,11 +699,15 @@ async fn hub_job_recovery_artifact(
     );
     let record = crate::storage::JobCheckpointRecord {
         job_id: job_id.clone(),
+        job_version: current.version,
         checkpoint_id: id,
         kind: kind.into(),
         status: "pending".into(),
         manifest_uri: None,
-        format_version: 1,
+        format_version: serde_json::from_str::<arkflow_core::job::JobSpec>(&current.spec_json)
+            .ok()
+            .and_then(|spec| spec.state.map(|state| state.format_version))
+            .unwrap_or(1),
         created_at_ms: hub::now_ms_for_metrics(),
         updated_at_ms: hub::now_ms_for_metrics(),
     };
