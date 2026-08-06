@@ -243,12 +243,6 @@ impl Input for KafkaInput {
                 record_batch = metadata::with_partition(record_batch, partition as u32)?;
 
                 let offset = kafka_message.offset();
-                {
-                    let mut acknowledged = self.acknowledged_offsets.write().await;
-                    acknowledged
-                        .entry((kafka_message.topic().to_owned(), partition))
-                        .or_insert(offset);
-                }
                 record_batch = metadata::with_offset(record_batch, offset as u64)?;
 
                 // Add key if present
@@ -526,6 +520,7 @@ mod tests {
         };
 
         let input = KafkaInput::new(None, config, None).unwrap();
+        assert!(input.current_positions().await.unwrap().is_empty());
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             acknowledged_offsets: input.acknowledged_offsets.clone(),

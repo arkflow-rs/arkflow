@@ -26,7 +26,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use reqwest::Client;
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,7 +222,7 @@ impl JobRuntime {
         generation: u64,
         recovery_id: Option<String>,
         recovery_savepoint: bool,
-        node_id: &str,
+        _node_id: &str,
     ) -> Result<(), String> {
         let _start_guard = self.starts.lock().await;
         let job_id = plan.spec.id.to_string();
@@ -256,7 +256,13 @@ impl JobRuntime {
             temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
             input_names: RefCell::new(Vec::new()),
         };
-        let state_root = std::env::temp_dir().join("arkflow-job-state").join(&job_id);
+        let state_root = std::env::temp_dir()
+            .join("arkflow-job-state")
+            .join(&job_id)
+            .join(format!(
+                "version-{}-generation-{}",
+                plan.spec.version.0, generation
+            ));
         let state_format_version = plan
             .spec
             .state
@@ -283,17 +289,14 @@ impl JobRuntime {
             let manifest = repository
                 .read_manifest(&artifact)
                 .map_err(|error| error.to_string())?;
+            let assigned_task_ids = assignments
+                .iter()
+                .map(|assignment| assignment.task_id.as_str())
+                .collect::<BTreeSet<_>>();
             let mut snapshots = manifest
                 .state_snapshots
                 .iter()
-                .filter(|snapshot_ref| {
-                    snapshot_ref.node_id.as_deref() == Some(node_id)
-                        || (snapshot_ref.node_id.is_none()
-                            && manifest
-                                .task_attempts
-                                .iter()
-                                .all(|attempt| attempt.node_id == node_id))
-                })
+                .filter(|snapshot_ref| assigned_task_ids.contains(snapshot_ref.task_id.as_str()))
                 .map(|snapshot_ref| {
                     repository
                         .read_state_snapshot(snapshot_ref)

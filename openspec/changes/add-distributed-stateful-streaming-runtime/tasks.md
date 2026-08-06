@@ -160,3 +160,10 @@
 - [x] 22.1 Validate checkpoint task coverage and every referenced state snapshot before publishing a completed artifact.
 - [x] 22.2 Refresh idle event-time partitions continuously and separate late-event update/route dispatch paths.
 - [x] 22.3 Include checkpoint identity in Hub operation deduplication and add regression coverage.
+
+## 23. Follow-up review remediation
+
+- [x] 23.1 Restore state snapshots by current task assignment IDs across node reassignment.
+- [x] 23.2 Advance Kafka checkpoint positions only after successful acknowledgements.
+- [x] 23.3 Apply configured state TTL to keyed counter updates and isolate local state by Job version/generation.
+- [x] 23.4 Add recovery, Kafka acknowledgement, TTL, and state-isolation regression coverage.

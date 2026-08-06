@@ -61,6 +61,16 @@ pub trait StateBackend: Send + Sync {
         now_ms: u64,
     ) -> Result<(), Error>;
     fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error>;
+    fn update_i64_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        delta: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, Error> {
+        let _ = ttl_ms;
+        self.update_i64(namespace, key, delta)
+    }
     fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error>;
     fn purge_expired(&self, now_ms: u64) -> Result<u64, Error>;
     fn scan(&self, namespace: &str) -> Result<Vec<StateEntry>, Error>;
@@ -76,6 +86,7 @@ pub trait StateBackend: Send + Sync {
 pub struct KeyedCounter {
     backend: std::sync::Arc<dyn StateBackend>,
     namespace: String,
+    ttl_ms: Option<u64>,
 }
 
 impl KeyedCounter {
@@ -83,11 +94,25 @@ impl KeyedCounter {
         Self {
             backend,
             namespace: namespace.into(),
+            ttl_ms: None,
+        }
+    }
+
+    pub fn with_ttl(
+        backend: std::sync::Arc<dyn StateBackend>,
+        namespace: impl Into<String>,
+        ttl_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            backend,
+            namespace: namespace.into(),
+            ttl_ms,
         }
     }
 
     pub fn add(&self, key: &[u8], delta: i64) -> Result<i64, Error> {
-        self.backend.update_i64(&self.namespace, key, delta)
+        self.backend
+            .update_i64_with_ttl(&self.namespace, key, delta, self.ttl_ms)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<i64>, Error> {
@@ -261,7 +286,18 @@ impl StateBackend for RedbStateBackend {
     }
 
     fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+        self.update_i64_with_ttl(namespace, key, delta, None)
+    }
+
+    fn update_i64_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        delta: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, Error> {
         let storage_key = Self::storage_key(namespace, key);
+        let current_time_ms = now_ms();
         let tx = self
             .db
             .begin_write()
@@ -280,7 +316,7 @@ impl StateBackend for RedbStateBackend {
                 .filter(|value| {
                     !value
                         .expires_at_ms
-                        .is_some_and(|expires| expires <= now_ms())
+                        .is_some_and(|expires| expires <= current_time_ms)
                 })
                 .map(|value| serde_json::from_slice::<i64>(&value.value))
                 .transpose()?
@@ -300,7 +336,10 @@ impl StateBackend for RedbStateBackend {
                     )));
                 }
             }
-            let encoded = encode_value(&next_value, None)?;
+            let encoded = encode_value(
+                &next_value,
+                ttl_ms.map(|ttl| current_time_ms.saturating_add(ttl)),
+            )?;
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state put: {error}")))?;
@@ -667,6 +706,20 @@ mod tests {
             .unwrap();
         let counter = KeyedCounter::new(backend, "aggregate");
         assert_eq!(counter.add(b"expired", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn keyed_counter_applies_configured_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: std::sync::Arc<dyn StateBackend> =
+            std::sync::Arc::new(RedbStateBackend::open(dir.path(), 1).unwrap());
+        let counter = KeyedCounter::with_ttl(backend.clone(), "aggregate", Some(0));
+        assert_eq!(counter.add(b"expired", 1).unwrap(), 1);
+        assert!(backend
+            .snapshot_at(now_ms().saturating_add(1))
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]

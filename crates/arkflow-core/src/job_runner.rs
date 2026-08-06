@@ -44,11 +44,12 @@ impl StatefulProcessor {
         backend: Arc<dyn StateBackend>,
         namespace: String,
         key_field: String,
+        ttl_ms: Option<u64>,
         state_field: String,
     ) -> Self {
         Self {
             inner,
-            counter: KeyedCounter::new(backend, namespace),
+            counter: KeyedCounter::with_ttl(backend, namespace, ttl_ms),
             key_field,
             state_field,
         }
@@ -290,6 +291,7 @@ impl SingleComputeJobRunner {
                                 operator.id
                             ))
                         })?,
+                        plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
                         operator
                             .config
                             .get("state_output_field")
