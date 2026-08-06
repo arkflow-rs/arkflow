@@ -400,31 +400,27 @@ impl JobSpec {
             }
         }
 
-        // A source and sink declaration is only executable when the DAG has a
-        // path between them.  Accepting disconnected declarations would make
-        // the runner acknowledge source batches that can never reach a sink.
-        let source_ids = self
-            .sources
-            .iter()
-            .map(|source| source.operator_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let mut reachable = source_ids.clone();
-        let mut pending = source_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::VecDeque<_>>();
-        while let Some(operator_id) = pending.pop_front() {
-            for downstream in outgoing.get(operator_id).into_iter().flatten() {
-                if reachable.insert(downstream.as_str()) {
-                    pending.push_back(downstream.as_str());
+        // Every declared source must have a path to a sink. Otherwise the
+        // runner can acknowledge input from an executable source without ever
+        // dispatching the batch to an output.
+        for source in &self.sources {
+            let mut reachable = BTreeSet::from([source.operator_id.as_str()]);
+            let mut pending = std::collections::VecDeque::from([source.operator_id.as_str()]);
+            while let Some(operator_id) = pending.pop_front() {
+                for downstream in outgoing.get(operator_id).into_iter().flatten() {
+                    if reachable.insert(downstream.as_str()) {
+                        pending.push_back(downstream.as_str());
+                    }
                 }
             }
-        }
-        for sink in &self.sinks {
-            if !reachable.contains(sink.operator_id.as_str()) {
+            if !self
+                .sinks
+                .iter()
+                .any(|sink| reachable.contains(sink.operator_id.as_str()))
+            {
                 return Err(Error::Config(format!(
-                    "sink '{}' is not reachable from any executable source",
-                    sink.operator_id
+                    "source '{}' cannot reach any executable sink",
+                    source.operator_id
                 )));
             }
         }
@@ -954,6 +950,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("stateful Sink"));
+    }
+
+    #[test]
+    fn rejects_sources_that_cannot_reach_a_sink() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "orphan-source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sources.push(SourceSpec {
+            operator_id: "orphan-source".into(),
+            input_type: "memory".into(),
+            config: serde_json::json!({}),
+            time: job.sources[0].time.clone(),
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("orphan-source"));
     }
 
     #[test]

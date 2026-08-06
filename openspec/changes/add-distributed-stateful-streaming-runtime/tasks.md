@@ -187,3 +187,9 @@
 - [x] 26.1 Persist Job version with checkpoint records, select only matching recovery artifacts, and verify the manifest before Agent restore.
 - [x] 26.2 Encode every supported Arrow integer key type distinctly and reject unsupported or absent state keys at runtime.
 - [x] 26.3 Reject unsupported stateful Source and Sink declarations during Job validation and add regression coverage.
+
+## 27. Follow-up review remediation
+
+- [x] 27.1 Persist the configured state format on periodic checkpoint records.
+- [x] 27.2 Require every executable source to reach at least one executable sink.
+- [x] 27.3 Remove per-Agent intermediate checkpoint manifests during artifact cleanup.

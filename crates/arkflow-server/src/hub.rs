@@ -901,7 +901,7 @@ impl Hub {
                 kind: "checkpoint".into(),
                 status: "pending".into(),
                 manifest_uri: None,
-                format_version: 1,
+                format_version: job_state_format_version(&spec),
                 created_at_ms: now,
                 updated_at_ms: now,
             };
@@ -3195,13 +3195,14 @@ fn recovery_record_is_compatible(
     spec: &arkflow_core::job::JobSpec,
     record: &JobCheckpointRecord,
 ) -> bool {
-    record.job_version == spec.version.0
-        && record.format_version
-            == spec
-                .state
-                .as_ref()
-                .map(|state| state.format_version)
-                .unwrap_or(1)
+    record.job_version == spec.version.0 && record.format_version == job_state_format_version(spec)
+}
+
+fn job_state_format_version(spec: &arkflow_core::job::JobSpec) -> u32 {
+    spec.state
+        .as_ref()
+        .map(|state| state.format_version)
+        .unwrap_or(1)
 }
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3222,6 +3223,7 @@ mod tests {
             "state": {"backend": "embedded_kv", "format_version": 3}
         }))
         .unwrap();
+        assert_eq!(job_state_format_version(&spec), 3);
         let compatible = JobCheckpointRecord {
             job_id: "orders".into(),
             job_version: 2,

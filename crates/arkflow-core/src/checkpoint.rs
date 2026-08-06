@@ -308,6 +308,21 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
     pub fn delete(&self, artifact: &RecoveryArtifact) -> Result<(), Error> {
         if let Some(bytes) = self.store.get(&artifact.manifest_key)? {
             let manifest: CheckpointManifest = serde_json::from_slice(&bytes)?;
+            let prefix = match artifact.kind {
+                RecoveryArtifactKind::Checkpoint => "checkpoints",
+                RecoveryArtifactKind::Savepoint => "savepoints",
+            };
+            let intermediate_manifest_keys = manifest
+                .task_attempts
+                .iter()
+                .map(|attempt| {
+                    format!(
+                        "{prefix}/{}/manifests/{}.json",
+                        manifest.checkpoint_id,
+                        attempt.node_id.replace('/', "_")
+                    )
+                })
+                .collect::<BTreeSet<_>>();
             let other_kind = match artifact.kind {
                 RecoveryArtifactKind::Checkpoint => RecoveryArtifactKind::Savepoint,
                 RecoveryArtifactKind::Savepoint => RecoveryArtifactKind::Checkpoint,
@@ -321,6 +336,9 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
                 for key in snapshot_keys {
                     self.store.delete(&key)?;
                 }
+            }
+            for key in intermediate_manifest_keys {
+                self.store.delete(&key)?;
             }
         }
         self.store.delete(&artifact.manifest_key)
@@ -712,7 +730,8 @@ mod tests {
     #[test]
     fn persists_savepoints_and_selects_latest_valid_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+        let store = FileCheckpointStore::new(dir.path()).unwrap();
+        let repository = CheckpointRepository::new(store.clone());
         let state_ref = repository.write_state_snapshot("cp-1", &state()).unwrap();
         let mut manifest = CheckpointManifest {
             checkpoint_id: "cp-1".into(),
@@ -745,6 +764,9 @@ mod tests {
         manifest.checksum = manifest_checksum(&manifest);
         let checkpoint = repository.write_checkpoint(&manifest).unwrap();
         let savepoint = repository.create_savepoint(&manifest).unwrap();
+        store
+            .put("savepoints/cp-1/manifests/node-a.json", b"intermediate")
+            .unwrap();
         assert_eq!(repository.read_manifest(&checkpoint).unwrap(), manifest);
         assert_eq!(
             RecoveryPlan::from_manifest(&manifest)
@@ -760,10 +782,21 @@ mod tests {
         assert_eq!(catalog.retain_checkpoints(0).len(), 1);
         repository.delete(&savepoint).unwrap();
         assert!(repository.read_manifest(&checkpoint).is_ok());
+        assert!(store
+            .get("savepoints/cp-1/manifests/node-a.json")
+            .unwrap()
+            .is_none());
+        store
+            .put("checkpoints/cp-1/manifests/node-a.json", b"intermediate")
+            .unwrap();
         repository.delete(&checkpoint).unwrap();
         assert!(repository
             .read_state_snapshot(&manifest.state_snapshots[0])
             .is_err());
+        assert!(store
+            .get("checkpoints/cp-1/manifests/node-a.json")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
