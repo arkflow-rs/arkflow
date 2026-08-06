@@ -51,7 +51,10 @@ pub struct CheckpointManifest {
     pub generation: u64,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
     pub source_positions: Vec<SourcePosition>,
-    pub watermarks_ms: BTreeMap<u32, i64>,
+    /// Watermarks keyed by stable source task identity. Partition numbers are
+    /// only unique within one source operator and cannot identify a Job-wide
+    /// watermark when multiple sources are present.
+    pub watermarks_ms: BTreeMap<String, i64>,
     pub in_flight_barrier: CheckpointBarrier,
     pub state_snapshots: Vec<StateSnapshotRef>,
     pub format_version: u32,
@@ -385,7 +388,7 @@ impl CheckpointCatalog {
 pub struct RecoveryPlan {
     pub checkpoint_id: String,
     pub source_positions: Vec<SourcePosition>,
-    pub watermarks_ms: BTreeMap<u32, i64>,
+    pub watermarks_ms: BTreeMap<String, i64>,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
 }
 
@@ -526,7 +529,7 @@ impl CheckpointCoordinator {
         for ack in self.acknowledgements.values() {
             source_positions.extend(ack.source_positions.clone());
             if let Some(watermark) = ack.watermark_ms {
-                watermarks_ms.insert(ack.partition, watermark);
+                watermarks_ms.insert(ack.task_id.clone(), watermark);
             }
         }
         let mut manifest = CheckpointManifest {
@@ -652,6 +655,8 @@ mod tests {
             .unwrap();
         assert!(manifest.verify());
         assert_eq!(manifest.watermarks_ms.len(), 2);
+        assert_eq!(manifest.watermarks_ms.get("task-0"), Some(&100));
+        assert_eq!(manifest.watermarks_ms.get("task-1"), Some(&100));
         assert_eq!(coordinator.status(), CheckpointStatus::Completed);
     }
 

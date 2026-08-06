@@ -174,3 +174,10 @@
 - [x] 24.2 Capture and restore task-scoped event-time watermarks across checkpoint recovery.
 - [x] 24.3 Enforce periodic checkpoint retention and remove durable checkpoint records and artifacts.
 - [x] 24.4 Delete referenced state snapshot objects when removing checkpoint manifests.
+
+## 25. Follow-up review remediation
+
+- [x] 25.1 Key checkpoint watermarks by stable source task identity across multiple sources.
+- [x] 25.2 Dispatch checkpoint commands only to nodes participating in the current Job generation.
+- [x] 25.3 Exclude and purge all expired state entries before enforcing keyed state budgets.
+- [x] 25.4 Apply checkpoint retention to both manual and periodic checkpoint completion paths.

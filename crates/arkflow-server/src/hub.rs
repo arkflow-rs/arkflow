@@ -673,6 +673,8 @@ impl Hub {
                     .push(record.clone());
                 self.dispatch_job_artifact(job, &record_for_dispatch)
                     .await?;
+                self.enforce_checkpoint_retention_for_job(&record.job_id)
+                    .await?;
             }
             return Ok(job);
         }
@@ -698,6 +700,8 @@ impl Hub {
             .push(record);
         self.dispatch_job_artifact(&result, &record_for_dispatch)
             .await?;
+        self.enforce_checkpoint_retention_for_job(&record_for_dispatch.job_id)
+            .await?;
         Ok(Some(result))
     }
 
@@ -711,12 +715,26 @@ impl Hub {
         let plan = arkflow_core::job::JobPlan::compile(spec.clone())
             .map_err(|error| HubError::Invalid(error.to_string()))?;
         let candidates = if job.node_ids.is_empty() {
-            self.nodes
+            self.operations
                 .read()
                 .await
-                .iter()
-                .filter(|(_, node)| node.resource.state == NodeConnectionState::Online)
-                .map(|(node_id, _)| node_id.clone())
+                .values()
+                .filter(|operation| {
+                    operation.resource_id == job.job_id
+                        && operation.operation == "job_start"
+                        && operation.generation == job.generation
+                        && matches!(
+                            operation.state,
+                            HubOperationState::Queued
+                                | HubOperationState::Dispatched
+                                | HubOperationState::Acknowledged
+                                | HubOperationState::Running
+                                | HubOperationState::Succeeded
+                        )
+                })
+                .map(|operation| operation.node_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>()
         } else {
             job.node_ids.clone()
@@ -819,6 +837,8 @@ impl Hub {
             }
             records.entry(job_id.into()).or_default().push(record);
         }
+        drop(records);
+        self.enforce_checkpoint_retention_for_job(job_id).await?;
         Ok(())
     }
 
@@ -880,7 +900,6 @@ impl Hub {
                 updated_at_ms: now,
             };
             self.record_job_checkpoint(record).await?;
-            self.enforce_checkpoint_retention(&job, &spec).await?;
             scheduled += 1;
         }
         Ok(scheduled)
@@ -940,6 +959,15 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    async fn enforce_checkpoint_retention_for_job(&self, job_id: &str) -> Result<(), HubError> {
+        let Some(job) = self.job(job_id).await? else {
+            return Ok(());
+        };
+        let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json)
+            .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
+        self.enforce_checkpoint_retention(&job, &spec).await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {

@@ -302,10 +302,33 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        let (previous_bytes, next, next_bytes) = {
+        let (_, next, _) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            let mut expired_keys = Vec::new();
+            let mut live_bytes = 0_u64;
+            for item in table
+                .iter()
+                .map_err(|error| Error::Process(format!("state scan: {error}")))?
+            {
+                let (stored_key, value) =
+                    item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
+                let decoded = decode_value(value.value())?;
+                if decoded
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= current_time_ms)
+                {
+                    expired_keys.push(stored_key.value().to_owned());
+                } else if stored_key.value() != storage_key {
+                    live_bytes = live_bytes.saturating_add(decoded.value.len() as u64);
+                }
+            }
+            for expired_key in expired_keys {
+                table
+                    .remove(expired_key.as_str())
+                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
+            }
             let previous = table
                 .get(storage_key.as_str())
                 .map_err(|error| Error::Process(format!("state get: {error}")))?
@@ -324,12 +347,7 @@ impl StateBackend for RedbStateBackend {
             let next = current.saturating_add(delta);
             let next_value = serde_json::to_vec(&next)?;
             if let Some(max_bytes) = self.max_bytes {
-                let accounted_previous = previous_bytes.unwrap_or_default();
-                let next_total = self
-                    .bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(accounted_previous)
-                    .saturating_add(next_value.len() as u64);
+                let next_total = live_bytes.saturating_add(next_value.len() as u64);
                 if next_total > max_bytes {
                     return Err(Error::Process(format!(
                         "state budget exceeded: {next_total} > {max_bytes} bytes"
@@ -347,12 +365,9 @@ impl StateBackend for RedbStateBackend {
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        if let Some(previous) = previous_bytes {
-            self.bytes.fetch_sub(previous, Ordering::Relaxed);
-        } else {
-            self.keys.fetch_add(1, Ordering::Relaxed);
-        }
-        self.bytes.fetch_add(next_bytes, Ordering::Relaxed);
+        let metrics = self.metrics()?;
+        self.keys.store(metrics.keys, Ordering::Relaxed);
+        self.bytes.store(metrics.bytes, Ordering::Relaxed);
         Ok(next)
     }
 
@@ -699,13 +714,16 @@ mod tests {
         let backend: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(
             RedbStateBackend::open(dir.path(), 1)
                 .unwrap()
-                .with_max_bytes(1),
+                .with_max_bytes(2),
         );
         backend
             .put_with_ttl("aggregate", b"expired", b"x", Some(1), 0)
             .unwrap();
+        backend
+            .put_with_ttl("aggregate", b"expired-2", b"x", Some(1), 0)
+            .unwrap();
         let counter = KeyedCounter::new(backend, "aggregate");
-        assert_eq!(counter.add(b"expired", 1).unwrap(), 1);
+        assert_eq!(counter.add(b"live", 1).unwrap(), 1);
     }
 
     #[test]
