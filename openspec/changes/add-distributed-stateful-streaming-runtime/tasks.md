@@ -193,3 +193,9 @@
 - [x] 27.1 Persist the configured state format on periodic checkpoint records.
 - [x] 27.2 Require every executable source to reach at least one executable sink.
 - [x] 27.3 Remove per-Agent intermediate checkpoint manifests during artifact cleanup.
+
+## 28. Follow-up review remediation
+
+- [x] 28.1 Stop Job runtimes on nodes that lose their current-generation task assignments.
+- [x] 28.2 Deduplicate same-generation successful Job starts during reconciliation and Agent registration.
+- [x] 28.3 Reload persisted checkpoint metadata before completing an in-flight checkpoint after Hub restart.

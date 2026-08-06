@@ -412,6 +412,86 @@ impl Hub {
                 })
                 .collect::<Vec<_>>()
         };
+        let previous_nodes = self
+            .operations
+            .read()
+            .await
+            .values()
+            .filter(|operation_record| {
+                operation_record.resource_id == job.job_id
+                    && operation_record.operation == "job_start"
+                    && operation_record.generation == job.generation
+                    && !matches!(
+                        operation_record.state,
+                        HubOperationState::Failed
+                            | HubOperationState::TimedOut
+                            | HubOperationState::NodeUnavailable
+                            | HubOperationState::Cancelled
+                            | HubOperationState::Superseded
+                    )
+            })
+            .map(|operation_record| operation_record.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut previous_nodes_all_online = !previous_nodes.is_empty();
+        for node_id in &previous_nodes {
+            let online = self.nodes.read().await.get(node_id).is_some_and(|node| {
+                node.resource.state == NodeConnectionState::Online
+                    && node.resource.lease_expires_at_ms > now_ms()
+                    && node.resource.maintenance_state == NodeMaintenanceState::Active
+            });
+            if !online {
+                previous_nodes_all_online = false;
+                break;
+            }
+        }
+        let targets =
+            if operation == "job_start" && job.node_ids.is_empty() && previous_nodes_all_online {
+                previous_nodes.iter().cloned().collect::<Vec<_>>()
+            } else if operation == "job_stop" {
+                let target_ids = if previous_nodes.is_empty() {
+                    targets.iter().cloned().collect::<BTreeSet<_>>()
+                } else {
+                    previous_nodes.clone()
+                };
+                targets
+                    .into_iter()
+                    .filter(|node_id| target_ids.contains(node_id))
+                    .collect::<Vec<_>>()
+            } else {
+                targets
+            };
+        let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
+        let placement_changed = operation == "job_start" && target_ids != previous_nodes;
+        if operation == "job_start" {
+            let nodes_to_stop = if placement_changed {
+                previous_nodes.iter().collect::<Vec<_>>()
+            } else {
+                previous_nodes.difference(&target_ids).collect::<Vec<_>>()
+            };
+            for node_id in nodes_to_stop {
+                let is_online = self.nodes.read().await.get(node_id).is_some_and(|node| {
+                    node.resource.state == NodeConnectionState::Online
+                        && node.resource.lease_expires_at_ms > now_ms()
+                        && node.resource.maintenance_state == NodeMaintenanceState::Active
+                });
+                if is_online {
+                    self.enqueue_with_metadata(
+                        node_id.clone(),
+                        "job_stop".into(),
+                        job.job_id.clone(),
+                        None,
+                        Some(serde_json::json!({"job_id": job.job_id})),
+                        job.generation,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+        }
         let assignments = plan.assignments_for_nodes(&targets, job.generation);
         let recovery = self
             .job_checkpoints(&job.job_id)
@@ -433,12 +513,29 @@ impl Hub {
             });
         let mut dispatched = 0;
         for node_id in targets {
+            if operation == "job_start"
+                && !placement_changed
+                && self
+                    .operations
+                    .read()
+                    .await
+                    .values()
+                    .any(|operation_record| {
+                        operation_record.node_id == node_id
+                            && operation_record.resource_id == job.job_id
+                            && operation_record.operation == "job_start"
+                            && operation_record.generation == job.generation
+                            && operation_record.state == HubOperationState::Succeeded
+                    })
+            {
+                continue;
+            }
             let node_assignments = assignments
                 .iter()
                 .filter(|assignment| assignment.node_id == node_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            if node_assignments.is_empty() {
+            if operation == "job_start" && node_assignments.is_empty() {
                 continue;
             }
             let payload = Some(serde_json::json!({
@@ -803,45 +900,66 @@ impl Hub {
         } else {
             "checkpoint"
         };
-        let mut records = self.job_checkpoints.write().await;
-        if let Some(record) = records
-            .entry(job_id.to_owned())
-            .or_default()
-            .iter_mut()
-            .find(|record| record.checkpoint_id == checkpoint_id)
-        {
-            record.status = status.into();
-            record.manifest_uri = manifest_uri.clone();
-            record.updated_at_ms = now_ms();
+        let mut record = self
+            .job_checkpoints
+            .read()
+            .await
+            .get(job_id)
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|record| record.checkpoint_id == checkpoint_id)
+                    .cloned()
+            });
+        if record.is_none() {
             if let Some(storage) = &self.storage {
-                storage
-                    .upsert_job_checkpoint(record.clone())
+                record = storage
+                    .list_job_checkpoints(job_id)
                     .await
-                    .map_err(HubError::from)?;
+                    .map_err(HubError::from)?
+                    .into_iter()
+                    .find(|record| record.checkpoint_id == checkpoint_id);
             }
+        }
+        let record = if let Some(mut record) = record {
+            record.status = status.into();
+            record.manifest_uri = manifest_uri;
+            record.updated_at_ms = now_ms();
+            record
         } else {
-            let record = JobCheckpointRecord {
+            let job = self.job(job_id).await?;
+            let (job_version, format_version) = job
+                .as_ref()
+                .and_then(|job| {
+                    serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
+                        .ok()
+                        .map(|spec| (spec.version.0, job_state_format_version(&spec)))
+                })
+                .unwrap_or((0, 1));
+            JobCheckpointRecord {
                 job_id: job_id.into(),
-                // A completion without a previously persisted request is not
-                // safe to use for recovery because its producer version is
-                // unknown.
-                job_version: 0,
+                job_version,
                 checkpoint_id: checkpoint_id.into(),
                 kind: kind.into(),
                 status: status.into(),
                 manifest_uri,
-                format_version: 1,
+                format_version,
                 created_at_ms: now_ms(),
                 updated_at_ms: now_ms(),
-            };
-            if let Some(storage) = &self.storage {
-                storage
-                    .upsert_job_checkpoint(record.clone())
-                    .await
-                    .map_err(HubError::from)?;
             }
-            records.entry(job_id.into()).or_default().push(record);
+        };
+        if let Some(storage) = &self.storage {
+            storage
+                .upsert_job_checkpoint(record.clone())
+                .await
+                .map_err(HubError::from)?;
         }
+        let mut records = self.job_checkpoints.write().await;
+        records
+            .entry(job_id.into())
+            .or_default()
+            .retain(|existing| existing.checkpoint_id != checkpoint_id);
+        records.entry(job_id.into()).or_default().push(record);
         drop(records);
         self.enforce_checkpoint_retention_for_job(job_id).await?;
         Ok(())
@@ -3244,6 +3362,68 @@ mod tests {
         assert!(!recovery_record_is_compatible(&spec, &old_format));
     }
 
+    #[tokio::test]
+    async fn checkpoint_completion_after_hub_restart_preserves_metadata() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = crate::storage::StorageActor::start(store, 8);
+        let hub1 = Hub::with_storage(config(), storage.clone());
+        let hub2 = Hub::with_storage(config(), storage);
+        let spec_json = serde_json::json!({
+            "id": "orders",
+            "version": 2,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {"backend": "embedded_kv", "format_version": 3}
+        })
+        .to_string();
+        hub1.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json,
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 4,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        hub1.record_job_checkpoint(JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 2,
+            checkpoint_id: "checkpoint-4".into(),
+            kind: "checkpoint".into(),
+            status: "pending".into(),
+            manifest_uri: None,
+            format_version: 3,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+        hub2.complete_job_checkpoint(
+            "orders",
+            "checkpoint-4",
+            "completed",
+            Some("s3://bucket/checkpoint-4/manifest.json".into()),
+        )
+        .await
+        .unwrap();
+        let records = hub2.job_checkpoints("orders").await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job_version, 2);
+        assert_eq!(records[0].format_version, 3);
+        assert_eq!(records[0].status, "completed");
+    }
+
     fn config() -> HubConfig {
         HubConfig {
             operator_token: Some("operator".into()),
@@ -4535,6 +4715,44 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+
+        let start_command = commands[0].clone();
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token.clone(),
+            },
+            CommandResult {
+                command_id: start_command.id.clone(),
+                operation_id: start_command.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: start_command.correlation_id.clone(),
+                generation: start_command.generation,
+                observed_generation: Some(start_command.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let job = hub.job("orders").await.unwrap().unwrap();
+        hub.reconcile_job(&job).await.unwrap();
+        let commands = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(!commands
+            .iter()
+            .any(|command| command.operation == "job_start"));
 
         hub.record_job_checkpoint(JobCheckpointRecord {
             job_id: "orders".into(),
