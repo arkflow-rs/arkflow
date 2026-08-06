@@ -387,6 +387,35 @@ impl JobSpec {
             }
         }
 
+        // A source and sink declaration is only executable when the DAG has a
+        // path between them.  Accepting disconnected declarations would make
+        // the runner acknowledge source batches that can never reach a sink.
+        let source_ids = self
+            .sources
+            .iter()
+            .map(|source| source.operator_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut reachable = source_ids.clone();
+        let mut pending = source_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::VecDeque<_>>();
+        while let Some(operator_id) = pending.pop_front() {
+            for downstream in outgoing.get(operator_id).into_iter().flatten() {
+                if reachable.insert(downstream.as_str()) {
+                    pending.push_back(downstream.as_str());
+                }
+            }
+        }
+        for sink in &self.sinks {
+            if !reachable.contains(sink.operator_id.as_str()) {
+                return Err(Error::Config(format!(
+                    "sink '{}' is not reachable from any executable source",
+                    sink.operator_id
+                )));
+            }
+        }
+
         if self.checkpoint.is_some() && self.state.is_none() {
             return Err(Error::Config(
                 "checkpointing a Job requires a state specification".into(),

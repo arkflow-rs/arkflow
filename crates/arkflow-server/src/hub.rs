@@ -4,6 +4,7 @@
 //! the transport-neutral state machine used by the HTTP handlers and Agent
 //! client protocol.
 
+use crate::agent::delete_checkpoint_artifact;
 use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
 use crate::storage::{
     AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, NodeMutation,
@@ -879,9 +880,66 @@ impl Hub {
                 updated_at_ms: now,
             };
             self.record_job_checkpoint(record).await?;
+            self.enforce_checkpoint_retention(&job, &spec).await?;
             scheduled += 1;
         }
         Ok(scheduled)
+    }
+
+    async fn enforce_checkpoint_retention(
+        &self,
+        job: &JobRecord,
+        spec: &arkflow_core::job::JobSpec,
+    ) -> Result<(), HubError> {
+        let retention = spec
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.retention as usize)
+            .unwrap_or(0);
+        if retention == 0 {
+            return Ok(());
+        }
+        let mut completed = self
+            .job_checkpoints(&job.job_id)
+            .await?
+            .into_iter()
+            .filter(|record| record.kind == "checkpoint" && record.status == "completed")
+            .collect::<Vec<_>>();
+        completed.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
+        });
+        for record in completed.into_iter().skip(retention) {
+            let artifact = arkflow_core::checkpoint::RecoveryArtifact {
+                id: record.checkpoint_id.clone(),
+                kind: arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                manifest_key: arkflow_core::checkpoint::recovery_manifest_key(
+                    arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                    &record.checkpoint_id,
+                ),
+                job_version: spec.version,
+                format_version: record.format_version,
+                created_at_ms: record.created_at_ms,
+                status: arkflow_core::checkpoint::CheckpointStatus::Completed,
+            };
+            delete_checkpoint_artifact(spec, &artifact).map_err(HubError::Invalid)?;
+            if let Some(storage) = &self.storage {
+                storage
+                    .delete_job_checkpoint(&record.job_id, &record.checkpoint_id)
+                    .await
+                    .map_err(HubError::from)?;
+            } else {
+                self.job_checkpoints
+                    .write()
+                    .await
+                    .entry(record.job_id.clone())
+                    .or_default()
+                    .retain(|candidate| candidate.checkpoint_id != record.checkpoint_id);
+            }
+        }
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {

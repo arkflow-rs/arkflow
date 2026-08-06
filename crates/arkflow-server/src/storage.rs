@@ -393,6 +393,11 @@ enum StorageCommand {
         job_id: String,
         response: oneshot::Sender<Result<Vec<JobCheckpointRecord>, StorageError>>,
     },
+    DeleteJobCheckpoint {
+        job_id: String,
+        checkpoint_id: String,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
     UpsertNode {
         mutation: NodeMutation,
         response: oneshot::Sender<Result<(), StorageError>>,
@@ -597,6 +602,13 @@ impl StorageActor {
                     }
                     StorageCommand::ListJobCheckpoints { job_id, response } => {
                         let _ = response.send(store.list_job_checkpoints(&job_id));
+                    }
+                    StorageCommand::DeleteJobCheckpoint {
+                        job_id,
+                        checkpoint_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id));
                     }
                     StorageCommand::UpsertNode { mutation, response } => {
                         let _ = response.send(store.upsert_node(mutation));
@@ -887,6 +899,23 @@ impl StorageActor {
         self.sender
             .send(StorageCommand::ListJobCheckpoints {
                 job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn delete_job_checkpoint(
+        &self,
+        job_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::DeleteJobCheckpoint {
+                job_id: job_id.into(),
+                checkpoint_id: checkpoint_id.into(),
                 response,
             })
             .await
@@ -2731,6 +2760,20 @@ impl ControlPlaneStore {
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn delete_job_checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM cp_job_checkpoints WHERE job_id = ?1 AND checkpoint_id = ?2",
+                rusqlite::params![job_id, checkpoint_id],
+            )?;
+            Ok(())
         })
     }
 

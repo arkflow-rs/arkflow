@@ -131,6 +131,21 @@ impl WatermarkTracker {
         &self.partitions
     }
 
+    pub fn restore_partition(&mut self, partition: u32, watermark_ms: i64) {
+        self.partitions.insert(
+            partition,
+            PartitionProgress {
+                watermark_ms,
+                last_event_at_ms: crate::state::now_ms() as i64,
+                idle: false,
+            },
+        );
+        self.watermark_ms = Some(
+            self.watermark_ms
+                .map_or(watermark_ms, |current| current.max(watermark_ms)),
+        );
+    }
+
     fn recompute(&mut self) -> i64 {
         let next = self
             .partitions

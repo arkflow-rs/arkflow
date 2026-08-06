@@ -85,7 +85,7 @@ impl StreamingSqlCompiler {
 
     pub fn compile(
         sql: impl Into<String>,
-        spec: JobSpec,
+        mut spec: JobSpec,
         extensions: Vec<RustExtensionSpec>,
     ) -> Result<CompiledStreamingJob, Error> {
         let sql = sql.into();
@@ -111,6 +111,23 @@ impl StreamingSqlCompiler {
                     extension.name
                 )));
             }
+        }
+        // The SQL adapter's minimal compatibility spec may omit physical
+        // edges.  Materialize the declared source-to-sink routes before the
+        // stricter Job graph validation runs.
+        if spec.edges.is_empty() {
+            spec.edges = spec
+                .sources
+                .iter()
+                .flat_map(|source| {
+                    spec.sinks.iter().map(move |sink| crate::job::EdgeSpec {
+                        id: format!("{}-to-{}", source.operator_id, sink.operator_id),
+                        from: source.operator_id.clone(),
+                        to: sink.operator_id.clone(),
+                        partitioned: false,
+                    })
+                })
+                .collect();
         }
         Ok(CompiledStreamingJob {
             sql,

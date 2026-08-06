@@ -167,3 +167,10 @@
 - [x] 23.2 Advance Kafka checkpoint positions only after successful acknowledgements.
 - [x] 23.3 Apply configured state TTL to keyed counter updates and isolate local state by Job version/generation.
 - [x] 23.4 Add recovery, Kafka acknowledgement, TTL, and state-isolation regression coverage.
+
+## 24. Follow-up review remediation
+
+- [x] 24.1 Reject disconnected source-to-sink Job graphs while preserving SQL adapter compatibility routes.
+- [x] 24.2 Capture and restore task-scoped event-time watermarks across checkpoint recovery.
+- [x] 24.3 Enforce periodic checkpoint retention and remove durable checkpoint records and artifacts.
+- [x] 24.4 Delete referenced state snapshot objects when removing checkpoint manifests.

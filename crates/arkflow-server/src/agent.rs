@@ -57,6 +57,7 @@ struct JobTask {
     generation: u64,
     cancellation: CancellationToken,
     assignments: Vec<TaskAttempt>,
+    watermark_partitions: BTreeMap<String, u32>,
     state: Arc<dyn StateBackend>,
     checkpoint_store_uri: Option<String>,
     runner: Arc<arkflow_core::job_runner::SingleComputeJobRunner>,
@@ -70,7 +71,7 @@ struct SharedCheckpointStore {
 }
 
 impl SharedCheckpointStore {
-    fn from_uri(uri: &str) -> Result<Self, String> {
+    pub(crate) fn from_uri(uri: &str) -> Result<Self, String> {
         let url = Url::parse(uri)
             .map_err(|error| format!("invalid checkpoint object_store_uri: {error}"))?;
         let (client, prefix) = object_store::parse_url(&url)
@@ -159,6 +160,21 @@ fn checkpoint_repository(
     Ok(CheckpointRepository::new(SharedCheckpointStore::from_uri(
         &uri,
     )?))
+}
+
+pub(crate) fn delete_checkpoint_artifact(
+    spec: &arkflow_core::job::JobSpec,
+    artifact: &RecoveryArtifact,
+) -> Result<(), String> {
+    let uri = spec
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?
+        .object_store_uri
+        .clone();
+    CheckpointRepository::new(SharedCheckpointStore::from_uri(&uri)?)
+        .delete(artifact)
+        .map_err(|error| error.to_string())
 }
 
 fn recovery_artifact(
@@ -252,6 +268,16 @@ impl JobRuntime {
             .iter()
             .map(|assignment| assignment.task_id.clone())
             .collect::<Vec<_>>();
+        let watermark_partitions = assignments
+            .iter()
+            .filter_map(|assignment| {
+                plan.task(&assignment.task_id).and_then(|task| {
+                    task.partitions
+                        .first()
+                        .map(|partition| (assignment.task_id.clone(), partition.id))
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         let resource = Resource {
             temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
             input_names: RefCell::new(Vec::new()),
@@ -318,7 +344,12 @@ impl JobRuntime {
                     .restore(&snapshot)
                     .map_err(|error| error.to_string())?;
             }
-            Some(RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?)
+            let recovery =
+                RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?;
+            runner
+                .restore_watermarks(&recovery.watermarks_ms)
+                .map_err(|error| error.to_string())?;
+            Some(recovery)
         } else {
             None
         };
@@ -336,6 +367,7 @@ impl JobRuntime {
                 generation,
                 cancellation: cancellation.clone(),
                 assignments,
+                watermark_partitions,
                 state,
                 checkpoint_store_uri: plan
                     .spec
@@ -364,7 +396,7 @@ impl JobRuntime {
         if task.generation != generation {
             return Err("checkpoint generation does not match running Job".into());
         }
-        let (snapshot, source_positions) = task
+        let (snapshot, source_positions, task_watermarks) = task
             .runner
             .checkpoint_snapshot(task.state.as_ref())
             .await
@@ -403,7 +435,11 @@ impl JobRuntime {
                 .acknowledge(TaskCheckpointAck {
                     task_id: assignment.task_id.clone(),
                     attempt_id: assignment.id.clone(),
-                    partition: assignment.task_id.parse::<u32>().unwrap_or(0),
+                    partition: task
+                        .watermark_partitions
+                        .get(&assignment.task_id)
+                        .copied()
+                        .unwrap_or_default(),
                     checkpoint_id: barrier.checkpoint_id.clone(),
                     generation: barrier.generation,
                     state: snapshot.clone(),
@@ -412,7 +448,7 @@ impl JobRuntime {
                     } else {
                         Vec::new()
                     },
-                    watermark_ms: None,
+                    watermark_ms: task_watermarks.get(&assignment.task_id).copied(),
                 })
                 .map_err(|error| error.to_string())?;
         }

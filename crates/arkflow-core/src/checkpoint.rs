@@ -303,6 +303,23 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
     }
 
     pub fn delete(&self, artifact: &RecoveryArtifact) -> Result<(), Error> {
+        if let Some(bytes) = self.store.get(&artifact.manifest_key)? {
+            let manifest: CheckpointManifest = serde_json::from_slice(&bytes)?;
+            let other_kind = match artifact.kind {
+                RecoveryArtifactKind::Checkpoint => RecoveryArtifactKind::Savepoint,
+                RecoveryArtifactKind::Savepoint => RecoveryArtifactKind::Checkpoint,
+            };
+            let other_manifest_key = recovery_manifest_key(other_kind, &manifest.checkpoint_id);
+            if self.store.get(&other_manifest_key)?.is_none() {
+                let mut snapshot_keys = BTreeSet::new();
+                for snapshot in manifest.state_snapshots {
+                    snapshot_keys.insert(snapshot.uri);
+                }
+                for key in snapshot_keys {
+                    self.store.delete(&key)?;
+                }
+            }
+        }
         self.store.delete(&artifact.manifest_key)
     }
 }
@@ -737,6 +754,11 @@ mod tests {
         assert!(catalog.latest_valid(JobVersion(1), 1).is_some());
         assert_eq!(catalog.retain_checkpoints(0).len(), 1);
         repository.delete(&savepoint).unwrap();
+        assert!(repository.read_manifest(&checkpoint).is_ok());
+        repository.delete(&checkpoint).unwrap();
+        assert!(repository
+            .read_state_snapshot(&manifest.state_snapshots[0])
+            .is_err());
     }
 
     #[test]

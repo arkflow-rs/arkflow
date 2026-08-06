@@ -495,11 +495,45 @@ impl SingleComputeJobRunner {
     pub async fn checkpoint_snapshot(
         &self,
         state: &dyn StateBackend,
-    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>), Error> {
+    ) -> Result<
+        (
+            StateSnapshot,
+            Vec<crate::checkpoint::SourcePosition>,
+            BTreeMap<String, i64>,
+        ),
+        Error,
+    > {
         let _guard = self.checkpoint_gate.write().await;
         let snapshot = state.snapshot()?;
         let positions = self.current_source_positions_unlocked().await?;
-        Ok((snapshot, positions))
+        let watermarks = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?
+            .iter()
+            .filter_map(|(task_id, runtime)| {
+                runtime
+                    .tracker
+                    .watermark()
+                    .map(|watermark| (task_id.clone(), watermark))
+            })
+            .collect();
+        Ok((snapshot, positions, watermarks))
+    }
+
+    pub fn restore_watermarks(&self, watermarks_ms: &BTreeMap<u32, i64>) -> Result<(), Error> {
+        let mut runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        for runtime in runtimes.values_mut() {
+            if let Some(watermark) = watermarks_ms.get(&runtime.partition) {
+                runtime
+                    .tracker
+                    .restore_partition(runtime.partition, *watermark);
+            }
+        }
+        Ok(())
     }
 
     async fn run_connected(&self, cancellation: CancellationToken) -> Result<(), Error> {
