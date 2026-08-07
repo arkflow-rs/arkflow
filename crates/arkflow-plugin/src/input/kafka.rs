@@ -16,6 +16,7 @@
 //!
 //! Receive data from a Kafka topic
 
+use arkflow_core::checkpoint::SourcePosition;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -25,10 +26,11 @@ use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Message as KafkaMessage, Timestamp};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 /// Kafka input configuration
@@ -59,10 +61,23 @@ pub struct KafkaInput {
     input_name: Option<String>,
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
+    assigned_partition: Arc<RwLock<Option<u32>>>,
+    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
     codec: Option<Arc<dyn Codec>>,
 }
 
 impl KafkaInput {
+    fn validate_checkpoint_offset(offset: u64, low: i64, high: i64) -> Result<i64, Error> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| Error::Config("Kafka checkpoint offset exceeds i64".into()))?;
+        if offset < low || offset > high {
+            return Err(Error::Process(format!(
+                "Kafka checkpoint offset {offset} is outside broker range {low}..={high}"
+            )));
+        }
+        Ok(offset)
+    }
+
     /// Create a new Kafka input component
     pub fn new(
         name: Option<&String>,
@@ -73,6 +88,8 @@ impl KafkaInput {
             input_name: name.cloned(),
             config,
             consumer: Arc::new(RwLock::new(None)),
+            assigned_partition: Arc::new(RwLock::new(None)),
+            acknowledged_offsets: Arc::new(RwLock::new(HashMap::new())),
             codec,
         })
     }
@@ -161,16 +178,30 @@ impl Input for KafkaInput {
             .create()
             .map_err(|e| Error::Connection(format!("Unable to create a Kafka consumer: {}", e)))?;
 
-        // Subscribe to a topic
-        let x: Vec<&str> = self
-            .config
-            .topics
-            .iter()
-            .map(|topic| topic.as_str())
-            .collect();
-        consumer.subscribe(&x).map_err(|e| {
-            Error::Connection(format!("You cannot subscribe to a Kafka topic: {}", e))
-        })?;
+        if let Some(partition) = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?
+        {
+            let mut assignment = TopicPartitionList::new();
+            for topic in &self.config.topics {
+                assignment.add_partition(topic, partition as i32);
+            }
+            consumer.assign(&assignment).map_err(|e| {
+                Error::Connection(format!("You cannot assign Kafka partitions: {}", e))
+            })?;
+        } else {
+            // Subscribe to all partitions for the legacy single-reader path.
+            let x: Vec<&str> = self
+                .config
+                .topics
+                .iter()
+                .map(|topic| topic.as_str())
+                .collect();
+            consumer.subscribe(&x).map_err(|e| {
+                Error::Connection(format!("You cannot subscribe to a Kafka topic: {}", e))
+            })?;
+        }
 
         // Update consumer and connection status
         let consumer_arc = self.consumer.clone();
@@ -248,6 +279,7 @@ impl Input for KafkaInput {
                 // Create acknowledgment object
                 let ack = KafkaAck {
                     consumer: self.consumer.clone(),
+                    acknowledged_offsets: self.acknowledged_offsets.clone(),
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
@@ -262,6 +294,66 @@ impl Input for KafkaInput {
         }
     }
 
+    async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
+        let acknowledged = self.acknowledged_offsets.read().await;
+        Ok(acknowledged
+            .iter()
+            .filter_map(|((topic, partition), offset)| {
+                if *partition < 0 || *offset < 0 {
+                    return None;
+                }
+                Some(SourcePosition {
+                    topic: Some(topic.clone()),
+                    partition: u32::try_from(*partition).ok()?,
+                    offset: u64::try_from(*offset).ok()?,
+                })
+            })
+            .collect())
+    }
+
+    async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
+        let assigned_partition = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Err(Error::Process(
+                "cannot restore Kafka positions before connect".into(),
+            ));
+        };
+        let mut assignment = TopicPartitionList::new();
+        for topic in &self.config.topics {
+            for position in positions.iter().filter(|position| {
+                position.partition < i32::MAX as u32
+                    && assigned_partition.is_none_or(|partition| position.partition == partition)
+                    && position.topic.as_deref() == Some(topic.as_str())
+            }) {
+                let partition = position.partition as i32;
+                let (low, high) = consumer
+                    .fetch_watermarks(topic, partition, Duration::from_secs(10))
+                    .map_err(|error| {
+                        Error::Process(format!(
+                            "fetch Kafka watermarks for {topic}-{partition}: {error}"
+                        ))
+                    })?;
+                let offset = Self::validate_checkpoint_offset(position.offset, low, high)?;
+                assignment
+                    .add_partition_offset(topic, partition, Offset::Offset(offset))
+                    .map_err(|error| {
+                        Error::Process(format!("build Kafka restore assignment: {error}"))
+                    })?;
+            }
+        }
+        if assignment.count() == 0 {
+            return Ok(());
+        }
+        consumer
+            .assign(&assignment)
+            .map_err(|error| Error::Process(format!("restore Kafka positions: {error}")))?;
+        Ok(())
+    }
+
     async fn close(&self) -> Result<(), Error> {
         let mut consumer_guard = self.consumer.write().await;
         if let Some(consumer) = consumer_guard.take() {
@@ -271,11 +363,25 @@ impl Input for KafkaInput {
         }
         Ok(())
     }
+
+    fn assign_partition(&self, partition: u32) -> Result<(), Error> {
+        let mut assigned = self
+            .assigned_partition
+            .try_write()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        *assigned = Some(partition);
+        Ok(())
+    }
+
+    fn supports_partitioning(&self) -> bool {
+        true
+    }
 }
 
 /// Kafka message acknowledgment
 pub struct KafkaAck {
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
+    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
     topic: String,
     partition: i32,
     offset: i64,
@@ -291,6 +397,12 @@ impl Ack for KafkaAck {
             v.store_offset(&self.topic, self.partition, self.offset)
                 .map_err(|e| Error::Process(format!("Failed to store Kafka offset: {}", e)))?;
         }
+        let mut acknowledged = self.acknowledged_offsets.write().await;
+        let next_offset = self.offset.saturating_add(1);
+        let entry = acknowledged
+            .entry((self.topic.clone(), self.partition))
+            .or_insert(next_offset);
+        *entry = (*entry).max(next_offset);
         Ok(())
     }
 }
@@ -408,8 +520,10 @@ mod tests {
         };
 
         let input = KafkaInput::new(None, config, None).unwrap();
+        assert!(input.current_positions().await.unwrap().is_empty());
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
+            acknowledged_offsets: input.acknowledged_offsets.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
@@ -417,7 +531,11 @@ mod tests {
 
         // Test acknowledgment, should have no effect since there is no actual consumer
         let _ = ack.ack().await;
-        // This test mainly verifies that the ack method does not panic
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].topic.as_deref(), Some("test-topic"));
+        assert_eq!(positions[0].partition, 0);
+        assert_eq!(positions[0].offset, 101);
     }
 
     #[test]
@@ -468,6 +586,21 @@ mod tests {
         ext_meta.insert("topic".to_string(), "test-topic".to_string());
         let result = metadata::with_ext_metadata(batch, &ext_meta);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_checkpoint_offsets_outside_broker_range() {
+        assert!(KafkaInput::validate_checkpoint_offset(9, 10, 20).is_err());
+        assert!(KafkaInput::validate_checkpoint_offset(21, 10, 20).is_err());
+        assert!(KafkaInput::validate_checkpoint_offset(u64::MAX, 0, i64::MAX).is_err());
+        assert_eq!(
+            KafkaInput::validate_checkpoint_offset(10, 10, 20).unwrap(),
+            10
+        );
+        assert_eq!(
+            KafkaInput::validate_checkpoint_offset(20, 10, 20).unwrap(),
+            20
+        );
     }
 
     #[test]

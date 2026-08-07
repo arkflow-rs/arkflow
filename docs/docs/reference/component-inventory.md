@@ -35,6 +35,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `http` | [reference](../components/outputs/http) |
 | output | `influxdb` | [reference](../components/outputs/influxdb) |
 | output | `kafka` | [reference](../components/outputs/kafka) |
+| output | `mongodb` | [reference](../components/outputs/mongodb) |
 | output | `mqtt` | [reference](../components/outputs/mqtt) |
 | output | `nats` | [reference](../components/outputs/nats) |
 | output | `pulsar` | [reference](../components/outputs/pulsar) |

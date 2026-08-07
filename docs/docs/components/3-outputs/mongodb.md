@@ -1,3 +1,7 @@
+---
+description: ArkFlow MongoDB output component.
+---
+
 # MongoDB
 
 The MongoDB output writes each Arrow row as a BSON document in a configured MongoDB collection. Column names become document field names, and scalar values and nulls are preserved.

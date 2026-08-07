@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 
+use crate::checkpoint::SourcePosition;
 use crate::codec::{Codec, CodecConfig};
 use crate::{Error, MessageBatchRef, Resource};
 
@@ -58,6 +59,30 @@ pub trait Input: Send + Sync {
 
     /// Read a message using Arc for zero-copy
     async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error>;
+
+    /// Restore source cursors before a distributed Job resumes processing.
+    /// Legacy inputs remain compatible through the no-op default.
+    async fn restore_positions(&self, _positions: &[SourcePosition]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Return the latest durable source positions for checkpointing.
+    /// Legacy inputs remain compatible through the empty default.
+    async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// Bind this reader to a physical source partition owned by its task.
+    /// Connectors that do not support partition assignment remain compatible
+    /// with single-partition Jobs through the no-op default.
+    fn assign_partition(&self, _partition: u32) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Whether this connector enforces the assigned partition at the source.
+    fn supports_partitioning(&self) -> bool {
+        false
+    }
 
     /// Close the input source connection
     async fn close(&self) -> Result<(), Error>;

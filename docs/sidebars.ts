@@ -33,6 +33,7 @@ const sidebars: SidebarsConfig = {
     {type: 'category', label: 'Understand ArkFlow', items: [
       'concepts/architecture', 'concepts/backpressure-ordering', 'concepts/metadata',
       'concepts/delivery-semantics', 'concepts/wal-optimization', 'concepts/exactly-once',
+      'concepts/distributed-jobs',
     ]},
     {type: 'category', label: 'Get started', items: [
       'getting-started/install', 'getting-started/quickstart',

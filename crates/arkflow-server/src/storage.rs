@@ -4,8 +4,8 @@
 //! repository schema is deliberately independent from HTTP and Hub types so
 //! the state machine can later move to a server database.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -210,6 +210,87 @@ pub struct PersistedOperation {
     pub operation_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub job_id: String,
+    pub version: u64,
+    pub spec_json: String,
+    pub desired_state: String,
+    pub observed_state: String,
+    pub convergence: String,
+    pub generation: u64,
+    pub node_ids: Vec<String>,
+    pub checkpoint_id: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobVersionRecord {
+    pub job_id: String,
+    pub version: u64,
+    pub spec_json: String,
+    pub plan_json: String,
+    pub created_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAssignmentRecord {
+    pub job_id: String,
+    pub generation: u64,
+    pub task_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub updated_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCheckpointRecord {
+    pub job_id: String,
+    /// Job version that produced this artifact. Recovery must never reuse a
+    /// checkpoint from a prior deployment of the same logical Job id.
+    pub job_version: u64,
+    pub checkpoint_id: String,
+    pub kind: String,
+    pub status: String,
+    pub manifest_uri: Option<String>,
+    pub format_version: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobObservationRecord {
+    pub job_id: String,
+    pub node_id: String,
+    pub boot_id: Option<String>,
+    pub report_seq: u64,
+    pub generation: u64,
+    pub state: String,
+    pub convergence: String,
+    pub checkpoint_id: Option<String>,
+    pub snapshot_json: String,
+    pub observed_at_ms: u64,
+}
+
+fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
+    let node_ids_json: String = row.get(7)?;
+    let node_ids = serde_json::from_str(&node_ids_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(JobRecord {
+        job_id: row.get(0)?,
+        version: row.get(1)?,
+        spec_json: row.get(2)?,
+        desired_state: row.get(3)?,
+        observed_state: row.get(4)?,
+        convergence: row.get(5)?,
+        generation: row.get(6)?,
+        node_ids,
+        checkpoint_id: row.get(8)?,
+        last_error: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RolloutTargetUpdate {
     pub rollout_id: String,
@@ -280,6 +361,46 @@ pub struct ControlPlaneStore {
 }
 
 enum StorageCommand {
+    UpsertJob {
+        job: JobRecord,
+        response: oneshot::Sender<Result<JobRecord, StorageError>>,
+    },
+    GetJob {
+        job_id: String,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    ListJobs {
+        response: oneshot::Sender<Result<Vec<JobRecord>, StorageError>>,
+    },
+    UpdateJob {
+        job_id: String,
+        desired_state: Option<String>,
+        observed_state: Option<String>,
+        convergence: Option<String>,
+        generation: Option<u64>,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    UpdateJobDesiredState {
+        job_id: String,
+        desired_state: String,
+        expected_generation: u64,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    UpsertJobCheckpoint {
+        record: JobCheckpointRecord,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ListJobCheckpoints {
+        job_id: String,
+        response: oneshot::Sender<Result<Vec<JobCheckpointRecord>, StorageError>>,
+    },
+    DeleteJobCheckpoint {
+        job_id: String,
+        checkpoint_id: String,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
     UpsertNode {
         mutation: NodeMutation,
         response: oneshot::Sender<Result<(), StorageError>>,
@@ -438,6 +559,60 @@ impl StorageActor {
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 match command {
+                    StorageCommand::UpsertJob { job, response } => {
+                        let _ = response.send(store.upsert_job(job));
+                    }
+                    StorageCommand::GetJob { job_id, response } => {
+                        let _ = response.send(store.get_job(&job_id));
+                    }
+                    StorageCommand::ListJobs { response } => {
+                        let _ = response.send(store.list_jobs());
+                    }
+                    StorageCommand::UpdateJob {
+                        job_id,
+                        desired_state,
+                        observed_state,
+                        convergence,
+                        generation,
+                        checkpoint_id,
+                        last_error,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job(
+                            &job_id,
+                            desired_state.as_deref(),
+                            observed_state.as_deref(),
+                            convergence.as_deref(),
+                            generation,
+                            checkpoint_id.as_deref(),
+                            last_error.as_deref(),
+                        ));
+                    }
+                    StorageCommand::UpdateJobDesiredState {
+                        job_id,
+                        desired_state,
+                        expected_generation,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job_desired_state(
+                            &job_id,
+                            &desired_state,
+                            expected_generation,
+                        ));
+                    }
+                    StorageCommand::UpsertJobCheckpoint { record, response } => {
+                        let _ = response.send(store.upsert_job_checkpoint(record));
+                    }
+                    StorageCommand::ListJobCheckpoints { job_id, response } => {
+                        let _ = response.send(store.list_job_checkpoints(&job_id));
+                    }
+                    StorageCommand::DeleteJobCheckpoint {
+                        job_id,
+                        checkpoint_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id));
+                    }
                     StorageCommand::UpsertNode { mutation, response } => {
                         let _ = response.send(store.upsert_node(mutation));
                     }
@@ -625,6 +800,130 @@ impl StorageActor {
             }
         });
         Self { sender }
+    }
+
+    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJob { job, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_job(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetJob {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobs { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_job(
+        &self,
+        job_id: impl Into<String>,
+        desired_state: Option<String>,
+        observed_state: Option<String>,
+        convergence: Option<String>,
+        generation: Option<u64>,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJob {
+                job_id: job_id.into(),
+                desired_state,
+                observed_state,
+                convergence,
+                generation,
+                checkpoint_id,
+                last_error,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_desired_state(
+        &self,
+        job_id: impl Into<String>,
+        desired_state: impl Into<String>,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobDesiredState {
+                job_id: job_id.into(),
+                desired_state: desired_state.into(),
+                expected_generation,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn upsert_job_checkpoint(
+        &self,
+        record: JobCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJobCheckpoint { record, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_job_checkpoints(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobCheckpoints {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn delete_job_checkpoint(
+        &self,
+        job_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::DeleteJobCheckpoint {
+                job_id: job_id.into(),
+                checkpoint_id: checkpoint_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
     pub async fn set_desired(
@@ -2308,6 +2607,191 @@ impl ControlPlaneStore {
         })
     }
 
+    pub fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            let current_generation = connection
+                .query_row(
+                    "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                    [&job.job_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?;
+            job.generation = current_generation
+                .map(|generation| generation.saturating_add(1))
+                .unwrap_or_else(|| job.generation.max(1));
+            let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
+                StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
+            connection.execute(
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    job.job_id,
+                    job.version,
+                    job.spec_json,
+                    job.desired_state,
+                    job.observed_state,
+                    job.convergence,
+                    job.generation,
+                    node_ids,
+                    job.checkpoint_id,
+                    job.last_error,
+                    job.updated_at_ms,
+                ],
+            )?;
+            Ok(job)
+        })
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()
+        })
+    }
+
+    pub fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
+            )?;
+            let rows = statement.query_map([], row_to_job)?;
+            rows.collect()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_job(
+        &self,
+        job_id: &str,
+        desired_state: Option<&str>,
+        observed_state: Option<&str>,
+        convergence: Option<&str>,
+        generation: Option<u64>,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE cp_jobs SET desired_state=COALESCE(?2, desired_state), observed_state=COALESCE(?3, observed_state), convergence=COALESCE(?4, convergence), generation=COALESCE(?5, generation), checkpoint_id=COALESCE(?6, checkpoint_id), last_error=?7, updated_at_ms=?8 WHERE job_id=?1",
+                rusqlite::params![job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error, now_ms()],
+            )?;
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()
+        })
+    }
+
+    pub fn update_job_desired_state(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                rusqlite::params![
+                    job_id,
+                    desired_state,
+                    expected_generation.saturating_add(1),
+                    now_ms(),
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return match current {
+                    Some(current) => Err(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current,
+                    }),
+                    None => Ok(None),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_job_checkpoints (job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(job_id, checkpoint_id) DO UPDATE SET job_version=excluded.job_version, status=excluded.status, manifest_uri=excluded.manifest_uri, format_version=excluded.format_version, updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    record.job_id,
+                    record.job_version,
+                    record.checkpoint_id,
+                    record.kind,
+                    record.status,
+                    record.manifest_uri,
+                    record.format_version,
+                    record.created_at_ms,
+                    record.updated_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_job_checkpoints(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms FROM cp_job_checkpoints WHERE job_id = ?1 ORDER BY created_at_ms DESC, checkpoint_id DESC",
+            )?;
+            let rows = statement.query_map([job_id], |row| {
+                Ok(JobCheckpointRecord {
+                    job_id: row.get(0)?,
+                    job_version: row.get(1)?,
+                    checkpoint_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    status: row.get(4)?,
+                    manifest_uri: row.get(5)?,
+                    format_version: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn delete_job_checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM cp_job_checkpoints WHERE job_id = ?1 AND checkpoint_id = ?2",
+                rusqlite::params![job_id, checkpoint_id],
+            )?;
+            Ok(())
+        })
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute_batch(
@@ -2327,6 +2811,47 @@ impl ControlPlaneStore {
                 maintenance_updated_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_jobs (
+                job_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                spec_json TEXT NOT NULL,
+                desired_state TEXT NOT NULL DEFAULT 'stopped',
+                observed_state TEXT NOT NULL DEFAULT 'draft',
+                convergence TEXT NOT NULL DEFAULT 'unknown',
+                generation INTEGER NOT NULL DEFAULT 0,
+                node_ids_json TEXT NOT NULL DEFAULT '[]',
+                checkpoint_id TEXT,
+                last_error TEXT,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS cp_jobs_updated
+                ON cp_jobs(updated_at_ms DESC, job_id);
+
+            CREATE TABLE IF NOT EXISTS cp_job_versions (
+                job_id TEXT NOT NULL, version INTEGER NOT NULL, spec_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS cp_job_tasks (
+                job_id TEXT NOT NULL, generation INTEGER NOT NULL, task_id TEXT NOT NULL,
+                node_id TEXT NOT NULL, attempt_id TEXT NOT NULL, state TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, generation, task_id)
+            );
+            CREATE TABLE IF NOT EXISTS cp_job_checkpoints (
+                job_id TEXT NOT NULL, job_version INTEGER NOT NULL DEFAULT 0,
+                checkpoint_id TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, manifest_uri TEXT, format_version INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, checkpoint_id)
+            );
+            CREATE TABLE IF NOT EXISTS cp_job_observations (
+                job_id TEXT NOT NULL, node_id TEXT NOT NULL, boot_id TEXT,
+                report_seq INTEGER NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL,
+                convergence TEXT NOT NULL, checkpoint_id TEXT, snapshot_json TEXT NOT NULL,
+                observed_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, node_id)
             );
 
             CREATE TABLE IF NOT EXISTS cp_stream_desired (
@@ -2583,6 +3108,18 @@ impl ControlPlaneStore {
             .collect::<Result<Vec<_>, _>>()?;
         if !event_columns.iter().any(|name| name == "actor") {
             connection.execute("ALTER TABLE cp_events ADD COLUMN actor TEXT", [])?;
+        }
+        let checkpoint_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_job_checkpoints)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !checkpoint_columns.iter().any(|name| name == "job_version") {
+            // Existing checkpoints have no durable producer version. Mark them
+            // incompatible (0) so they are never auto-selected for recovery.
+            connection.execute(
+                "ALTER TABLE cp_job_checkpoints ADD COLUMN job_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
@@ -3643,4 +4180,111 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod job_storage_tests {
+    use super::*;
+
+    #[test]
+    fn job_records_survive_store_reopen() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let job = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "draft".into(),
+            convergence: "unknown".into(),
+            generation: 0,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let stored = store.upsert_job(job.clone()).unwrap();
+        assert_eq!(stored.generation, 1);
+        assert_eq!(store.get_job("orders").unwrap(), Some(stored));
+        let updated = store
+            .update_job(
+                "orders",
+                Some("running"),
+                Some("running"),
+                Some("in_sync"),
+                Some(1),
+                Some("cp-1"),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.desired_state, "running");
+        assert_eq!(updated.checkpoint_id.as_deref(), Some("cp-1"));
+        assert_eq!(store.list_jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_job_advances_its_generation() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let original = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{\"version\":1}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 4,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        assert_eq!(store.upsert_job(original).unwrap().generation, 4);
+
+        let replacement = store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 2,
+                spec_json: "{\"version\":2}".into(),
+                desired_state: "running".into(),
+                observed_state: "validated".into(),
+                convergence: "pending".into(),
+                generation: 1,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        assert_eq!(replacement.generation, 5);
+        assert_eq!(replacement.version, 2);
+        assert_eq!(store.get_job("orders").unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn desired_state_update_marks_job_as_reconciling() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "stopped".into(),
+                convergence: "converged".into(),
+                generation: 3,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+
+        let updated = store
+            .update_job_desired_state("orders", "running", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.generation, 4);
+        assert_eq!(updated.convergence, "reconciling");
+    }
 }

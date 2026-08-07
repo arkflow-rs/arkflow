@@ -120,6 +120,24 @@ pub struct RolloutActionRequest {
     pub config_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateJobRequest {
+    pub spec: serde_json::Value,
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    #[serde(default = "default_job_desired_state")]
+    pub desired_state: String,
+}
+
+fn default_job_desired_state() -> String {
+    "stopped".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobDesiredStateRequest {
+    pub state: String,
+}
+
 fn default_rollout_batch_size() -> u32 {
     1
 }
