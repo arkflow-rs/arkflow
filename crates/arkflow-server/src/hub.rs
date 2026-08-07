@@ -358,17 +358,23 @@ impl Hub {
         Ok(self.jobs.read().await.get(job_id).cloned())
     }
 
-    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, HubError> {
+    pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, HubError> {
         if let Some(storage) = &self.storage {
-            storage
-                .upsert_job(job.clone())
-                .await
-                .map_err(HubError::from)?;
+            job = storage.upsert_job(job).await.map_err(HubError::from)?;
+        } else {
+            let mut jobs = self.jobs.write().await;
+            job.generation = jobs
+                .get(&job.job_id)
+                .map(|current| current.generation.saturating_add(1))
+                .unwrap_or_else(|| job.generation.max(1));
+            jobs.insert(job.job_id.clone(), job.clone());
         }
-        self.jobs
-            .write()
-            .await
-            .insert(job.job_id.clone(), job.clone());
+        if self.storage.is_some() {
+            self.jobs
+                .write()
+                .await
+                .insert(job.job_id.clone(), job.clone());
+        }
         if job.desired_state != "stopped" {
             self.reconcile_job(&job).await?;
         }
@@ -640,6 +646,7 @@ impl Hub {
                 });
             }
             job.desired_state = desired_state.into();
+            job.convergence = "reconciling".into();
             job.generation = expected_generation.saturating_add(1);
             job.updated_at_ms = now_ms();
             Some(job.clone())
@@ -4700,7 +4707,50 @@ mod tests {
             (Ok(Some(_)), Err(HubError::GenerationConflict { .. }))
                 | (Err(HubError::GenerationConflict { .. }), Ok(Some(_)))
         ));
-        assert_eq!(hub.job("orders").await.unwrap().unwrap().generation, 4);
+        let current = hub.job("orders").await.unwrap().unwrap();
+        assert_eq!(current.generation, 4);
+        assert_eq!(current.convergence, "reconciling");
+    }
+
+    #[tokio::test]
+    async fn replacing_a_job_preserves_generation_fencing() {
+        let hub = Hub::new(config());
+        let original = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "stopped".into(),
+                convergence: "converged".into(),
+                generation: 6,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(original.generation, 6);
+
+        let replacement = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 2,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "validated".into(),
+                convergence: "pending".into(),
+                generation: 1,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(replacement.generation, 7);
+        assert_eq!(hub.job("orders").await.unwrap(), Some(replacement));
     }
 
     #[tokio::test]

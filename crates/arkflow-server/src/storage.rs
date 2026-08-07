@@ -363,7 +363,7 @@ pub struct ControlPlaneStore {
 enum StorageCommand {
     UpsertJob {
         job: JobRecord,
-        response: oneshot::Sender<Result<(), StorageError>>,
+        response: oneshot::Sender<Result<JobRecord, StorageError>>,
     },
     GetJob {
         job_id: String,
@@ -802,7 +802,7 @@ impl StorageActor {
         Self { sender }
     }
 
-    pub async fn upsert_job(&self, job: JobRecord) -> Result<(), StorageError> {
+    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::UpsertJob { job, response })
@@ -2607,11 +2607,21 @@ impl ControlPlaneStore {
         })
     }
 
-    pub fn upsert_job(&self, job: JobRecord) -> Result<(), StorageError> {
-        let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
-            StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
-        self.with_connection(|connection| {
+    pub fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            let current_generation = connection
+                .query_row(
+                    "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                    [&job.job_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?;
+            job.generation = current_generation
+                .map(|generation| generation.saturating_add(1))
+                .unwrap_or_else(|| job.generation.max(1));
+            let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
+                StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
             connection.execute(
                 "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
                 rusqlite::params![
@@ -2628,7 +2638,7 @@ impl ControlPlaneStore {
                     job.updated_at_ms,
                 ],
             )?;
-            Ok(())
+            Ok(job)
         })
     }
 
@@ -2688,7 +2698,7 @@ impl ControlPlaneStore {
     ) -> Result<Option<JobRecord>, StorageError> {
         self.immediate_transaction(|connection| {
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
                 rusqlite::params![
                     job_id,
                     desired_state,
@@ -4192,8 +4202,9 @@ mod job_storage_tests {
             last_error: None,
             updated_at_ms: 1,
         };
-        store.upsert_job(job.clone()).unwrap();
-        assert_eq!(store.get_job("orders").unwrap(), Some(job));
+        let stored = store.upsert_job(job.clone()).unwrap();
+        assert_eq!(stored.generation, 1);
+        assert_eq!(store.get_job("orders").unwrap(), Some(stored));
         let updated = store
             .update_job(
                 "orders",
@@ -4209,5 +4220,71 @@ mod job_storage_tests {
         assert_eq!(updated.desired_state, "running");
         assert_eq!(updated.checkpoint_id.as_deref(), Some("cp-1"));
         assert_eq!(store.list_jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_job_advances_its_generation() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let original = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{\"version\":1}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 4,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        assert_eq!(store.upsert_job(original).unwrap().generation, 4);
+
+        let replacement = store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 2,
+                spec_json: "{\"version\":2}".into(),
+                desired_state: "running".into(),
+                observed_state: "validated".into(),
+                convergence: "pending".into(),
+                generation: 1,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        assert_eq!(replacement.generation, 5);
+        assert_eq!(replacement.version, 2);
+        assert_eq!(store.get_job("orders").unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn desired_state_update_marks_job_as_reconciling() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "stopped".into(),
+                convergence: "converged".into(),
+                generation: 3,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+
+        let updated = store
+            .update_job_desired_state("orders", "running", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.generation, 4);
+        assert_eq!(updated.convergence, "reconciling");
     }
 }
