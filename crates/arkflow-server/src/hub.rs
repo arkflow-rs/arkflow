@@ -4,7 +4,7 @@
 //! the transport-neutral state machine used by the HTTP handlers and Agent
 //! client protocol.
 
-use crate::agent::delete_checkpoint_artifact;
+use crate::agent::{delete_checkpoint_artifact, recovery_record_is_valid};
 use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
 use crate::storage::{
     AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, NodeMutation,
@@ -493,7 +493,7 @@ impl Hub {
             }
         }
         let assignments = plan.assignments_for_nodes(&targets, job.generation);
-        let recovery = self
+        let mut recovery_candidates = self
             .job_checkpoints(&job.job_id)
             .await?
             .into_iter()
@@ -504,7 +504,16 @@ impl Hub {
                 arkflow_core::job::RecoveryPolicy::LatestSavepoint => record.kind == "savepoint",
                 arkflow_core::job::RecoveryPolicy::Fail => false,
             })
-            .max_by_key(|record| record.created_at_ms)
+            .collect::<Vec<_>>();
+        recovery_candidates.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
+        });
+        let recovery = recovery_candidates
+            .into_iter()
+            .find(|record| recovery_record_is_valid(&spec, record))
             .map(|record| {
                 serde_json::json!({
                     "checkpoint_id": record.checkpoint_id,
@@ -1389,8 +1398,8 @@ impl Hub {
             NodeRecord {
                 resource,
                 session_token: session_token.clone(),
-                boot_id: None,
-                report_seq: 0,
+                boot_id: old.as_ref().and_then(|record| record.boot_id.clone()),
+                report_seq: old.as_ref().map(|record| record.report_seq).unwrap_or(0),
                 commands: old
                     .as_ref()
                     .map(|record| record.commands.clone())
@@ -1497,6 +1506,10 @@ impl Hub {
         let reported_configuration = report.configuration.clone();
         let mut nodes = self.nodes.write().await;
         let node = authenticated_node(&mut nodes, &report.auth)?;
+        let boot_changed = report
+            .boot_id
+            .as_deref()
+            .is_some_and(|boot_id| node.boot_id.as_deref() != Some(boot_id));
         if let Some(boot_id) = report.boot_id.as_deref() {
             if node.boot_id.as_deref() == Some(boot_id) && report.report_seq <= node.report_seq {
                 return Ok(());
@@ -1538,7 +1551,37 @@ impl Hub {
         let persisted_report_seq = Some(node.report_seq);
         let persisted_lease = node.resource.lease_expires_at_ms;
         drop(nodes);
+        let invalidated_job_starts = if boot_changed {
+            let mut operations = self.operations.write().await;
+            operations
+                .values_mut()
+                .filter(|operation| {
+                    operation.node_id == report.auth.node_id
+                        && operation.operation == "job_start"
+                        && !matches!(
+                            operation.state,
+                            HubOperationState::Failed
+                                | HubOperationState::TimedOut
+                                | HubOperationState::NodeUnavailable
+                                | HubOperationState::Cancelled
+                                | HubOperationState::Superseded
+                        )
+                })
+                .map(|operation| {
+                    operation.state = HubOperationState::NodeUnavailable;
+                    operation.finished_at_ms = Some(now);
+                    operation.clone()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if let Some(storage) = self.storage.as_ref() {
+            for operation in &invalidated_job_starts {
+                persist_operation(storage, operation)
+                    .await
+                    .map_err(HubError::from)?;
+            }
             storage
                 .upsert_node(NodeMutation {
                     node_id: report.auth.node_id.clone(),
@@ -1627,6 +1670,16 @@ impl Hub {
                         })
                         .await
                         .map_err(HubError::from)?;
+                }
+            }
+        }
+        if boot_changed {
+            for job in self.jobs().await? {
+                if job.desired_state != "stopped"
+                    && (job.node_ids.is_empty()
+                        || job.node_ids.iter().any(|id| id == &report.auth.node_id))
+                {
+                    self.reconcile_job(&job).await?;
                 }
             }
         }

@@ -222,6 +222,62 @@ fn validate_recovery_manifest(
     Ok(())
 }
 
+pub(crate) fn recovery_record_is_valid(
+    spec: &arkflow_core::job::JobSpec,
+    record: &crate::storage::JobCheckpointRecord,
+) -> bool {
+    let Ok(plan) = JobPlan::compile(spec.clone()) else {
+        return false;
+    };
+    let kind = match record.kind.as_str() {
+        "checkpoint" => RecoveryArtifactKind::Checkpoint,
+        "savepoint" => RecoveryArtifactKind::Savepoint,
+        _ => return false,
+    };
+    let Ok(repository) = checkpoint_repository(&plan) else {
+        return false;
+    };
+    let artifact = RecoveryArtifact {
+        id: record.checkpoint_id.clone(),
+        kind,
+        manifest_key: recovery_manifest_key(kind, &record.checkpoint_id),
+        job_version: spec.version,
+        format_version: record.format_version,
+        created_at_ms: record.created_at_ms,
+        status: CheckpointStatus::Completed,
+    };
+    let Ok(manifest) = repository.read_manifest(&artifact) else {
+        return false;
+    };
+    if validate_recovery_manifest(
+        &plan,
+        &record.checkpoint_id,
+        record.format_version,
+        &manifest,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let task_ids = manifest
+        .task_attempts
+        .iter()
+        .map(|attempt| attempt.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let snapshot_tasks = manifest
+        .state_snapshots
+        .iter()
+        .map(|snapshot| snapshot.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if task_ids.is_empty() || !task_ids.is_subset(&snapshot_tasks) {
+        return false;
+    }
+    manifest
+        .state_snapshots
+        .iter()
+        .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
+}
+
 fn parse_recovery_payload(payload: &serde_json::Value) -> Result<(Option<String>, bool), String> {
     let Some(recovery) = payload.get("recovery") else {
         return Ok((None, false));

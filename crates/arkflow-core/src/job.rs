@@ -425,6 +425,35 @@ impl JobSpec {
             }
         }
 
+        let mut incoming = BTreeMap::<&str, Vec<&str>>::new();
+        for edge in &self.edges {
+            incoming
+                .entry(edge.to.as_str())
+                .or_default()
+                .push(edge.from.as_str());
+        }
+        for sink in &self.sinks {
+            let mut reachable = BTreeSet::from([sink.operator_id.as_str()]);
+            let mut pending = std::collections::VecDeque::from([sink.operator_id.as_str()]);
+            while let Some(operator_id) = pending.pop_front() {
+                for upstream in incoming.get(operator_id).into_iter().flatten() {
+                    if reachable.insert(upstream) {
+                        pending.push_back(upstream);
+                    }
+                }
+            }
+            if !self
+                .sources
+                .iter()
+                .any(|source| reachable.contains(source.operator_id.as_str()))
+            {
+                return Err(Error::Config(format!(
+                    "sink '{}' cannot be reached from any executable source",
+                    sink.operator_id
+                )));
+            }
+        }
+
         if self.checkpoint.is_some() && self.state.is_none() {
             return Err(Error::Config(
                 "checkpointing a Job requires a state specification".into(),
@@ -973,6 +1002,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("orphan-source"));
+    }
+
+    #[test]
+    fn rejects_sinks_that_cannot_be_reached_from_a_source() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "orphan-sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sinks.push(SinkSpec {
+            operator_id: "orphan-sink".into(),
+            output_type: "drop".into(),
+            config: serde_json::json!({}),
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("orphan-sink"));
     }
 
     #[test]

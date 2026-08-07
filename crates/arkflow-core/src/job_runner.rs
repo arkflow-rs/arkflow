@@ -30,6 +30,13 @@ struct SourceRuntime {
     late_policy: crate::job::LateEventPolicy,
     allowed_lateness_ms: u64,
     window_sizes_ms: Vec<i64>,
+    held: Vec<PendingEvent>,
+    pending_acks: Vec<Arc<dyn Ack>>,
+}
+
+struct PendingEvent {
+    batch: crate::MessageBatchRef,
+    event_time_ms: Option<i64>,
 }
 
 struct StatefulProcessor {
@@ -229,14 +236,14 @@ impl SingleComputeJobRunner {
             .map(|task| ((task.operator_id.clone(), task.subtask), task.id.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut inputs = Vec::with_capacity(source_tasks.len());
-        let mut source_task_counts = BTreeMap::<String, usize>::new();
         for (task, source) in &source_tasks {
             let input = adapter.build_input(source, resource)?;
-            let count = source_task_counts
-                .entry(task.operator_id.clone())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            if *count > 1 && !input.supports_partitioning() {
+            let job_source_task_count = plan
+                .tasks
+                .iter()
+                .filter(|candidate| candidate.operator_id == task.operator_id)
+                .count();
+            if job_source_task_count > 1 && !input.supports_partitioning() {
                 return Err(Error::Config(format!(
                     "source '{}' does not support partitioned task execution",
                     task.operator_id
@@ -428,6 +435,8 @@ impl SingleComputeJobRunner {
                         late_policy: source.time.late_event_policy,
                         allowed_lateness_ms: source.time.allowed_lateness_ms,
                         window_sizes_ms: applicable_window_sizes_ms,
+                        held: Vec::new(),
+                        pending_acks: Vec::new(),
                     },
                 );
             }
@@ -554,7 +563,15 @@ impl SingleComputeJobRunner {
             let Some(read) = (tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
                 _ = idle_tick.tick() => {
-                    self.refresh_idle_partitions()?;
+                    let ready = self.flush_held_event_time()?;
+                    let _guard = self.checkpoint_gate.read().await;
+                    for (source_task_id, batch, action) in ready {
+                        self.dispatch_event_action(&source_task_id, batch, action)
+                            .await?;
+                    }
+                    for ack in self.take_ready_acks()? {
+                        ack.ack().await?;
+                    }
                     continue;
                 }
                 result = reads.next() => result,
@@ -564,38 +581,94 @@ impl SingleComputeJobRunner {
             let (index, batch, ack) = read?;
             let _guard = self.checkpoint_gate.read().await;
             for (batch, action) in self.prepare_event_time(&self.source_task_ids[index], batch)? {
-                match action {
-                    WindowAction::Route => {
-                        self.dispatch_late_event(&self.source_task_ids[index], batch)
-                            .await?;
-                    }
-                    WindowAction::Update => {
-                        self.dispatch_window_update(&self.source_task_ids[index], batch)
-                            .await?;
-                    }
-                    WindowAction::Hold | WindowAction::Emit => {
-                        self.dispatch_from_source(&self.source_task_ids[index], batch)
-                            .await?;
-                    }
-                    WindowAction::Drop => {}
-                }
+                self.dispatch_event_action(&self.source_task_ids[index], batch, action)
+                    .await?;
             }
-            ack.ack().await?;
+            let source_task_id = &self.source_task_ids[index];
+            if self.has_held_events(source_task_id)? {
+                self.defer_ack(source_task_id, ack)?;
+            } else {
+                ack.ack().await?;
+            }
+            for ack in self.take_ready_acks_for(source_task_id)? {
+                ack.ack().await?;
+            }
             drop(_guard);
             reads.push(read_input(index, self.inputs[index].clone()));
         }
     }
 
-    fn refresh_idle_partitions(&self) -> Result<(), Error> {
+    fn flush_held_event_time(
+        &self,
+    ) -> Result<Vec<(String, crate::MessageBatchRef, WindowAction)>, Error> {
         let now_ms = crate::state::now_ms() as i64;
         let mut runtimes = self
             .source_runtimes
             .lock()
             .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
-        for runtime in runtimes.values_mut() {
+        let mut ready = Vec::new();
+        for (source_task_id, runtime) in runtimes.iter_mut() {
             runtime.tracker.refresh_idle(now_ms);
+            let held = std::mem::take(&mut runtime.held);
+            for pending in held {
+                let action = Self::event_time_action(
+                    runtime,
+                    pending.event_time_ms,
+                    runtime.tracker.watermark(),
+                    true,
+                );
+                if action == WindowAction::Hold {
+                    runtime.held.push(pending);
+                } else if action != WindowAction::Drop {
+                    ready.push((source_task_id.clone(), pending.batch, action));
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    fn has_held_events(&self, source_task_id: &str) -> Result<bool, Error> {
+        let runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        Ok(runtimes
+            .get(source_task_id)
+            .is_some_and(|runtime| !runtime.held.is_empty()))
+    }
+
+    fn defer_ack(&self, source_task_id: &str, ack: Arc<dyn Ack>) -> Result<(), Error> {
+        let mut runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        if let Some(runtime) = runtimes.get_mut(source_task_id) {
+            runtime.pending_acks.push(ack);
         }
         Ok(())
+    }
+
+    fn take_ready_acks(&self) -> Result<Vec<Arc<dyn Ack>>, Error> {
+        let source_task_ids = self.source_task_ids.clone();
+        let mut acks = Vec::new();
+        for source_task_id in source_task_ids {
+            acks.extend(self.take_ready_acks_for(&source_task_id)?);
+        }
+        Ok(acks)
+    }
+
+    fn take_ready_acks_for(&self, source_task_id: &str) -> Result<Vec<Arc<dyn Ack>>, Error> {
+        let mut runtimes = self
+            .source_runtimes
+            .lock()
+            .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
+        let Some(runtime) = runtimes.get_mut(source_task_id) else {
+            return Ok(Vec::new());
+        };
+        if runtime.held.is_empty() {
+            return Ok(std::mem::take(&mut runtime.pending_acks));
+        }
+        Ok(Vec::new())
     }
 
     fn prepare_event_time(
@@ -608,71 +681,100 @@ impl SingleComputeJobRunner {
             .lock()
             .map_err(|_| Error::Process("event-time runtime lock is unavailable".into()))?;
         let Some(runtime) = runtimes.get_mut(source_task_id) else {
-            return Ok(vec![(batch, WindowAction::Hold)]);
+            return Ok(vec![(batch, WindowAction::Emit)]);
         };
         let event_times_ms = runtime.extractor.extract_timestamps_ms(&batch)?;
         let now_ms = crate::state::now_ms() as i64;
         runtime.tracker.refresh_idle(now_ms);
-        let mut actions = Vec::with_capacity(event_times_ms.len());
-        for event_time_ms in event_times_ms {
-            let Some(event_time_ms) = event_time_ms else {
-                actions.push(
-                    if matches!(runtime.late_policy, crate::job::LateEventPolicy::Drop) {
-                        WindowAction::Drop
-                    } else {
-                        WindowAction::Hold
-                    },
-                );
-                continue;
-            };
-            let watermark_ms = runtime
+        let watermark_before = runtime.tracker.watermark();
+        let current_actions = event_times_ms
+            .iter()
+            .map(|event_time_ms| {
+                Self::event_time_action(runtime, *event_time_ms, watermark_before, false)
+            })
+            .collect::<Vec<_>>();
+        for event_time_ms in event_times_ms.iter().flatten().copied() {
+            runtime
                 .tracker
                 .observe(runtime.partition, event_time_ms, now_ms);
-            let action = runtime.window_sizes_ms.iter().min().map(|window_size| {
-                let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
-                window_action(
-                    window_start + *window_size,
+        }
+
+        let mut result = Vec::new();
+        let held = std::mem::take(&mut runtime.held);
+        for pending in held {
+            let action = Self::event_time_action(
+                runtime,
+                pending.event_time_ms,
+                runtime.tracker.watermark(),
+                true,
+            );
+            if action == WindowAction::Hold {
+                runtime.held.push(pending);
+            } else if action != WindowAction::Drop {
+                result.push((pending.batch, action));
+            }
+        }
+
+        for (index, (event_time_ms, action)) in
+            event_times_ms.into_iter().zip(current_actions).enumerate()
+        {
+            if action == WindowAction::Hold {
+                runtime.held.push(PendingEvent {
+                    batch: Self::filter_row(&batch, index)?,
                     event_time_ms,
-                    Some(watermark_ms),
-                    runtime.allowed_lateness_ms,
-                    runtime.late_policy,
-                )
-            });
-            actions.push(action.unwrap_or(WindowAction::Hold));
+                });
+            } else if action != WindowAction::Drop {
+                result.push((Self::filter_row(&batch, index)?, action));
+            }
         }
-        let mut groups = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for (index, action) in actions.into_iter().enumerate() {
-            let group = match action {
-                WindowAction::Hold => 0,
-                WindowAction::Emit => 1,
-                WindowAction::Update => 2,
-                WindowAction::Route => 3,
-                WindowAction::Drop => continue,
+        Ok(result)
+    }
+
+    fn event_time_action(
+        runtime: &SourceRuntime,
+        event_time_ms: Option<i64>,
+        watermark_ms: Option<i64>,
+        held: bool,
+    ) -> WindowAction {
+        let Some(event_time_ms) = event_time_ms else {
+            return if matches!(runtime.late_policy, crate::job::LateEventPolicy::Drop) {
+                WindowAction::Drop
+            } else {
+                WindowAction::Hold
             };
-            groups[group].push(index);
+        };
+        let Some(window_size) = runtime.window_sizes_ms.iter().min() else {
+            return WindowAction::Emit;
+        };
+        let window_start = event_time_ms.div_euclid(*window_size) * *window_size;
+        let window_end = window_start + *window_size;
+        if held {
+            return if watermark_ms >= Some(window_end) {
+                WindowAction::Emit
+            } else {
+                WindowAction::Hold
+            };
         }
-        let group_actions = [
-            WindowAction::Hold,
-            WindowAction::Emit,
-            WindowAction::Update,
-            WindowAction::Route,
-        ];
-        groups
-            .into_iter()
-            .zip(group_actions)
-            .filter(|(indices, _)| !indices.is_empty())
-            .map(|(indices, action)| {
-                let mut keep = vec![false; batch.len()];
-                for index in indices {
-                    keep[index] = true;
-                }
-                let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
-                    .map_err(|error| Error::Process(format!("filter late events: {error}")))?;
-                let mut filtered_batch = MessageBatch::new_arrow(filtered);
-                filtered_batch.set_input_name(batch.get_input_name());
-                Ok((Arc::new(filtered_batch), action))
-            })
-            .collect()
+        window_action(
+            window_end,
+            event_time_ms,
+            watermark_ms,
+            runtime.allowed_lateness_ms,
+            runtime.late_policy,
+        )
+    }
+
+    fn filter_row(
+        batch: &crate::MessageBatchRef,
+        index: usize,
+    ) -> Result<crate::MessageBatchRef, Error> {
+        let mut keep = vec![false; batch.len()];
+        keep[index] = true;
+        let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
+            .map_err(|error| Error::Process(format!("filter event-time row: {error}")))?;
+        let mut filtered_batch = MessageBatch::new_arrow(filtered);
+        filtered_batch.set_input_name(batch.get_input_name());
+        Ok(Arc::new(filtered_batch))
     }
 
     async fn dispatch_from_source(
@@ -681,6 +783,22 @@ impl SingleComputeJobRunner {
         batch: crate::MessageBatchRef,
     ) -> Result<(), Error> {
         self.dispatch(source_task_id, batch).await
+    }
+
+    async fn dispatch_event_action(
+        &self,
+        source_task_id: &str,
+        batch: crate::MessageBatchRef,
+        action: WindowAction,
+    ) -> Result<(), Error> {
+        match action {
+            WindowAction::Route => self.dispatch_late_event(source_task_id, batch).await,
+            WindowAction::Update => self.dispatch_window_update(source_task_id, batch).await,
+            WindowAction::Hold | WindowAction::Emit => {
+                self.dispatch_from_source(source_task_id, batch).await
+            }
+            WindowAction::Drop => Ok(()),
+        }
     }
 
     async fn dispatch_late_event(
@@ -861,6 +979,55 @@ mod tests {
         }
     }
 
+    struct UnpartitionedInput;
+
+    #[async_trait]
+    impl Input for UnpartitionedInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::Process("test input is not readable".into()))
+        }
+
+        fn supports_partitioning(&self) -> bool {
+            false
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct UnpartitionedAdapter;
+
+    impl JobComponentAdapter for UnpartitionedAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(UnpartitionedInput))
+        }
+
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(TestOutput))
+        }
+
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(TestProcessor))
+        }
+    }
+
     fn plan() -> JobPlan {
         JobPlan::compile(JobSpec {
             id: JobId::new("routing").unwrap(),
@@ -947,6 +1114,24 @@ mod tests {
         assert_eq!(runner.processors.len(), 2);
         assert_eq!(runner.edges["map-0"], vec!["sink-0", "sink-1"]);
         assert_eq!(runner.edges["map-1"], vec!["sink-0", "sink-1"]);
+    }
+
+    #[test]
+    fn rejects_unpartitioned_source_when_job_is_parallel() {
+        let plan = plan();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let result = SingleComputeJobRunner::build_for_tasks(
+            &plan,
+            &["source-0".into(), "map-0".into(), "sink-0".into()],
+            &UnpartitionedAdapter,
+            &resource,
+        );
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("does not support partitioned"))
+        );
     }
 
     #[tokio::test]
@@ -1098,13 +1283,27 @@ mod tests {
         .unwrap();
         let prepared = runner
             .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(mixed)))
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .0;
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared.record_batch().num_rows(), 1);
+            .unwrap();
+        assert!(prepared.is_empty());
+
+        let next = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, false),
+                Field::new("key", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2_000])),
+                Arc::new(StringArray::from(vec!["c"])),
+            ],
+        )
+        .unwrap();
+        let released = runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(next)))
+            .unwrap();
+        assert_eq!(released.len(), 2);
+        assert!(released
+            .iter()
+            .all(|(batch, action)| batch.len() == 1 && *action == WindowAction::Emit));
     }
 
     #[test]
