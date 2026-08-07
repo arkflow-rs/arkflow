@@ -27,6 +27,7 @@ const MAX_NODES: usize = 256;
 const MAX_COMMANDS_PER_NODE: usize = 128;
 const MAX_OPERATIONS: usize = 1024;
 const MAX_EVENTS: usize = 2048;
+const MAX_JOB_RECONCILIATIONS_PER_TICK: usize = 256;
 const SUPPORTED_PROTOCOL_VERSION: &str = "v1";
 const ALLOWED_NODE_METRICS: &[&str] = &[
     "input_batches",
@@ -379,6 +380,17 @@ impl Hub {
             self.reconcile_job(&job).await?;
         }
         Ok(job)
+    }
+
+    /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
+    /// recovery converge without waiting for a new lifecycle request.
+    pub async fn reconcile_jobs(&self) -> Result<usize, HubError> {
+        let jobs = self.jobs().await?;
+        let mut dispatched = 0;
+        for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
+            dispatched += self.reconcile_job(&job).await?;
+        }
+        Ok(dispatched)
     }
 
     pub async fn reconcile_job(&self, job: &JobRecord) -> Result<usize, HubError> {
@@ -4981,5 +4993,162 @@ mod tests {
             records[0].manifest_uri.as_deref(),
             Some("/tmp/final/checkpoint-7/manifest.json")
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_job_reconciliation_retries_a_failed_runtime() {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        let registration = hub
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            })
+            .await
+            .unwrap();
+        let job = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: serde_json::json!({
+                    "id": "orders",
+                    "version": 1,
+                    "operators": [{"id": "source", "kind": "source"}, {"id": "sink", "kind": "sink"}],
+                    "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+                    "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+                    "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+                })
+                .to_string(),
+                desired_state: "running".into(),
+                observed_state: "starting".into(),
+                convergence: "reconciling".into(),
+                generation: 1,
+                node_ids: vec!["compute-1".into()],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        let first = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token.clone(),
+            })
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token.clone(),
+            },
+            CommandResult {
+                command_id: first.id.clone(),
+                operation_id: first.operation_id.clone(),
+                state: HubOperationState::Failed,
+                progress: 100,
+                error: Some("runner failed".into()),
+                correlation_id: first.correlation_id,
+                generation: job.generation,
+                observed_generation: Some(job.generation),
+                action_id: None,
+                failure_class: Some("runtime".into()),
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hub.job("orders").await.unwrap().unwrap().observed_state,
+            "failed"
+        );
+        assert_eq!(hub.reconcile_jobs().await.unwrap(), 1);
+        let commands = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token,
+            })
+            .await
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            command.operation == "job_start"
+                && command.generation == job.generation
+                && command.id != first.id
+        }));
+    }
+
+    #[tokio::test]
+    async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery() {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub1 = Hub::with_storage(config(), storage.clone());
+        hub1.register(RegisterRequest {
+            node_id: "compute-1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+        })
+        .await
+        .unwrap();
+        let job = hub1
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: serde_json::json!({
+                    "id": "orders",
+                    "version": 1,
+                    "operators": [{"id": "source", "kind": "source"}, {"id": "sink", "kind": "sink"}],
+                    "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+                    "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+                    "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+                })
+                .to_string(),
+                desired_state: "stopped".into(),
+                observed_state: "running".into(),
+                convergence: "reconciling".into(),
+                generation: 3,
+                node_ids: vec!["compute-1".into()],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        drop(hub1);
+
+        let hub2 = Hub::with_storage(config(), storage);
+        hub2.recover_persisted_state().await.unwrap();
+        let registration = hub2
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(hub2.reconcile_jobs().await.unwrap(), 1);
+        let commands = hub2
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: registration.session_token,
+            })
+            .await
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            command.operation == "job_stop"
+                && command.resource_id == "orders"
+                && command.generation == job.generation
+        }));
     }
 }

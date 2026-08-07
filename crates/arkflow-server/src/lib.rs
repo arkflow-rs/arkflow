@@ -383,6 +383,7 @@ pub async fn serve_hub(
                     let started = crate::hub::now_ms_for_metrics();
                     let result = reconcile_hub.reconcile_once("hub-reconciler").await;
                     reconcile_hub.record_reconcile_result(started, &result).await;
+                    let _ = reconcile_hub.reconcile_jobs().await;
                     let _ = reconcile_hub.reconcile_rollouts().await;
                     let _ = reconcile_hub.prune_events(2048).await;
                 }
