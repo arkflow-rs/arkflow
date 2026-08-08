@@ -7,9 +7,9 @@
 use crate::agent::{delete_checkpoint_artifact, recovery_record_is_valid};
 use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
 use crate::storage::{
-    AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, NodeMutation,
-    ObservedMutation, PersistedOperation, RolloutRecord, RolloutTargetRecord, RolloutTargetUpdate,
-    StorageActor, StorageError,
+    AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, JobVersionRecord,
+    NodeMutation, ObservedMutation, PersistedOperation, RolloutRecord, RolloutTargetRecord,
+    RolloutTargetUpdate, StorageActor, StorageError,
 };
 use arkflow_core::control::{
     ControlEvent, NodeMaintenanceState, OperationRecord, OperationalStatus, ReconciliationHealth,
@@ -304,6 +304,7 @@ pub struct Hub {
     storage: Option<StorageActor>,
     lifecycle: Arc<RwLock<HubLifecycle>>,
     jobs: Arc<RwLock<BTreeMap<String, JobRecord>>>,
+    job_versions: Arc<RwLock<BTreeMap<String, Vec<JobVersionRecord>>>>,
     job_checkpoints: Arc<RwLock<BTreeMap<String, Vec<JobCheckpointRecord>>>>,
 }
 
@@ -331,6 +332,7 @@ impl Hub {
             storage: None,
             lifecycle: Arc::new(RwLock::new(HubLifecycle::default())),
             jobs: Arc::new(RwLock::new(BTreeMap::new())),
+            job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -360,8 +362,28 @@ impl Hub {
     }
 
     pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, HubError> {
+        let version_record = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
+            .ok()
+            .and_then(|spec| {
+                arkflow_core::job::JobPlan::compile(spec)
+                    .ok()
+                    .and_then(|plan| serde_json::to_string(&plan).ok())
+                    .map(|plan_json| JobVersionRecord {
+                        job_id: job.job_id.clone(),
+                        version: job.version,
+                        spec_json: job.spec_json.clone(),
+                        plan_json,
+                        created_at_ms: now_ms(),
+                    })
+            });
         if let Some(storage) = &self.storage {
             job = storage.upsert_job(job).await.map_err(HubError::from)?;
+            if let Some(record) = version_record.clone() {
+                storage
+                    .upsert_job_version(record)
+                    .await
+                    .map_err(HubError::from)?;
+            }
         } else {
             let mut jobs = self.jobs.write().await;
             job.generation = jobs
@@ -369,6 +391,13 @@ impl Hub {
                 .map(|current| current.generation.saturating_add(1))
                 .unwrap_or_else(|| job.generation.max(1));
             jobs.insert(job.job_id.clone(), job.clone());
+        }
+        if let Some(record) = version_record {
+            let mut versions = self.job_versions.write().await;
+            let entries = versions.entry(record.job_id.clone()).or_default();
+            entries.retain(|existing| existing.version != record.version);
+            entries.push(record);
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.version));
         }
         if self.storage.is_some() {
             self.jobs
@@ -380,6 +409,25 @@ impl Hub {
             self.reconcile_job(&job).await?;
         }
         Ok(job)
+    }
+
+    pub async fn job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, HubError> {
+        if let Some(storage) = &self.storage {
+            let versions = storage
+                .list_job_versions(job_id)
+                .await
+                .map_err(HubError::from)?;
+            if !versions.is_empty() {
+                return Ok(versions);
+            }
+        }
+        Ok(self
+            .job_versions
+            .read()
+            .await
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
@@ -511,12 +559,19 @@ impl Hub {
             }
         }
         let assignments = plan.assignments_for_nodes(&targets, job.generation);
+        let explicit_recovery_id = job.checkpoint_id.clone();
         let mut recovery_candidates = self
             .job_checkpoints(&job.job_id)
             .await?
             .into_iter()
             .filter(|record| record.status == "completed")
-            .filter(|record| recovery_record_is_compatible(&spec, record))
+            .filter(|record| {
+                if explicit_recovery_id.as_deref() == Some(record.checkpoint_id.as_str()) {
+                    record.format_version == job_state_format_version(&spec)
+                } else {
+                    recovery_record_is_compatible(&spec, record)
+                }
+            })
             .filter(|record| match spec.recovery {
                 arkflow_core::job::RecoveryPolicy::LatestCheckpoint => record.kind == "checkpoint",
                 arkflow_core::job::RecoveryPolicy::LatestSavepoint => record.kind == "savepoint",

@@ -21,9 +21,19 @@ Hub 持久化 Job、版本、任务分配和恢复记录，使用 generation 防
 ## API 示例
 
 ```http
+POST /api/v1/jobs/validate
 POST /api/v1/jobs
 PUT  /api/v1/jobs/{job_id}/desired-state
 GET  /api/v1/jobs/{job_id}
+GET  /api/v1/jobs/{job_id}/detail
+GET  /api/v1/jobs/{job_id}/versions
+POST /api/v1/jobs/{job_id}/checkpoints
+POST /api/v1/jobs/{job_id}/savepoints
+POST /api/v1/jobs/{job_id}/upgrades
+POST /api/v1/jobs/{job_id}/upgrades/{upgrade_id}/rollback
 ```
 
-建议先用 `stopped` 提交并检查编译后的 plan，再切换为 `running`。checkpoint/savepoint 的生命周期与 Job 版本、状态格式版本绑定。
+工作台和 API 都应先调用 `validate` 检查编译计划与节点能力，再以 `stopped` 提交并检查
+`detail`。确认后才切换为 `running`。版本升级要求 Job 已停止并收敛，且选择一个已完成、
+状态格式兼容的 savepoint；升级失败时保持停止状态，由操作者明确恢复旧版本。checkpoint/savepoint
+的生命周期与 Job 版本、状态格式版本绑定。

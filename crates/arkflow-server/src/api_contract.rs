@@ -129,6 +129,22 @@ pub struct CreateJobRequest {
     pub desired_state: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ValidateJobRequest {
+    pub spec: serde_json::Value,
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobUpgradeRequest {
+    pub spec: serde_json::Value,
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    pub expected_generation: u64,
+    pub savepoint_id: String,
+}
+
 fn default_job_desired_state() -> String {
     "stopped".into()
 }

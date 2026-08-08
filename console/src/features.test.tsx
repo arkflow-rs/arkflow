@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { Configuration, convertConfiguration } from './features'
+import { Jobs } from './features/jobs'
 import { Rollouts } from './features/rollouts'
 
 describe('configuration workflow', () => {
@@ -71,5 +72,25 @@ describe('rollout workflow', () => {
     expect(await screen.findByText('paused')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/rollouts/r-1/actions'), expect.objectContaining({ method: 'POST' }))
+  })
+})
+
+describe('distributed Job workbench', () => {
+  it('validates a Job plan before creating it in stopped state', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: { tasks: [] }, required_capabilities: [], nodes: [], warnings: [] }) })
+      if (url.endsWith('/jobs') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ job_id: 'new-job', version: 1, desired_state: 'stopped', observed_state: 'validated', convergence: 'pending', generation: 1, node_ids: [], updated_at_ms: 1 }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const refresh = vi.fn()
+    render(<Jobs jobs={[]} nodes={[]} onRefresh={refresh} onError={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Create Job' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    expect(await screen.findByText('Plan is valid')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Create stopped' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/jobs'), expect.objectContaining({ method: 'POST' })))
+    expect(refresh).toHaveBeenCalled()
   })
 })

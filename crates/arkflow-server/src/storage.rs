@@ -225,7 +225,7 @@ pub struct JobRecord {
     pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobVersionRecord {
     pub job_id: String,
     pub version: u64,
@@ -371,6 +371,14 @@ enum StorageCommand {
     },
     ListJobs {
         response: oneshot::Sender<Result<Vec<JobRecord>, StorageError>>,
+    },
+    UpsertJobVersion {
+        record: JobVersionRecord,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ListJobVersions {
+        job_id: String,
+        response: oneshot::Sender<Result<Vec<JobVersionRecord>, StorageError>>,
     },
     UpdateJob {
         job_id: String,
@@ -567,6 +575,12 @@ impl StorageActor {
                     }
                     StorageCommand::ListJobs { response } => {
                         let _ = response.send(store.list_jobs());
+                    }
+                    StorageCommand::UpsertJobVersion { record, response } => {
+                        let _ = response.send(store.upsert_job_version(record));
+                    }
+                    StorageCommand::ListJobVersions { job_id, response } => {
+                        let _ = response.send(store.list_job_versions(&job_id));
                     }
                     StorageCommand::UpdateJob {
                         job_id,
@@ -830,6 +844,30 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::ListJobs { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJobVersion { record, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_job_versions(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Vec<JobVersionRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobVersions {
+                job_id: job_id.into(),
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -2651,6 +2689,40 @@ impl ControlPlaneStore {
                     row_to_job,
                 )
                 .optional()
+        })
+    }
+
+    pub fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_job_versions (job_id, version, spec_json, plan_json, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(job_id, version) DO UPDATE SET spec_json=excluded.spec_json, plan_json=excluded.plan_json",
+                rusqlite::params![
+                    record.job_id,
+                    record.version,
+                    record.spec_json,
+                    record.plan_json,
+                    record.created_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, version, spec_json, plan_json, created_at_ms FROM cp_job_versions WHERE job_id = ?1 ORDER BY version DESC",
+            )?;
+            let rows = statement.query_map([job_id], |row| {
+                Ok(JobVersionRecord {
+                    job_id: row.get(0)?,
+                    version: row.get(1)?,
+                    spec_json: row.get(2)?,
+                    plan_json: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })?;
+            rows.collect()
         })
     }
 

@@ -10,8 +10,8 @@ pub mod storage;
 
 use crate::api_contract::{
     AcceptedIntentResponse, CreateJobRequest, CreateRolloutRequest, DesiredStateRequest,
-    JobDesiredStateRequest, OperatorAction, OperatorPrincipal, RestartActionRequest,
-    RolloutActionRequest,
+    JobDesiredStateRequest, JobUpgradeRequest, OperatorAction, OperatorPrincipal,
+    RestartActionRequest, RolloutActionRequest, ValidateJobRequest,
 };
 use crate::storage::{DesiredMutation, JobRecord};
 use arkflow_core::component::{self, ComponentKind};
@@ -266,7 +266,15 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/nodes", get(hub_nodes))
         .route("/streams", get(hub_streams))
         .route("/jobs", get(hub_jobs).post(hub_create_job))
+        .route("/jobs/validate", post(hub_validate_job))
         .route("/jobs/{id}", get(hub_job))
+        .route("/jobs/{id}/detail", get(hub_job_detail))
+        .route("/jobs/{id}/versions", get(hub_job_versions))
+        .route("/jobs/{id}/upgrades", post(hub_job_upgrade))
+        .route(
+            "/jobs/{id}/upgrades/{upgrade_id}/rollback",
+            post(hub_job_upgrade_rollback),
+        )
         .route("/jobs/{id}/plan", get(hub_job_plan))
         .route("/jobs/{id}/status", get(hub_job))
         .route(
@@ -662,6 +670,404 @@ async fn hub_job_checkpoints(
     }
     match hub.job_checkpoints(&job_id).await {
         Ok(records) => Json(records).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_validate_job(
+    State(hub): State<hub::Hub>,
+    headers: HeaderMap,
+    Json(request): Json<ValidateJobRequest>,
+) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Configure, "job", None).await
+    {
+        return response;
+    }
+    let spec: arkflow_core::job::JobSpec = match serde_json::from_value(request.spec.clone()) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_job_spec",
+                error.to_string(),
+            )
+        }
+    };
+    if let Err(error) = spec.validate() {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_job_spec",
+            error.to_string(),
+        );
+    }
+    let plan = match arkflow_core::job::JobPlan::compile(spec.clone()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_job_plan",
+                error.to_string(),
+            )
+        }
+    };
+    let nodes = hub.nodes().await;
+    let candidates = if request.node_ids.is_empty() {
+        nodes.clone()
+    } else {
+        nodes
+            .into_iter()
+            .filter(|node| request.node_ids.iter().any(|id| id == &node.id))
+            .collect::<Vec<_>>()
+    };
+    let required = ["job_runtime", "state_backend"];
+    let compatibility = candidates
+        .iter()
+        .map(|node| {
+            let missing = required
+                .iter()
+                .filter(|capability| !node.capabilities.iter().any(|item| item == **capability))
+                .map(|capability| (*capability).to_owned())
+                .collect::<Vec<_>>();
+            let online = matches!(node.state, hub::NodeConnectionState::Online);
+            serde_json::json!({
+                "node_id": node.id,
+                "state": node.state,
+                "capabilities": node.capabilities,
+                "compatible": online && missing.is_empty(),
+                "missing_capabilities": if online { missing } else { vec!["online_lease".to_owned()] },
+            })
+        })
+        .collect::<Vec<_>>();
+    let compatible = compatibility
+        .iter()
+        .all(|node| node["compatible"].as_bool().unwrap_or(false));
+    Json(serde_json::json!({
+        "valid": compatible || compatibility.is_empty(),
+        "plan": plan,
+        "required_capabilities": required,
+        "nodes": compatibility,
+        "warnings": if compatibility.is_empty() { vec!["No online compute nodes selected".to_owned()] } else { Vec::new() },
+    }))
+    .into_response()
+}
+
+async fn hub_job_detail(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let Some(job) = (match hub.job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return hub_problem(error),
+    }) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    };
+    let spec: arkflow_core::job::JobSpec = match serde_json::from_str(&job.spec_json) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_persisted_job",
+                error.to_string(),
+            )
+        }
+    };
+    let plan = match arkflow_core::job::JobPlan::compile(spec) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_job_plan",
+                error.to_string(),
+            )
+        }
+    };
+    let nodes = hub.nodes().await;
+    let selected_nodes = if job.node_ids.is_empty() {
+        nodes.clone()
+    } else {
+        nodes
+            .into_iter()
+            .filter(|node| job.node_ids.iter().any(|id| id == &node.id))
+            .collect::<Vec<_>>()
+    };
+    let assignments = plan.assignments_for_nodes(
+        &selected_nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>(),
+        job.generation,
+    );
+    let operations = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .filter(|operation| operation.resource_id == job_id)
+        .collect::<Vec<_>>();
+    let checkpoints = match hub.job_checkpoints(&job_id).await {
+        Ok(checkpoints) => checkpoints,
+        Err(error) => return hub_problem(error),
+    };
+    let metrics = hub.metrics(None).await;
+    Json(serde_json::json!({
+        "job": job,
+        "plan": plan,
+        "tasks": assignments,
+        "nodes": selected_nodes,
+        "operations": operations,
+        "checkpoints": checkpoints,
+        "metrics": {
+            "watermark_lag_ms": metrics.get("watermark_lag_ms").copied().unwrap_or_default(),
+            "state_bytes": metrics.get("state_bytes").copied().unwrap_or_default(),
+            "checkpoint_duration_ms": metrics.get("checkpoint_duration_ms").copied().unwrap_or_default(),
+            "checkpoint_failures": metrics.get("checkpoint_failures").copied().unwrap_or_default(),
+            "recovery_progress": metrics.get("recovery_progress").copied().unwrap_or_default(),
+            "task_pressure": metrics.get("task_pressure").copied().unwrap_or_default(),
+            "partition_health": metrics.get("partition_health").copied().unwrap_or_default(),
+        }
+    }))
+    .into_response()
+}
+
+async fn hub_job_versions(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !hub.operator_authorized(bearer(&headers)) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    if matches!(hub.job(&job_id).await, Ok(None)) {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    }
+    match hub.job_versions(&job_id).await {
+        Ok(versions) => Json(versions).into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_upgrade(
+    State(hub): State<hub::Hub>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<JobUpgradeRequest>,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Configure,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(current) = (match hub.job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return hub_problem(error),
+    }) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    };
+    if current.generation != request.expected_generation {
+        return problem_with_details(
+            StatusCode::CONFLICT,
+            "generation_conflict",
+            "Job changed while the upgrade was being prepared".into(),
+            Some(
+                serde_json::json!({"expected": request.expected_generation, "current": current.generation}),
+            ),
+        );
+    }
+    if current.desired_state != "stopped" || current.observed_state == "running" {
+        return problem(
+            StatusCode::CONFLICT,
+            "job_must_be_stopped",
+            "Stop and converge the current Job before upgrading".into(),
+        );
+    }
+    let mut spec: arkflow_core::job::JobSpec = match serde_json::from_value(request.spec.clone()) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_job_spec",
+                error.to_string(),
+            )
+        }
+    };
+    if spec.id.as_str() != job_id {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_spec",
+            "upgrade spec id must match the Job id".into(),
+        );
+    }
+    if spec.version.0 <= current.version {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_version",
+            "upgrade version must be greater than the current version".into(),
+        );
+    }
+    if let Err(error) = spec
+        .validate()
+        .and_then(|_| arkflow_core::job::JobPlan::compile(spec.clone()).map(|_| ()))
+    {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_job_plan",
+            error.to_string(),
+        );
+    }
+    let checkpoint = match hub.job_checkpoints(&job_id).await.map(|records| {
+        records.into_iter().find(|record| {
+            record.checkpoint_id == request.savepoint_id
+                && record.kind == "savepoint"
+                && record.status == "completed"
+        })
+    }) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => {
+            return problem(
+                StatusCode::CONFLICT,
+                "savepoint_not_ready",
+                "The selected savepoint is not completed".into(),
+            )
+        }
+        Err(error) => return hub_problem(error),
+    };
+    let format_version = spec
+        .state
+        .as_ref()
+        .map(|state| state.format_version)
+        .unwrap_or(1);
+    if checkpoint.format_version != format_version {
+        return problem(
+            StatusCode::CONFLICT,
+            "state_format_incompatible",
+            "The savepoint state format is incompatible with the new Job version".into(),
+        );
+    }
+    spec.recovery = arkflow_core::job::RecoveryPolicy::LatestSavepoint;
+    let upgraded = JobRecord {
+        job_id: job_id.clone(),
+        version: spec.version.0,
+        spec_json: serde_json::to_string(&spec).unwrap_or_else(|_| request.spec.to_string()),
+        desired_state: "stopped".into(),
+        observed_state: "stopped".into(),
+        convergence: "pending_recovery".into(),
+        generation: current.generation,
+        node_ids: if request.node_ids.is_empty() {
+            current.node_ids.clone()
+        } else {
+            request.node_ids
+        },
+        checkpoint_id: Some(checkpoint.checkpoint_id.clone()),
+        last_error: None,
+        updated_at_ms: hub::now_ms_for_metrics(),
+    };
+    match hub.upsert_job(upgraded).await {
+        Ok(job) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "upgrade_id": format!("upgrade-{}", hub::now_ms_for_metrics()),
+                "state": "pending_recovery",
+                "savepoint_id": checkpoint.checkpoint_id,
+                "job": job,
+            })),
+        )
+            .into_response(),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_upgrade_rollback(
+    State(hub): State<hub::Hub>,
+    Path((job_id, _upgrade_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Operate,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(current) = (match hub.job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return hub_problem(error),
+    }) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("Unknown Job {job_id}"),
+        );
+    };
+    let versions = match hub.job_versions(&job_id).await {
+        Ok(versions) => versions,
+        Err(error) => return hub_problem(error),
+    };
+    let Some(previous) = versions
+        .into_iter()
+        .find(|version| version.version < current.version)
+    else {
+        return problem(
+            StatusCode::CONFLICT,
+            "no_previous_job_version",
+            "No previous Job version is available for recovery".into(),
+        );
+    };
+    let restored_spec_json =
+        serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json)
+            .map(|mut spec| {
+                spec.recovery = arkflow_core::job::RecoveryPolicy::LatestSavepoint;
+                serde_json::to_string(&spec).unwrap_or(previous.spec_json.clone())
+            })
+            .unwrap_or(previous.spec_json);
+    let restored = JobRecord {
+        job_id: job_id.clone(),
+        version: previous.version,
+        spec_json: restored_spec_json,
+        desired_state: "stopped".into(),
+        observed_state: "stopped".into(),
+        convergence: "pending_recovery".into(),
+        generation: current.generation,
+        node_ids: current.node_ids,
+        checkpoint_id: current.checkpoint_id,
+        last_error: None,
+        updated_at_ms: hub::now_ms_for_metrics(),
+    };
+    match hub.upsert_job(restored).await {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err(error) => hub_problem(error),
     }
 }
@@ -3004,6 +3410,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn job_workbench_routes_validate_create_detail_and_versions() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator-secret".into()),
+            node_token: None,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+        });
+        let app = hub_router(hub, &ServerConfig::default());
+        let spec = serde_json::json!({
+            "id": "workbench-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs/validate")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"spec": spec, "node_ids": []}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"spec": spec, "desired_state": "stopped"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/jobs/workbench-job/detail")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["job"]["job_id"], "workbench-job");
+        assert!(detail["plan"].is_object());
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/jobs/workbench-job/versions")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

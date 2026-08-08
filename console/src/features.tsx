@@ -5,7 +5,7 @@ import { api, Component, ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion
 export type Snapshot = { system: SystemResource|null; status: EngineStatus|null; nodes: ControlNode[]; streams: StreamStatus[]; jobs: Job[]; operations: Operation[]; events: ControlEvent[]; metrics?: MetricsResponse }
 export type Command = (id: string, action: 'start'|'stop'|'restart') => Promise<void>
 
-export function Jobs({jobs, onRefresh}:{jobs:Job[]; onRefresh:()=>void}) { return <section className="panel"><div className="panel-title"><h3>Stateful Jobs</h3><span>{jobs.length} registered</span></div>{jobs.length === 0 ? <p className="empty">No distributed Jobs submitted.</p> : <div className="table">{jobs.map(job => <div className="row" key={job.job_id}><div><strong>{job.job_id}</strong><small>version {job.version} · generation {job.generation} · nodes {job.node_ids.join(', ') || 'unassigned'}</small></div><div><span className={`state ${job.observed_state}`}>{job.observed_state}</span><small>desired: {job.desired_state} · {job.convergence}</small></div><div className="actions"><button onClick={()=>void api.setJobState(job.job_id, job.desired_state === 'running' ? 'stopped' : 'running').then(onRefresh)}>{job.desired_state === 'running' ? 'Stop' : 'Start'}</button></div></div>)}</div>}</section> }
+export { Jobs } from './features/jobs'
 
 const number = (value: number|undefined) => value === undefined ? '—' : new Intl.NumberFormat().format(value)
 const time = (value?: number) => value ? new Date(value).toLocaleString() : '—'
