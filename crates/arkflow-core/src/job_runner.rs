@@ -462,18 +462,10 @@ impl SingleComputeJobRunner {
         cancellation: CancellationToken,
         recovery: Option<&RecoveryPlan>,
     ) -> Result<(), Error> {
-        for input in &self.inputs {
-            input.connect().await?;
-        }
-        if let Some(recovery) = recovery {
-            for input in &self.inputs {
-                input.restore_positions(&recovery.source_positions).await?;
-            }
-        }
-        for output in self.outputs.values() {
-            output.connect().await?;
-        }
-        let result = self.run_connected(cancellation).await;
+        let result = match self.connect_all(recovery).await {
+            Ok(()) => self.run_connected(cancellation).await,
+            Err(error) => Err(error),
+        };
         for processor in self.processors.values() {
             if let Err(error) = processor.close().await {
                 tracing::warn!(%error, "failed to close Job processor");
@@ -490,6 +482,21 @@ impl SingleComputeJobRunner {
             }
         }
         result
+    }
+
+    async fn connect_all(&self, recovery: Option<&RecoveryPlan>) -> Result<(), Error> {
+        for input in &self.inputs {
+            input.connect().await?;
+        }
+        if let Some(recovery) = recovery {
+            for input in &self.inputs {
+                input.restore_positions(&recovery.source_positions).await?;
+            }
+        }
+        for output in self.outputs.values() {
+            output.connect().await?;
+        }
+        Ok(())
     }
 
     pub async fn current_source_positions(
@@ -737,10 +744,14 @@ impl SingleComputeJobRunner {
         held: bool,
     ) -> WindowAction {
         let Some(event_time_ms) = event_time_ms else {
-            return if matches!(runtime.late_policy, crate::job::LateEventPolicy::Drop) {
-                WindowAction::Drop
-            } else {
-                WindowAction::Hold
+            // A null timestamp cannot join any window; treat the row as
+            // unusable under the late-event policy instead of holding it
+            // forever (it would never satisfy a watermark condition).
+            return match runtime.late_policy {
+                crate::job::LateEventPolicy::Route => WindowAction::Route,
+                crate::job::LateEventPolicy::Drop | crate::job::LateEventPolicy::Update => {
+                    WindowAction::Drop
+                }
             };
         };
         let Some(window_size) = runtime.window_sizes_ms.iter().min() else {
@@ -1351,5 +1362,90 @@ mod tests {
             .unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].1, WindowAction::Route);
+    }
+
+    #[test]
+    fn routes_null_timestamps_under_the_late_event_policy() {
+        let mut plan = plan();
+        let source = plan.spec.sources.first_mut().unwrap();
+        source.time = TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(crate::job::WatermarkSpec {
+                strategy: crate::job::WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 0,
+            late_event_policy: LateEventPolicy::Route,
+            late_event_route: None,
+        };
+        plan.spec.operators[1].kind = OperatorKind::Window;
+        plan.spec.operators[1].config = serde_json::json!({"window_size_ms": 1_000});
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner =
+            SingleComputeJobRunner::build_for_tasks(&plan, &task_ids, &TestAdapter, &resource)
+                .unwrap();
+        let null_ts = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None::<i64>]))],
+        )
+        .unwrap();
+        let actions = runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(null_ts)))
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].1, WindowAction::Route);
+        assert!(!runner.has_held_events("source-0").unwrap());
+    }
+
+    #[test]
+    fn drops_null_timestamps_under_the_drop_policy() {
+        let mut plan = plan();
+        let source = plan.spec.sources.first_mut().unwrap();
+        source.time = TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(crate::job::WatermarkSpec {
+                strategy: crate::job::WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 0,
+            late_event_policy: LateEventPolicy::Drop,
+            late_event_route: None,
+        };
+        plan.spec.operators[1].kind = OperatorKind::Window;
+        plan.spec.operators[1].config = serde_json::json!({"window_size_ms": 1_000});
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let resource = Resource {
+            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let runner =
+            SingleComputeJobRunner::build_for_tasks(&plan, &task_ids, &TestAdapter, &resource)
+                .unwrap();
+        let null_ts = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None::<i64>]))],
+        )
+        .unwrap();
+        let actions = runner
+            .prepare_event_time("source-0", Arc::new(MessageBatch::new_arrow(null_ts)))
+            .unwrap();
+        assert!(actions.is_empty());
+        assert!(!runner.has_held_events("source-0").unwrap());
     }
 }

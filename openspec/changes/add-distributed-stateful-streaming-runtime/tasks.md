@@ -199,3 +199,11 @@
 - [x] 28.1 Stop Job runtimes on nodes that lose their current-generation task assignments.
 - [x] 28.2 Deduplicate same-generation successful Job starts during reconciliation and Agent registration.
 - [x] 28.3 Reload persisted checkpoint metadata before completing an in-flight checkpoint after Hub restart.
+
+## 29. Follow-up review remediation
+
+- [x] 29.1 Close already-connected inputs, outputs, and processors when Job startup fails partway through the connect phase.
+- [x] 29.2 Issue a fresh cancellation token to restarted task attempts and record the stop generation for fencing.
+- [x] 29.3 Buffer finished Job outcomes and retry failed observation posts so the Hub eventually learns terminal Job state.
+- [x] 29.4 Route or drop null-timestamp rows under the late-event policy instead of holding them forever.
+- [x] 29.5 Reference the shared `url` dependency through the workspace manifest across crates.

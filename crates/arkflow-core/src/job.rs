@@ -728,6 +728,9 @@ impl TaskAttemptController {
         if self.is_stale(generation) {
             return Err(Error::Config("stale task attempt generation".into()));
         }
+        if self.cancellation.is_cancelled() {
+            self.cancellation = CancellationToken::new();
+        }
         self.attempt.generation = generation;
         self.attempt.state = TaskAttemptState::Running;
         Ok(())
@@ -737,6 +740,7 @@ impl TaskAttemptController {
         if self.is_stale(generation) {
             return Err(Error::Config("stale task attempt generation".into()));
         }
+        self.attempt.generation = generation;
         self.attempt.state = TaskAttemptState::Stopping;
         self.cancellation.cancel();
         Ok(())
@@ -1096,6 +1100,28 @@ mod tests {
         controller.start(3).unwrap();
         controller.supersede();
         assert!(controller.start(4).is_err());
+    }
+
+    #[test]
+    fn restart_after_stop_gets_a_fresh_cancellation_token() {
+        let attempt = TaskAttempt {
+            id: "aggregate-0:node-a:0".into(),
+            job_id: JobId::new("orders").unwrap(),
+            job_version: JobVersion(1),
+            task_id: "aggregate-0".into(),
+            generation: 1,
+            node_id: "node-a".into(),
+            state: TaskAttemptState::Queued,
+        };
+        let mut controller = TaskAttemptController::new(attempt);
+        controller.start(1).unwrap();
+        controller.stop(1).unwrap();
+        assert!(controller.cancellation_token().is_cancelled());
+        // A restarted attempt must observe an active token, not the cancelled
+        // one from the previous attempt.
+        controller.start(2).unwrap();
+        assert!(!controller.cancellation_token().is_cancelled());
+        assert_eq!(controller.attempt().generation, 2);
     }
 
     #[test]

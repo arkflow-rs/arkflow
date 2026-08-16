@@ -64,6 +64,7 @@ mockall = "0.14"
 redb = "2"
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
+url = "2.5.8"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
 arkflow-server = { path = "crates/arkflow-server" }

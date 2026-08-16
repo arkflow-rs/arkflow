@@ -47,10 +47,13 @@ pub struct NodeAgentConfig {
     pub poll_interval: Duration,
 }
 
+type PendingJobOutcome = (String, u64, Result<(), String>);
+
 #[derive(Clone, Default)]
 struct JobRuntime {
     tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
     starts: Arc<Mutex<()>>,
+    pending_observations: Arc<Mutex<Vec<PendingJobOutcome>>>,
 }
 
 struct JobTask {
@@ -656,7 +659,7 @@ impl JobRuntime {
         ))
     }
 
-    async fn take_finished(&self) -> Vec<(String, u64, Result<(), String>)> {
+    async fn take_finished(&self) -> Vec<PendingJobOutcome> {
         let mut finished = Vec::new();
         let mut tasks = self.tasks.lock().await;
         let ids = tasks
@@ -675,6 +678,17 @@ impl JobRuntime {
             }
         }
         finished
+    }
+
+    /// Buffer a Job outcome that the Hub has not accepted yet, so it is
+    /// retried on a later poll tick instead of being discarded.
+    async fn buffer_pending_observation(&self, outcome: PendingJobOutcome) {
+        self.pending_observations.lock().await.push(outcome);
+    }
+
+    /// Take the buffered observations for a retry round.
+    async fn take_pending_observations(&self) -> Vec<PendingJobOutcome> {
+        std::mem::take(&mut *self.pending_observations.lock().await)
     }
 
     async fn stop(&self, job_id: &str, generation: u64) -> Result<(), String> {
@@ -872,22 +886,33 @@ async fn run_session(
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq).await).await?; }
             _ = poll.tick() => {
-                for (job_id, generation, outcome) in job_runtime.take_finished().await {
-                    let (state, error) = match outcome {
-                        Ok(()) => ("stopped".into(), None),
-                        Err(error) => ("failed".into(), Some(error)),
+                // Retry buffered observations first: only drop one after the Hub accepts it.
+                let mut retry = job_runtime.take_pending_observations().await;
+                retry.extend(job_runtime.take_finished().await);
+                let mut still_pending = Vec::with_capacity(retry.len());
+                for (job_id, generation, outcome) in retry.drain(..) {
+                    let (state, error) = match &outcome {
+                        Ok(()) => ("stopped", None),
+                        Err(error) => ("failed", Some(error.clone())),
                     };
-                    post_json(
+                    let post = post_json(
                         client,
                         format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/job-observations"),
                         &crate::hub::JobObservationRequest {
                             auth: auth.clone(),
-                            job_id,
+                            job_id: job_id.clone(),
                             generation,
-                            state,
+                            state: state.into(),
                             error,
                         },
-                    ).await?;
+                    ).await;
+                    if let Err(error) = post {
+                        warn!(job_id = %job_id, error = %error, "failed to post Job observation; will retry");
+                        still_pending.push((job_id, generation, outcome));
+                    }
+                }
+                for outcome in still_pending {
+                    job_runtime.buffer_pending_observation(outcome).await;
                 }
                 let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish();
                 let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?;
