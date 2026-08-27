@@ -329,6 +329,7 @@ name = "arkflow-server"
 version = "0.5.0"
 dependencies = [
  "arkflow-core",
+ "arkflow-plugin",
  "axum",
  "bytes",
  "futures-util",
