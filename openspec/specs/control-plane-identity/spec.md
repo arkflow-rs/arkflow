@@ -1,8 +1,8 @@
-# Purpose
+## Purpose
 
 Define operator identity, resource-scoped authorization, and actor-aware control-plane auditing.
 
-# Requirements
+## Requirements
 
 ### Requirement: Authenticated operator principal
 

@@ -1,8 +1,8 @@
-# Purpose
+## Purpose
 
 Define the dedicated ArkFlow control-plane service boundary, resource API, runtime operations, and transport security behavior.
 
-# Requirements
+## Requirements
 
 ### Requirement: Dedicated control-plane service boundary
 

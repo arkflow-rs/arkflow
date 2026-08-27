@@ -75,8 +75,7 @@ downstream idempotency — and SHALL state that L3 true end-to-end EOS
   `openspec/specs/exactly-once-output/spec.md`
 
 ### Requirement: Component inventory parity across landing docs
-For the primary configurable categories — inputs, processors, outputs, and
-buffers — `README.md`, `README_zh.md`, and `docs/docs/0-intro.md` SHALL
+For the primary configurable categories (inputs, processors, outputs, and buffers), `README.md`, `README_zh.md`, and `docs/docs/0-intro.md` SHALL
 enumerate the same set of components, and that set SHALL equal the components
 registered in the engine (as surfaced by `arkflow components list`) for those
 categories. The SQL input SHALL be named consistently ("SQL") across all three
@@ -106,8 +105,7 @@ MAY mention them but are not required to enumerate them fully.
   window only, and does not list "join" as a peer buffer type
 
 ### Requirement: Feature coverage reflects shipped capabilities
-The README (`README.md`, `README_zh.md`) and `docs/docs/0-intro.md` feature
-sections SHALL mention the shipped headline capabilities: CDC via Debezium,
+The README (`README.md`, `README_zh.md`) and `docs/docs/0-intro.md` feature sections SHALL mention the shipped headline capabilities: CDC via Debezium,
 Schema Registry (Confluent wire-format Protobuf), WAL input durability,
 exactly-once output, and the control-plane Hub. Mentions need not be deep but
 MUST surface each capability's existence to a first-time reader.

@@ -1,8 +1,8 @@
-# Purpose
+## Purpose
 
 Define bounded operational health, diagnostics, and metrics for production control-plane operation.
 
-# Requirements
+## Requirements
 
 ### Requirement: Operational health snapshot
 
