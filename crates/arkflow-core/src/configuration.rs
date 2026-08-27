@@ -183,9 +183,31 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
     }
 
     for (index, stream) in config.streams.iter().enumerate() {
-        if let Err(error) = stream.build() {
+        // Kernel-equivalent validation: compile to a JobSpec, then dry-run
+        // component construction and graph building (unknown inputs,
+        // processors, temporaries, and broken graphs all surface here).
+        if let Err(error) = (|| -> Result<(), crate::Error> {
+            let spec = crate::executor::stream_compiler::compile_stream(stream, index)?;
+            let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                stream.durability.as_ref(),
+                stream.temporary.clone(),
+            )?;
+            let mut resource = adapter.build_resource()?;
+            let plan = crate::job::JobPlan::compile(spec)?;
+            crate::executor::graph::ExecutionGraphBuilder::default()
+                .build(&plan, &adapter, &mut resource)?;
+            Ok(())
+        })() {
             errors.push(ConfigIssue {
                 path: format!("streams[{index}]"),
+                message: error.to_string(),
+            });
+        }
+    }
+    for (index, job) in config.jobs.iter().enumerate() {
+        if let Err(error) = job.validate() {
+            errors.push(ConfigIssue {
+                path: format!("jobs[{index}]"),
                 message: error.to_string(),
             });
         }

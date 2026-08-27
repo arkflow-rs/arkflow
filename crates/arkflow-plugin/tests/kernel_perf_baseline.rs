@@ -1,6 +1,7 @@
-//! Performance baseline (task 6.4): the same generate → sql → drop workload
-//! through (a) the legacy linear Stream runtime and (b) the unified kernel.
-//! Run with `cargo test -p arkflow-plugin --test kernel_perf_baseline -- --ignored --nocapture`.
+//! Throughput baseline for the unified kernel (the legacy linear executor is
+//! retired; the original migration comparison measured kernel 528ms vs legacy
+//! 559ms on this workload — 6% faster). Run with
+//! `cargo test -p arkflow-plugin --test kernel_perf_baseline -- --ignored --nocapture`.
 
 use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
@@ -40,14 +41,6 @@ streams:
     )
 }
 
-async fn run_legacy(config: &EngineConfig) -> Duration {
-    let started = Instant::now();
-    let mut stream = config.streams[0].build().unwrap();
-    let cancellation = CancellationToken::new();
-    stream.run(cancellation).await.unwrap();
-    started.elapsed()
-}
-
 async fn run_kernel(config: &EngineConfig) -> Duration {
     let started = Instant::now();
     let spec = compile_stream(&config.streams[0], 0).unwrap();
@@ -64,17 +57,14 @@ async fn run_kernel(config: &EngineConfig) -> Duration {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf baseline: run explicitly with --ignored --nocapture"]
-async fn baseline_legacy_vs_kernel() {
+async fn kernel_throughput_baseline() {
     setup();
     let count = 200_000;
     let config: EngineConfig = serde_yaml::from_str(&workload_yaml(count)).unwrap();
 
-    // Warm up builders/registries, then measure both paths.
-    let legacy = run_legacy(&config).await;
     let kernel = run_kernel(&config).await;
     println!(
         "workload: generate(batch=1000, count={count}) → json_to_arrow → sql(sum) → drop");
-    println!("legacy Stream runtime : {legacy:?}");
-    println!("unified kernel        : {kernel:?}");
-    println!("ratio (kernel/legacy) : {:.2}", kernel.as_secs_f64() / legacy.as_secs_f64());
+    println!("unified kernel: {kernel:?} ({:.0} rows/s)",
+        count as f64 / kernel.as_secs_f64());
 }

@@ -60,10 +60,8 @@ struct JobTask {
     watermark_partitions: BTreeMap<String, u32>,
     state: Arc<dyn StateBackend>,
     checkpoint_store_uri: Option<String>,
-    runner: Arc<arkflow_core::job_runner::SingleComputeJobRunner>,
-    /// Unified-kernel snapshot handle: same job graph, command-driven
-    /// snapshots. While present, `checkpoint` prefers it over the legacy
-    /// runner; the legacy path stays until its tests migrate.
+    /// Unified-kernel handle: command-driven snapshots over the running
+    /// graph (the kernel executes the Job's chains).
     kernel: Option<std::sync::Arc<arkflow_core::executor::kernel_handle::KernelJobHandle>>,
     handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
 }
@@ -357,10 +355,6 @@ impl JobRuntime {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        let resource = Resource {
-            temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
-            input_names: RefCell::new(Vec::new()),
-        };
         let state_root = std::env::temp_dir()
             .join("arkflow-job-state")
             .join(&job_id)
@@ -378,16 +372,7 @@ impl JobRuntime {
             RedbStateBackend::open(state_root, state_format_version)
                 .map_err(|error| error.to_string())?,
         );
-        let runner = Arc::new(
-            arkflow_core::job_runner::SingleComputeJobRunner::build_for_tasks_with_state(
-                &plan,
-                &task_ids,
-                &RegistryJobAdapter,
-                &resource,
-                Some(state.clone()),
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        let mut watermarks_to_restore = BTreeMap::new();
         let recovery = if let Some(checkpoint_id) = recovery_id {
             let repository = checkpoint_repository(&plan)?;
             let artifact = recovery_artifact(&plan, &checkpoint_id, recovery_savepoint)?;
@@ -426,9 +411,7 @@ impl JobRuntime {
             }
             let recovery =
                 RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?;
-            runner
-                .restore_watermarks(&recovery.watermarks_ms)
-                .map_err(|error| error.to_string())?;
+            watermarks_to_restore = recovery.watermarks_ms.clone();
             Some(recovery)
         } else {
             None
@@ -448,6 +431,12 @@ impl JobRuntime {
             )
             .await?,
         );
+        if !watermarks_to_restore.is_empty() {
+            kernel
+                .restore_watermarks(&watermarks_to_restore)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let handle = kernel.watcher();
         self.tasks.lock().await.insert(
             job_id,
@@ -462,7 +451,6 @@ impl JobRuntime {
                     .checkpoint
                     .as_ref()
                     .map(|checkpoint| checkpoint.object_store_uri.clone()),
-                runner,
                 kernel: Some(kernel),
                 handle,
             },
@@ -485,17 +473,13 @@ impl JobRuntime {
         if task.generation != generation {
             return Err("checkpoint generation does not match running Job".into());
         }
-        let (snapshot, source_positions, task_watermarks) = match &task.kernel {
-            Some(kernel) => kernel
-                .checkpoint_snapshot()
-                .await
-                .map_err(|error| error.to_string())?,
-            None => task
-                .runner
-                .checkpoint_snapshot(task.state.as_ref())
-                .await
-                .map_err(|error| error.to_string())?,
-        };
+        let (snapshot, source_positions, task_watermarks) = task
+            .kernel
+            .as_ref()
+            .ok_or_else(|| "Job kernel handle is missing".to_string())?
+            .checkpoint_snapshot()
+            .await
+            .map_err(|error| error.to_string())?;
         let store_uri = task
             .checkpoint_store_uri
             .as_deref()

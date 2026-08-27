@@ -494,34 +494,29 @@ impl RuntimeManager {
         };
         let stream_id = id.to_string();
 
-        // Dry-run component construction so config errors surface in `start`
-        // (reconciliation relies on synchronous failure); the kernel run
-        // rebuilds the components from the same configs.
-        if let Err(error) = config.build() {
-            let mut runtime = entry.lock().await;
-            runtime.state = StreamState::Failed;
-            runtime.record_error("build", error.to_string());
-            drop(runtime);
-            self.record_event(
-                "stream_start",
-                Some(id.to_string()),
-                "failed",
-                Some(error.to_string()),
-            )
-            .await;
-            return Err(error);
+        // Dry-run: compile + component construction + graph build so config
+        // errors (unknown inputs/processors, broken graphs) surface in `start`
+        // synchronously — reconciliation relies on that. The discarded graph
+        // is rebuilt by the spawned run.
+        {
+            let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                config.durability.as_ref(),
+                config.temporary.clone(),
+            )?;
+            let mut resource = adapter.build_resource()?;
+            let plan = crate::job::JobPlan::compile(spec.clone())?;
+            crate::executor::graph::ExecutionGraphBuilder::default()
+                .build(&plan, &adapter, &mut resource)?;
         }
 
         let handle =
             self.spawn_supervised(entry.clone(), async move {
                 let _ = metrics;
-                let adapter = crate::executor::stream_adapter::StreamJobAdapter::new(
+                let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
                     config.durability.as_ref(),
+                    config.temporary.clone(),
                 )?;
-                let mut resource = crate::Resource {
-                    temporary: std::collections::HashMap::new(),
-                    input_names: std::cell::RefCell::new(Vec::new()),
-                };
+                let mut resource = adapter.build_resource()?;
                 crate::executor::run_job(&spec, &adapter, &mut resource, cancellation).await
                     .map_err(|error| {
                         tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");

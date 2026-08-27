@@ -20,17 +20,48 @@ use std::sync::Arc;
 /// execution-model property).
 pub struct StreamJobAdapter {
     wal: Option<Arc<Wal>>,
+    /// Temporary-table configs from the stream; `build_resource` constructs
+    /// them so SQL processors find their tables in the shared Resource.
+    temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
 }
 
 impl StreamJobAdapter {
     /// Build the adapter for a compiled stream, opening the WAL when the
     /// stream declares enabled durability.
     pub fn new(durability: Option<&WalConfig>) -> Result<Self, Error> {
+        Self::with_temporary(durability, None)
+    }
+
+    /// Adapter carrying the stream's temporary-table configs.
+    pub fn with_temporary(
+        durability: Option<&WalConfig>,
+        temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
+    ) -> Result<Self, Error> {
         let wal = match durability {
             Some(config) if config.enabled => Some(Wal::open(config)?),
             _ => None,
         };
-        Ok(Self { wal })
+        Ok(Self { wal, temporary })
+    }
+
+    /// Construct the shared Resource with temporary tables built (SQL
+    /// processors resolve `temporary_list` entries from it). Also serves as
+    /// the synchronous dry-run: unknown inputs/outputs/temporaries fail
+    /// here, before the kernel starts.
+    pub fn build_resource(&self) -> Result<Resource, Error> {
+        let mut resource = Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
+        if let Some(temporary_configs) = &self.temporary {
+            for temporary_config in temporary_configs {
+                resource.temporary.insert(
+                    temporary_config.name.clone(),
+                    temporary_config.build(&resource)?,
+                );
+            }
+        }
+        Ok(resource)
     }
 
     pub fn wal(&self) -> Option<&Arc<Wal>> {
@@ -56,11 +87,45 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Wrap an input with the adapter's WAL: appends batches and gates the ack on
-/// the WAL commit, exactly like the legacy `Stream::do_input` path.
+/// Wrap an input with the adapter's WAL: replays unacknowledged entries
+/// before new reads (crash recovery), appends each batch, and gates the ack
+/// on the WAL commit — exactly like the legacy `Stream::do_input` path.
 pub struct WalInput {
     inner: Arc<dyn Input>,
     wal: Arc<Wal>,
+    /// Unacked-entry replay queue, initialized on the first read (the
+    /// component-builder trait is sync; WAL reads are async).
+    replay: tokio::sync::OnceCell<tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>>,
+}
+
+impl WalInput {
+    pub fn new(inner: Arc<dyn Input>, wal: Arc<Wal>) -> Self {
+        Self {
+            inner,
+            wal,
+            replay: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Load the unacknowledged entries once (first read), then replay them
+    /// ahead of new input. The OnceCell guarantees recovery runs exactly one
+    /// time even with concurrent first reads.
+    async fn replay_queue(
+        &self,
+    ) -> Result<&tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>, Error>
+    {
+        self.replay
+            .get_or_init(|| async {
+                let entries = self.wal.read_after_cursor().await.unwrap_or_default();
+                if !entries.is_empty() {
+                    tracing::info!(count = entries.len(), "WAL recovery: replaying entries");
+                }
+                tokio::sync::Mutex::new(entries.into_iter().collect())
+            })
+            .await;
+        // SAFETY-free: OnceCell::get is Some after get_or_init resolves.
+        Ok(self.replay.get().expect("replay queue initialized"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -70,6 +135,20 @@ impl Input for WalInput {
     }
 
     async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+        // Replay unacked WAL entries before reading new input (spec:
+        // recovery forwards pending entries before do_input starts).
+        {
+            let queue = self.replay_queue().await?;
+            let mut queue = queue.lock().await;
+            if let Some((seq, msg)) = queue.pop_front() {
+                let ack: Arc<dyn crate::input::Ack> = Arc::new(WalAck::new(
+                    self.wal.clone(),
+                    seq,
+                    Arc::new(crate::input::NoopAck),
+                ));
+                return Ok((msg, ack));
+            }
+        }
         let (batch, ack) = self.inner.read().await?;
         let seq = self.wal.append(&batch).await?;
         Ok((batch, Arc::new(WalAck::new(self.wal.clone(), seq, ack))))
@@ -111,10 +190,7 @@ impl JobComponentAdapter for StreamJobAdapter {
         };
         let input = config.build(resource)?;
         match &self.wal {
-            Some(wal) => Ok(Arc::new(WalInput {
-                inner: input,
-                wal: wal.clone(),
-            })),
+            Some(wal) => Ok(Arc::new(WalInput::new(input, wal.clone()))),
             None => Ok(input),
         }
     }

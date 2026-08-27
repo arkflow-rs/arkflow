@@ -795,3 +795,107 @@ fn stateful_operator_without_backend_is_rejected() {
     let result = ExecutionGraphBuilder::default().build(&plan, &adapter, &resource());
     assert!(matches!(result, Err(Error::Config(message)) if message.contains("stateful operator 'agg' requires a Job state backend")));
 }
+
+// ---------- migrated legacy runner semantics ----------
+
+#[test]
+fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
+    // A parallel Job whose source input cannot pin partitions must fail at
+    // graph build (legacy SingleComputeJobRunner guard, migrated).
+    struct UnpartitionedInput;
+    #[async_trait]
+    impl Input for UnpartitionedInput {
+        async fn connect(&self) -> Result<(), Error> { Ok(()) }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::Process("not readable".into()))
+        }
+        async fn close(&self) -> Result<(), Error> { Ok(()) }
+    }
+    struct UnpartitionedAdapter(Adapter);
+    impl JobComponentAdapter for UnpartitionedAdapter {
+        fn build_input(&self, _s: &SourceSpec, _r: &Resource) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(UnpartitionedInput))
+        }
+        fn build_output(&self, _s: &SinkSpec, _r: &Resource) -> Result<Arc<dyn Output>, Error> {
+            self.0.build_output(_s, _r)
+        }
+        fn build_processor(&self, _o: &OperatorSpec, _r: &Resource) -> Result<Arc<dyn Processor>, Error> {
+            self.0.build_processor(_o, _r)
+        }
+    }
+
+    let mut job = spec(
+        vec![stateful_operator("agg")],
+        vec![edge("source", "agg"), edge("agg", "sink")],
+        2,
+    );
+    job.state = Some(crate::job::StateSpec {
+        backend: "embedded_kv".into(),
+        namespace: None,
+        ttl_ms: None,
+        format_version: 1,
+    });
+    let plan = JobPlan::compile(job).unwrap();
+    let adapter = UnpartitionedAdapter(Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn crate::state::StateBackend> =
+        Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+    let mut resource = resource();
+    // Full assignment (all tasks, both subtasks) mirrors the legacy test:
+    // the source has 2 tasks and the input cannot pin partitions.
+    let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+    let result = ExecutionGraphBuilder::default()
+        .with_state(backend)
+        .build_subgraph(&plan, &task_ids, &adapter, &mut resource);
+    assert!(
+        matches!(&result, Err(Error::Config(message)) if message.contains("does not support partitioned")),
+        "expected partition guard failure, got {}",
+        result.err().map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+#[test]
+fn separates_route_and_update_late_event_actions_migrated() {
+    // Route vs Update policies produce distinct actions for the same late
+    // event (legacy runner guard, migrated to the gate).
+    let time = |policy: LateEventPolicy| TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 100,
+        late_event_policy: policy,
+        late_event_route: None,
+    };
+    let late = |gate: &mut EventTimeGate| {
+        gate.observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1_000, "a".into())])))).unwrap();
+        gate.observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1_500, "a".into())])))).unwrap()
+    };
+    // Watermark 2_100 closes window [1000,2000). A NEW row at 1_900 (inside
+    // the closed window, before the 2_200 lateness deadline) diverges per
+    // policy: Route forwards it late, Update marks it for reprocessing.
+    let mut routed = EventTimeGate::new(&time(LateEventPolicy::Route), vec![1_000]).unwrap();
+    routed.observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2_100, "a".into())])))).unwrap();
+    let decision = routed
+        .observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1_900, "a".into())]))))
+        .unwrap();
+    let routed_action = decision.ready.first().map(|(_, action)| *action);
+
+    let mut updated = EventTimeGate::new(&time(LateEventPolicy::Update), vec![1_000]).unwrap();
+    updated.observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2_100, "a".into())])))).unwrap();
+    let decision = updated
+        .observe(0, Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1_900, "a".into())]))))
+        .unwrap();
+    let updated_action = decision.ready.first().map(|(_, action)| *action);
+
+    assert_eq!(routed_action, Some(crate::event_time::WindowAction::Route));
+    assert_eq!(updated_action, Some(crate::event_time::WindowAction::Update));
+    let _ = late;
+}
