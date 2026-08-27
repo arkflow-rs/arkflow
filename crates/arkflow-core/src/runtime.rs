@@ -250,6 +250,8 @@ impl Default for RuntimeMetrics {
 pub struct RuntimeEntry {
     pub id: String,
     pub config: StreamConfig,
+    /// Registration index (for deterministic legacy stream-id derivation).
+    pub index: usize,
     pub state: StreamState,
     pub cancellation: CancellationToken,
     pub handle: Option<JoinHandle<Result<(), Error>>>,
@@ -272,10 +274,11 @@ pub struct RuntimeEntry {
 }
 
 impl RuntimeEntry {
-    pub fn new(id: String, config: StreamConfig) -> Self {
+    pub fn new(id: String, config: StreamConfig, index: usize) -> Self {
         Self {
             id,
             config,
+            index,
             state: StreamState::Created,
             cancellation: CancellationToken::new(),
             handle: None,
@@ -355,9 +358,10 @@ impl RuntimeManager {
                 "Stream runtime already registered: {id}"
             )));
         }
+        let index = entries.len();
         entries.insert(
             id.clone(),
-            Arc::new(Mutex::new(RuntimeEntry::new(id, config))),
+            Arc::new(Mutex::new(RuntimeEntry::new(id, config, index))),
         );
         Ok(())
     }
@@ -468,8 +472,11 @@ impl RuntimeManager {
         }
 
         let metrics = entry.lock().await.metrics.clone();
-        let mut stream = match config.build() {
-            Ok(stream) => stream.with_metrics(metrics),
+        let index = entry.lock().await.index;
+        // Unified kernel: the StreamConfig compiles to a JobSpec and runs
+        // through the same executor as declared Jobs and Agent subgraphs.
+        let spec = match crate::executor::stream_compiler::compile_stream(&config, index) {
+            Ok(spec) => spec,
             Err(error) => {
                 let mut runtime = entry.lock().await;
                 runtime.state = StreamState::Failed;
@@ -485,9 +492,42 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
+        let stream_id = id.to_string();
+
+        // Dry-run component construction so config errors surface in `start`
+        // (reconciliation relies on synchronous failure); the kernel run
+        // rebuilds the components from the same configs.
+        if let Err(error) = config.build() {
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Failed;
+            runtime.record_error("build", error.to_string());
+            drop(runtime);
+            self.record_event(
+                "stream_start",
+                Some(id.to_string()),
+                "failed",
+                Some(error.to_string()),
+            )
+            .await;
+            return Err(error);
+        }
 
         let handle =
-            self.spawn_supervised(entry.clone(), async move { stream.run(cancellation).await });
+            self.spawn_supervised(entry.clone(), async move {
+                let _ = metrics;
+                let adapter = crate::executor::stream_adapter::StreamJobAdapter::new(
+                    config.durability.as_ref(),
+                )?;
+                let mut resource = crate::Resource {
+                    temporary: std::collections::HashMap::new(),
+                    input_names: std::cell::RefCell::new(Vec::new()),
+                };
+                crate::executor::run_job(&spec, &adapter, &mut resource, cancellation).await
+                    .map_err(|error| {
+                        tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
+                        error
+                    })
+            });
 
         let mut runtime = entry.lock().await;
         runtime.state = StreamState::Running;
@@ -1039,6 +1079,7 @@ mod tests {
         let manager = RuntimeManager::new();
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: crate::config::LoggingConfig::default(),
             health_check: crate::config::HealthCheckConfig::default(),
         };
@@ -1055,6 +1096,7 @@ mod tests {
             .unwrap();
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1076,6 +1118,7 @@ mod tests {
         invalid.input.input_type = "missing-input".into();
         let config = EngineConfig {
             streams: vec![invalid],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1088,6 +1131,7 @@ mod tests {
     fn runtime_types_are_usable_in_engine_configs() {
         let config = EngineConfig {
             streams: vec![stream_config()],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1103,7 +1147,7 @@ mod tests {
         assert_eq!(snapshot.input_batches, 2);
         assert_eq!(snapshot.output_messages, 5);
 
-        let mut entry = RuntimeEntry::new("orders".into(), stream_config());
+        let mut entry = RuntimeEntry::new("orders".into(), stream_config(), 0);
         for index in 0..(MAX_RECENT_ERRORS + 1) {
             entry.record_error("test", index.to_string());
         }

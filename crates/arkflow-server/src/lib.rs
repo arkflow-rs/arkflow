@@ -2992,6 +2992,7 @@ mod tests {
     async fn resource_router_exposes_system_nodes_streams_and_health() {
         let engine = Engine::new(EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         });
@@ -3054,6 +3055,7 @@ mod tests {
     async fn resource_contract_includes_pagination_and_correlation_id() {
         let engine = Engine::new(EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         });
@@ -3123,6 +3125,7 @@ mod tests {
         };
         let engine = Engine::new(EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: health,
         });
@@ -3146,6 +3149,7 @@ mod tests {
         };
         let engine = Engine::new(EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: health,
         });

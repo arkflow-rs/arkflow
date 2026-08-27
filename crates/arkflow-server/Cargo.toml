@@ -31,3 +31,5 @@ bytes = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true }
 tempfile = { workspace = true }
+datafusion = { workspace = true }
+async-trait = { workspace = true }

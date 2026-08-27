@@ -39,6 +39,7 @@ pub mod control_plane;
 pub mod engine;
 pub mod error_helpers;
 pub mod event_time;
+pub mod executor;
 pub mod input;
 pub mod job;
 pub mod job_runner;

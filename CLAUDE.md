@@ -64,6 +64,40 @@ export PROTOC=$(which protoc)
 
 ArkFlow is a high-performance Rust stream processing engine built on Tokio with a plugin-based architecture.
 
+### Unified Execution Kernel (in progress: `rebuild-unified-streaming-engine`)
+
+A single execution model for local streams and distributed Jobs lives in
+`crates/arkflow-core/src/executor/`:
+
+- `envelope.rs` — `Envelope` (Data/Barrier/Watermark/EOS) control+data
+  elements that flow FIFO through execution edges.
+- `graph.rs` — `ExecutionGraphBuilder` compiles a `JobPlan` into chains of
+  operators joined by bounded flume channels; consecutive pass-through
+  operators fuse into one chain (zero channel hops); source/sink/stateful
+  operators always break chains.
+- `task.rs` — per-chain event loops (`run_graph`); chains run concurrently so
+  stages pipeline; bounded edges propagate backpressure; source chains handle
+  EOF/reconnect; sink chains ack after successful writes.
+- `barrier.rs` — async checkpoint barriers: `Aligner` (multi-input barrier
+  alignment with a bounded buffer), `BarrierCoordinator` (injects barriers,
+  completes checkpoints once every chain reports).
+- `window.rs` — `ColumnarWindowOperator`: vectorized tumbling window
+  assignment (Arrow column ops, no per-row batch copies), keyed aggregate
+  state in the `StateBackend`, watermark + processing-time triggers.
+- `stream_compiler.rs` — deterministic `StreamConfig → JobSpec` compilation
+  (input→source, processors→Map chain, window buffers→processing-time window
+  operators, `join` buffers→compile error, error_output→side sink edge).
+- `stream_adapter.rs` — `StreamJobAdapter`: rebuilds compiled-stream
+  components (codec/name passthrough) and wraps inputs with the stream WAL.
+- `job_runner_adapter.rs` — `run_job`/`run_job_tasks` entry points (local
+  full-graph and Agent subgraph modes share one code path).
+
+`EngineConfig` accepts a `jobs:` list (default empty) executed by the kernel
+locally; `--validate` deep-validates both streams and jobs (graph checks).
+The legacy linear Stream executor (`stream/mod.rs`) and
+`SingleComputeJobRunner` remain in place until the migration tasks (5.2–5.5)
+land; Agent Job execution still uses the legacy runner.
+
 ### Workspace Dependency Management
 
 The project uses Cargo workspace with centralized dependency management in the root `Cargo.toml`. All workspace members share versions through `[workspace.package]` and dependencies through `[workspace.dependencies]`. When adding dependencies, add them to the workspace section and reference with `workspace = true` in crate `Cargo.toml` files.

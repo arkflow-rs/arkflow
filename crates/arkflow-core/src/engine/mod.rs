@@ -4,6 +4,8 @@
 
 use crate::config::EngineConfig;
 use crate::control_plane::ControlPlane;
+use crate::executor::stream_adapter::StreamJobAdapter;
+use crate::executor::run_job;
 use crate::runtime::RuntimeManager;
 use std::error::Error;
 use tokio::signal::unix::{signal, SignalKind};
@@ -42,11 +44,17 @@ impl Engine {
     }
 
     /// Run the engine domain without starting an HTTP server.
+    ///
+    /// YAML-declared `jobs` execute on the unified kernel (local mode,
+    /// single process). Registered streams currently execute through the
+    /// legacy linear runtime via `RuntimeManager`; migrating that path onto
+    /// the kernel is staged in the `rebuild-unified-streaming-engine` change.
     pub async fn run_with_cancellation(
         &self,
         token: CancellationToken,
     ) -> Result<(), Box<dyn Error>> {
         let ids = self.config.stream_ids()?;
+        self.config.job_specs()?; // validate declared jobs up front
         for (index, stream_config) in self.config.streams.iter().enumerate() {
             let id = ids[index].clone();
             if stream_config.id.is_none() {
@@ -60,6 +68,26 @@ impl Engine {
         if let Err(error) = self.runtime_manager.start_all().await {
             let _ = self.runtime_manager.stop_all().await;
             return Err(Box::new(error));
+        }
+
+        // Local Jobs declared in YAML run on the unified kernel alongside the
+        // compiled streams. They are bounded by the engine cancellation token.
+        // `Resource` holds a `RefCell` (built per job inside the spawned
+        // task), so construction stays inside the task.
+        let mut job_handles = Vec::new();
+        for job in &self.config.jobs {
+            let spec = job.clone();
+            let token = token.clone();
+            info!(job_id = %spec.id, "starting local Job on the unified kernel");
+            let handle = tokio::spawn(async move {
+                let adapter = StreamJobAdapter::new(None)?;
+                let mut resource = crate::Resource {
+                    temporary: std::collections::HashMap::new(),
+                    input_names: std::cell::RefCell::new(Vec::new()),
+                };
+                run_job(&spec, &adapter, &mut resource, token).await
+            });
+            job_handles.push(handle);
         }
 
         self.control_plane.health().set_ready(true);
@@ -83,6 +111,14 @@ impl Engine {
             return Err(Box::new(error));
         }
         self.runtime_manager.wait_all().await?;
+        // Local kernel Jobs stop via the shared token; surface their results.
+        for handle in job_handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => error!("Local Job failed: {}", error),
+                Err(error) => error!("Local Job task panicked: {}", error),
+            }
+        }
         self.control_plane.health().set_running(false);
         info!("All flow tasks have been complete");
         Ok(())

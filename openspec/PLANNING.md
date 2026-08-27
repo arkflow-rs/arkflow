@@ -209,6 +209,37 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 
 ---
 
+## 六、统一执行内核重建（2026-08-27 启动，进行中）
+
+用户决策（2026-08-27）：**允许破坏性更新，以 Job 运行时为本体重建引擎，对标最先进流处理产品**。OpenSpec change：`rebuild-unified-streaming-engine`（v1 分支）。
+
+### 已落地（25/30 任务，2026-08-27 第二批）
+
+- **executor 内核**（`crates/arkflow-core/src/executor/`）：Envelope 通道、算子链融合、per-chain 事件循环（流水线并行 + 通道反压）、partitioned/broadcast 路由；12 项单测。
+- **异步 barrier checkpoint**：barrier 随数据流动、多输入对齐（有界缓冲）、异步快照不停世界、BarrierCoordinator 复用现有 checkpoint.rs 契约。
+- **事件时间门控**（`event_time_gate.rs`）：watermark 追踪、行级 Hold/Emit/Route/Update/Drop、held 行 FIFO 释放、延迟 ack、idle 刷新；接入源链事件循环。
+- **列式窗口算子**：向量化 tumbling 分配、keyed 聚合状态（持久化/恢复）、watermark/processing-time 双触发、迟到策略。
+- **有状态算子接线**（`stateful.rs`）：图构建期 StatefulOperator 包装（keyed counter 入 state backend 命名空间），无 backend 时构建拒绝。
+- **StreamConfig 编译器**：确定性编译 + buffer 映射 + error_output 侧边；全量 examples 黄金测试通过。
+- **三路执行全走内核**：① YAML `jobs`（Engine 直驱）；② streams（RuntimeManager::start → compile → run_job，真实二进制验证 generate→SQL→stdout）；③ Agent（spawn_kernel_job + KernelJobHandle 命令驱动快照，生命周期测试验证快照期间数据继续流动）。
+- **内核指标**（`metrics.rs`）：per-chain 吞吐/平均延迟/在途/错误 + checkpoint 时长/失败 + watermark lag + 迟到计数。
+- **性能基线**：generate→json_to_arrow→sql→drop（20 万行，batch=1000）：内核 528ms vs legacy 559ms（快 6%，`kernel_perf_baseline.rs`）。
+
+### 待办（5 项）
+
+1. **5.4** 删除 `SingleComputeJobRunner` 与 `stream/mod.rs` 执行器本体（现已是并行保留，行为路径已切内核；需迁移/裁剪其测试后删除）。
+2. **5.2** RuntimeEntry 状态与内核指标接通（现 dry-run build + run_job 已通，指标快照并入 StreamMetricsSnapshot 待做）。
+3. **3.5 sliding/session 窗口**、**2.6 故障注入测试**、**4.5 examples 输出等价回归**、**5.6 双节点 smoke**、6.2/6.3 文档 spec 同步。
+
+### 关键设计决策
+
+- 两套运行时统一方向：**Stream 编译为 JobSpec 走内核**（编译器 + adapter 保留 YAML 零改动），不是反向。
+- WAL 是 input 的持久化属性（`StreamJobAdapter::WalInput` 包装），与 Job checkpoint（barrier + 状态快照）互补：checkpoint 优先、WAL 兜底。
+- `Resource` 的 `RefCell` 仅构建期使用——图构建同步完成后释放，`run_job` future 因此可 Send。
+- Agent 切换内核需要"命令驱动快照"接口（现在是 barrier 注入式），是 5.3 的前置。
+
+---
+
 ## 五、Hub 平台路线（2026-08-02 制定，2026-08-27 更新进展）
 
 ### 5.1 当前进展（对齐 main @ 2f423ef 与 v1 @ cea1e8e）

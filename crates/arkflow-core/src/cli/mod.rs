@@ -125,6 +125,17 @@ impl Cli {
             }
         };
 
+        // Deep validation: stream ids and declared Job specs (graph checks,
+        // duplicate ids, operator references) beyond deserialization.
+        if let Err(e) = config.stream_ids() {
+            println!("Invalid configuration: {}", e);
+            process::exit(1);
+        }
+        if let Err(e) = config.job_specs() {
+            println!("Invalid configuration: {}", e);
+            process::exit(1);
+        }
+
         // If you just verify the configuration, exit it
         if matches.get_flag("validate") {
             info!("The config is validated.");

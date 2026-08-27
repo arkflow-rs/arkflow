@@ -330,8 +330,10 @@ version = "0.5.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
+ "async-trait",
  "axum",
  "bytes",
+ "datafusion",
  "futures-util",
  "object_store",
  "reqwest 0.13.4",

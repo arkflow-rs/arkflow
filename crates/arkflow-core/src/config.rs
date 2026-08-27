@@ -97,6 +97,10 @@ pub struct HealthCheckConfig {
 pub struct EngineConfig {
     /// Streams configuration
     pub streams: Vec<StreamConfig>,
+    /// Local Jobs declared directly in config (executed by the unified
+    /// kernel without a Hub).
+    #[serde(default)]
+    pub jobs: Vec<crate::job::JobSpec>,
     /// Logging configuration (optional)
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -125,6 +129,21 @@ impl EngineConfig {
         }
 
         Ok(resolved)
+    }
+
+    /// Validate declared Jobs (spec-level validation incl. graph checks).
+    pub fn job_specs(&self) -> Result<Vec<&crate::job::JobSpec>, Error> {
+        let mut job_ids = std::collections::HashSet::with_capacity(self.jobs.len());
+        for job in &self.jobs {
+            job.validate()?;
+            if !job_ids.insert(job.id.as_str().to_owned()) {
+                return Err(Error::Config(format!(
+                    "Duplicate job id '{}'",
+                    job.id
+                )));
+            }
+        }
+        Ok(self.jobs.iter().collect())
     }
 
     /// Load configuration from file
@@ -579,6 +598,7 @@ type = "stdout"
     fn test_engine_config_serialization_with_defaults() {
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -622,6 +642,7 @@ type = "stdout"
     fn test_stream_ids_assign_legacy_ids() {
         let config = EngineConfig {
             streams: vec![test_stream(None), test_stream(None)],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -633,6 +654,7 @@ type = "stdout"
     fn test_stream_ids_reject_invalid_and_duplicate_ids() {
         let invalid = EngineConfig {
             streams: vec![test_stream(Some("bad id"))],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -640,6 +662,7 @@ type = "stdout"
 
         let duplicate = EngineConfig {
             streams: vec![test_stream(Some("orders")), test_stream(Some("orders"))],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };

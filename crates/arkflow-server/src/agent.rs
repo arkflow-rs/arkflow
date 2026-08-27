@@ -61,6 +61,10 @@ struct JobTask {
     state: Arc<dyn StateBackend>,
     checkpoint_store_uri: Option<String>,
     runner: Arc<arkflow_core::job_runner::SingleComputeJobRunner>,
+    /// Unified-kernel snapshot handle: same job graph, command-driven
+    /// snapshots. While present, `checkpoint` prefers it over the legacy
+    /// runner; the legacy path stays until its tests migrate.
+    kernel: Option<std::sync::Arc<arkflow_core::executor::kernel_handle::KernelJobHandle>>,
     handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
 }
 
@@ -430,13 +434,21 @@ impl JobRuntime {
             None
         };
         let cancellation = CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let runner_for_task = runner.clone();
-        let handle = tokio::spawn(async move {
-            runner_for_task
-                .run_with_recovery(task_cancellation, recovery.as_ref())
-                .await
-        });
+        // Spawn the Job on the unified kernel: the same plan, adapter and
+        // state backend drive pipelined chain execution, and the handle backs
+        // command-driven checkpoints. The legacy runner stays attached only
+        // until its review-fix tests migrate (kernel snapshots take priority).
+        let kernel = Arc::new(
+            spawn_kernel_job(
+                &plan,
+                &task_ids,
+                state.clone(),
+                recovery.as_ref(),
+                cancellation.clone(),
+            )
+            .await?,
+        );
+        let handle = kernel.watcher();
         self.tasks.lock().await.insert(
             job_id,
             JobTask {
@@ -451,6 +463,7 @@ impl JobRuntime {
                     .as_ref()
                     .map(|checkpoint| checkpoint.object_store_uri.clone()),
                 runner,
+                kernel: Some(kernel),
                 handle,
             },
         );
@@ -472,11 +485,17 @@ impl JobRuntime {
         if task.generation != generation {
             return Err("checkpoint generation does not match running Job".into());
         }
-        let (snapshot, source_positions, task_watermarks) = task
-            .runner
-            .checkpoint_snapshot(task.state.as_ref())
-            .await
-            .map_err(|error| error.to_string())?;
+        let (snapshot, source_positions, task_watermarks) = match &task.kernel {
+            Some(kernel) => kernel
+                .checkpoint_snapshot()
+                .await
+                .map_err(|error| error.to_string())?,
+            None => task
+                .runner
+                .checkpoint_snapshot(task.state.as_ref())
+                .await
+                .map_err(|error| error.to_string())?,
+        };
         let store_uri = task
             .checkpoint_store_uri
             .as_deref()
@@ -694,6 +713,131 @@ impl JobRuntime {
         }
         Ok(())
     }
+}
+
+/// Spawn the assigned Job tasks on the unified kernel and return the
+/// command-driven snapshot handle. Mirrors the legacy start path's component
+/// assembly (same adapter, same state backend) but executes through the
+/// kernel's pipelined chains.
+async fn spawn_kernel_job(
+    plan: &JobPlan,
+    task_ids: &[String],
+    state: Arc<dyn StateBackend>,
+    recovery: Option<&RecoveryPlan>,
+    cancellation: CancellationToken,
+) -> Result<arkflow_core::executor::kernel_handle::KernelJobHandle, String> {
+    let mut resource = Resource {
+        temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
+        input_names: RefCell::new(Vec::new()),
+    };
+    let graph = arkflow_core::executor::graph::ExecutionGraphBuilder::default()
+        .with_state(state.clone())
+        .build_subgraph(plan, task_ids, &RegistryJobAdapter, &mut resource)
+        .map_err(|error| error.to_string())?;
+    let inputs = graph
+        .chains
+        .iter()
+        .filter_map(|chain| chain.source.clone())
+        .collect::<Vec<_>>();
+
+    // Event-time gates per event-time source task (processing-time sources
+    // keep the pass-through gate inside the source loop).
+    let mut watermark_gates = BTreeMap::new();
+    for task_id in task_ids {
+        let Some(task) = plan.task(task_id) else { continue };
+        let Some(source) = plan
+            .spec
+            .sources
+            .iter()
+            .find(|source| source.operator_id == task.operator_id)
+        else {
+            continue;
+        };
+        if source.time.mode == arkflow_core::job::TimeMode::EventTime {
+            let window_sizes = window_sizes_for_source(plan, &source.operator_id);
+            let gate = arkflow_core::executor::event_time_gate::EventTimeGate::new(
+                &source.time,
+                window_sizes,
+            )
+            .map_err(|error| error.to_string())?;
+            watermark_gates.insert(task_id.clone(), Arc::new(tokio::sync::Mutex::new(Some(gate))));
+        }
+    }
+
+    let mut states = BTreeMap::new();
+    states.insert(
+        task_ids.first().cloned().unwrap_or_default(),
+        state.clone(),
+    );
+    let handle = arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        inputs,
+        states,
+        watermark_gates.clone(),
+        false,
+        cancellation,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Some(recovery) = recovery {
+        handle
+            .restore_positions(&recovery.source_positions)
+            .await
+            .map_err(|error| error.to_string())?;
+        handle
+            .restore_watermarks(&recovery.watermarks_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(handle)
+}
+
+/// Window sizes reachable downstream of one source operator (used by the
+/// event-time gate's hold/emit decisions), mirroring the legacy runner.
+fn window_sizes_for_source(plan: &JobPlan, source_operator_id: &str) -> Vec<i64> {
+    let operator_kinds = plan
+        .spec
+        .operators
+        .iter()
+        .map(|operator| (operator.id.as_str(), operator.kind))
+        .collect::<BTreeMap<_, _>>();
+    let mut queue = plan
+        .spec
+        .edges
+        .iter()
+        .filter(|edge| edge.from == source_operator_id)
+        .map(|edge| edge.to.clone())
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut sizes = Vec::new();
+    while let Some(operator_id) = queue.pop() {
+        if !visited.insert(operator_id.clone()) {
+            continue;
+        }
+        if operator_kinds.get(operator_id.as_str())
+            == Some(&arkflow_core::job::OperatorKind::Window)
+        {
+            if let Some(size) = plan
+                .spec
+                .operators
+                .iter()
+                .find(|operator| operator.id == operator_id)
+                .and_then(|operator| operator.config.get("window_size_ms"))
+                .and_then(serde_json::Value::as_i64)
+                .filter(|size| *size > 0)
+            {
+                sizes.push(size);
+            }
+        }
+        queue.extend(
+            plan.spec
+                .edges
+                .iter()
+                .filter(|edge| edge.from == operator_id)
+                .map(|edge| edge.to.clone()),
+        );
+    }
+    sizes
 }
 
 struct RegistryJobAdapter;
@@ -1428,6 +1572,7 @@ mod tests {
         };
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: health,
         };
