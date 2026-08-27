@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 arkflow-core = { workspace = true }
+arkflow-plugin = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

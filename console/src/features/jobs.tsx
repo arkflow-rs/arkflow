@@ -1,29 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, ControlNode, Job, JobCheckpoint, JobDetail, JobValidation } from '../api'
+import { api, ControlNode, Job, JobCheckpoint, JobDetail } from '../api'
+import { JobEditor as VisualJobEditor } from './job-editor'
 
 type JobsProps = { jobs: Job[]; nodes: ControlNode[]; onRefresh: () => void; onError: (message: string) => void; canMutate?: boolean }
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 const stamp = (value?: number) => value ? new Date(value).toLocaleString() : '—'
 const message = (cause: unknown) => typeof cause === 'object' && cause && 'message' in cause ? String(cause.message) : cause instanceof Error ? cause.message : 'Control API unavailable'
-
-const template = (id = 'new-job') => ({
-  id, version: 1, parallelism: 1, max_parallelism: 128,
-  operators: [
-    { id: 'source', kind: 'source', config: {} },
-    { id: 'processor', kind: 'map', stateful: true, key_field: 'key', config: { type: 'json_to_arrow' } },
-    { id: 'sink', kind: 'sink', config: {} },
-  ],
-  edges: [
-    { id: 'source-processor', from: 'source', to: 'processor', partitioned: true },
-    { id: 'processor-sink', from: 'processor', to: 'sink', partitioned: true },
-  ],
-  sources: [{ operator_id: 'source', input_type: 'generate', config: { context: '{"key":"demo","value":1}', interval: '1s', batch_size: 1 }, time: { mode: 'processing_time' } }],
-  sinks: [{ operator_id: 'sink', output_type: 'stdout', config: {} }],
-  state: { backend: 'embedded_kv', namespace: id, format_version: 1 },
-  checkpoint: { interval_ms: 30000, retention: 3, object_store_uri: 's3://arkflow-checkpoints/' },
-  recovery: 'latest_checkpoint',
-})
 
 export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: JobsProps) {
   const [filter, setFilter] = useState('')
@@ -60,7 +43,7 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
       </div>)}</div>}
     </section>
     {selected && <JobDetailPanel detail={selected} nodes={nodes} canMutate={canMutate} busy={!!busy} onClose={() => setSelected(undefined)} onError={onError} onRefresh={() => void load(selected.job.job_id)} onAction={action} onUpgrade={(savepoint) => setEditor({ mode: 'upgrade', job: selected.job, savepoint })} />}
-    {editor && <JobEditor mode={editor.mode} job={editor.job} savepoint={editor.savepoint} nodes={nodes} busy={!!busy} onClose={() => setEditor(undefined)} onError={onError} onSaved={() => { setEditor(undefined); onRefresh(); if (editor.job) void load(editor.job.job_id) }} onAction={action} />}
+    {editor && <VisualJobEditor mode={editor.mode} job={editor.job} savepoint={editor.savepoint} nodes={nodes} busy={!!busy} onClose={() => setEditor(undefined)} onError={onError} onSaved={() => { setEditor(undefined); onRefresh(); if (editor.job) void load(editor.job.job_id) }} onAction={action} />}
   </>
 }
 
@@ -84,43 +67,4 @@ function JobVersions({ jobId, currentVersion, canMutate, busy, onError, onRefres
   const [versions, setVersions] = useState<Array<{ version: number; spec_json: string; plan_json: string; created_at_ms: number }>>([])
   useEffect(() => { void api.jobVersions(jobId).then(setVersions).catch(cause => onError(message(cause))) }, [jobId, onError])
   return <div>{versions.length ? versions.map(version => <div className="version" key={version.version}><span><strong>v{version.version}</strong> · {stamp(version.created_at_ms)}<small>{version.version === currentVersion ? 'current' : 'available for recovery'}</small></span><div className="actions"><button onClick={() => window.alert(version.plan_json)}>View plan</button>{version.version < currentVersion && <button disabled={!canMutate || busy} onClick={() => void onAction('Restoring…', async () => { await api.rollbackJobUpgrade(jobId, `restore-v${version.version}`); onRefresh() })}>Restore</button>}</div></div>) : <p className="empty">No version history recorded.</p>}</div>
-}
-
-function JobEditor({ mode, job, savepoint, nodes, busy, onClose, onError, onSaved, onAction }: { mode: 'create'|'upgrade'; job?: Job; savepoint?: JobCheckpoint; nodes: ControlNode[]; busy: boolean; onClose: () => void; onError: (message: string) => void; onSaved: () => void; onAction: (label: string, fn: () => Promise<unknown>) => Promise<void> }) {
-  const initial = useMemo(() => {
-    if (mode === 'upgrade' && job) {
-      if (typeof job.spec === 'object' && job.spec) return structuredClone(job.spec) as Record<string, unknown>
-      if (job.spec_json) { try { return JSON.parse(job.spec_json) as Record<string, unknown> } catch { /* server will report the persisted spec error */ } }
-    }
-    return template()
-  }, [job, mode])
-  const [content, setContent] = useState(pretty(initial))
-  const [spec, setSpec] = useState<Record<string, unknown>>(initial)
-  const [nodeIds, setNodeIds] = useState<string[]>(job?.node_ids ?? [])
-  const [validation, setValidation] = useState<JobValidation>()
-  const [issues, setIssues] = useState<string[]>([])
-  const update = (next: Record<string, unknown>) => { setSpec(next); setContent(pretty(next)); setValidation(undefined); setIssues([]) }
-  const changeSimple = (path: string, value: unknown) => update({ ...spec, [path]: value })
-  const parseContent = () => { try { const next = JSON.parse(content) as Record<string, unknown>; setSpec(next); setIssues([]); return next } catch (cause) { setIssues([cause instanceof Error ? cause.message : 'Invalid JSON']); return undefined } }
-  const validate = async () => { const next = parseContent(); if (!next) return; try { const result = await api.validateJob(next, nodeIds); setValidation(result); if (!result.valid) setIssues(['Selected nodes or Job plan are not compatible']) } catch (cause) { onError(message(cause)) } }
-  const submit = async () => { const next = parseContent(); if (!next || !validation?.valid) { setIssues(['Validate the current Job before submitting']); return } if (!window.confirm(mode === 'create' ? 'Create this Job in stopped state?' : `Upgrade from ${savepoint?.checkpoint_id ?? 'the selected savepoint'}?`)) return
-    await onAction(mode === 'create' ? 'Creating Job…' : 'Submitting upgrade…', async () => {
-      if (mode === 'create') await api.createJob(next, nodeIds)
-      else if (job && savepoint) {
-        const upgraded = await api.upgradeJob(job.job_id, next, savepoint.checkpoint_id, job.generation, nodeIds)
-        await api.setJobState(job.job_id, 'running')
-        void upgraded
-      }
-      onSaved()
-    })
-  }
-  const currentId = String(spec.id ?? '')
-  const currentVersion = Number(spec.version ?? 1)
-  return <section className="panel detail job-editor"><div className="panel-title"><div><span className="eyebrow">{mode === 'create' ? 'CREATE JOB' : 'UPGRADE JOB'}</span><h3>{mode === 'create' ? 'New distributed Job' : `${job?.job_id} → v${currentVersion}`}</h3><small>{mode === 'upgrade' ? `Recovery: ${savepoint?.checkpoint_id}` : 'Validate before creating a stopped Job'}</small></div><div className="actions"><button onClick={onClose}>Cancel</button><button disabled={busy} onClick={() => void validate()}>Validate Plan</button><button disabled={busy || !validation?.valid} onClick={() => void submit()}>{mode === 'create' ? 'Create stopped' : 'Submit upgrade'}</button></div></div>
-    <div className="job-form"><label>Job ID<input value={currentId} disabled={mode === 'upgrade'} onChange={event => changeSimple('id', event.target.value)} /></label><label>Version<input type="number" min={1} value={currentVersion} onChange={event => changeSimple('version', Number(event.target.value))} /></label><label>Parallelism<input type="number" min={1} value={Number(spec.parallelism ?? 1)} onChange={event => changeSimple('parallelism', Number(event.target.value))} /></label></div>
-    <div className="node-picker"><span>Target nodes</span>{nodes.map(node => <label key={node.id}><input type="checkbox" checked={nodeIds.includes(node.id)} onChange={event => setNodeIds(current => event.target.checked ? [...current, node.id] : current.filter(id => id !== node.id))} />{node.id} · {node.state}</label>)}</div>
-    <textarea aria-label="Job JSON Spec" value={content} disabled={busy} onChange={event => { setContent(event.target.value); setValidation(undefined); setIssues([]) }} spellCheck={false} />
-    {validation && <div className={validation.valid ? 'success validation' : 'validation'}><strong>{validation.valid ? 'Plan is valid' : 'Plan needs attention'}</strong>{validation.warnings.map(warning => <p key={warning}>{warning}</p>)}{validation.nodes.filter(node => !node.compatible).map(node => <p key={node.node_id}>{node.node_id}: missing {node.missing_capabilities.join(', ')}</p>)}</div>}
-    {issues.length > 0 && <div className="validation"><strong>{issues.length} issue(s)</strong>{issues.map(issue => <p key={issue}>{issue}</p>)}</div>}
-  </section>
 }

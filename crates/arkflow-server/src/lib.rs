@@ -318,6 +318,9 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/operations/{id}", delete(hub_cancel_operation))
         .route("/events", get(hub_events))
         .route("/events/stream", get(hub_event_stream))
+        .route("/components", get(components))
+        .route("/components/{kind}/{name}", get(component))
+        .route("/schema", get(schema))
         .route("/audit", get(hub_audit))
         .route("/rollouts", get(hub_rollouts).post(create_rollout))
         .route("/rollouts/{id}", get(hub_rollout))
@@ -366,6 +369,7 @@ pub async fn serve_hub(
     if !config.enabled {
         return Ok(());
     }
+    arkflow_plugin::initialize()?;
     hub.recover_persisted_state().await?;
     let address: SocketAddr = config.address.parse()?;
     let listener = TcpListener::bind(address).await?;
@@ -2953,6 +2957,36 @@ mod tests {
     use arkflow_core::engine::Engine;
     use futures_util::StreamExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn hub_component_catalogue_exposes_registered_job_components() {
+        arkflow_plugin::initialize().unwrap();
+        let app = hub_router(
+            hub::Hub::new(hub::HubConfig {
+                operator_token: None,
+                node_token: None,
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            }),
+            &ServerConfig::default(),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/components")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let components: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(components.iter().any(|item| item["kind"] == "input"));
+        assert!(components.iter().any(|item| item["kind"] == "output"));
+        assert!(components.iter().any(|item| item["kind"] == "processor"));
+    }
 
     #[tokio::test]
     async fn resource_router_exposes_system_nodes_streams_and_health() {

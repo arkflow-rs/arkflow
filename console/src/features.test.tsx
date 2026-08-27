@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { Configuration, convertConfiguration } from './features'
+import { Components, Configuration, convertConfiguration } from './features'
 import { Jobs } from './features/jobs'
 import { Rollouts } from './features/rollouts'
 
@@ -92,5 +92,61 @@ describe('distributed Job workbench', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create stopped' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/jobs'), expect.objectContaining({ method: 'POST' })))
     expect(refresh).toHaveBeenCalled()
+  })
+
+  it('requires a fresh validation after Job settings change', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    fireEvent.click(local.getByRole('button', { name: 'Validate Plan' }))
+    await waitFor(() => expect(local.getByRole('button', { name: 'Create stopped' })).not.toBeDisabled())
+    fireEvent.change(local.getByLabelText('Job ID'), { target: { value: 'changed-job' } })
+    expect(local.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+  })
+
+  it('shows a retryable component-catalogue failure in the Job palette', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/components')) return Promise.resolve({ ok: false, status: 503, json: async () => ({ message: 'catalogue unavailable' }), headers: new Headers() })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    expect(await local.findByText('Component catalogue could not be loaded.')).toBeInTheDocument()
+    expect(local.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  it('filters the Job palette by component kind and search term', async () => {
+    const components = [{ kind: 'input', name: 'generate', description: 'Generate records' }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON' }, { kind: 'output', name: 'stdout', description: 'Write output' }]
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, json: async () => components })) as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    expect(await local.findByText('generate')).toBeInTheDocument()
+    expect(local.queryByText('stdout')).not.toBeInTheDocument()
+    fireEvent.click(local.getByRole('tab', { name: 'processor' }))
+    expect(await local.findByText('json_to_arrow')).toBeInTheDocument()
+    fireEvent.change(local.getByLabelText('Component search'), { target: { value: 'missing' } })
+    expect(local.getByText('No matching components.')).toBeInTheDocument()
+  })
+})
+
+describe('component catalogue', () => {
+  it('filters entries and shows details only for the selected component', async () => {
+    const components = [{ kind: 'input', name: 'generate', description: 'Generate records', schema: { type: 'object' }, example: { batch_size: 1 } }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON', schema: { type: 'object' } }]
+    globalThis.fetch = vi.fn((url: string) => Promise.resolve({ ok: true, json: async () => url.endsWith('/components') ? components : {} })) as unknown as typeof fetch
+    const view = render(<Components onError={vi.fn()} />)
+    const local = within(view.container)
+    expect(await local.findByText('generate')).toBeInTheDocument()
+    expect(local.getAllByText('Generate records')).toHaveLength(2)
+    fireEvent.click(local.getByRole('tab', { name: 'processor' }))
+    expect(local.getAllByText('json_to_arrow')).toHaveLength(2)
+    expect(local.queryByText('Generate records')).not.toBeInTheDocument()
   })
 })
