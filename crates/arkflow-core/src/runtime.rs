@@ -511,17 +511,23 @@ impl RuntimeManager {
 
         let handle =
             self.spawn_supervised(entry.clone(), async move {
-                let _ = metrics;
                 let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
                     config.durability.as_ref(),
                     config.temporary.clone(),
                 )?;
                 let mut resource = adapter.build_resource()?;
-                crate::executor::run_job(&spec, &adapter, &mut resource, cancellation).await
-                    .map_err(|error| {
-                        tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
-                        error
-                    })
+                crate::executor::run_job_with_metrics(
+                    &spec,
+                    &adapter,
+                    &mut resource,
+                    cancellation,
+                    Some(metrics),
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
+                    error
+                })
             });
 
         let mut runtime = entry.lock().await;

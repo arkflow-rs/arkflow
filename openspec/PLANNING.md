@@ -213,7 +213,7 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 
 用户决策（2026-08-27）：**允许破坏性更新，以 Job 运行时为本体重建引擎，对标最先进流处理产品**。OpenSpec change：`rebuild-unified-streaming-engine`（v1 分支）。
 
-### 已落地（25/30 任务，2026-08-27 第二批）
+### 已落地（29/30 任务，2026-08-28 第三批：执行器删除 + 收尾）
 
 - **executor 内核**（`crates/arkflow-core/src/executor/`）：Envelope 通道、算子链融合、per-chain 事件循环（流水线并行 + 通道反压）、partitioned/broadcast 路由；12 项单测。
 - **异步 barrier checkpoint**：barrier 随数据流动、多输入对齐（有界缓冲）、异步快照不停世界、BarrierCoordinator 复用现有 checkpoint.rs 契约。
@@ -225,11 +225,11 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - **内核指标**（`metrics.rs`）：per-chain 吞吐/平均延迟/在途/错误 + checkpoint 时长/失败 + watermark lag + 迟到计数。
 - **性能基线**：generate→json_to_arrow→sql→drop（20 万行，batch=1000）：内核 528ms vs legacy 559ms（快 6%，`kernel_perf_baseline.rs`）。
 
-### 待办（5 项）
+### 待办（1 项）
 
-1. **5.4** 删除 `SingleComputeJobRunner` 与 `stream/mod.rs` 执行器本体（现已是并行保留，行为路径已切内核；需迁移/裁剪其测试后删除）。
-2. **5.2** RuntimeEntry 状态与内核指标接通（现 dry-run build + run_job 已通，指标快照并入 StreamMetricsSnapshot 待做）。
-3. **3.5 sliding/session 窗口**、**2.6 故障注入测试**、**4.5 examples 输出等价回归**、**5.6 双节点 smoke**、6.2/6.3 文档 spec 同步。
+1. **5.6 双节点 smoke**：两节点 Hub–Agent Job + barrier checkpoint + kill/restart 恢复（需要多进程环境，建议专项做）。
+
+第三批（2026-08-28）完成：5.4 双执行器删除（-2966 行；迁移 partition-guard/Route-vs-Update 测试到 executor；WAL 重放迁入 WalInput 惰性队列；temporary 表经 StreamJobAdapter::build_resource 进入内核 Resource——修复了内核丢 temporary 的缺口）；4.5 examples 等价回归（inline 管道 + durability_example 含 WAL 重放路径）；2.6 故障注入（注入 snapshot 失败→checkpoint 失败但数据继续；恢复位置 ≤ checkpoint 位点）；3.5 sliding/session 窗口（多窗口隶属分配、会话按 gap 合并扩展，编译器按 legacy 字段名 interval/gap 映射）；5.2 指标接通（run_job_with_metrics → RuntimeMetrics：input/processing/output/error 计数）；6.2 CLAUDE.md 对齐；6.3 tasks 勾选。
 
 ### 关键设计决策
 

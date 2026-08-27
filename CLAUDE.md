@@ -64,7 +64,7 @@ export PROTOC=$(which protoc)
 
 ArkFlow is a high-performance Rust stream processing engine built on Tokio with a plugin-based architecture.
 
-### Unified Execution Kernel (in progress: `rebuild-unified-streaming-engine`)
+### Unified Execution Kernel (the only runtime; `rebuild-unified-streaming-engine`)
 
 A single execution model for local streams and distributed Jobs lives in
 `crates/arkflow-core/src/executor/`:
@@ -94,9 +94,14 @@ A single execution model for local streams and distributed Jobs lives in
 
 `EngineConfig` accepts a `jobs:` list (default empty) executed by the kernel
 locally; `--validate` deep-validates both streams and jobs (graph checks).
-The legacy linear Stream executor (`stream/mod.rs`) and
-`SingleComputeJobRunner` remain in place until the migration tasks (5.2–5.5)
-land; Agent Job execution still uses the legacy runner.
+The legacy executors are REMOVED: `SingleComputeJobRunner` (job_runner.rs)
+and the linear Stream executor are deleted. Streams compile through
+`stream_compiler` + `StreamJobAdapter` (WAL replay included in `WalInput`);
+Agent Jobs run through `kernel_handle::KernelJobRunner` with command-driven
+snapshots; `RuntimeManager::start` bumps the shared `RuntimeMetrics` via
+`run_job_with_metrics`. Window operators support tumbling/sliding/session
+(`WindowKind`), and window buffers compile by their legacy field names
+(`interval`/`gap`).
 
 ### Workspace Dependency Management
 
@@ -110,8 +115,8 @@ This is a Cargo workspace with three crates:
 
 - **`arkflow-core`** (`crates/arkflow-core/`) - Core engine abstractions and interfaces
   - `Engine`: Main orchestrator managing streams and health checks
-  - `Stream`: Complete data processing unit (input → pipeline → output)
-  - `Pipeline`: Ordered collection of processors
+  - `executor`: The unified execution kernel (chains, channels, barriers, windows)
+  - `StreamConfig`: Legacy stream schema, compiled to JobSpecs
   - `MessageBatch`: Columnar data using Apache Arrow `RecordBatch`
   - Abstract traits for `Input`, `Output`, `Processor`, `Buffer`, `Codec`
 
@@ -135,16 +140,16 @@ When adding a new plugin:
 3. Call the plugin's `init()` from the module's `init()` function
 
 #### Stream Processing Flow
-Each `Stream` runs concurrently with:
-- **Input worker**: Reads data from source
-- **Processor workers**: Multiple threads (configurable via `thread_num`) process batches
-- **Output worker**: Writes to sink with ordered delivery using sequence numbers
-- **Buffer layer**: Handles backpressure (threshold: 1024 messages in channel)
+Streams compile to JobSpecs and run on the unified kernel:
+- **Source chains**: read batches, apply event-time gating when configured, push Data/Barrier/Watermark envelopes downstream
+- **Chains** (fused operator runs): process batches in their own event loops; multiple chains pipeline concurrently
+- **Sink chains**: write batches (`write_batch`) then ack
+- **Edges**: bounded flume channels (default capacity 1024) — a full edge backpressures the producer
 
-Data flow: `Input → Buffer → [Processor1 → Processor2 → ...] → Output`
-Errors are routed to `error_output` if configured.
+Data flow: `Source chain → [chained processors] → channel → [chained processors] → Sink chain`
+Errors surface as processing-error metrics; `error_output` compiles to a side sink.
 
-**Backpressure Mechanism**: When the channel between input and processor contains 1024+ messages, the input worker blocks until space is available, preventing memory overflow from fast inputs/slow processors.
+**Backpressure Mechanism**: bounded inter-chain channels (default 1024 envelopes); producers await send when full, propagating backpressure to the source.
 
 #### Data Model
 Uses Apache Arrow's `RecordBatch` for efficient columnar storage. The `MessageBatch` wrapper includes:

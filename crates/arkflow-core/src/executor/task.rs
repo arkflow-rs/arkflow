@@ -39,6 +39,9 @@ pub struct CheckpointHook {
     pub event_time_gate: Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
     /// Source partition bound to this chain (event-time observation).
     pub partition: Option<u32>,
+    /// Runtime counters for control-plane snapshots (source chains bump
+    /// input counts; dispatch paths bump output/error counts).
+    pub metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
 }
 
 pub async fn run_graph(
@@ -46,6 +49,33 @@ pub async fn run_graph(
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
     run_graph_with_hooks(graph, cancellation, BTreeMap::new()).await
+}
+
+/// Run the graph with runtime metrics: source chains count input
+/// batches/rows, processing errors and outputs update on every envelope
+/// result, mirroring the legacy runtime counters.
+pub async fn run_graph_with_metrics(
+    graph: ExecutionGraph,
+    cancellation: CancellationToken,
+    metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
+) -> Result<(), Error> {
+    // Chain-level metric plumbing rides the hooks map: each source chain
+    // gets a metrics-enabled hook so its loop can bump counters.
+    let mut hooks = BTreeMap::new();
+    if let Some(metrics) = &metrics {
+        for chain in &graph.chains {
+            if chain.is_source() {
+                hooks.insert(
+                    chain.entry_task_id().to_owned(),
+                    CheckpointHook {
+                        metrics: Some(metrics.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    run_graph_with_hooks(graph, cancellation, hooks).await
 }
 
 /// Run the graph with a snapshot gate: chains take read shares per envelope,
@@ -197,7 +227,7 @@ async fn run_source_chain(
                 if let Some(gate) = event_gate.as_mut() {
                     let decision = gate.refresh()?;
                     for (batch, action) in decision.ready {
-                        dispatch_gated(chain, batch, action).await?;
+                        dispatch_gated(chain, hook, batch, action).await?;
                     }
                     for ack in gate.take_ready_acks() {
                         ack.ack().await?;
@@ -240,6 +270,13 @@ async fn run_source_chain(
             },
         };
         let (batch, ack) = read;
+        if let Some(metrics) = &hook.metrics {
+            use std::sync::atomic::Ordering;
+            metrics.input_batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .input_messages
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        }
         // Snapshot gate: read share while this envelope is in flight so a
         // command-driven snapshot observes a quiescent graph.
         let _gate_guard = match snapshot_gate {
@@ -248,7 +285,7 @@ async fn run_source_chain(
         };
         match event_gate.as_mut() {
             None => {
-                for output in process_chain(chain, batch).await? {
+                for output in process_chain(chain, batch, hook.metrics.as_ref()).await? {
                     send_downstream(chain, Envelope::Data(output, ack.clone())).await?;
                 }
             }
@@ -256,7 +293,7 @@ async fn run_source_chain(
                 let partition = hook.partition.unwrap_or(0);
                 let decision = gate.observe(partition, batch)?;
                 for (slice, action) in decision.ready {
-                    dispatch_gated(chain, slice, action).await?;
+                    dispatch_gated(chain, hook, slice, action).await?;
                 }
                 if gate.has_held() {
                     gate.defer_ack(ack);
@@ -276,6 +313,7 @@ async fn run_source_chain(
 /// Emit/Hold-equivalent rows flow through the chain normally.
 async fn dispatch_gated(
     chain: &Chain,
+    hook: &CheckpointHook,
     batch: crate::MessageBatchRef,
     action: crate::event_time::WindowAction,
 ) -> Result<(), Error> {
@@ -284,7 +322,7 @@ async fn dispatch_gated(
         crate::event_time::WindowAction::Update => mark_event_batch(batch, "__arkflow_late_event_update")?,
         _ => batch,
     };
-    for output in process_chain(chain, batch).await? {
+    for output in process_chain(chain, batch, hook.metrics.as_ref()).await? {
         send_downstream(chain, Envelope::Data(output, Arc::new(crate::input::NoopAck))).await?;
     }
     Ok(())
@@ -393,7 +431,7 @@ async fn run_interior_chain(
                 report_chain_barrier(chain, hook, barrier.clone()).await?;
                 send_downstream(chain, Envelope::Barrier(barrier)).await?;
                 for (_, buffered) in aligner.release() {
-                    handle_envelope(chain, buffered).await?;
+                    handle_envelope(chain, hook, buffered).await?;
                 }
             }
             Ok(None) => {
@@ -401,14 +439,14 @@ async fn run_interior_chain(
                     // Envelope retained inside the aligner; replay happens at
                     // alignment completion above.
                 } else if let Some(envelope) = aligner.take_passthrough() {
-                    handle_envelope(chain, envelope).await?;
+                    handle_envelope(chain, hook, envelope).await?;
                 }
             }
             Err(error) => {
                 // Alignment overflow: release what was buffered and keep the
                 // data flowing; the barrier round fails upstream.
                 for (_, buffered) in aligner.release() {
-                    handle_envelope(chain, buffered).await?;
+                    handle_envelope(chain, hook, buffered).await?;
                 }
                 tracing::warn!(%error, "barrier alignment overflowed");
             }
@@ -421,10 +459,14 @@ async fn run_interior_chain(
     }
 }
 
-async fn handle_envelope(chain: &Chain, envelope: Envelope) -> Result<(), Error> {
+async fn handle_envelope(
+    chain: &Chain,
+    hook: &CheckpointHook,
+    envelope: Envelope,
+) -> Result<(), Error> {
     match envelope {
         Envelope::Data(batch, ack) => {
-            for output in process_chain(chain, batch).await? {
+            for output in process_chain(chain, batch, hook.metrics.as_ref()).await? {
                 send_downstream(chain, Envelope::Data(output, ack.clone())).await?;
             }
             Ok(())
@@ -480,15 +522,24 @@ async fn recv_envelope(
 async fn process_chain(
     chain: &Chain,
     batch: crate::MessageBatchRef,
+    metrics: Option<&Arc<crate::runtime::RuntimeMetrics>>,
 ) -> Result<Vec<crate::MessageBatchRef>, Error> {
     let mut batches = vec![batch];
     for processor in &chain.processors {
         let mut next = Vec::with_capacity(batches.len());
         for batch in batches {
-            match processor.process(batch).await? {
-                ProcessResult::Single(output) => next.push(output),
-                ProcessResult::Multiple(outputs) => next.extend(outputs),
-                ProcessResult::None => {}
+            match processor.process(batch).await {
+                Ok(ProcessResult::Single(output)) => next.push(output),
+                Ok(ProcessResult::Multiple(outputs)) => next.extend(outputs),
+                Ok(ProcessResult::None) => {}
+                Err(error) => {
+                    if let Some(metrics) = metrics {
+                        metrics
+                            .processing_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
             }
         }
         batches = next;
@@ -499,6 +550,14 @@ async fn process_chain(
     if let Some(sink) = &chain.sink {
         if !batches.is_empty() {
             sink.write_batch(&batches).await?;
+            if let Some(metrics) = metrics {
+                use std::sync::atomic::Ordering;
+                metrics.output_batches.fetch_add(1, Ordering::Relaxed);
+                metrics.output_messages.fetch_add(
+                    batches.iter().map(|batch| batch.len() as u64).sum(),
+                    Ordering::Relaxed,
+                );
+            }
         }
         return Ok(Vec::new());
     }

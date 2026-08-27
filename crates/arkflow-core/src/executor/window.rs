@@ -88,8 +88,12 @@ pub enum WindowTrigger {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WindowKind {
     Tumbling { size_ms: i64 },
-    // Sliding/session follow the same contracts; implemented after tumbling
-    // is proven in benchmarks and examples.
+    /// Size-sized windows advancing every `slide_ms`: one event belongs to
+    /// every window whose interval contains its timestamp.
+    Sliding { size_ms: i64, slide_ms: i64 },
+    /// Gap-extended windows: a new window opens when no event arrives within
+    /// `gap_ms` of the previous one; the window fires after the gap passes.
+    Session { gap_ms: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,10 +155,36 @@ impl ColumnarWindowOperator {
         }
     }
 
-    fn window_bounds(&self, event_time_ms: i64) -> (i64, i64) {
-        let WindowKind::Tumbling { size_ms } = self.config.kind;
-        let start = event_time_ms.div_euclid(size_ms) * size_ms;
-        (start, start + size_ms)
+    /// All windows containing one event time. Tumbling yields one;
+    /// sliding yields `size / slide` overlapping windows; session yields
+    /// its gap-extended window (tracked per key in the buffer map).
+    fn windows_for(&self, event_time_ms: i64) -> Vec<(i64, i64)> {
+        match self.config.kind {
+            WindowKind::Tumbling { size_ms } => {
+                let start = event_time_ms.div_euclid(size_ms) * size_ms;
+                vec![(start, start + size_ms)]
+            }
+            WindowKind::Sliding { size_ms, slide_ms } => {
+                let slide_ms = slide_ms.max(1);
+                // The latest window containing the event starts at
+                // floor(ts/slide)*slide; the size/slide covering windows
+                // precede it (each event joins every window whose interval
+                // contains its timestamp).
+                let last_start = event_time_ms.div_euclid(slide_ms) * slide_ms;
+                let count = size_ms.div_euclid(slide_ms).max(1);
+                (0..count)
+                    .map(|step| last_start - step * slide_ms)
+                    .filter(|start| event_time_ms >= *start && event_time_ms < start + size_ms)
+                    .map(|start| (start, start + size_ms))
+                    .collect()
+            }
+            WindowKind::Session { gap_ms } => {
+                // Session windows extend per key; a conservative window for
+                // assignment purposes starts at the event and ends after the
+                // gap (the accumulator merges overlapping sessions per key).
+                vec![(event_time_ms, event_time_ms + gap_ms)]
+            }
+        }
     }
 
     fn state_key(window_start: i64, key: &str) -> Vec<u8> {
@@ -280,7 +310,30 @@ impl ColumnarWindowOperator {
             let (Some(event_time), Some(key)) = (&timestamps[row], &keys[row]) else {
                 continue;
             };
-            let (window_start, _) = self.window_bounds(*event_time);
+            // Sliding windows contribute to every containing window;
+            // tumbling and session contribute to their single window.
+            let mut windows = self.windows_for(*event_time);
+            if let WindowKind::Session { gap_ms } = self.config.kind {
+                // Session semantics: extend an existing per-key session whose
+                // end reaches this event (gap not exceeded), else open a new
+                // one at the event time.
+                let session = windows.pop().unwrap();
+                let extended = buffers
+                    .range(
+                        (event_time - gap_ms, String::new())
+                            ..(event_time + 1, String::new()),
+                    )
+                    .filter(|((start, window_key), _)| {
+                        *window_key == *key && start + gap_ms > *event_time
+                    })
+                    .map(|((start, _), _)| *start)
+                    .min();
+                windows = vec![match extended {
+                    Some(start) => (start, start + gap_ms),
+                    None => session,
+                }];
+            }
+            for (window_start, _) in windows {
             let entry = buffers.entry((window_start, key.clone())).or_default();
             if value_columns.is_empty() {
                 entry.observe_i64(1);
@@ -306,6 +359,7 @@ impl ColumnarWindowOperator {
                     _ => entry.observe_i64(1),
                 }
             }
+            }
         }
         Ok(())
     }
@@ -314,12 +368,15 @@ impl ColumnarWindowOperator {
     /// threshold, persisting nothing (buffers are the working state; the
     /// barrier snapshot serializes them on demand).
     fn fire_ready(&self, threshold: i64) -> Result<Option<MessageBatchRef>, Error> {
-        let WindowKind::Tumbling { size_ms } = self.config.kind;
+        let window_size = match self.config.kind {
+            WindowKind::Tumbling { size_ms } | WindowKind::Sliding { size_ms, .. } => size_ms,
+            WindowKind::Session { gap_ms } => gap_ms,
+        };
         let mut buffers = self.buffers.lock().unwrap();
         let ready: Vec<i64> = buffers
             .keys()
             .map(|(window_start, _)| *window_start)
-            .filter(|start| start + size_ms <= threshold)
+            .filter(|start| start + window_size <= threshold)
             .collect();
         if ready.is_empty() {
             return Ok(None);
@@ -339,7 +396,7 @@ impl ColumnarWindowOperator {
             for (key, buffer) in candidates {
                 buffers.remove(&(start, key.clone()));
                 starts.push(start);
-                ends.push(start + size_ms);
+                ends.push(start + window_size);
                 key_strings.push(key);
                 counts.push(buffer.count);
                 sums.push(if buffer.is_float {
@@ -602,6 +659,89 @@ mod tests {
             .unwrap();
         // -1 falls into [-10000, 0); 9_999 into [0, 10000).
         assert_eq!(starts.values(), &[-10_000]);
+    }
+
+    #[tokio::test]
+    async fn sliding_windows_aggregate_overlapping_memberships() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = ColumnarWindowOperator::new(
+            WindowOperatorConfig {
+                kind: WindowKind::Sliding { size_ms: 10_000, slide_ms: 5_000 },
+                timestamp_field: "ts".into(),
+                key_field: "key".into(),
+                value_fields: vec!["value".into()],
+                trigger: WindowTrigger::Watermark,
+                trigger_interval_ms: 1_000,
+                watermark_field: "__watermark_ms".into(),
+            },
+            backend,
+            "sliding-test",
+        );
+        // Event at 6_000 belongs to [0,10000) and [5000,15000).
+        op.process(batch(vec![(6_000, "a", 2)], None)).await.unwrap();
+        // Event at 7_000 also belongs to both; [0,10000) has both, [5000,15000) has both.
+        op.process(batch(vec![(7_000, "a", 3)], None)).await.unwrap();
+        let fired = op
+            .process(batch(vec![(20_000, "z", 0)], Some(15_000)))
+            .await
+            .unwrap();
+        let ProcessResult::Single(fired) = fired else { panic!("sliding should fire") };
+        let starts = fired
+            .record_batch()
+            .column_by_name("window_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        // Both overlapping windows closed at watermark 15_000.
+        assert_eq!(starts.values(), &[0, 5_000]);
+        assert_eq!(counts.values(), &[2, 2]);
+    }
+
+    #[tokio::test]
+    async fn session_windows_extend_within_gap_and_fire_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = ColumnarWindowOperator::new(
+            WindowOperatorConfig {
+                kind: WindowKind::Session { gap_ms: 1_000 },
+                timestamp_field: "ts".into(),
+                key_field: "key".into(),
+                value_fields: vec![],
+                trigger: WindowTrigger::Watermark,
+                trigger_interval_ms: 1_000,
+                watermark_field: "__watermark_ms".into(),
+            },
+            backend,
+            "session-test",
+        );
+        // Events 3ms apart stay one session (gap 1000ms); all extend it.
+        op.process(batch(vec![(1_000, "a", 0), (1_003, "a", 0)], None)).await.unwrap();
+        // A far-future watermark fires the merged session.
+        let fired = op
+            .process(batch(vec![(5_000, "b", 0)], Some(3_000)))
+            .await
+            .unwrap();
+        let ProcessResult::Single(fired) = fired else { panic!("session should fire") };
+        let starts = fired
+            .record_batch()
+            .column_by_name("window_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // One merged session starting at the first event (1_000).
+        assert_eq!(starts.values(), &[1_000]);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@
 
 use crate::Error;
 use crate::executor::graph::ExecutionGraphBuilder;
-use crate::executor::task::{run_graph, run_graph_with_hooks, CheckpointHook};
+use crate::executor::task::{run_graph, run_graph_with_hooks, run_graph_with_metrics, CheckpointHook};
 use crate::job::{JobComponentAdapter, JobPlan, JobSpec};
 use crate::Resource;
 use std::collections::BTreeMap;
@@ -24,9 +24,22 @@ pub async fn run_job<A: JobComponentAdapter>(
     resource: &mut Resource,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
+    run_job_with_metrics(spec, adapter, resource, cancellation, None).await
+}
+
+/// Run a JobSpec with runtime metrics: per-batch counters update the shared
+/// `RuntimeMetrics` (input/processing/output/errors) so control-plane
+/// snapshots observe kernel activity.
+pub async fn run_job_with_metrics<A: JobComponentAdapter>(
+    spec: &JobSpec,
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+    metrics: Option<std::sync::Arc<crate::runtime::RuntimeMetrics>>,
+) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
     let graph = ExecutionGraphBuilder::default().build(&plan, adapter, resource)?;
-    run_graph(graph, cancellation).await
+    run_graph_with_metrics(graph, cancellation, metrics).await
 }
 
 /// Run a JobPlan's assigned task subset (Agent mode). The assignment must not

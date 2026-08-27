@@ -618,6 +618,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
         task_id: Some("source-0".to_string()),
         event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
         partition: Some(0),
+        metrics: None,
     });
 
     let cancellation = CancellationToken::new();

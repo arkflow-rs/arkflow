@@ -16,7 +16,7 @@
 - [x] 2.3 Implement per-chain async state snapshot (Arrow IPC keyed state + source positions + watermark) that does not block data flow.
 - [x] 2.4 Wire ack semantics: source positions captured when the barrier passes the source; WAL cursor falls back for Jobs without checkpoints (checkpoint-priority recovery order documented and tested).
 - [x] 2.5 Unit tests: barrier does not stall processing (data continues during snapshot), alignment correctness with two inputs, stale-generation barrier rejection, checkpoint completes only after all vertices ack.
-- [ ] 2.6 Failure-injection tests: snapshot failure → checkpoint Failed and data continues; recovery replays from checkpoint source positions (reuses `RecoveryPlan`).
+- [x] 2.6 Failure-injection tests: snapshot failure → checkpoint Failed and data continues; recovery replays from checkpoint source positions (reuses `RecoveryPlan`).
 
 ## 3. Columnar window operator
 
@@ -24,7 +24,7 @@
 - [x] 3.2 Implement keyed window aggregation state: `(namespace=operator_id, key=window_start||key)` entries in `StateBackend`, aggregate buffers serialized via Arrow IPC.
 - [x] 3.3 Implement watermark trigger (emit aggregate when watermark ≥ window_end) and processing-time trigger mode (interval-based emit, matches legacy buffer batching semantics).
 - [x] 3.4 Wire late-event policy (Drop/Route/Update) via existing `event_time::WindowAction` decisions and route operators.
-- [ ] 3.5 Implement sliding and session window assignment after tumbling is proven.
+- [x] 3.5 Implement sliding and session window assignment after tumbling is proven.
 - [x] 3.6 Unit tests: window assignment edge cases (negative timestamps, window boundary), aggregation correctness across batches, trigger timing in both modes, state restore produces identical aggregates, late events per policy.
 
 ## 4. StreamConfig compiler
@@ -33,20 +33,20 @@
 - [x] 4.2 Map buffer plugins: `memory`→no-op, `tumbling/sliding/session`→WindowOperator processing-time mode, `join`→compile-time error with migration message.
 - [x] 4.3 Add `jobs` field to `EngineConfig` (`#[serde(default)]`) with validation.
 - [x] 4.4 Golden compilation tests for every `examples/*.yaml` shape; `--validate` accepts both streams and jobs (deep validation incl. job graph checks).
-- [ ] 4.5 Regression: every runnable example produces equivalent output under the unified kernel (window batching aligned to processing-time mode).
+- [x] 4.5 Regression: every runnable example produces equivalent output under the unified kernel (window batching aligned to processing-time mode).
 
 ## 5. Runtime integration (local + Agent)
 
 - [x] 5.1 Engine executes compiled streams + declared jobs through the unified kernel with an embedded BarrierCoordinator per checkpointed Job. (Streams compile and run via `RuntimeManager::start` → `run_job`; YAML `jobs` run end-to-end. BarrierCoordinator wiring per checkpointed Job remains part of 5.6/6.x hardening.)
-- [ ] 5.2 `RuntimeManager`/`RuntimeEntry` carry Job runtime state; health/metrics endpoints report kernel counters (in-flight batches, watermark lag, checkpoint duration).
+- [x] 5.2 `RuntimeManager`/`RuntimeEntry` carry Job runtime state; health/metrics endpoints report kernel counters (in-flight batches, watermark lag, checkpoint duration).
 - [x] 5.3 Agent `JobRuntime::start` rebuilds local subgraphs via `ExecutionGraphBuilder::build_subgraph`; generation fencing and recovery flow (agent.rs) preserved. (`spawn_kernel_job` + `KernelJobHandle`; kernel snapshots preferred; lifecycle test in `arkflow-server/tests/kernel_job_lifecycle.rs`.)
-- [ ] 5.4 Remove `SingleComputeJobRunner` execution path; migrate its review-fix test suite (generation isolation, recovery validation, fence semantics) to the kernel.
-- [ ] 5.5 Remove `stream/mod.rs` executor (`Stream::run` etc.); `StreamConfig` type moves to the compiler module; deprecated buffer plugins emit compile warnings.
+- [x] 5.4 Remove `SingleComputeJobRunner` execution path; migrate its review-fix test suite (generation isolation, recovery validation, fence semantics) to the kernel.
+- [x] 5.5 Remove `stream/mod.rs` executor (`Stream::run` etc.); `StreamConfig` type moves to the compiler module; deprecated buffer plugins emit compile warnings.
 - [ ] 5.6 Multi-node smoke: two-node Hub–Agent Job with barrier checkpoint + kill/restart recovery passes.
 
 ## 6. Observability and docs
 
 - [x] 6.1 Kernel metrics: per-vertex throughput/latency, channel backlog, checkpoint duration/failures, watermark lag, late-event counters (expose via RuntimeMetrics snapshot). (`executor::metrics` KernelMetrics/ChainMetrics + snapshot; RuntimeMetrics wiring is incremental.)
-- [ ] 6.2 Update CLAUDE.md / docs: single kernel, Stream-as-compiled-Job narrative, breaking changes and migration notes.
-- [ ] 6.3 Sync OpenSpec specs (`stream-backpressure`, `stream-runtime-control`, `input-durability` wording) to unified-kernel acceptance criteria.
+- [x] 6.2 Update CLAUDE.md / docs: single kernel, Stream-as-compiled-Job narrative, breaking changes and migration notes.
+- [x] 6.3 Sync OpenSpec specs (`stream-backpressure`, `stream-runtime-control`, `input-durability` wording) to unified-kernel acceptance criteria.
 - [x] 6.4 Performance baseline: throughput/latency benchmark comparing legacy Stream runtime vs unified kernel (generate→json_to_arrow→sql→drop, 200k rows batch=1000: kernel 528ms vs legacy 559ms, ratio 0.94 — kernel 6% faster; `kernel_perf_baseline.rs`, run with --ignored). kafka/window variants to extend.

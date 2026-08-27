@@ -281,17 +281,31 @@ fn window_config(
             ))
         })
     };
+    // Legacy buffer field names: tumbling/sliding key on `interval`
+    // (sliding's `slide_size` is a row count; the window operator's slide
+    // falls back to the interval cadence), session on `gap`.
+    let interval_ms = |field: &str| -> Result<i64, Error> {
+        config
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_duration_ms)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "buffer '{buffer_type}' requires a '{field}' duration (e.g. \"1s\")"
+                ))
+            })
+    };
     let kind = match buffer_type {
-        "tumbling_window" => json!({"kind": "tumbling", "size_ms": get_duration_ms("size")?}),
-        "sliding_window" => json!({
-            "kind": "tumbling", // sliding lands after tumbling is proven; the
-                                // compiler maps it to tumbling at slide cadence
-            "size_ms": get_duration_ms("size")?,
-        }),
-        "session_window" => json!({
-            "kind": "tumbling",
-            "size_ms": get_duration_ms("gap")?,
-        }),
+        "tumbling_window" => {
+            json!({"kind": "tumbling", "size_ms": interval_ms("interval").or_else(|_| get_duration_ms("size"))?})
+        }
+        "sliding_window" => {
+            let size_ms = interval_ms("interval").or_else(|_| get_duration_ms("size"))?;
+            json!({"kind": "sliding", "size_ms": size_ms, "slide_ms": size_ms})
+        }
+        "session_window" => {
+            json!({"kind": "session", "gap_ms": interval_ms("gap").or_else(|_| get_duration_ms("gap"))?})
+        }
         _ => unreachable!("caller matched window buffer types"),
     };
     let timestamp_field = config
@@ -479,5 +493,68 @@ mod tests {
         assert_eq!(parse_duration_ms("2m"), Some(120_000));
         assert_eq!(parse_duration_ms("1h"), Some(3_600_000));
         assert_eq!(parse_duration_ms("bogus"), None);
+    }
+}
+
+#[cfg(test)]
+mod window_mapping_tests {
+    use super::*;
+
+    fn window_stream(buffer_type: &str, buffer_config: serde_json::Value) -> JobSpec {
+        let stream = StreamConfig {
+            id: Some("w".into()),
+            input: crate::input::InputConfig {
+                input_type: "generate".into(),
+                name: None,
+                codec: None,
+                config: Some(json!({"count": 1})),
+            },
+            pipeline: crate::pipeline::PipelineConfig {
+                thread_num: 1,
+                processors: vec![],
+            },
+            output: crate::output::OutputConfig {
+                output_type: "drop".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: Some(crate::buffer::BufferConfig {
+                buffer_type: buffer_type.into(),
+                name: None,
+                config: Some(buffer_config),
+            }),
+            durability: None,
+            temporary: None,
+        };
+        compile_stream(&stream, 0).unwrap()
+    }
+
+    #[test]
+    fn tumbling_uses_legacy_interval_field() {
+        let spec = window_stream("tumbling_window", json!({"interval": "1m"}));
+        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        assert_eq!(window.config.get("kind").unwrap(), "tumbling");
+        assert_eq!(window.config.get("size_ms").unwrap(), 60_000);
+    }
+
+    #[test]
+    fn sliding_maps_interval_to_size_and_slide() {
+        let spec = window_stream("sliding_window", json!({"interval": "30s", "slide_size": 5}));
+        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        assert_eq!(window.config.get("kind").unwrap(), "sliding");
+        assert_eq!(window.config.get("size_ms").unwrap(), 30_000);
+        // Legacy slide is a row count; the time-based slide falls back to
+        // the interval cadence until row-based slides exist.
+        assert_eq!(window.config.get("slide_ms").unwrap(), 30_000);
+    }
+
+    #[test]
+    fn session_maps_gap() {
+        let spec = window_stream("session_window", json!({"gap": "2s"}));
+        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        assert_eq!(window.config.get("kind").unwrap(), "session");
+        assert_eq!(window.config.get("gap_ms").unwrap(), 2_000);
     }
 }
