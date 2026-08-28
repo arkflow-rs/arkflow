@@ -10,17 +10,21 @@
 use crate::Error;
 use crate::MessageBatchRef;
 use crate::ProcessResult;
+use crate::input::{fanout_ack, Ack, VecAck};
 use crate::processor::Processor;
 use crate::state::StateBackend;
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int64Array, TimestampNanosecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, UInt64Array,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Serialized aggregate for one (window, key) pair. Kept as a compact JSON
@@ -33,6 +37,11 @@ pub struct AggregateBuffer {
     pub min_i64: i64,
     pub max_i64: i64,
     pub is_float: bool,
+    /// Dynamic end for a session window.  Zero means the value was written by
+    /// the pre-session-end state format and should use `start + gap` while it
+    /// is being upgraded.
+    #[serde(default)]
+    pub session_end_ms: i64,
 }
 
 impl AggregateBuffer {
@@ -48,6 +57,7 @@ impl AggregateBuffer {
             self.max_i64 = self.max_i64.max(other.max_i64);
         }
         self.is_float = self.is_float || other.is_float;
+        self.session_end_ms = self.session_end_ms.max(other.session_end_ms);
     }
 
     pub fn observe_i64(&mut self, value: i64) {
@@ -98,6 +108,7 @@ pub enum WindowKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowOperatorConfig {
+    #[serde(flatten)]
     pub kind: WindowKind,
     pub timestamp_field: String,
     pub key_field: String,
@@ -114,6 +125,52 @@ pub struct WindowOperatorConfig {
     /// its max value advances the operator's watermark.
     #[serde(default = "default_watermark_field")]
     pub watermark_field: String,
+}
+
+impl WindowOperatorConfig {
+    /// Validate the arithmetic and schema contract before an operator enters
+    /// the executor.  Without this guard a zero-sized window could panic in
+    /// `div_euclid`, while a zero trigger interval would create a busy timer.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.timestamp_field.trim().is_empty() {
+            return Err(Error::Config(
+                "window timestamp_field must not be empty".into(),
+            ));
+        }
+        if self.key_field.trim().is_empty() {
+            return Err(Error::Config("window key_field must not be empty".into()));
+        }
+        if self.trigger_interval_ms == 0 {
+            return Err(Error::Config(
+                "window trigger_interval_ms must be positive".into(),
+            ));
+        }
+        match self.kind {
+            WindowKind::Tumbling { size_ms } if size_ms > 0 => {}
+            WindowKind::Sliding { size_ms, slide_ms } if size_ms > 0 && slide_ms > 0 => {
+                if slide_ms > size_ms {
+                    return Err(Error::Config(
+                        "sliding window slide_ms must not exceed size_ms".into(),
+                    ));
+                }
+            }
+            WindowKind::Session { gap_ms } if gap_ms > 0 => {}
+            WindowKind::Tumbling { .. } => {
+                return Err(Error::Config(
+                    "tumbling window size_ms must be positive".into(),
+                ));
+            }
+            WindowKind::Sliding { .. } => {
+                return Err(Error::Config(
+                    "sliding window size_ms and slide_ms must be positive".into(),
+                ));
+            }
+            WindowKind::Session { .. } => {
+                return Err(Error::Config("session window gap_ms must be positive".into()));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_trigger() -> WindowTrigger {
@@ -137,7 +194,12 @@ pub struct ColumnarWindowOperator {
     namespace: String,
     /// (window_start, key) -> buffer, mirroring the backend lazily.
     buffers: Mutex<BTreeMap<(i64, String), AggregateBuffer>>,
+    /// Source acknowledgements held until the corresponding aggregate is
+    /// successfully written downstream.
+    pending_acks: Mutex<BTreeMap<(i64, String), Vec<Arc<dyn Ack>>>>,
     watermark_ms: Mutex<Option<i64>>,
+    last_processing_trigger_ms: Mutex<Option<i64>>,
+    loaded: Mutex<bool>,
 }
 
 impl ColumnarWindowOperator {
@@ -151,7 +213,10 @@ impl ColumnarWindowOperator {
             backend,
             namespace: namespace.into(),
             buffers: Mutex::new(BTreeMap::new()),
+            pending_acks: Mutex::new(BTreeMap::new()),
             watermark_ms: Mutex::new(None),
+            last_processing_trigger_ms: Mutex::new(None),
+            loaded: Mutex::new(false),
         }
     }
 
@@ -161,28 +226,37 @@ impl ColumnarWindowOperator {
     fn windows_for(&self, event_time_ms: i64) -> Vec<(i64, i64)> {
         match self.config.kind {
             WindowKind::Tumbling { size_ms } => {
-                let start = event_time_ms.div_euclid(size_ms) * size_ms;
-                vec![(start, start + size_ms)]
+                let start = event_time_ms
+                    .div_euclid(size_ms)
+                    .saturating_mul(size_ms);
+                vec![(start, start.saturating_add(size_ms))]
             }
             WindowKind::Sliding { size_ms, slide_ms } => {
-                let slide_ms = slide_ms.max(1);
                 // The latest window containing the event starts at
                 // floor(ts/slide)*slide; the size/slide covering windows
                 // precede it (each event joins every window whose interval
                 // contains its timestamp).
-                let last_start = event_time_ms.div_euclid(slide_ms) * slide_ms;
+                let last_start = event_time_ms
+                    .div_euclid(slide_ms)
+                    .saturating_mul(slide_ms);
                 let count = size_ms.div_euclid(slide_ms).max(1);
                 (0..count)
-                    .map(|step| last_start - step * slide_ms)
-                    .filter(|start| event_time_ms >= *start && event_time_ms < start + size_ms)
-                    .map(|start| (start, start + size_ms))
+                    .map(|step| {
+                        (
+                            last_start.saturating_sub(step.saturating_mul(slide_ms)),
+                            last_start
+                                .saturating_sub(step.saturating_mul(slide_ms))
+                                .saturating_add(size_ms),
+                        )
+                    })
+                    .filter(|(start, end)| event_time_ms >= *start && event_time_ms < *end)
                     .collect()
             }
             WindowKind::Session { gap_ms } => {
                 // Session windows extend per key; a conservative window for
                 // assignment purposes starts at the event and ends after the
                 // gap (the accumulator merges overlapping sessions per key).
-                vec![(event_time_ms, event_time_ms + gap_ms)]
+                vec![(event_time_ms, event_time_ms.saturating_add(gap_ms))]
             }
         }
     }
@@ -193,16 +267,33 @@ impl ColumnarWindowOperator {
         bytes
     }
 
+    fn session_end(window_start: i64, buffer: &AggregateBuffer, gap_ms: i64) -> i64 {
+        if buffer.session_end_ms > window_start {
+            buffer.session_end_ms
+        } else {
+            window_start.saturating_add(gap_ms)
+        }
+    }
+
     fn extract_timestamps(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<i64>>, Error> {
-        let column = batch
+        let Some(column) = batch
             .record_batch()
             .column_by_name(&self.config.timestamp_field)
-            .ok_or_else(|| {
-                Error::Process(format!(
-                    "window timestamp field '{}' is missing",
-                    self.config.timestamp_field
-                ))
-            })?;
+        else {
+            // Legacy Stream buffers run in processing-time mode and their
+            // generated batches do not necessarily carry the optional
+            // `__meta_timestamp` column.  Assigning the current processing
+            // time keeps that compatibility path valid while event-time
+            // windows still fail fast on a missing timestamp field.
+            if self.config.trigger == WindowTrigger::ProcessingTime {
+                let now = crate::state::now_ms() as i64;
+                return Ok(vec![Some(now); batch.len()]);
+            }
+            return Err(Error::Process(format!(
+                "window timestamp field '{}' is missing",
+                self.config.timestamp_field
+            )));
+        };
         match column.data_type() {
             DataType::Int64 => Ok(column
                 .as_any()
@@ -210,14 +301,36 @@ impl ColumnarWindowOperator {
                 .unwrap()
                 .iter()
                 .collect()),
-            DataType::Timestamp(_, _) => {
-                let nanos = column
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .unwrap();
-                Ok(nanos.iter().map(|value| value.map(|v| v / 1_000_000)).collect())
+            DataType::Timestamp(unit, _) => {
+                let casted = cast(column, &DataType::Int64)
+                    .map_err(|error| Error::Process(format!("cast timestamp: {error}")))?;
+                let values = casted.as_any().downcast_ref::<Int64Array>().unwrap();
+                let to_ms = match unit {
+                    datafusion::arrow::datatypes::TimeUnit::Second => {
+                        |value: i64| value.saturating_mul(1_000)
+                    }
+                    datafusion::arrow::datatypes::TimeUnit::Millisecond => |value: i64| value,
+                    datafusion::arrow::datatypes::TimeUnit::Microsecond => {
+                        |value: i64| value / 1_000
+                    }
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond => {
+                        |value: i64| value / 1_000_000
+                    }
+                };
+                Ok(values.iter().map(|value| value.map(to_ms)).collect())
             }
-            DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Date64 => {
+            DataType::Date32 => {
+                let casted = cast(column, &DataType::Int64)
+                    .map_err(|error| Error::Process(format!("cast date: {error}")))?;
+                Ok(casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.saturating_mul(86_400_000)))
+                    .collect())
+            }
+            DataType::Int32 | DataType::UInt32 | DataType::Date64 => {
                 let casted = cast(column, &DataType::Int64)
                     .map_err(|error| Error::Process(format!("cast timestamp: {error}")))?;
                 Ok(casted
@@ -236,15 +349,15 @@ impl ColumnarWindowOperator {
     }
 
     fn extract_keys(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<String>>, Error> {
-        let column = batch
-            .record_batch()
-            .column_by_name(&self.config.key_field)
-            .ok_or_else(|| {
-                Error::Process(format!(
-                    "window key field '{}' is missing",
-                    self.config.key_field
-                ))
-            })?;
+        let Some(column) = batch.record_batch().column_by_name(&self.config.key_field) else {
+            if self.config.key_field == "__arkflow_window_all" {
+                return Ok(vec![Some("__all__".to_owned()); batch.len()]);
+            }
+            return Err(Error::Process(format!(
+                "window key field '{}' is missing",
+                self.config.key_field
+            )));
+        };
         match column.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => {
                 let casted = cast(column, &DataType::Utf8)
@@ -296,7 +409,7 @@ impl ColumnarWindowOperator {
     }
 
     /// Merge one batch into the aggregate buffers (vectorized assignment).
-    fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<(), Error> {
+    fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<Vec<(i64, String)>, Error> {
         let timestamps = self.extract_timestamps(batch)?;
         let keys = self.extract_keys(batch)?;
         let value_columns: Vec<&ArrayRef> = self
@@ -306,6 +419,8 @@ impl ColumnarWindowOperator {
             .filter_map(|field| batch.record_batch().column_by_name(field))
             .collect();
         let mut buffers = self.buffers.lock().unwrap();
+        let mut touched = BTreeSet::new();
+        let mut session_rekeys = Vec::new();
         for row in 0..batch.len() {
             let (Some(event_time), Some(key)) = (&timestamps[row], &keys[row]) else {
                 continue;
@@ -313,71 +428,122 @@ impl ColumnarWindowOperator {
             // Sliding windows contribute to every containing window;
             // tumbling and session contribute to their single window.
             let mut windows = self.windows_for(*event_time);
+            let mut session_seed = None;
             if let WindowKind::Session { gap_ms } = self.config.kind {
-                // Session semantics: extend an existing per-key session whose
-                // end reaches this event (gap not exceeded), else open a new
-                // one at the event time.
-                let session = windows.pop().unwrap();
-                let extended = buffers
-                    .range(
-                        (event_time - gap_ms, String::new())
-                            ..(event_time + 1, String::new()),
-                    )
-                    .filter(|((start, window_key), _)| {
-                        *window_key == *key && start + gap_ms > *event_time
+                // A session is identified by its dynamic end rather than by
+                // the original `start + gap`.  Collect all matching sessions
+                // first so an out-of-order event can bridge two sessions and
+                // merge their aggregates into one interval.
+                let matching = buffers
+                    .iter()
+                    .filter(|((start, window_key), buffer)| {
+                        *window_key == *key
+                            && event_time.saturating_add(gap_ms) >= *start
+                            && *event_time
+                                <= Self::session_end(*start, buffer, gap_ms)
                     })
-                    .map(|((start, _), _)| *start)
-                    .min();
-                windows = vec![match extended {
-                    Some(start) => (start, start + gap_ms),
-                    None => session,
-                }];
-            }
-            for (window_start, _) in windows {
-            let entry = buffers.entry((window_start, key.clone())).or_default();
-            if value_columns.is_empty() {
-                entry.observe_i64(1);
-                continue;
-            }
-            for column in &value_columns {
-                match column.data_type() {
-                    DataType::Int64 => {
-                        let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                        if !values.is_null(row) {
-                            entry.observe_i64(values.value(row));
-                        }
+                    .map(|((start, window_key), buffer)| {
+                        ((*start, window_key.clone()), buffer.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let mut merged_start = *event_time;
+                let mut merged_end = event_time.saturating_add(gap_ms);
+                if !matching.is_empty() {
+                    let mut merged = AggregateBuffer::default();
+                    let mut matched_keys = Vec::new();
+                    for ((start, window_key), buffer) in matching {
+                        merged_start = merged_start.min(start);
+                        merged_end = merged_end.max(Self::session_end(start, &buffer, gap_ms));
+                        buffers.remove(&(start, window_key.clone()));
+                        matched_keys.push((start, window_key));
+                        merged.merge(&buffer);
                     }
-                    DataType::Float64 => {
-                        let values = column
-                            .as_any()
-                            .downcast_ref::<datafusion::arrow::array::Float64Array>()
-                            .unwrap();
-                        if !values.is_null(row) {
-                            entry.observe_float(values.value(row));
+                    merged.session_end_ms = merged_end;
+                    let merged_key = (merged_start, key.clone());
+                    session_rekeys.extend(
+                        matched_keys
+                            .into_iter()
+                            .map(|old_key| (old_key, merged_key.clone())),
+                    );
+                    session_seed = Some(merged);
+                }
+                windows = vec![(merged_start, merged_end)];
+            }
+            for (window_start, window_end) in windows {
+                touched.insert((window_start, key.clone()));
+                let entry = buffers.entry((window_start, key.clone())).or_default();
+                if let Some(seed) = session_seed.take() {
+                    entry.merge(&seed);
+                }
+                if matches!(self.config.kind, WindowKind::Session { .. }) {
+                    entry.session_end_ms = entry.session_end_ms.max(window_end);
+                }
+                if let Some(column) = value_columns.first() {
+                    match column.data_type() {
+                        DataType::Int64 => {
+                            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                            if !values.is_null(row) {
+                                entry.observe_i64(values.value(row));
+                            }
                         }
+                        DataType::Float64 => {
+                            let values = column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                                .unwrap();
+                            if !values.is_null(row) {
+                                entry.observe_float(values.value(row));
+                            }
+                        }
+                        _ => entry.observe_i64(1),
                     }
-                    _ => entry.observe_i64(1),
+                } else {
+                    entry.observe_i64(1);
                 }
             }
+        }
+        drop(buffers);
+        if !session_rekeys.is_empty() {
+            let mut pending = self.pending_acks.lock().unwrap();
+            for (old_key, new_key) in session_rekeys {
+                if old_key == new_key {
+                    continue;
+                }
+                if let Some(acks) = pending.remove(&old_key) {
+                    pending.entry(new_key).or_default().extend(acks);
+                }
             }
         }
-        Ok(())
+        Ok(touched.into_iter().collect())
     }
 
     /// Emit aggregates for windows whose end has passed the trigger
     /// threshold, persisting nothing (buffers are the working state; the
     /// barrier snapshot serializes them on demand).
-    fn fire_ready(&self, threshold: i64) -> Result<Option<MessageBatchRef>, Error> {
+    fn fire_ready(
+        &self,
+        threshold: i64,
+    ) -> Result<Option<(MessageBatchRef, Vec<(i64, String)>)>, Error> {
         let window_size = match self.config.kind {
             WindowKind::Tumbling { size_ms } | WindowKind::Sliding { size_ms, .. } => size_ms,
             WindowKind::Session { gap_ms } => gap_ms,
         };
         let mut buffers = self.buffers.lock().unwrap();
-        let ready: Vec<i64> = buffers
-            .keys()
-            .map(|(window_start, _)| *window_start)
-            .filter(|start| start + window_size <= threshold)
-            .collect();
+        let ready = buffers
+            .iter()
+            .filter(|((window_start, _), buffer)| {
+                let end = match self.config.kind {
+                    WindowKind::Session { gap_ms } => {
+                        Self::session_end(*window_start, buffer, gap_ms)
+                    }
+                    _ => window_start.saturating_add(window_size),
+                };
+                end <= threshold
+            })
+            .map(|((window_start, key), buffer)| {
+                ((*window_start, key.clone()), buffer.clone())
+            })
+            .collect::<Vec<_>>();
         if ready.is_empty() {
             return Ok(None);
         }
@@ -388,25 +554,24 @@ impl ColumnarWindowOperator {
         let mut sums = Vec::new();
         let mut mins = Vec::new();
         let mut maxs = Vec::new();
-        for start in ready {
-            let candidates: Vec<(String, AggregateBuffer)> = buffers
-                .range((start, String::new())..(start + 1, String::new()))
-                .map(|((_, key), buffer)| (key.clone(), buffer.clone()))
-                .collect();
-            for (key, buffer) in candidates {
-                buffers.remove(&(start, key.clone()));
-                starts.push(start);
-                ends.push(start + window_size);
-                key_strings.push(key);
-                counts.push(buffer.count);
-                sums.push(if buffer.is_float {
-                    buffer.sum_float as i64
-                } else {
-                    buffer.sum_i64
-                });
-                mins.push(buffer.min_i64);
-                maxs.push(buffer.max_i64);
-            }
+        let mut fired_keys = Vec::new();
+        for ((start, key), buffer) in ready {
+            buffers.remove(&(start, key.clone()));
+            fired_keys.push((start, key.clone()));
+            starts.push(start);
+            ends.push(match self.config.kind {
+                WindowKind::Session { gap_ms } => Self::session_end(start, &buffer, gap_ms),
+                _ => start.saturating_add(window_size),
+            });
+            key_strings.push(key);
+            counts.push(buffer.count);
+            sums.push(if buffer.is_float {
+                buffer.sum_float as i64
+            } else {
+                buffer.sum_i64
+            });
+            mins.push(buffer.min_i64);
+            maxs.push(buffer.max_i64);
         }
         drop(buffers);
         let batch = RecordBatch::try_new(
@@ -430,26 +595,95 @@ impl ColumnarWindowOperator {
             ],
         )
         .map_err(|error| Error::Process(format!("build window aggregate batch: {error}")))?;
-        Ok(Some(Arc::new(crate::MessageBatch::new_arrow(batch))))
+        Ok(Some((
+            Arc::new(crate::MessageBatch::new_arrow(batch)),
+            fired_keys,
+        )))
     }
 }
 
 #[async_trait]
 impl Processor for ColumnarWindowOperator {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        self.observe_watermark(&batch);
-        self.accumulate(&batch)?;
-        let threshold = match self.config.trigger {
-            WindowTrigger::Watermark => *self.watermark_ms.lock().unwrap(),
-            WindowTrigger::ProcessingTime => Some(crate::state::now_ms() as i64),
-        };
-        let Some(threshold) = threshold else {
+        self.process_internal(batch, None).await
+    }
+
+    async fn process_with_ack(
+        &self,
+        batch: MessageBatchRef,
+        ack: Arc<dyn Ack>,
+    ) -> Result<ProcessResult, Error> {
+        self.process_internal(batch, Some(ack)).await
+    }
+
+    async fn finish(&self) -> Result<ProcessResult, Error> {
+        self.load_from_backend()?;
+        let fired = self.fire_ready(i64::MAX)?;
+        self.persist_buffers()?;
+        Ok(match fired {
+            Some((emitted, fired_keys)) => {
+                ProcessResult::SingleWithAck(emitted, Arc::new(VecAck(self.take_acks(&fired_keys))))
+            }
+            None => ProcessResult::None,
+        })
+    }
+
+    async fn on_tick(&self) -> Result<ProcessResult, Error> {
+        if self.config.trigger != WindowTrigger::ProcessingTime {
             return Ok(ProcessResult::None);
-        };
-        match self.fire_ready(threshold)? {
-            Some(emitted) => Ok(ProcessResult::Single(emitted)),
-            None => Ok(ProcessResult::None),
         }
+        self.load_from_backend()?;
+        let now = crate::state::now_ms() as i64;
+        let due = {
+            let mut last = self.last_processing_trigger_ms.lock().unwrap();
+            let interval = self.config.trigger_interval_ms.max(1) as i64;
+            match *last {
+                None => {
+                    *last = Some(now);
+                    false
+                }
+                Some(previous) if now.saturating_sub(previous) >= interval => {
+                    *last = Some(now);
+                    true
+                }
+                Some(_) => false,
+            }
+        };
+        if !due {
+            return Ok(ProcessResult::None);
+        }
+
+        // Processing-time triggers flush the current buffers independent of
+        // event timestamps. The timestamp only determines the aggregate key;
+        // it must not prevent an idle timer from emitting old or future-dated
+        // records.
+        let fired = self.fire_ready(i64::MAX)?;
+        self.persist_buffers()?;
+        Ok(match fired {
+            Some((emitted, fired_keys)) => {
+                ProcessResult::SingleWithAck(emitted, Arc::new(VecAck(self.take_acks(&fired_keys))))
+            }
+            None => ProcessResult::None,
+        })
+    }
+
+    async fn on_watermark(&self, watermark_ms: i64) -> Result<ProcessResult, Error> {
+        self.load_from_backend()?;
+        {
+            let mut watermark = self.watermark_ms.lock().unwrap();
+            *watermark = Some(watermark.map_or(watermark_ms, |current| current.max(watermark_ms)));
+        }
+        if self.config.trigger != WindowTrigger::Watermark {
+            return Ok(ProcessResult::None);
+        }
+        let fired = self.fire_ready(watermark_ms)?;
+        self.persist_buffers()?;
+        Ok(match fired {
+            Some((emitted, fired_keys)) => {
+                ProcessResult::SingleWithAck(emitted, Arc::new(VecAck(self.take_acks(&fired_keys))))
+            }
+            None => ProcessResult::None,
+        })
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -460,15 +694,153 @@ impl Processor for ColumnarWindowOperator {
 }
 
 impl ColumnarWindowOperator {
+    async fn process_internal(
+        &self,
+        batch: MessageBatchRef,
+        ack: Option<Arc<dyn Ack>>,
+    ) -> Result<ProcessResult, Error> {
+        self.load_from_backend()?;
+        // A Route action is delivered to the explicitly configured late-event
+        // branch by the source gate. If a route batch reaches a window (for
+        // example through a compatibility graph without a synthetic branch),
+        // never fold it into the normal aggregate a second time.
+        if batch
+            .record_batch()
+            .column_by_name("__arkflow_late_event_route")
+            .is_some()
+        {
+            if let Some(ack) = ack {
+                ack.ack().await?;
+            }
+            return Ok(ProcessResult::None);
+        }
+        self.observe_watermark(&batch);
+        let touched = self.accumulate(&batch)?;
+        let threshold = match self.config.trigger {
+            WindowTrigger::Watermark => *self.watermark_ms.lock().unwrap(),
+            WindowTrigger::ProcessingTime => {
+                let now = crate::state::now_ms() as i64;
+                let mut last = self.last_processing_trigger_ms.lock().unwrap();
+                let interval = self.config.trigger_interval_ms.max(1) as i64;
+                let due = match *last {
+                    // Start the cadence when the first data arrives; the
+                    // first timer tick, rather than the first record, owns
+                    // the emission.
+                    None => false,
+                    Some(previous) => now.saturating_sub(previous) >= interval,
+                };
+                if last.is_none() || due {
+                    *last = Some(now);
+                }
+                if due {
+                    Some(i64::MAX)
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(ack) = ack else {
+            let fired = match threshold {
+                Some(threshold) => self.fire_ready(threshold)?,
+                None => None,
+            };
+            self.persist_buffers()?;
+            return Ok(match fired {
+                Some((emitted, _)) => ProcessResult::Single(emitted),
+                None => ProcessResult::None,
+            });
+        };
+
+        // Split the source delivery before firing so each window group owns a
+        // child acknowledgement. This ordering matters when the current
+        // batch itself makes a processing-time or watermark-triggered window
+        // ready: `fire_ready` must be able to transfer those child acks into
+        // the emitted aggregate instead of leaving them stranded.
+        if !touched.is_empty() {
+            let group_acks = fanout_ack(ack.clone(), touched.len());
+            self.remember_acks(touched.clone(), group_acks);
+        }
+
+        let fired = match threshold {
+            Some(threshold) => self.fire_ready(threshold)?,
+            None => None,
+        };
+        self.persist_buffers()?;
+
+        let Some((emitted, fired_keys)) = fired else {
+            if touched.is_empty() {
+                ack.ack().await?;
+            }
+            return Ok(ProcessResult::Deferred);
+        };
+
+        let mut output_acks = self.take_acks(&fired_keys);
+        if touched.is_empty() {
+            // A watermark-only batch still has to be committed, but only
+            // after the output produced by that watermark has been written.
+            output_acks.push(ack);
+        }
+        Ok(ProcessResult::SingleWithAck(
+            emitted,
+            Arc::new(VecAck(output_acks)),
+        ))
+    }
+}
+
+impl ColumnarWindowOperator {
+    fn load_from_backend(&self) -> Result<(), Error> {
+        let mut loaded = self.loaded.lock().unwrap();
+        if *loaded {
+            return Ok(());
+        }
+        self.restore_buffers_inner()?;
+        *loaded = true;
+        Ok(())
+    }
+
+    fn remember_acks(&self, keys: Vec<(i64, String)>, acks: Vec<Arc<dyn Ack>>) {
+        let mut pending = self.pending_acks.lock().unwrap();
+        for (key, ack) in keys.into_iter().zip(acks) {
+            pending.entry(key).or_default().push(ack);
+        }
+    }
+
+    fn take_acks(&self, keys: &[(i64, String)]) -> Vec<Arc<dyn Ack>> {
+        let mut pending = self.pending_acks.lock().unwrap();
+        keys.iter()
+            .flat_map(|key| pending.remove(key).unwrap_or_default())
+            .collect()
+    }
+
     /// Serialize the working buffers into the state backend (used by barrier
     /// snapshots and tests).
     pub fn persist_buffers(&self) -> Result<(), Error> {
-        let buffers = self.buffers.lock().unwrap();
-        for ((window_start, key), buffer) in buffers.iter() {
-            let value = serde_json::to_vec(buffer)?;
+        let current = self
+            .buffers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((window_start, key), buffer)| ((*window_start, key.clone()), buffer.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let existing = self.backend.scan(&self.namespace)?;
+        for entry in existing {
+            let window_start = if entry.key.len() >= 8 {
+                i64::from_be_bytes(entry.key[..8].try_into().unwrap())
+            } else {
+                return Err(Error::Process("corrupt window state key".into()));
+            };
+            let key = String::from_utf8(entry.key[8..].to_vec())
+                .map_err(|_| Error::Process("window state key is not utf8".into()))?;
+            if !current.contains_key(&(window_start, key)) {
+                self.backend.delete(&self.namespace, &entry.key)?;
+            }
+        }
+        for ((window_start, key), buffer) in current {
+            let value = encode_buffer(&buffer)?;
             self.backend.put_with_ttl(
                 &self.namespace,
-                &Self::state_key(*window_start, key),
+                &Self::state_key(window_start, &key),
                 &value,
                 None,
                 crate::state::now_ms(),
@@ -479,22 +851,135 @@ impl ColumnarWindowOperator {
 
     /// Restore working buffers from the state backend.
     pub fn restore_buffers(&self) -> Result<usize, Error> {
+        let restored = self.restore_buffers_inner()?;
+        *self.loaded.lock().unwrap() = true;
+        Ok(restored)
+    }
+
+    fn restore_buffers_inner(&self) -> Result<usize, Error> {
         let entries = self.backend.scan(&self.namespace)?;
         let mut buffers = self.buffers.lock().unwrap();
+        buffers.clear();
         let mut restored = 0;
         for entry in entries {
-            let buffer: AggregateBuffer = serde_json::from_slice(&entry.value)?;
-            let window_start = i64::from_be_bytes(
-                entry.key[..8].try_into().map_err(|_| {
-                    Error::Process("corrupt window state key".into())
-                })?,
-            );
+            let buffer = decode_buffer(&entry.value)?;
+            if entry.key.len() < 8 {
+                return Err(Error::Process("corrupt window state key".into()));
+            }
+            let window_start = i64::from_be_bytes(entry.key[..8].try_into().unwrap());
             let key = String::from_utf8_lossy(&entry.key[8..]).into_owned();
             buffers.insert((window_start, key), buffer);
             restored += 1;
         }
         Ok(restored)
     }
+}
+
+/// Encode one aggregate buffer as a one-row Arrow IPC stream. Keeping the
+/// state payload columnar makes snapshots backend-neutral and avoids coupling
+/// the window state format to JSON field ordering or number representations.
+fn encode_buffer(buffer: &AggregateBuffer) -> Result<Vec<u8>, Error> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("count", DataType::UInt64, false),
+        Field::new("sum_i64", DataType::Int64, false),
+        Field::new("sum_float", DataType::Float64, false),
+        Field::new("min_i64", DataType::Int64, false),
+        Field::new("max_i64", DataType::Int64, false),
+        Field::new("is_float", DataType::Boolean, false),
+        Field::new("session_end_ms", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![buffer.count])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![buffer.sum_i64])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![buffer.sum_float])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![buffer.min_i64])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![buffer.max_i64])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![buffer.is_float])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![buffer.session_end_ms])) as ArrayRef,
+        ],
+    )
+    .map_err(|error| Error::Process(format!("build window state batch: {error}")))?;
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref())
+        .map_err(|error| Error::Process(format!("start window state IPC writer: {error}")))?;
+    writer
+        .write(&batch)
+        .map_err(|error| Error::Process(format!("write window state IPC: {error}")))?;
+    writer
+        .finish()
+        .map_err(|error| Error::Process(format!("finish window state IPC: {error}")))?;
+    Ok(bytes)
+}
+
+fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
+    let mut reader = match StreamReader::try_new(Cursor::new(bytes), None) {
+        Ok(reader) => reader,
+        Err(_) => {
+            return serde_json::from_slice(bytes)
+                .map_err(|error| Error::Process(format!("invalid window state payload: {error}")));
+        }
+    };
+    let batch = reader
+        .next()
+        .ok_or_else(|| Error::Process("window state IPC has no record batch".into()))?
+        .map_err(|error| Error::Process(format!("read window state IPC: {error}")))?;
+    if batch.num_rows() != 1 || !matches!(batch.num_columns(), 6 | 7) {
+        // A short JSON fallback keeps state written by the pre-IPC kernel
+        // recoverable during rolling upgrades.
+        return serde_json::from_slice(bytes)
+            .map_err(|error| Error::Process(format!("invalid window state payload: {error}")));
+    }
+    let value = |index: usize| batch.column(index).clone();
+    let count = value(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::Process("window state count column has wrong type".into()))?
+        .value(0);
+    let sum_i64 = value(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::Process("window state sum_i64 column has wrong type".into()))?
+        .value(0);
+    let sum_float = value(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| Error::Process("window state sum_float column has wrong type".into()))?
+        .value(0);
+    let min_i64 = value(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::Process("window state min_i64 column has wrong type".into()))?
+        .value(0);
+    let max_i64 = value(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::Process("window state max_i64 column has wrong type".into()))?
+        .value(0);
+    let is_float = value(5)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| Error::Process("window state is_float column has wrong type".into()))?
+        .value(0);
+    let session_end_ms = if batch.num_columns() == 7 {
+        value(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| Error::Process("window state session_end_ms column has wrong type".into()))?
+            .value(0)
+    } else {
+        0
+    };
+    Ok(AggregateBuffer {
+        count,
+        sum_i64,
+        sum_float,
+        min_i64,
+        max_i64,
+        is_float,
+        session_end_ms,
+    })
 }
 
 #[cfg(test)]
@@ -588,21 +1073,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn processing_time_trigger_fires_immediately() {
+    async fn processing_time_trigger_fires_on_idle_tick() {
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn StateBackend> =
             Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
         let op = operator(WindowTrigger::ProcessingTime, backend);
-        // Processing-time mode uses the wall clock as the threshold: a batch
-        // with ancient timestamps still fires (legacy buffering semantics).
+        // Processing-time mode starts a cadence when data arrives; an idle
+        // timer flushes the buffer regardless of event timestamps.
         let now = crate::state::now_ms() as i64;
         let far_past = now - 60_000;
         let ts = far_past - (far_past % 10_000);
-        let fired = op
+        let held = op
             .process(batch(vec![(ts, "a", 1), (ts + 1, "a", 2)], None))
             .await
             .unwrap();
-        assert!(matches!(fired, ProcessResult::Single(_)));
+        assert!(matches!(held, ProcessResult::None));
+        *op.last_processing_trigger_ms.lock().unwrap() = Some(now - 2_000);
+        let fired = op.on_tick().await.unwrap();
+        assert!(matches!(
+            fired,
+            ProcessResult::Single(_) | ProcessResult::SingleWithAck(_, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn processing_time_window_accepts_batches_without_metadata_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = operator(WindowTrigger::ProcessingTime, backend);
+        let batch = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                    Arc::new(I64::from(vec![7])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        ));
+
+        assert!(matches!(op.process(batch).await.unwrap(), ProcessResult::None));
+        *op.last_processing_trigger_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        let fired = op.on_tick().await.unwrap();
+        let (ProcessResult::Single(fired) | ProcessResult::SingleWithAck(fired, _)) = fired else {
+            panic!("processing-time window should flush a metadata-free batch");
+        };
+        assert_eq!(fired.record_batch().num_rows(), 1);
+        assert_eq!(
+            fired
+                .record_batch()
+                .column_by_name("sum")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
     }
 
     #[tokio::test]
@@ -725,11 +1257,19 @@ mod tests {
             backend,
             "session-test",
         );
-        // Events 3ms apart stay one session (gap 1000ms); all extend it.
-        op.process(batch(vec![(1_000, "a", 0), (1_003, "a", 0)], None)).await.unwrap();
+        // Each event is within 1000ms of the previous one, so the dynamic
+        // session end keeps extending instead of using the original start.
+        op.process(
+            batch(
+                vec![(1_000, "a", 0), (1_800, "a", 0), (2_700, "a", 0)],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
         // A far-future watermark fires the merged session.
         let fired = op
-            .process(batch(vec![(5_000, "b", 0)], Some(3_000)))
+            .process(batch(vec![(5_000, "b", 0)], Some(3_700)))
             .await
             .unwrap();
         let ProcessResult::Single(fired) = fired else { panic!("session should fire") };
@@ -742,6 +1282,22 @@ mod tests {
             .unwrap();
         // One merged session starting at the first event (1_000).
         assert_eq!(starts.values(), &[1_000]);
+        let ends = fired
+            .record_batch()
+            .column_by_name("window_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(ends.values(), &[3_700]);
+        assert_eq!(counts.values(), &[3]);
     }
 
     #[tokio::test]

@@ -41,6 +41,18 @@ const ALLOWED_NODE_METRICS: &[&str] = &[
     "restarts",
     "streams_total",
     "streams_running",
+    "kernel_batches_in",
+    "kernel_batches_out",
+    "kernel_rows",
+    "kernel_errors",
+    "in_flight",
+    "mean_latency_us",
+    "checkpoint_duration_ms",
+    "checkpoint_failures",
+    "watermark_lag_ms",
+    "late_events",
+    "jobs_total",
+    "jobs_running",
 ];
 
 #[derive(Debug, Clone)]

@@ -28,6 +28,13 @@ pub struct Aligner {
     /// Envelope parked by the fast path (no alignment in progress) for the
     /// caller to retrieve with `take_passthrough`.
     passthrough: Option<super::envelope::Envelope>,
+    /// Barrier currently being aligned. Keeping the full value prevents a
+    /// second checkpoint id from being silently paired with the first one's
+    /// state snapshot.
+    in_flight: Option<CheckpointBarrier>,
+    /// Last completed barrier, used to reject an accidental duplicate after a
+    /// one-input vertex has already forwarded it.
+    last_completed: Option<CheckpointBarrier>,
 }
 
 impl Aligner {
@@ -38,6 +45,8 @@ impl Aligner {
             input_count,
             max_buffered,
             passthrough: None,
+            in_flight: None,
+            last_completed: None,
         }
     }
 
@@ -50,10 +59,64 @@ impl Aligner {
         index: usize,
         envelope: super::envelope::Envelope,
     ) -> Result<Option<CheckpointBarrier>, crate::Error> {
+        if index >= self.input_count {
+            return Err(crate::Error::Config(format!(
+                "barrier input index {index} is outside the {}-input vertex",
+                self.input_count
+            )));
+        }
         if let super::envelope::Envelope::Barrier(barrier) = envelope {
-            self.aligned.insert(index);
+            if self
+                .last_completed
+                .as_ref()
+                .is_some_and(|completed| completed == &barrier)
+            {
+                return Err(crate::Error::Process(format!(
+                    "stale duplicate barrier '{}' received after completion",
+                    barrier.checkpoint_id
+                )));
+            }
+            if self
+                .last_completed
+                .as_ref()
+                .is_some_and(|completed| barrier.generation < completed.generation)
+            {
+                return Err(crate::Error::Process(format!(
+                    "stale barrier '{}' generation {} arrived after generation {}",
+                    barrier.checkpoint_id,
+                    barrier.generation,
+                    self.last_completed
+                        .as_ref()
+                        .map(|completed| completed.generation)
+                        .unwrap_or_default()
+                )));
+            }
+            if let Some(expected) = self.in_flight.clone() {
+                if expected != barrier {
+                    self.in_flight = None;
+                    self.aligned.clear();
+                    return Err(crate::Error::Process(format!(
+                        "barrier mismatch: expected '{}' generation {}, received '{}' generation {}",
+                        expected.checkpoint_id,
+                        expected.generation,
+                        barrier.checkpoint_id,
+                        barrier.generation
+                    )));
+                }
+                if !self.aligned.insert(index) {
+                    return Err(crate::Error::Process(format!(
+                        "duplicate barrier '{}' from input {index}",
+                        barrier.checkpoint_id
+                    )));
+                }
+            } else {
+                self.in_flight = Some(barrier.clone());
+                self.aligned.insert(index);
+            }
             if self.aligned.len() == self.input_count {
                 self.aligned.clear();
+                self.in_flight = None;
+                self.last_completed = Some(barrier.clone());
                 return Ok(Some(barrier));
             }
             return Ok(None);
@@ -71,6 +134,7 @@ impl Aligner {
             // by `release` and the checkpoint fails upstream rather than
             // growing memory without bound.
             self.aligned.clear();
+            self.in_flight = None;
             return Err(crate::Error::Process(format!(
                 "barrier alignment exceeded the {total}-envelope bound"
             )));
@@ -99,6 +163,7 @@ impl Aligner {
             }
         }
         self.aligned.clear();
+        self.in_flight = None;
         drained
     }
 }
@@ -232,27 +297,6 @@ impl BarrierCoordinator {
 
     pub fn take_error(&self) -> Option<crate::Error> {
         self.last_error.lock().unwrap().take()
-    }
-}
-
-impl CheckpointCoordinator {
-    /// Start the barrier round if not already started (idempotent per
-    /// coordinator instance).
-    pub fn start_if_needed(
-        &mut self,
-        checkpoint_id: impl Into<String>,
-    ) -> Result<CheckpointBarrier, crate::Error> {
-        if self.status() == crate::checkpoint::CheckpointStatus::Pending {
-            return self.start(checkpoint_id);
-        }
-        Ok(CheckpointBarrier {
-            checkpoint_id: self.pending_checkpoint_id().unwrap_or_default(),
-            generation: 0,
-        })
-    }
-
-    fn pending_checkpoint_id(&self) -> Option<String> {
-        None
     }
 }
 

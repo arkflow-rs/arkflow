@@ -66,6 +66,11 @@ impl Pipeline {
                         match processor.process(batch).await? {
                             ProcessResult::Single(result) => results.push(result),
                             ProcessResult::Multiple(mut res) => results.append(&mut res),
+                            ProcessResult::SingleWithAck(result, _) => results.push(result),
+                            ProcessResult::MultipleWithAck(mut res) => {
+                                results.extend(res.drain(..).map(|(batch, _)| batch));
+                            }
+                            ProcessResult::Deferred => {} // Buffered for a later emission
                             ProcessResult::None => {} // Filtered out
                         }
                     }
@@ -77,7 +82,11 @@ impl Pipeline {
                         ProcessResult::Multiple(results)
                     }
                 }
-                ProcessResult::None => ProcessResult::None, // Already filtered
+                ProcessResult::SingleWithAck(result, _) => ProcessResult::Single(result),
+                ProcessResult::MultipleWithAck(results) => ProcessResult::Multiple(
+                    results.into_iter().map(|(batch, _)| batch).collect(),
+                ),
+                ProcessResult::Deferred | ProcessResult::None => ProcessResult::None,
             };
         }
 

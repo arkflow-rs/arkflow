@@ -504,6 +504,12 @@ impl CheckpointCoordinator {
                 ack.task_id
             )));
         }
+        if self.acknowledgements.contains_key(&ack.task_id) {
+            return Err(Error::Process(format!(
+                "duplicate checkpoint acknowledgement from task '{}'",
+                ack.task_id
+            )));
+        }
         self.acknowledgements.insert(ack.task_id.clone(), ack);
         Ok(self.acknowledgements.len() == self.participants.len())
     }
@@ -570,6 +576,24 @@ impl CheckpointCoordinator {
 
     pub fn status(&self) -> CheckpointStatus {
         self.status
+    }
+
+    /// Start the barrier round if it is pending, otherwise return the
+    /// already-active barrier for idempotent report handling.
+    pub fn start_if_needed(
+        &mut self,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<CheckpointBarrier, Error> {
+        if self.status == CheckpointStatus::Pending {
+            return self.start(checkpoint_id);
+        }
+        self.barrier
+            .clone()
+            .ok_or_else(|| Error::Process("checkpoint barrier is missing".into()))
+    }
+
+    pub fn barrier(&self) -> Option<&CheckpointBarrier> {
+        self.barrier.as_ref()
     }
 }
 

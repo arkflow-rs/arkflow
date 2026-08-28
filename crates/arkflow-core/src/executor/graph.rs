@@ -44,6 +44,20 @@ pub struct Chain {
     pub inputs: Vec<Receiver<super::envelope::Envelope>>,
     /// Outbound edges keyed by the upstream task id inside this chain.
     pub outputs: BTreeMap<String, Vec<EdgeTarget>>,
+    /// Error-only outbound edges. These are used when a processor fails; they
+    /// must not receive successful data like ordinary broadcast edges.
+    pub error_outputs: BTreeMap<String, Vec<EdgeTarget>>,
+    /// Outbound edges used only for source-side late-event Route actions.
+    /// They are separate from normal data edges so a late row cannot be
+    /// delivered to the main window and the late sink at the same time.
+    pub late_event_outputs: BTreeMap<String, Vec<EdgeTarget>>,
+    /// Event-time configuration for a source chain. The kernel uses this to
+    /// construct a gate automatically for local and Agent execution alike.
+    pub source_time: Option<crate::job::TimeSpec>,
+    /// Physical source partition represented by this chain.
+    pub source_partition: Option<u32>,
+    /// Downstream window timing definitions used by the source gate.
+    pub window_timings: Vec<super::event_time_gate::WindowTiming>,
 }
 
 impl Chain {
@@ -159,6 +173,17 @@ impl<'a> PlanIndex<'a> {
         self.sink_operators.contains(operator_id)
     }
 
+    fn is_error_sink(&self, operator_id: &str) -> bool {
+        self.plan
+            .spec
+            .operators
+            .iter()
+            .find(|operator| operator.id == operator_id)
+            .and_then(|operator| operator.config.get("__arkflow_error_sink"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn task(&self, task_id: &str) -> Option<&TaskSpec> {
         self.plan.task(task_id)
     }
@@ -257,6 +282,22 @@ impl ExecutionGraphBuilder {
         if tasks.is_empty() {
             return Err(Error::Config("Job assignment contains no tasks".into()));
         }
+        // Window operators are stateful even when a local StreamConfig has no
+        // explicit Job state section. Give that local graph a real backend;
+        // explicit Job state backends still take precedence and all other
+        // stateful operators retain the strict configuration requirement.
+        let state_backend = match self.state_backend.clone() {
+            Some(backend) => Some(backend),
+            None if tasks.iter().any(|task| {
+                plan.spec
+                    .operators
+                    .iter()
+                    .find(|operator| operator.id == task.operator_id)
+                    .is_some_and(|operator| operator.kind == crate::job::OperatorKind::Window)
+            }) => Some(Arc::new(crate::state::InMemoryStateBackend::new(1)?)
+                as Arc<dyn crate::state::StateBackend>),
+            None => None,
+        };
         let _assigned: BTreeSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
 
         // 1. Group tasks into fusable runs. Tasks are visited in plan order
@@ -362,6 +403,8 @@ impl ExecutionGraphBuilder {
                     .or_default()
                     .push(OutboundEdge {
                         kind,
+                        error: index.is_error_sink(&downstream_operator),
+                        late_route: false,
                         targets,
                         key_field: index
                             .plan
@@ -373,19 +416,88 @@ impl ExecutionGraphBuilder {
                             .unwrap_or_default(),
                     });
             }
+
+            // A late-event route is a logical side edge of the source, not a
+            // normal data edge. Materialize it even when the JobSpec does not
+            // repeat the route as a regular source->operator edge; the route
+            // target still participates in the same local graph and receives
+            // barriers/EOS through the control path.
+            if index.is_source(&task.operator_id) {
+                if let Some(route_operator) = plan
+                    .spec
+                    .sources
+                    .iter()
+                    .find(|source| source.operator_id == task.operator_id)
+                    .and_then(|source| source.time.late_event_route.as_deref())
+                {
+                    let target_tasks = tasks
+                        .iter()
+                        .filter(|candidate| candidate.operator_id == route_operator)
+                        .collect::<Vec<_>>();
+                    if target_tasks.is_empty() {
+                        return Err(Error::Config(format!(
+                            "late-event route target '{}' for source '{}' is not in this Job assignment",
+                            route_operator, task.operator_id
+                        )));
+                    }
+                    let upstream_run = *run_of_task
+                        .get(task.id.as_str())
+                        .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
+                    let mut target_runs = Vec::new();
+                    for target in target_tasks {
+                        let target_run = *run_of_task.get(target.id.as_str()).ok_or_else(|| {
+                            Error::Config(format!("task '{}' lost its run", target.id))
+                        })?;
+                        if target_run != upstream_run && !target_runs.contains(&target_run) {
+                            target_runs.push(target_run);
+                        }
+                    }
+                    if !target_runs.is_empty() {
+                        let targets = target_runs
+                            .iter()
+                            .map(|run_index| runs[*run_index][0].id.clone())
+                            .collect::<Vec<_>>();
+                        outbound
+                            .entry(task.id.clone())
+                            .or_default()
+                            .push(OutboundEdge {
+                                kind: if targets.len() == 1 {
+                                    OutboundKind::Forward
+                                } else {
+                                    OutboundKind::Broadcast
+                                },
+                                error: false,
+                                late_route: true,
+                                targets,
+                                key_field: index
+                                    .plan
+                                    .spec
+                                    .operators
+                                    .iter()
+                                    .find(|operator| operator.id == route_operator)
+                                    .and_then(|operator| operator.key_field.clone())
+                                    .unwrap_or_default(),
+                            });
+                    }
+                }
+            }
         }
 
         // 3. Materialize channels per (upstream task, target run entry).
         let mut senders: BTreeMap<(String, String), Sender<super::envelope::Envelope>> =
             BTreeMap::new();
-        let mut receivers: BTreeMap<String, Receiver<super::envelope::Envelope>> = BTreeMap::new();
+        // A run may have several upstream edges. Keep every receiver instead
+        // of indexing only by target task id; overwriting here silently turns
+        // a multi-input vertex into a single-input vertex.
+        let mut receivers: BTreeMap<String, Vec<Receiver<super::envelope::Envelope>>> =
+            BTreeMap::new();
         for (upstream_task_id, edges) in &outbound {
             for edge in edges {
                 for target in &edge.targets {
                     if !senders.contains_key(&(upstream_task_id.clone(), target.clone())) {
                         let (sender, receiver) = flume::bounded(self.channel_capacity);
                         senders.insert((upstream_task_id.clone(), target.clone()), sender);
-                        receivers.insert(target.clone(), receiver);
+                        receivers.entry(target.clone()).or_default().push(receiver);
                     }
                 }
             }
@@ -432,46 +544,68 @@ impl ExecutionGraphBuilder {
                             task.id
                         ))
                     })?;
-                let processor = adapter.build_processor(operator, resource)?;
-                let processor: Arc<dyn Processor> = if operator.stateful {
-                    let backend = self.state_backend.clone().ok_or_else(|| {
+                let processor: Arc<dyn Processor> = if operator.kind == crate::job::OperatorKind::Window {
+                    let backend = state_backend.clone().ok_or_else(|| {
                         Error::Config(format!(
                             "stateful operator '{}' requires a Job state backend",
                             operator.id
                         ))
                     })?;
-                    Arc::new(super::stateful::StatefulOperator::new(
-                        processor,
-                        backend,
-                        format!("job:{}:task:{}", plan.spec.id, task.id),
-                        operator.key_field.clone().ok_or_else(|| {
+                    let config: super::window::WindowOperatorConfig =
+                        serde_json::from_value(operator.config.clone()).map_err(|error| {
                             Error::Config(format!(
-                                "stateful operator '{}' requires key_field",
+                                "window operator '{}' has invalid config: {error}",
                                 operator.id
                             ))
-                        })?,
-                        plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
-                        operator
-                            .config
-                            .get("state_output_field")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("__arkflow_state_count")
-                            .to_owned(),
+                        })?;
+                    config.validate()?;
+                    Arc::new(super::window::ColumnarWindowOperator::new(
+                        config,
+                        backend,
+                        format!("job:{}:task:{}", plan.spec.id, task.id),
                     ))
                 } else {
-                    processor
+                    let processor = adapter.build_processor(operator, resource)?;
+                    if !operator.stateful {
+                        processor
+                    } else {
+                        let backend = state_backend.clone().ok_or_else(|| {
+                            Error::Config(format!(
+                                "stateful operator '{}' requires a Job state backend",
+                                operator.id
+                            ))
+                        })?;
+                        Arc::new(super::stateful::StatefulOperator::new(
+                            processor,
+                            backend,
+                            format!("job:{}:task:{}", plan.spec.id, task.id),
+                            operator.key_field.clone().ok_or_else(|| {
+                                Error::Config(format!(
+                                    "stateful operator '{}' requires key_field",
+                                    operator.id
+                                ))
+                            })?,
+                            plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
+                            operator
+                                .config
+                                .get("state_output_field")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("__arkflow_state_count")
+                                .to_owned(),
+                        ))
+                    }
                 };
                 processors.push(processor);
             }
 
             let inputs = run
                 .first()
-                .map(|task| receivers.remove(&task.id))
-                .flatten()
-                .into_iter()
-                .collect::<Vec<_>>();
+                .and_then(|task| receivers.remove(&task.id))
+                .unwrap_or_default();
 
             let mut outputs = BTreeMap::new();
+            let mut error_outputs = BTreeMap::new();
+            let mut late_event_outputs = BTreeMap::new();
             for task in run {
                 if let Some(edges) = outbound.remove(&task.id) {
                     let mut targets = Vec::with_capacity(edges.len());
@@ -495,9 +629,23 @@ impl ExecutionGraphBuilder {
                                 key_field: edge.key_field,
                             },
                         };
-                        targets.push(target);
+                        if edge.late_route {
+                            late_event_outputs
+                                .entry(task.id.clone())
+                                .or_insert_with(Vec::new)
+                                .push(target);
+                        } else if edge.error {
+                            error_outputs
+                                .entry(task.id.clone())
+                                .or_insert_with(Vec::new)
+                                .push(target);
+                        } else {
+                            targets.push(target);
+                        }
                     }
-                    outputs.insert(task.id.clone(), targets);
+                    if !targets.is_empty() {
+                        outputs.insert(task.id.clone(), targets);
+                    }
                 }
             }
 
@@ -508,6 +656,27 @@ impl ExecutionGraphBuilder {
                 sink,
                 inputs,
                 outputs,
+                error_outputs,
+                late_event_outputs,
+                source_time: if is_source {
+                    plan.spec
+                        .sources
+                        .iter()
+                        .find(|source| source.operator_id == first.operator_id)
+                        .map(|source| source.time.clone())
+                } else {
+                    None
+                },
+                source_partition: if is_source {
+                    first.partitions.first().map(|partition| partition.id)
+                } else {
+                    None
+                },
+                window_timings: if is_source {
+                    window_timings_for_source(plan, &first.operator_id)?
+                } else {
+                    Vec::new()
+                },
             });
         }
 
@@ -532,6 +701,8 @@ enum OutboundKind {
 
 struct OutboundEdge {
     kind: OutboundKind,
+    error: bool,
+    late_route: bool,
     targets: Vec<String>,
     key_field: String,
 }
@@ -568,4 +739,63 @@ fn build_source_input<A: JobComponentAdapter>(
         .ok_or_else(|| Error::Config(format!("task '{}' has no source partition", task.id)))?;
     input.assign_partition(partition)?;
     Ok(input)
+}
+
+/// Collect the timing shape of every normal-path window reachable from a
+/// source. The source gate uses the latest containing-window end, which is
+/// essential for sliding windows where one event belongs to several windows.
+fn window_timings_for_source(
+    plan: &JobPlan,
+    source_operator_id: &str,
+) -> Result<Vec<super::event_time_gate::WindowTiming>, Error> {
+    let mut queue = plan
+        .spec
+        .edges
+        .iter()
+        .filter(|edge| edge.from == source_operator_id)
+        .map(|edge| edge.to.clone())
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut timings = Vec::new();
+    while let Some(operator_id) = queue.pop() {
+        if !visited.insert(operator_id.clone()) {
+            continue;
+        }
+        if let Some(operator) = plan
+            .spec
+            .operators
+            .iter()
+            .find(|operator| operator.id == operator_id)
+        {
+            if operator.kind == crate::job::OperatorKind::Window {
+                let config: super::window::WindowOperatorConfig =
+                    serde_json::from_value(operator.config.clone()).map_err(|error| {
+                        Error::Config(format!(
+                            "window operator '{}' has invalid config: {error}",
+                            operator.id
+                        ))
+                    })?;
+                config.validate()?;
+                timings.push(match config.kind {
+                    super::window::WindowKind::Tumbling { size_ms } => {
+                        super::event_time_gate::WindowTiming::Tumbling { size_ms }
+                    }
+                    super::window::WindowKind::Sliding { size_ms, slide_ms } => {
+                        super::event_time_gate::WindowTiming::Sliding { size_ms, slide_ms }
+                    }
+                    super::window::WindowKind::Session { gap_ms } => {
+                        super::event_time_gate::WindowTiming::Session { gap_ms }
+                    }
+                });
+            }
+            queue.extend(
+                plan.spec
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.from == operator_id)
+                    .map(|edge| edge.to.clone()),
+            );
+        }
+    }
+    Ok(timings)
 }

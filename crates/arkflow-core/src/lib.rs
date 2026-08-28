@@ -188,14 +188,41 @@ pub type MessageBatchRef = Arc<MessageBatch>;
 ///     ProcessResult::Multiple(chunks)
 /// }
 /// ```
-#[derive(Debug)]
 pub enum ProcessResult {
     /// Single message batch output
     Single(MessageBatchRef),
     /// Multiple message batches output
     Multiple(Vec<MessageBatchRef>),
+    /// A single output with an acknowledgement that represents the input
+    /// batches consumed to produce it. Stateful processors such as windows
+    /// use this when an output is emitted after buffering input.
+    SingleWithAck(MessageBatchRef, Arc<dyn crate::input::Ack>),
+    /// Multiple outputs with one acknowledgement per output branch.
+    MultipleWithAck(Vec<(MessageBatchRef, Arc<dyn crate::input::Ack>)>),
+    /// The processor consumed the input but is retaining its acknowledgement
+    /// until a later call emits the resulting batch.
+    Deferred,
     /// No output (filtered)
     None,
+}
+
+impl std::fmt::Debug for ProcessResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(_) => formatter.write_str("ProcessResult::Single(..)"),
+            Self::Multiple(outputs) => formatter
+                .debug_struct("ProcessResult::Multiple")
+                .field("len", &outputs.len())
+                .finish(),
+            Self::SingleWithAck(_, _) => formatter.write_str("ProcessResult::SingleWithAck(..)"),
+            Self::MultipleWithAck(outputs) => formatter
+                .debug_struct("ProcessResult::MultipleWithAck")
+                .field("len", &outputs.len())
+                .finish(),
+            Self::Deferred => formatter.write_str("ProcessResult::Deferred"),
+            Self::None => formatter.write_str("ProcessResult::None"),
+        }
+    }
 }
 
 impl ProcessResult {
@@ -216,6 +243,14 @@ impl ProcessResult {
                 .into_iter()
                 .map(|m| Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone()))
                 .collect(),
+            ProcessResult::SingleWithAck(msg, _) => {
+                vec![Arc::try_unwrap(msg).unwrap_or_else(|m| (*m).clone())]
+            }
+            ProcessResult::MultipleWithAck(msgs) => msgs
+                .into_iter()
+                .map(|(msg, _)| Arc::try_unwrap(msg).unwrap_or_else(|m| (*m).clone()))
+                .collect(),
+            ProcessResult::Deferred => vec![],
             ProcessResult::None => vec![],
         }
     }
@@ -231,7 +266,7 @@ impl ProcessResult {
 
     /// Check if result is empty (filtered out)
     pub fn is_empty(&self) -> bool {
-        matches!(self, ProcessResult::None)
+        matches!(self, ProcessResult::None | ProcessResult::Deferred)
     }
 
     /// Get the number of output batches
@@ -239,6 +274,9 @@ impl ProcessResult {
         match self {
             ProcessResult::Single(_) => 1,
             ProcessResult::Multiple(vec) => vec.len(),
+            ProcessResult::SingleWithAck(_, _) => 1,
+            ProcessResult::MultipleWithAck(vec) => vec.len(),
+            ProcessResult::Deferred => 0,
             ProcessResult::None => 0,
         }
     }

@@ -3,8 +3,10 @@
 use crate::Error;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("job_state");
@@ -81,6 +83,184 @@ pub trait StateBackend: Send + Sync {
     fn restore(&self, snapshot: &StateSnapshot) -> Result<(), Error>;
     fn metrics(&self) -> Result<StateMetrics, Error>;
     fn close(&self) -> Result<(), Error>;
+}
+
+/// Process-local state backend used by local streams that declare a stateful
+/// operator but do not configure a durable Job backend. It has the same
+/// snapshot/restore contract as the embedded backend, so the execution graph
+/// does not need a second window implementation just for local mode.
+pub struct InMemoryStateBackend {
+    format_version: u32,
+    entries: RwLock<BTreeMap<(String, Vec<u8>), StateEntry>>,
+}
+
+impl InMemoryStateBackend {
+    pub fn new(format_version: u32) -> Result<Self, Error> {
+        if format_version == 0 {
+            return Err(Error::Config(
+                "state format_version must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            format_version,
+            entries: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    fn is_live(entry: &StateEntry, now_ms: u64) -> bool {
+        !entry
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+    }
+}
+
+impl StateBackend for InMemoryStateBackend {
+    fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let entries = self.entries.read().unwrap();
+        Ok(entries
+            .get(&(namespace.to_owned(), key.to_vec()))
+            .filter(|entry| Self::is_live(entry, now_ms()))
+            .map(|entry| entry.value.clone()))
+    }
+
+    fn put_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        self.entries.write().unwrap().insert(
+            (namespace.to_owned(), key.to_vec()),
+            StateEntry {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                expires_at_ms: ttl_ms.map(|ttl| now_ms.saturating_add(ttl)),
+            },
+        );
+        Ok(())
+    }
+
+    fn update_i64_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        delta: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, Error> {
+        let now = now_ms();
+        let map_key = (namespace.to_owned(), key.to_vec());
+        let mut entries = self.entries.write().unwrap();
+        let current = entries
+            .get(&map_key)
+            .filter(|entry| Self::is_live(entry, now))
+            .map(|entry| serde_json::from_slice::<i64>(&entry.value))
+            .transpose()?
+            .unwrap_or_default();
+        let next = current.saturating_add(delta);
+        let value = serde_json::to_vec(&next)?;
+        entries.insert(
+            map_key,
+            StateEntry {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                value,
+                expires_at_ms: ttl_ms.map(|ttl| now.saturating_add(ttl)),
+            },
+        );
+        Ok(next)
+    }
+
+    fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+        self.update_i64_with_ttl(namespace, key, delta, None)
+    }
+
+    fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+        Ok(self
+            .entries
+            .write()
+            .unwrap()
+            .remove(&(namespace.to_owned(), key.to_vec()))
+            .is_some())
+    }
+
+    fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+        let mut entries = self.entries.write().unwrap();
+        let before = entries.len();
+        entries.retain(|_, entry| Self::is_live(entry, now_ms));
+        Ok((before - entries.len()) as u64)
+    }
+
+    fn scan(&self, namespace: &str) -> Result<Vec<StateEntry>, Error> {
+        let now = now_ms();
+        Ok(self
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.namespace == namespace && Self::is_live(entry, now))
+            .cloned()
+            .collect())
+    }
+
+    fn snapshot_at(&self, now_ms: u64) -> Result<StateSnapshot, Error> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| Self::is_live(entry, now_ms))
+            .cloned()
+            .collect();
+        Ok(StateSnapshot::new(self.format_version, entries))
+    }
+
+    fn restore(&self, snapshot: &StateSnapshot) -> Result<(), Error> {
+        if snapshot.format_version != self.format_version {
+            return Err(Error::Config(format!(
+                "state format {} is incompatible with backend format {}",
+                snapshot.format_version, self.format_version
+            )));
+        }
+        if !snapshot.verify() {
+            return Err(Error::Process("state snapshot checksum mismatch".into()));
+        }
+        let now = now_ms();
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
+        for entry in &snapshot.entries {
+            if Self::is_live(entry, now) {
+                entries.insert((entry.namespace.clone(), entry.key.clone()), entry.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> Result<StateMetrics, Error> {
+        let now = now_ms();
+        let entries = self.entries.read().unwrap();
+        Ok(StateMetrics {
+            keys: entries
+                .values()
+                .filter(|entry| Self::is_live(entry, now))
+                .count() as u64,
+            bytes: entries
+                .values()
+                .filter(|entry| Self::is_live(entry, now))
+                .map(|entry| entry.value.len() as u64)
+                .sum(),
+        })
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct KeyedCounter {

@@ -211,11 +211,24 @@ pub struct RuntimeMetrics {
     pub input_reconnects: AtomicU64,
     pub output_errors: AtomicU64,
     pub restarts: AtomicU64,
+    pub kernel: Arc<crate::executor::metrics::KernelMetrics>,
 }
 
 impl RuntimeMetrics {
     pub fn snapshot(&self) -> StreamMetricsSnapshot {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let kernel = self.kernel.snapshot();
+        let in_flight = kernel
+            .chains
+            .values()
+            .map(|metrics| metrics.in_flight)
+            .sum();
+        let mean_latency_us = kernel
+            .chains
+            .values()
+            .map(|metrics| metrics.mean_latency_us)
+            .max()
+            .unwrap_or_default();
         StreamMetricsSnapshot {
             input_batches: load(&self.input_batches),
             input_messages: load(&self.input_messages),
@@ -226,6 +239,13 @@ impl RuntimeMetrics {
             input_reconnects: load(&self.input_reconnects),
             output_errors: load(&self.output_errors),
             restarts: load(&self.restarts),
+            kernel_chains: kernel.chains,
+            in_flight,
+            mean_latency_us,
+            checkpoint_duration_ms: kernel.checkpoint_duration_ms,
+            checkpoint_failures: kernel.checkpoint_failures,
+            watermark_lag_ms: kernel.watermark_lag_ms,
+            late_events: kernel.late_events,
         }
     }
 }
@@ -242,6 +262,7 @@ impl Default for RuntimeMetrics {
             input_reconnects: AtomicU64::new(0),
             output_errors: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            kernel: Arc::new(crate::executor::metrics::KernelMetrics::default()),
         }
     }
 }

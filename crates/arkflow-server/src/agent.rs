@@ -308,6 +308,58 @@ impl JobRuntime {
             .map(|task| task.generation)
     }
 
+    /// Aggregate unified-kernel counters for the Agent report.  A JobTask owns
+    /// one kernel handle even when its assigned subgraph has several chains;
+    /// summing throughput while taking the maximum latency/lag keeps the
+    /// node-level report useful without exposing internal task handles.
+    async fn metrics(&self) -> BTreeMap<String, f64> {
+        let tasks = self.tasks.lock().await;
+        let mut batches_in = 0_u64;
+        let mut batches_out = 0_u64;
+        let mut rows = 0_u64;
+        let mut errors = 0_u64;
+        let mut in_flight = 0_u64;
+        let mut mean_latency_us = 0_u64;
+        let mut checkpoint_duration_ms = 0_u64;
+        let mut checkpoint_failures = 0_u64;
+        let mut watermark_lag_ms = 0_u64;
+        let mut late_events = 0_u64;
+
+        for task in tasks.values() {
+            let Some(kernel) = task.kernel.as_ref() else {
+                continue;
+            };
+            let snapshot = kernel.metrics().snapshot();
+            for chain in snapshot.chains.values() {
+                batches_in = batches_in.saturating_add(chain.batches_in);
+                batches_out = batches_out.saturating_add(chain.batches_out);
+                rows = rows.saturating_add(chain.rows);
+                errors = errors.saturating_add(chain.errors);
+                in_flight = in_flight.saturating_add(chain.in_flight);
+                mean_latency_us = mean_latency_us.max(chain.mean_latency_us);
+            }
+            checkpoint_duration_ms = checkpoint_duration_ms.max(snapshot.checkpoint_duration_ms);
+            checkpoint_failures = checkpoint_failures.saturating_add(snapshot.checkpoint_failures);
+            watermark_lag_ms = watermark_lag_ms.max(snapshot.watermark_lag_ms);
+            late_events = late_events.saturating_add(snapshot.late_events);
+        }
+
+        BTreeMap::from([
+            ("kernel_batches_in".into(), batches_in as f64),
+            ("kernel_batches_out".into(), batches_out as f64),
+            ("kernel_rows".into(), rows as f64),
+            ("kernel_errors".into(), errors as f64),
+            ("in_flight".into(), in_flight as f64),
+            ("mean_latency_us".into(), mean_latency_us as f64),
+            ("checkpoint_duration_ms".into(), checkpoint_duration_ms as f64),
+            ("checkpoint_failures".into(), checkpoint_failures as f64),
+            ("watermark_lag_ms".into(), watermark_lag_ms as f64),
+            ("late_events".into(), late_events as f64),
+            ("jobs_total".into(), tasks.len() as f64),
+            ("jobs_running".into(), tasks.len() as f64),
+        ])
+    }
+
     async fn start(
         &self,
         plan: JobPlan,
@@ -315,7 +367,7 @@ impl JobRuntime {
         generation: u64,
         recovery_id: Option<String>,
         recovery_savepoint: bool,
-        _node_id: &str,
+        node_id: &str,
     ) -> Result<(), String> {
         let _start_guard = self.starts.lock().await;
         let job_id = plan.spec.id.to_string();
@@ -358,6 +410,7 @@ impl JobRuntime {
         let state_root = std::env::temp_dir()
             .join("arkflow-job-state")
             .join(&job_id)
+            .join(format!("node-{}", safe_path_component(node_id)))
             .join(format!(
                 "version-{}-generation-{}",
                 plan.spec.version.0, generation
@@ -372,7 +425,6 @@ impl JobRuntime {
             RedbStateBackend::open(state_root, state_format_version)
                 .map_err(|error| error.to_string())?,
         );
-        let mut watermarks_to_restore = BTreeMap::new();
         let recovery = if let Some(checkpoint_id) = recovery_id {
             let repository = checkpoint_repository(&plan)?;
             let artifact = recovery_artifact(&plan, &checkpoint_id, recovery_savepoint)?;
@@ -411,7 +463,6 @@ impl JobRuntime {
             }
             let recovery =
                 RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?;
-            watermarks_to_restore = recovery.watermarks_ms.clone();
             Some(recovery)
         } else {
             None
@@ -431,12 +482,6 @@ impl JobRuntime {
             )
             .await?,
         );
-        if !watermarks_to_restore.is_empty() {
-            kernel
-                .restore_watermarks(&watermarks_to_restore)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         let handle = kernel.watcher();
         self.tasks.lock().await.insert(
             job_id,
@@ -477,7 +522,7 @@ impl JobRuntime {
             .kernel
             .as_ref()
             .ok_or_else(|| "Job kernel handle is missing".to_string())?
-            .checkpoint_snapshot()
+            .checkpoint_barrier(checkpoint_id, generation)
             .await
             .map_err(|error| error.to_string())?;
         let store_uri = task
@@ -674,10 +719,26 @@ impl JobRuntime {
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(error) => Err(error.to_string()),
                 };
+                let _ = task.state.close();
                 finished.push((job_id, task.generation, result));
             }
         }
         finished
+    }
+
+    async fn stop_all(&self) {
+        let _start_guard = self.starts.lock().await;
+        let tasks = {
+            let mut tasks = self.tasks.lock().await;
+            std::mem::take(&mut *tasks)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        for task in tasks {
+            task.cancellation.cancel();
+            let _ = task.handle.await;
+            let _ = task.state.close();
+        }
     }
 
     async fn stop(&self, job_id: &str, generation: u64) -> Result<(), String> {
@@ -694,8 +755,28 @@ impl JobRuntime {
         if let Some(task) = task {
             task.cancellation.cancel();
             let _ = task.handle.await;
+            let _ = task.state.close();
         }
         Ok(())
+    }
+}
+
+fn safe_path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    if component.is_empty() {
+        "unknown".into()
+    } else {
+        component
     }
 }
 
@@ -724,104 +805,96 @@ async fn spawn_kernel_job(
         .filter_map(|chain| chain.source.clone())
         .collect::<Vec<_>>();
 
-    // Event-time gates per event-time source task (processing-time sources
-    // keep the pass-through gate inside the source loop).
+    // Event-time gates per event-time source chain.  Use the graph's compiled
+    // window timing metadata so sliding/session windows keep their exact
+    // trigger geometry; the older source-operator scan only knew a list of
+    // sizes and could release a row too early.
     let mut watermark_gates = BTreeMap::new();
-    for task_id in task_ids {
-        let Some(task) = plan.task(task_id) else { continue };
-        let Some(source) = plan
-            .spec
-            .sources
-            .iter()
-            .find(|source| source.operator_id == task.operator_id)
-        else {
-            continue;
-        };
-        if source.time.mode == arkflow_core::job::TimeMode::EventTime {
-            let window_sizes = window_sizes_for_source(plan, &source.operator_id);
+    for chain in &graph.chains {
+        if let Some(source_time) = chain.source_time.as_ref().filter(|time| {
+            time.mode == arkflow_core::job::TimeMode::EventTime
+        }) {
             let gate = arkflow_core::executor::event_time_gate::EventTimeGate::new(
-                &source.time,
-                window_sizes,
+                source_time,
+                chain.window_timings.clone(),
             )
             .map_err(|error| error.to_string())?;
-            watermark_gates.insert(task_id.clone(), Arc::new(tokio::sync::Mutex::new(Some(gate))));
+            watermark_gates.insert(
+                chain.entry_task_id().to_owned(),
+                Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            );
+        }
+    }
+
+    // Recovery must be applied before the kernel connects and reads any
+    // source. The previous order spawned the graph first, allowing a source
+    // to consume from its pre-recovery cursor before positions/watermarks
+    // were installed.
+    if let Some(recovery) = recovery {
+        for input in &inputs {
+            input.connect().await.map_err(|error| error.to_string())?;
+        }
+        for input in &inputs {
+            input
+                .restore_positions(&recovery.source_positions)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for (task_id, watermark) in &recovery.watermarks_ms {
+            if let Some(gate) = watermark_gates.get(task_id) {
+                gate.lock()
+                    .await
+                    .as_mut()
+                    .map(|gate| gate.restore_partition(0, *watermark));
+            }
         }
     }
 
     let mut states = BTreeMap::new();
-    states.insert(
-        task_ids.first().cloned().unwrap_or_default(),
-        state.clone(),
-    );
-    let handle = arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
-        graph,
-        inputs,
-        states,
-        watermark_gates.clone(),
-        false,
-        cancellation,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    if let Some(recovery) = recovery {
-        handle
-            .restore_positions(&recovery.source_positions)
-            .await
-            .map_err(|error| error.to_string())?;
-        handle
-            .restore_watermarks(&recovery.watermarks_ms)
-            .await
-            .map_err(|error| error.to_string())?;
+    for task_id in task_ids {
+        let is_stateful = plan
+            .task(task_id)
+            .and_then(|task| {
+                plan.spec
+                    .operators
+                    .iter()
+                    .find(|operator| operator.id == task.operator_id)
+            })
+            .is_some_and(|operator| {
+                operator.stateful || operator.kind == arkflow_core::job::OperatorKind::Window
+            });
+        if is_stateful {
+            states.insert(task_id.clone(), state.clone());
+        }
     }
-    Ok(handle)
-}
-
-/// Window sizes reachable downstream of one source operator (used by the
-/// event-time gate's hold/emit decisions), mirroring the legacy runner.
-fn window_sizes_for_source(plan: &JobPlan, source_operator_id: &str) -> Vec<i64> {
-    let operator_kinds = plan
-        .spec
-        .operators
-        .iter()
-        .map(|operator| (operator.id.as_str(), operator.kind))
-        .collect::<BTreeMap<_, _>>();
-    let mut queue = plan
-        .spec
-        .edges
-        .iter()
-        .filter(|edge| edge.from == source_operator_id)
-        .map(|edge| edge.to.clone())
-        .collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut sizes = Vec::new();
-    while let Some(operator_id) = queue.pop() {
-        if !visited.insert(operator_id.clone()) {
-            continue;
-        }
-        if operator_kinds.get(operator_id.as_str())
-            == Some(&arkflow_core::job::OperatorKind::Window)
-        {
-            if let Some(size) = plan
-                .spec
-                .operators
-                .iter()
-                .find(|operator| operator.id == operator_id)
-                .and_then(|operator| operator.config.get("window_size_ms"))
-                .and_then(serde_json::Value::as_i64)
-                .filter(|size| *size > 0)
-            {
-                sizes.push(size);
-            }
-        }
-        queue.extend(
-            plan.spec
-                .edges
-                .iter()
-                .filter(|edge| edge.from == operator_id)
-                .map(|edge| edge.to.clone()),
+    if states.is_empty() {
+        states.insert(
+            task_ids.first().cloned().unwrap_or_default(),
+            state.clone(),
         );
     }
-    sizes
+    let handle = if recovery.is_some() {
+        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_prepared_with_cancellation(
+            graph,
+            inputs,
+            states,
+            watermark_gates.clone(),
+            cancellation,
+        )
+        .await
+    } else {
+        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+            graph,
+            inputs,
+            states,
+            watermark_gates.clone(),
+            false,
+            cancellation,
+        )
+        .await
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(handle)
 }
 
 struct RegistryJobAdapter;
@@ -919,6 +992,7 @@ pub async fn run(
     let job_runtime = JobRuntime::default();
     loop {
         if cancellation.is_cancelled() {
+            job_runtime.stop_all().await;
             return Ok(());
         }
         match register(&client, &config).await {
@@ -943,7 +1017,13 @@ pub async fn run(
                 warn!(node_id = %config.node_id, error = %error, "Hub Agent registration failed")
             }
         }
-        tokio::select! { _ = cancellation.cancelled() => return Ok(()), _ = tokio::time::sleep(backoff) => {} }
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                job_runtime.stop_all().await;
+                return Ok(())
+            },
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
 }
@@ -998,7 +1078,7 @@ async fn run_session(
         tokio::select! {
             _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await; return Ok(()) },
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
-            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq).await).await?; }
+            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime).await).await?; }
             _ = poll.tick() => {
                 for (job_id, generation, outcome) in job_runtime.take_finished().await {
                     let (state, error) = match outcome {
@@ -1025,7 +1105,13 @@ async fn run_session(
     }
 }
 
-async fn report(cp: &ControlPlane, auth: &AgentAuth, boot_id: &str, report_seq: u64) -> NodeReport {
+async fn report(
+    cp: &ControlPlane,
+    auth: &AgentAuth,
+    boot_id: &str,
+    report_seq: u64,
+    job_runtime: &JobRuntime,
+) -> NodeReport {
     let streams = cp.runtime_manager().snapshots().await;
     let configuration_version = cp
         .runtime_manager()
@@ -1061,6 +1147,7 @@ async fn report(cp: &ControlPlane, auth: &AgentAuth, boot_id: &str, report_seq: 
             .filter(|stream| stream.state == arkflow_core::control::StreamState::Running)
             .count() as f64,
     );
+    metrics.extend(job_runtime.metrics().await);
     NodeReport {
         auth: auth.clone(),
         version: env!("CARGO_PKG_VERSION").into(),

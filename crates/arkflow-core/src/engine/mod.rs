@@ -5,7 +5,7 @@
 use crate::config::EngineConfig;
 use crate::control_plane::ControlPlane;
 use crate::executor::stream_adapter::StreamJobAdapter;
-use crate::executor::run_job;
+use crate::executor::run_job_with_checkpoints;
 use crate::runtime::RuntimeManager;
 use std::error::Error;
 use tokio::signal::unix::{signal, SignalKind};
@@ -46,9 +46,8 @@ impl Engine {
     /// Run the engine domain without starting an HTTP server.
     ///
     /// YAML-declared `jobs` execute on the unified kernel (local mode,
-    /// single process). Registered streams currently execute through the
-    /// legacy linear runtime via `RuntimeManager`; migrating that path onto
-    /// the kernel is staged in the `rebuild-unified-streaming-engine` change.
+    /// single process). Registered streams are compiled to JobSpecs by the
+    /// RuntimeManager and use the same kernel path.
     pub async fn run_with_cancellation(
         &self,
         token: CancellationToken,
@@ -85,7 +84,7 @@ impl Engine {
                     temporary: std::collections::HashMap::new(),
                     input_names: std::cell::RefCell::new(Vec::new()),
                 };
-                run_job(&spec, &adapter, &mut resource, token).await
+                run_job_with_checkpoints(&spec, &adapter, &mut resource, token).await
             });
             job_handles.push(handle);
         }

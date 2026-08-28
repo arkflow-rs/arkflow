@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::checkpoint::SourcePosition;
@@ -50,6 +51,73 @@ pub trait Ack: Send + Sync {
     /// unacknowledged message will be re-delivered — but it lets the stream
     /// observe the failure to apply backpressure or stop.
     async fn ack(&self) -> Result<(), Error>;
+}
+
+/// Split one source acknowledgement across several downstream deliveries.
+///
+/// A DAG fan-out must not acknowledge the source as soon as the first branch
+/// succeeds: every terminal branch has to finish first. The returned child
+/// acknowledgements are idempotent individually and invoke `parent` exactly
+/// once, after all children have been acknowledged successfully.
+pub fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn Ack>> {
+    if branches <= 1 {
+        return vec![parent];
+    }
+
+    let state = Arc::new(FanoutAckState {
+        parent,
+        remaining: AtomicUsize::new(branches),
+        parent_lock: tokio::sync::Mutex::new(()),
+    });
+    (0..branches)
+        .map(|_| {
+            Arc::new(FanoutAckPart {
+                state: state.clone(),
+                acknowledged: AtomicBool::new(false),
+            }) as Arc<dyn Ack>
+        })
+        .collect()
+}
+
+struct FanoutAckState {
+    parent: Arc<dyn Ack>,
+    remaining: AtomicUsize,
+    /// Serialize the final parent acknowledgement. A transient parent error
+    /// can then roll the group back for a safe retry.
+    parent_lock: tokio::sync::Mutex<()>,
+}
+
+struct FanoutAckPart {
+    state: Arc<FanoutAckState>,
+    acknowledged: AtomicBool,
+}
+
+#[async_trait]
+impl Ack for FanoutAckPart {
+    async fn ack(&self) -> Result<(), Error> {
+        // A downstream retry or a duplicated control path must not decrement
+        // the group more than once.
+        if self.acknowledged.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if self.state.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _guard = self.state.parent_lock.lock().await;
+            match self.state.parent.ack().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // The child was only tentatively acknowledged. Keep the
+                    // group pending when the parent could not commit so the
+                    // caller can retry this child without losing the source
+                    // acknowledgement.
+                    self.state.remaining.fetch_add(1, Ordering::AcqRel);
+                    self.acknowledged.store(false, Ordering::Release);
+                    Err(error)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
@@ -126,6 +194,43 @@ impl DerefMut for VecAck {
 impl From<Arc<dyn Ack>> for VecAck {
     fn from(ack: Arc<dyn Ack>) -> Self {
         VecAck(vec![ack])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailOnceAck {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Ack for FailOnceAck {
+        async fn ack(&self) -> Result<(), Error> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                Err(Error::Process("transient parent ack failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_ack_retries_parent_after_transient_failure() {
+        let parent_impl = Arc::new(FailOnceAck {
+            calls: AtomicUsize::new(0),
+        });
+        let parent = parent_impl.clone() as Arc<dyn Ack>;
+        let children = fanout_ack(parent.clone(), 2);
+
+        children[0].ack().await.unwrap();
+        assert!(children[1].ack().await.is_err());
+        assert!(children[1].ack().await.is_ok());
+        // A duplicate downstream acknowledgement is idempotent.
+        children[1].ack().await.unwrap();
+        assert_eq!(parent_impl.calls.load(Ordering::Relaxed), 2);
     }
 }
 

@@ -96,6 +96,7 @@ pub struct HealthCheckConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     /// Streams configuration
+    #[serde(default)]
     pub streams: Vec<StreamConfig>,
     /// Local Jobs declared directly in config (executed by the unified
     /// kernel without a Hub).

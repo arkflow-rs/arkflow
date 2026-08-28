@@ -9,7 +9,46 @@
 
 use crate::Error;
 use crate::event_time::{window_action, FieldTimestampExtractor, WatermarkTracker, WindowAction};
+use crate::input::{fanout_ack, Ack, NoopAck};
 use crate::job::{LateEventPolicy, TimeSpec};
+
+/// The part of a downstream window definition that affects when a source row
+/// is safe to release.  Keeping this separate from the window operator's
+/// aggregate configuration lets the source gate handle sliding/session
+/// windows without pretending every window is tumbling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTiming {
+    Tumbling { size_ms: i64 },
+    Sliding { size_ms: i64, slide_ms: i64 },
+    Session { gap_ms: i64 },
+}
+
+impl From<i64> for WindowTiming {
+    fn from(size_ms: i64) -> Self {
+        Self::Tumbling { size_ms }
+    }
+}
+
+impl WindowTiming {
+    fn window_end_for(self, event_time_ms: i64) -> Option<i64> {
+        match self {
+            Self::Tumbling { size_ms } if size_ms > 0 => event_time_ms
+                .div_euclid(size_ms)
+                .checked_mul(size_ms)
+                .and_then(|start| start.checked_add(size_ms))
+                .or(Some(i64::MAX)),
+            Self::Sliding { size_ms, slide_ms } if size_ms > 0 && slide_ms > 0 => event_time_ms
+                .div_euclid(slide_ms)
+                .checked_mul(slide_ms)
+                .and_then(|start| start.checked_add(size_ms))
+                .or(Some(i64::MAX)),
+            Self::Session { gap_ms } if gap_ms > 0 => event_time_ms
+                .checked_add(gap_ms)
+                .or(Some(i64::MAX)),
+            _ => None,
+        }
+    }
+}
 
 /// Per-source event-time state.
 pub struct EventTimeGate {
@@ -17,24 +56,43 @@ pub struct EventTimeGate {
     tracker: Option<WatermarkTracker>,
     late_policy: LateEventPolicy,
     allowed_lateness_ms: u64,
-    window_sizes_ms: Vec<i64>,
-    /// Rows held back until the watermark opens their window, keyed by hold
-    /// order (FIFO) — batch slices waiting for watermark progress.
-    held: Vec<HeldRow>,
-    pending_acks: Vec<std::sync::Arc<dyn crate::input::Ack>>,
+    window_timings: Vec<WindowTiming>,
+    /// Batch slices held back until the watermark opens their window. Every
+    /// slice carries the source delivery ack that owns it, so releasing an old
+    /// batch can commit the correct input delivery rather than a later batch's
+    /// ack.
+    held: Vec<HeldBatch>,
 }
 
-struct HeldRow {
+struct HeldBatch {
     batch: crate::MessageBatchRef,
-    event_time_ms: Option<i64>,
+    event_times_ms: Vec<Option<i64>>,
+    ack: std::sync::Arc<dyn Ack>,
 }
 
 /// The decision for one inbound batch plus everything released by this step.
 pub struct GateDecision {
     /// (batch slice, action) pairs to dispatch now, in order.
     pub ready: Vec<(crate::MessageBatchRef, WindowAction)>,
+    /// One ack per `ready` item, in the same order. The source delivery is
+    /// split across ready, held, and dropped outcome groups.
+    pub ready_acks: Vec<std::sync::Arc<dyn Ack>>,
+    /// Acks for rows dropped by the late-event policy. The caller invokes
+    /// these after the gate has accepted the source delivery.
+    pub dropped_acks: Vec<std::sync::Arc<dyn Ack>>,
     /// The watermark after this observation (None before the first event).
     pub watermark_ms: Option<i64>,
+}
+
+impl GateDecision {
+    fn new(watermark_ms: Option<i64>) -> Self {
+        Self {
+            ready: Vec::new(),
+            ready_acks: Vec::new(),
+            dropped_acks: Vec::new(),
+            watermark_ms,
+        }
+    }
 }
 
 impl EventTimeGate {
@@ -45,19 +103,18 @@ impl EventTimeGate {
             tracker: None,
             late_policy: LateEventPolicy::Drop,
             allowed_lateness_ms: 0,
-            window_sizes_ms: Vec::new(),
+            window_timings: Vec::new(),
             held: Vec::new(),
-            pending_acks: Vec::new(),
         }
     }
 
-    /// Build the gate from a source's time spec. `window_sizes_ms` lists the
-    /// window sizes of downstream window operators (used to decide when a row
-    /// may emit); an empty list means plain event-time ordering without
-    /// windows — rows emit immediately.
-    pub fn new(
+    /// Build the gate from a source's time spec. The timing list describes
+    /// downstream windows; an empty list means plain event-time ordering
+    /// without windows, so rows emit immediately. `i64` entries remain
+    /// accepted as tumbling windows for compatibility with the original API.
+    pub fn new<T: Into<WindowTiming>>(
         time: &TimeSpec,
-        window_sizes_ms: Vec<i64>,
+        window_timings: Vec<T>,
     ) -> Result<Self, Error> {
         let tracker = WatermarkTracker::from_time_spec(time)?;
         Ok(Self {
@@ -70,9 +127,8 @@ impl EventTimeGate {
             tracker: Some(tracker),
             late_policy: time.late_event_policy,
             allowed_lateness_ms: time.allowed_lateness_ms,
-            window_sizes_ms,
+            window_timings: window_timings.into_iter().map(Into::into).collect(),
             held: Vec::new(),
-            pending_acks: Vec::new(),
         })
     }
 
@@ -101,127 +157,158 @@ impl EventTimeGate {
         partition: u32,
         batch: crate::MessageBatchRef,
     ) -> Result<GateDecision, Error> {
+        self.observe_with_ack(partition, batch, std::sync::Arc::new(NoopAck))
+    }
+
+    /// Observe a source delivery while retaining the delivery's ack through
+    /// held/released/dropped row groups. The compatibility `observe` method
+    /// above remains useful for pure gate tests that do not model source
+    /// commits; the kernel source loop always calls this method.
+    pub fn observe_with_ack(
+        &mut self,
+        partition: u32,
+        batch: crate::MessageBatchRef,
+        ack: std::sync::Arc<dyn Ack>,
+    ) -> Result<GateDecision, Error> {
         if self.tracker.is_none() {
-            return Ok(GateDecision {
-                ready: vec![(batch, WindowAction::Emit)],
-                watermark_ms: None,
-            });
+            let mut decision = GateDecision::new(None);
+            decision.ready.push((batch, WindowAction::Emit));
+            decision.ready_acks.push(ack);
+            return Ok(decision);
         }
-        let (extractor_field, late_policy, allowed_lateness_ms, min_window) = (
+        let (extractor_field, late_policy, allowed_lateness_ms) = (
             self.extractor.as_ref().map(|extractor| extractor.field.clone()),
             self.late_policy,
             self.allowed_lateness_ms,
-            self.min_window_size(),
         );
         let extractor = FieldTimestampExtractor {
             field: extractor_field.unwrap_or_default(),
         };
         let event_times_ms = extractor.extract_timestamps_ms(&batch)?;
         let now_ms = crate::state::now_ms() as i64;
-        let tracker = self.tracker.as_mut().unwrap();
-        tracker.refresh_idle(now_ms);
-        let watermark_before = tracker.watermark();
+        let watermark_before = {
+            let tracker = self.tracker.as_mut().unwrap();
+            tracker.refresh_idle(now_ms);
+            tracker.watermark()
+        };
 
         let current_actions = event_times_ms
             .iter()
             .map(|event_time_ms| {
-                Self::action(min_window, *event_time_ms, watermark_before, false, late_policy, allowed_lateness_ms)
+                Self::action(
+                    event_time_ms.and_then(|event_time| self.window_end_for(event_time)),
+                    *event_time_ms,
+                    watermark_before,
+                    false,
+                    late_policy,
+                    allowed_lateness_ms,
+                )
             })
             .collect::<Vec<_>>();
-        for event_time_ms in event_times_ms.iter().flatten().copied() {
-            tracker.observe(partition, event_time_ms, now_ms);
-        }
-        let watermark_after = tracker.watermark();
-        let _ = &tracker;
+        let watermark_after = {
+            let tracker = self.tracker.as_mut().unwrap();
+            for event_time_ms in event_times_ms.iter().flatten().copied() {
+                tracker.observe(partition, event_time_ms, now_ms);
+            }
+            tracker.watermark()
+        };
 
-        let mut ready = Vec::new();
+        let mut decision = GateDecision::new(watermark_after);
         // Held rows first (FIFO), re-evaluated against the new watermark.
         let held = std::mem::take(&mut self.held);
         for pending in held {
-            let action = Self::action(
-                min_window,
-                pending.event_time_ms,
-                watermark_after,
-                true,
-                late_policy,
-                allowed_lateness_ms,
-            );
-            match action {
-                WindowAction::Hold => self.held.push(pending),
-                WindowAction::Drop => {}
-                other => ready.push((pending.batch, other)),
-            }
+            let actions = pending
+                .event_times_ms
+                .iter()
+                .map(|event_time_ms| {
+                    Self::action(
+                        event_time_ms.and_then(|event_time| self.window_end_for(event_time)),
+                        *event_time_ms,
+                        watermark_after,
+                        true,
+                        late_policy,
+                        allowed_lateness_ms,
+                    )
+                })
+                .collect();
+            self.collect_outcomes(
+                pending.batch,
+                pending.event_times_ms,
+                actions,
+                pending.ack,
+                &mut decision,
+            )?;
         }
         // Current batch rows: slice the batch by decision (contiguous runs
         // preserved; columnar layout kept — no per-row batch copies).
-        let mut slices = SliceBuilder::new(&batch);
-        for (index, action) in current_actions.into_iter().enumerate() {
-            match action {
-                WindowAction::Hold => {
-                    slices.push_held(index, event_times_ms[index]);
-                }
-                WindowAction::Drop => slices.push_drop(index),
-                other => slices.push_ready(index, other),
-            }
-        }
-        let (ready_slices, held_slices) = slices.finish()?;
-        ready.extend(ready_slices);
-        self.held.extend(held_slices.into_iter().map(HeldRow::emitted_time));
+        self.collect_outcomes(
+            batch,
+            event_times_ms,
+            current_actions,
+            ack,
+            &mut decision,
+        )?;
 
-        Ok(GateDecision {
-            ready,
-            watermark_ms: watermark_after,
-        })
+        Ok(decision)
     }
 
     /// Re-evaluate held rows against the wall clock (idle partitions unblock
     /// the watermark). Called from the source loop's idle tick.
     pub fn refresh(&mut self) -> Result<GateDecision, Error> {
         if self.tracker.is_none() {
-            return Ok(GateDecision {
-                ready: Vec::new(),
-                watermark_ms: None,
-            });
+            return Ok(GateDecision::new(None));
         }
-        let (late_policy, allowed_lateness_ms, min_window) = (
-            self.late_policy,
-            self.allowed_lateness_ms,
-            self.min_window_size(),
-        );
+        let (late_policy, allowed_lateness_ms) = (self.late_policy, self.allowed_lateness_ms);
         let now_ms = crate::state::now_ms() as i64;
-        let tracker = self.tracker.as_mut().unwrap();
-        tracker.refresh_idle(now_ms);
-        let watermark = tracker.watermark();
-        let _ = &tracker;
-        let mut ready = Vec::new();
+        let watermark = {
+            let tracker = self.tracker.as_mut().unwrap();
+            tracker.refresh_idle(now_ms);
+            tracker.watermark()
+        };
+        let mut decision = GateDecision::new(watermark);
         let held = std::mem::take(&mut self.held);
         for pending in held {
-            let action =
-                Self::action(min_window, pending.event_time_ms, watermark, true, late_policy, allowed_lateness_ms);
-            match action {
-                WindowAction::Hold => self.held.push(pending),
-                WindowAction::Drop => {}
-                other => ready.push((pending.batch, other)),
-            }
+            let actions = pending
+                .event_times_ms
+                .iter()
+                .map(|event_time_ms| {
+                    Self::action(
+                        event_time_ms.and_then(|event_time| self.window_end_for(event_time)),
+                        *event_time_ms,
+                        watermark,
+                        true,
+                        late_policy,
+                        allowed_lateness_ms,
+                    )
+                })
+                .collect();
+            self.collect_outcomes(
+                pending.batch,
+                pending.event_times_ms,
+                actions,
+                pending.ack,
+                &mut decision,
+            )?;
         }
-        Ok(GateDecision {
-            ready,
-            watermark_ms: watermark,
-        })
+        Ok(decision)
     }
 
-    /// Defer the batch's ack while rows are held (the source re-delivers on
-    /// recovery, matching at-least-once semantics).
-    pub fn defer_ack(&mut self, ack: std::sync::Arc<dyn crate::input::Ack>) {
-        self.pending_acks.push(ack);
+    /// Flush held rows when a bounded source reaches EOS. There is no future
+    /// watermark after EOS, so rows that were valid but still held are emitted
+    /// before the source's EOS control envelope is forwarded.
+    pub fn finish(&mut self) -> GateDecision {
+        let mut decision = GateDecision::new(self.watermark());
+        for pending in std::mem::take(&mut self.held) {
+            decision.ready.push((pending.batch, WindowAction::Emit));
+            decision.ready_acks.push(pending.ack);
+        }
+        decision
     }
 
-    /// Take acks ready to fire: when nothing is held, all deferred acks
-    /// release; while rows remain held, nothing releases.
-    pub fn take_ready_acks(&mut self) -> Vec<std::sync::Arc<dyn crate::input::Ack>> {
-        if self.held.is_empty() {
-            return std::mem::take(&mut self.pending_acks);
-        }
+    /// Compatibility hook for callers of the pre-kernel gate API. Acks now
+    /// travel alongside each `GateDecision::ready` item, so there is no
+    /// detached ack queue to drain.
+    pub fn take_ready_acks(&mut self) -> Vec<std::sync::Arc<dyn Ack>> {
         Vec::new()
     }
 
@@ -229,12 +316,76 @@ impl EventTimeGate {
         !self.held.is_empty()
     }
 
-    fn min_window_size(&self) -> Option<i64> {
-        self.window_sizes_ms.iter().copied().min()
+    /// Split a batch by the exact action for each row and distribute the
+    /// source ack over every non-empty outcome group. There are at most five
+    /// groups (Hold/Emit/Update/Drop/Route), so this remains columnar while
+    /// avoiding the old bug that labeled a mixed Route/Update batch with the
+    /// action of its first row.
+    fn collect_outcomes(
+        &mut self,
+        batch: crate::MessageBatchRef,
+        event_times_ms: Vec<Option<i64>>,
+        actions: Vec<WindowAction>,
+        ack: std::sync::Arc<dyn Ack>,
+        decision: &mut GateDecision,
+    ) -> Result<(), Error> {
+        if batch.len() == 0 {
+            decision.dropped_acks.push(ack);
+            return Ok(());
+        }
+        if actions.len() != batch.len() || event_times_ms.len() != batch.len() {
+            return Err(Error::Process(
+                "event-time action and timestamp lengths differ from batch".into(),
+            ));
+        }
+
+        let mut groups: Vec<(WindowAction, Vec<bool>, Vec<Option<i64>>)> = Vec::new();
+        for (index, action) in actions.into_iter().enumerate() {
+            let Some((_, keep, times)) = groups
+                .iter_mut()
+                .find(|(group_action, _, _)| *group_action == action)
+            else {
+                let mut keep = vec![false; batch.len()];
+                keep[index] = true;
+                groups.push((action, keep, vec![event_times_ms[index]]));
+                continue;
+            };
+            keep[index] = true;
+            times.push(event_times_ms[index]);
+        }
+
+        let child_acks = fanout_ack(ack, groups.len());
+        for ((action, keep, group_times), child_ack) in groups.into_iter().zip(child_acks) {
+            let filtered = filter_batch(&batch, &keep)?;
+            match action {
+                WindowAction::Hold => self.held.push(HeldBatch {
+                    batch: filtered,
+                    event_times_ms: group_times,
+                    ack: child_ack,
+                }),
+                WindowAction::Drop => decision.dropped_acks.push(child_ack),
+                other => {
+                    decision.ready.push((filtered, other));
+                    decision.ready_acks.push(child_ack);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the latest end among all downstream windows containing this
+    /// event. A row must stay held until the latest containing window can no
+    /// longer be changed; using the minimum size under-released sliding
+    /// windows in the previous implementation.
+    fn window_end_for(&self, event_time_ms: i64) -> Option<i64> {
+        self.window_timings
+            .iter()
+            .filter_map(|timing| timing.window_end_for(event_time_ms))
+            .max()
     }
 
     fn action(
-        window_size: Option<i64>,
+        window_end: Option<i64>,
         event_time_ms: Option<i64>,
         watermark_ms: Option<i64>,
         held: bool,
@@ -253,11 +404,9 @@ impl EventTimeGate {
                 }
             };
         };
-        let Some(window_size) = window_size else {
+        let Some(window_end) = window_end else {
             return WindowAction::Emit;
         };
-        let window_start = event_time_ms.div_euclid(window_size) * window_size;
-        let window_end = window_start + window_size;
         if held {
             return if watermark_ms >= Some(window_end) {
                 WindowAction::Emit
@@ -269,95 +418,18 @@ impl EventTimeGate {
     }
 }
 
-/// Slices a batch into contiguous same-decision runs (ready and held) with
-/// zero per-row batch reconstruction beyond one slice per run.
-struct SliceBuilder<'a> {
-    batch: &'a crate::MessageBatch,
-    keep_ready: Vec<bool>,
-    ready_actions: Vec<Option<WindowAction>>,
-    keep_held: Vec<bool>,
-    held_event_times: Vec<Option<i64>>,
-}
+fn filter_batch(
+    batch: &crate::MessageBatchRef,
+    keep: &[bool],
+) -> Result<crate::MessageBatchRef, Error> {
+    use datafusion::arrow::array::BooleanArray;
+    use datafusion::arrow::compute::filter_record_batch;
 
-impl HeldRow {
-    fn emitted_time(row: (crate::MessageBatchRef, Option<i64>)) -> HeldRow {
-        HeldRow {
-            batch: row.0,
-            event_time_ms: row.1,
-        }
-    }
-}
-
-impl<'a> SliceBuilder<'a> {
-    fn new(batch: &'a crate::MessageBatch) -> Self {
-        let rows = batch.len();
-        Self {
-            batch,
-            keep_ready: vec![false; rows],
-            ready_actions: vec![None; rows],
-            keep_held: vec![false; rows],
-            held_event_times: vec![None; rows],
-        }
-    }
-
-    fn push_ready(&mut self, index: usize, action: WindowAction) {
-        self.keep_ready[index] = true;
-        self.ready_actions[index] = Some(action);
-    }
-
-    fn push_held(&mut self, index: usize, event_time_ms: Option<i64>) {
-        self.keep_held[index] = true;
-        self.held_event_times[index] = event_time_ms;
-    }
-
-    fn push_drop(&mut self, _index: usize) {}
-
-    fn finish(
-        self,
-    ) -> Result<
-        (
-            Vec<(crate::MessageBatchRef, WindowAction)>,
-            Vec<(crate::MessageBatchRef, Option<i64>)>,
-        ),
-        Error,
-    > {
-        use datafusion::arrow::array::BooleanArray;
-        use datafusion::arrow::compute::filter_record_batch;
-
-        let mut ready = Vec::new();
-        if self.keep_ready.iter().any(|keep| *keep) {
-            let filter = BooleanArray::from(self.keep_ready.clone());
-            let filtered = filter_record_batch(self.batch.record_batch(), &filter)
-                .map_err(|error| Error::Process(format!("slice event-time batch: {error}")))?;
-            let first_action = self
-                .ready_actions
-                .iter()
-                .find_map(|action| action.clone());
-            let mut filtered_batch = crate::MessageBatch::new_arrow(filtered);
-            filtered_batch.set_input_name(self.batch.get_input_name());
-            // One slice per contiguous run would preserve distinct actions;
-            // for the common single-action batch this is exact. Mixed runs
-            // fall back to the batch-dominant action (documented trade-off).
-            let _ = &self.ready_actions;
-            ready.push((
-                std::sync::Arc::new(filtered_batch),
-                first_action.unwrap_or(WindowAction::Emit),
-            ));
-        }
-        let mut held = Vec::new();
-        if self.keep_held.iter().any(|keep| *keep) {
-            let filter = BooleanArray::from(self.keep_held.clone());
-            let filtered = filter_record_batch(self.batch.record_batch(), &filter)
-                .map_err(|error| Error::Process(format!("slice held batch: {error}")))?;
-            let mut filtered_batch = crate::MessageBatch::new_arrow(filtered);
-            filtered_batch.set_input_name(self.batch.get_input_name());
-            // The slice keeps the dominant (first held) event time; slices
-            // re-evaluate as units, matching the window granularity.
-            let event_time = self.held_event_times.iter().flatten().copied().min();
-            held.push((std::sync::Arc::new(filtered_batch), event_time));
-        }
-        Ok((ready, held))
-    }
+    let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep.to_vec()))
+        .map_err(|error| Error::Process(format!("slice event-time batch: {error}")))?;
+    let mut filtered_batch = crate::MessageBatch::new_arrow(filtered);
+    filtered_batch.set_input_name(batch.get_input_name());
+    Ok(std::sync::Arc::new(filtered_batch))
 }
 
 
@@ -483,6 +555,37 @@ mod tests {
         assert!(decision.ready.is_empty());
         // The held 2_000 row (window [2000,3000)) remains — only the late
         // 500 is gone.
+        assert!(gate.has_held());
+    }
+
+    #[test]
+    fn mixed_released_and_late_rows_keep_distinct_actions() {
+        let mut gate = EventTimeGate::new(&time_spec(LateEventPolicy::Route), vec![1_000]).unwrap();
+        // Keep a future row held while advancing the watermark far enough to
+        // close its predecessor window.
+        gate.observe(0, batch(vec![2_500])).unwrap();
+        let decision = gate.observe(0, batch(vec![500, 4_000])).unwrap();
+
+        assert_eq!(decision.ready.len(), 2);
+        assert_eq!(decision.ready_acks.len(), 2);
+        assert_eq!(decision.ready[0].1, WindowAction::Emit);
+        assert_eq!(decision.ready[1].1, WindowAction::Route);
+        let released = decision.ready[0]
+            .0
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let routed = decision.ready[1]
+            .0
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(released.values(), &[2_500]);
+        assert_eq!(routed.values(), &[500]);
         assert!(gate.has_held());
     }
 

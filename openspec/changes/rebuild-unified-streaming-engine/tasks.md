@@ -37,16 +37,16 @@
 
 ## 5. Runtime integration (local + Agent)
 
-- [x] 5.1 Engine executes compiled streams + declared jobs through the unified kernel with an embedded BarrierCoordinator per checkpointed Job. (Streams compile and run via `RuntimeManager::start` → `run_job`; YAML `jobs` run end-to-end. BarrierCoordinator wiring per checkpointed Job remains part of 5.6/6.x hardening.)
+- [x] 5.1 Engine executes compiled streams + declared jobs through the unified kernel with an embedded BarrierCoordinator per checkpointed Job. (Streams compile and run via `RuntimeManager::start` → `run_job`; YAML `jobs` run end-to-end. Local interval checkpoints and Agent command-driven barriers use the same `KernelJobHandle` path.)
 - [x] 5.2 `RuntimeManager`/`RuntimeEntry` carry Job runtime state; health/metrics endpoints report kernel counters (in-flight batches, watermark lag, checkpoint duration).
 - [x] 5.3 Agent `JobRuntime::start` rebuilds local subgraphs via `ExecutionGraphBuilder::build_subgraph`; generation fencing and recovery flow (agent.rs) preserved. (`spawn_kernel_job` + `KernelJobHandle`; kernel snapshots preferred; lifecycle test in `arkflow-server/tests/kernel_job_lifecycle.rs`.)
 - [x] 5.4 Remove `SingleComputeJobRunner` execution path; migrate its review-fix test suite (generation isolation, recovery validation, fence semantics) to the kernel.
 - [x] 5.5 Remove `stream/mod.rs` executor (`Stream::run` etc.); `StreamConfig` type moves to the compiler module; deprecated buffer plugins emit compile warnings.
-- [ ] 5.6 Multi-node smoke: two-node Hub–Agent Job with barrier checkpoint + kill/restart recovery passes.
+- [x] 5.6 Multi-node smoke: two-node Hub–Agent Job with barrier checkpoint + kill/restart recovery passes (`arkflow-server/tests/two_node_job_smoke.rs`).
 
 ## 6. Observability and docs
 
-- [x] 6.1 Kernel metrics: per-vertex throughput/latency, channel backlog, checkpoint duration/failures, watermark lag, late-event counters (expose via RuntimeMetrics snapshot). (`executor::metrics` KernelMetrics/ChainMetrics + snapshot; RuntimeMetrics wiring is incremental.)
+- [x] 6.1 Kernel metrics: per-vertex throughput/latency, channel backlog, checkpoint duration/failures, watermark lag, late-event counters (expose via RuntimeMetrics snapshot). (`executor::metrics` KernelMetrics/ChainMetrics + snapshot; Agent reports and Hub/local metrics endpoints expose the runtime counters.)
 - [x] 6.2 Update CLAUDE.md / docs: single kernel, Stream-as-compiled-Job narrative, breaking changes and migration notes.
 - [x] 6.3 Sync OpenSpec specs (`stream-backpressure`, `stream-runtime-control`, `input-durability` wording) to unified-kernel acceptance criteria.
 - [x] 6.4 Performance baseline: throughput/latency benchmark comparing legacy Stream runtime vs unified kernel (generate→json_to_arrow→sql→drop, 200k rows batch=1000: kernel 528ms vs legacy 559ms, ratio 0.94 — kernel 6% faster; `kernel_perf_baseline.rs`, run with --ignored). kafka/window variants to extend.

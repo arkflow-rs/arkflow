@@ -2194,6 +2194,15 @@ async fn hub_metrics(
             ));
         }
     }
+    for node in hub.metrics_by_node(None).await {
+        let node_id = prometheus_label(&node.node_id);
+        for (name, value) in node.metrics {
+            body.push_str(&format!(
+                "arkflow_node_metric{{node_id=\"{node_id}\",metric=\"{}\"}} {value}\n",
+                prometheus_label(&name)
+            ));
+        }
+    }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -2830,6 +2839,30 @@ async fn metrics(State(cp): State<ControlPlane>) -> Response {
         body.push_str(&format!(
             "arkflow_stream_restarts{{stream_id=\"{}\"}} {}\n",
             stream.id, stream.metrics.restarts
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_in_flight{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.in_flight
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_mean_latency_us{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.mean_latency_us
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_checkpoint_duration_ms{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.checkpoint_duration_ms
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_checkpoint_failures{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.checkpoint_failures
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_watermark_lag_ms{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.watermark_lag_ms
+        ));
+        body.push_str(&format!(
+            "arkflow_stream_late_events{{stream_id=\"{}\"}} {}\n",
+            stream.id, stream.metrics.late_events
         ));
     }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()

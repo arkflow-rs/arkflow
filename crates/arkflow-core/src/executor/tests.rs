@@ -3,7 +3,7 @@
 
 use crate::executor::graph::{ExecutionGraphBuilder, DEFAULT_CHANNEL_CAPACITY};
 use crate::executor::run_graph;
-use crate::input::{Ack, Input};
+use crate::input::{fanout_ack, Ack, Input};
 use crate::job::{
     EdgeSpec, JobComponentAdapter, JobId, JobPlan, JobSpec, JobVersion, OperatorKind,
     OperatorSpec, SinkSpec, SourceSpec, TimeMode, TimeSpec,
@@ -16,7 +16,7 @@ use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +54,35 @@ fn int64_batch(rows: Vec<(i64, String)>) -> RecordBatch {
     .unwrap()
 }
 
+fn window_batch(
+    rows: Vec<(i64, String, i64)>,
+    watermark: Option<i64>,
+) -> MessageBatchRef {
+    let mut fields = vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ];
+    let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.1.clone()).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+        )),
+    ];
+    if let Some(watermark) = watermark {
+        fields.push(Field::new("__watermark_ms", DataType::Int64, false));
+        columns.push(Arc::new(Int64Array::from(vec![watermark; rows.len()])));
+    }
+    Arc::new(MessageBatch::new_arrow(
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+    ))
+}
+
 #[async_trait]
 impl Input for VecInput {
     async fn connect(&self) -> Result<(), Error> {
@@ -74,9 +103,54 @@ impl Input for VecInput {
     }
 }
 
+struct CountingAck {
+    acknowledgements: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Ack for CountingAck {
+    async fn ack(&self) -> Result<(), Error> {
+        self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct CountingInput {
+    batches: Mutex<std::collections::VecDeque<MessageBatchRef>>,
+    acknowledgements: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Input for CountingInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        self.batches
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|batch| {
+                (
+                    batch,
+                    Arc::new(CountingAck {
+                        acknowledgements: self.acknowledgements.clone(),
+                    }) as Arc<dyn Ack>,
+                )
+            })
+            .ok_or(Error::EOF)
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct CollectOutput {
     written: Mutex<Vec<RecordBatch>>,
+    fail: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -85,6 +159,9 @@ impl Output for CollectOutput {
         Ok(())
     }
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Process("injected sink failure".into()));
+        }
         self.written.lock().unwrap().push(msg.record_batch().clone());
         Ok(())
     }
@@ -100,6 +177,19 @@ impl Processor for PassThroughProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         Ok(ProcessResult::Single(batch))
     }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+struct FailingProcessor;
+
+#[async_trait]
+impl Processor for FailingProcessor {
+    async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        Err(Error::Process("injected processor failure".into()))
+    }
+
     async fn close(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -126,6 +216,45 @@ impl JobComponentAdapter for Adapter {
     ) -> Result<Arc<dyn Output>, Error> {
         Ok(self.output.clone())
     }
+    fn build_processor(
+        &self,
+        _operator: &OperatorSpec,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
+        Ok(self.processor.clone())
+    }
+}
+
+struct MultiInputAdapter {
+    inputs: HashMap<String, Arc<dyn Input>>,
+    outputs: HashMap<String, Arc<CollectOutput>>,
+    processor: Arc<dyn Processor>,
+}
+
+impl JobComponentAdapter for MultiInputAdapter {
+    fn build_input(
+        &self,
+        source: &SourceSpec,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Input>, Error> {
+        self.inputs
+            .get(&source.operator_id)
+            .cloned()
+            .ok_or_else(|| Error::Config(format!("missing test input {}", source.operator_id)))
+    }
+
+    fn build_output(
+        &self,
+        sink: &SinkSpec,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Output>, Error> {
+        self.outputs
+            .get(&sink.operator_id)
+            .cloned()
+            .map(|output| output as Arc<dyn Output>)
+            .ok_or_else(|| Error::Config(format!("missing test output {}", sink.operator_id)))
+    }
+
     fn build_processor(
         &self,
         _operator: &OperatorSpec,
@@ -218,6 +347,32 @@ fn edge(from: &str, to: &str) -> EdgeSpec {
         from: from.into(),
         to: to.into(),
         partitioned: false,
+    }
+}
+
+fn source_spec(operator_id: &str) -> SourceSpec {
+    SourceSpec {
+        operator_id: operator_id.into(),
+        input_type: "vec".into(),
+        config: serde_json::json!({}),
+        time: TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        },
+    }
+}
+
+fn sink_operator(id: &str, error_sink: bool) -> OperatorSpec {
+    OperatorSpec {
+        id: id.into(),
+        kind: OperatorKind::Sink,
+        stateful: false,
+        key_field: None,
+        config: error_sink.then(|| serde_json::json!({"__arkflow_error_sink": true})).unwrap_or_else(|| serde_json::json!({})),
     }
 }
 
@@ -330,6 +485,288 @@ async fn pipelines_batches_to_sink_in_order() {
         })
         .collect();
     assert_eq!(rows, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            window_batch(vec![(1_000, "a".into(), 4)], None),
+            window_batch(vec![(11_000, "z".into(), 0)], Some(10_000)),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input,
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(JobSpec {
+        id: JobId::new("window-runtime-job").unwrap(),
+        version: JobVersion(1),
+        max_parallelism: 1,
+        parallelism: 1,
+        operators: vec![
+            OperatorSpec {
+                id: "source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            OperatorSpec {
+                id: "window".into(),
+                kind: OperatorKind::Window,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({
+                    "type": "window",
+                    "kind": "tumbling",
+                    "size_ms": 10_000,
+                    "timestamp_field": "ts",
+                    "key_field": "key",
+                    "value_fields": ["value"],
+                    "trigger": "watermark",
+                    "watermark_field": "__watermark_ms"
+                }),
+            },
+            sink_operator("sink", false),
+        ],
+        edges: vec![edge("source", "window"), edge("window", "sink")],
+        sources: vec![source_spec("source")],
+        sinks: vec![SinkSpec {
+            operator_id: "sink".into(),
+            output_type: "collect".into(),
+            config: serde_json::json!({}),
+        }],
+        state: None,
+        checkpoint: None,
+        recovery: Default::default(),
+    })
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    let sums: Vec<i64> = output
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("sum")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(sums, vec![4, 0]);
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn terminal_sink_acknowledges_only_after_successful_write() {
+    for fail in [false, true] {
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(CountingInput {
+            batches: Mutex::new(std::collections::VecDeque::from([
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+            ])),
+            acknowledgements: acknowledgements.clone(),
+        });
+        let output = Arc::new(CollectOutput::default());
+        output.fail.store(fail, Ordering::SeqCst);
+        let adapter = Adapter {
+            input,
+            output,
+            processor: Arc::new(PassThroughProcessor),
+        };
+        let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+        let graph = ExecutionGraphBuilder::default()
+            .build(&plan, &adapter, &resource())
+            .unwrap();
+        let result = run_graph(graph, CancellationToken::new()).await;
+        if fail {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            acknowledgements.load(Ordering::SeqCst),
+            usize::from(!fail),
+            "ack must follow the terminal sink result"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fanout_ack_waits_for_every_branch_and_is_idempotent() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let parent: Arc<dyn Ack> = Arc::new(CountingAck {
+        acknowledgements: acknowledgements.clone(),
+    });
+    let children = fanout_ack(parent, 3);
+
+    children[0].ack().await.unwrap();
+    children[0].ack().await.unwrap();
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+    children[1].ack().await.unwrap();
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+    children[2].ack().await.unwrap();
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+    children[2].ack().await.unwrap();
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn multi_input_chain_preserves_every_upstream_channel() {
+    let left = Arc::new(VecInput::new(vec![vec![(1, "left".into())]]));
+    let right = Arc::new(VecInput::new(vec![vec![(2, "right".into())]]));
+    let output = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([
+            ("left-source".into(), left as Arc<dyn Input>),
+            ("right-source".into(), right as Arc<dyn Input>),
+        ]),
+        outputs: HashMap::from([("sink".into(), output.clone())]),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let job = JobSpec {
+        id: JobId::new("multi-input-job").unwrap(),
+        version: JobVersion(1),
+        max_parallelism: 1,
+        parallelism: 1,
+        operators: vec![
+            OperatorSpec {
+                id: "left-source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            OperatorSpec {
+                id: "right-source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            map_operator("merge"),
+            sink_operator("sink", false),
+        ],
+        edges: vec![
+            edge("left-source", "merge"),
+            edge("right-source", "merge"),
+            edge("merge", "sink"),
+        ],
+        sources: vec![source_spec("left-source"), source_spec("right-source")],
+        sinks: vec![SinkSpec {
+            operator_id: "sink".into(),
+            output_type: "collect".into(),
+            config: serde_json::json!({}),
+        }],
+        state: None,
+        checkpoint: None,
+        recovery: Default::default(),
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    let rows: Vec<i64> = output
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(rows, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn processor_failure_uses_error_output_without_receiving_successes() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(7, "bad".into())]))),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let primary = Arc::new(CollectOutput::default());
+    let errors = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([("source".into(), input as Arc<dyn Input>)]),
+        outputs: HashMap::from([
+            ("sink".into(), primary.clone()),
+            ("error-sink".into(), errors.clone()),
+        ]),
+        processor: Arc::new(FailingProcessor),
+    };
+    let job = JobSpec {
+        id: JobId::new("error-route-job").unwrap(),
+        version: JobVersion(1),
+        max_parallelism: 1,
+        parallelism: 1,
+        operators: vec![
+            OperatorSpec {
+                id: "source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            map_operator("fail"),
+            sink_operator("sink", false),
+            sink_operator("error-sink", true),
+        ],
+        edges: vec![
+            edge("source", "fail"),
+            edge("fail", "sink"),
+            edge("fail", "error-sink"),
+        ],
+        sources: vec![source_spec("source")],
+        sinks: vec![
+            SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "collect".into(),
+                config: serde_json::json!({}),
+            },
+            SinkSpec {
+                operator_id: "error-sink".into(),
+                output_type: "collect".into(),
+                config: serde_json::json!({}),
+            },
+        ],
+        state: None,
+        checkpoint: None,
+        recovery: Default::default(),
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    assert!(primary.written.lock().unwrap().is_empty());
+    assert_eq!(errors.written.lock().unwrap().len(), 1);
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -613,6 +1050,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
     let mut hooks = std::collections::BTreeMap::new();
     hooks.insert("source-0".to_string(), CheckpointHook {
         reporter: Some(report_tx),
+        failure_reporter: None,
         barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
         state: None,
         task_id: Some("source-0".to_string()),
@@ -715,6 +1153,340 @@ async fn event_time_source_holds_and_releases_through_kernel() {
         batch.record_batch().column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
     }).collect();
     assert_eq!(released, vec![2_500]);
+}
+
+#[tokio::test]
+async fn kernel_runner_applies_event_time_gate_and_preserves_delivery_acks() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(100, "a".into())]))),
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2_500, "b".into())]))),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let mut job = spec(vec![], vec![edge("source", "sink")], 1);
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Drop,
+        late_event_route: None,
+    };
+    let plan = JobPlan::compile(job.clone()).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let gate = EventTimeGate::new(&job.sources[0].time, vec![1_000]).unwrap();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input],
+        BTreeMap::new(),
+        BTreeMap::from([(
+            "source-0".to_string(),
+            Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        )]),
+        false,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    handle.watcher().await.unwrap().unwrap();
+
+    let written = output.written.lock().unwrap();
+    assert_eq!(written.len(), 2, "held and EOS-flushed batches must both flow");
+    let rows: Vec<i64> = written
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(rows, vec![100, 2_500]);
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn event_time_window_runs_in_graph_and_fires_on_watermark_then_eos() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            window_batch(vec![(100, "a".into(), 1)], None),
+            window_batch(vec![(2_500, "a".into(), 2)], None),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let mut job = spec(
+        vec![OperatorSpec {
+            id: "window".into(),
+            kind: OperatorKind::Window,
+            stateful: true,
+            key_field: Some("key".into()),
+            config: serde_json::json!({
+                "kind": "tumbling",
+                "size_ms": 1_000,
+                "timestamp_field": "ts",
+                "key_field": "key",
+                "value_fields": ["value"],
+                "trigger": "watermark",
+                "trigger_interval_ms": 1_000
+            }),
+        }],
+        vec![edge("source", "window"), edge("window", "sink")],
+        1,
+    );
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Drop,
+        late_event_route: None,
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    // The plain local graph runner must derive the source event-time gate from
+    // the JobSpec carried by the graph; callers should not need a separate
+    // gate map just to make a watermark-triggered window work.
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    let written = output.written.lock().unwrap();
+    assert_eq!(written.len(), 2, "watermark and EOS should flush two windows");
+    let starts = written
+        .iter()
+        .map(|batch| {
+            batch
+                .column_by_name("window_start")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts, vec![0, 2_000]);
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn late_route_is_a_real_side_branch_and_does_not_update_window() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            window_batch(vec![(100, "a".into(), 1)], None),
+            window_batch(vec![(2_000, "a".into(), 2)], None),
+            window_batch(vec![(100, "a".into(), 99)], None),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let primary = Arc::new(CollectOutput::default());
+    let late = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([("source".into(), input.clone() as Arc<dyn Input>)]),
+        outputs: HashMap::from([
+            ("sink".into(), primary.clone()),
+            ("late-sink".into(), late.clone()),
+        ]),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let mut job = spec(
+        vec![
+            OperatorSpec {
+                id: "window".into(),
+                kind: OperatorKind::Window,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({
+                    "kind": "tumbling",
+                    "size_ms": 1_000,
+                    "timestamp_field": "ts",
+                    "key_field": "key",
+                    "value_fields": ["value"],
+                    "trigger": "watermark",
+                    "trigger_interval_ms": 1_000
+                }),
+            },
+            sink_operator("sink", false),
+            sink_operator("late-sink", false),
+        ],
+        vec![edge("source", "window"), edge("window", "sink")],
+        1,
+    );
+    job.sinks.push(SinkSpec {
+        operator_id: "late-sink".into(),
+        output_type: "collect".into(),
+        config: serde_json::json!({}),
+    });
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Route,
+        late_event_route: Some("late-sink".into()),
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    assert!(graph
+        .chains
+        .iter()
+        .any(|chain| chain.late_event_outputs.contains_key("source-0")));
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    let primary_batches = primary.written.lock().unwrap();
+    assert_eq!(primary_batches.len(), 2);
+    let primary_counts = primary_batches
+        .iter()
+        .map(|batch| {
+            batch
+                .column_by_name("count")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(primary_counts, vec![1, 1]);
+
+    let late_batches = late.written.lock().unwrap();
+    assert_eq!(late_batches.len(), 1);
+    assert!(late_batches[0]
+        .column_by_name("__arkflow_late_event_route")
+        .is_some());
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
+    struct SlowInput {
+        reads: AtomicUsize,
+        max_reads: usize,
+    }
+
+    #[async_trait]
+    impl Input for SlowInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+            if offset >= self.max_reads {
+                return Err(Error::EOF);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                    offset as i64,
+                    "a".into(),
+                )]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+                0,
+                self.reads.load(Ordering::SeqCst) as u64,
+            )])
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(SlowInput {
+        reads: AtomicUsize::new(0),
+        max_reads: 100,
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input.clone()],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (snapshot, positions, watermarks) = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.checkpoint_snapshot(),
+    )
+    .await
+    .expect("barrier checkpoint timed out")
+    .unwrap();
+    assert!(snapshot.verify());
+    assert_eq!(snapshot.entries.len(), 0);
+    assert_eq!(positions.len(), 1);
+    assert!(positions[0].offset > 0);
+    assert!(watermarks.is_empty());
+    let metrics = handle.metrics().snapshot();
+    assert_eq!(metrics.checkpoint_failures, 0);
+    assert!(metrics.chains.values().any(|chain| chain.batches_in > 0));
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle.watcher())
+        .await
+        .expect("kernel did not stop after cancellation")
+        .unwrap()
+        .unwrap();
 }
 
 // ---------- stateful operator wiring tests ----------

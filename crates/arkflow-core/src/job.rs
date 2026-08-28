@@ -312,15 +312,79 @@ impl JobSpec {
                     operator.id
                 )));
             }
+            if operator.kind == OperatorKind::Window {
+                let window: crate::executor::window::WindowOperatorConfig =
+                    serde_json::from_value(operator.config.clone()).map_err(|error| {
+                        Error::Config(format!(
+                            "window operator '{}' has invalid config: {error}",
+                            operator.id
+                        ))
+                    })?;
+                window.validate()?;
+            }
         }
 
+        let mut edge_ids = BTreeSet::new();
+        let mut edge_pairs = BTreeSet::new();
         for edge in &self.edges {
+            if edge.id.is_empty() || !edge_ids.insert(edge.id.clone()) {
+                return Err(Error::Config(format!(
+                    "Job '{}' contains a duplicate or empty edge id",
+                    self.id
+                )));
+            }
+            if edge.from == edge.to {
+                return Err(Error::Config(format!(
+                    "Job '{}' contains a self-loop on operator '{}'",
+                    self.id, edge.from
+                )));
+            }
             if !operator_ids.contains(&edge.from) || !operator_ids.contains(&edge.to) {
                 return Err(Error::Config(format!(
                     "edge '{}' references an unknown operator",
                     edge.id
                 )));
             }
+            if !edge_pairs.insert((edge.from.clone(), edge.to.clone())) {
+                return Err(Error::Config(format!(
+                    "Job '{}' contains duplicate edges from '{}' to '{}'",
+                    self.id, edge.from, edge.to
+                )));
+            }
+        }
+
+        // A late-event Route is a runtime side edge. It is intentionally not
+        // required to be repeated in `edges`, but it must still be validated
+        // as part of the operator DAG so placement and reachability cannot
+        // split the route target away from its source.
+        let mut late_route_links = BTreeSet::new();
+        for source in &self.sources {
+            let Some(route_operator) = source.time.late_event_route.as_deref() else {
+                continue;
+            };
+            let Some(route) = self
+                .operators
+                .iter()
+                .find(|operator| operator.id == route_operator)
+            else {
+                return Err(Error::Config(format!(
+                    "late-event route target '{}' for source '{}' is unknown",
+                    route_operator, source.operator_id
+                )));
+            };
+            if route.kind == OperatorKind::Source || route.id == source.operator_id {
+                return Err(Error::Config(format!(
+                    "late-event route target '{}' for source '{}' must not be a Source or itself",
+                    route_operator, source.operator_id
+                )));
+            }
+            if edge_pairs.contains(&(source.operator_id.clone(), route_operator.to_owned())) {
+                return Err(Error::Config(format!(
+                    "late-event route target '{}' for source '{}' must be a side target, not a normal edge",
+                    route_operator, source.operator_id
+                )));
+            }
+            late_route_links.insert((source.operator_id.clone(), route_operator.to_owned()));
         }
 
         let mut outgoing = BTreeMap::<String, Vec<String>>::new();
@@ -334,6 +398,12 @@ impl JobSpec {
                 .or_default()
                 .push(edge.to.clone());
             if let Some(degree) = indegree.get_mut(&edge.to) {
+                *degree += 1;
+            }
+        }
+        for (from, to) in &late_route_links {
+            outgoing.entry(from.clone()).or_default().push(to.clone());
+            if let Some(degree) = indegree.get_mut(to) {
                 *degree += 1;
             }
         }
@@ -431,6 +501,12 @@ impl JobSpec {
                 .entry(edge.to.as_str())
                 .or_default()
                 .push(edge.from.as_str());
+        }
+        for (from, to) in &late_route_links {
+            incoming
+                .entry(to.as_str())
+                .or_default()
+                .push(from.as_str());
         }
         for sink in &self.sinks {
             let mut reachable = BTreeSet::from([sink.operator_id.as_str()]);
@@ -613,6 +689,18 @@ impl JobPlan {
                 .entry(edge.to.clone())
                 .or_default()
                 .insert(edge.from.clone());
+        }
+        for source in &self.spec.sources {
+            if let Some(route_operator) = source.time.late_event_route.as_ref() {
+                adjacency
+                    .entry(source.operator_id.clone())
+                    .or_default()
+                    .insert(route_operator.clone());
+                adjacency
+                    .entry(route_operator.clone())
+                    .or_default()
+                    .insert(source.operator_id.clone());
+            }
         }
         let mut component_by_operator = BTreeMap::new();
         let mut visited = BTreeSet::new();

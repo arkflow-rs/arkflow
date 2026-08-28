@@ -74,6 +74,41 @@ pub trait Processor: Send + Sync {
     /// ```
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error>;
 
+    /// Process a batch while allowing stateful processors to take ownership
+    /// of its source acknowledgement. Stateless processors use the default
+    /// implementation; a processor that buffers input can return a
+    /// `ProcessResult` carrying a replacement acknowledgement once the
+    /// buffered data is emitted.
+    async fn process_with_ack(
+        &self,
+        batch: MessageBatchRef,
+        _ack: Arc<dyn crate::input::Ack>,
+    ) -> Result<ProcessResult, Error> {
+        self.process(batch).await
+    }
+
+    /// Flush processor-owned state when an upstream bounded source reaches
+    /// EOS. Stateless processors have nothing to emit; buffering processors
+    /// may return an output carrying the acknowledgements for their retained
+    /// input deliveries.
+    async fn finish(&self) -> Result<ProcessResult, Error> {
+        Ok(ProcessResult::None)
+    }
+
+    /// Give a processor a chance to fire a processing-time trigger while its
+    /// input is idle. Stateful timers use this hook; ordinary processors keep
+    /// the no-op default.
+    async fn on_tick(&self) -> Result<ProcessResult, Error> {
+        Ok(ProcessResult::None)
+    }
+
+    /// Receive a watermark control event. Window-like processors may emit
+    /// aggregates whose end has passed the watermark; ordinary processors
+    /// keep the no-op default and the kernel forwards the control envelope.
+    async fn on_watermark(&self, _watermark_ms: i64) -> Result<ProcessResult, Error> {
+        Ok(ProcessResult::None)
+    }
+
     /// Turn off the processor
     async fn close(&self) -> Result<(), Error>;
 }

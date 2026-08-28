@@ -4,9 +4,9 @@
 //! WAL-durability path (replay before new input).
 
 use arkflow_core::config::EngineConfig;
+use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
-use arkflow_core::executor::run_job;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -18,8 +18,15 @@ fn setup() {
     let _ = arkflow_plugin::codec::init();
 }
 
-async fn run_example_on_kernel(path: &str) -> usize {
-    let config = EngineConfig::from_file(path).unwrap();
+async fn run_example_on_kernel(path: &str, wal_path: &std::path::Path) -> usize {
+    let mut config = EngineConfig::from_file(path).unwrap();
+    for stream in &mut config.streams {
+        if let Some(durability) = &mut stream.durability {
+            // Keep the regression rerunnable: a previous interrupted test
+            // must not turn the next run into an unbounded historical replay.
+            durability.path = wal_path.to_string_lossy().into_owned();
+        }
+    }
     let mut completed = 0;
     for (index, stream) in config.streams.iter().enumerate() {
         let spec = compile_stream(stream, index).unwrap();
@@ -79,6 +86,7 @@ streams:
 
     // WAL durability example (bounded count: 1000) — replay path included.
     let durable = format!("{root}/../../examples/durability_example.yaml");
-    let completed = run_example_on_kernel(&durable).await;
+    let wal_path = tempfile::tempdir().unwrap();
+    let completed = run_example_on_kernel(&durable, wal_path.path()).await;
     assert_eq!(completed, 1, "durability example must run one stream");
 }

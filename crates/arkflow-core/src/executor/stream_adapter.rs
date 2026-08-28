@@ -11,6 +11,7 @@ use crate::executor::stream_compiler::CODEC_PAYLOAD_KEY;
 use crate::input::{Input, InputConfig};
 use crate::job::{JobComponentAdapter, OperatorSpec, SinkSpec, SourceSpec};
 use crate::{codec::CodecConfig, output::{Output, OutputConfig}, processor::{Processor, ProcessorConfig}, Resource};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, UInt32Array, UInt64Array};
 use crate::wal::{Wal, WalAck, WalConfig};
 use std::sync::Arc;
 
@@ -96,6 +97,11 @@ pub struct WalInput {
     /// Unacked-entry replay queue, initialized on the first read (the
     /// component-builder trait is sync; WAL reads are async).
     replay: tokio::sync::OnceCell<tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>>,
+    /// Checkpoint positions are installed before the first read.  WAL
+    /// entries are durable independently of the connector cursor, so the
+    /// replay queue must discard entries already covered by a checkpoint
+    /// while retaining entries that were read but not acknowledged.
+    checkpoint_positions: tokio::sync::RwLock<Option<Vec<crate::checkpoint::SourcePosition>>>,
 }
 
 impl WalInput {
@@ -104,7 +110,72 @@ impl WalInput {
             inner,
             wal,
             replay: tokio::sync::OnceCell::new(),
+            checkpoint_positions: tokio::sync::RwLock::new(None),
         }
+    }
+
+    fn batch_is_covered_by_checkpoint(
+        seq: u64,
+        batch: &crate::MessageBatch,
+        positions: &[crate::checkpoint::SourcePosition],
+    ) -> bool {
+        if positions.is_empty() || batch.is_empty() {
+            return false;
+        }
+
+        let partition = batch
+            .record_batch()
+            .column_by_name(crate::meta_columns::PARTITION)
+            .and_then(|column| {
+                if let Some(array) = column.as_any().downcast_ref::<UInt32Array>() {
+                    Some((0..array.len()).map(|row| array.value(row) as u64).collect::<Vec<_>>())
+                } else if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+                    Some((0..array.len())
+                        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
+                        .collect::<Option<Vec<_>>>()?)
+                } else {
+                    None
+                }
+            });
+        let offset = batch
+            .record_batch()
+            .column_by_name(crate::meta_columns::OFFSET)
+            .and_then(|column| {
+                if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
+                    Some((0..array.len()).map(|row| array.value(row)).collect::<Vec<_>>())
+                } else if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+                    Some((0..array.len())
+                        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
+                        .collect::<Option<Vec<_>>>()?)
+                } else {
+                    None
+                }
+            });
+
+        // Connector metadata lets us compare a Kafka-style checkpoint's
+        // next offset directly.  If a connector did not expose metadata, use
+        // the WAL sequence only for the local, topic-less fallback position.
+        let Some((partitions, offsets)) = partition.zip(offset) else {
+            return positions.iter().any(|position| {
+                position.topic.is_none()
+                    && position.partition == 0
+                    && seq < position.offset
+            });
+        };
+        if partitions.len() != offsets.len() || partitions.len() != batch.len() {
+            return false;
+        }
+        (0..batch.len()).all(|row| {
+            let topic = batch_topic(batch.record_batch(), row);
+            positions.iter().any(|position| {
+                position.partition as u64 == partitions[row]
+                    && offsets[row] < position.offset
+                    && position
+                        .topic
+                        .as_deref()
+                        .is_none_or(|expected| topic.as_deref() == Some(expected))
+            })
+        })
     }
 
     /// Load the unacknowledged entries once (first read), then replay them
@@ -115,14 +186,25 @@ impl WalInput {
     ) -> Result<&tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>, Error>
     {
         self.replay
-            .get_or_init(|| async {
-                let entries = self.wal.read_after_cursor().await.unwrap_or_default();
+            .get_or_try_init(|| async {
+                let entries = self.wal.read_after_cursor().await?;
+                let positions = self.checkpoint_positions.read().await.clone();
+                let entries = if let Some(positions) = positions.as_deref() {
+                    entries
+                        .into_iter()
+                        .filter(|(seq, batch)| {
+                            !Self::batch_is_covered_by_checkpoint(*seq, batch, positions)
+                        })
+                        .collect()
+                } else {
+                    entries
+                };
                 if !entries.is_empty() {
                     tracing::info!(count = entries.len(), "WAL recovery: replaying entries");
                 }
-                tokio::sync::Mutex::new(entries.into_iter().collect())
+                Ok::<_, Error>(tokio::sync::Mutex::new(entries.into_iter().collect()))
             })
-            .await;
+            .await?;
         // SAFETY-free: OnceCell::get is Some after get_or_init resolves.
         Ok(self.replay.get().expect("replay queue initialized"))
     }
@@ -155,11 +237,20 @@ impl Input for WalInput {
     }
 
     async fn restore_positions(&self, positions: &[crate::checkpoint::SourcePosition]) -> Result<(), Error> {
+        *self.checkpoint_positions.write().await = Some(positions.to_vec());
         self.inner.restore_positions(positions).await
     }
 
     async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
-        self.inner.current_positions().await
+        let positions = self.inner.current_positions().await?;
+        if !positions.is_empty() {
+            return Ok(positions);
+        }
+        // Inputs without a native cursor still get a durable local position
+        // from the WAL.  The offset is expressed as the next sequence, just
+        // like the Kafka connector's checkpoint position.
+        let next = self.wal.cursor().await?.saturating_add(1);
+        Ok(vec![crate::checkpoint::SourcePosition::for_partition(0, next)])
     }
 
     fn supports_partitioning(&self) -> bool {
@@ -173,6 +264,23 @@ impl Input for WalInput {
     async fn close(&self) -> Result<(), Error> {
         self.inner.close().await
     }
+}
+
+fn batch_topic(
+    batch: &datafusion::arrow::record_batch::RecordBatch,
+    row: usize,
+) -> Option<String> {
+    let column = batch.column_by_name(crate::meta_columns::EXT)?;
+    let map = column.as_any().downcast_ref::<MapArray>()?;
+    let entries = map.entries();
+    let keys = entries.column(0).as_any().downcast_ref::<StringArray>()?;
+    let values = entries.column(1).as_any().downcast_ref::<StringArray>()?;
+    let offsets = map.offsets();
+    let start = offsets.get(row).copied()? as usize;
+    let end = offsets.get(row + 1).copied()? as usize;
+    (start..end).find_map(|index| {
+        (keys.value(index) == "topic").then(|| values.value(index).to_owned())
+    })
 }
 
 impl JobComponentAdapter for StreamJobAdapter {
@@ -244,4 +352,118 @@ fn strip_payload_keys(mut payload: serde_json::Value) -> Option<serde_json::Valu
         serde_json::Value::Null => serde_json::json!({}),
         value => value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::SourcePosition;
+    use crate::input::{Ack, Input};
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::HashMap;
+
+    struct EmptyInput;
+
+    #[async_trait::async_trait]
+    impl Input for EmptyInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::EOF)
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn metadata_batch(partition: u32, offset: u64, topic: &str) -> crate::MessageBatchRef {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let batch = crate::metadata::with_partition(batch, partition).unwrap();
+        let batch = crate::metadata::with_offset(batch, offset).unwrap();
+        let mut extended = HashMap::new();
+        extended.insert("topic".to_owned(), topic.to_owned());
+        Arc::new(crate::MessageBatch::new_arrow(
+            crate::metadata::with_ext_metadata(batch, &extended).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn checkpoint_coverage_requires_matching_topic_partition_and_next_offset() {
+        let position = SourcePosition {
+            topic: Some("orders".into()),
+            partition: 2,
+            offset: 11,
+        };
+        assert!(WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &metadata_batch(2, 10, "orders"),
+            &[position.clone()]
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &metadata_batch(2, 11, "orders"),
+            &[position.clone()]
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &metadata_batch(2, 10, "payments"),
+            &[position]
+        ));
+    }
+
+    #[test]
+    fn checkpoint_coverage_has_topicless_wal_sequence_fallback() {
+        let batch = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ));
+        let position = SourcePosition::for_partition(0, 3);
+        assert!(WalInput::batch_is_covered_by_checkpoint(2, &batch, &[position.clone()]));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(3, &batch, &[position]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_queue_skips_wal_entries_already_covered_by_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        wal.append(&metadata_batch(2, 10, "orders")).await.unwrap();
+        wal.append(&metadata_batch(2, 11, "orders")).await.unwrap();
+
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+        input
+            .restore_positions(&[SourcePosition {
+                topic: Some("orders".into()),
+                partition: 2,
+                offset: 11,
+            }])
+            .await
+            .unwrap();
+        let queue = input.replay_queue().await.unwrap();
+        let entries = queue.lock().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.front().unwrap().0, 2);
+
+        wal.close().await.unwrap();
+    }
 }

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 /// Counters for one chain (vertex).
 #[derive(Debug, Default)]
@@ -45,7 +46,7 @@ impl ChainMetrics {
 }
 
 /// Serializable view of one chain's counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainMetricsSnapshot {
     pub batches_in: u64,
     pub batches_out: u64,
@@ -108,7 +109,7 @@ impl KernelMetrics {
 }
 
 /// Serializable view of the job-wide metrics.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KernelMetricsSnapshot {
     pub chains: BTreeMap<String, ChainMetricsSnapshot>,
     pub checkpoint_duration_ms: u64,

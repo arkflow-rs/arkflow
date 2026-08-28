@@ -163,7 +163,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
             kind: OperatorKind::Sink,
             stateful: false,
             key_field: None,
-            config: json!({}),
+            // The graph keeps this edge separate from successful data. The
+            // marker is internal JobSpec metadata and is not sent to the
+            // output builder.
+            config: json!({"__arkflow_error_sink": true}),
         });
         edges.push(EdgeSpec {
             id: format!("edge-{upstream}-{error_operator_id}"),
@@ -332,10 +335,17 @@ fn window_config(
         .unwrap_or_default();
     let mut window = kind;
     if let Some(object) = window.as_object_mut() {
+        let trigger_interval_ms = object
+            .get("size_ms")
+            .or_else(|| object.get("gap_ms"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(5_000);
+        object.insert("type".into(), json!("window"));
         object.insert("timestamp_field".into(), json!(timestamp_field));
         object.insert("key_field".into(), json!(key_field));
         object.insert("value_fields".into(), json!(value_fields));
         object.insert("trigger".into(), json!("processing_time"));
+        object.insert("trigger_interval_ms".into(), json!(trigger_interval_ms.max(1)));
     }
     Ok(window)
 }

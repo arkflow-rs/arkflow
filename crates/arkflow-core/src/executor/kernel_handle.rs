@@ -2,25 +2,24 @@
 //!
 //! The Agent protocol checkpoints on command (Hub `checkpoint` dispatch),
 //! unlike local mode's interval-driven barriers. `KernelJobHandle` runs a
-//! graph and exposes a synchronous snapshot entry point: the graph's chains
-//! observe a read-write gate — data processing takes read shares, snapshots
-//! take the write share — so a snapshot observes a quiescent instant of the
-//! graph (positions, watermarks, state) without killing the run. This keeps
-//! the Agent's existing checkpoint contract while the kernel executes the
-//! data plane; the barrier path (`barrier.rs`) remains the long-term
-//! home for fully asynchronous snapshots.
+//! graph and exposes a barrier snapshot entry point: the graph's chains carry
+//! the marker through their FIFO data channels, align multi-input vertices,
+//! and snapshot state asynchronously without a job-wide read/write gate.
 
 use crate::Error;
 use crate::executor::graph::ExecutionGraph;
+use crate::executor::metrics::KernelMetrics;
 use crate::input::Input;
-use crate::state::{StateBackend, StateSnapshot};
-use std::collections::BTreeMap;
+use crate::state::{StateBackend, StateEntry, StateSnapshot};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-/// Shared gate every chain's event loop acquires (read) per envelope and the
-/// snapshot acquires (write).
+/// Compatibility type for callers that still mention the retired global gate.
+/// The kernel no longer reads or writes this lock; barriers are in-band.
 pub type SnapshotGate = Arc<RwLock<()>>;
 
 /// Shared completion signal for the run: resolved with the graph's result
@@ -32,7 +31,6 @@ type Completion = Arc<tokio::sync::Mutex<Option<Arc<Result<(), Error>>>>>;
 /// the handle; completion is observed via `watcher`.
 pub struct KernelJobHandle {
     cancellation: CancellationToken,
-    gate: SnapshotGate,
     /// Source inputs (for current_positions and restore).
     inputs: Vec<Arc<dyn Input>>,
     /// State backends by task namespace (keyed by chain entry task id).
@@ -40,36 +38,154 @@ pub struct KernelJobHandle {
     /// Event-time watermarks keyed by source task id.
     watermark_gates:
         BTreeMap<String, Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>>,
+    /// Barrier injection channels keyed by source chain entry task.
+    barrier_senders: BTreeMap<String, flume::Sender<super::envelope::Envelope>>,
+    /// Every chain reports once for a barrier round.
+    participants: BTreeSet<String>,
+    reports: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>>,
+    checkpoint_errors: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Error>>>,
+    checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
+    next_snapshot_id: AtomicU64,
+    /// Shared job metrics.  The runner installs the corresponding
+    /// `RuntimeMetrics` in every chain hook, so Agent jobs and local streams
+    /// observe the same per-chain counters and checkpoint timings.
+    metrics: Arc<KernelMetrics>,
     /// Notified once with the graph's result when the runner task finishes.
     completion: Completion,
 }
 
 impl KernelJobHandle {
-    /// Snapshot the running graph: hold the write gate (chains finish their
-    /// in-flight envelope), then read state + positions + watermarks.
+    /// Start a barrier round and collect one snapshot from every execution
+    /// chain. Data continues through the graph while each chain reaches its
+    /// own FIFO barrier position; there is no global write gate in this path.
     pub async fn checkpoint_snapshot(
         &self,
     ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
     {
-        let _guard = self.gate.write().await;
-        let mut positions = Vec::new();
-        for input in &self.inputs {
-            positions.extend(input.current_positions().await?);
+        let id = format!("kernel-snapshot-{}", self.next_snapshot_id.fetch_add(1, Ordering::Relaxed));
+        self.checkpoint_barrier(id, 0).await
+    }
+
+    /// Inject one checkpoint barrier into every source chain and wait until
+    /// all chains have acknowledged the same barrier. The returned state is
+    /// assembled from the barrier-time chain snapshots, not from a later
+    /// quiescent read of mutable state.
+    pub async fn checkpoint_barrier(
+        &self,
+        checkpoint_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
+    {
+        let started = Instant::now();
+        let result = self
+            .checkpoint_barrier_inner(checkpoint_id.into(), generation)
+            .await;
+        match &result {
+            Ok(_) => self
+                .metrics
+                .record_checkpoint(started.elapsed().as_millis() as u64),
+            Err(_) => self.metrics.record_checkpoint_failure(),
         }
-        // Merge every chain's state entries into one snapshot (the Agent
-        // protocol stores one snapshot per node).
-        let mut entries = Vec::new();
-        for backend in self.states.values() {
-            entries.extend(backend.snapshot()?.entries);
+        result
+    }
+
+    async fn checkpoint_barrier_inner(
+        &self,
+        checkpoint_id: String,
+        generation: u64,
+    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
+    {
+        let _round = self.checkpoint_lock.lock().await;
+        let barrier = crate::checkpoint::CheckpointBarrier {
+            checkpoint_id,
+            generation,
+        };
+        if self.barrier_senders.is_empty() {
+            return Err(Error::Process("kernel graph has no source barrier channel".into()));
         }
-        let snapshot = StateSnapshot::new(1, entries);
-        let mut watermarks = BTreeMap::new();
-        for (task_id, gate) in &self.watermark_gates {
-            if let Some(watermark) = gate.lock().await.as_ref().and_then(|gate| gate.watermark()) {
-                watermarks.insert(task_id.clone(), watermark);
+        for sender in self.barrier_senders.values() {
+            sender
+                .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
+                .await
+                .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
+        }
+
+        let mut snapshots = BTreeMap::new();
+        while snapshots.len() < self.participants.len() {
+            let report = {
+                let mut reports = self.reports.lock().await;
+                let mut checkpoint_errors = self.checkpoint_errors.lock().await;
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => {
+                        return Err(Error::Process("kernel cancelled during checkpoint".into()));
+                    }
+                    error = checkpoint_errors.recv() => {
+                        if let Some(error) = error {
+                            return Err(error);
+                        }
+                        return Err(Error::Process("checkpoint error channel closed".into()));
+                    }
+                    report = reports.recv() => report,
+                }
+            };
+            let Some(report) = report else {
+                return Err(Error::Process("kernel ended before checkpoint completed".into()));
+            };
+            if report.barrier != barrier {
+                // A failed prior round may have detached snapshots still
+                // completing after the caller has moved on.  Do not let that
+                // stale report poison the next barrier; the current round
+                // still requires one matching report from every participant.
+                tracing::warn!(
+                    task = %report.task_id,
+                    checkpoint = %report.barrier.checkpoint_id,
+                    generation = report.barrier.generation,
+                    expected = %barrier.checkpoint_id,
+                    expected_generation = barrier.generation,
+                    "ignoring stale checkpoint report"
+                );
+                continue;
+            }
+            if !self.participants.contains(&report.task_id) {
+                return Err(Error::Config(format!(
+                    "checkpoint report from unknown chain '{}'",
+                    report.task_id
+                )));
+            }
+            if snapshots.insert(report.task_id.clone(), report).is_some() {
+                return Err(Error::Process("duplicate chain checkpoint report".into()));
             }
         }
-        Ok((snapshot, positions, watermarks))
+
+        let format_version = snapshots
+            .values()
+            .map(|snapshot| snapshot.state.format_version)
+            .chain(self.states.values().map(|state| state.format_version()))
+            .next()
+            .unwrap_or(1);
+        let mut state_entries = BTreeMap::<(String, Vec<u8>), StateEntry>::new();
+        let mut positions = Vec::new();
+        let mut watermarks = BTreeMap::new();
+        for report in snapshots.values() {
+            if report.state.format_version != format_version || !report.state.verify() {
+                return Err(Error::Process(format!(
+                    "invalid state snapshot from chain '{}'",
+                    report.task_id
+                )));
+            }
+            for entry in &report.state.entries {
+                state_entries.insert((entry.namespace.clone(), entry.key.clone()), entry.clone());
+            }
+            positions.extend(report.source_positions.clone());
+            if let Some(watermark) = report.watermark_ms {
+                watermarks.insert(report.task_id.clone(), watermark);
+            }
+        }
+        Ok((
+            StateSnapshot::new(format_version, state_entries.into_values().collect()),
+            positions,
+            watermarks,
+        ))
     }
 
     /// Restore source positions before the run starts (recovery).
@@ -136,8 +252,14 @@ impl KernelJobHandle {
         self.cancellation.clone()
     }
 
+    pub fn metrics(&self) -> Arc<KernelMetrics> {
+        self.metrics.clone()
+    }
+
     pub fn gate(&self) -> SnapshotGate {
-        self.gate.clone()
+        // Source-compatible no-op for clients compiled against the legacy
+        // API.  It is deliberately detached from the running graph.
+        Arc::new(RwLock::new(()))
     }
 }
 
@@ -180,29 +302,145 @@ impl KernelJobRunner {
         connect_inputs: bool,
         cancellation: CancellationToken,
     ) -> Result<KernelJobHandle, Error> {
-        let gate: SnapshotGate = Arc::new(RwLock::new(()));
+        Self::spawn_with_cancellation_mode(
+            graph,
+            inputs,
+            states,
+            watermark_gates,
+            connect_inputs,
+            false,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Spawn a graph after the caller has connected every source input and
+    /// restored its checkpoint position.  The graph bootstrap skips source
+    /// reconnects in this mode, preserving connector-specific assignments.
+    pub async fn spawn_prepared_with_cancellation(
+        graph: ExecutionGraph,
+        inputs: Vec<Arc<dyn Input>>,
+        states: BTreeMap<String, Arc<dyn StateBackend>>,
+        watermark_gates: BTreeMap<
+            String,
+            Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
+        >,
+        cancellation: CancellationToken,
+    ) -> Result<KernelJobHandle, Error> {
+        Self::spawn_with_cancellation_mode(
+            graph,
+            inputs,
+            states,
+            watermark_gates,
+            false,
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn spawn_with_cancellation_mode(
+        graph: ExecutionGraph,
+        inputs: Vec<Arc<dyn Input>>,
+        states: BTreeMap<String, Arc<dyn StateBackend>>,
+        watermark_gates: BTreeMap<
+            String,
+            Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
+        >,
+        connect_inputs: bool,
+        sources_preconnected: bool,
+        cancellation: CancellationToken,
+    ) -> Result<KernelJobHandle, Error> {
         if connect_inputs {
             for input in &inputs {
                 input.connect().await?;
             }
         }
         let completion: Completion = Arc::new(tokio::sync::Mutex::new(None));
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (checkpoint_error_tx, checkpoint_error_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reports = Arc::new(tokio::sync::Mutex::new(report_rx));
+        let checkpoint_errors = Arc::new(tokio::sync::Mutex::new(checkpoint_error_rx));
+        let runtime_metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        let mut barrier_senders = BTreeMap::new();
+        let mut participants = BTreeSet::new();
+        let mut hooks = BTreeMap::new();
+        let mut watermark_gates = watermark_gates;
+        for chain in &graph.chains {
+            let entry_task_id = chain.entry_task_id().to_owned();
+            participants.insert(entry_task_id.clone());
+            let event_time_gate = if let Some(gate) = watermark_gates.get(&entry_task_id).cloned() {
+                gate
+            } else {
+                let gate = if chain
+                    .source_time
+                    .as_ref()
+                    .is_some_and(|time| time.mode == crate::job::TimeMode::EventTime)
+                {
+                    let source_time = chain.source_time.as_ref().expect("checked above");
+                    let gate = super::event_time_gate::EventTimeGate::new(
+                        source_time,
+                        chain.window_timings.clone(),
+                    )?;
+                    Some(gate)
+                } else {
+                    None
+                };
+                let gate = Arc::new(tokio::sync::Mutex::new(gate));
+                watermark_gates.insert(entry_task_id.clone(), gate.clone());
+                gate
+            };
+            let state = chain
+                .task_ids
+                .iter()
+                .find_map(|task_id| states.get(task_id).cloned());
+            let barrier_rx = if chain.is_source() {
+                let (sender, receiver) = flume::bounded(8);
+                barrier_senders.insert(entry_task_id.clone(), sender);
+                Some(Arc::new(tokio::sync::Mutex::new(receiver)))
+            } else {
+                None
+            };
+            hooks.insert(
+                entry_task_id.clone(),
+                super::task::CheckpointHook {
+                    reporter: Some(report_tx.clone()),
+                    failure_reporter: Some(checkpoint_error_tx.clone()),
+                    barrier_rx,
+                    state,
+                    task_id: Some(entry_task_id),
+                    event_time_gate,
+                    partition: chain.source_partition,
+                    metrics: Some(runtime_metrics.clone()),
+                    ..Default::default()
+                },
+            );
+        }
         {
             let cancellation = cancellation.clone();
-            let gate = gate.clone();
             let completion = completion.clone();
             tokio::spawn(async move {
-                let result = super::task::run_graph_with_gate(graph, cancellation, gate).await;
+                let result = if sources_preconnected || connect_inputs {
+                    super::task::run_graph_with_hooks_preconnected(graph, cancellation, hooks).await
+                } else {
+                    super::task::run_graph_with_hooks(graph, cancellation, hooks).await
+                };
                 KernelJobHandle::complete(&completion, result).await;
             });
         }
         Ok(KernelJobHandle {
             cancellation,
-            gate,
             inputs,
             states,
             watermark_gates,
             completion,
+            barrier_senders,
+            participants,
+            reports,
+            checkpoint_errors,
+            checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            next_snapshot_id: AtomicU64::new(0),
+            metrics: runtime_metrics.kernel.clone(),
         })
     }
 }
