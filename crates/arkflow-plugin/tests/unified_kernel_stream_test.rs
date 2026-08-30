@@ -2,12 +2,11 @@
 //! stdout/drop) runs on the unified kernel through the real plugin registry.
 
 use arkflow_core::config::EngineConfig;
+use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
-use arkflow_core::executor::run_job;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-
 
 fn setup() {
     let _ = arkflow_plugin::input::init();

@@ -1,11 +1,11 @@
 //! Execution graph construction: JobPlan tasks to chains of operators joined
 //! by bounded in-process channels, with operator-chain fusion.
 
-use crate::Error;
 use crate::input::Input;
 use crate::job::{JobComponentAdapter, JobPlan, TaskSpec};
 use crate::output::Output;
 use crate::processor::Processor;
+use crate::Error;
 use crate::Resource;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,6 +56,11 @@ pub struct Chain {
     pub source_time: Option<crate::job::TimeSpec>,
     /// Physical source partition represented by this chain.
     pub source_partition: Option<u32>,
+    /// Bounded processor worker concurrency for the source chain (the legacy
+    /// `pipeline.thread_num`). 1 = the ordinary single-threaded chain loop;
+    /// values above 1 run a bounded, ordered, cancellable worker pool while
+    /// the source stays a single task (partition topology unchanged).
+    pub processor_parallelism: usize,
     /// Downstream window timing definitions used by the source gate.
     pub window_timings: Vec<super::event_time_gate::WindowTiming>,
 }
@@ -63,6 +68,26 @@ pub struct Chain {
 impl Chain {
     pub fn is_source(&self) -> bool {
         self.source.is_some()
+    }
+
+    /// A copy sharing the processing topology (processors, sink, outputs)
+    /// for bounded worker pools. Source/input ownership stays with the
+    /// original chain's event loop.
+    pub fn share_for_workers(&self) -> Chain {
+        Chain {
+            task_ids: self.task_ids.clone(),
+            source: None,
+            processors: self.processors.clone(),
+            sink: self.sink.clone(),
+            inputs: Vec::new(),
+            outputs: self.outputs.clone(),
+            error_outputs: self.error_outputs.clone(),
+            late_event_outputs: self.late_event_outputs.clone(),
+            source_time: None,
+            source_partition: None,
+            processor_parallelism: 1,
+            window_timings: Vec::new(),
+        }
     }
 
     pub fn entry_task_id(&self) -> &str {
@@ -75,6 +100,10 @@ pub struct ExecutionGraph {
     pub chains: Vec<Chain>,
     /// Capacity used for every inter-chain channel.
     pub channel_capacity: usize,
+    /// Temporary stores shared by this graph's processors. The resource
+    /// guard connects them (dependency order) before any chain spawns and
+    /// closes them at shutdown.
+    pub temporaries: Vec<Arc<dyn crate::temporary::Temporary>>,
 }
 
 /// Fuse a JobPlan's assigned tasks into chains connected by bounded channels.
@@ -231,10 +260,7 @@ impl ExecutionGraphBuilder {
 
     /// Attach the Job's state backend; stateful operators get the
     /// `StatefulOperator` wrapper during graph build.
-    pub fn with_state(
-        mut self,
-        state_backend: Arc<dyn crate::state::StateBackend>,
-    ) -> Self {
+    pub fn with_state(mut self, state_backend: Arc<dyn crate::state::StateBackend>) -> Self {
         self.state_backend = Some(state_backend);
         self
     }
@@ -274,9 +300,10 @@ impl ExecutionGraphBuilder {
         let tasks = task_ids
             .iter()
             .map(|task_id| {
-                index.task(task_id).cloned().ok_or_else(|| {
-                    Error::Config(format!("unknown Job task '{task_id}'"))
-                })
+                index
+                    .task(task_id)
+                    .cloned()
+                    .ok_or_else(|| Error::Config(format!("unknown Job task '{task_id}'")))
             })
             .collect::<Result<Vec<TaskSpec>, Error>>()?;
         if tasks.is_empty() {
@@ -294,8 +321,11 @@ impl ExecutionGraphBuilder {
                     .iter()
                     .find(|operator| operator.id == task.operator_id)
                     .is_some_and(|operator| operator.kind == crate::job::OperatorKind::Window)
-            }) => Some(Arc::new(crate::state::InMemoryStateBackend::new(1)?)
-                as Arc<dyn crate::state::StateBackend>),
+            }) =>
+            {
+                Some(Arc::new(crate::state::InMemoryStateBackend::new(1)?)
+                    as Arc<dyn crate::state::StateBackend>)
+            }
             None => None,
         };
         let _assigned: BTreeSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
@@ -306,13 +336,13 @@ impl ExecutionGraphBuilder {
         // subtask.
         let mut runs: Vec<Vec<TaskSpec>> = Vec::new();
         for task in &tasks {
-            let fusable_into_previous = runs
-                .last()
-                .and_then(|run| run.last())
-                .is_some_and(|previous| {
-                    previous.subtask == task.subtask
-                        && index.fusable_pair(&previous.operator_id, &task.operator_id)
-                });
+            let fusable_into_previous =
+                runs.last()
+                    .and_then(|run| run.last())
+                    .is_some_and(|previous| {
+                        previous.subtask == task.subtask
+                            && index.fusable_pair(&previous.operator_id, &task.operator_id)
+                    });
             if fusable_into_previous {
                 runs.last_mut().unwrap().push(task.clone());
             } else {
@@ -377,9 +407,9 @@ impl ExecutionGraphBuilder {
                     .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
                 let mut target_runs: Vec<usize> = Vec::new();
                 for target in &target_tasks {
-                    let target_run = *run_of_task
-                        .get(target.id.as_str())
-                        .ok_or_else(|| Error::Config(format!("task '{}' lost its run", target.id)))?;
+                    let target_run = *run_of_task.get(target.id.as_str()).ok_or_else(|| {
+                        Error::Config(format!("task '{}' lost its run", target.id))
+                    })?;
                     if target_run != upstream_run && !target_runs.contains(&target_run) {
                         target_runs.push(target_run);
                     }
@@ -503,13 +533,44 @@ impl ExecutionGraphBuilder {
             }
         }
 
-        // 4. Assemble chains.
+        // 4. Assemble chains. The legacy `pipeline.thread_num` rides the
+        // source config; it applies to the fused PROCESSOR chains (bounded,
+        // ordered worker concurrency) and never changes the source partition
+        // topology.
+        let processor_parallelism = plan
+            .spec
+            .sources
+            .iter()
+            .find_map(|source| {
+                source
+                    .config
+                    .get("__arkflow_processor_parallelism")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                plan.spec.operators.iter().find_map(|operator| {
+                    operator
+                        .config
+                        .get("__arkflow_processor_parallelism")
+                        .and_then(serde_json::Value::as_u64)
+                })
+            })
+            .map(|value| (value as usize).max(1));
         let mut chains = Vec::with_capacity(runs.len());
         for run in &runs {
             let first = run.first().unwrap();
             let last = run.last().unwrap();
             let is_source = index.is_source(&first.operator_id);
             let is_sink = index.is_sink(&last.operator_id);
+            let has_stateful_processor = run.iter().any(|task| {
+                plan.spec
+                    .operators
+                    .iter()
+                    .find(|operator| operator.id == task.operator_id)
+                    .is_some_and(|operator| {
+                        operator.stateful || operator.kind == crate::job::OperatorKind::Window
+                    })
+            });
 
             let source = if is_source {
                 Some(build_source_input(plan, &index, first, adapter, resource)?)
@@ -539,62 +600,64 @@ impl ExecutionGraphBuilder {
                     .iter()
                     .find(|operator| operator.id == task.operator_id)
                     .ok_or_else(|| {
-                        Error::Config(format!(
-                            "task '{}' references unknown operator",
-                            task.id
-                        ))
+                        Error::Config(format!("task '{}' references unknown operator", task.id))
                     })?;
-                let processor: Arc<dyn Processor> = if operator.kind == crate::job::OperatorKind::Window {
-                    let backend = state_backend.clone().ok_or_else(|| {
-                        Error::Config(format!(
-                            "stateful operator '{}' requires a Job state backend",
-                            operator.id
-                        ))
-                    })?;
-                    let config: super::window::WindowOperatorConfig =
-                        serde_json::from_value(operator.config.clone()).map_err(|error| {
-                            Error::Config(format!(
-                                "window operator '{}' has invalid config: {error}",
-                                operator.id
-                            ))
-                        })?;
-                    config.validate()?;
-                    Arc::new(super::window::ColumnarWindowOperator::new(
-                        config,
-                        backend,
-                        format!("job:{}:task:{}", plan.spec.id, task.id),
-                    ))
-                } else {
-                    let processor = adapter.build_processor(operator, resource)?;
-                    if !operator.stateful {
-                        processor
-                    } else {
+                let processor: Arc<dyn Processor> =
+                    if operator.kind == crate::job::OperatorKind::Window {
                         let backend = state_backend.clone().ok_or_else(|| {
                             Error::Config(format!(
                                 "stateful operator '{}' requires a Job state backend",
                                 operator.id
                             ))
                         })?;
-                        Arc::new(super::stateful::StatefulOperator::new(
-                            processor,
-                            backend,
-                            format!("job:{}:task:{}", plan.spec.id, task.id),
-                            operator.key_field.clone().ok_or_else(|| {
+                        let config: super::window::WindowOperatorConfig =
+                            serde_json::from_value(operator.config.clone()).map_err(|error| {
                                 Error::Config(format!(
-                                    "stateful operator '{}' requires key_field",
+                                    "window operator '{}' has invalid config: {error}",
                                     operator.id
                                 ))
-                            })?,
-                            plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
-                            operator
-                                .config
-                                .get("state_output_field")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("__arkflow_state_count")
-                                .to_owned(),
+                            })?;
+                        config.validate()?;
+                        let namespace = format!("job:{}:task:{}", plan.spec.id, task.id);
+                        Arc::new(super::window::ColumnarWindowOperator::with_journal(
+                            config,
+                            backend,
+                            Arc::new(super::state_journal::StateJournal::new(
+                                state_backend.clone().expect("window backend checked above"),
+                            )),
+                            namespace,
                         ))
-                    }
-                };
+                    } else {
+                        let processor = adapter.build_processor(operator, resource)?;
+                        if !operator.stateful {
+                            processor
+                        } else {
+                            let backend = state_backend.clone().ok_or_else(|| {
+                                Error::Config(format!(
+                                    "stateful operator '{}' requires a Job state backend",
+                                    operator.id
+                                ))
+                            })?;
+                            Arc::new(super::stateful::StatefulOperator::with_journal(
+                                processor,
+                                Arc::new(super::state_journal::StateJournal::new(backend)),
+                                format!("job:{}:task:{}", plan.spec.id, task.id),
+                                operator.key_field.clone().ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "stateful operator '{}' requires key_field",
+                                        operator.id
+                                    ))
+                                })?,
+                                plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
+                                operator
+                                    .config
+                                    .get("state_output_field")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("__arkflow_state_count")
+                                    .to_owned(),
+                            ))
+                        }
+                    };
                 processors.push(processor);
             }
 
@@ -618,11 +681,11 @@ impl ExecutionGraphBuilder {
                             })
                             .collect::<Vec<_>>();
                         let target = match edge.kind {
-                            OutboundKind::Forward => EdgeTarget::Forward(
-                                channels.into_iter().next().ok_or_else(|| {
-                                    Error::Process("forward edge lost its channel".into())
-                                })?,
-                            ),
+                            OutboundKind::Forward => {
+                                EdgeTarget::Forward(channels.into_iter().next().ok_or_else(
+                                    || Error::Process("forward edge lost its channel".into()),
+                                )?)
+                            }
                             OutboundKind::Broadcast => EdgeTarget::Broadcast(channels),
                             OutboundKind::Route => EdgeTarget::Partitioned {
                                 channels,
@@ -672,6 +735,14 @@ impl ExecutionGraphBuilder {
                 } else {
                     None
                 },
+                // Stateful and window operators own a mutable state epoch.
+                // Keep their chain single-threaded so a worker pool cannot
+                // interleave state updates or cross a checkpoint cut.
+                processor_parallelism: if has_stateful_processor {
+                    1
+                } else {
+                    processor_parallelism.unwrap_or(1)
+                },
                 window_timings: if is_source {
                     window_timings_for_source(plan, &first.operator_id)?
                 } else {
@@ -689,6 +760,7 @@ impl ExecutionGraphBuilder {
         Ok(ExecutionGraph {
             chains,
             channel_capacity: self.channel_capacity,
+            temporaries: Vec::new(),
         })
     }
 }
@@ -726,7 +798,15 @@ fn build_source_input<A: JobComponentAdapter>(
         .iter()
         .filter(|candidate| candidate.operator_id == task.operator_id)
         .count();
-    if parallel_tasks > 1 && !input.supports_partitioning() {
+    // Partition assignment derives from the operator's ACTUAL task count: a
+    // single source task keeps the connector's all-partition subscription
+    // (pinning it to physical partition 0 would silently drop every other
+    // partition); only multiple physical tasks receive explicit, stable
+    // partitions.
+    if parallel_tasks <= 1 {
+        return Ok(input);
+    }
+    if !input.supports_partitioning() {
         return Err(Error::Config(format!(
             "source '{}' does not support partitioned task execution",
             task.operator_id

@@ -524,6 +524,16 @@ async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     }
 }
 
+/// Validate a Job through the same component, state-backend, and graph
+/// construction path used by local execution. The HTTP Hub is also used
+/// directly in tests and embedded deployments, so initialize the built-in
+/// catalogue here as well as in `serve_hub`.
+fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(), String> {
+    arkflow_plugin::initialize()
+        .and_then(|_| arkflow_core::executor::job_runner_adapter::validate_local_job(spec))
+        .map_err(|error| error.to_string())
+}
+
 async fn hub_job(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
@@ -715,6 +725,9 @@ async fn hub_validate_job(
             )
         }
     };
+    if let Err(error) = deep_validate_job(&spec) {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "invalid_job_plan", error);
+    }
     let nodes = hub.nodes().await;
     let candidates = if request.node_ids.is_empty() {
         nodes.clone()
@@ -948,6 +961,9 @@ async fn hub_job_upgrade(
             error.to_string(),
         );
     }
+    if let Err(error) = deep_validate_job(&spec) {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "invalid_job_plan", error);
+    }
     let checkpoint = match hub.job_checkpoints(&job_id).await.map(|records| {
         records.into_iter().find(|record| {
             record.checkpoint_id == request.savepoint_id
@@ -1051,12 +1067,41 @@ async fn hub_job_upgrade_rollback(
         );
     };
     let restored_spec_json =
-        serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json)
-            .map(|mut spec| {
+        match serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json) {
+            Ok(mut spec) => {
                 spec.recovery = arkflow_core::job::RecoveryPolicy::LatestSavepoint;
-                serde_json::to_string(&spec).unwrap_or(previous.spec_json.clone())
-            })
-            .unwrap_or(previous.spec_json);
+                if let Err(error) = spec
+                    .validate()
+                    .and_then(|_| arkflow_core::job::JobPlan::compile(spec.clone()).map(|_| ()))
+                {
+                    return problem(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_job_plan",
+                        error.to_string(),
+                    );
+                }
+                if let Err(error) = deep_validate_job(&spec) {
+                    return problem(StatusCode::UNPROCESSABLE_ENTITY, "invalid_job_plan", error);
+                }
+                match serde_json::to_string(&spec) {
+                    Ok(spec_json) => spec_json,
+                    Err(error) => {
+                        return problem(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "invalid_persisted_job",
+                            error.to_string(),
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid_persisted_job",
+                    error.to_string(),
+                )
+            }
+        };
     let restored = JobRecord {
         job_id: job_id.clone(),
         version: previous.version,
@@ -1166,6 +1211,9 @@ async fn hub_create_job(
             "invalid_job_plan",
             error.to_string(),
         );
+    }
+    if let Err(error) = deep_validate_job(&spec) {
+        return problem(StatusCode::BAD_REQUEST, "invalid_job_plan", error);
     }
     if !matches!(request.desired_state.as_str(), "stopped" | "running") {
         return problem(
@@ -3932,7 +3980,7 @@ mod tests {
         hub.report(hub::NodeReport {
             auth: hub::AgentAuth {
                 node_id: "node-a".into(),
-                session_token: session.session_token,
+                session_token: session.session_token.clone(),
             },
             version: "test".into(),
             state: "online".into(),
@@ -3943,7 +3991,7 @@ mod tests {
             metrics: Default::default(),
             configuration: None,
             configuration_version: Some(config_version),
-            boot_id: Some("boot-config".into()),
+            boot_id: Some(session.session_token.clone()),
             report_seq: 1,
         })
         .await

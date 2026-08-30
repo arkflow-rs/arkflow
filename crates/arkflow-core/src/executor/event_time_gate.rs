@@ -7,10 +7,10 @@
 //! them). Unlike the legacy implementation this operates on the kernel's
 //! source-chain loop and preserves batch boundaries where the policy allows.
 
-use crate::Error;
 use crate::event_time::{window_action, FieldTimestampExtractor, WatermarkTracker, WindowAction};
 use crate::input::{fanout_ack, Ack, NoopAck};
 use crate::job::{LateEventPolicy, TimeSpec};
+use crate::Error;
 
 /// The part of a downstream window definition that affects when a source row
 /// is safe to release.  Keeping this separate from the window operator's
@@ -42,9 +42,9 @@ impl WindowTiming {
                 .checked_mul(slide_ms)
                 .and_then(|start| start.checked_add(size_ms))
                 .or(Some(i64::MAX)),
-            Self::Session { gap_ms } if gap_ms > 0 => event_time_ms
-                .checked_add(gap_ms)
-                .or(Some(i64::MAX)),
+            Self::Session { gap_ms } if gap_ms > 0 => {
+                event_time_ms.checked_add(gap_ms).or(Some(i64::MAX))
+            }
             _ => None,
         }
     }
@@ -119,10 +119,9 @@ impl EventTimeGate {
         let tracker = WatermarkTracker::from_time_spec(time)?;
         Ok(Self {
             extractor: Some(FieldTimestampExtractor {
-                field: time
-                    .timestamp_field
-                    .clone()
-                    .ok_or_else(|| Error::Config("event-time source requires timestamp_field".into()))?,
+                field: time.timestamp_field.clone().ok_or_else(|| {
+                    Error::Config("event-time source requires timestamp_field".into())
+                })?,
             }),
             tracker: Some(tracker),
             late_policy: time.late_event_policy,
@@ -139,6 +138,16 @@ impl EventTimeGate {
     /// Current watermark (restored or observed).
     pub fn watermark(&self) -> Option<i64> {
         self.tracker.as_ref().and_then(WatermarkTracker::watermark)
+    }
+
+    /// The tracked watermark of one physical partition (restore
+    /// verification and multi-input minimum-progress checks).
+    pub fn partition_watermark(&self, partition: u32) -> Option<i64> {
+        self.tracker
+            .as_ref()?
+            .partition_progress()
+            .get(&partition)
+            .map(|progress| progress.watermark_ms)
     }
 
     /// Restore a checkpointed watermark for one partition.
@@ -177,7 +186,9 @@ impl EventTimeGate {
             return Ok(decision);
         }
         let (extractor_field, late_policy, allowed_lateness_ms) = (
-            self.extractor.as_ref().map(|extractor| extractor.field.clone()),
+            self.extractor
+                .as_ref()
+                .map(|extractor| extractor.field.clone()),
             self.late_policy,
             self.allowed_lateness_ms,
         );
@@ -186,9 +197,16 @@ impl EventTimeGate {
         };
         let event_times_ms = extractor.extract_timestamps_ms(&batch)?;
         let now_ms = crate::state::now_ms() as i64;
-        let watermark_before = {
+        // Advance the watermark with THIS batch's observations first, then
+        // classify the current rows against the advanced watermark: a batch
+        // like [2100, 100] makes row 100 late the moment row 2100 is
+        // observed, and only genuinely future rows stay held.
+        let watermark_after = {
             let tracker = self.tracker.as_mut().unwrap();
             tracker.refresh_idle(now_ms);
+            for event_time_ms in event_times_ms.iter().flatten().copied() {
+                tracker.observe(partition, event_time_ms, now_ms);
+            }
             tracker.watermark()
         };
 
@@ -198,20 +216,13 @@ impl EventTimeGate {
                 Self::action(
                     event_time_ms.and_then(|event_time| self.window_end_for(event_time)),
                     *event_time_ms,
-                    watermark_before,
+                    watermark_after,
                     false,
                     late_policy,
                     allowed_lateness_ms,
                 )
             })
             .collect::<Vec<_>>();
-        let watermark_after = {
-            let tracker = self.tracker.as_mut().unwrap();
-            for event_time_ms in event_times_ms.iter().flatten().copied() {
-                tracker.observe(partition, event_time_ms, now_ms);
-            }
-            tracker.watermark()
-        };
 
         let mut decision = GateDecision::new(watermark_after);
         // Held rows first (FIFO), re-evaluated against the new watermark.
@@ -241,13 +252,7 @@ impl EventTimeGate {
         }
         // Current batch rows: slice the batch by decision (contiguous runs
         // preserved; columnar layout kept — no per-row batch copies).
-        self.collect_outcomes(
-            batch,
-            event_times_ms,
-            current_actions,
-            ack,
-            &mut decision,
-        )?;
+        self.collect_outcomes(batch, event_times_ms, current_actions, ack, &mut decision)?;
 
         Ok(decision)
     }
@@ -358,11 +363,17 @@ impl EventTimeGate {
         for ((action, keep, group_times), child_ack) in groups.into_iter().zip(child_acks) {
             let filtered = filter_batch(&batch, &keep)?;
             match action {
-                WindowAction::Hold => self.held.push(HeldBatch {
-                    batch: filtered,
-                    event_times_ms: group_times,
-                    ack: child_ack,
-                }),
+                WindowAction::Hold => {
+                    // Held rows keep their acknowledgement pending until the
+                    // watermark opens their window; barrier draining must not
+                    // wait on them, so mark the child as held.
+                    child_ack.mark_held();
+                    self.held.push(HeldBatch {
+                        batch: filtered,
+                        event_times_ms: group_times,
+                        ack: child_ack,
+                    })
+                }
                 WindowAction::Drop => decision.dropped_acks.push(child_ack),
                 other => {
                     decision.ready.push((filtered, other));
@@ -393,15 +404,13 @@ impl EventTimeGate {
         allowed_lateness_ms: u64,
     ) -> WindowAction {
         let Some(event_time_ms) = event_time_ms else {
-            return if held {
-                WindowAction::Hold
-            } else {
-                match late_policy {
-                    // A null timestamp can never enter a window; route or
-                    // update would loop, so drop or hold per policy.
-                    LateEventPolicy::Drop => WindowAction::Drop,
-                    _ => WindowAction::Hold,
-                }
+            // A null (invalid) timestamp can never compute a window end, so
+            // no watermark can ever release it: route to the configured
+            // side output when one exists, otherwise drop and acknowledge.
+            // Holding it would retain its acknowledgement indefinitely.
+            return match late_policy {
+                LateEventPolicy::Route => WindowAction::Route,
+                LateEventPolicy::Update | LateEventPolicy::Drop => WindowAction::Drop,
             };
         };
         let Some(window_end) = window_end else {
@@ -414,7 +423,13 @@ impl EventTimeGate {
                 WindowAction::Hold
             };
         }
-        window_action(window_end, event_time_ms, watermark_ms, allowed_lateness_ms, late_policy)
+        window_action(
+            window_end,
+            event_time_ms,
+            watermark_ms,
+            allowed_lateness_ms,
+            late_policy,
+        )
     }
 }
 
@@ -431,7 +446,6 @@ fn filter_batch(
     filtered_batch.set_input_name(batch.get_input_name());
     Ok(std::sync::Arc::new(filtered_batch))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -601,7 +615,7 @@ mod tests {
         assert!(gate.has_held());
         gate.observe(0, batch(vec![8_000])).unwrap();
         assert!(gate.has_held()); // 8_000 held in [8000,9000)
-        // Acks release only when nothing at all is held; feed one more tick.
+                                  // Acks release only when nothing at all is held; feed one more tick.
         gate.observe(0, batch(vec![9_500])).unwrap();
         assert!(gate.has_held()); // 9_500 held in [9000,10000)
     }
@@ -613,5 +627,143 @@ mod tests {
         let decision = gate.observe(0, batch.clone()).unwrap();
         assert_eq!(decision.ready.len(), 1);
         assert_eq!(decision.ready[0].0.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod cut_consistency_tests {
+    use super::*;
+    use crate::job::{TimeMode, WatermarkSpec, WatermarkStrategy};
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn spec(policy: LateEventPolicy, lateness: u64) -> TimeSpec {
+        TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(WatermarkSpec {
+                strategy: WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: lateness,
+            late_event_policy: policy,
+            late_event_route: None,
+        }
+    }
+
+    fn nullable_batch(times: Vec<Option<i64>>) -> crate::MessageBatchRef {
+        let count = times.len();
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, true),
+                    Field::new("key", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(times)),
+                    Arc::new(StringArray::from(vec!["a"; count])),
+                ],
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn times_of(decision: &GateDecision) -> Vec<Option<i64>> {
+        decision
+            .ready
+            .iter()
+            .flat_map(|(batch, _)| {
+                batch
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Task 4.2: the batch watermark advances BEFORE the current rows are
+    /// classified, so a batch `[2100, 100]` classifies row 100 by the
+    /// configured late policy and only the genuinely future row stays held.
+    #[test]
+    fn batch_watermark_advances_before_classifying_current_rows() {
+        // Drop policy: the old row is dropped (its acknowledgement completes
+        // immediately); the future row stays held.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(2_100), Some(100)]))
+            .unwrap();
+        assert!(decision.ready.is_empty(), "Drop: nothing is ready");
+        assert_eq!(decision.dropped_acks.len(), 1, "Drop: old row dropped");
+        assert!(gate.has_held(), "Drop: future row stays held");
+
+        // Route policy: the old row goes to the side output branch.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Route, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(2_100), Some(100)]))
+            .unwrap();
+        assert_eq!(decision.ready.len(), 1, "Route: old row routed");
+        assert_eq!(decision.ready[0].1, WindowAction::Route);
+        assert_eq!(times_of(&decision), vec![Some(100)]);
+        assert!(gate.has_held(), "Route: future row stays held");
+
+        // Update policy within allowed lateness: the old row is marked for
+        // update against the window aggregate.
+        let mut gate =
+            EventTimeGate::new(&spec(LateEventPolicy::Update, 2_000), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(2_100), Some(100)]))
+            .unwrap();
+        assert_eq!(decision.ready.len(), 1, "Update: old row marked");
+        assert_eq!(decision.ready[0].1, WindowAction::Update);
+        assert_eq!(times_of(&decision), vec![Some(100)]);
+        assert!(gate.has_held(), "Update: future row stays held");
+    }
+
+    /// Task 4.2: a null timestamp cannot compute a window end; it must route
+    /// (side output) or drop, never stay held holding its acknowledgement.
+    #[test]
+    fn null_timestamps_route_or_drop_without_indefinite_hold() {
+        // With a Route policy the null row goes to the side output; the
+        // valid future row stays held for its window.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Route, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(100), None]))
+            .unwrap();
+        assert_eq!(decision.ready.len(), 1);
+        assert_eq!(decision.ready[0].1, WindowAction::Route);
+        assert_eq!(times_of(&decision), vec![None]);
+        assert_eq!(decision.dropped_acks.len(), 0);
+        assert!(gate.has_held(), "the valid future row stays held");
+
+        // Without a route, the null row is dropped and acknowledged.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(100), None]))
+            .unwrap();
+        assert!(decision.ready.is_empty());
+        assert_eq!(decision.dropped_acks.len(), 1);
+        assert!(gate.has_held(), "the valid future row stays held");
+    }
+
+    /// Task 4.2: a held row whose window closed re-emits (and a null row
+    /// held by an older gate release also routes/drops instead of looping).
+    #[test]
+    fn update_policy_releases_held_rows_through_watermark() {
+        let mut gate =
+            EventTimeGate::new(&spec(LateEventPolicy::Update, 1_000), vec![1_000]).unwrap();
+        let first = gate.observe(0, nullable_batch(vec![Some(100)])).unwrap();
+        assert!(first.ready.is_empty());
+        assert!(gate.has_held());
+        // A later batch closes [0, 1000): the held 100 was a normal future
+        // row at observe time, so it emits rather than being treated late.
+        let second = gate.observe(0, nullable_batch(vec![Some(1_500)])).unwrap();
+        assert!(times_of(&second).contains(&Some(100)));
     }
 }

@@ -5,16 +5,40 @@
 //! the plan, build the execution graph through a component adapter, and drive
 //! it with `run_graph`.
 
-use crate::Error;
 use crate::executor::graph::ExecutionGraphBuilder;
 use crate::executor::kernel_handle::KernelJobRunner;
-use crate::executor::task::{run_graph, run_graph_with_hooks, run_graph_with_metrics, CheckpointHook};
+use crate::executor::task::{
+    run_graph, run_graph_with_hooks, run_graph_with_metrics_startup, CheckpointHook,
+};
 use crate::job::{JobComponentAdapter, JobPlan, JobSpec};
+use crate::Error;
 use crate::Resource;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Deep-build a local Job without starting it: compile the plan, open the
+/// local state backend, and construct the execution graph through the same
+/// component path the real startup uses. Every constructed resource is
+/// dropped before returning (redb handles release their locks on drop), so
+/// the real startup can reopen them. Called before readiness so an invalid
+/// component, unsupported backend, or broken graph fails startup visibly.
+pub fn validate_local_job(spec: &JobSpec) -> Result<(), Error> {
+    let plan = JobPlan::compile(spec.clone())?;
+    let state = local_state_backend(&plan)?;
+    let builder = match state {
+        Some(state) => ExecutionGraphBuilder::default().with_state(state),
+        None => ExecutionGraphBuilder::default(),
+    };
+    let adapter = crate::executor::stream_adapter::StreamJobAdapter::new(None)?;
+    let mut resource = crate::Resource {
+        temporary: std::collections::HashMap::new(),
+        input_names: std::cell::RefCell::new(Vec::new()),
+    };
+    builder.build(&plan, &adapter, &mut resource)?;
+    Ok(())
+}
 
 /// Run a whole JobSpec locally (all tasks, single process).
 ///
@@ -40,6 +64,21 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
     resource: &mut Resource,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
+    run_job_with_checkpoints_started(spec, adapter, resource, cancellation, None).await
+}
+
+/// Run a local Job and notify the caller once the graph's resource startup
+/// has completed. The notification is used by the Engine to delay readiness
+/// until component construction and resource connection have actually
+/// succeeded; the ordinary API keeps the notification optional for existing
+/// callers.
+pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
+    spec: &JobSpec,
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+    mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
     let checkpoint_root = spec
         .checkpoint
@@ -51,7 +90,8 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
         None => ExecutionGraphBuilder::default(),
     };
-    let graph = builder.build(&plan, adapter, resource)?;
+    let mut graph = builder.build(&plan, adapter, resource)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
     let inputs = graph
         .chains
         .iter()
@@ -76,10 +116,22 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
                 );
                 restore_local_snapshot(&repository, &manifest, state)?;
                 for input in &inputs {
-                    input.connect().await?;
+                    if let Err(error) = input.connect().await {
+                        close_inputs(&inputs).await;
+                        let _ = startup
+                            .take()
+                            .map(|sender| sender.send(Err(error.to_string())));
+                        return Err(error);
+                    }
                 }
                 for input in &inputs {
-                    input.restore_positions(&manifest.source_positions).await?;
+                    if let Err(error) = input.restore_positions(&manifest.source_positions).await {
+                        close_inputs(&inputs).await;
+                        let _ = startup
+                            .take()
+                            .map(|sender| sender.send(Err(error.to_string())));
+                        return Err(error);
+                    }
                 }
                 restore_event_time_watermarks(&graph, &watermark_gates, &manifest.watermarks_ms)
                     .await;
@@ -87,26 +139,45 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
             }
         }
     }
-    let handle = Arc::new(if prepared_inputs {
+    let spawned_result = if prepared_inputs {
         KernelJobRunner::spawn_prepared_with_cancellation(
             graph,
-            inputs,
+            inputs.clone(),
             states,
             watermark_gates,
             cancellation.clone(),
         )
-        .await?
+        .await
     } else {
         KernelJobRunner::spawn_with_cancellation(
             graph,
-            inputs,
+            inputs.clone(),
             states,
             std::mem::take(&mut watermark_gates),
             false,
             cancellation.clone(),
         )
-        .await?
-    });
+        .await
+    };
+    let spawned = match spawned_result {
+        Ok(handle) => handle,
+        Err(error) => {
+            if prepared_inputs {
+                close_inputs(&inputs).await;
+            }
+            if let Some(state) = state.as_ref() {
+                let _ = state.close();
+            }
+            let _ = startup
+                .take()
+                .map(|sender| sender.send(Err(error.to_string())));
+            return Err(error);
+        }
+    };
+    let handle = Arc::new(spawned);
+    if let Some(startup) = startup.take() {
+        let _ = startup.send(Ok(()));
+    }
 
     let checkpoint_stop = CancellationToken::new();
     let checkpoint_task = spec.checkpoint.as_ref().map(|checkpoint| {
@@ -144,18 +215,29 @@ pub async fn run_job_with_metrics<A: JobComponentAdapter>(
     cancellation: CancellationToken,
     metrics: Option<std::sync::Arc<crate::runtime::RuntimeMetrics>>,
 ) -> Result<(), Error> {
+    run_job_with_metrics_started(spec, adapter, resource, cancellation, metrics, None).await
+}
+
+/// Metrics-enabled local Job runner with an optional startup handshake. The
+/// sender is completed by the graph runner only after temporary stores,
+/// sources, sinks, and state backends have connected successfully.
+pub async fn run_job_with_metrics_started<A: JobComponentAdapter>(
+    spec: &JobSpec,
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+    metrics: Option<std::sync::Arc<crate::runtime::RuntimeMetrics>>,
+    startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
     let state = local_state_backend(&plan)?;
     let builder = match state.clone() {
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
         None => ExecutionGraphBuilder::default(),
     };
-    let result = run_graph_with_metrics(
-        builder.build(&plan, adapter, resource)?,
-        cancellation,
-        metrics,
-    )
-    .await;
+    let mut graph = builder.build(&plan, adapter, resource)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
+    let result = run_graph_with_metrics_startup(graph, cancellation, metrics, startup).await;
     if let Some(state) = state {
         state.close()?;
     }
@@ -171,7 +253,9 @@ pub async fn run_job_tasks<A: JobComponentAdapter>(
     resource: &mut Resource,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
-    let graph = ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource)?;
+    let mut graph =
+        ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
     run_graph(graph, cancellation).await
 }
 
@@ -190,7 +274,8 @@ pub async fn run_job_with_hooks<A: JobComponentAdapter>(
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
         None => ExecutionGraphBuilder::default(),
     };
-    let graph = builder.build(&plan, adapter, resource)?;
+    let mut graph = builder.build(&plan, adapter, resource)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
     run_graph_with_hooks(graph, cancellation, hooks).await
 }
 
@@ -250,9 +335,11 @@ fn event_time_gates(
 > {
     let mut gates = BTreeMap::new();
     for chain in &graph.chains {
-        let Some(source_time) = chain.source_time.as_ref().filter(|time| {
-            time.mode == crate::job::TimeMode::EventTime
-        }) else {
+        let Some(source_time) = chain
+            .source_time
+            .as_ref()
+            .filter(|time| time.mode == crate::job::TimeMode::EventTime)
+        else {
             continue;
         };
         let gate = crate::executor::event_time_gate::EventTimeGate::new(
@@ -287,6 +374,14 @@ async fn restore_event_time_watermarks(
     }
 }
 
+async fn close_inputs(inputs: &[Arc<dyn crate::input::Input>]) {
+    for input in inputs.iter().rev() {
+        if let Err(error) = input.close().await {
+            tracing::warn!(%error, "failed to close input after local Job startup failure");
+        }
+    }
+}
+
 fn latest_local_checkpoint(
     root: &std::path::Path,
     plan: &JobPlan,
@@ -315,9 +410,8 @@ fn latest_local_checkpoint(
     };
     let mut candidates = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            Error::Process(format!("scan local recovery directory: {error}"))
-        })?;
+        let entry = entry
+            .map_err(|error| Error::Process(format!("scan local recovery directory: {error}")))?;
         let path = entry.path().join("manifest.json");
         if !path.is_file() {
             continue;
@@ -358,11 +452,31 @@ fn latest_local_checkpoint(
         let Ok(manifest) = repository.read_manifest(&artifact) else {
             continue;
         };
-        if manifest.job_id != plan.spec.id
-            || manifest.job_version != plan.spec.version
-            || manifest.format_version != state_format
-            || manifest.state_snapshots.is_empty()
-        {
+        if manifest.state_snapshots.is_empty() {
+            continue;
+        }
+        // One shared compatibility evaluation (task membership, formats,
+        // version direction, checksum) — the same verdict the Hub and Agent
+        // would reach for this artifact.
+        let planned_tasks = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<BTreeSet<_>>();
+        let compatibility = crate::checkpoint::evaluate_recovery_compatibility(
+            &manifest,
+            &plan.spec.id,
+            plan.spec.version,
+            state_format,
+            &planned_tasks,
+        );
+        if !compatibility.is_compatible() {
+            tracing::warn!(
+                job_id = %plan.spec.id,
+                checkpoint = %manifest.checkpoint_id,
+                reason = compatibility.reason.as_deref().unwrap_or("incompatible"),
+                "skipping incompatible local recovery artifact"
+            );
             continue;
         }
         if manifest
@@ -395,10 +509,8 @@ fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(
             entries.insert((entry.namespace.clone(), entry.key.clone()), entry);
         }
     }
-    let snapshot = crate::state::StateSnapshot::new(
-        state.format_version(),
-        entries.into_values().collect(),
-    );
+    let snapshot =
+        crate::state::StateSnapshot::new(state.format_version(), entries.into_values().collect());
     state.restore(&snapshot)
 }
 
@@ -437,14 +549,18 @@ fn local_checkpoint_catalog(
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok()
-                .and_then(|modified| modified.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .and_then(|modified| {
+                    modified
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .ok()
+                })
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or_default(),
             status: crate::checkpoint::CheckpointStatus::Completed,
         };
         if let Ok(manifest) = repository.read_manifest(&artifact) {
             if manifest.job_id == plan.spec.id
-                && manifest.job_version == plan.spec.version
+                && manifest.job_version <= plan.spec.version
                 && manifest.format_version == format_version
             {
                 catalog.record(artifact);
@@ -476,7 +592,8 @@ async fn run_local_checkpoint_loop(
         }
     };
     let mut catalog = local_checkpoint_catalog(&root, &store, &plan);
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(checkpoint.interval_ms));
+    let mut ticker =
+        tokio::time::interval(std::time::Duration::from_millis(checkpoint.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sequence = 0u64;
     loop {
@@ -581,7 +698,8 @@ fn persist_local_checkpoint(
         })
         .collect::<Vec<_>>();
     let manifest = coordinator.complete(attempts, state_refs)?;
-    let artifact = repository.write_checkpoint(&manifest)?;
+    let planned_tasks = participants.iter().cloned().collect::<BTreeSet<_>>();
+    let artifact = repository.write_checkpoint_with_plan(&manifest, &planned_tasks)?;
     catalog.record(artifact);
     for removed in catalog.retain_checkpoints(checkpoint.retention as usize) {
         repository.delete(&removed)?;
@@ -593,7 +711,9 @@ fn local_checkpoint_root(uri: &str) -> Result<PathBuf, Error> {
     if let Some(path) = uri.strip_prefix("file://") {
         let path = PathBuf::from(path);
         if path.as_os_str().is_empty() {
-            return Err(Error::Config("file checkpoint URI has an empty path".into()));
+            return Err(Error::Config(
+                "file checkpoint URI has an empty path".into(),
+            ));
         }
         return Ok(path);
     }
@@ -609,4 +729,74 @@ fn local_checkpoint_root(uri: &str) -> Result<PathBuf, Error> {
 /// Convenience for building the shared `Resource` outside the executor.
 pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
     std::sync::Arc::new(resource)
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::job::{
+        JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec, TimeMode, TimeSpec,
+    };
+
+    fn local_spec(input_type: &str, output_type: &str) -> JobSpec {
+        JobSpec {
+            id: JobId::new("validate-job").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 1,
+            parallelism: 1,
+            operators: vec![
+                OperatorSpec {
+                    id: "source".into(),
+                    kind: OperatorKind::Source,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({"type": input_type}),
+                },
+                OperatorSpec {
+                    id: "sink".into(),
+                    kind: OperatorKind::Sink,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({"type": output_type}),
+                },
+            ],
+            edges: vec![crate::job::EdgeSpec {
+                id: "source-sink".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }],
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: input_type.into(),
+                config: serde_json::json!({}),
+                time: TimeSpec {
+                    mode: TimeMode::ProcessingTime,
+                    timestamp_field: None,
+                    watermark: None,
+                    allowed_lateness_ms: 0,
+                    late_event_policy: Default::default(),
+                    late_event_route: None,
+                },
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: output_type.into(),
+                config: serde_json::json!({}),
+            }],
+            state: None,
+            checkpoint: None,
+            recovery: Default::default(),
+        }
+    }
+
+    /// Task 2.5 / 6.1: a local Job referencing an unknown component fails
+    /// the side-effect-free deep build instead of failing later at runtime.
+    #[test]
+    fn validate_local_job_rejects_unknown_components() {
+        let spec = local_spec("no-such-input", "no-such-output");
+        let error =
+            validate_local_job(&spec).expect_err("unknown input component must fail validation");
+        assert!(error.to_string().contains("Unknown input type"));
+    }
 }

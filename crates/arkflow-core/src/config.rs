@@ -138,10 +138,7 @@ impl EngineConfig {
         for job in &self.jobs {
             job.validate()?;
             if !job_ids.insert(job.id.as_str().to_owned()) {
-                return Err(Error::Config(format!(
-                    "Duplicate job id '{}'",
-                    job.id
-                )));
+                return Err(Error::Config(format!("Duplicate job id '{}'", job.id)));
             }
         }
         Ok(self.jobs.iter().collect())

@@ -451,6 +451,10 @@ impl crate::input::Ack for WalAck {
         self.inner.ack().await?;
         Ok(())
     }
+
+    fn mark_held(&self) {
+        self.inner.mark_held();
+    }
 }
 
 #[cfg(test)]

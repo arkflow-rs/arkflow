@@ -4,9 +4,9 @@
 //! `cargo test -p arkflow-plugin --test kernel_perf_baseline -- --ignored --nocapture`.
 
 use arkflow_core::config::EngineConfig;
+use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
-use arkflow_core::executor::run_job;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -63,8 +63,9 @@ async fn kernel_throughput_baseline() {
     let config: EngineConfig = serde_yaml::from_str(&workload_yaml(count)).unwrap();
 
     let kernel = run_kernel(&config).await;
+    println!("workload: generate(batch=1000, count={count}) → json_to_arrow → sql(sum) → drop");
     println!(
-        "workload: generate(batch=1000, count={count}) → json_to_arrow → sql(sum) → drop");
-    println!("unified kernel: {kernel:?} ({:.0} rows/s)",
-        count as f64 / kernel.as_secs_f64());
+        "unified kernel: {kernel:?} ({:.0} rows/s)",
+        count as f64 / kernel.as_secs_f64()
+    );
 }

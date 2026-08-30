@@ -345,9 +345,19 @@ pub fn build_config_schema() -> serde_json::Value {
                 "type": "array",
                 "description": "List of stream processing pipelines.",
                 "items": {"$ref": "#/$defs/stream"}
+            },
+            "jobs": {
+                "type": "array",
+                "description": "Local Jobs declared directly in the configuration; they execute on the unified kernel without a Hub.",
+                "items": {"$ref": "#/$defs/job"}
             }
         },
-        "required": ["streams"]
+        // Streams and jobs are both optional individually (serde defaults),
+        // but a configuration carries at least one of them.
+        "anyOf": [
+            {"required": ["streams"]},
+            {"required": ["jobs"]}
+        ]
     });
 
     let defs = root.as_object_mut().unwrap();
@@ -411,6 +421,9 @@ pub fn build_config_schema() -> serde_json::Value {
         "codec".to_string(),
         component_union(&codec_variants, ComponentKind::Codec),
     );
+    defs.insert("job".to_string(), job_schema());
+    defs.insert("job_operator".to_string(), job_operator_schema_fragment());
+    defs.insert("job_source".to_string(), job_source_schema_fragment());
     defs.insert(
         "stream".to_string(),
         serde_json::json!({
@@ -459,6 +472,194 @@ pub fn build_config_schema() -> serde_json::Value {
     );
 
     root
+}
+
+/// Schema for one local Job (the `jobs` entry): the same JobSpec structure
+/// deserialization and deep validation accept, with strict
+/// additional-property checks.
+fn job_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "A local Job executed by the unified streaming kernel.",
+        "additionalProperties": false,
+        "required": ["id", "version", "operators", "edges", "sources", "sinks"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "description": "Job identity."
+            },
+            "version": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Monotonic Job version; upgrades restore compatible savepoints."
+            },
+            "max_parallelism": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Upper bound on physical task parallelism."
+            },
+            "parallelism": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Requested task parallelism."
+            },
+            "operators": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/job_operator"}
+            },
+            "edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "from", "to"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "partitioned": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Route by key hash instead of broadcasting."
+                        }
+                    }
+                }
+            },
+            "sources": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/job_source"}
+            },
+            "sinks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["operator_id", "output_type"],
+                    "properties": {
+                        "operator_id": {"type": "string"},
+                        "output_type": {"type": "string"},
+                        "config": {"type": "object"}
+                    }
+                }
+            },
+            "state": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["backend"],
+                "properties": {
+                    "backend": {
+                        "type": "string",
+                        "enum": ["embedded_kv", "redb"],
+                        "description": "Keyed-state backend (local execution)."
+                    },
+                    "namespace": {"type": "string"},
+                    "ttl_ms": {"type": "integer", "minimum": 0},
+                    "format_version": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1,
+                        "description": "State format contract; savepoint compatibility keys on it."
+                    }
+                }
+            },
+            "checkpoint": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "interval_ms": {"type": "integer", "minimum": 1},
+                    "object_store_uri": {"type": "string"},
+                    "retention": {"type": "integer", "minimum": 1}
+                }
+            },
+            "recovery": {
+                "type": "string",
+                "enum": ["fail", "latest_checkpoint", "latest_savepoint"],
+                "default": "fail",
+                "description": "Recovery policy on restart."
+            }
+        }
+    })
+}
+
+/// Schema for one Job source entry.
+fn job_source_schema_fragment() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operator_id", "input_type", "time"],
+        "properties": {
+            "operator_id": {"type": "string"},
+            "input_type": {"type": "string"},
+            "config": {"type": "object"},
+            "time": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode"],
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["processing_time", "event_time"],
+                        "description": "Time semantics for this source."
+                    },
+                    "timestamp_field": {
+                        "type": "string",
+                        "description": "Event-time field (Int64 ms or an Arrow timestamp column)."
+                    },
+                    "watermark": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "strategy": {
+                                "type": "string",
+                                "enum": ["monotonous", "bounded_out_of_orderness"]
+                            },
+                            "out_of_orderness_ms": {"type": "integer", "minimum": 0},
+                            "idle_timeout_ms": {"type": "integer", "minimum": 0}
+                        }
+                    },
+                    "allowed_lateness_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Fired windows stay correctable (late Update) until end + lateness."
+                    },
+                    "late_event_policy": {
+                        "type": "string",
+                        "enum": ["drop", "update", "route"],
+                        "default": "drop"
+                    },
+                    "late_event_route": {
+                        "type": "string",
+                        "description": "Operator receiving routed late/invalid-timestamp rows."
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Schema for one Job operator entry.
+fn job_operator_schema_fragment() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind"],
+        "properties": {
+            "id": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "source", "map", "aggregate", "window", "join", "sink"
+                ]
+            },
+            "stateful": {"type": "boolean", "default": false},
+            "key_field": {"type": "string"},
+            "config": {"type": "object"}
+        }
+    })
 }
 
 /// Build the `oneOf` variant array for a given component kind. Each
@@ -648,5 +849,85 @@ mod tests {
             ),
             "registered component should appear in output schema variants"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    /// Task 6.3: the generated engine schema exposes the `jobs` property
+    /// and the JobSpec structure with strict additional-property checks.
+    #[test]
+    fn engine_schema_describes_local_jobs() {
+        let schema = build_config_schema();
+        let jobs = &schema["properties"]["jobs"];
+        assert_eq!(jobs["type"], "array", "the jobs property is exposed");
+        let defs = schema["$defs"].as_object().unwrap();
+        for definition in ["job", "job_operator", "job_source"] {
+            let job = defs.get(definition).expect(definition);
+            assert_eq!(job["type"], "object");
+            assert_eq!(
+                job["additionalProperties"], false,
+                "{definition} keeps strict additional-property checks"
+            );
+        }
+        let job = &defs["job"];
+        for field in [
+            "id",
+            "version",
+            "operators",
+            "edges",
+            "sources",
+            "sinks",
+            "state",
+            "checkpoint",
+            "recovery",
+        ] {
+            assert!(
+                job["properties"].get(field).is_some(),
+                "job schema exposes '{field}'"
+            );
+        }
+        // A jobs-only configuration is representable: neither `streams` nor
+        // `jobs` is in `required`, and `anyOf` demands at least one.
+        assert!(
+            schema.get("required").is_none(),
+            "streams and jobs are individually optional"
+        );
+        let any_of = schema["anyOf"].as_array().expect("at-least-one-of gate");
+        let requires_jobs = any_of.iter().any(|variant| {
+            variant["required"]
+                .as_array()
+                .map(|required| required.contains(&serde_json::json!("jobs")))
+                .unwrap_or(false)
+        });
+        let requires_streams = any_of.iter().any(|variant| {
+            variant["required"]
+                .as_array()
+                .map(|required| required.contains(&serde_json::json!("streams")))
+                .unwrap_or(false)
+        });
+        assert!(
+            requires_jobs,
+            "a jobs-only configuration satisfies the schema"
+        );
+        assert!(
+            requires_streams,
+            "a streams-only configuration satisfies it too"
+        );
+        // Deserialization agrees: a jobs-only config parses.
+        let jobs_only = serde_json::json!({
+            "jobs": [{
+                "id": "orders",
+                "version": 1,
+                "operators": [],
+                "edges": [],
+                "sources": [],
+                "sinks": []
+            }]
+        });
+        let parsed: Result<crate::config::EngineConfig, _> = serde_json::from_value(jobs_only);
+        assert!(parsed.is_ok(), "jobs-only deserializes: {parsed:?}");
     }
 }

@@ -5,8 +5,8 @@
 //! were emitted with — the same invariant Flink's StreamElement guarantees.
 
 use crate::checkpoint::CheckpointBarrier;
-use crate::MessageBatchRef;
 use crate::input::Ack;
+use crate::MessageBatchRef;
 use std::sync::Arc;
 
 /// One element travelling on an execution edge.

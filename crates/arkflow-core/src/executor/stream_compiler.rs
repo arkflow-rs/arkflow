@@ -8,12 +8,12 @@
 //! durability passes through to the built input unchanged (the WAL is a
 //! property of the input, not the execution model).
 
-use crate::Error;
 use crate::job::{
     EdgeSpec, JobId, JobSpec, JobVersion, LateEventPolicy, OperatorKind, OperatorSpec, SinkSpec,
     SourceSpec, TimeMode, TimeSpec,
 };
 use crate::stream::StreamConfig;
+use crate::Error;
 use serde_json::json;
 
 /// Key under which the compiled source/sink payloads carry the original
@@ -47,7 +47,13 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         kind: OperatorKind::Source,
         stateful: false,
         key_field: None,
-        config: json!({}),
+        // Preserve `pipeline.thread_num` as bounded chain-level processor
+        // worker concurrency (the legacy Stream contract) without changing
+        // the source partition topology: the value rides the source config
+        // and the graph builder copies it onto the source chain.
+        config: json!({
+            "__arkflow_processor_parallelism": stream.pipeline.thread_num.max(1),
+        }),
     });
     sources.push(SourceSpec {
         operator_id: source_operator_id.clone(),
@@ -200,7 +206,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
 
 /// Compile every stream in an engine config.
 pub fn compile_engine_streams(config: &crate::config::EngineConfig) -> Result<Vec<JobSpec>, Error> {
-    config.streams.iter().enumerate()
+    config
+        .streams
+        .iter()
+        .enumerate()
         .map(|(index, stream)| compile_stream(stream, index))
         .collect()
 }
@@ -226,7 +235,10 @@ fn input_config_payload(stream: &StreamConfig) -> serde_json::Value {
             object.insert("name".into(), json!(name));
         }
         if let Some(codec) = &stream.input.codec {
-            object.insert("__stream_codec".into(), serde_json::to_value(codec).unwrap_or_default());
+            object.insert(
+                "__stream_codec".into(),
+                serde_json::to_value(codec).unwrap_or_default(),
+            );
         }
     }
     payload
@@ -239,7 +251,10 @@ fn output_config_payload(output: &crate::output::OutputConfig) -> serde_json::Va
             object.insert("name".into(), json!(name));
         }
         if let Some(codec) = &output.codec {
-            object.insert("__stream_codec".into(), serde_json::to_value(codec).unwrap_or_default());
+            object.insert(
+                "__stream_codec".into(),
+                serde_json::to_value(codec).unwrap_or_default(),
+            );
         }
     }
     payload
@@ -345,7 +360,10 @@ fn window_config(
         object.insert("key_field".into(), json!(key_field));
         object.insert("value_fields".into(), json!(value_fields));
         object.insert("trigger".into(), json!("processing_time"));
-        object.insert("trigger_interval_ms".into(), json!(trigger_interval_ms.max(1)));
+        object.insert(
+            "trigger_interval_ms".into(),
+            json!(trigger_interval_ms.max(1)),
+        );
     }
     Ok(window)
 }
@@ -353,7 +371,8 @@ fn window_config(
 /// Parse a human duration string ("500ms", "1s", "2m", "1h") to milliseconds.
 fn parse_duration_ms(raw: &str) -> Option<i64> {
     let raw = raw.trim();
-    let (value, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')?);
+    let (value, unit) =
+        raw.split_at(raw.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')?);
     let value: f64 = value.parse().ok()?;
     let multiplier = match unit.trim() {
         "ms" => 1.0,
@@ -380,13 +399,11 @@ mod tests {
             },
             pipeline: crate::pipeline::PipelineConfig {
                 thread_num: 1,
-                processors: vec![
-                    crate::processor::ProcessorConfig {
-                        processor_type: "sql".into(),
-                        name: None,
-                        config: Some(json!({"query": "SELECT 1"})),
-                    },
-                ],
+                processors: vec![crate::processor::ProcessorConfig {
+                    processor_type: "sql".into(),
+                    name: None,
+                    config: Some(json!({"query": "SELECT 1"})),
+                }],
             },
             output: crate::output::OutputConfig {
                 output_type: "stdout".into(),
@@ -414,11 +431,7 @@ mod tests {
         assert_eq!(first.sinks[0].output_type, "stdout");
         assert!(first.operators.iter().any(|op| op.id == "p0-sql"));
         // Processor config preserved verbatim.
-        let sql = first
-            .operators
-            .iter()
-            .find(|op| op.id == "p0-sql")
-            .unwrap();
+        let sql = first.operators.iter().find(|op| op.id == "p0-sql").unwrap();
         assert_eq!(sql.config.get("type").unwrap(), "sql");
         assert_eq!(sql.config.get("query").unwrap(), "SELECT 1");
     }
@@ -465,7 +478,10 @@ mod tests {
             config: Some(json!({"capacity": 128})),
         });
         let spec = compile_stream(&stream, 0).unwrap();
-        assert!(!spec.operators.iter().any(|op| op.kind == OperatorKind::Window));
+        assert!(!spec
+            .operators
+            .iter()
+            .any(|op| op.kind == OperatorKind::Window));
     }
 
     #[test]
@@ -544,15 +560,26 @@ mod window_mapping_tests {
     #[test]
     fn tumbling_uses_legacy_interval_field() {
         let spec = window_stream("tumbling_window", json!({"interval": "1m"}));
-        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        let window = spec
+            .operators
+            .iter()
+            .find(|op| op.kind == OperatorKind::Window)
+            .unwrap();
         assert_eq!(window.config.get("kind").unwrap(), "tumbling");
         assert_eq!(window.config.get("size_ms").unwrap(), 60_000);
     }
 
     #[test]
     fn sliding_maps_interval_to_size_and_slide() {
-        let spec = window_stream("sliding_window", json!({"interval": "30s", "slide_size": 5}));
-        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        let spec = window_stream(
+            "sliding_window",
+            json!({"interval": "30s", "slide_size": 5}),
+        );
+        let window = spec
+            .operators
+            .iter()
+            .find(|op| op.kind == OperatorKind::Window)
+            .unwrap();
         assert_eq!(window.config.get("kind").unwrap(), "sliding");
         assert_eq!(window.config.get("size_ms").unwrap(), 30_000);
         // Legacy slide is a row count; the time-based slide falls back to
@@ -563,7 +590,11 @@ mod window_mapping_tests {
     #[test]
     fn session_maps_gap() {
         let spec = window_stream("session_window", json!({"gap": "2s"}));
-        let window = spec.operators.iter().find(|op| op.kind == OperatorKind::Window).unwrap();
+        let window = spec
+            .operators
+            .iter()
+            .find(|op| op.kind == OperatorKind::Window)
+            .unwrap();
         assert_eq!(window.config.get("kind").unwrap(), "session");
         assert_eq!(window.config.get("gap_ms").unwrap(), 2_000);
     }

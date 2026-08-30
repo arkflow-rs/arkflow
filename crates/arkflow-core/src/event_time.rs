@@ -2,7 +2,8 @@
 
 use crate::job::{LateEventPolicy, TimeSpec, WatermarkStrategy};
 use crate::{Error, MessageBatch};
-use datafusion::arrow::array::{Array, Int64Array, TimestampNanosecondArray};
+use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::datatypes::DataType;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -140,10 +141,12 @@ impl WatermarkTracker {
                 idle: false,
             },
         );
-        self.watermark_ms = Some(
-            self.watermark_ms
-                .map_or(watermark_ms, |current| current.max(watermark_ms)),
-        );
+        // Recovery installs partitions one by one. Recompute from the full
+        // restored set instead of applying the normal runtime monotonic-max
+        // rule: restoring a high partition first must not make the global
+        // watermark skip a lower partition restored immediately afterwards.
+        self.watermark_ms = None;
+        self.recompute();
     }
 
     fn recompute(&mut self) -> i64 {
@@ -218,39 +221,78 @@ impl FieldTimestampExtractor {
         Ok(array.as_ref())
     }
 
-    fn extract_timestamp_at_zero(&self, batch: &MessageBatch) -> Result<Option<i64>, Error> {
-        let array = self.timestamp_array(batch)?;
-        if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-            return Ok((!values.is_empty())
-                .then(|| (!values.is_null(0)).then(|| values.value(0)))
-                .flatten());
+    /// Checked conversion of one raw timestamp value to milliseconds.
+    /// Negative times round toward negative infinity (`div_euclid`), matching
+    /// the window-boundary rule so pre-epoch timestamps assign
+    /// deterministically; overflow returns an actionable error instead of
+    /// silently wrapping.
+    fn to_milliseconds(
+        &self,
+        value: i64,
+        unit: &datafusion::arrow::datatypes::TimeUnit,
+    ) -> Result<i64, Error> {
+        use datafusion::arrow::datatypes::TimeUnit;
+        match unit {
+            TimeUnit::Second => value.checked_mul(1_000).ok_or_else(|| {
+                Error::Process(format!(
+                    "timestamp field '{}' overflows milliseconds (second-unit value {value})",
+                    self.field
+                ))
+            }),
+            TimeUnit::Millisecond => Ok(value),
+            TimeUnit::Microsecond => Ok(value.div_euclid(1_000)),
+            TimeUnit::Nanosecond => Ok(value.div_euclid(1_000_000)),
         }
-        if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            return Ok((!values.is_empty())
-                .then(|| (!values.is_null(0)).then(|| values.value(0) / 1_000_000))
-                .flatten());
-        }
-        Err(Error::Config(format!(
-            "timestamp field '{}' must be int64 or timestamp nanoseconds",
-            self.field
-        )))
     }
 
+    fn extract_timestamp_at_zero(&self, batch: &MessageBatch) -> Result<Option<i64>, Error> {
+        Ok(self
+            .extract_timestamps_ms(batch)?
+            .into_iter()
+            .next()
+            .flatten())
+    }
+
+    /// Extract every row's timestamp normalized to milliseconds. Supported
+    /// column types: Int64 (already milliseconds) and Arrow
+    /// `Timestamp(Second | Millisecond | Microsecond | Nanosecond, _)`.
+    /// Nulls are preserved as `None`; unsupported types and values that
+    /// cannot be represented in milliseconds fail with a field/type error.
     pub fn extract_timestamps_ms(&self, batch: &MessageBatch) -> Result<Vec<Option<i64>>, Error> {
         let array = self.timestamp_array(batch)?;
-        if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-            return Ok(values.iter().collect());
-        }
-        if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            return Ok(values
+        match array.data_type() {
+            DataType::Int64 => Ok(array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type checked above")
                 .iter()
-                .map(|value| value.map(|value| value / 1_000_000))
-                .collect());
+                .collect()),
+            DataType::Timestamp(unit, _) => {
+                let casted = datafusion::arrow::compute::cast(array, &DataType::Int64)
+                    .map_err(|error| {
+                        Error::Process(format!(
+                            "timestamp field '{}' cannot cast to i64: {error}",
+                            self.field
+                        ))
+                    })?;
+                let values = casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("cast target is Int64");
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .map(|value| self.to_milliseconds(value, unit))
+                            .transpose()
+                    })
+                    .collect()
+            }
+            other => Err(Error::Config(format!(
+                "timestamp field '{}' has unsupported type {other:?}; expected Int64 (milliseconds) or Arrow Timestamp(seconds|milliseconds|microseconds|nanoseconds)",
+                self.field
+            ))),
         }
-        Err(Error::Config(format!(
-            "timestamp field '{}' must be int64 or timestamp nanoseconds",
-            self.field
-        )))
     }
 }
 
@@ -304,6 +346,100 @@ mod tests {
             window_action(1_000, 900, Some(2_000), 100, LateEventPolicy::Route),
             WindowAction::Route
         );
+    }
+
+    #[test]
+    fn timestamp_extraction_accepts_every_arrow_unit_with_nulls() {
+        use datafusion::arrow::array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        };
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc as StdArc;
+
+        fn batch_of(
+            data_type: DataType,
+            column: StdArc<dyn datafusion::arrow::array::Array>,
+        ) -> MessageBatch {
+            MessageBatch::new_arrow(
+                RecordBatch::try_new(
+                    StdArc::new(Schema::new(vec![Field::new("ts", data_type, true)])),
+                    vec![column],
+                )
+                .unwrap(),
+            )
+        }
+        let extractor = FieldTimestampExtractor { field: "ts".into() };
+        // Seconds, including a null row.
+        let seconds = batch_of(
+            DataType::Timestamp(TimeUnit::Second, None),
+            StdArc::new(TimestampSecondArray::from(vec![Some(1), None, Some(-2)])),
+        );
+        assert_eq!(
+            extractor.extract_timestamps_ms(&seconds).unwrap(),
+            vec![Some(1_000), None, Some(-2_000)]
+        );
+        // Milliseconds pass through unchanged.
+        let millis = batch_of(
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            StdArc::new(TimestampMillisecondArray::from(vec![Some(1_500)])),
+        );
+        assert_eq!(
+            extractor.extract_timestamps_ms(&millis).unwrap(),
+            vec![Some(1_500)]
+        );
+        // Microseconds divide with div_euclid so negative times round toward
+        // negative infinity, matching the window-boundary rule.
+        let micros = batch_of(
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            StdArc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_500),
+                Some(-1_500),
+            ])),
+        );
+        assert_eq!(
+            extractor.extract_timestamps_ms(&micros).unwrap(),
+            vec![Some(1), Some(-2)]
+        );
+        // Nanoseconds.
+        let nanos = batch_of(
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            StdArc::new(TimestampNanosecondArray::from(vec![Some(2_500_000_000)])),
+        );
+        assert_eq!(
+            extractor.extract_timestamps_ms(&nanos).unwrap(),
+            vec![Some(2_500)]
+        );
+        // Unsupported types fail with a field/type error naming the field.
+        let utf8 = batch_of(
+            DataType::Utf8,
+            StdArc::new(datafusion::arrow::array::StringArray::from(vec!["x"])),
+        );
+        let error = extractor.extract_timestamps_ms(&utf8).unwrap_err();
+        assert!(error.to_string().contains("ts"), "{error}");
+    }
+
+    #[test]
+    fn second_unit_overflow_is_actionable_not_wrapped() {
+        use datafusion::arrow::array::TimestampSecondArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc as StdArc;
+        let batch = MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    false,
+                )])),
+                vec![StdArc::new(TimestampSecondArray::from(vec![i64::MAX]))],
+            )
+            .unwrap(),
+        );
+        let extractor = FieldTimestampExtractor { field: "ts".into() };
+        let error = extractor.extract_timestamps_ms(&batch).unwrap_err();
+        assert!(error.to_string().contains("overflows"), "{error}");
     }
 
     #[test]

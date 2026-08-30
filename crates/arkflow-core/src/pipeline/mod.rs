@@ -71,7 +71,7 @@ impl Pipeline {
                                 results.extend(res.drain(..).map(|(batch, _)| batch));
                             }
                             ProcessResult::Deferred => {} // Buffered for a later emission
-                            ProcessResult::None => {} // Filtered out
+                            ProcessResult::None => {}     // Filtered out
                         }
                     }
                     if results.is_empty() {
@@ -83,9 +83,9 @@ impl Pipeline {
                     }
                 }
                 ProcessResult::SingleWithAck(result, _) => ProcessResult::Single(result),
-                ProcessResult::MultipleWithAck(results) => ProcessResult::Multiple(
-                    results.into_iter().map(|(batch, _)| batch).collect(),
-                ),
+                ProcessResult::MultipleWithAck(results) => {
+                    ProcessResult::Multiple(results.into_iter().map(|(batch, _)| batch).collect())
+                }
                 ProcessResult::Deferred | ProcessResult::None => ProcessResult::None,
             };
         }

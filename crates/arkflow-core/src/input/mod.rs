@@ -51,6 +51,16 @@ pub trait Ack: Send + Sync {
     /// unacknowledged message will be re-delivered — but it lets the stream
     /// observe the failure to apply backpressure or stop.
     async fn ack(&self) -> Result<(), Error>;
+
+    /// Signal that this acknowledgement is now held by a buffering operator
+    /// (event-time gate or window) and may complete much later, or never
+    /// before shutdown. Checkpoint barrier draining waits for in-flight
+    /// acknowledgements to complete so sealed positions and committed state
+    /// describe the same acknowledged set; held acknowledgements are excluded
+    /// from that wait because their state mutations stay staged in the
+    /// execution-local journal until the buffer fires. The default is a
+    /// no-op for acknowledgements that complete in ordinary sink latency.
+    fn mark_held(&self) {}
 }
 
 /// Split one source acknowledgement across several downstream deliveries.
@@ -118,6 +128,12 @@ impl Ack for FanoutAckPart {
             Ok(())
         }
     }
+
+    fn mark_held(&self) {
+        // The held child may never ack before shutdown; propagate so the
+        // group's source-side tracker excludes it from barrier draining.
+        self.state.parent.mark_held();
+    }
 }
 
 #[async_trait]
@@ -175,6 +191,12 @@ impl Ack for VecAck {
         }
         Ok(())
     }
+
+    fn mark_held(&self) {
+        for ack in &self.0 {
+            ack.mark_held();
+        }
+    }
 }
 
 impl Deref for VecAck {
@@ -217,6 +239,18 @@ mod tests {
         }
     }
 
+    struct RecordingAck {
+        acked: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn fanout_ack_retries_parent_after_transient_failure() {
         let parent_impl = Arc::new(FailOnceAck {
@@ -231,6 +265,38 @@ mod tests {
         // A duplicate downstream acknowledgement is idempotent.
         children[1].ack().await.unwrap();
         assert_eq!(parent_impl.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Task 1.5: a composite acknowledgement must surface a constituent's
+    /// failure instead of reporting success while one branch's state or
+    /// durability commit failed.
+    #[tokio::test]
+    async fn vec_ack_propagates_constituent_failures() {
+        let healthy = Arc::new(RecordingAck {
+            acked: AtomicUsize::new(0),
+        });
+        let failing = Arc::new(FailOnceAck {
+            calls: AtomicUsize::new(0),
+        });
+        let composite = VecAck(vec![
+            healthy.clone() as Arc<dyn Ack>,
+            failing.clone() as Arc<dyn Ack>,
+            Arc::new(NoopAck),
+        ]);
+        assert!(composite.ack().await.is_err());
+        // The constituents before the failing one completed; the failure is
+        // not hidden by a later successful branch.
+        assert_eq!(healthy.acked.load(Ordering::Relaxed), 1);
+        assert_eq!(failing.calls.load(Ordering::Relaxed), 1);
+        // A composite of successful constituents (including the no-op)
+        // acknowledges cleanly.
+        let clean = VecAck(vec![
+            Arc::new(NoopAck),
+            Arc::new(RecordingAck {
+                acked: AtomicUsize::new(0),
+            }),
+        ]);
+        assert!(clean.ack().await.is_ok());
     }
 }
 

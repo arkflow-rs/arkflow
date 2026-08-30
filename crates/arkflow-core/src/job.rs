@@ -503,10 +503,7 @@ impl JobSpec {
                 .push(edge.from.as_str());
         }
         for (from, to) in &late_route_links {
-            incoming
-                .entry(to.as_str())
-                .or_default()
-                .push(from.as_str());
+            incoming.entry(to.as_str()).or_default().push(from.as_str());
         }
         for sink in &self.sinks {
             let mut reachable = BTreeSet::from([sink.operator_id.as_str()]);

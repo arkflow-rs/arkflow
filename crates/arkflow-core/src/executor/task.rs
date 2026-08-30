@@ -8,8 +8,9 @@
 
 use super::envelope::Envelope;
 use super::graph::{Chain, EdgeTarget, ExecutionGraph};
-use crate::Error;
 use crate::input::{fanout_ack, Input};
+use crate::output::Output;
+use crate::Error;
 use crate::ProcessResult;
 use datafusion::arrow::array::{
     Array, BinaryArray, Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array,
@@ -20,6 +21,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// Upper bound on how long a source chain waits for in-flight (non-held)
+/// acknowledgements to drain before sealing a checkpoint cut. Exceeding it
+/// fails the barrier round (the last valid checkpoint is retained) instead of
+/// blocking the source indefinitely behind a wedged sink.
+const BARRIER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Drive every chain in the graph to completion (cancellation or all-source
 /// end-of-stream). Connects inputs/outputs first and closes them after.
@@ -64,6 +71,18 @@ pub async fn run_graph_with_metrics(
     cancellation: CancellationToken,
     metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
 ) -> Result<(), Error> {
+    run_graph_with_metrics_startup(graph, cancellation, metrics, None).await
+}
+
+/// Metrics-enabled graph runner variant that reports when all graph resources
+/// have connected. Runtime-managed streams use this handshake to publish
+/// `Running` only after the asynchronous resource phase has succeeded.
+pub(crate) async fn run_graph_with_metrics_startup(
+    graph: ExecutionGraph,
+    cancellation: CancellationToken,
+    metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
+    startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), Error> {
     // Chain-level metric plumbing rides the hooks map: each source chain
     // gets a metrics-enabled hook so its loop can bump counters.
     let mut hooks = BTreeMap::new();
@@ -78,7 +97,7 @@ pub async fn run_graph_with_metrics(
             );
         }
     }
-    run_graph_with_hooks(graph, cancellation, hooks).await
+    run_graph_with_hooks_startup(graph, cancellation, hooks, false, startup).await
 }
 
 /// Compatibility wrapper for the retired global checkpoint gate. Barriers are
@@ -98,19 +117,19 @@ pub async fn run_graph_with_hooks(
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
 ) -> Result<(), Error> {
-    run_graph_inner(graph, cancellation, hooks, false).await
+    run_graph_inner(graph, cancellation, hooks, false, None).await
 }
 
-/// Run a graph whose source inputs have already been connected and had their
-/// recovery positions installed.  This is used by checkpoint recovery so the
-/// normal graph bootstrap cannot reconnect a Kafka-like input and discard the
-/// restored assignment before the first read.
-pub(crate) async fn run_graph_with_hooks_preconnected(
+/// Internal runner variant used by command-driven Jobs to await resource
+/// startup before returning a handle to the caller.
+pub(crate) async fn run_graph_with_hooks_startup(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
+    sources_preconnected: bool,
+    startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
-    run_graph_inner(graph, cancellation, hooks, true).await
+    run_graph_inner(graph, cancellation, hooks, sources_preconnected, startup).await
 }
 
 /// Compatibility wrapper for callers that still pass the retired global gate.
@@ -131,26 +150,93 @@ async fn run_graph_inner(
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
     sources_preconnected: bool,
+    mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
-    for chain in &graph.chains {
-        if !sources_preconnected {
-            if let Some(source) = &chain.source {
-                source.connect().await?;
+    // Connect every resource in dependency order (temporary stores first,
+    // then sources and sinks) before any task loop spawns: a processor's
+    // first `get` cannot race a temporary's `connect`, and a partial startup
+    // closes what it opened in reverse order.
+    let sources: Vec<Arc<dyn Input>> = graph
+        .chains
+        .iter()
+        .filter_map(|chain| chain.source.clone())
+        .collect();
+    let sinks: Vec<Arc<dyn Output>> = graph
+        .chains
+        .iter()
+        .filter_map(|chain| chain.sink.clone())
+        .collect();
+    let mut states: Vec<(String, Arc<dyn crate::state::StateBackend>)> = Vec::new();
+    for hook in hooks.values() {
+        if let Some(state) = &hook.state {
+            if !states
+                .iter()
+                .any(|(_, existing)| Arc::ptr_eq(existing, state))
+            {
+                states.push((hook.task_id.clone().unwrap_or_default(), state.clone()));
             }
         }
-        if let Some(sink) = &chain.sink {
-            sink.connect().await?;
-        }
     }
+    let guard = if sources_preconnected {
+        // Recovery path: the caller connected the sources and restored their
+        // positions before spawning; connect the remaining sinks.
+        match super::resource_guard::JobResourceGuard::connect(
+            &graph.temporaries,
+            &[],
+            &sinks,
+            &states,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                // These inputs were connected by the recovery preparer and
+                // are not yet owned by a chain task.
+                for source in sources.iter().rev() {
+                    let _ = source.close().await;
+                }
+                let _ = startup
+                    .take()
+                    .map(|sender| sender.send(Err(error.to_string())));
+                return Err(error);
+            }
+        }
+    } else {
+        match super::resource_guard::JobResourceGuard::connect(
+            &graph.temporaries,
+            &sources,
+            &sinks,
+            &states,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = startup
+                    .take()
+                    .map(|sender| sender.send(Err(error.to_string())));
+                return Err(error);
+            }
+        }
+    };
+
+    // At this point every resource is connected and the graph can be
+    // considered started. Only now let a caller publish readiness.
+    let _ = startup.take().map(|sender| sender.send(Ok(())));
 
     let mut tasks = FuturesUnordered::new();
     for chain in graph.chains {
         let token = cancellation.clone();
-        let hook = hooks.get(chain.entry_task_id()).cloned().unwrap_or_default();
-        tasks.push(tokio::spawn(async move {
-            run_chain(chain, hook, token).await
-        }));
+        let hook = hooks
+            .get(chain.entry_task_id())
+            .cloned()
+            .unwrap_or_default();
+        tasks.push(tokio::spawn(
+            async move { run_chain(chain, hook, token).await },
+        ));
     }
+    // The chains own their source/sink close paths from here on.
+    guard.hand_off_stream_resources();
 
     let mut first_error = None;
     while let Some(result) = tasks.next().await {
@@ -165,17 +251,21 @@ async fn run_graph_inner(
             Err(join_error) => {
                 if first_error.is_none() {
                     cancellation.cancel();
-                    first_error = Some(Error::Process(format!(
-                        "chain task panicked: {join_error}"
-                    )));
+                    first_error =
+                        Some(Error::Process(format!("chain task panicked: {join_error}")));
                 }
             }
         }
     }
 
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    // Close temporary stores and state backends after every chain exited
+    // (reverse dependency order). A close failure surfaces alongside the
+    // chain error rather than being swallowed.
+    let close_result = guard.close().await;
+    match (first_error, close_result) {
+        (Some(error), _) => Err(error),
+        (None, Err(error)) => Err(error),
+        (None, Ok(())) => Ok(()),
     }
 }
 
@@ -187,24 +277,31 @@ async fn run_chain(
 ) -> Result<(), Error> {
     let result = run_chain_inner(&chain, &hook, &cancellation).await;
 
-    // Close owned components on every exit path, matching the legacy
-    // close-time policy: log per-component errors, keep closing.
+    // Close owned components on every exit path, keeping the first close
+    // failure observable while still attempting every remaining component.
+    let mut close_error = None;
     for processor in &chain.processors {
         if let Err(error) = processor.close().await {
             tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain processor");
+            close_error.get_or_insert(error);
         }
     }
     if let Some(sink) = &chain.sink {
         if let Err(error) = sink.close().await {
             tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain sink");
+            close_error.get_or_insert(error);
         }
     }
     if let Some(source) = &chain.source {
         if let Err(error) = source.close().await {
             tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain source");
+            close_error.get_or_insert(error);
         }
     }
-    result
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => close_error.map_or(Ok(()), Err),
+    }
 }
 
 async fn run_chain_inner(
@@ -242,6 +339,15 @@ async fn run_source_chain(
 ) -> Result<(), Error> {
     let mut barrier_rx = hook.barrier_rx.clone();
     let event_gate = hook.event_time_gate.clone();
+    // Seals each barrier's acknowledged cut: positions and watermark frozen
+    // at injection time, before the barrier flows downstream.
+    let frontier = super::commit::CommitFrontier::new();
+    // In-flight acknowledgement tracker for barrier draining: the source
+    // waits (bounded) until every dispatched, non-held acknowledgement has
+    // fully completed — state apply, WAL-cursor advance, and source-side
+    // commit — so the sealed positions and the committed state snapshot
+    // describe the same acknowledged set.
+    let tracker = Arc::new(super::commit::AckTracker::new());
     // Local stream execution and callers that use the plain graph runner do
     // not need to manufacture a gate map themselves.  The graph carries the
     // source time contract, so initialize the same gate used by Agent mode at
@@ -283,6 +389,32 @@ async fn run_source_chain(
                 let Envelope::Barrier(barrier) = barrier else {
                     continue;
                 };
+                // Drain in-flight (non-held) acknowledgements before sealing.
+                // An acknowledgement completes only after its state apply and
+                // source-side commit; held acknowledgements (gate/window
+                // buffers whose mutations stay staged in the journal) are
+                // excluded, so an open window never stalls a barrier.
+                {
+                    let drain = async {
+                        while tracker.blocking() > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return shutdown_source_chain(chain, hook).await;
+                        }
+                        _ = drain => {}
+                        _ = tokio::time::sleep(BARRIER_DRAIN_TIMEOUT) => {
+                            if let Some(reporter) = &hook.failure_reporter {
+                                let _ = reporter.send(Error::Process(format!(
+                                    "checkpoint barrier drain timed out with {} acknowledgements still in flight",
+                                    tracker.blocking()
+                                )));
+                            }
+                        }
+                    }
+                }
                 let positions = match source.current_positions().await {
                     Ok(positions) => positions,
                     Err(error) => {
@@ -298,17 +430,20 @@ async fn run_source_chain(
                     .await
                     .as_ref()
                     .and_then(super::event_time_gate::EventTimeGate::watermark);
-                // The source loop is single-threaded: positions are captured
-                // before the marker is sent and the next source read cannot
-                // start until this arm returns. State snapshotting itself is
-                // detached below, so a slow backend never stalls the data
-                // plane behind a global checkpoint lock.
+                // Seal the acknowledged cut before the barrier flows
+                // downstream. The source loop is single-threaded: the cut's
+                // positions and watermark are frozen at this instant and the
+                // report cannot observe acknowledgements completing after
+                // the seal. Pre-cut outputs with pending acknowledgements
+                // stay outside the cut; recovery replays them from the
+                // sealed positions.
+                frontier.seed(&positions);
+                let cut = frontier.seal(watermark_ms);
                 send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
                 spawn_barrier_snapshot(
                     hook,
                     barrier,
-                    positions,
-                    watermark_ms,
+                    cut,
                     None,
                     chain.entry_task_id().to_owned(),
                 );
@@ -427,6 +562,8 @@ async fn run_source_chain(
                 .input_messages
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
+        let ack: Arc<dyn crate::input::Ack> =
+            Arc::new(super::commit::TrackingAck::new(tracker.clone(), ack));
         let event_time_enabled = event_gate.lock().await.is_some();
         match event_time_enabled {
             false => {
@@ -540,12 +677,7 @@ async fn dispatch_gated(
         let last_task = chain.task_ids.last().map(String::as_str).unwrap_or("");
         if let Some(targets) = chain.late_event_outputs.get(last_task) {
             let batch = mark_event_batch(batch, "__arkflow_late_event_route")?;
-            return send_to_targets(
-                Some(targets),
-                Envelope::Data(batch, ack),
-                true,
-            )
-            .await;
+            return send_to_targets(Some(targets), Envelope::Data(batch, ack), true).await;
         }
         // A Route policy without a declared route target has no safe side
         // branch. Preserve the row on the main path as an Update instead of
@@ -554,16 +686,12 @@ async fn dispatch_gated(
         return dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await;
     }
     let batch = match action {
-        crate::event_time::WindowAction::Update => mark_event_batch(batch, "__arkflow_late_event_update")?,
+        crate::event_time::WindowAction::Update => {
+            mark_event_batch(batch, "__arkflow_late_event_update")?
+        }
         _ => batch,
     };
-    dispatch_data(
-        chain,
-        batch,
-        ack,
-        hook.metrics.as_ref(),
-    )
-    .await
+    dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await
 }
 
 /// Attach a boolean marker column to a batch (late-event routing metadata).
@@ -588,15 +716,15 @@ fn mark_event_batch(
     Ok(Arc::new(marked))
 }
 
-/// Start an asynchronous barrier snapshot. Source positions and watermarks
-/// are captured by the event loop at the marker; only the potentially
-/// blocking state snapshot is detached so the data plane is never held behind
-/// a global checkpoint lock.
+/// Start an asynchronous barrier snapshot for a source chain. The cut is
+/// sealed by the single-threaded event loop at the marker — positions and
+/// watermark cannot race with the report — while the potentially blocking
+/// state read stays detached so the data plane is never held behind a global
+/// checkpoint lock.
 fn spawn_barrier_snapshot(
     hook: &CheckpointHook,
     barrier: crate::checkpoint::CheckpointBarrier,
-    source_positions: Vec<crate::checkpoint::SourcePosition>,
-    watermark_ms: Option<i64>,
+    cut: super::commit::CheckpointCut,
     task_id_override: Option<String>,
     default_task_id: String,
 ) {
@@ -622,9 +750,10 @@ fn spawn_barrier_snapshot(
                     attempt_id,
                     partition,
                     barrier,
+                    cut_generation: cut.generation,
                     state,
-                    source_positions,
-                    watermark_ms,
+                    source_positions: cut.positions,
+                    watermark_ms: cut.watermark_ms,
                 });
             }
             Err(error) => {
@@ -649,8 +778,19 @@ async fn run_interior_chain(
     }
     let mut aligner = super::barrier::Aligner::new(chain.inputs.len(), 1024);
     let mut ended_inputs = BTreeSet::new();
+    // Watermarks arriving on different input edges represent independent
+    // progress. Keep one value per edge and only forward the minimum once
+    // every active input has reported; using the latest/max value would let a
+    // fast partition close a window while a lagging partition can still
+    // deliver data for it.
+    let mut upstream_watermarks = BTreeMap::<usize, i64>::new();
     let mut idle_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Bounded, ordered processor worker pool (`pipeline.thread_num`): data
+    // deliveries fan out to N workers while the chain's control flow
+    // (barriers, watermarks, EOS, ticks) stays in this loop. A reorder
+    // collector preserves per-delivery output order.
+    let pool = ProcessorWorkerPool::start(chain, hook, cancellation);
     loop {
         let read = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -664,10 +804,22 @@ async fn run_interior_chain(
                 tick_chain(chain).await?;
                 continue;
             }
+            failure = async {
+                match pool.as_ref() {
+                    Some(pool) => pool.fail().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                return Err(failure);
+            }
             read = readers.next() => read,
         };
         let Some((index, read)) = read else {
-            // All input channels closed: end of stream.
+            // All input channels closed: end of stream. Drain the worker
+            // pool first so its outputs precede the terminal flush.
+            if let Some(pool) = pool {
+                pool.drain().await;
+            }
             finish_chain(chain).await?;
             return Ok(());
         };
@@ -685,9 +837,15 @@ async fn run_interior_chain(
                     index,
                     Envelope::Eos,
                     &mut ended_inputs,
+                    pool.as_ref(),
+                    &mut upstream_watermarks,
                 )
                 .await?
                 {
+                    if let Some(pool) = pool {
+                        pool.drain().await;
+                    }
+                    finish_chain(chain).await?;
                     return Ok(());
                 }
                 continue;
@@ -700,15 +858,53 @@ async fn run_interior_chain(
         // inputs' data until the last barrier arrives.
         match aligner.observe(index, envelope) {
             Ok(Some(barrier)) => {
-                send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
-                spawn_barrier_snapshot(
-                    hook,
-                    barrier,
-                    Vec::new(),
-                    None,
-                    None,
-                    chain.entry_task_id().to_owned(),
-                );
+                // A barrier is a control fence for the data submitted before
+                // it. Do not snapshot or forward it while a worker can still
+                // publish pre-barrier output.
+                if let Some(pool) = pool.as_ref() {
+                    pool.flush().await?;
+                }
+                // Capture the committed state epoch BEFORE releasing the
+                // buffered post-barrier data: a detached read could observe
+                // a mutation that belongs after the barrier. The journal
+                // guarantees the backend holds only committed (acknowledged)
+                // state, so this read is the checkpoint's immutable view;
+                // report delivery stays non-blocking (unbounded channel).
+                let state = match hook.state.clone() {
+                    Some(backend) => super::barrier::snapshot_state(backend).await,
+                    None => Ok(crate::state::StateSnapshot::new(1, Vec::new())),
+                };
+                match state {
+                    Ok(state) => {
+                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                        if let Some(reporter) = &hook.reporter {
+                            let task_id = hook
+                                .task_id
+                                .clone()
+                                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+                            let _ = reporter.send(super::barrier::ChainSnapshot {
+                                task_id: task_id.clone(),
+                                attempt_id: format!("{task_id}-attempt"),
+                                partition: hook.partition.unwrap_or_default(),
+                                barrier: barrier.clone(),
+                                // Interior chains inherit the source's cut
+                                // through the barrier identity.
+                                cut_generation: barrier.generation,
+                                state,
+                                source_positions: Vec::new(),
+                                watermark_ms: None,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        // Snapshot failure fails this barrier round upstream;
+                        // the data plane keeps flowing through the barrier.
+                        if let Some(reporter) = &hook.failure_reporter {
+                            let _ = reporter.send(error);
+                        }
+                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                    }
+                }
                 for (buffered_index, buffered) in aligner.release() {
                     if handle_envelope(
                         chain,
@@ -716,9 +912,15 @@ async fn run_interior_chain(
                         buffered_index,
                         buffered,
                         &mut ended_inputs,
+                        pool.as_ref(),
+                        &mut upstream_watermarks,
                     )
                     .await?
                     {
+                        if let Some(pool) = pool {
+                            pool.drain().await;
+                        }
+                        finish_chain(chain).await?;
                         return Ok(());
                     }
                 }
@@ -734,9 +936,15 @@ async fn run_interior_chain(
                         index,
                         envelope,
                         &mut ended_inputs,
+                        pool.as_ref(),
+                        &mut upstream_watermarks,
                     )
                     .await?
                     {
+                        if let Some(pool) = pool {
+                            pool.drain().await;
+                        }
+                        finish_chain(chain).await?;
                         return Ok(());
                     }
                 }
@@ -747,6 +955,9 @@ async fn run_interior_chain(
                 if let Some(reporter) = &hook.failure_reporter {
                     let _ = reporter.send(Error::Process(error.to_string()));
                 }
+                if let Some(pool) = pool.as_ref() {
+                    pool.flush().await?;
+                }
                 for (buffered_index, buffered) in aligner.release() {
                     if handle_envelope(
                         chain,
@@ -754,9 +965,15 @@ async fn run_interior_chain(
                         buffered_index,
                         buffered,
                         &mut ended_inputs,
+                        pool.as_ref(),
+                        &mut upstream_watermarks,
                     )
                     .await?
                     {
+                        if let Some(pool) = pool {
+                            pool.drain().await;
+                        }
+                        finish_chain(chain).await?;
                         return Ok(());
                     }
                 }
@@ -779,33 +996,285 @@ async fn handle_envelope(
     input_index: usize,
     envelope: Envelope,
     ended_inputs: &mut BTreeSet<usize>,
+    pool: Option<&ProcessorWorkerPool>,
+    upstream_watermarks: &mut BTreeMap<usize, i64>,
 ) -> Result<bool, Error> {
     match envelope {
         Envelope::Data(batch, ack) => {
-            dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await?;
+            if let Some(pool) = pool {
+                // The pool owns this delivery's processing; ordering and
+                // backpressure are the pool's contract.
+                pool.submit((batch, ack)).await?;
+            } else {
+                dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await?;
+            }
             Ok(false)
         }
         Envelope::Eos => {
             ended_inputs.insert(input_index);
-            if ended_inputs.len() == chain.inputs.len() {
-                finish_chain(chain).await?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+            // An ended input can no longer contribute data behind its last
+            // watermark. Remove it from the active watermark frontier so one
+            // finite upstream does not pin a multi-input window forever after
+            // the other upstreams continue to advance.
+            upstream_watermarks.remove(&input_index);
+            // The caller drains the worker pool and flushes the chain when
+            // this returns true (ordered end of stream).
+            Ok(ended_inputs.len() == chain.inputs.len())
         }
         Envelope::Barrier(_) => {
             // Barrier handling lands with the checkpoint task; forward
             // transparently so ordering is preserved.
+            if let Some(pool) = pool {
+                pool.flush().await?;
+            }
             send_downstream(chain, envelope).await?;
             Ok(false)
         }
         Envelope::Watermark(watermark) => {
+            upstream_watermarks.insert(input_index, watermark);
+            // An input that has not emitted a watermark yet is still active;
+            // wait for every still-active input before allowing the first
+            // aggregate to fire. Subsequent values use the slowest active
+            // input's progress; ended inputs were removed above.
+            if !(0..chain.inputs.len())
+                .filter(|index| !ended_inputs.contains(index))
+                .all(|index| upstream_watermarks.contains_key(&index))
+            {
+                return Ok(false);
+            }
+            let watermark = upstream_watermarks
+                .iter()
+                .filter(|(index, _)| !ended_inputs.contains(index))
+                .map(|(_, watermark)| *watermark)
+                .min()
+                .unwrap_or(watermark);
+            if let Some(pool) = pool {
+                // Watermarks must not overtake data already accepted by the
+                // worker pool.
+                pool.flush().await?;
+            }
             dispatch_watermark(chain, watermark).await?;
             send_downstream(chain, Envelope::Watermark(watermark)).await?;
             Ok(false)
         }
     }
+}
+
+/// One data delivery submitted to a worker pool.
+type PoolDelivery = (crate::MessageBatchRef, Arc<dyn crate::input::Ack>);
+
+/// Bounded, ordered, cancellable processor worker pool for one chain.
+/// Present only when the chain's configured concurrency exceeds 1; the data
+/// path otherwise stays on the chain's single event loop.
+struct ProcessorWorkerPool {
+    work: flume::Sender<(u64, PoolDelivery)>,
+    failure: flume::Receiver<Error>,
+    submitted: std::sync::atomic::AtomicU64,
+    flushed: Arc<std::sync::atomic::AtomicU64>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    progress: Arc<tokio::sync::Notify>,
+    cancellation: CancellationToken,
+    /// Reorder collector: awaited on the chain's end-of-stream path so the
+    /// terminal EOS never overtakes in-flight pool deliveries.
+    collector: tokio::task::JoinHandle<()>,
+}
+
+impl ProcessorWorkerPool {
+    /// Start a pool for `chain` (no-op returning `None` when the configured
+    /// concurrency is 1 or the chain has no processors). Workers are
+    /// detached tasks bounded by the cancellation token; the reorder
+    /// collector is joined on end-of-stream so ordered delivery finishes
+    /// before the terminal control envelope flows downstream.
+    fn start(
+        chain: &Chain,
+        hook: &CheckpointHook,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        if chain.processor_parallelism <= 1 || chain.processors.is_empty() {
+            return None;
+        }
+        let parallelism = chain.processor_parallelism;
+        let shared = Arc::new(chain.share_for_workers());
+        let metrics = hook.metrics.clone();
+        let (work_tx, work_rx) = flume::bounded::<(u64, PoolDelivery)>(64.min(parallelism * 8));
+        let (done_tx, done_rx) = flume::unbounded::<(u64, Vec<ProcessedBatch>)>();
+        let (fail_tx, fail_rx) = flume::bounded::<Error>(1);
+        let flushed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress = Arc::new(tokio::sync::Notify::new());
+        for _ in 0..parallelism {
+            let shared = shared.clone();
+            let metrics = metrics.clone();
+            let work_rx = work_rx.clone();
+            let done_tx = done_tx.clone();
+            let fail_tx = fail_tx.clone();
+            let failed = failed.clone();
+            let progress = progress.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                loop {
+                    let submit = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        submit = work_rx.recv_async() => match submit {
+                            Ok(submit) => submit,
+                            Err(_) => return,
+                        },
+                    };
+                    let (sequence, (batch, ack)) = submit;
+                    match process_chain(&shared, batch, ack, metrics.as_ref()).await {
+                        Ok(outputs) => {
+                            if done_tx.send((sequence, outputs)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let error = match error {
+                                ProcessChainError::Processor(failure) => {
+                                    if let Some(metrics) = &metrics {
+                                        metrics
+                                            .processing_errors
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Error::Process(format!(
+                                        "processor worker failure: {}",
+                                        failure.error
+                                    ))
+                                }
+                                ProcessChainError::Fatal(error) => error,
+                            };
+                            // Keep draining so the bounded queue never
+                            // deadlocks the chain loop; the chain observes
+                            // the failure through `fail` and cancels.
+                            failed.store(true, std::sync::atomic::Ordering::Release);
+                            progress.notify_waiters();
+                            let _ = fail_tx.try_send(error);
+                        }
+                    }
+                }
+            });
+        }
+        // Reorder collector: outputs leave in submission order (the legacy
+        // Stream contract requires ordered delivery).
+        let collector_shared = shared.clone();
+        let collector_cancellation = cancellation.clone();
+        let collector_flushed = flushed.clone();
+        let collector_failed = failed.clone();
+        let collector_progress = progress.clone();
+        let collector = tokio::spawn(async move {
+            let mut pending: BTreeMap<u64, Vec<ProcessedBatch>> = BTreeMap::new();
+            let mut next_sequence = 0u64;
+            loop {
+                let done = tokio::select! {
+                    _ = collector_cancellation.cancelled() => return,
+                    done = done_rx.recv_async() => match done {
+                        Ok(done) => done,
+                        Err(_) => {
+                            // All workers exited: flush what is left.
+                            while let Some(outputs) = pending.remove(&next_sequence) {
+                                if flush_outputs(&collector_shared, outputs).await.is_err() {
+                                    collector_failed.store(
+                                        true,
+                                        std::sync::atomic::Ordering::Release,
+                                    );
+                                    collector_progress.notify_waiters();
+                                    return;
+                                }
+                                next_sequence += 1;
+                                collector_flushed
+                                    .store(next_sequence, std::sync::atomic::Ordering::Release);
+                                collector_progress.notify_waiters();
+                            }
+                            return;
+                        }
+                    },
+                };
+                let (sequence, outputs) = done;
+                pending.insert(sequence, outputs);
+                while let Some(outputs) = pending.remove(&next_sequence) {
+                    if flush_outputs(&collector_shared, outputs).await.is_err() {
+                        collector_failed.store(true, std::sync::atomic::Ordering::Release);
+                        collector_progress.notify_waiters();
+                        return;
+                    }
+                    next_sequence += 1;
+                    collector_flushed.store(next_sequence, std::sync::atomic::Ordering::Release);
+                    collector_progress.notify_waiters();
+                }
+            }
+        });
+        Some(Self {
+            work: work_tx,
+            failure: fail_rx,
+            submitted: std::sync::atomic::AtomicU64::new(0),
+            flushed,
+            failed,
+            progress,
+            cancellation: cancellation.clone(),
+            collector,
+        })
+    }
+
+    /// Drain the pool: close the submission queue, let every worker finish
+    /// its in-flight delivery, and wait until the reorder collector has
+    /// forwarded all outputs. Called on the chain's end-of-stream path.
+    async fn drain(self) {
+        drop(self.work);
+        let _ = self.collector.await;
+    }
+
+    /// Submit one data delivery; the bounded queue applies backpressure to
+    /// the chain loop exactly like a bounded inter-chain channel.
+    async fn submit(&self, delivery: PoolDelivery) -> Result<(), Error> {
+        // Sequence numbers are local to this pool. A process-global counter
+        // makes a newly created pool wait forever for sequence zero after an
+        // earlier pool has already consumed it.
+        let sequence = self
+            .submitted
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.work
+            .send_async((sequence, delivery))
+            .await
+            .map_err(|_| Error::Process("processor worker pool is closed".into()))
+    }
+
+    /// Wait until every delivery submitted before this control event has been
+    /// published downstream.
+    async fn flush(&self) -> Result<(), Error> {
+        let target = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::Process(
+                    "processor worker pool failed before control fence".into(),
+                ));
+            }
+            if self.flushed.load(std::sync::atomic::Ordering::Acquire) >= target {
+                return Ok(());
+            }
+            let notified = self.progress.notified();
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    return Err(Error::Process("processor worker pool was cancelled".into()));
+                }
+                _ = notified => {}
+            }
+        }
+    }
+
+    /// Await the first worker failure (called from the chain loop's select).
+    async fn fail(&self) -> Error {
+        match self.failure.recv_async().await {
+            Ok(error) => error,
+            Err(_) => Error::Process("processor worker pool failed".into()),
+        }
+    }
+}
+
+/// Forward pool outputs through the chain's outbound edges.
+async fn flush_outputs(chain: &Chain, outputs: Vec<ProcessedBatch>) -> Result<(), Error> {
+    for ProcessedBatch { batch, ack } in outputs {
+        send_downstream(chain, Envelope::Data(batch, ack)).await?;
+    }
+    Ok(())
 }
 
 fn result_to_batches(result: ProcessResult) -> Vec<ProcessedBatch> {
@@ -816,24 +1285,20 @@ fn result_to_batches(result: ProcessResult) -> Vec<ProcessedBatch> {
                 ack: Arc::new(crate::input::NoopAck),
             }]
         }
-        ProcessResult::Multiple(batches) => {
-            batches
-                .into_iter()
-                .map(|batch| ProcessedBatch {
-                    batch,
-                    ack: Arc::new(crate::input::NoopAck),
-                })
-                .collect()
-        }
+        ProcessResult::Multiple(batches) => batches
+            .into_iter()
+            .map(|batch| ProcessedBatch {
+                batch,
+                ack: Arc::new(crate::input::NoopAck),
+            })
+            .collect(),
         ProcessResult::SingleWithAck(batch, ack) => {
             vec![ProcessedBatch { batch, ack }]
         }
-        ProcessResult::MultipleWithAck(batches) => {
-            batches
-                .into_iter()
-                .map(|(batch, ack)| ProcessedBatch { batch, ack })
-                .collect()
-        }
+        ProcessResult::MultipleWithAck(batches) => batches
+            .into_iter()
+            .map(|(batch, ack)| ProcessedBatch { batch, ack })
+            .collect(),
         ProcessResult::Deferred | ProcessResult::None => Vec::new(),
     }
 }
@@ -886,17 +1351,16 @@ enum ProcessorControl {
 /// batches from an earlier processor are processed by every later processor
 /// before that later processor's own control hook runs; this preserves the
 /// same zero-channel semantics as ordinary data processing.
-async fn dispatch_processor_control(
-    chain: &Chain,
-    control: ProcessorControl,
-) -> Result<(), Error> {
+async fn dispatch_processor_control(chain: &Chain, control: ProcessorControl) -> Result<(), Error> {
     let mut pending = Vec::new();
     for processor in &chain.processors {
         pending = process_generated_batches(processor, pending).await?;
         let result = match control {
             ProcessorControl::Finish => processor.finish().await?,
             ProcessorControl::Tick => processor.on_tick().await?,
-            ProcessorControl::Watermark(watermark_ms) => processor.on_watermark(watermark_ms).await?,
+            ProcessorControl::Watermark(watermark_ms) => {
+                processor.on_watermark(watermark_ms).await?
+            }
         };
         pending.extend(result_to_batches(result));
     }
@@ -1037,10 +1501,9 @@ async fn process_chain(
         chain_metrics
             .batches_in
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        chain_metrics.rows.fetch_add(
-            batch.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        chain_metrics
+            .rows
+            .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let mut batches = vec![(batch, ack)];
     for processor in &chain.processors {
@@ -1139,10 +1602,9 @@ async fn process_chain(
         return Ok(Vec::new());
     }
     if let Some(chain_metrics) = &chain_metrics {
-        chain_metrics.batches_out.fetch_add(
-            batches.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        chain_metrics
+            .batches_out
+            .fetch_add(batches.len() as u64, std::sync::atomic::Ordering::Relaxed);
         chain_metrics.processing_us_total.fetch_add(
             started.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1201,9 +1663,17 @@ async fn send_to_targets(
             match target {
                 EdgeTarget::Forward(sender) => deliveries.push((sender.clone(), batch.clone())),
                 EdgeTarget::Broadcast(senders) => {
-                    deliveries.extend(senders.iter().cloned().map(|sender| (sender, batch.clone())));
+                    deliveries.extend(
+                        senders
+                            .iter()
+                            .cloned()
+                            .map(|sender| (sender, batch.clone())),
+                    );
                 }
-                EdgeTarget::Partitioned { channels, key_field } => {
+                EdgeTarget::Partitioned {
+                    channels,
+                    key_field,
+                } => {
                     if channels.len() <= 1 {
                         if let Some(sender) = channels.first() {
                             deliveries.push((sender.clone(), batch.clone()));
@@ -1253,7 +1723,10 @@ async fn send_to_targets(
                         .map_err(|_| Error::Process("downstream channel closed".into()))?;
                 }
             }
-            EdgeTarget::Partitioned { channels, key_field: _ } => {
+            EdgeTarget::Partitioned {
+                channels,
+                key_field: _,
+            } => {
                 // Control envelopes broadcast to every partition so each
                 // subtask observes barriers, watermarks, and EOS.
                 for sender in channels {

@@ -193,6 +193,49 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         )
     }
 
+    /// Seal a checkpoint against the COMPLETE planned assignment. A manifest
+    /// whose task set is missing, duplicating, or exceeding the planned
+    /// tasks is rejected: a partially collected checkpoint (one node
+    /// offline) must never publish a recoverable artifact.
+    pub fn write_checkpoint_with_plan(
+        &self,
+        manifest: &CheckpointManifest,
+        planned_tasks: &BTreeSet<String>,
+    ) -> Result<RecoveryArtifact, Error> {
+        self.write_manifest_with_plan(
+            manifest,
+            RecoveryArtifactKind::Checkpoint,
+            recovery_manifest_key(RecoveryArtifactKind::Checkpoint, &manifest.checkpoint_id),
+            planned_tasks,
+        )
+    }
+
+    /// Seal either a checkpoint or savepoint only when its task set exactly
+    /// matches the planned assignment. The generic form is used by Agent
+    /// aggregation, where the final artifact may be a savepoint.
+    pub fn write_manifest_with_plan(
+        &self,
+        manifest: &CheckpointManifest,
+        kind: RecoveryArtifactKind,
+        key: String,
+        planned_tasks: &BTreeSet<String>,
+    ) -> Result<RecoveryArtifact, Error> {
+        let compatibility = evaluate_recovery_compatibility(
+            manifest,
+            &manifest.job_id,
+            manifest.job_version,
+            manifest.format_version,
+            planned_tasks,
+        );
+        if !compatibility.is_compatible() {
+            return Err(Error::Process(format!(
+                "refusing to seal an incomplete checkpoint: {}",
+                compatibility.reason.unwrap_or_default()
+            )));
+        }
+        self.write_manifest(manifest, kind, key)
+    }
+
     pub fn write_manifest(
         &self,
         manifest: &CheckpointManifest,
@@ -375,7 +418,7 @@ impl CheckpointCatalog {
         self.artifacts.iter().rev().find(|artifact| {
             artifact.kind == RecoveryArtifactKind::Checkpoint
                 && artifact.status == CheckpointStatus::Completed
-                && artifact.job_version == job_version
+                && artifact.job_version <= job_version
                 && artifact.format_version == format_version
         })
     }
@@ -408,6 +451,109 @@ pub struct RecoveryPlan {
     pub source_positions: Vec<SourcePosition>,
     pub watermarks_ms: BTreeMap<String, i64>,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
+}
+
+/// The result of one shared recovery-compatibility evaluation. Hub
+/// authorization, Agent validation, repository validation, and runtime
+/// restore all derive their verdict from this single evaluation so one side
+/// can never authorize an artifact the other side rejects (and vice versa).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCompatibility {
+    pub compatible: bool,
+    pub reason: Option<String>,
+}
+
+impl RecoveryCompatibility {
+    pub fn ok() -> Self {
+        Self {
+            compatible: true,
+            reason: None,
+        }
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self {
+            compatible: false,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn is_compatible(&self) -> bool {
+        self.compatible
+    }
+}
+
+/// Evaluate whether `manifest` can restore into a Job with the given
+/// identity, target version, state format, and COMPLETE planned task set.
+///
+/// Rules (one evaluator, every caller):
+/// * the manifest checksum must verify;
+/// * the Job identity must match exactly;
+/// * the state format must match exactly — an equal format is the only
+///   supported compatibility path, and it permits a TARGET VERSION UPGRADE
+///   (a newer Job version restoring an older artifact); a downgrade or a
+///   changed format has no migration path and is rejected;
+/// * the manifest's task set must equal the planned task set EXACTLY —
+///   missing (an offline node), duplicate, or extra entries all reject, so
+///   a partially collected checkpoint is never a recoverable artifact.
+pub fn evaluate_recovery_compatibility(
+    manifest: &CheckpointManifest,
+    expected_job_id: &JobId,
+    target_job_version: JobVersion,
+    format_version: u32,
+    planned_tasks: &BTreeSet<String>,
+) -> RecoveryCompatibility {
+    if !manifest.verify() {
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' checksum mismatch",
+            manifest.checkpoint_id
+        ));
+    }
+    if &manifest.job_id != expected_job_id {
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' belongs to job '{}' not '{}'",
+            manifest.checkpoint_id, manifest.job_id, expected_job_id
+        ));
+    }
+    if manifest.format_version != format_version {
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' state format {} has no migration path to the configured format {}",
+            manifest.checkpoint_id, manifest.format_version, format_version
+        ));
+    }
+    if manifest.job_version > target_job_version {
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' was written by job version {} which is newer than the target \
+             version {}; downgrades have no compatibility path",
+            manifest.checkpoint_id, manifest.job_version.0, target_job_version.0
+        ));
+    }
+    let manifest_tasks = manifest
+        .task_attempts
+        .iter()
+        .map(|attempt| attempt.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    if manifest_tasks.len() != manifest.task_attempts.len() {
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' contains duplicate task entries",
+            manifest.checkpoint_id
+        ));
+    }
+    if &manifest_tasks != planned_tasks {
+        let missing = planned_tasks
+            .difference(&manifest_tasks)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = manifest_tasks
+            .difference(planned_tasks)
+            .cloned()
+            .collect::<Vec<_>>();
+        return RecoveryCompatibility::reject(format!(
+            "checkpoint '{}' task set does not match the planned assignment (missing: {:?}, extra: {:?})",
+            manifest.checkpoint_id, missing, extra
+        ));
+    }
+    RecoveryCompatibility::ok()
 }
 
 impl RecoveryPlan {
@@ -891,5 +1037,171 @@ mod tests {
         };
         manifest.seal();
         assert!(repository.write_checkpoint(&manifest).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::state::StateEntry;
+
+    fn make_manifest(
+        task_ids: &[&str],
+        job_version: u64,
+        format_version: u32,
+    ) -> CheckpointManifest {
+        let mut manifest = CheckpointManifest {
+            checkpoint_id: "cp-compat".into(),
+            job_id: JobId::new("orders").unwrap(),
+            job_version: JobVersion(job_version),
+            generation: 1,
+            task_attempts: task_ids
+                .iter()
+                .map(|task_id| TaskAttemptSnapshot {
+                    task_id: (*task_id).into(),
+                    attempt_id: format!("{task_id}-a"),
+                    node_id: "node-a".into(),
+                })
+                .collect(),
+            source_positions: vec![],
+            watermarks_ms: BTreeMap::new(),
+            in_flight_barrier: CheckpointBarrier {
+                checkpoint_id: "cp-compat".into(),
+                generation: 1,
+            },
+            state_snapshots: vec![],
+            format_version,
+            checksum: 0,
+        };
+        manifest.seal();
+        manifest
+    }
+
+    fn planned() -> BTreeSet<String> {
+        ["task-0", "task-1"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect()
+    }
+
+    /// Task 5.1/5.5: one shared evaluator reaches the same verdict for
+    /// compatible upgrades, rejected migrations, incomplete task sets, and
+    /// checksum failures.
+    #[test]
+    fn evaluator_accepts_compatible_version_upgrades() {
+        let manifest = make_manifest(&["task-0", "task-1"], 1, 1);
+        let verdict = evaluate_recovery_compatibility(
+            &manifest,
+            &JobId::new("orders").unwrap(),
+            JobVersion(2),
+            1,
+            &planned(),
+        );
+        assert!(verdict.is_compatible(), "{verdict:?}");
+    }
+
+    #[test]
+    fn evaluator_rejects_downgrades_and_format_changes() {
+        let manifest = make_manifest(&["task-0", "task-1"], 3, 1);
+        let verdict = evaluate_recovery_compatibility(
+            &manifest,
+            &JobId::new("orders").unwrap(),
+            JobVersion(2),
+            1,
+            &planned(),
+        );
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("newer"));
+
+        let other_format = make_manifest(&["task-0", "task-1"], 1, 2);
+        let verdict = evaluate_recovery_compatibility(
+            &other_format,
+            &JobId::new("orders").unwrap(),
+            JobVersion(2),
+            1,
+            &planned(),
+        );
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("no migration path"));
+    }
+
+    #[test]
+    fn evaluator_rejects_incomplete_duplicate_and_extra_task_sets() {
+        let job = JobId::new("orders").unwrap();
+        let missing = make_manifest(&["task-0"], 1, 1);
+        let verdict = evaluate_recovery_compatibility(&missing, &job, JobVersion(1), 1, &planned());
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("missing: [\"task-1\"]"));
+
+        let extra = make_manifest(&["task-0", "task-1", "task-2"], 1, 1);
+        let verdict = evaluate_recovery_compatibility(&extra, &job, JobVersion(1), 1, &planned());
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("extra: [\"task-2\"]"));
+
+        let duplicate = make_manifest(&["task-0", "task-0", "task-1"], 1, 1);
+        let verdict =
+            evaluate_recovery_compatibility(&duplicate, &job, JobVersion(1), 1, &planned());
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("duplicate"));
+    }
+
+    #[test]
+    fn evaluator_rejects_checksum_failures_and_foreign_jobs() {
+        let mut corrupt = make_manifest(&["task-0", "task-1"], 1, 1);
+        corrupt.checksum ^= 1;
+        let verdict = evaluate_recovery_compatibility(
+            &corrupt,
+            &JobId::new("orders").unwrap(),
+            JobVersion(1),
+            1,
+            &planned(),
+        );
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("checksum"));
+
+        let foreign = make_manifest(&["task-0", "task-1"], 1, 1);
+        let verdict = evaluate_recovery_compatibility(
+            &foreign,
+            &JobId::new("payments").unwrap(),
+            JobVersion(1),
+            1,
+            &planned(),
+        );
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("belongs to job"));
+    }
+
+    /// Task 5.3: the repository refuses to seal a checkpoint whose manifest
+    /// does not carry the complete planned assignment.
+    #[test]
+    fn repository_refuses_incomplete_planned_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+        let snapshot = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "orders".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let reference = repository
+            .write_state_snapshot("cp-incomplete", &snapshot)
+            .unwrap();
+        let mut manifest = make_manifest(&["task-0"], 1, 1);
+        manifest.state_snapshots = vec![StateSnapshotRef {
+            task_id: "task-0".into(),
+            ..reference
+        }];
+        manifest.seal();
+        let planned: BTreeSet<String> = ["task-0", "task-1"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let error = repository
+            .write_checkpoint_with_plan(&manifest, &planned)
+            .expect_err("an incomplete checkpoint must not be sealed");
+        assert!(error.to_string().contains("incomplete"), "{error}");
     }
 }

@@ -211,14 +211,34 @@ fn validate_recovery_manifest(
     state_format_version: u32,
     manifest: &arkflow_core::checkpoint::CheckpointManifest,
 ) -> Result<(), String> {
-    if manifest.checkpoint_id != checkpoint_id
-        || manifest.job_id != plan.spec.id
-        || manifest.job_version != plan.spec.version
-        || manifest.format_version != state_format_version
-    {
+    if manifest.checkpoint_id != checkpoint_id {
         return Err(format!(
-            "recovery artifact '{checkpoint_id}' is incompatible with Job '{}' version {} state format {}",
-            plan.spec.id, plan.spec.version.0, state_format_version
+            "recovery artifact '{checkpoint_id}' does not match the dispatched checkpoint"
+        ));
+    }
+    // The SAME shared evaluation the Hub authorization and the repository
+    // sealing apply: an equal state format permits a target-version upgrade,
+    // while downgrades, format changes, checksum failures, and manifests
+    // without the complete planned task set are incompatible for everyone.
+    let planned_tasks = plan
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let compatibility = arkflow_core::checkpoint::evaluate_recovery_compatibility(
+        manifest,
+        &plan.spec.id,
+        plan.spec.version,
+        state_format_version,
+        &planned_tasks,
+    );
+    if !compatibility.is_compatible() {
+        return Err(format!(
+            "recovery artifact '{checkpoint_id}' is incompatible with Job '{}' version {} state format {}: {}",
+            plan.spec.id,
+            plan.spec.version.0,
+            state_format_version,
+            compatibility.reason.unwrap_or_default()
         ));
     }
     Ok(())
@@ -351,7 +371,10 @@ impl JobRuntime {
             ("kernel_errors".into(), errors as f64),
             ("in_flight".into(), in_flight as f64),
             ("mean_latency_us".into(), mean_latency_us as f64),
-            ("checkpoint_duration_ms".into(), checkpoint_duration_ms as f64),
+            (
+                "checkpoint_duration_ms".into(),
+                checkpoint_duration_ms as f64,
+            ),
             ("checkpoint_failures".into(), checkpoint_failures as f64),
             ("watermark_lag_ms".into(), watermark_lag_ms as f64),
             ("late_events".into(), late_events as f64),
@@ -620,6 +643,7 @@ impl JobRuntime {
         generation: u64,
         savepoint: bool,
         manifest_nodes: &[String],
+        planned_task_ids: &[String],
     ) -> Result<String, String> {
         let tasks = self.tasks.lock().await;
         let task = tasks
@@ -694,8 +718,12 @@ impl JobRuntime {
         manifest.checksum = 0;
         manifest.seal();
         let final_key = recovery_manifest_key(kind, checkpoint_id);
+        let planned_tasks = planned_task_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if planned_tasks.is_empty() {
+            return Err("checkpoint has no planned task assignments".into());
+        }
         let artifact = repository
-            .write_manifest(&manifest, kind, final_key)
+            .write_manifest_with_plan(&manifest, kind, final_key, &planned_tasks)
             .map_err(|error| error.to_string())?;
         Ok(format!(
             "{}/{}",
@@ -795,10 +823,14 @@ async fn spawn_kernel_job(
         temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
         input_names: RefCell::new(Vec::new()),
     };
-    let graph = arkflow_core::executor::graph::ExecutionGraphBuilder::default()
+    let mut graph = arkflow_core::executor::graph::ExecutionGraphBuilder::default()
         .with_state(state.clone())
         .build_subgraph(plan, task_ids, &RegistryJobAdapter, &mut resource)
         .map_err(|error| error.to_string())?;
+    // The graph builder constructs temporary resources through `Resource`;
+    // transfer those instances into the unified graph so the resource guard
+    // connects them before any processor can issue its first lookup.
+    graph.temporaries = resource.temporary.values().cloned().collect();
     let inputs = graph
         .chains
         .iter()
@@ -810,15 +842,24 @@ async fn spawn_kernel_job(
     // trigger geometry; the older source-operator scan only knew a list of
     // sizes and could release a row too early.
     let mut watermark_gates = BTreeMap::new();
+    // Physical source partition per gated chain: a restored watermark is
+    // installed for the task's REAL partition, never a synthesized
+    // partition 0.
+    let mut gate_partitions: BTreeMap<String, u32> = BTreeMap::new();
     for chain in &graph.chains {
-        if let Some(source_time) = chain.source_time.as_ref().filter(|time| {
-            time.mode == arkflow_core::job::TimeMode::EventTime
-        }) {
+        if let Some(source_time) = chain
+            .source_time
+            .as_ref()
+            .filter(|time| time.mode == arkflow_core::job::TimeMode::EventTime)
+        {
             let gate = arkflow_core::executor::event_time_gate::EventTimeGate::new(
                 source_time,
                 chain.window_timings.clone(),
             )
             .map_err(|error| error.to_string())?;
+            if let Some(partition) = chain.source_partition {
+                gate_partitions.insert(chain.entry_task_id().to_owned(), partition);
+            }
             watermark_gates.insert(
                 chain.entry_task_id().to_owned(),
                 Arc::new(tokio::sync::Mutex::new(Some(gate))),
@@ -832,20 +873,24 @@ async fn spawn_kernel_job(
     // were installed.
     if let Some(recovery) = recovery {
         for input in &inputs {
-            input.connect().await.map_err(|error| error.to_string())?;
+            if let Err(error) = input.connect().await {
+                close_inputs(&inputs).await;
+                return Err(error.to_string());
+            }
         }
         for input in &inputs {
-            input
-                .restore_positions(&recovery.source_positions)
-                .await
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = input.restore_positions(&recovery.source_positions).await {
+                close_inputs(&inputs).await;
+                return Err(error.to_string());
+            }
         }
         for (task_id, watermark) in &recovery.watermarks_ms {
             if let Some(gate) = watermark_gates.get(task_id) {
+                let partition = gate_partitions.get(task_id).copied().unwrap_or_default();
                 gate.lock()
                     .await
                     .as_mut()
-                    .map(|gate| gate.restore_partition(0, *watermark));
+                    .map(|gate| gate.restore_partition(partition, *watermark));
             }
         }
     }
@@ -868,15 +913,12 @@ async fn spawn_kernel_job(
         }
     }
     if states.is_empty() {
-        states.insert(
-            task_ids.first().cloned().unwrap_or_default(),
-            state.clone(),
-        );
+        states.insert(task_ids.first().cloned().unwrap_or_default(), state.clone());
     }
     let handle = if recovery.is_some() {
         arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_prepared_with_cancellation(
             graph,
-            inputs,
+            inputs.clone(),
             states,
             watermark_gates.clone(),
             cancellation,
@@ -885,16 +927,34 @@ async fn spawn_kernel_job(
     } else {
         arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
             graph,
-            inputs,
+            inputs.clone(),
             states,
             watermark_gates.clone(),
             false,
             cancellation,
         )
         .await
-    }
-    .map_err(|error| error.to_string())?;
+    };
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Prepared inputs are not yet owned by chain tasks when graph
+            // startup fails; release them here so a retry can reconnect.
+            if recovery.is_some() {
+                close_inputs(&inputs).await;
+            }
+            return Err(error.to_string());
+        }
+    };
     Ok(handle)
+}
+
+async fn close_inputs(inputs: &[Arc<dyn arkflow_core::input::Input>]) {
+    for input in inputs.iter().rev() {
+        if let Err(error) = input.close().await {
+            tracing::warn!(%error, "failed to close input after Job startup failure");
+        }
+    }
 }
 
 struct RegistryJobAdapter;
@@ -1078,7 +1138,7 @@ async fn run_session(
         tokio::select! {
             _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await; return Ok(()) },
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
-            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime).await).await?; }
+            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &auth.session_token, report_seq, &job_runtime).await).await?; }
             _ = poll.tick() => {
                 for (job_id, generation, outcome) in job_runtime.take_finished().await {
                     let (state, error) = match outcome {
@@ -1108,6 +1168,10 @@ async fn run_session(
 async fn report(
     cp: &ControlPlane,
     auth: &AgentAuth,
+    // The report boot identity: the REGISTRATION session token. A
+    // reconnecting Agent re-registers and starts its sequence at zero
+    // without the Hub treating the fresh reports as stale under the
+    // previous session.
     boot_id: &str,
     report_seq: u64,
     job_runtime: &JobRuntime,
@@ -1323,6 +1387,13 @@ async fn execute_command(
                         .ok_or_else(|| "missing checkpoint manifest nodes".to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
+                let planned_task_ids = serde_json::from_value::<Vec<String>>(
+                    payload
+                        .get("planned_task_ids")
+                        .cloned()
+                        .ok_or_else(|| "missing planned checkpoint task ids".to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
                 result.observed_checkpoint_id = Some(checkpoint_id.into());
                 result.checkpoint_manifest_uri = Some(
                     job_runtime
@@ -1332,6 +1403,7 @@ async fn execute_command(
                             command.generation,
                             command.operation == "job_savepoint_commit",
                             &manifest_nodes,
+                            &planned_task_ids,
                         )
                         .await?,
                 );

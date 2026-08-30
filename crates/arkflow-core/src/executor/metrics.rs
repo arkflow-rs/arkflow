@@ -2,10 +2,10 @@
 //! metrics snapshot (6.1). Chains update shared atomics; the handle exposes
 //! a snapshot for control-plane reporting.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 
 /// Counters for one chain (vertex).
 #[derive(Debug, Default)]

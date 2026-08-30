@@ -8,7 +8,7 @@
 //! completes a checkpoint once every chain reports its snapshot.
 
 use crate::checkpoint::{
-    CheckpointBarrier, CheckpointCoordinator, TaskCheckpointAck, TaskAttemptSnapshot,
+    CheckpointBarrier, CheckpointCoordinator, TaskAttemptSnapshot, TaskCheckpointAck,
 };
 use crate::job::{JobId, JobVersion};
 use crate::state::{StateBackend, StateSnapshot};
@@ -174,6 +174,12 @@ pub struct ChainSnapshot {
     pub attempt_id: String,
     pub partition: u32,
     pub barrier: CheckpointBarrier,
+    /// Generation of the sealed acknowledged cut this report belongs to.
+    /// Source chains seal the cut (positions + watermark) at barrier
+    /// injection; interior chains inherit the barrier's identity, so a
+    /// report's positions, watermark, barrier, and attempt all reference one
+    /// cut generation.
+    pub cut_generation: u64,
     pub state: StateSnapshot,
     pub source_positions: Vec<crate::checkpoint::SourcePosition>,
     pub watermark_ms: Option<i64>,
@@ -302,10 +308,7 @@ impl BarrierCoordinator {
 
 /// Snapshot helper shared by chains: capture a state backend snapshot without
 /// blocking the caller's event loop (spawn_blocking-friendly).
-pub async fn snapshot_state(
-    backend: Arc<dyn StateBackend>,
-) -> Result<StateSnapshot, crate::Error> {
-    let handle =
-        tokio::task::spawn_blocking(move || backend.snapshot().map_err(Into::into)).await;
+pub async fn snapshot_state(backend: Arc<dyn StateBackend>) -> Result<StateSnapshot, crate::Error> {
+    let handle = tokio::task::spawn_blocking(move || backend.snapshot().map_err(Into::into)).await;
     handle.map_err(|error| crate::Error::Process(format!("state snapshot task failed: {error}")))?
 }

@@ -6,11 +6,11 @@
 //! the marker through their FIFO data channels, align multi-input vertices,
 //! and snapshot state asynchronously without a job-wide read/write gate.
 
-use crate::Error;
 use crate::executor::graph::ExecutionGraph;
 use crate::executor::metrics::KernelMetrics;
 use crate::input::Input;
 use crate::state::{StateBackend, StateEntry, StateSnapshot};
+use crate::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -38,11 +38,17 @@ pub struct KernelJobHandle {
     /// Event-time watermarks keyed by source task id.
     watermark_gates:
         BTreeMap<String, Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>>,
+    /// Physical source partition of each gated source chain: restoring a
+    /// checkpointed watermark installs it for the task's REAL partition
+    /// instead of synthesizing progress on partition 0.
+    gate_partitions: BTreeMap<String, u32>,
     /// Barrier injection channels keyed by source chain entry task.
     barrier_senders: BTreeMap<String, flume::Sender<super::envelope::Envelope>>,
     /// Every chain reports once for a barrier round.
     participants: BTreeSet<String>,
-    reports: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>>,
+    reports: Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>,
+    >,
     checkpoint_errors: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Error>>>,
     checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     next_snapshot_id: AtomicU64,
@@ -60,9 +66,18 @@ impl KernelJobHandle {
     /// own FIFO barrier position; there is no global write gate in this path.
     pub async fn checkpoint_snapshot(
         &self,
-    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
-    {
-        let id = format!("kernel-snapshot-{}", self.next_snapshot_id.fetch_add(1, Ordering::Relaxed));
+    ) -> Result<
+        (
+            StateSnapshot,
+            Vec<crate::checkpoint::SourcePosition>,
+            BTreeMap<String, i64>,
+        ),
+        Error,
+    > {
+        let id = format!(
+            "kernel-snapshot-{}",
+            self.next_snapshot_id.fetch_add(1, Ordering::Relaxed)
+        );
         self.checkpoint_barrier(id, 0).await
     }
 
@@ -74,8 +89,14 @@ impl KernelJobHandle {
         &self,
         checkpoint_id: impl Into<String>,
         generation: u64,
-    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
-    {
+    ) -> Result<
+        (
+            StateSnapshot,
+            Vec<crate::checkpoint::SourcePosition>,
+            BTreeMap<String, i64>,
+        ),
+        Error,
+    > {
         let started = Instant::now();
         let result = self
             .checkpoint_barrier_inner(checkpoint_id.into(), generation)
@@ -93,15 +114,23 @@ impl KernelJobHandle {
         &self,
         checkpoint_id: String,
         generation: u64,
-    ) -> Result<(StateSnapshot, Vec<crate::checkpoint::SourcePosition>, BTreeMap<String, i64>), Error>
-    {
+    ) -> Result<
+        (
+            StateSnapshot,
+            Vec<crate::checkpoint::SourcePosition>,
+            BTreeMap<String, i64>,
+        ),
+        Error,
+    > {
         let _round = self.checkpoint_lock.lock().await;
         let barrier = crate::checkpoint::CheckpointBarrier {
             checkpoint_id,
             generation,
         };
         if self.barrier_senders.is_empty() {
-            return Err(Error::Process("kernel graph has no source barrier channel".into()));
+            return Err(Error::Process(
+                "kernel graph has no source barrier channel".into(),
+            ));
         }
         for sender in self.barrier_senders.values() {
             sender
@@ -129,7 +158,9 @@ impl KernelJobHandle {
                 }
             };
             let Some(report) = report else {
-                return Err(Error::Process("kernel ended before checkpoint completed".into()));
+                return Err(Error::Process(
+                    "kernel ended before checkpoint completed".into(),
+                ));
             };
             if report.barrier != barrier {
                 // A failed prior round may have detached snapshots still
@@ -157,20 +188,38 @@ impl KernelJobHandle {
             }
         }
 
-        let format_version = snapshots
+        // The checkpoint's state format is the CONFIGURED Job/backend
+        // contract, not whatever the first report happened to carry: a
+        // stateless chain's empty default-format snapshot never vetoes a Job
+        // configured with another state format.
+        let format_version = self
+            .states
             .values()
-            .map(|snapshot| snapshot.state.format_version)
-            .chain(self.states.values().map(|state| state.format_version()))
             .next()
+            .map(|state| state.format_version())
+            .or_else(|| {
+                snapshots
+                    .values()
+                    .map(|snapshot| snapshot.state.format_version)
+                    .max()
+            })
             .unwrap_or(1);
         let mut state_entries = BTreeMap::<(String, Vec<u8>), StateEntry>::new();
         let mut positions = Vec::new();
         let mut watermarks = BTreeMap::new();
         for report in snapshots.values() {
-            if report.state.format_version != format_version || !report.state.verify() {
+            if !report.state.verify() {
                 return Err(Error::Process(format!(
                     "invalid state snapshot from chain '{}'",
                     report.task_id
+                )));
+            }
+            let stateless_default_format =
+                report.state.entries.is_empty() && report.state.format_version == 1;
+            if !stateless_default_format && report.state.format_version != format_version {
+                return Err(Error::Process(format!(
+                    "chain '{}' reported state format {} but the Job's configured state format is {}",
+                    report.task_id, report.state.format_version, format_version
                 )));
             }
             for entry in &report.state.entries {
@@ -199,17 +248,25 @@ impl KernelJobHandle {
         Ok(())
     }
 
-    /// Restore watermarks into the source gates (recovery).
+    /// Restore watermarks into the source gates (recovery). Each watermark
+    /// is installed for that source task's ACTUAL assigned partition —
+    /// defaulting to partition 0 would synthesize progress on a partition
+    /// the task never reads and skew the minimum-watermark computation.
     pub async fn restore_watermarks(
         &self,
         watermarks_ms: &BTreeMap<String, i64>,
     ) -> Result<(), Error> {
         for (task_id, watermark) in watermarks_ms {
+            let partition = self
+                .gate_partitions
+                .get(task_id)
+                .copied()
+                .unwrap_or_default();
             if let Some(gate) = self.watermark_gates.get(task_id) {
                 gate.lock()
                     .await
                     .as_mut()
-                    .map(|gate| gate.restore_partition(0, *watermark));
+                    .map(|gate| gate.restore_partition(partition, *watermark));
             }
         }
         Ok(())
@@ -250,6 +307,15 @@ impl KernelJobHandle {
 
     pub fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// Read-only view of the source watermark gates (restore verification
+    /// and tests).
+    pub fn watermark_gates(
+        &self,
+    ) -> &BTreeMap<String, Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>>
+    {
+        &self.watermark_gates
     }
 
     pub fn metrics(&self) -> Arc<KernelMetrics> {
@@ -353,7 +419,12 @@ impl KernelJobRunner {
     ) -> Result<KernelJobHandle, Error> {
         if connect_inputs {
             for input in &inputs {
-                input.connect().await?;
+                if let Err(error) = input.connect().await {
+                    for connected in inputs.iter().rev() {
+                        let _ = connected.close().await;
+                    }
+                    return Err(error);
+                }
             }
         }
         let completion: Completion = Arc::new(tokio::sync::Mutex::new(None));
@@ -366,6 +437,7 @@ impl KernelJobRunner {
         let mut participants = BTreeSet::new();
         let mut hooks = BTreeMap::new();
         let mut watermark_gates = watermark_gates;
+        let mut gate_partitions = BTreeMap::new();
         for chain in &graph.chains {
             let entry_task_id = chain.entry_task_id().to_owned();
             participants.insert(entry_task_id.clone());
@@ -381,7 +453,27 @@ impl KernelJobRunner {
                     let gate = super::event_time_gate::EventTimeGate::new(
                         source_time,
                         chain.window_timings.clone(),
-                    )?;
+                    );
+                    let gate = match gate {
+                        Ok(gate) => gate,
+                        Err(error) => {
+                            // At this point source inputs may already be
+                            // connected (normal startup) or restored and
+                            // connected by the caller (recovery). Do not leave
+                            // either those handles or the state backend alive
+                            // when hook construction aborts before the graph
+                            // resource guard takes ownership.
+                            if connect_inputs || sources_preconnected {
+                                for input in inputs.iter().rev() {
+                                    let _ = input.close().await;
+                                }
+                            }
+                            for state in states.values() {
+                                let _ = state.close();
+                            }
+                            return Err(error);
+                        }
+                    };
                     Some(gate)
                 } else {
                     None
@@ -401,6 +493,11 @@ impl KernelJobRunner {
             } else {
                 None
             };
+            if chain.is_source() {
+                if let Some(partition) = chain.source_partition {
+                    gate_partitions.insert(entry_task_id.clone(), partition);
+                }
+            }
             hooks.insert(
                 entry_task_id.clone(),
                 super::task::CheckpointHook {
@@ -416,23 +513,41 @@ impl KernelJobRunner {
                 },
             );
         }
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         {
             let cancellation = cancellation.clone();
             let completion = completion.clone();
             tokio::spawn(async move {
-                let result = if sources_preconnected || connect_inputs {
-                    super::task::run_graph_with_hooks_preconnected(graph, cancellation, hooks).await
-                } else {
-                    super::task::run_graph_with_hooks(graph, cancellation, hooks).await
-                };
+                let result = super::task::run_graph_with_hooks_startup(
+                    graph,
+                    cancellation,
+                    hooks,
+                    sources_preconnected || connect_inputs,
+                    Some(startup_tx),
+                )
+                .await;
                 KernelJobHandle::complete(&completion, result).await;
             });
+        }
+        match startup_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                cancellation.cancel();
+                return Err(Error::Process(message));
+            }
+            Err(_) => {
+                cancellation.cancel();
+                return Err(Error::Process(
+                    "kernel graph startup task exited before readiness".into(),
+                ));
+            }
         }
         Ok(KernelJobHandle {
             cancellation,
             inputs,
             states,
             watermark_gates,
+            gate_partitions,
             completion,
             barrier_senders,
             participants,

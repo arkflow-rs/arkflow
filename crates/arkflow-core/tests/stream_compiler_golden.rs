@@ -8,15 +8,18 @@ use arkflow_core::executor::stream_compiler::compile_engine_streams;
 
 #[test]
 fn every_stream_example_compiles_to_job_specs() {
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples");
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
     let mut compiled = 0;
     for entry in std::fs::read_dir(&examples).unwrap() {
         let path = entry.unwrap().path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".yaml") || name.contains("control_plane") || name.contains("hub") || name.contains("node") {
+        if !name.ends_with(".yaml")
+            || name.contains("control_plane")
+            || name.contains("hub")
+            || name.contains("node")
+        {
             continue;
         }
         let Ok(config) = EngineConfig::from_file(path.to_str().unwrap()) else {
@@ -40,15 +43,15 @@ fn every_stream_example_compiles_to_job_specs() {
             Err(error) => {
                 // Only the join buffer is allowed to fail (by contract).
                 let message = error.to_string();
-                assert!(
-                    name.contains("join"),
-                    "{name} failed to compile: {message}"
-                );
+                assert!(name.contains("join"), "{name} failed to compile: {message}");
                 assert!(message.contains("join"), "{name}: {message}");
             }
         }
     }
-    assert!(compiled >= 20, "expected most examples to compile, got {compiled}");
+    assert!(
+        compiled >= 20,
+        "expected most examples to compile, got {compiled}"
+    );
 }
 
 #[test]

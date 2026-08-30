@@ -20,6 +20,7 @@ use arkflow_core::checkpoint::SourcePosition;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use arkflow_core::executor::commit::{AckAdvance, CommitFrontier};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -62,7 +63,11 @@ pub struct KafkaInput {
     config: KafkaInputConfig,
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
     assigned_partition: Arc<RwLock<Option<u32>>>,
-    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
+    /// Acknowledged-position frontier: per topic-partition contiguous
+    /// next-offsets. `current_positions` (and therefore every checkpoint)
+    /// exposes only the contiguous acknowledged run — a maximum observed
+    /// offset would silently skip unacknowledged records in a gap.
+    frontier: Arc<CommitFrontier>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -89,9 +94,59 @@ impl KafkaInput {
             config,
             consumer: Arc::new(RwLock::new(None)),
             assigned_partition: Arc::new(RwLock::new(None)),
-            acknowledged_offsets: Arc::new(RwLock::new(HashMap::new())),
+            frontier: Arc::new(CommitFrontier::new()),
             codec,
         })
+    }
+
+    /// Merge checkpoint positions into the COMPLETE configured assignment for
+    /// one explicitly-assigned partition. Configured topics whose partitions
+    /// the checkpoint omitted keep their configured starting behavior — a
+    /// subset checkpoint must never unassign a configured partition.
+    fn merged_restore_assignment(
+        topics: &[String],
+        assigned_partition: u32,
+        positions: &[SourcePosition],
+        start_from_latest: bool,
+    ) -> TopicPartitionList {
+        let mut assignment = TopicPartitionList::new();
+        for topic in topics {
+            let restored = positions.iter().find(|position| {
+                position.topic.as_deref() == Some(topic.as_str())
+                    && position.partition == assigned_partition
+            });
+            let offset = match restored {
+                Some(position) => Offset::Offset(position.offset as i64),
+                None if start_from_latest => Offset::End,
+                None => Offset::Beginning,
+            };
+            let _ = assignment.add_partition_offset(topic, assigned_partition as i32, offset);
+        }
+        assignment
+    }
+
+    /// The checkpoint positions applicable to this reader: in
+    /// explicit-partition mode only its own partition, in subscription mode
+    /// every configured topic's matching partitions.
+    fn applicable_positions(
+        &self,
+        positions: &[SourcePosition],
+    ) -> Result<Vec<SourcePosition>, Error> {
+        let assigned = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        Ok(positions
+            .iter()
+            .filter(|position| {
+                self.config
+                    .topics
+                    .iter()
+                    .any(|topic| position.topic.as_deref() == Some(topic.as_str()))
+                    && assigned.is_none_or(|partition| position.partition == partition)
+            })
+            .cloned()
+            .collect())
     }
     /// Convert Kafka timestamps to SystemTime
     fn convert_kafka_timestamp(millis_since_epoch: i64) -> Option<SystemTime> {
@@ -263,6 +318,17 @@ impl Input for KafkaInput {
 
                 // Add extended metadata (topic, headers)
                 let topic = kafka_message.topic().to_string();
+
+                // Anchor the partition's frontier at this delivery: an
+                // out-of-order FIRST acknowledgement (fan-out completing a
+                // later branch first) cannot then claim the earlier records
+                // of this delivery were acknowledged.
+                self.frontier.anchor_delivery(&SourcePosition {
+                    topic: Some(topic.clone()),
+                    partition: kafka_message.partition() as u32,
+                    offset: kafka_message.offset() as u64,
+                });
+
                 let mut ext_metadata = HashMap::new();
                 ext_metadata.insert("topic".to_string(), topic);
 
@@ -279,7 +345,7 @@ impl Input for KafkaInput {
                 // Create acknowledgment object
                 let ack = KafkaAck {
                     consumer: self.consumer.clone(),
-                    acknowledged_offsets: self.acknowledged_offsets.clone(),
+                    frontier: self.frontier.clone(),
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
@@ -295,20 +361,10 @@ impl Input for KafkaInput {
     }
 
     async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
-        let acknowledged = self.acknowledged_offsets.read().await;
-        Ok(acknowledged
-            .iter()
-            .filter_map(|((topic, partition), offset)| {
-                if *partition < 0 || *offset < 0 {
-                    return None;
-                }
-                Some(SourcePosition {
-                    topic: Some(topic.clone()),
-                    partition: u32::try_from(*partition).ok()?,
-                    offset: u64::try_from(*offset).ok()?,
-                })
-            })
-            .collect())
+        // Only the contiguous acknowledged frontier: a gap (fan-out
+        // acknowledgement still pending) holds the position back so a
+        // checkpoint never skips unacknowledged records.
+        Ok(self.frontier.contiguous_positions())
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
@@ -316,41 +372,89 @@ impl Input for KafkaInput {
             .assigned_partition
             .try_read()
             .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        let applicable = self.applicable_positions(positions)?;
         let consumer_guard = self.consumer.read().await;
         let Some(consumer) = consumer_guard.as_ref() else {
             return Err(Error::Process(
                 "cannot restore Kafka positions before connect".into(),
             ));
         };
-        let mut assignment = TopicPartitionList::new();
-        for topic in &self.config.topics {
-            for position in positions.iter().filter(|position| {
-                position.partition < i32::MAX as u32
-                    && assigned_partition.is_none_or(|partition| position.partition == partition)
-                    && position.topic.as_deref() == Some(topic.as_str())
-            }) {
-                let partition = position.partition as i32;
-                let (low, high) = consumer
-                    .fetch_watermarks(topic, partition, Duration::from_secs(10))
-                    .map_err(|error| {
-                        Error::Process(format!(
-                            "fetch Kafka watermarks for {topic}-{partition}: {error}"
-                        ))
-                    })?;
-                let offset = Self::validate_checkpoint_offset(position.offset, low, high)?;
-                assignment
-                    .add_partition_offset(topic, partition, Offset::Offset(offset))
-                    .map_err(|error| {
-                        Error::Process(format!("build Kafka restore assignment: {error}"))
-                    })?;
+        // Validate every restored offset against the broker's watermarks so a
+        // stale or out-of-range checkpoint fails the recovery here, keeping
+        // the previous valid checkpoint selected.
+        for position in &applicable {
+            let (low, high) = consumer
+                .fetch_watermarks(
+                    position.topic.as_deref().unwrap_or_default(),
+                    position.partition as i32,
+                    Duration::from_secs(10),
+                )
+                .map_err(|error| {
+                    Error::Process(format!(
+                        "fetch Kafka watermarks for {}-{}: {error}",
+                        position.topic.as_deref().unwrap_or_default(),
+                        position.partition
+                    ))
+                })?;
+            Self::validate_checkpoint_offset(position.offset, low, high)?;
+        }
+        match assigned_partition {
+            Some(partition) => {
+                // Explicit-partition mode: the checkpoint is merged into the
+                // complete configured assignment. Omitted configured
+                // partitions keep their configured start — a subset
+                // checkpoint never replaces the assignment with a subset.
+                let assignment = Self::merged_restore_assignment(
+                    &self.config.topics,
+                    partition,
+                    positions,
+                    self.config.start_from_latest,
+                );
+                consumer
+                    .assign(&assignment)
+                    .map_err(|error| Error::Process(format!("restore Kafka positions: {error}")))?;
+            }
+            None => {
+                // Subscription mode: keep the full subscription; seek each
+                // checkpointed partition to its offset. A partition the group
+                // has not assigned yet may reject the seek right after
+                // (re)connect — retry briefly for the assignment to arrive.
+                for position in &applicable {
+                    let offset =
+                        Self::validate_checkpoint_offset(position.offset, i64::MIN, i64::MAX)?;
+                    let topic = position.topic.as_deref().unwrap_or_default();
+                    let partition = position.partition as i32;
+                    let mut attempt = 0;
+                    loop {
+                        match consumer.seek(
+                            topic,
+                            partition,
+                            Offset::Offset(offset),
+                            Duration::from_secs(5),
+                        ) {
+                            Ok(()) => break,
+                            Err(error) if attempt < 2 => {
+                                attempt += 1;
+                                tracing::warn!(
+                                    %error, topic, partition,
+                                    "Kafka restore seek failed; waiting for group assignment"
+                                );
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                            Err(error) => {
+                                return Err(Error::Process(format!(
+                                    "restore Kafka position for {topic}-{partition}: {error}"
+                                )));
+                            }
+                        }
+                    }
+                }
             }
         }
-        if assignment.count() == 0 {
-            return Ok(());
-        }
-        consumer
-            .assign(&assignment)
-            .map_err(|error| Error::Process(format!("restore Kafka positions: {error}")))?;
+        // Seed the in-memory acknowledged frontier: a checkpoint taken
+        // immediately after restore (before any new acknowledgement) still
+        // reports the restored cursor instead of an empty position set.
+        self.frontier.seed(&applicable);
         Ok(())
     }
 
@@ -381,7 +485,7 @@ impl Input for KafkaInput {
 /// Kafka message acknowledgment
 pub struct KafkaAck {
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
-    acknowledged_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
+    frontier: Arc<CommitFrontier>,
     topic: String,
     partition: i32,
     offset: i64,
@@ -390,19 +494,35 @@ pub struct KafkaAck {
 #[async_trait]
 impl Ack for KafkaAck {
     async fn ack(&self) -> Result<(), Error> {
-        // Store the offset so it is committed by the periodic auto-commit.
-        // Only called after the downstream output confirms the write.
+        // Only called after the downstream output confirms the write. The
+        // frontier records the acknowledgement; the durable store advances to
+        // the CONTIGUOUS acknowledged next offset — a fan-out completing this
+        // branch before an earlier one leaves the store waiting at the gap so
+        // a crash never skips the unacknowledged records in between.
+        let position = SourcePosition {
+            topic: Some(self.topic.clone()),
+            partition: self.partition.max(0) as u32,
+            offset: u64::try_from(self.offset.saturating_add(1))
+                .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
+        };
+        let next_offset = match self.frontier.acknowledge(&position) {
+            AckAdvance::Pending { .. } => return Ok(()),
+            AckAdvance::Advanced { next_offset } => next_offset,
+            // A retry after the durable store failed: the frontier already
+            // advanced, only the store needs to catch up.
+            AckAdvance::AlreadyCovered => self
+                .frontier
+                .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
+                .unwrap_or(position.offset),
+        };
+        let store_offset_value = i64::try_from(next_offset.saturating_sub(1))
+            .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
         let consumer_mutex_guard = self.consumer.read().await;
-        if let Some(v) = &*consumer_mutex_guard {
-            v.store_offset(&self.topic, self.partition, self.offset)
+        if let Some(consumer) = &*consumer_mutex_guard {
+            consumer
+                .store_offset(&self.topic, self.partition, store_offset_value)
                 .map_err(|e| Error::Process(format!("Failed to store Kafka offset: {}", e)))?;
         }
-        let mut acknowledged = self.acknowledged_offsets.write().await;
-        let next_offset = self.offset.saturating_add(1);
-        let entry = acknowledged
-            .entry((self.topic.clone(), self.partition))
-            .or_insert(next_offset);
-        *entry = (*entry).max(next_offset);
         Ok(())
     }
 }
@@ -523,7 +643,7 @@ mod tests {
         assert!(input.current_positions().await.unwrap().is_empty());
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
-            acknowledged_offsets: input.acknowledged_offsets.clone(),
+            frontier: input.frontier.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
@@ -536,6 +656,146 @@ mod tests {
         assert_eq!(positions[0].topic.as_deref(), Some("test-topic"));
         assert_eq!(positions[0].partition, 0);
         assert_eq!(positions[0].offset, 101);
+    }
+
+    /// Task 3.3: out-of-order acknowledgements expose only the contiguous
+    /// frontier — an acknowledged offset beyond a gap does not advance the
+    /// checkpoint position past the unacknowledged records.
+    #[tokio::test]
+    async fn out_of_order_acknowledgements_wait_for_the_gap() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        let frontier = input.frontier.clone();
+        // Deliveries 5, 6, 7 (the frontier anchors at the first delivery).
+        frontier.anchor_delivery(&SourcePosition {
+            topic: Some("test-topic".into()),
+            partition: 0,
+            offset: 5,
+        });
+        let ack_at = |offset: i64| KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            topic: "test-topic".to_string(),
+            partition: 0,
+            offset,
+        };
+        // The later branch of a fan-out completes first.
+        ack_at(7).ack().await.unwrap();
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions[0].offset, 5, "the gap holds the frontier");
+        ack_at(6).ack().await.unwrap();
+        assert_eq!(input.current_positions().await.unwrap()[0].offset, 5);
+        // Closing the gap drains the contiguous run to 8 at once.
+        ack_at(5).ack().await.unwrap();
+        assert_eq!(input.current_positions().await.unwrap()[0].offset, 8);
+    }
+
+    /// Task 3.3: restored positions seed the in-memory frontier, so a
+    /// checkpoint immediately after restore reports the restored cursor.
+    #[tokio::test]
+    async fn restored_positions_seed_the_checkpoint_cursor() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: false,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        // Seed directly (restore_positions itself needs a broker for
+        // watermark validation); this is exactly what it does on success.
+        input.frontier.seed(&[SourcePosition {
+            topic: Some("test-topic".into()),
+            partition: 3,
+            offset: 42,
+        }]);
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].partition, 3);
+        assert_eq!(positions[0].offset, 42);
+        // A new acknowledgement continues from the restored cursor.
+        let ack = KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            topic: "test-topic".to_string(),
+            partition: 3,
+            offset: 42,
+        };
+        ack.ack().await.unwrap();
+        assert_eq!(input.current_positions().await.unwrap()[0].offset, 43);
+    }
+
+    /// Task 3.2: restoring a subset of configured partitions merges the
+    /// checkpoint into the complete assignment instead of replacing it —
+    /// omitted partitions keep their configured start.
+    #[test]
+    fn merged_restore_assignment_retains_omitted_partitions() {
+        let topics = vec!["orders".to_string(), "payments".to_string()];
+        let assignment = KafkaInput::merged_restore_assignment(
+            &topics,
+            2,
+            &[
+                SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 2,
+                    offset: 101,
+                },
+                // A different task's partition must be ignored.
+                SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 5,
+                    offset: 900,
+                },
+            ],
+            false,
+        );
+        assert_eq!(
+            assignment.count(),
+            2,
+            "every configured topic stays assigned"
+        );
+        let elements: Vec<(String, i32, Offset)> = assignment
+            .elements()
+            .iter()
+            .map(|element| {
+                (
+                    element.topic().to_string(),
+                    element.partition(),
+                    element.offset(),
+                )
+            })
+            .collect();
+        let orders = elements
+            .iter()
+            .find(|(topic, _, _)| topic == "orders")
+            .unwrap();
+        assert_eq!(orders.1, 2);
+        assert_eq!(orders.2, Offset::Offset(101));
+        let payments = elements
+            .iter()
+            .find(|(topic, _, _)| topic == "payments")
+            .unwrap();
+        assert_eq!(payments.2, Offset::Beginning);
+
+        let latest = KafkaInput::merged_restore_assignment(&topics, 2, &[], true);
+        assert!(latest
+            .elements()
+            .iter()
+            .all(|element| element.offset() == Offset::End));
     }
 
     #[test]

@@ -41,10 +41,12 @@ impl Input for ForeverInput {
     async fn current_positions(
         &self,
     ) -> Result<Vec<arkflow_core::checkpoint::SourcePosition>, Error> {
-        Ok(vec![arkflow_core::checkpoint::SourcePosition::for_partition(
-            0,
-            self.reads.load(std::sync::atomic::Ordering::SeqCst) as u64,
-        )])
+        Ok(vec![
+            arkflow_core::checkpoint::SourcePosition::for_partition(
+                0,
+                self.reads.load(std::sync::atomic::Ordering::SeqCst) as u64,
+            ),
+        ])
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
@@ -242,7 +244,6 @@ fn tempfile_dir() -> std::path::PathBuf {
 
 // ---------- fault-injection (task 2.6) ----------
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_failure_fails_checkpoint_but_data_continues() {
     // A state backend whose snapshot() errors: the checkpoint must fail
@@ -250,21 +251,46 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
     struct BrokenState;
     #[async_trait]
     impl arkflow_core::state::StateBackend for BrokenState {
-        fn format_version(&self) -> u32 { 1 }
-        fn get(&self, _n: &str, _k: &[u8]) -> Result<Option<Vec<u8>>, Error> { Ok(None) }
-        fn put_with_ttl(&self, _n: &str, _k: &[u8], _v: &[u8], _t: Option<u64>, _now: u64) -> Result<(), Error> { Ok(()) }
-        fn update_i64(&self, _n: &str, _k: &[u8], _d: i64) -> Result<i64, Error> { Ok(0) }
-        fn delete(&self, _n: &str, _k: &[u8]) -> Result<bool, Error> { Ok(false) }
-        fn purge_expired(&self, _now: u64) -> Result<u64, Error> { Ok(0) }
-        fn scan(&self, _n: &str) -> Result<Vec<arkflow_core::state::StateEntry>, Error> { Ok(vec![]) }
+        fn format_version(&self) -> u32 {
+            1
+        }
+        fn get(&self, _n: &str, _k: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            Ok(None)
+        }
+        fn put_with_ttl(
+            &self,
+            _n: &str,
+            _k: &[u8],
+            _v: &[u8],
+            _t: Option<u64>,
+            _now: u64,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn update_i64(&self, _n: &str, _k: &[u8], _d: i64) -> Result<i64, Error> {
+            Ok(0)
+        }
+        fn delete(&self, _n: &str, _k: &[u8]) -> Result<bool, Error> {
+            Ok(false)
+        }
+        fn purge_expired(&self, _now: u64) -> Result<u64, Error> {
+            Ok(0)
+        }
+        fn scan(&self, _n: &str) -> Result<Vec<arkflow_core::state::StateEntry>, Error> {
+            Ok(vec![])
+        }
         fn snapshot_at(&self, _now: u64) -> Result<arkflow_core::state::StateSnapshot, Error> {
             Err(Error::Process("injected snapshot failure".into()))
         }
-        fn restore(&self, _s: &arkflow_core::state::StateSnapshot) -> Result<(), Error> { Ok(()) }
+        fn restore(&self, _s: &arkflow_core::state::StateSnapshot) -> Result<(), Error> {
+            Ok(())
+        }
         fn metrics(&self) -> Result<arkflow_core::state::StateMetrics, Error> {
             Ok(Default::default())
         }
-        fn close(&self) -> Result<(), Error> { Ok(()) }
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     let spec = kernel_job_spec();
@@ -289,7 +315,10 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
         .filter_map(|chain| chain.source.clone())
         .collect::<Vec<_>>();
     let mut states = BTreeMap::new();
-    states.insert("source-0".to_string(), Arc::new(BrokenState) as Arc<dyn StateBackend>);
+    states.insert(
+        "source-0".to_string(),
+        Arc::new(BrokenState) as Arc<dyn StateBackend>,
+    );
 
     let cancellation = CancellationToken::new();
     let handle = KernelJobRunner::spawn_with_cancellation(
@@ -306,12 +335,18 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     // The injected failure surfaces as a snapshot error (checkpoint Failed).
     let snapshot_result = handle.checkpoint_snapshot().await;
-    assert!(snapshot_result.is_err(), "injected snapshot failure must surface");
+    assert!(
+        snapshot_result.is_err(),
+        "injected snapshot failure must surface"
+    );
     // Data continues after the failed checkpoint.
     let after = adapter.output.written.lock().unwrap().clone();
     tokio::time::sleep(Duration::from_millis(150)).await;
     let later = adapter.output.written.lock().unwrap().clone();
-    assert!(later > after, "data must keep flowing after a failed checkpoint ({after} → {later})");
+    assert!(
+        later > after,
+        "data must keep flowing after a failed checkpoint ({after} → {later})"
+    );
     handle.stop();
     let watcher = handle.watcher();
     tokio::time::timeout(Duration::from_secs(5), watcher)
@@ -332,7 +367,9 @@ async fn recovery_restores_positions_before_new_reads() {
     }
     #[async_trait]
     impl Input for PositionRecordingInput {
-        async fn connect(&self) -> Result<(), Error> { Ok(()) }
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -352,12 +389,16 @@ async fn recovery_restores_positions_before_new_reads() {
         async fn current_positions(
             &self,
         ) -> Result<Vec<arkflow_core::checkpoint::SourcePosition>, Error> {
-            Ok(vec![arkflow_core::checkpoint::SourcePosition::for_partition(
-                0,
-                self.reads.load(std::sync::atomic::Ordering::SeqCst) as u64,
-            )])
+            Ok(vec![
+                arkflow_core::checkpoint::SourcePosition::for_partition(
+                    0,
+                    self.reads.load(std::sync::atomic::Ordering::SeqCst) as u64,
+                ),
+            ])
         }
-        async fn close(&self) -> Result<(), Error> { Ok(()) }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     let spec = kernel_job_spec();

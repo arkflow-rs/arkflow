@@ -1484,8 +1484,12 @@ impl Hub {
             NodeRecord {
                 resource,
                 session_token: session_token.clone(),
-                boot_id: old.as_ref().and_then(|record| record.boot_id.clone()),
-                report_seq: old.as_ref().map(|record| record.report_seq).unwrap_or(0),
+                // The registration session identity IS the report boot
+                // identity: every newly registered session starts its
+                // report sequence at zero, and delayed reports from an
+                // older session are rejected by comparison against it.
+                boot_id: Some(session_token.clone()),
+                report_seq: 0,
                 commands: old
                     .as_ref()
                     .map(|record| record.commands.clone())
@@ -1597,11 +1601,25 @@ impl Hub {
             .as_deref()
             .is_some_and(|boot_id| node.boot_id.as_deref() != Some(boot_id));
         if let Some(boot_id) = report.boot_id.as_deref() {
-            if node.boot_id.as_deref() == Some(boot_id) && report.report_seq <= node.report_seq {
-                return Ok(());
+            match node.boot_id.as_deref() {
+                Some(current) if current == boot_id => {
+                    // Same session: the sequence cursor rejects replays.
+                    if report.report_seq <= node.report_seq {
+                        return Ok(());
+                    }
+                    node.report_seq = report.report_seq;
+                }
+                Some(_) => {
+                    // A delayed report from an older session (the node has
+                    // re-registered since): acknowledge without regressing
+                    // the new session's observed state.
+                    return Ok(());
+                }
+                None => {
+                    node.boot_id = Some(boot_id.to_owned());
+                    node.report_seq = report.report_seq;
+                }
             }
-            node.boot_id = Some(boot_id.to_owned());
-            node.report_seq = report.report_seq;
         }
         let now = now_ms();
         node.resource.last_seen_at_ms = now;
@@ -2102,7 +2120,7 @@ impl Hub {
         }
         operation.state = result.state;
         operation.progress = result.progress;
-        operation.error = result.error;
+        operation.error = result.error.clone();
         operation.failure_class = result.failure_class.clone();
         if matches!(
             result.state,
@@ -2156,10 +2174,12 @@ impl Hub {
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                let expected_nodes = checkpoint_operations
+                let fallback_nodes = checkpoint_operations
                     .iter()
                     .map(|operation| operation.node_id.clone())
                     .collect::<BTreeSet<_>>();
+                let (expected_nodes, planned_task_ids) =
+                    self.checkpoint_scope(&updated, &fallback_nodes).await?;
                 let succeeded_nodes = checkpoint_operations
                     .iter()
                     .filter(|operation| operation.state == HubOperationState::Succeeded)
@@ -2169,7 +2189,7 @@ impl Hub {
                     && checkpoint_id.is_some()
                     && !expected_nodes.is_empty()
                 {
-                    expected_nodes.is_subset(&succeeded_nodes)
+                    expected_nodes == succeeded_nodes
                 } else {
                     false
                 };
@@ -2216,6 +2236,7 @@ impl Hub {
                                     .iter()
                                     .map(|operation| operation.node_id.clone())
                                     .collect::<Vec<_>>(),
+                                "planned_task_ids": planned_task_ids,
                             })),
                             updated.generation,
                             None,
@@ -2255,29 +2276,199 @@ impl Hub {
                 )
                 .await?;
             }
-            let observed_state = if matches!(
-                result.state,
+            if matches!(updated.operation.as_str(), "job_start" | "job_stop") {
+                // Task 7.1: derive the Job-level observed state from the
+                // AGGREGATE of every planned assignment operation for the
+                // same generation and action. One peer's acknowledgement or
+                // transient failure never overwrites healthy peers, and the
+                // Job reports running/stopped only after EVERY expected
+                // assignment succeeded.
+                match self.aggregate_job_observed_state(&updated, &result).await? {
+                    Some(observed_state) => {
+                        let _ = self
+                            .observe_job(
+                                &updated.resource_id,
+                                updated.generation,
+                                &observed_state,
+                                None,
+                                updated.error.as_deref(),
+                            )
+                            .await?;
+                    }
+                    None => {
+                        // The aggregate is still converging (pending
+                        // assignments or retryable degradation): keep the
+                        // current observed state and convergence label.
+                    }
+                }
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Resolve the complete node/task scope for one checkpoint round. The
+    /// checkpoint operation list contains only nodes that were online when
+    /// dispatch ran, so it cannot be used as the expected set by itself: an
+    /// offline node would disappear and a partial artifact could be sealed.
+    /// Prefer the Job's explicit placement, otherwise retain the nodes from
+    /// the generation's active start assignments.
+    async fn checkpoint_scope(
+        &self,
+        operation: &HubOperation,
+        fallback_nodes: &BTreeSet<String>,
+    ) -> Result<(BTreeSet<String>, Vec<String>), HubError> {
+        let Some(job) = self.job(&operation.resource_id).await? else {
+            return Ok((fallback_nodes.clone(), Vec::new()));
+        };
+        let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json)
+            .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
+        let plan = arkflow_core::job::JobPlan::compile(spec)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        let candidates = if job.node_ids.is_empty() {
+            let nodes = self
+                .operations
+                .read()
+                .await
+                .values()
+                .filter(|candidate| {
+                    candidate.resource_id == operation.resource_id
+                        && candidate.operation == "job_start"
+                        && candidate.generation == operation.generation
+                        && !matches!(
+                            candidate.state,
+                            HubOperationState::Failed
+                                | HubOperationState::TimedOut
+                                | HubOperationState::NodeUnavailable
+                                | HubOperationState::Cancelled
+                                | HubOperationState::Superseded
+                        )
+                })
+                .map(|candidate| candidate.node_id.clone())
+                .collect::<BTreeSet<_>>();
+            if nodes.is_empty() {
+                fallback_nodes.iter().cloned().collect::<Vec<_>>()
+            } else {
+                nodes.into_iter().collect::<Vec<_>>()
+            }
+        } else {
+            job.node_ids.clone()
+        };
+        let assignments = plan.assignments_for_nodes(&candidates, operation.generation);
+        let expected_nodes = assignments
+            .iter()
+            .map(|assignment| assignment.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let planned_task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        Ok((expected_nodes, planned_task_ids))
+    }
+
+    /// Aggregate the Job-level observed state across every assignment
+    /// operation of the same (resource, generation, action). Returns:
+    /// * `Some("running" | "stopped")` when every expected assignment
+    ///   succeeded (the terminal success form for the action);
+    /// * `Some("failed")` when the COMPLETE set has been evaluated and an
+    ///   assignment reports a non-retryable execution failure;
+    /// * `None` while any assignment is still queued/dispatched/running or
+    ///   degraded-but-retryable — the current observed snapshot stays.
+    async fn aggregate_job_observed_state(
+        &self,
+        updated: &HubOperation,
+        result: &CommandResult,
+    ) -> Result<Option<String>, HubError> {
+        let peers = self
+            .operations
+            .read()
+            .await
+            .values()
+            .filter(|operation| {
+                operation.resource_id == updated.resource_id
+                    && operation.operation == updated.operation
+                    && operation.generation == updated.generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let fallback_nodes = peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let (expected_nodes, _) = self.checkpoint_scope(updated, &fallback_nodes).await?;
+        let expected_nodes = if expected_nodes.is_empty() {
+            fallback_nodes
+        } else {
+            expected_nodes
+        };
+        let observed_nodes = peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        // A command result is only one assignment's result. Missing planned
+        // nodes (including offline nodes filtered before dispatch) keep the
+        // Job converging instead of making the first successful peer look
+        // like a fully running Job.
+        if observed_nodes != expected_nodes {
+            return Ok(None);
+        }
+        let terminal_success = updated.operation == "job_stop";
+        let succeeded = |state: &HubOperationState| {
+            matches!(
+                state,
                 HubOperationState::Succeeded | HubOperationState::Running
-            ) {
-                if updated.operation == "job_stop" {
+            )
+        };
+        let permanently_failed = |state: &HubOperationState| {
+            matches!(
+                state,
+                HubOperationState::Failed | HubOperationState::Superseded
+            )
+        };
+        let _retryable = |state: &HubOperationState| {
+            matches!(
+                state,
+                HubOperationState::Queued
+                    | HubOperationState::Dispatched
+                    | HubOperationState::Acknowledged
+                    | HubOperationState::TimedOut
+                    | HubOperationState::NodeUnavailable
+            )
+        };
+        // Single-assignment operations keep the direct derivation.
+        if peers.len() <= 1 {
+            return Ok(Some(if succeeded(&result.state) {
+                if terminal_success {
+                    "stopped".to_string()
+                } else {
+                    "running".to_string()
+                }
+            } else if permanently_failed(&result.state) {
+                "failed".to_string()
+            } else {
+                // A retryable single-node outcome stays observed-neutral.
+                return Ok(None);
+            }));
+        }
+        if peers.iter().all(|peer| succeeded(&peer.state)) {
+            return Ok(Some(
+                if terminal_success {
                     "stopped"
                 } else {
                     "running"
                 }
-            } else {
-                "failed"
-            };
-            let _ = self
-                .observe_job(
-                    &updated.resource_id,
-                    updated.generation,
-                    observed_state,
-                    None,
-                    updated.error.as_deref(),
-                )
-                .await?;
+                .to_string(),
+            ));
         }
-        Ok(updated)
+        if peers
+            .iter()
+            .all(|peer| succeeded(&peer.state) || permanently_failed(&peer.state))
+            && peers.iter().any(|peer| permanently_failed(&peer.state))
+        {
+            return Ok(Some("failed".to_string()));
+        }
+        // Pending, running, or degraded-retryable peers: keep observing.
+        Ok(None)
     }
 
     pub async fn nodes(&self) -> Vec<HubNode> {
@@ -3452,7 +3643,12 @@ fn recovery_record_is_compatible(
     spec: &arkflow_core::job::JobSpec,
     record: &JobCheckpointRecord,
 ) -> bool {
-    record.job_version == spec.version.0 && record.format_version == job_state_format_version(spec)
+    // The same version-direction rule the shared recovery evaluator applies
+    // for the Agent and the repository: an equal state format permits a
+    // TARGET VERSION UPGRADE (a savepoint written by an older Job version
+    // restoring into the new one); downgrades and format changes have no
+    // migration path and stay rejected on both sides.
+    record.format_version == job_state_format_version(spec) && record.job_version <= spec.version.0
 }
 
 fn job_state_format_version(spec: &arkflow_core::job::JobSpec) -> u32 {
@@ -3493,9 +3689,21 @@ mod tests {
             updated_at_ms: 2,
         };
         assert!(recovery_record_is_compatible(&spec, &compatible));
-        let mut old_version = compatible.clone();
-        old_version.job_version = 1;
-        assert!(!recovery_record_is_compatible(&spec, &old_version));
+        // A savepoint written by an OLDER Job version with the same state
+        // format is a compatible upgrade target (the shared evaluator's
+        // version-direction rule); a NEWER artifact has no downgrade path.
+        let mut upgrade = compatible.clone();
+        upgrade.job_version = 1;
+        assert!(
+            recovery_record_is_compatible(&spec, &upgrade),
+            "an equal-format older artifact restores into the newer version"
+        );
+        let mut downgrade = compatible.clone();
+        downgrade.job_version = 3;
+        assert!(
+            !recovery_record_is_compatible(&spec, &downgrade),
+            "downgrades have no compatibility path"
+        );
         let mut old_format = compatible;
         old_format.format_version = 2;
         assert!(!recovery_record_is_compatible(&spec, &old_format));
@@ -3909,7 +4117,7 @@ mod tests {
         hub.report(NodeReport {
             auth: AgentAuth {
                 node_id: "node-a".into(),
-                session_token: session.session_token,
+                session_token: session.session_token.clone(),
             },
             version: "agent-1".into(),
             state: "online".into(),
@@ -3920,7 +4128,7 @@ mod tests {
             metrics: BTreeMap::new(),
             configuration: None,
             configuration_version: Some("cfg-health".into()),
-            boot_id: Some("boot-health".into()),
+            boot_id: Some(session.session_token.clone()),
             report_seq: 1,
         })
         .await
@@ -4014,7 +4222,7 @@ mod tests {
         hub.report(NodeReport {
             auth: AgentAuth {
                 node_id: "node-a".into(),
-                session_token: node_a.session_token,
+                session_token: node_a.session_token.clone(),
             },
             version: "agent-state".into(),
             state: "online".into(),
@@ -4025,7 +4233,7 @@ mod tests {
             metrics: BTreeMap::new(),
             configuration: None,
             configuration_version: Some("cfg-state-a".into()),
-            boot_id: Some("boot-state".into()),
+            boot_id: Some(node_a.session_token.clone()),
             report_seq: 1,
         })
         .await
@@ -4197,7 +4405,7 @@ mod tests {
             .await
             .unwrap();
             hub.report(NodeReport {
-                auth,
+                auth: auth.clone(),
                 version: "agent-e2e".into(),
                 state: "online".into(),
                 capabilities: vec!["configuration".into()],
@@ -4207,7 +4415,7 @@ mod tests {
                 metrics: BTreeMap::from([("streams_total".into(), 0.0)]),
                 configuration: None,
                 configuration_version: Some("cfg-e2e".into()),
-                boot_id: Some(format!("boot-{node_id}")),
+                boot_id: Some(auth.session_token.clone()),
                 report_seq: 1,
             })
             .await
@@ -4275,7 +4483,7 @@ mod tests {
         hub2.report(NodeReport {
             auth: AgentAuth {
                 node_id: "node-a".into(),
-                session_token: session2.session_token,
+                session_token: session2.session_token.clone(),
             },
             version: "test".into(),
             state: "online".into(),
@@ -4286,7 +4494,7 @@ mod tests {
             metrics: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
-            boot_id: Some("boot-2".into()),
+            boot_id: Some(session2.session_token.clone()),
             report_seq: 1,
         })
         .await
@@ -4507,7 +4715,7 @@ mod tests {
             metrics: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
-            boot_id: Some("boot-1".into()),
+            boot_id: Some(session.session_token.clone()),
             report_seq,
         };
         hub.report(report(2, "running")).await.unwrap();
@@ -5217,5 +5425,176 @@ mod tests {
                 && command.resource_id == "orders"
                 && command.generation == job.generation
         }));
+    }
+}
+
+#[cfg(test)]
+mod session_report_tests {
+    use super::*;
+
+    fn config() -> HubConfig {
+        HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node-secret".into()),
+            lease_ttl_ms: 1000,
+            poll_interval_ms: 1000,
+        }
+    }
+
+    fn stream(state: &str) -> arkflow_core::control::StreamStatus {
+        serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "state": state,
+            "metrics": {
+                "input_batches": 0,
+                "input_messages": 0,
+                "processing_errors": 0,
+                "output_batches": 0,
+                "output_messages": 0,
+                "input_errors": 0,
+                "input_reconnects": 0,
+                "output_errors": 0,
+                "restarts": 0,
+                "kernel_chains": {},
+                "in_flight": 0,
+                "mean_latency_us": 0,
+                "checkpoint_duration_ms": 0,
+                "checkpoint_failures": 0,
+                "watermark_lag_ms": 0,
+                "late_events": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn registered_hub() -> (Hub, crate::hub::RegisterResponse) {
+        let hub = Hub::with_storage(
+            config(),
+            crate::storage::StorageActor::start(
+                crate::storage::ControlPlaneStore::in_memory().unwrap(),
+                4,
+            ),
+        );
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+            })
+            .await
+            .unwrap();
+        (hub, session)
+    }
+
+    /// Task 7.3: a newly registered session receives a fresh report cursor —
+    /// sequence 1 of the new session identity is accepted even though the
+    /// previous session had already reported higher sequences.
+    #[tokio::test]
+    async fn new_session_resets_the_report_cursor() {
+        let (hub, first) = registered_hub().await;
+        let report = |session: &crate::hub::RegisterResponse, seq: u64, state: &str| NodeReport {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: session.session_token.clone(),
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![stream(state)],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some(session.session_token.clone()),
+            report_seq: seq,
+        };
+        hub.report(report(&first, 7, "running")).await.unwrap();
+        // Re-register: a fresh session identity with a fresh cursor.
+        let second = hub
+            .register(RegisterRequest {
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+            })
+            .await
+            .unwrap();
+        // Sequence 1 of the new session is accepted (not stale under the
+        // previous session's cursor of 7).
+        hub.report(report(&second, 1, "failed")).await.unwrap();
+        let streams = hub.streams(Some("n1")).await;
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0].1.state,
+            arkflow_core::control::StreamState::Failed
+        );
+    }
+
+    /// Task 7.3: a delayed report from an older session arrives after the new
+    /// session registered — the Hub acknowledges it without changing the new
+    /// session's observed state.
+    #[tokio::test]
+    async fn delayed_report_from_an_old_session_is_ignored() {
+        let (hub, first) = registered_hub().await;
+        let second = hub
+            .register(RegisterRequest {
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+            })
+            .await
+            .unwrap();
+        // The new session reports a healthy stream.
+        hub.report(NodeReport {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: second.session_token.clone(),
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![stream("running")],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some(second.session_token.clone()),
+            report_seq: 1,
+        })
+        .await
+        .unwrap();
+        // A delayed report from the OLD session (stale boot identity) claims
+        // a failure: the Hub must not regress the observed snapshot.
+        // The old session token is no longer authenticated after
+        // re-registration, so this surfaces as Unauthorized.
+        let stale = hub
+            .report(NodeReport {
+                auth: AgentAuth {
+                    node_id: "n1".into(),
+                    session_token: first.session_token.clone(),
+                },
+                version: "test".into(),
+                state: "online".into(),
+                capabilities: vec![],
+                streams: vec![stream("failed")],
+                operations: vec![],
+                events: vec![],
+                metrics: BTreeMap::new(),
+                configuration: None,
+                configuration_version: None,
+                boot_id: Some(first.session_token.clone()),
+                report_seq: 99,
+            })
+            .await;
+        assert!(stale.is_err(), "the old session token is revoked");
+        let streams = hub.streams(Some("n1")).await;
+        assert_eq!(
+            streams[0].1.state,
+            arkflow_core::control::StreamState::Running
+        );
     }
 }

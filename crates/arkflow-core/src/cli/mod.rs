@@ -135,6 +135,17 @@ impl Cli {
             println!("Invalid configuration: {}", e);
             process::exit(1);
         }
+        let validation = crate::configuration::validate_config(&config);
+        if !validation.valid {
+            let details = validation
+                .errors
+                .iter()
+                .map(|issue| format!("{}: {}", issue.path, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            println!("Invalid configuration: {details}");
+            process::exit(1);
+        }
 
         // If you just verify the configuration, exit it
         if matches.get_flag("validate") {

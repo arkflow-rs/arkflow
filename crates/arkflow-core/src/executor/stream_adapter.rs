@@ -6,13 +6,20 @@
 //! exactly the components the legacy runtime would have built — including
 //! codecs, names, temporary tables, and the WAL-backed input wrapper.
 
-use crate::Error;
 use crate::executor::stream_compiler::CODEC_PAYLOAD_KEY;
 use crate::input::{Input, InputConfig};
 use crate::job::{JobComponentAdapter, OperatorSpec, SinkSpec, SourceSpec};
-use crate::{codec::CodecConfig, output::{Output, OutputConfig}, processor::{Processor, ProcessorConfig}, Resource};
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, UInt32Array, UInt64Array};
 use crate::wal::{Wal, WalAck, WalConfig};
+use crate::Error;
+use crate::{
+    codec::CodecConfig,
+    output::{Output, OutputConfig},
+    processor::{Processor, ProcessorConfig},
+    Resource,
+};
+use datafusion::arrow::array::{
+    Array, Int32Array, Int64Array, MapArray, StringArray, UInt32Array, UInt64Array,
+};
 use std::sync::Arc;
 
 /// Adapter for one compiled stream: rebuilds components from the original
@@ -68,6 +75,18 @@ impl StreamJobAdapter {
     pub fn wal(&self) -> Option<&Arc<Wal>> {
         self.wal.as_ref()
     }
+
+    /// Close the adapter's WAL: stop the background flusher, flush pending
+    /// appends, and release the store handle's exclusive lock. Dry-run and
+    /// deep-validation paths must call this — including on their error paths
+    /// — before the real runtime rebuilds the adapter and reopens the same
+    /// WAL path.
+    pub async fn close(&self) -> Result<(), Error> {
+        match &self.wal {
+            Some(wal) => wal.close().await,
+            None => Ok(()),
+        }
+    }
 }
 
 fn decode_codec(payload: &serde_json::Value) -> Result<Option<CodecConfig>, Error> {
@@ -96,7 +115,9 @@ pub struct WalInput {
     wal: Arc<Wal>,
     /// Unacked-entry replay queue, initialized on the first read (the
     /// component-builder trait is sync; WAL reads are async).
-    replay: tokio::sync::OnceCell<tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>>,
+    replay: tokio::sync::OnceCell<
+        tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
+    >,
     /// Checkpoint positions are installed before the first read.  WAL
     /// entries are durable independently of the connector cursor, so the
     /// replay queue must discard entries already covered by a checkpoint
@@ -128,11 +149,17 @@ impl WalInput {
             .column_by_name(crate::meta_columns::PARTITION)
             .and_then(|column| {
                 if let Some(array) = column.as_any().downcast_ref::<UInt32Array>() {
-                    Some((0..array.len()).map(|row| array.value(row) as u64).collect::<Vec<_>>())
+                    Some(
+                        (0..array.len())
+                            .map(|row| array.value(row) as u64)
+                            .collect::<Vec<_>>(),
+                    )
                 } else if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
-                    Some((0..array.len())
-                        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
-                        .collect::<Option<Vec<_>>>()?)
+                    Some(
+                        (0..array.len())
+                            .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
+                            .collect::<Option<Vec<_>>>()?,
+                    )
                 } else {
                     None
                 }
@@ -142,11 +169,17 @@ impl WalInput {
             .column_by_name(crate::meta_columns::OFFSET)
             .and_then(|column| {
                 if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
-                    Some((0..array.len()).map(|row| array.value(row)).collect::<Vec<_>>())
+                    Some(
+                        (0..array.len())
+                            .map(|row| array.value(row))
+                            .collect::<Vec<_>>(),
+                    )
                 } else if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
-                    Some((0..array.len())
-                        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
-                        .collect::<Option<Vec<_>>>()?)
+                    Some(
+                        (0..array.len())
+                            .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
+                            .collect::<Option<Vec<_>>>()?,
+                    )
                 } else {
                     None
                 }
@@ -157,9 +190,7 @@ impl WalInput {
         // the WAL sequence only for the local, topic-less fallback position.
         let Some((partitions, offsets)) = partition.zip(offset) else {
             return positions.iter().any(|position| {
-                position.topic.is_none()
-                    && position.partition == 0
-                    && seq < position.offset
+                position.topic.is_none() && position.partition == 0 && seq < position.offset
             });
         };
         if partitions.len() != offsets.len() || partitions.len() != batch.len() {
@@ -236,7 +267,10 @@ impl Input for WalInput {
         Ok((batch, Arc::new(WalAck::new(self.wal.clone(), seq, ack))))
     }
 
-    async fn restore_positions(&self, positions: &[crate::checkpoint::SourcePosition]) -> Result<(), Error> {
+    async fn restore_positions(
+        &self,
+        positions: &[crate::checkpoint::SourcePosition],
+    ) -> Result<(), Error> {
         *self.checkpoint_positions.write().await = Some(positions.to_vec());
         self.inner.restore_positions(positions).await
     }
@@ -250,7 +284,9 @@ impl Input for WalInput {
         // from the WAL.  The offset is expressed as the next sequence, just
         // like the Kafka connector's checkpoint position.
         let next = self.wal.cursor().await?.saturating_add(1);
-        Ok(vec![crate::checkpoint::SourcePosition::for_partition(0, next)])
+        Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+            0, next,
+        )])
     }
 
     fn supports_partitioning(&self) -> bool {
@@ -262,14 +298,23 @@ impl Input for WalInput {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        self.inner.close().await
+        // Close the wrapped connector first (stop its consumer/subscription),
+        // then stop the WAL flusher, flush pending appends, and release the
+        // redb handle so a replacement stream can reopen the same path.
+        // `Wal::close` is idempotent, so a repeated close stays a no-op.
+        let inner_result = self.inner.close().await;
+        let wal_result = self.wal.close().await;
+        match (inner_result, wal_result) {
+            (Err(inner), Err(wal)) => Err(Error::Process(format!(
+                "failed to close wrapped input ({inner}); failed to close WAL ({wal})"
+            ))),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
-fn batch_topic(
-    batch: &datafusion::arrow::record_batch::RecordBatch,
-    row: usize,
-) -> Option<String> {
+fn batch_topic(batch: &datafusion::arrow::record_batch::RecordBatch, row: usize) -> Option<String> {
     let column = batch.column_by_name(crate::meta_columns::EXT)?;
     let map = column.as_any().downcast_ref::<MapArray>()?;
     let entries = map.entries();
@@ -278,9 +323,8 @@ fn batch_topic(
     let offsets = map.offsets();
     let start = offsets.get(row).copied()? as usize;
     let end = offsets.get(row + 1).copied()? as usize;
-    (start..end).find_map(|index| {
-        (keys.value(index) == "topic").then(|| values.value(index).to_owned())
-    })
+    (start..end)
+        .find_map(|index| (keys.value(index) == "topic").then(|| values.value(index).to_owned()))
 }
 
 impl JobComponentAdapter for StreamJobAdapter {
@@ -383,7 +427,11 @@ mod tests {
 
     fn metadata_batch(partition: u32, offset: u64, topic: &str) -> crate::MessageBatchRef {
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
             vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap();
@@ -434,8 +482,16 @@ mod tests {
             .unwrap(),
         ));
         let position = SourcePosition::for_partition(0, 3);
-        assert!(WalInput::batch_is_covered_by_checkpoint(2, &batch, &[position.clone()]));
-        assert!(!WalInput::batch_is_covered_by_checkpoint(3, &batch, &[position]));
+        assert!(WalInput::batch_is_covered_by_checkpoint(
+            2,
+            &batch,
+            &[position.clone()]
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            3,
+            &batch,
+            &[position]
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -465,5 +521,101 @@ mod tests {
         assert_eq!(entries.front().unwrap().0, 2);
 
         wal.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wal_lifecycle_tests {
+    use super::*;
+    use crate::wal::{SyncPolicy, Wal, WalConfig};
+
+    struct EmptyInput;
+
+    #[async_trait::async_trait]
+    impl Input for EmptyInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn trivial_batch() -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(
+            datafusion::arrow::record_batch::RecordBatch::try_new(
+                Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                    datafusion::arrow::datatypes::Field::new(
+                        "value",
+                        datafusion::arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
+                ])),
+                vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    1,
+                ]))],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// Task 2.3: a normal shutdown closes the wrapped connector, stops and
+    /// flushes the WAL flusher, and releases the redb handle so the same
+    /// path reopens without an exclusive-lock failure — including appends
+    /// still pending under `group-commit`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_close_flushes_pending_and_releases_the_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            SyncPolicy::GroupCommit,
+        );
+        let wal = Wal::open(&config).unwrap();
+        // A pending append the background flusher has not committed yet.
+        wal.append(&trivial_batch()).await.unwrap();
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+
+        input.close().await.unwrap();
+        // Idempotent close.
+        input.close().await.unwrap();
+        // redb releases its flock when the last handle drops: the closed
+        // WalInput and the test's reference both go away before the reopen,
+        // mirroring the runtime dropping the finished adapter.
+        drop(input);
+        drop(wal);
+
+        // The same path reopens (no exclusive lock) and the pending entry
+        // survived the close-time flush.
+        let reopened = Wal::open(&config).unwrap();
+        let pending = reopened.read_after_cursor().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        reopened.close().await.unwrap();
+    }
+
+    /// Task 2.4's companion: a WAL opened during validation or a partial
+    /// startup must be closed before another adapter opens the same path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_close_after_partial_startup_releases_the_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        {
+            let wal = Wal::open(&config).unwrap();
+            let input = WalInput::new(Arc::new(EmptyInput), wal);
+            // Simulate a partial startup: nothing read, immediate close.
+            input.close().await.unwrap();
+        }
+        // The next adapter can open the same redb path.
+        let second = Wal::open(&config).unwrap();
+        second.close().await.unwrap();
     }
 }

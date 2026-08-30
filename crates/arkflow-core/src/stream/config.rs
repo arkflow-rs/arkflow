@@ -20,8 +20,8 @@
 //! configuration type as the compiler's input and the control plane's
 //! resource identity.
 
-use crate::Error;
 use crate::wal::WalConfig;
+use crate::Error;
 
 /// Stream configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
