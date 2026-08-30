@@ -56,6 +56,9 @@ pub struct KernelJobHandle {
     /// `RuntimeMetrics` in every chain hook, so Agent jobs and local streams
     /// observe the same per-chain counters and checkpoint timings.
     metrics: Arc<KernelMetrics>,
+    /// State format configured by the Job, including stateless Jobs whose
+    /// checkpoint reports carry empty snapshots.
+    state_format: u32,
     /// Notified once with the graph's result when the runner task finishes.
     completion: Completion,
 }
@@ -192,18 +195,7 @@ impl KernelJobHandle {
         // contract, not whatever the first report happened to carry: a
         // stateless chain's empty default-format snapshot never vetoes a Job
         // configured with another state format.
-        let format_version = self
-            .states
-            .values()
-            .next()
-            .map(|state| state.format_version())
-            .or_else(|| {
-                snapshots
-                    .values()
-                    .map(|snapshot| snapshot.state.format_version)
-                    .max()
-            })
-            .unwrap_or(1);
+        let format_version = self.state_format;
         let mut state_entries = BTreeMap::<(String, Vec<u8>), StateEntry>::new();
         let mut positions = Vec::new();
         let mut watermarks = BTreeMap::new();
@@ -375,6 +367,7 @@ impl KernelJobRunner {
             watermark_gates,
             connect_inputs,
             false,
+            None,
             cancellation,
         )
         .await
@@ -400,6 +393,60 @@ impl KernelJobRunner {
             watermark_gates,
             false,
             true,
+            None,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Spawn a graph while retaining the Job's configured state format even
+    /// when the graph is stateless and therefore has no state backend entries.
+    pub async fn spawn_with_cancellation_and_state_format(
+        graph: ExecutionGraph,
+        inputs: Vec<Arc<dyn Input>>,
+        states: BTreeMap<String, Arc<dyn StateBackend>>,
+        watermark_gates: BTreeMap<
+            String,
+            Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
+        >,
+        connect_inputs: bool,
+        state_format: u32,
+        cancellation: CancellationToken,
+    ) -> Result<KernelJobHandle, Error> {
+        Self::spawn_with_cancellation_mode(
+            graph,
+            inputs,
+            states,
+            watermark_gates,
+            connect_inputs,
+            false,
+            Some(state_format),
+            cancellation,
+        )
+        .await
+    }
+
+    /// Prepared-source variant of
+    /// [`KernelJobRunner::spawn_with_cancellation_and_state_format`].
+    pub async fn spawn_prepared_with_cancellation_and_state_format(
+        graph: ExecutionGraph,
+        inputs: Vec<Arc<dyn Input>>,
+        states: BTreeMap<String, Arc<dyn StateBackend>>,
+        watermark_gates: BTreeMap<
+            String,
+            Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
+        >,
+        state_format: u32,
+        cancellation: CancellationToken,
+    ) -> Result<KernelJobHandle, Error> {
+        Self::spawn_with_cancellation_mode(
+            graph,
+            inputs,
+            states,
+            watermark_gates,
+            false,
+            true,
+            Some(state_format),
             cancellation,
         )
         .await
@@ -415,6 +462,7 @@ impl KernelJobRunner {
         >,
         connect_inputs: bool,
         sources_preconnected: bool,
+        configured_state_format: Option<u32>,
         cancellation: CancellationToken,
     ) -> Result<KernelJobHandle, Error> {
         if connect_inputs {
@@ -542,6 +590,9 @@ impl KernelJobRunner {
                 ));
             }
         }
+        let state_format = configured_state_format
+            .or_else(|| states.values().next().map(|state| state.format_version()))
+            .unwrap_or(1);
         Ok(KernelJobHandle {
             cancellation,
             inputs,
@@ -556,6 +607,7 @@ impl KernelJobRunner {
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_snapshot_id: AtomicU64::new(0),
             metrics: runtime_metrics.kernel.clone(),
+            state_format,
         })
     }
 }

@@ -97,10 +97,14 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         .iter()
         .filter_map(|chain| chain.source.clone())
         .collect::<Vec<_>>();
-    let participants = graph
-        .chains
+    // Local checkpoint manifests are validated against the logical Job plan,
+    // while adjacent stateless processors may be fused into one runtime
+    // chain. Record every logical task so a fused graph still produces the
+    // exact task set required for recovery.
+    let participants = plan
+        .tasks
         .iter()
-        .map(|chain| chain.entry_task_id().to_owned())
+        .map(|task| task.id.clone())
         .collect::<Vec<_>>();
     let states = state_map(&plan, state.clone());
     let mut watermark_gates = event_time_gates(&graph)?;
@@ -140,21 +144,31 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         }
     }
     let spawned_result = if prepared_inputs {
-        KernelJobRunner::spawn_prepared_with_cancellation(
+        KernelJobRunner::spawn_prepared_with_cancellation_and_state_format(
             graph,
             inputs.clone(),
             states,
             watermark_gates,
+            plan.spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             cancellation.clone(),
         )
         .await
     } else {
-        KernelJobRunner::spawn_with_cancellation(
+        KernelJobRunner::spawn_with_cancellation_and_state_format(
             graph,
             inputs.clone(),
             states,
             std::mem::take(&mut watermark_gates),
             false,
+            plan.spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             cancellation.clone(),
         )
         .await

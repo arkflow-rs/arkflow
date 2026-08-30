@@ -3948,6 +3948,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["configuration".into()],
+                boot_id: None,
             })
             .await
             .unwrap();

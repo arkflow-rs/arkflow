@@ -16,7 +16,7 @@
 //!   double-apply it.
 
 use crate::input::Ack;
-use crate::state::StateBackend;
+use crate::state::{StateBackend, StateEntry};
 use crate::Error;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -116,15 +116,19 @@ enum TxnState {
     /// mutation (in apply order) so `undo` can compensate.
     Applied {
         mutations: Vec<StagedMutation>,
-        previous: Vec<Option<Vec<u8>>>,
+        previous: Vec<Option<StateEntry>>,
+        previous_versions: Vec<Option<u64>>,
+        applied_versions: Vec<u64>,
     },
 }
 
 #[derive(Debug, Default)]
 struct JournalInner {
     next_id: u64,
+    next_version: u64,
     txns: BTreeMap<u64, TxnState>,
     staged_bytes: usize,
+    key_versions: BTreeMap<(String, Vec<u8>), u64>,
 }
 
 impl JournalInner {
@@ -139,6 +143,15 @@ impl JournalInner {
 pub struct StateJournal {
     backend: Arc<dyn StateBackend>,
     inner: Mutex<JournalInner>,
+    /// Serialize backend mutations and their journal version transitions.
+    commit_lock: Mutex<()>,
+    /// Serialize acknowledgement finalization for this journal across the
+    /// whole `apply -> wrapped ack -> complete/undo` interval. Without a
+    /// lock spanning that interval, transaction A could be applied, B could
+    /// commit the same key, and A could then be retried after undoing over B.
+    /// Journals are scoped to one stateful operator task, so this conservative
+    /// per-journal lock preserves correctness without a process-wide mutex.
+    finalize_lock: tokio::sync::Mutex<()>,
     limits: JournalLimits,
 }
 
@@ -151,6 +164,8 @@ impl StateJournal {
         Self {
             backend,
             inner: Mutex::new(JournalInner::default()),
+            commit_lock: Mutex::new(()),
+            finalize_lock: tokio::sync::Mutex::new(()),
             limits,
         }
     }
@@ -276,6 +291,7 @@ impl StateJournal {
     }
 
     fn stage(&self, txn: StateTxn, mutation: StagedMutation) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
         let byte_len = mutation.bytes();
         if !matches!(inner.txns.get(&txn.id), Some(TxnState::Staged(_))) {
@@ -302,10 +318,23 @@ impl StateJournal {
     /// A backend failure during apply compensates the applied prefix and
     /// returns the transaction to the staged state so the caller may retry.
     pub fn apply(&self, txn: StateTxn) -> Result<(), Error> {
-        let mutations = {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let (mutations, previous_versions) = {
             let inner = self.inner.lock().unwrap();
             match inner.txns.get(&txn.id) {
-                Some(TxnState::Staged(mutations)) => mutations.clone(),
+                Some(TxnState::Staged(mutations)) => (
+                    mutations.clone(),
+                    mutations
+                        .iter()
+                        .map(|mutation| {
+                            let (namespace, key) = mutation.storage();
+                            inner
+                                .key_versions
+                                .get(&(namespace.to_owned(), key.to_vec()))
+                                .copied()
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 Some(TxnState::Applied { .. }) | None => return Ok(()),
             }
         };
@@ -314,9 +343,10 @@ impl StateJournal {
         let mut previous = Vec::with_capacity(mutations.len());
         for mutation in &mutations {
             let (namespace, key) = mutation.storage();
-            previous.push(self.backend.get(namespace, key)?);
+            previous.push(self.backend.get_entry(namespace, key)?);
         }
         let mut applied = 0usize;
+        let mut applied_versions = Vec::with_capacity(mutations.len());
         for mutation in &mutations {
             let result = match mutation {
                 StagedMutation::Put {
@@ -345,13 +375,29 @@ impl StateJournal {
                     .map(|_| ()),
             };
             match result {
-                Ok(_) => applied += 1,
+                Ok(_) => {
+                    let version = {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.next_version = inner.next_version.saturating_add(1);
+                        let version = inner.next_version;
+                        let (namespace, key) = mutation.storage();
+                        inner
+                            .key_versions
+                            .insert((namespace.to_owned(), key.to_vec()), version);
+                        version
+                    };
+                    applied_versions.push(version);
+                    applied += 1;
+                }
                 Err(error) => {
                     // Compensate the applied prefix so the backend does not
                     // keep a partial transaction a retry would double-apply.
-                    if let Err(rollback_error) =
-                        self.restore_previous(&mutations[..applied], &previous[..applied])
-                    {
+                    if let Err(rollback_error) = self.restore_previous(
+                        &mutations[..applied],
+                        &previous[..applied],
+                        &previous_versions[..applied],
+                        &applied_versions,
+                    ) {
                         return Err(Error::Process(format!(
                             "state journal apply failed ({error}); rollback also failed ({rollback_error})"
                         )));
@@ -366,6 +412,8 @@ impl StateJournal {
                 *state = TxnState::Applied {
                     mutations,
                     previous,
+                    previous_versions,
+                    applied_versions,
                 };
             }
         }
@@ -375,6 +423,7 @@ impl StateJournal {
     /// Complete an applied transaction: its wrapped acknowledgement
     /// succeeded, so the applied state becomes final. No-op otherwise.
     pub fn complete(&self, txn: StateTxn) {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.txns.remove(&txn.id) {
             match state {
@@ -387,21 +436,34 @@ impl StateJournal {
 
     /// Compensating rollback of an applied transaction: restore the
     /// pre-apply value of every mutation so an at-least-once replay cannot
-    /// double-apply it. The transaction is then discarded.
+    /// double-apply it. A successful undo returns the transaction to
+    /// `Staged`, because a transient wrapped-ack failure retries this same
+    /// acknowledgement and must apply the mutation again.
     pub fn undo(&self, txn: StateTxn) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let applied = {
             let inner = self.inner.lock().unwrap();
             match inner.txns.get(&txn.id) {
                 Some(TxnState::Applied {
                     mutations,
                     previous,
-                }) => (mutations.clone(), previous.clone()),
+                    previous_versions,
+                    applied_versions,
+                }) => (
+                    mutations.clone(),
+                    previous.clone(),
+                    previous_versions.clone(),
+                    applied_versions.clone(),
+                ),
                 _ => return Ok(()),
             }
         };
-        let result = self.restore_previous(&applied.0, &applied.1);
-        self.complete(txn);
-        result
+        self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(TxnState::Applied { mutations, .. }) = inner.txns.remove(&txn.id) {
+            inner.txns.insert(txn.id, TxnState::Staged(mutations));
+        }
+        Ok(())
     }
 
     /// Apply and complete in one step, for callers that gate the commit on a
@@ -422,14 +484,42 @@ impl StateJournal {
     fn restore_previous(
         &self,
         mutations: &[StagedMutation],
-        previous: &[Option<Vec<u8>>],
+        previous: &[Option<StateEntry>],
+        previous_versions: &[Option<u64>],
+        applied_versions: &[u64],
     ) -> Result<(), Error> {
-        for (mutation, value) in mutations.iter().zip(previous).rev() {
+        for (((mutation, value), previous_version), applied_version) in mutations
+            .iter()
+            .zip(previous)
+            .zip(previous_versions)
+            .zip(applied_versions)
+            .rev()
+        {
             let (namespace, key) = mutation.storage();
-            match value {
-                Some(value) => self.backend.put(namespace, key, value.as_slice())?,
-                None => {
-                    self.backend.delete(namespace, key)?;
+            let version_key = (namespace.to_owned(), key.to_vec());
+            let owns_current_value = self
+                .inner
+                .lock()
+                .unwrap()
+                .key_versions
+                .get(&version_key)
+                .copied()
+                == Some(*applied_version);
+            if !owns_current_value {
+                // A later committed transaction owns this key. Restoring the
+                // older bytes would erase that valid commit.
+                continue;
+            }
+            self.backend.restore_entry(namespace, key, value.as_ref())?;
+            let mut inner = self.inner.lock().unwrap();
+            if inner.key_versions.get(&version_key).copied() == Some(*applied_version) {
+                match previous_version {
+                    Some(version) => {
+                        inner.key_versions.insert(version_key, *version);
+                    }
+                    None => {
+                        inner.key_versions.remove(&version_key);
+                    }
                 }
             }
         }
@@ -463,6 +553,11 @@ impl CommitOnAck {
 #[async_trait]
 impl Ack for CommitOnAck {
     async fn ack(&self) -> Result<(), Error> {
+        // Keep a same-journal transaction from being interleaved with a
+        // later transaction while this one waits for its wrapped source ack.
+        // The conditional version check in `undo` remains necessary for
+        // direct apply/undo callers and compensation paths.
+        let _finalize_guard = self.journal.finalize_lock.lock().await;
         // Idempotent at the journal level: a retry after a transient backend
         // failure re-applies only the unapplied transaction.
         self.journal.apply(self.txn)?;
@@ -588,7 +683,9 @@ mod tests {
         );
         assert!(journal.backend().get("ns", b"fresh").unwrap().is_none());
         assert!(journal.backend().get("ns", b"counter").unwrap().is_none());
-        assert_eq!(journal.pending_transactions(), 0);
+        // Undo keeps the transaction staged so the same acknowledgement can
+        // retry after a transient wrapped-ack failure.
+        assert_eq!(journal.pending_transactions(), 1);
     }
 
     #[test]
@@ -682,13 +779,13 @@ mod tests {
 
     struct RecordingAck {
         acked: Mutex<bool>,
-        fail: bool,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl Ack for RecordingAck {
         async fn ack(&self) -> Result<(), Error> {
-            if self.fail {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(Error::Process("downstream ack failed".into()));
             }
             *self.acked.lock().unwrap() = true;
@@ -701,7 +798,7 @@ mod tests {
         let journal = Arc::new(StateJournal::new(backend()));
         let inner = Arc::new(RecordingAck {
             acked: Mutex::new(false),
-            fail: false,
+            fail: std::sync::atomic::AtomicBool::new(false),
         });
         let txn = journal.begin().unwrap();
         journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
@@ -727,7 +824,7 @@ mod tests {
         let journal = Arc::new(StateJournal::new(backend()));
         let inner = Arc::new(RecordingAck {
             acked: Mutex::new(false),
-            fail: true,
+            fail: std::sync::atomic::AtomicBool::new(true),
         });
         let txn = journal.begin().unwrap();
         journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
@@ -737,24 +834,64 @@ mod tests {
             inner.clone() as Arc<dyn Ack>,
         ));
         assert!(ack.ack().await.is_err());
-        assert_eq!(journal.pending_transactions(), 0);
+        assert_eq!(journal.pending_transactions(), 1);
         assert!(journal.backend().get("ns", b"k").unwrap().is_none());
-        // Replay: the record is re-delivered and applied once.
-        let replay = Arc::new(RecordingAck {
-            acked: Mutex::new(false),
-            fail: false,
-        });
-        let replay_txn = journal.begin().unwrap();
-        journal.update_i64(replay_txn, "ns", b"k", 1, None).unwrap();
-        let replay_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
-            journal.clone(),
-            replay_txn,
-            replay.clone() as Arc<dyn Ack>,
-        ));
-        replay_ack.ack().await.unwrap();
+        // The fan-out/ack retry reuses the same CommitOnAck and therefore the
+        // same staged transaction. It must apply the mutation once, rather
+        // than observing a removed transaction and acknowledging the source
+        // without restoring state.
+        inner
+            .fail
+            .store(false, std::sync::atomic::Ordering::Release);
+        ack.ack().await.unwrap();
+        assert_eq!(journal.pending_transactions(), 0);
         assert_eq!(
             journal.backend().get("ns", b"k").unwrap(),
             Some(b"1".to_vec())
+        );
+    }
+
+    #[test]
+    fn undo_preserves_ttl_metadata() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let backend_dyn: Arc<dyn StateBackend> = backend.clone();
+        let now = crate::state::now_ms();
+        backend_dyn
+            .put_with_ttl("ns", b"k", b"old", Some(60_000), now)
+            .unwrap();
+        let before = backend_dyn.get_entry("ns", b"k").unwrap().unwrap();
+
+        let journal = StateJournal::new(backend_dyn.clone());
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"k", b"new".to_vec(), None).unwrap();
+        journal.apply(txn).unwrap();
+        journal.undo(txn).unwrap();
+
+        let after = backend_dyn.get_entry("ns", b"k").unwrap().unwrap();
+        assert_eq!(after.value, before.value);
+        assert_eq!(after.expires_at_ms, before.expires_at_ms);
+    }
+
+    #[test]
+    fn older_undo_does_not_restore_over_a_later_commit() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"0").unwrap();
+
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        journal.apply(first).unwrap();
+
+        let second = journal.begin().unwrap();
+        journal.update_i64(second, "ns", b"k", 1, None).unwrap();
+        journal.apply(second).unwrap();
+        journal.complete(second);
+
+        // The first transaction's compensation must not erase the second
+        // transaction's already committed increment.
+        journal.undo(first).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec())
         );
     }
 }

@@ -71,6 +71,11 @@ pub struct RegisterRequest {
     pub protocol_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Stable identity of the Agent process. It is independent from the
+    /// per-registration session token, so a reconnect in the same process
+    /// does not look like a process restart to report/reconciliation logic.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1461,6 +1466,14 @@ impl Hub {
             "node-session-{}",
             SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
+        // Older clients do not send a process identity. Keep them compatible
+        // by treating the fresh session token as their boot identity; the
+        // built-in Agent sends its stable `NodeAgentConfig::boot_id`.
+        let registered_boot_id = request
+            .boot_id
+            .clone()
+            .filter(|boot_id| !boot_id.trim().is_empty())
+            .unwrap_or_else(|| session_token.clone());
         let resource = HubNode {
             id: request.node_id.clone(),
             protocol_version: request.protocol_version.clone(),
@@ -1479,21 +1492,26 @@ impl Hub {
             return Err(HubError::Capacity);
         }
         let old = nodes.remove(&request.node_id);
+        let boot_changed = old
+            .as_ref()
+            .is_some_and(|record| record.boot_id.as_deref() != Some(registered_boot_id.as_str()));
         nodes.insert(
             request.node_id.clone(),
             NodeRecord {
                 resource,
                 session_token: session_token.clone(),
-                // The registration session identity IS the report boot
-                // identity: every newly registered session starts its
-                // report sequence at zero, and delayed reports from an
-                // older session are rejected by comparison against it.
-                boot_id: Some(session_token.clone()),
+                boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
-                commands: old
-                    .as_ref()
-                    .map(|record| record.commands.clone())
-                    .unwrap_or_default(),
+                // Commands queued for an old process belong to a runtime that
+                // no longer exists. Reconciliation below will enqueue the
+                // desired state for the new boot.
+                commands: if boot_changed {
+                    VecDeque::new()
+                } else {
+                    old.as_ref()
+                        .map(|record| record.commands.clone())
+                        .unwrap_or_default()
+                },
                 streams: old
                     .as_ref()
                     .map(|record| record.streams.clone())
@@ -1511,6 +1529,35 @@ impl Hub {
             },
         );
         drop(nodes);
+        // A fresh Agent process starts with an empty local JobRuntime. Mark
+        // every previous start attempt for this node unavailable before
+        // reconciliation, otherwise a persisted successful operation would
+        // suppress the new start command even though no local Job exists.
+        let invalidated_job_starts = if boot_changed {
+            let mut operations = self.operations.write().await;
+            operations
+                .values_mut()
+                .filter(|operation| {
+                    operation.node_id == request.node_id
+                        && operation.operation == "job_start"
+                        && !matches!(
+                            operation.state,
+                            HubOperationState::Failed
+                                | HubOperationState::TimedOut
+                                | HubOperationState::NodeUnavailable
+                                | HubOperationState::Cancelled
+                                | HubOperationState::Superseded
+                        )
+                })
+                .map(|operation| {
+                    operation.state = HubOperationState::NodeUnavailable;
+                    operation.finished_at_ms = Some(now);
+                    operation.clone()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if let Some(storage) = self.storage.as_ref() {
             storage
                 .upsert_node(NodeMutation {
@@ -1521,8 +1568,8 @@ impl Hub {
                         request.capabilities,
                     ))
                     .unwrap_or_else(|_| "[]".into()),
-                    boot_id: None,
-                    report_seq: None,
+                    boot_id: Some(registered_boot_id.clone()),
+                    report_seq: Some(0),
                     last_seen_at_ms: now,
                     lease_expires_at_ms: now + self.config.lease_ttl_ms,
                     maintenance_state: None,
@@ -1530,6 +1577,11 @@ impl Hub {
                 })
                 .await
                 .map_err(HubError::from)?;
+            for operation in &invalidated_job_starts {
+                persist_operation(storage, operation)
+                    .await
+                    .map_err(HubError::from)?;
+            }
             storage
                 .wake_node(&request.node_id, now)
                 .await
@@ -3937,6 +3989,7 @@ mod tests {
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
             capabilities: vec!["stream_lifecycle".into()],
+            boot_id: None,
         })
         .await
         .unwrap();
@@ -4043,6 +4096,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["configuration".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4091,6 +4145,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["configuration".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4161,6 +4216,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["configuration".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4169,6 +4225,7 @@ mod tests {
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
             capabilities: vec!["configuration".into()],
+            boot_id: None,
         })
         .await
         .unwrap();
@@ -4353,6 +4410,7 @@ mod tests {
                     node_token: "node-secret".into(),
                     protocol_version: "v1".into(),
                     capabilities: vec!["configuration".into()],
+                    boot_id: None,
                 })
                 .await
                 .unwrap();
@@ -4438,6 +4496,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4471,6 +4530,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4514,7 +4574,8 @@ mod tests {
                 node_id: "n1".into(),
                 node_token: "bad".into(),
                 protocol_version: "v1".into(),
-                capabilities: vec![]
+                capabilities: vec![],
+                boot_id: None,
             })
             .await,
             Err(HubError::Unauthorized)
@@ -4525,6 +4586,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4615,6 +4677,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4640,6 +4703,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v0".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await,
             Err(HubError::Invalid(message)) if message.contains("protocol")
@@ -4654,6 +4718,7 @@ mod tests {
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
             capabilities: vec!["configuration".into()],
+            boot_id: None,
         })
         .await
         .unwrap();
@@ -4680,6 +4745,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4737,6 +4803,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4814,6 +4881,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["first".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4823,6 +4891,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["second".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -4866,6 +4935,7 @@ mod tests {
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
             capabilities: vec![],
+            boot_id: None,
         })
         .await
         .unwrap();
@@ -4875,6 +4945,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap()
@@ -5049,6 +5120,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -5268,6 +5340,30 @@ mod tests {
             records[0].manifest_uri.as_deref(),
             Some("/tmp/final/checkpoint-7/manifest.json")
         );
+
+        // A new process has an empty local JobRuntime. Its new boot identity
+        // must invalidate the old successful start and trigger reconciliation
+        // instead of treating the absent local Job as already running.
+        let restarted = hub
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: Some("boot-after-process-restart".into()),
+            })
+            .await
+            .unwrap();
+        let restart_commands = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: restarted.session_token,
+            })
+            .await
+            .unwrap();
+        assert!(restart_commands
+            .iter()
+            .any(|command| command.operation == "job_start"));
     }
 
     #[tokio::test]
@@ -5281,6 +5377,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -5371,6 +5468,7 @@ mod tests {
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
             capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
         })
         .await
         .unwrap();
@@ -5408,6 +5506,7 @@ mod tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -5481,6 +5580,7 @@ mod session_report_tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -5518,6 +5618,7 @@ mod session_report_tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();
@@ -5544,6 +5645,7 @@ mod session_report_tests {
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
                 capabilities: vec![],
+                boot_id: None,
             })
             .await
             .unwrap();

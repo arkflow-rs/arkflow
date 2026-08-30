@@ -157,7 +157,12 @@ impl WatermarkTracker {
             .map(|progress| progress.watermark_ms)
             .min();
         if let Some(next) = next {
-            self.watermark_ms = Some(self.watermark_ms.map_or(next, |current| current.max(next)));
+            // The global watermark is the minimum progress of the active
+            // partitions. A newly observed partition is allowed to lower the
+            // previous global value: retaining the old max would let an early
+            // fast partition close windows before the slower partition had
+            // entered the active set.
+            self.watermark_ms = Some(next);
         }
         self.watermark_ms.unwrap_or(i64::MIN)
     }
@@ -327,9 +332,17 @@ mod tests {
     #[test]
     fn idle_timeout_unblocks_watermark() {
         let mut tracker = WatermarkTracker::from_time_spec(&spec()).unwrap();
-        tracker.observe(0, 1_000, 0);
+        tracker.observe(0, 1_000, 900);
         tracker.observe(1, 500, 0);
         assert_eq!(tracker.refresh_idle(1_000), 900);
+    }
+
+    #[test]
+    fn a_new_slower_partition_can_lower_the_global_watermark() {
+        let mut tracker = WatermarkTracker::from_time_spec(&spec()).unwrap();
+        assert_eq!(tracker.observe(0, 2_000, 0), 1_900);
+        assert_eq!(tracker.observe(1, 1_000, 0), 900);
+        assert_eq!(tracker.watermark(), Some(900));
     }
 
     #[test]

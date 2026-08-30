@@ -51,6 +51,20 @@ pub struct StateMetrics {
 pub trait StateBackend: Send + Sync {
     fn format_version(&self) -> u32;
     fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    /// Read the complete stored value, including expiration metadata.  The
+    /// default implementation keeps third-party backends source-compatible;
+    /// durable backends should override it so compensating state rollback can
+    /// restore TTL exactly.
+    fn get_entry(&self, namespace: &str, key: &[u8]) -> Result<Option<StateEntry>, Error> {
+        self.get(namespace, key).map(|value| {
+            value.map(|value| StateEntry {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                value,
+                expires_at_ms: None,
+            })
+        })
+    }
     fn put(&self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.put_with_ttl(namespace, key, value, None, now_ms())
     }
@@ -74,6 +88,35 @@ pub trait StateBackend: Send + Sync {
         self.update_i64(namespace, key, delta)
     }
     fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error>;
+    /// Restore one exact entry captured by [`StateBackend::get_entry`].
+    /// Backends with TTL support should preserve the absolute expiration.
+    fn restore_entry(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        entry: Option<&StateEntry>,
+    ) -> Result<(), Error> {
+        let now = now_ms();
+        match entry {
+            Some(entry) if entry.expires_at_ms.is_some_and(|expires| expires <= now) => {
+                self.delete(namespace, key)?;
+                Ok(())
+            }
+            Some(entry) => self.put_with_ttl(
+                namespace,
+                key,
+                &entry.value,
+                entry
+                    .expires_at_ms
+                    .map(|expires| expires.saturating_sub(now)),
+                now,
+            ),
+            None => {
+                self.delete(namespace, key)?;
+                Ok(())
+            }
+        }
+    }
     fn purge_expired(&self, now_ms: u64) -> Result<u64, Error>;
     fn scan(&self, namespace: &str) -> Result<Vec<StateEntry>, Error>;
     fn snapshot(&self) -> Result<StateSnapshot, Error> {
@@ -125,6 +168,42 @@ impl StateBackend for InMemoryStateBackend {
             .get(&(namespace.to_owned(), key.to_vec()))
             .filter(|entry| Self::is_live(entry, now_ms()))
             .map(|entry| entry.value.clone()))
+    }
+
+    fn get_entry(&self, namespace: &str, key: &[u8]) -> Result<Option<StateEntry>, Error> {
+        let entries = self.entries.read().unwrap();
+        Ok(entries
+            .get(&(namespace.to_owned(), key.to_vec()))
+            .filter(|entry| Self::is_live(entry, now_ms()))
+            .cloned())
+    }
+
+    fn restore_entry(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        entry: Option<&StateEntry>,
+    ) -> Result<(), Error> {
+        let mut entries = self.entries.write().unwrap();
+        match entry {
+            Some(entry) if !Self::is_live(entry, now_ms()) => {
+                entries.remove(&(namespace.to_owned(), key.to_vec()));
+            }
+            Some(entry) => {
+                entries.insert(
+                    (namespace.to_owned(), key.to_vec()),
+                    StateEntry {
+                        namespace: namespace.to_owned(),
+                        key: key.to_vec(),
+                        ..entry.clone()
+                    },
+                );
+            }
+            None => {
+                entries.remove(&(namespace.to_owned(), key.to_vec()));
+            }
+        }
+        Ok(())
     }
 
     fn put_with_ttl(
@@ -416,6 +495,78 @@ impl StateBackend for RedbStateBackend {
         } else {
             Ok(None)
         }
+    }
+
+    fn get_entry(&self, namespace: &str, key: &[u8]) -> Result<Option<StateEntry>, Error> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|error| Error::Process(format!("state read: {error}")))?;
+        let table = match tx.open_table(STATE_TABLE) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        let value = table
+            .get(Self::storage_key(namespace, key).as_str())
+            .map_err(|error| Error::Process(format!("state get: {error}")))
+            .and_then(|value| value.map(|value| decode_value(value.value())).transpose())?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value
+            .expires_at_ms
+            .is_some_and(|expires| expires <= now_ms())
+        {
+            drop(table);
+            drop(tx);
+            self.delete(namespace, key)?;
+            return Ok(None);
+        }
+        Ok(Some(StateEntry {
+            namespace: namespace.to_owned(),
+            key: key.to_vec(),
+            value: value.value,
+            expires_at_ms: value.expires_at_ms,
+        }))
+    }
+
+    fn restore_entry(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        entry: Option<&StateEntry>,
+    ) -> Result<(), Error> {
+        let Some(entry) = entry else {
+            self.delete(namespace, key)?;
+            return Ok(());
+        };
+        if entry
+            .expires_at_ms
+            .is_some_and(|expires| expires <= now_ms())
+        {
+            self.delete(namespace, key)?;
+            return Ok(());
+        }
+        let storage_key = Self::storage_key(namespace, key);
+        let encoded = encode_value(&entry.value, entry.expires_at_ms)?;
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|error| Error::Process(format!("state write: {error}")))?;
+        {
+            let mut table = tx
+                .open_table(STATE_TABLE)
+                .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            table
+                .insert(storage_key.as_str(), encoded.as_slice())
+                .map_err(|error| Error::Process(format!("state restore: {error}")))?;
+        }
+        tx.commit()
+            .map_err(|error| Error::Process(format!("state commit: {error}")))?;
+        let metrics = self.metrics()?;
+        self.keys.store(metrics.keys, Ordering::Relaxed);
+        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        Ok(())
     }
 
     fn put_with_ttl(

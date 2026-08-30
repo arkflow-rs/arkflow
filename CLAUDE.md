@@ -183,6 +183,31 @@ The output worker ensures ordered delivery using:
 - **Blocking queue**: Output worker waits for out-of-order batches before writing
 - Atomic counters track the next expected sequence, preventing out-of-order writes to sinks
 
+#### Durability and Recovery Invariants
+
+The unified runtime treats acknowledgement, state, event time, and recovery as
+one consistency boundary:
+
+- WAL and Kafka acknowledgements advance only through the highest contiguous
+  acknowledged sequence/offset. A later fan-out child must wait for an earlier
+  gap, and restored cursors seed the same in-memory frontier.
+- Stateful mutations remain staged until the processing acknowledgement commits.
+  Compensation restores the complete previous state entry, including TTL, and
+  cannot overwrite a newer per-key commit.
+- A fired window commits its state journal before acknowledging source input.
+  Window watermarks use the minimum progress of all active physical input
+  partitions; a multiplexed source must carry each delivery's physical
+  partition into the gate.
+- Sliding-window lateness is evaluated independently for every containing
+  window. Null or invalid event timestamps are never held indefinitely and are
+  explicitly marked when routed.
+- A local checkpoint manifest contains every planned task, even when stateless
+  operators are fused into fewer execution chains, and preserves the configured
+  state format when no stateful task has entries.
+- An Agent report identifies the process boot, not its short-lived session
+  token. A new boot invalidates stale start operations so desired-running Jobs
+  are reconciled into the fresh local runtime.
+
 ### Configuration System
 
 Configuration is hierarchical YAML with the following structure:

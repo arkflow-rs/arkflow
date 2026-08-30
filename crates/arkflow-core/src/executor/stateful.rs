@@ -13,7 +13,7 @@
 //! failed sink write cannot durably apply a mutation a replay would repeat.
 
 use crate::processor::Processor;
-use crate::state::{KeyedCounter, StateBackend};
+use crate::state::StateBackend;
 use crate::Error;
 use crate::MessageBatchRef;
 use async_trait::async_trait;
@@ -30,11 +30,11 @@ use std::sync::Arc;
 /// inner processor runs, persisting counts into the task's state namespace.
 pub struct StatefulOperator {
     inner: Arc<dyn Processor>,
-    /// Direct-backend path (legacy, no output-gated commit).
-    counter: Option<KeyedCounter>,
-    /// Output-gated path: increments stage in the journal and apply when the
-    /// final output acknowledgement fires.
-    journal: Option<Arc<super::state_journal::StateJournal>>,
+    /// Increments stage in the journal and apply when the final output
+    /// acknowledgement fires. The constructor that accepts a backend creates
+    /// a private journal as well, so legacy callers get the same failure-safe
+    /// ordering as graph-built operators.
+    journal: Arc<super::state_journal::StateJournal>,
     namespace: String,
     key_field: String,
     state_field: String,
@@ -52,8 +52,7 @@ impl StatefulOperator {
     ) -> Self {
         Self {
             inner,
-            counter: Some(KeyedCounter::with_ttl(backend, namespace.clone(), ttl_ms)),
-            journal: None,
+            journal: Arc::new(super::state_journal::StateJournal::new(backend)),
             namespace,
             key_field,
             state_field,
@@ -74,8 +73,7 @@ impl StatefulOperator {
     ) -> Self {
         Self {
             inner,
-            counter: None,
-            journal: Some(journal),
+            journal,
             namespace,
             key_field,
             state_field,
@@ -142,52 +140,41 @@ impl StatefulOperator {
 #[async_trait]
 impl Processor for StatefulOperator {
     async fn process(&self, batch: MessageBatchRef) -> Result<crate::ProcessResult, Error> {
-        let Some(counter) = &self.counter else {
-            // Journaled operator driven without an acknowledgement flow:
-            // nothing gates the commit downstream, so stage the increments
-            // and commit them once the inner processor succeeds.
-            let journal = self
-                .journal
-                .clone()
-                .expect("counter and journal are mutually exclusive");
-            let keys = self.keys_for_batch(&batch)?;
-            let txn = journal.begin()?;
-            let counts = keys
-                .iter()
-                .map(|key| journal.update_i64(txn, &self.namespace, key, 1, self.ttl_ms))
-                .collect::<Result<Vec<_>, _>>();
-            let counts = match counts {
-                Ok(counts) => counts,
-                Err(error) => {
-                    journal.rollback(txn);
-                    return Err(error);
-                }
-            };
-            let enriched = match self.enrich(batch, counts) {
-                Ok(enriched) => enriched,
-                Err(error) => {
-                    journal.rollback(txn);
-                    return Err(error);
-                }
-            };
-            return match self.inner.process(enriched).await {
-                Ok(result) => {
-                    journal.commit(txn)?;
-                    Ok(result)
-                }
-                Err(error) => {
-                    journal.rollback(txn);
-                    Err(error)
-                }
-            };
+        // Without an acknowledgement flow, no downstream handle can commit
+        // the transaction later. Commit only after the inner processor has
+        // accepted the enriched batch, so a processor failure cannot leave a
+        // live counter mutation behind for a replay to apply again.
+        let journal = self.journal.clone();
+        let keys = self.keys_for_batch(&batch)?;
+        let txn = journal.begin()?;
+        let counts = keys
+            .iter()
+            .map(|key| journal.update_i64(txn, &self.namespace, key, 1, self.ttl_ms))
+            .collect::<Result<Vec<_>, _>>();
+        let counts = match counts {
+            Ok(counts) => counts,
+            Err(error) => {
+                journal.rollback(txn);
+                return Err(error);
+            }
         };
-        let counts = self
-            .keys_for_batch(&batch)?
-            .into_iter()
-            .map(|key| counter.add(&key, 1))
-            .collect::<Result<Vec<_>, _>>()?;
-        let enriched = self.enrich(batch, counts)?;
-        self.inner.process(enriched).await
+        let enriched = match self.enrich(batch, counts) {
+            Ok(enriched) => enriched,
+            Err(error) => {
+                journal.rollback(txn);
+                return Err(error);
+            }
+        };
+        match self.inner.process(enriched).await {
+            Ok(result) => {
+                journal.commit(txn)?;
+                Ok(result)
+            }
+            Err(error) => {
+                journal.rollback(txn);
+                Err(error)
+            }
+        }
     }
 
     /// Journaled path: stage the increments, run the inner processor, and
@@ -200,9 +187,7 @@ impl Processor for StatefulOperator {
         batch: MessageBatchRef,
         ack: Arc<dyn crate::input::Ack>,
     ) -> Result<crate::ProcessResult, Error> {
-        let Some(journal) = self.journal.clone() else {
-            return self.process(batch).await;
-        };
+        let journal = self.journal.clone();
         let keys = self.keys_for_batch(&batch)?;
         let txn = journal.begin()?;
         let counts = keys
@@ -256,7 +241,7 @@ impl Processor for StatefulOperator {
                 Ok(crate::ProcessResult::SingleWithAck(
                     output,
                     Arc::new(super::state_journal::CommitOnAck::new(
-                        self.journal.clone().expect("journal checked above"),
+                        journal.clone(),
                         txn,
                         replacement,
                     )),
@@ -329,13 +314,31 @@ mod tests {
         }
     }
 
-    struct PendingAck;
+    struct FailingProcessor;
+    #[async_trait]
+    impl Processor for FailingProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Err(Error::Process("processor rejected batch".into()))
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct PendingAck {
+        fail: std::sync::atomic::AtomicBool,
+    }
     #[async_trait]
     impl crate::input::Ack for PendingAck {
         async fn ack(&self) -> Result<(), Error> {
-            // The downstream sink write failed: the acknowledgement never
-            // completes, exactly like a failed `write_batch`.
-            Err(Error::Process("sink write failed".into()))
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                // The downstream sink write failed: the acknowledgement does
+                // not complete, exactly like a failed `write_batch`.
+                Err(Error::Process("sink write failed".into()))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -373,9 +376,13 @@ mod tests {
         );
 
         // First delivery: the sink write fails, so the output acknowledgement
-        // never completes and the staged increment is never applied.
+        // never completes. The transaction remains staged for the same ack's
+        // retry, but the mutation is not applied to the backend.
+        let source_ack = Arc::new(PendingAck {
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
         let first = operator
-            .process_with_ack(batch(vec!["a"]), Arc::new(PendingAck))
+            .process_with_ack(batch(vec!["a"]), source_ack.clone())
             .await
             .unwrap();
         let ProcessResult::SingleWithAck(_, failed_ack) = first else {
@@ -383,25 +390,14 @@ mod tests {
         };
         assert!(failed_ack.ack().await.is_err());
         assert!(backend.scan("job:t:task:m-0").unwrap().is_empty());
-        assert_eq!(journal.pending_transactions(), 0);
+        assert_eq!(journal.pending_transactions(), 1);
 
-        // Replay of the same record commits exactly one increment.
-        let second = operator
-            .process_with_ack(batch(vec!["a"]), Arc::new(crate::input::NoopAck))
-            .await
-            .unwrap();
-        let ProcessResult::SingleWithAck(output, ack) = second else {
-            panic!("journaled operator returns an ack-gated output");
-        };
-        ack.ack().await.unwrap();
-        let counts = output
-            .record_batch()
-            .column_by_name("count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(counts.values(), &[1]);
+        // Fan-out retry reuses the same acknowledgement and must re-apply the
+        // retained staged transaction before acknowledging the source.
+        source_ack
+            .fail
+            .store(false, std::sync::atomic::Ordering::Release);
+        failed_ack.ack().await.unwrap();
         let state = backend.scan("job:t:task:m-0").unwrap();
         assert_eq!(state.len(), 1);
         assert_eq!(
@@ -450,6 +446,27 @@ mod tests {
             .unwrap();
         assert_eq!(counts.values(), &[3]);
         assert_eq!(backend.scan("job:t:task:m-0").unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_backend_path_does_not_commit_when_processor_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let operator = StatefulOperator::new(
+            Arc::new(FailingProcessor),
+            backend.clone(),
+            "failed-processor".into(),
+            "key".into(),
+            None,
+            "count".into(),
+        );
+
+        assert!(operator.process(batch(vec!["a"])).await.is_err());
+        assert!(
+            backend.scan("failed-processor").unwrap().is_empty(),
+            "processor failure must not leave a keyed increment behind"
+        );
     }
 
     #[tokio::test]

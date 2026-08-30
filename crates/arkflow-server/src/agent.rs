@@ -916,21 +916,31 @@ async fn spawn_kernel_job(
         states.insert(task_ids.first().cloned().unwrap_or_default(), state.clone());
     }
     let handle = if recovery.is_some() {
-        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_prepared_with_cancellation(
+        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_prepared_with_cancellation_and_state_format(
             graph,
             inputs.clone(),
             states,
             watermark_gates.clone(),
+            plan.spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             cancellation,
         )
         .await
     } else {
-        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        arkflow_core::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation_and_state_format(
             graph,
             inputs.clone(),
             states,
             watermark_gates.clone(),
             false,
+            plan.spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             cancellation,
         )
         .await
@@ -1109,6 +1119,7 @@ async fn register(
                 "state_backend".into(),
                 "checkpoint_recovery".into(),
             ],
+            boot_id: Some(config.boot_id.clone()),
         })
         .send()
         .await?
@@ -1138,7 +1149,7 @@ async fn run_session(
         tokio::select! {
             _ = cancellation.cancelled() => { let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await; return Ok(()) },
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
-            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &auth.session_token, report_seq, &job_runtime).await).await?; }
+            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime).await).await?; }
             _ = poll.tick() => {
                 for (job_id, generation, outcome) in job_runtime.take_finished().await {
                     let (state, error) = match outcome {
@@ -1168,10 +1179,10 @@ async fn run_session(
 async fn report(
     cp: &ControlPlane,
     auth: &AgentAuth,
-    // The report boot identity: the REGISTRATION session token. A
-    // reconnecting Agent re-registers and starts its sequence at zero
-    // without the Hub treating the fresh reports as stale under the
-    // previous session.
+    // The report boot identity belongs to the Agent process, not the
+    // per-registration session credential. The Hub uses the session token to
+    // fence delayed transport messages and this stable identity to decide
+    // whether a new local JobRuntime must be reconstructed.
     boot_id: &str,
     report_seq: u64,
     job_runtime: &JobRuntime,

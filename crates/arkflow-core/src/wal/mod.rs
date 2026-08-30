@@ -42,6 +42,7 @@ pub use store::{
 use crate::wal::store::serialize;
 use crate::{Error, MessageBatchRef};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -242,6 +243,12 @@ pub struct Wal {
     /// Pluggable storage backend. `RedbStore` for local; `S3Store` (or
     /// equivalent) for S3-compatible object storage.
     store: Arc<dyn WalStore>,
+    /// Contiguous source-delivery acknowledgement frontier. WAL sequence N
+    /// maps to the exclusive next offset N+1 in this topic-less partition.
+    frontier: Arc<crate::executor::commit::CommitFrontier>,
+    /// Keeps the underlying source acknowledgements for out-of-order WAL
+    /// completions until every earlier sequence has completed too.
+    acknowledgements: Mutex<BTreeMap<u64, Arc<dyn crate::input::Ack>>>,
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
@@ -249,6 +256,9 @@ pub struct Wal {
     // --- staging for group-commit / periodic ---
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     pending_notify: Notify,
+    /// Wakes acknowledgements that are waiting for an earlier WAL sequence
+    /// to finish its source-side commit and cursor advance.
+    ack_notify: Notify,
     close: CancellationToken,
     flusher: Mutex<Option<JoinHandle<()>>>,
 }
@@ -288,12 +298,20 @@ impl Wal {
     ) -> Result<Arc<Self>, Error> {
         let sync_policy = config.effective_sync().clone();
 
+        let frontier = Arc::new(crate::executor::commit::CommitFrontier::new());
+        frontier.seed(&[crate::checkpoint::SourcePosition::for_partition(
+            0,
+            store.cursor().saturating_add(1),
+        )]);
         let wal = Arc::new(Self {
             store,
+            frontier,
+            acknowledgements: Mutex::new(BTreeMap::new()),
             next_seq: AtomicU64::new(next_seq),
             policy: sync_policy,
             pending: Mutex::new(Vec::new()),
             pending_notify: Notify::new(),
+            ack_notify: Notify::new(),
             close: CancellationToken::new(),
             flusher: Mutex::new(None),
         });
@@ -374,9 +392,108 @@ impl Wal {
     }
 
     /// Advance the committed cursor to `seq` (monotonic). Called by the ack
-    /// path only after the downstream output confirms the write.
+    /// path only after the downstream output confirms the write. Direct users
+    /// of this compatibility method also get the same contiguous frontier
+    /// semantics; source-side ack objects use [`Wal::acknowledge`].
     pub async fn advance(&self, seq: u64) -> Result<(), Error> {
-        self.store.advance_cursor(seq)
+        let _guard = self.acknowledgements.lock().await;
+        self.frontier
+            .acknowledge(&crate::checkpoint::SourcePosition::for_partition(
+                0,
+                seq.saturating_add(1),
+            ));
+        let target = self
+            .frontier
+            .next_offset_of(None, 0)
+            .unwrap_or_default()
+            .saturating_sub(1);
+        if target > self.store.cursor() {
+            self.store.advance_cursor(target)?;
+            self.ack_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// Complete one WAL delivery. The durable cursor advances only through
+    /// the highest contiguous set of acknowledged sequences, while the
+    /// wrapped source acks are invoked in sequence order once their gap closes.
+    /// Each source acknowledgement is completed before the corresponding WAL
+    /// cursor advance. If the source-side commit fails, the cursor stays before
+    /// that sequence and the entry remains replayable after a restart.
+    async fn acknowledge(&self, seq: u64, inner: Arc<dyn crate::input::Ack>) -> Result<(), Error> {
+        {
+            let mut acknowledgements = self.acknowledgements.lock().await;
+            acknowledgements.entry(seq).or_insert(inner);
+            self.frontier
+                .acknowledge(&crate::checkpoint::SourcePosition::for_partition(
+                    0,
+                    seq.saturating_add(1),
+                ));
+        }
+
+        // Do not hold the pending-map lock while awaiting a source
+        // acknowledgement. A later sequence may already be waiting for this
+        // one, and the gap-closing call must be able to drain the map and
+        // wake it. More importantly, this method does not report success for
+        // a sequence that is merely pending in memory: its caller may be the
+        // checkpoint barrier, so completion must mean that the durable WAL
+        // cursor has reached this sequence.
+        loop {
+            let notified = self.ack_notify.notified();
+            let work = {
+                let mut acknowledgements = self.acknowledgements.lock().await;
+                let cursor = self.store.cursor();
+                while let Some((&stale, _)) = acknowledgements.iter().next() {
+                    if stale <= cursor {
+                        acknowledgements.remove(&stale);
+                    } else {
+                        break;
+                    }
+                }
+                let next_seq = cursor.saturating_add(1);
+                if let Some(ack) = acknowledgements.remove(&next_seq) {
+                    Some((next_seq, ack))
+                } else if cursor >= seq {
+                    return Ok(());
+                } else {
+                    None
+                }
+            };
+
+            match work {
+                Some((next_seq, ack)) => {
+                    if let Err(error) = ack.ack().await {
+                        self.acknowledgements
+                            .lock()
+                            .await
+                            .entry(next_seq)
+                            .or_insert(ack);
+                        self.ack_notify.notify_waiters();
+                        return Err(error);
+                    }
+                    if let Err(error) = self.store.advance_cursor(next_seq) {
+                        self.acknowledgements
+                            .lock()
+                            .await
+                            .entry(next_seq)
+                            .or_insert(ack);
+                        self.ack_notify.notify_waiters();
+                        return Err(error);
+                    }
+                    self.ack_notify.notify_waiters();
+                }
+                None => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = self.close.cancelled() => {
+                            return Err(Error::Process(
+                                "WAL closed while acknowledgement was pending".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Read all entries with sequence strictly greater than the committed
@@ -426,9 +543,9 @@ impl Wal {
     }
 }
 
-/// Acknowledgement decorator that advances the WAL cursor before delegating to
-/// the source-side ack. Wired into the stream so the durable cursor only moves
-/// past a message once the downstream output confirms the write.
+/// Acknowledgement decorator that commits the wrapped source acknowledgement
+/// before advancing the WAL cursor. Wired into the stream so a source-side
+/// failure leaves the record before both durable cursors and replayable.
 pub struct WalAck {
     wal: Arc<Wal>,
     seq: u64,
@@ -444,12 +561,7 @@ impl WalAck {
 #[async_trait::async_trait]
 impl crate::input::Ack for WalAck {
     async fn ack(&self) -> Result<(), Error> {
-        // Advance the durable cursor first (so the entry is reclaimable on
-        // restart), then commit the source. If the source ack fails after the
-        // cursor advanced, the source re-delivers — at-least-once, not loss.
-        self.wal.advance(self.seq).await?;
-        self.inner.ack().await?;
-        Ok(())
+        self.wal.acknowledge(self.seq, self.inner.clone()).await
     }
 
     fn mark_held(&self) {
@@ -467,7 +579,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::ops::Deref;
-    use std::sync::Arc as StdArc;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     fn sample_batch(input_name: Option<&str>) -> MessageBatch {
         let schema = StdArc::new(Schema::new(vec![
@@ -668,6 +780,61 @@ mod tests {
         drop(wal2);
         let wal3 = Wal::open(&cfg).unwrap();
         assert!(wal3.read_after_cursor().await.unwrap().is_empty());
+    }
+
+    struct RecordingAck {
+        sequence: u64,
+        calls: StdArc<StdMutex<Vec<u64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.calls.lock().unwrap().push(self.sequence);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_ack_keeps_cursor_contiguous_across_out_of_order_children() {
+        let dir = tempdir();
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&cfg).unwrap();
+        let first = wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        let second = wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        assert_eq!((first, second), (1, 2));
+
+        let calls = StdArc::new(StdMutex::new(Vec::new()));
+        let second_ack: StdArc<dyn Ack> = StdArc::new(RecordingAck {
+            sequence: second,
+            calls: calls.clone(),
+        });
+        let first_ack: StdArc<dyn Ack> = StdArc::new(RecordingAck {
+            sequence: first,
+            calls: calls.clone(),
+        });
+        let second_wal_ack: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), second, second_ack));
+        let first_wal_ack: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), first, first_ack));
+
+        // N+1 cannot report success until the source ack and WAL cursor have
+        // crossed the still-unacknowledged N. It therefore waits here.
+        let second_task = tokio::spawn(async move { second_wal_ack.ack().await });
+        tokio::task::yield_now().await;
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Closing the gap drains source acknowledgements and cursor advances
+        // in the same contiguous order.
+        first_wal_ack.ack().await.unwrap();
+        second_task.await.unwrap().unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+        assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
     }
 
     /// Throughput benchmark per sync policy (task 5.3). Ignored by default;

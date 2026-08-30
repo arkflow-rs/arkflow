@@ -219,6 +219,28 @@ impl From<Arc<dyn Ack>> for VecAck {
     }
 }
 
+/// Acknowledgement composite for independent source records. Unlike
+/// [`VecAck`], it invokes all children concurrently so a later Kafka/WAL
+/// sequence cannot block the earlier sequence from running in the same
+/// composite. The caller still observes a single success only after every
+/// child succeeds.
+pub struct ConcurrentAck(pub Vec<Arc<dyn Ack>>);
+
+#[async_trait]
+impl Ack for ConcurrentAck {
+    async fn ack(&self) -> Result<(), Error> {
+        futures::future::try_join_all(self.0.iter().map(|ack| ack.ack()))
+            .await
+            .map(|_| ())
+    }
+
+    fn mark_held(&self) {
+        for ack in &self.0 {
+            ack.mark_held();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +319,33 @@ mod tests {
             }),
         ]);
         assert!(clean.ack().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_ack_runs_independent_children_together() {
+        struct BarrierAck {
+            barrier: Arc<tokio::sync::Barrier>,
+        }
+
+        #[async_trait]
+        impl Ack for BarrierAck {
+            async fn ack(&self) -> Result<(), Error> {
+                self.barrier.wait().await;
+                Ok(())
+            }
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let composite = ConcurrentAck(vec![
+            Arc::new(BarrierAck {
+                barrier: barrier.clone(),
+            }),
+            Arc::new(BarrierAck { barrier }),
+        ]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), composite.ack())
+            .await
+            .expect("independent acknowledgements must not be serialized")
+            .unwrap();
     }
 }
 

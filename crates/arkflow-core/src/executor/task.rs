@@ -439,37 +439,74 @@ async fn run_source_chain(
                 // sealed positions.
                 frontier.seed(&positions);
                 let cut = frontier.seal(watermark_ms);
-                send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
-                spawn_barrier_snapshot(
-                    hook,
-                    barrier,
-                    cut,
-                    None,
-                    chain.entry_task_id().to_owned(),
-                );
+                // Capture the source chain's state before forwarding the
+                // barrier. Forwarding first would let the next loop turn
+                // around, process post-barrier input, and mutate the same
+                // backend while a detached snapshot was still reading it.
+                // The snapshot uses spawn_blocking internally, so this only
+                // yields this source loop and does not block the async
+                // runtime's worker threads.
+                let state = match hook.state.clone() {
+                    Some(backend) => super::barrier::snapshot_state(backend).await,
+                    None => Ok(crate::state::StateSnapshot::new(1, Vec::new())),
+                };
+                match state {
+                    Ok(state) => {
+                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                        if let Some(reporter) = &hook.reporter {
+                            let task_id = hook
+                                .task_id
+                                .clone()
+                                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+                            let _ = reporter.send(super::barrier::ChainSnapshot {
+                                task_id: task_id.clone(),
+                                attempt_id: format!("{task_id}-attempt"),
+                                partition: hook.partition.unwrap_or_default(),
+                                barrier: barrier.clone(),
+                                cut_generation: cut.generation,
+                                state,
+                                source_positions: cut.positions,
+                                watermark_ms: cut.watermark_ms,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(reporter) = &hook.failure_reporter {
+                            let _ = reporter.send(error);
+                        }
+                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                    }
+                }
                 continue;
             }
             _ = idle_tick.tick() => {
                 // Idle tick: refresh held rows (idle partitions unblock the
                 // watermark) and fire acks that are no longer deferred.
-                let (ready, ready_acks, dropped_acks, watermark) = {
+                let (ready, ready_acks, ready_invalid_timestamps, dropped_acks, watermark, late_rows) = {
                     let mut guard = event_gate.lock().await;
                     match guard.as_mut() {
-                        None => (Vec::new(), Vec::new(), Vec::new(), None),
+                        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, 0),
                         Some(gate) => {
                             let decision = gate.refresh()?;
                             (
                                 decision.ready,
                                 decision.ready_acks,
+                                decision.ready_invalid_timestamps,
                                 decision.dropped_acks,
                                 decision.watermark_ms,
+                                decision.late_event_rows,
                             )
                         }
                     }
                 };
                 record_watermark_lag(hook, watermark);
-                for ((batch, action), ack) in ready.into_iter().zip(ready_acks) {
-                    dispatch_gated(chain, hook, batch, action, ack).await?;
+                record_late_event_rows(hook, late_rows);
+                for (((batch, action), ack), invalid_timestamp) in ready
+                    .into_iter()
+                    .zip(ready_acks)
+                    .zip(ready_invalid_timestamps)
+                {
+                    dispatch_gated(chain, hook, batch, action, ack, invalid_timestamp).await?;
                 }
                 for ack in dropped_acks {
                     ack.ack().await?;
@@ -482,23 +519,30 @@ async fn run_source_chain(
             result = source.read() => match result {
                 Ok(read) => read,
                 Err(Error::EOF) => {
-                    let (ready, ready_acks, dropped_acks, watermark) = {
+                    let (ready, ready_acks, ready_invalid_timestamps, dropped_acks, watermark, late_rows) = {
                         let mut guard = event_gate.lock().await;
                         match guard.as_mut() {
-                            None => (Vec::new(), Vec::new(), Vec::new(), None),
+                            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, 0),
                             Some(gate) => {
                                 let decision = gate.finish();
                                 (
                                     decision.ready,
                                     decision.ready_acks,
+                                    decision.ready_invalid_timestamps,
                                     decision.dropped_acks,
                                     decision.watermark_ms,
+                                    decision.late_event_rows,
                                 )
                             }
                         }
                     };
-                    for ((batch, action), ack) in ready.into_iter().zip(ready_acks) {
-                        dispatch_gated(chain, hook, batch, action, ack).await?;
+                    record_late_event_rows(hook, late_rows);
+                    for (((batch, action), ack), invalid_timestamp) in ready
+                        .into_iter()
+                        .zip(ready_acks)
+                        .zip(ready_invalid_timestamps)
+                    {
+                        dispatch_gated(chain, hook, batch, action, ack, invalid_timestamp).await?;
                     }
                     for ack in dropped_acks {
                         ack.ack().await?;
@@ -570,23 +614,48 @@ async fn run_source_chain(
                 dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await?;
             }
             true => {
-                let partition = hook.partition.unwrap_or(0);
-                let (ready, ready_acks, dropped_acks, watermark) = {
+                let partitions = super::event_time_gate::split_by_partition(
+                    &batch,
+                    hook.partition.unwrap_or(0),
+                )?;
+                let child_acks = crate::input::fanout_ack(ack, partitions.len());
+                let (
+                    ready,
+                    ready_acks,
+                    ready_invalid_timestamps,
+                    dropped_acks,
+                    watermark,
+                    late_rows,
+                ) = {
                     let mut guard = event_gate.lock().await;
                     let gate = guard
                         .as_mut()
                         .expect("event-time gate disappeared while processing a source batch");
-                    let decision = gate.observe_with_ack(partition, batch, ack)?;
+                    let decision = gate.observe_partitioned_with_ack(
+                        partitions
+                            .into_iter()
+                            .zip(child_acks)
+                            .map(|((partition, slice), slice_ack)| (partition, slice, slice_ack))
+                            .collect(),
+                    )?;
                     (
                         decision.ready,
                         decision.ready_acks,
+                        decision.ready_invalid_timestamps,
                         decision.dropped_acks,
                         decision.watermark_ms,
+                        decision.late_event_rows,
                     )
                 };
                 record_watermark_lag(hook, watermark);
-                for ((slice, action), slice_ack) in ready.into_iter().zip(ready_acks) {
-                    dispatch_gated(chain, hook, slice, action, slice_ack).await?;
+                record_late_event_rows(hook, late_rows);
+                for (((slice, action), slice_ack), invalid_timestamp) in ready
+                    .into_iter()
+                    .zip(ready_acks)
+                    .zip(ready_invalid_timestamps)
+                {
+                    dispatch_gated(chain, hook, slice, action, slice_ack, invalid_timestamp)
+                        .await?;
                 }
                 for dropped in dropped_acks {
                     dropped.ack().await?;
@@ -600,18 +669,30 @@ async fn run_source_chain(
 }
 
 async fn shutdown_source_chain(chain: &Chain, hook: &CheckpointHook) -> Result<(), Error> {
-    let (ready, ready_acks, dropped_acks) = {
+    let (ready, ready_acks, ready_invalid_timestamps, dropped_acks, late_rows) = {
         let mut guard = hook.event_time_gate.lock().await;
         match guard.as_mut() {
             Some(gate) => {
                 let decision = gate.finish();
-                (decision.ready, decision.ready_acks, decision.dropped_acks)
+                (
+                    decision.ready,
+                    decision.ready_acks,
+                    decision.ready_invalid_timestamps,
+                    decision.dropped_acks,
+                    decision.late_event_rows,
+                )
             }
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0),
         }
     };
-    for ((batch, action), ack) in ready.into_iter().zip(ready_acks) {
-        if let Err(error) = dispatch_gated(chain, hook, batch, action, ack).await {
+    record_late_event_rows(hook, late_rows);
+    for (((batch, action), ack), invalid_timestamp) in ready
+        .into_iter()
+        .zip(ready_acks)
+        .zip(ready_invalid_timestamps)
+    {
+        if let Err(error) = dispatch_gated(chain, hook, batch, action, ack, invalid_timestamp).await
+        {
             tracing::debug!(%error, task = chain.entry_task_id(), "discarding source output during cancellation");
         }
     }
@@ -652,6 +733,18 @@ fn record_watermark_lag(hook: &CheckpointHook, watermark: Option<i64>) {
     }
 }
 
+fn record_late_event_rows(hook: &CheckpointHook, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    if let Some(metrics) = &hook.metrics {
+        metrics
+            .kernel
+            .late_events
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Dispatch one gated batch slice according to its window action. Route and
 /// Update forward with their marker columns attached (legacy semantics);
 /// Emit/Hold-equivalent rows flow through the chain normally.
@@ -661,27 +754,27 @@ async fn dispatch_gated(
     batch: crate::MessageBatchRef,
     action: crate::event_time::WindowAction,
     ack: Arc<dyn crate::input::Ack>,
+    invalid_timestamp: bool,
 ) -> Result<(), Error> {
-    if matches!(
-        action,
-        crate::event_time::WindowAction::Route | crate::event_time::WindowAction::Update
-    ) {
-        if let Some(metrics) = &hook.metrics {
-            metrics
-                .kernel
-                .late_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     if action == crate::event_time::WindowAction::Route {
         let last_task = chain.task_ids.last().map(String::as_str).unwrap_or("");
         if let Some(targets) = chain.late_event_outputs.get(last_task) {
+            let batch = if invalid_timestamp {
+                mark_event_batch(batch, "__arkflow_invalid_timestamp_route")?
+            } else {
+                batch
+            };
             let batch = mark_event_batch(batch, "__arkflow_late_event_route")?;
             return send_to_targets(Some(targets), Envelope::Data(batch, ack), true).await;
         }
         // A Route policy without a declared route target has no safe side
         // branch. Preserve the row on the main path as an Update instead of
         // silently acknowledging and dropping it.
+        let batch = if invalid_timestamp {
+            mark_event_batch(batch, "__arkflow_invalid_timestamp_route")?
+        } else {
+            batch
+        };
         let batch = mark_event_batch(batch, "__arkflow_late_event_update")?;
         return dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await;
     }
@@ -714,55 +807,6 @@ fn mark_event_batch(
     let mut marked = crate::MessageBatch::new_arrow(marked);
     marked.set_input_name(batch.get_input_name());
     Ok(Arc::new(marked))
-}
-
-/// Start an asynchronous barrier snapshot for a source chain. The cut is
-/// sealed by the single-threaded event loop at the marker — positions and
-/// watermark cannot race with the report — while the potentially blocking
-/// state read stays detached so the data plane is never held behind a global
-/// checkpoint lock.
-fn spawn_barrier_snapshot(
-    hook: &CheckpointHook,
-    barrier: crate::checkpoint::CheckpointBarrier,
-    cut: super::commit::CheckpointCut,
-    task_id_override: Option<String>,
-    default_task_id: String,
-) {
-    let Some(reporter) = hook.reporter.clone() else {
-        return;
-    };
-    let failure_reporter = hook.failure_reporter.clone();
-    let state_backend = hook.state.clone();
-    let task_id = task_id_override
-        .or_else(|| hook.task_id.clone())
-        .unwrap_or(default_task_id);
-    let attempt_id = format!("{task_id}-attempt");
-    let partition = hook.partition.unwrap_or_default();
-    tokio::spawn(async move {
-        let state = match state_backend {
-            Some(backend) => super::barrier::snapshot_state(backend).await,
-            None => Ok(crate::state::StateSnapshot::new(1, Vec::new())),
-        };
-        match state {
-            Ok(state) => {
-                let _ = reporter.send(super::barrier::ChainSnapshot {
-                    task_id,
-                    attempt_id,
-                    partition,
-                    barrier,
-                    cut_generation: cut.generation,
-                    state,
-                    source_positions: cut.positions,
-                    watermark_ms: cut.watermark_ms,
-                });
-            }
-            Err(error) => {
-                if let Some(failure_reporter) = failure_reporter {
-                    let _ = failure_reporter.send(error);
-                }
-            }
-        }
-    });
 }
 
 /// Interior/sink chain: consume inbound channels. Barriers align across the
@@ -1079,6 +1123,11 @@ struct ProcessorWorkerPool {
     collector: tokio::task::JoinHandle<()>,
 }
 
+enum PoolResult {
+    Outputs(Vec<ProcessedBatch>),
+    ProcessorFailure(ProcessorFailure),
+}
+
 impl ProcessorWorkerPool {
     /// Start a pool for `chain` (no-op returning `None` when the configured
     /// concurrency is 1 or the chain has no processors). Workers are
@@ -1097,8 +1146,13 @@ impl ProcessorWorkerPool {
         let shared = Arc::new(chain.share_for_workers());
         let metrics = hook.metrics.clone();
         let (work_tx, work_rx) = flume::bounded::<(u64, PoolDelivery)>(64.min(parallelism * 8));
-        let (done_tx, done_rx) = flume::unbounded::<(u64, Vec<ProcessedBatch>)>();
+        let (done_tx, done_rx) = flume::unbounded::<(u64, PoolResult)>();
         let (fail_tx, fail_rx) = flume::bounded::<Error>(1);
+        let error_targets = chain
+            .task_ids
+            .last()
+            .and_then(|task_id| chain.error_outputs.get(task_id))
+            .cloned();
         let flushed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Notify::new());
@@ -1123,32 +1177,37 @@ impl ProcessorWorkerPool {
                     let (sequence, (batch, ack)) = submit;
                     match process_chain(&shared, batch, ack, metrics.as_ref()).await {
                         Ok(outputs) => {
-                            if done_tx.send((sequence, outputs)).is_err() {
+                            if done_tx
+                                .send((sequence, PoolResult::Outputs(outputs)))
+                                .is_err()
+                            {
                                 return;
                             }
                         }
-                        Err(error) => {
-                            let error = match error {
-                                ProcessChainError::Processor(failure) => {
-                                    if let Some(metrics) = &metrics {
-                                        metrics
-                                            .processing_errors
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    Error::Process(format!(
-                                        "processor worker failure: {}",
-                                        failure.error
-                                    ))
+                        Err(error) => match error {
+                            ProcessChainError::Processor(failure) => {
+                                // Keep the failed batch and its source
+                                // acknowledgement in the ordered result
+                                // stream. The collector routes it through
+                                // the configured error edge at the same
+                                // sequence position as ordinary output.
+                                if done_tx
+                                    .send((sequence, PoolResult::ProcessorFailure(failure)))
+                                    .is_err()
+                                {
+                                    return;
                                 }
-                                ProcessChainError::Fatal(error) => error,
-                            };
-                            // Keep draining so the bounded queue never
-                            // deadlocks the chain loop; the chain observes
-                            // the failure through `fail` and cancels.
-                            failed.store(true, std::sync::atomic::Ordering::Release);
-                            progress.notify_waiters();
-                            let _ = fail_tx.try_send(error);
-                        }
+                            }
+                            ProcessChainError::Fatal(error) => {
+                                // Keep draining so the bounded queue never
+                                // deadlocks the chain loop; the chain
+                                // observes the fatal failure through
+                                // `fail` and cancels.
+                                failed.store(true, std::sync::atomic::Ordering::Release);
+                                progress.notify_waiters();
+                                let _ = fail_tx.try_send(error);
+                            }
+                        },
                     }
                 }
             });
@@ -1160,8 +1219,9 @@ impl ProcessorWorkerPool {
         let collector_flushed = flushed.clone();
         let collector_failed = failed.clone();
         let collector_progress = progress.clone();
+        let collector_fail_tx = fail_tx.clone();
         let collector = tokio::spawn(async move {
-            let mut pending: BTreeMap<u64, Vec<ProcessedBatch>> = BTreeMap::new();
+            let mut pending: BTreeMap<u64, PoolResult> = BTreeMap::new();
             let mut next_sequence = 0u64;
             loop {
                 let done = tokio::select! {
@@ -1170,12 +1230,19 @@ impl ProcessorWorkerPool {
                         Ok(done) => done,
                         Err(_) => {
                             // All workers exited: flush what is left.
-                            while let Some(outputs) = pending.remove(&next_sequence) {
-                                if flush_outputs(&collector_shared, outputs).await.is_err() {
+                            while let Some(result) = pending.remove(&next_sequence) {
+                                if let Err(error) = flush_pool_result(
+                                    &collector_shared,
+                                    result,
+                                    error_targets.as_ref(),
+                                )
+                                .await
+                                {
                                     collector_failed.store(
                                         true,
                                         std::sync::atomic::Ordering::Release,
                                     );
+                                    let _ = collector_fail_tx.try_send(error);
                                     collector_progress.notify_waiters();
                                     return;
                                 }
@@ -1188,11 +1255,14 @@ impl ProcessorWorkerPool {
                         }
                     },
                 };
-                let (sequence, outputs) = done;
-                pending.insert(sequence, outputs);
-                while let Some(outputs) = pending.remove(&next_sequence) {
-                    if flush_outputs(&collector_shared, outputs).await.is_err() {
+                let (sequence, result) = done;
+                pending.insert(sequence, result);
+                while let Some(result) = pending.remove(&next_sequence) {
+                    if let Err(error) =
+                        flush_pool_result(&collector_shared, result, error_targets.as_ref()).await
+                    {
                         collector_failed.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = collector_fail_tx.try_send(error);
                         collector_progress.notify_waiters();
                         return;
                     }
@@ -1265,6 +1335,36 @@ impl ProcessorWorkerPool {
         match self.failure.recv_async().await {
             Ok(error) => error,
             Err(_) => Error::Process("processor worker pool failed".into()),
+        }
+    }
+}
+
+/// Publish one ordered worker result. Processor failures retain their failed
+/// delivery and use the same error-only routing path as the single-threaded
+/// chain instead of being converted into an opaque error and dropped.
+async fn flush_pool_result(
+    chain: &Chain,
+    result: PoolResult,
+    error_targets: Option<&Vec<EdgeTarget>>,
+) -> Result<(), Error> {
+    match result {
+        PoolResult::Outputs(outputs) => flush_outputs(chain, outputs).await,
+        PoolResult::ProcessorFailure(failure) => {
+            let Some(targets) = error_targets else {
+                return Err(failure.error);
+            };
+            send_to_targets(
+                Some(targets),
+                Envelope::Data(failure.batch, failure.ack),
+                false,
+            )
+            .await
+            .map_err(|route_error| {
+                Error::Process(format!(
+                    "processor failed and error output routing failed: {}; route error: {route_error}",
+                    failure.error
+                ))
+            })
         }
     }
 }

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 /// Kafka input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +68,13 @@ pub struct KafkaInput {
     /// exposes only the contiguous acknowledged run — a maximum observed
     /// offset would silently skip unacknowledged records in a gap.
     frontier: Arc<CommitFrontier>,
+    /// Serialize frontier advancement and broker `store_offset` calls. A
+    /// concurrent fan-out ack must not issue an older broker write after a
+    /// newer one and regress the committed offset.
+    ack_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Wakes acknowledgements waiting for an earlier offset to close the
+    /// contiguous frontier gap.
+    ack_notify: Arc<Notify>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -95,6 +102,8 @@ impl KafkaInput {
             consumer: Arc::new(RwLock::new(None)),
             assigned_partition: Arc::new(RwLock::new(None)),
             frontier: Arc::new(CommitFrontier::new()),
+            ack_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ack_notify: Arc::new(Notify::new()),
             codec,
         })
     }
@@ -346,6 +355,8 @@ impl Input for KafkaInput {
                 let ack = KafkaAck {
                     consumer: self.consumer.clone(),
                     frontier: self.frontier.clone(),
+                    ack_lock: self.ack_lock.clone(),
+                    ack_notify: self.ack_notify.clone(),
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
@@ -486,6 +497,8 @@ impl Input for KafkaInput {
 pub struct KafkaAck {
     consumer: Arc<RwLock<Option<StreamConsumer>>>,
     frontier: Arc<CommitFrontier>,
+    ack_lock: Arc<tokio::sync::Mutex<()>>,
+    ack_notify: Arc<Notify>,
     topic: String,
     partition: i32,
     offset: i64,
@@ -494,36 +507,67 @@ pub struct KafkaAck {
 #[async_trait]
 impl Ack for KafkaAck {
     async fn ack(&self) -> Result<(), Error> {
-        // Only called after the downstream output confirms the write. The
-        // frontier records the acknowledgement; the durable store advances to
-        // the CONTIGUOUS acknowledged next offset — a fan-out completing this
-        // branch before an earlier one leaves the store waiting at the gap so
-        // a crash never skips the unacknowledged records in between.
         let position = SourcePosition {
             topic: Some(self.topic.clone()),
             partition: self.partition.max(0) as u32,
             offset: u64::try_from(self.offset.saturating_add(1))
                 .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
         };
-        let next_offset = match self.frontier.acknowledge(&position) {
-            AckAdvance::Pending { .. } => return Ok(()),
-            AckAdvance::Advanced { next_offset } => next_offset,
-            // A retry after the durable store failed: the frontier already
-            // advanced, only the store needs to catch up.
-            AckAdvance::AlreadyCovered => self
-                .frontier
-                .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
-                .unwrap_or(position.offset),
-        };
-        let store_offset_value = i64::try_from(next_offset.saturating_sub(1))
-            .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
-        let consumer_mutex_guard = self.consumer.read().await;
-        if let Some(consumer) = &*consumer_mutex_guard {
-            consumer
-                .store_offset(&self.topic, self.partition, store_offset_value)
-                .map_err(|e| Error::Process(format!("Failed to store Kafka offset: {}", e)))?;
+        loop {
+            // Register the notification before inspecting the frontier. If
+            // the gap-closing ack completes between these two operations, the
+            // Notify permit is retained and this wait still wakes.
+            let notified = self.ack_notify.notified();
+            let result = {
+                // Keep frontier advancement and broker-side store_offset in
+                // one order, but never hold this lock while waiting for an
+                // earlier offset. Otherwise two out-of-order acks can
+                // deadlock each other.
+                let _ack_guard = self.ack_lock.lock().await;
+                let next_offset = match self.frontier.acknowledge(&position) {
+                    AckAdvance::Pending { .. } => None,
+                    AckAdvance::Advanced { next_offset } => Some(next_offset),
+                    // A retry after a durable store failure: the frontier
+                    // already advanced, so the broker store only needs to
+                    // catch up to the current contiguous next offset.
+                    AckAdvance::AlreadyCovered => Some(
+                        self.frontier
+                            .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
+                            .unwrap_or(position.offset),
+                    ),
+                };
+
+                match next_offset {
+                    None => Ok::<Option<u64>, Error>(None),
+                    Some(next_offset) => {
+                        let store_offset_value = i64::try_from(next_offset.saturating_sub(1))
+                            .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
+                        let consumer_mutex_guard = self.consumer.read().await;
+                        if let Some(consumer) = &*consumer_mutex_guard {
+                            consumer
+                                .store_offset(&self.topic, self.partition, store_offset_value)
+                                .map_err(|e| {
+                                    Error::Process(format!("Failed to store Kafka offset: {}", e))
+                                })?;
+                        }
+                        Ok::<Option<u64>, Error>(Some(next_offset))
+                    }
+                }
+            };
+            match result {
+                Ok(Some(_)) => {
+                    // A successful store wakes any later branch waiting on
+                    // this newly closed gap, while this caller's durable cut
+                    // is now complete.
+                    self.ack_notify.notify_waiters();
+                    return Ok(());
+                }
+                Ok(None) => {
+                    notified.await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(())
     }
 }
 
@@ -644,6 +688,8 @@ mod tests {
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
@@ -685,18 +731,26 @@ mod tests {
         let ack_at = |offset: i64| KafkaAck {
             consumer: input.consumer.clone(),
             frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset,
         };
-        // The later branch of a fan-out completes first.
-        ack_at(7).ack().await.unwrap();
+        // The later branch of a fan-out cannot report success while the
+        // earlier offsets are still missing. It waits for the gap to close.
+        let later_ack = ack_at(7);
+        let later_task = tokio::spawn(async move { later_ack.ack().await });
+        tokio::task::yield_now().await;
         let positions = input.current_positions().await.unwrap();
         assert_eq!(positions[0].offset, 5, "the gap holds the frontier");
-        ack_at(6).ack().await.unwrap();
-        assert_eq!(input.current_positions().await.unwrap()[0].offset, 5);
-        // Closing the gap drains the contiguous run to 8 at once.
+        // Closing the first gap advances only to the next missing delivery.
         ack_at(5).ack().await.unwrap();
+        assert_eq!(input.current_positions().await.unwrap()[0].offset, 6);
+        // The next acknowledgement drains the pending later branch and the
+        // waiting task can now finish with the durable frontier at 8.
+        ack_at(6).ack().await.unwrap();
+        later_task.await.unwrap().unwrap();
         assert_eq!(input.current_positions().await.unwrap()[0].offset, 8);
     }
 
@@ -731,6 +785,8 @@ mod tests {
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
             topic: "test-topic".to_string(),
             partition: 3,
             offset: 42,

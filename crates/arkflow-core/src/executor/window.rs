@@ -7,7 +7,7 @@
 //! backend. Watermarks (or the processing-time trigger) fire windows whose
 //! end has passed, emitting the aggregate batch downstream.
 
-use crate::input::{fanout_ack, Ack, VecAck};
+use crate::input::{fanout_ack, Ack, ConcurrentAck, VecAck};
 use crate::processor::Processor;
 use crate::state::StateBackend;
 use crate::Error;
@@ -578,8 +578,24 @@ impl ColumnarWindowOperator {
             .config
             .value_fields
             .iter()
-            .filter_map(|field| batch.record_batch().column_by_name(field))
-            .collect();
+            .map(|field| {
+                batch.record_batch().column_by_name(field).ok_or_else(|| {
+                    Error::Process(format!("window value field '{}' is missing", field))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let late_update_flags = batch
+            .record_batch()
+            .column_by_name("__arkflow_late_event_update")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>());
+        let excluded_window_ends = batch
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .and_then(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+            });
         let mut buffers = self.buffers.lock().unwrap();
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
@@ -631,6 +647,27 @@ impl ColumnarWindowOperator {
                 windows = vec![(merged_start, merged_end)];
             }
             for (window_start, window_end) in windows {
+                let excluded = excluded_window_ends
+                    .and_then(|values| values.is_valid(row).then(|| values.value(row)))
+                    .is_some_and(|values| {
+                        values.split(',').any(|value| {
+                            value
+                                .parse::<i64>()
+                                .map(|end| end == window_end)
+                                .unwrap_or(false)
+                        })
+                    });
+                if excluded {
+                    continue;
+                }
+                // A late Update corrects an already retained aggregate. Do
+                // not create a new partial buffer for a window that has
+                // already been cleaned up after its lateness deadline.
+                if late_update_flags.is_some_and(|flags| flags.value(row))
+                    && !buffers.contains_key(&(window_start, key.clone()))
+                {
+                    continue;
+                }
                 touched.insert((window_start, key.clone()));
                 let entry = buffers.entry((window_start, key.clone())).or_default();
                 if let Some(seed) = session_seed.take() {
@@ -1124,8 +1161,10 @@ impl ColumnarWindowOperator {
     /// fired window group so its staged state applies only after the output
     /// write is confirmed downstream.
     fn fired_ack(&self, fired_keys: &[(i64, String)], extra: Vec<Arc<dyn Ack>>) -> Arc<dyn Ack> {
-        let mut acks = self.take_acks(fired_keys);
-        acks.extend(extra);
+        // The journal commit must run before any source/WAL acknowledgement.
+        // Otherwise a source cursor can become durable while applying the
+        // fired window state still fails, making the aggregate unrecoverable.
+        let mut state_acks = Vec::new();
         if let Some(journal) = &self.journal {
             let fired_txns = {
                 let mut txns = self.window_txns.lock().unwrap();
@@ -1135,14 +1174,23 @@ impl ColumnarWindowOperator {
                     .collect::<Vec<_>>()
             };
             for txn in fired_txns {
-                acks.push(Arc::new(super::state_journal::CommitOnAck::new(
+                state_acks.push(Arc::new(super::state_journal::CommitOnAck::new(
                     journal.clone(),
                     txn,
                     Arc::new(crate::input::NoopAck),
                 )) as Arc<dyn Ack>);
             }
         }
-        Arc::new(VecAck(acks))
+        let mut source_acks = self.take_acks(fired_keys);
+        source_acks.extend(extra);
+        let mut ordered = Vec::new();
+        if !state_acks.is_empty() {
+            ordered.push(Arc::new(VecAck(state_acks)) as Arc<dyn Ack>);
+        }
+        if !source_acks.is_empty() {
+            ordered.push(Arc::new(ConcurrentAck(source_acks)) as Arc<dyn Ack>);
+        }
+        Arc::new(VecAck(ordered))
     }
 
     /// Commit fired windows immediately (no acknowledgement flow to gate on).
@@ -1770,8 +1818,23 @@ mod tests {
         op.process(Arc::new(crate::MessageBatch::new_arrow(record)))
             .await
             .unwrap();
+        let trigger = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, false),
+                Field::new("key", DataType::Utf8, false),
+                Field::new("f", DataType::Float64, false),
+                Field::new("__watermark_ms", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![20_000])),
+                Arc::new(StringArray::from(vec!["z"])),
+                Arc::new(Float64Array::from(vec![0.0])),
+                Arc::new(Int64Array::from(vec![10_000])),
+            ],
+        )
+        .unwrap();
         let fired = op
-            .process(batch(vec![(20_000, "z", 0)], Some(10_000)))
+            .process(Arc::new(crate::MessageBatch::new_arrow(trigger)))
             .await
             .unwrap();
         let ProcessResult::Single(fired) = fired else {
@@ -1850,8 +1913,23 @@ mod tests {
         op.process(Arc::new(crate::MessageBatch::new_arrow(record)))
             .await
             .unwrap();
+        let trigger = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, false),
+                Field::new("key", DataType::Utf8, false),
+                Field::new("f", DataType::Float32, false),
+                Field::new("__watermark_ms", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![20_000])),
+                Arc::new(StringArray::from(vec!["z"])),
+                Arc::new(datafusion::arrow::array::Float32Array::from(vec![0.0f32])),
+                Arc::new(Int64Array::from(vec![10_000])),
+            ],
+        )
+        .unwrap();
         let fired = op
-            .process(batch(vec![(20_000, "z", 0)], Some(10_000)))
+            .process(Arc::new(crate::MessageBatch::new_arrow(trigger)))
             .await
             .unwrap();
         let ProcessResult::Single(fired) = fired else {
