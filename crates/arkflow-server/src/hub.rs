@@ -303,6 +303,11 @@ struct NodeRecord {
     boot_id: Option<String>,
     report_seq: u64,
     commands: VecDeque<AgentCommand>,
+    /// Commands returned by the poll endpoint remain leased until a terminal
+    /// result arrives. Keeping the lease separately from the queue lets the
+    /// Hub recover a command whose HTTP response was lost after it was popped
+    /// but before the Agent executed it.
+    leased_commands: BTreeMap<String, AgentCommand>,
     streams: Vec<StreamStatus>,
     operations: Vec<OperationRecord>,
     events: Vec<ControlEvent>,
@@ -495,6 +500,27 @@ impl Hub {
                 })
                 .collect::<Vec<_>>()
         };
+        let historical_nodes = self
+            .operations
+            .read()
+            .await
+            .values()
+            .filter(|operation_record| {
+                operation_record.resource_id == job.job_id
+                    && operation_record.operation == "job_start"
+                    // Keep starts from older generations in the placement
+                    // history: a generation change may move a Job to another
+                    // node, and the old node must receive a stop command.
+                    && operation_record.generation <= job.generation
+            })
+            .map(|operation_record| operation_record.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        // A successful/current operation is used to retain an automatic
+        // placement. Historical failed or expired starts are intentionally
+        // excluded here: they may never have reached an Agent and must not
+        // pin a newly reconciled Job to a dead node. They remain in
+        // `historical_nodes` so a partially executed command can still be
+        // fenced with a best-effort stop below.
         let previous_nodes = self
             .operations
             .read()
@@ -503,7 +529,7 @@ impl Hub {
             .filter(|operation_record| {
                 operation_record.resource_id == job.job_id
                     && operation_record.operation == "job_start"
-                    && operation_record.generation == job.generation
+                    && operation_record.generation <= job.generation
                     && !matches!(
                         operation_record.state,
                         HubOperationState::Failed
@@ -531,26 +557,36 @@ impl Hub {
             if operation == "job_start" && job.node_ids.is_empty() && previous_nodes_all_online {
                 previous_nodes.iter().cloned().collect::<Vec<_>>()
             } else if operation == "job_stop" {
-                let target_ids = if previous_nodes.is_empty() {
-                    targets.iter().cloned().collect::<BTreeSet<_>>()
-                } else {
-                    previous_nodes.clone()
-                };
-                targets
+                // A stopped Job must reach every node that may still host an
+                // older generation. Such a node is not necessarily part of
+                // the current explicit placement (for example after a move
+                // from A to B), so filtering the already-derived current
+                // targets would silently omit A. Include both the durable
+                // start history and the current placement, then retain only
+                // nodes that can accept a command now.
+                let mut target_ids = historical_nodes.clone();
+                target_ids.extend(targets.iter().cloned());
+                let nodes = self.nodes.read().await;
+                target_ids
                     .into_iter()
-                    .filter(|node_id| target_ids.contains(node_id))
+                    .filter(|node_id| {
+                        nodes.get(node_id).is_some_and(|node| {
+                            node.resource.state == NodeConnectionState::Online
+                                && node.resource.lease_expires_at_ms > now_ms()
+                                && node.resource.maintenance_state == NodeMaintenanceState::Active
+                        })
+                    })
                     .collect::<Vec<_>>()
             } else {
                 targets
             };
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
-        let placement_changed = operation == "job_start" && target_ids != previous_nodes;
         if operation == "job_start" {
-            let nodes_to_stop = if placement_changed {
-                previous_nodes.iter().collect::<Vec<_>>()
-            } else {
-                previous_nodes.difference(&target_ids).collect::<Vec<_>>()
-            };
+            // A target that is still valid for the new generation does not
+            // need a stop/start bounce. Every historical placement outside
+            // the desired set is stale and must be fenced, including starts
+            // recorded under an older generation.
+            let nodes_to_stop = historical_nodes.difference(&target_ids).collect::<Vec<_>>();
             for node_id in nodes_to_stop {
                 let is_online = self.nodes.read().await.get(node_id).is_some_and(|node| {
                     node.resource.state == NodeConnectionState::Online
@@ -613,7 +649,6 @@ impl Hub {
         let mut dispatched = 0;
         for node_id in targets {
             if operation == "job_start"
-                && !placement_changed
                 && self
                     .operations
                     .read()
@@ -1204,6 +1239,26 @@ impl Hub {
                 .recover_reconciliation(now_ms())
                 .await
                 .map_err(HubError::from)?;
+            // Operations are part of durable reconciliation state. Restore
+            // them before the recovered Hub becomes visible, otherwise the
+            // first reconciliation cannot tell an existing assignment from a
+            // missing one and may dispatch duplicate starts.
+            let recovered_operations = storage
+                .list_operations(None::<String>)
+                .await
+                .map_err(HubError::from)?;
+            let mut operations = self.operations.write().await;
+            for persisted in recovered_operations {
+                let operation = serde_json::from_str::<HubOperation>(&persisted.operation_json)
+                    .map_err(|error| {
+                        HubError::Invalid(format!(
+                            "invalid persisted operation '{}': {error}",
+                            persisted.operation_id
+                        ))
+                    })?;
+                operations.insert(operation.id.clone(), operation);
+            }
+            drop(operations);
             let recovered = storage.recover_rollouts().await.map_err(HubError::from)?;
             let mut rollouts = self.rollouts.write().await;
             for rollout in recovered {
@@ -1510,6 +1565,13 @@ impl Hub {
                 } else {
                     old.as_ref()
                         .map(|record| record.commands.clone())
+                        .unwrap_or_default()
+                },
+                leased_commands: if boot_changed {
+                    BTreeMap::new()
+                } else {
+                    old.as_ref()
+                        .map(|record| record.leased_commands.clone())
                         .unwrap_or_default()
                 },
                 streams: old
@@ -1847,12 +1909,62 @@ impl Hub {
         let node = authenticated_node(&mut nodes, &auth)?;
         let now = now_ms();
         let mut commands = Vec::new();
+        let mut expired = Vec::new();
         while let Some(command) = node.commands.pop_front() {
             if command.expires_at_ms > now {
+                node.leased_commands
+                    .insert(command.id.clone(), command.clone());
                 commands.push(command);
+            } else {
+                expired.push(command);
+            }
+        }
+        let expired_leases = node
+            .leased_commands
+            .iter()
+            .filter(|(_, command)| command.expires_at_ms <= now)
+            .map(|(command_id, _)| command_id.clone())
+            .collect::<Vec<_>>();
+        for command_id in expired_leases {
+            if let Some(command) = node.leased_commands.remove(&command_id) {
+                expired.push(command);
             }
         }
         drop(nodes);
+        // A queued command is leased even before an Agent receives it. Do not
+        // silently discard an expired lease while leaving its operation in an
+        // active deduplication state: mark it retryable/terminal so the normal
+        // Job reconciler can enqueue a fresh command.  Non-Job commands do
+        // not have a desired-state reconciler, so retain enough of the
+        // expired command to enqueue a replacement below.
+        let mut expired_operations = Vec::new();
+        let mut expired_job_ids = BTreeSet::new();
+        let mut expired_retries = Vec::new();
+        if !expired.is_empty() {
+            let mut operations = self.operations.write().await;
+            for command in &expired {
+                if let Some(operation) = operations.get_mut(&command.operation_id) {
+                    if matches!(
+                        operation.state,
+                        HubOperationState::Queued
+                            | HubOperationState::Dispatched
+                            | HubOperationState::Acknowledged
+                            | HubOperationState::Running
+                    ) {
+                        operation.state = HubOperationState::TimedOut;
+                        operation.finished_at_ms = Some(now);
+                        operation.next_retry_at_ms = Some(now);
+                        operation.error = Some("command lease expired before execution".into());
+                        if matches!(operation.operation.as_str(), "job_start" | "job_stop") {
+                            expired_job_ids.insert(operation.resource_id.clone());
+                        } else {
+                            expired_retries.push(command.clone());
+                        }
+                        expired_operations.push(operation.clone());
+                    }
+                }
+            }
+        }
         if !commands.is_empty() {
             let mut operations = self.operations.write().await;
             for command in &commands {
@@ -1863,6 +1975,11 @@ impl Hub {
             }
         }
         if let Some(storage) = self.storage.as_ref() {
+            for operation in &expired_operations {
+                persist_operation(storage, operation)
+                    .await
+                    .map_err(HubError::from)?;
+            }
             for command in &commands {
                 if let Some(attempt_id) = command.attempt_id.as_deref() {
                     storage
@@ -1870,6 +1987,57 @@ impl Hub {
                         .await
                         .map_err(HubError::from)?;
                 }
+            }
+        }
+        // A command can expire after being queued, or after an Agent polled it
+        // and lost the response before execution.  Marking its old operation
+        // terminal is not enough for operations without a desired-state
+        // reconciler: the old active record would otherwise be the next
+        // deduplication hit forever.  Re-enqueue a fresh command with the same
+        // payload and generation.  Job start/stop uses the canonical
+        // reconciliation path below so a changed Job spec/placement is
+        // rebuilt instead of replaying stale command data.
+        for command in expired_retries {
+            if command.operation.starts_with("job_") {
+                let Some(job) = self.job(&command.resource_id).await? else {
+                    continue;
+                };
+                if job.generation != command.generation {
+                    continue;
+                }
+            }
+            if let Err(error) = self
+                .enqueue_with_metadata(
+                    command.node_id.clone(),
+                    command.operation.clone(),
+                    command.resource_id.clone(),
+                    command.correlation_id.clone(),
+                    command.payload.clone(),
+                    command.generation,
+                    command.action_id.clone(),
+                    command.config_version_id.clone(),
+                    None,
+                    None,
+                    command.attempt_id.clone(),
+                )
+                .await
+            {
+                // The node may have gone offline while the expired command
+                // was being requeued.  The next heartbeat/reconciliation can
+                // retry it; polling the current command queue should still
+                // succeed and return the non-expired commands.
+                tracing::warn!(
+                    node_id = %command.node_id,
+                    operation = %command.operation,
+                    resource_id = %command.resource_id,
+                    %error,
+                    "failed to requeue expired Hub command"
+                );
+            }
+        }
+        for job_id in expired_job_ids {
+            if let Some(job) = self.job(&job_id).await? {
+                self.reconcile_job(&job).await?;
             }
         }
         Ok(commands)
@@ -2055,12 +2223,16 @@ impl Hub {
             .and_then(serde_json::Value::as_str);
         if let Some(operation_id) = operation_id_override.as_deref() {
             if let Some(existing) = operations.get(operation_id) {
-                return Ok(existing.clone());
+                if existing.generation == generation {
+                    return Ok(existing.clone());
+                }
+                return Err(HubError::IdempotencyKeyReused);
             }
         } else if let Some(existing) = operations.values().find(|item| {
             item.node_id == node_id
                 && item.resource_id == resource_id
                 && item.operation == operation
+                && item.generation == generation
                 && (item.checkpoint_id.as_deref() == requested_checkpoint_id
                     || (!operation.starts_with("job_checkpoint")
                         && !operation.starts_with("job_savepoint")))
@@ -2079,7 +2251,7 @@ impl Hub {
             .unwrap_or_else(|| format!("hop-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
         let command_id = command_id_override
             .unwrap_or_else(|| format!("cmd-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-        if node.commands.len() >= MAX_COMMANDS_PER_NODE {
+        if node.commands.len() + node.leased_commands.len() >= MAX_COMMANDS_PER_NODE {
             return Err(HubError::Capacity);
         }
         let operation_record = HubOperation {
@@ -2153,7 +2325,7 @@ impl Hub {
         auth: AgentAuth,
         result: CommandResult,
     ) -> Result<HubOperation, HubError> {
-        let nodes = self.nodes.read().await;
+        let mut nodes = self.nodes.write().await;
         let node = nodes.get(&auth.node_id).ok_or(HubError::Unauthorized)?;
         if !bool::from(
             auth.session_token
@@ -2162,6 +2334,12 @@ impl Hub {
         ) {
             return Err(HubError::Unauthorized);
         }
+        // A terminal result settles the command lease as well as the
+        // operation.  If the result is a duplicate, removing an already
+        // absent lease is intentionally idempotent.
+        if let Some(node) = nodes.get_mut(&auth.node_id) {
+            node.leased_commands.remove(&result.command_id);
+        }
         let mut operations = self.operations.write().await;
         let operation = operations
             .values_mut()
@@ -2169,6 +2347,26 @@ impl Hub {
             .ok_or(HubError::NotFound)?;
         if operation.node_id != auth.node_id {
             return Err(HubError::Unauthorized);
+        }
+        if operation.id != result.operation_id {
+            return Ok(operation.clone());
+        }
+        if operation.generation != result.generation {
+            return Ok(operation.clone());
+        }
+        if matches!(
+            operation.state,
+            HubOperationState::Succeeded
+                | HubOperationState::Failed
+                | HubOperationState::TimedOut
+                | HubOperationState::NodeUnavailable
+                | HubOperationState::Cancelled
+                | HubOperationState::Superseded
+        ) {
+            // A late result from an in-flight Agent must not resurrect or
+            // otherwise rewrite a terminal operation. Returning the stored
+            // record keeps duplicate result delivery idempotent.
+            return Ok(operation.clone());
         }
         operation.state = result.state;
         operation.progress = result.progress;
@@ -2343,7 +2541,7 @@ impl Hub {
                                 updated.generation,
                                 &observed_state,
                                 None,
-                                updated.error.as_deref(),
+                                result.error.as_deref(),
                             )
                             .await?;
                     }
@@ -2443,6 +2641,24 @@ impl Hub {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // A failed/expired attempt can be followed by a retry for the same
+        // node and generation.  Aggregate only the newest operation per
+        // assignment; otherwise the old terminal failure would continue to
+        // make the whole Job look failed after the replacement succeeds.
+        let mut latest_by_node = BTreeMap::<String, HubOperation>::new();
+        for peer in peers {
+            latest_by_node
+                .entry(peer.node_id.clone())
+                .and_modify(|current| {
+                    if (peer.created_at_ms, peer.id.as_str())
+                        > (current.created_at_ms, current.id.as_str())
+                    {
+                        *current = peer.clone();
+                    }
+                })
+                .or_insert(peer);
+        }
+        let peers = latest_by_node.into_values().collect::<Vec<_>>();
         let fallback_nodes = peers
             .iter()
             .map(|peer| peer.node_id.clone())
@@ -2720,6 +2936,7 @@ impl Hub {
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(&node_id) {
             node.commands.retain(|command| command.id != command_id);
+            node.leased_commands.remove(&command_id);
         }
         drop(nodes);
         if let Some(storage) = self.storage.as_ref() {
@@ -4645,12 +4862,12 @@ mod tests {
                 },
                 CommandResult {
                     command_id: commands[0].id.clone(),
-                    operation_id: "local-op".into(),
+                    operation_id: first.id.clone(),
                     state: HubOperationState::Succeeded,
                     progress: 100,
                     error: None,
                     correlation_id: Some("corr".into()),
-                    generation: 0,
+                    generation: first.generation,
                     observed_generation: None,
                     action_id: None,
                     failure_class: None,

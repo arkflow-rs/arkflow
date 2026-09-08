@@ -20,7 +20,18 @@ use crate::state::{StateBackend, StateEntry};
 use crate::Error;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+
+// A stateful processor and a window can be nested in the same acknowledgement
+// chain. Both use this journal, so a non-reentrant Tokio mutex would deadlock
+// when the outer window finalization invokes the inner processor's
+// `CommitOnAck`. The scope is task-local: top-level acknowledgements still
+// serialize the complete apply -> wrapped ack -> complete/undo interval, while
+// nested acknowledgements in that same interval reuse the held lock.
+tokio::task_local! {
+    static ACTIVE_FINALIZATION_JOURNALS: std::cell::RefCell<Vec<usize>>;
+}
 
 /// Bounds on staged (uncommitted) state. Exceeding either bound fails the
 /// staging call so the affected chain surfaces the error instead of growing
@@ -122,6 +133,19 @@ enum TxnState {
     },
 }
 
+/// Durable compensation data retained by an acknowledgement after a journal
+/// transaction has been completed.  A later sibling acknowledgement may
+/// still need to undo that already-completed state change; dropping the
+/// pre-apply values at `complete` would make that impossible.
+#[derive(Debug, Clone)]
+pub struct StateRollback {
+    txn: StateTxn,
+    mutations: Vec<StagedMutation>,
+    previous: Vec<Option<StateEntry>>,
+    previous_versions: Vec<Option<u64>>,
+    applied_versions: Vec<u64>,
+}
+
 #[derive(Debug, Default)]
 struct JournalInner {
     next_id: u64,
@@ -170,6 +194,29 @@ impl StateJournal {
         }
     }
 
+    async fn with_finalize_scope<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T> + Send,
+        T: Send,
+    {
+        let journal_key = self as *const Self as usize;
+        let active = ACTIVE_FINALIZATION_JOURNALS
+            .try_with(|journals| journals.borrow().contains(&journal_key))
+            .unwrap_or(false);
+        if active {
+            return future.await;
+        }
+
+        let mut journals = ACTIVE_FINALIZATION_JOURNALS
+            .try_with(|journals| journals.borrow().clone())
+            .unwrap_or_default();
+        journals.push(journal_key);
+        let _finalize_guard = self.finalize_lock.lock().await;
+        ACTIVE_FINALIZATION_JOURNALS
+            .scope(std::cell::RefCell::new(journals), future)
+            .await
+    }
+
     /// The committed-only backend. Barrier snapshots read through this handle
     /// so a checkpoint captures the applied epoch, never the pending overlay.
     pub fn backend(&self) -> &Arc<dyn StateBackend> {
@@ -178,6 +225,82 @@ impl StateJournal {
 
     pub fn pending_transactions(&self) -> usize {
         self.inner.lock().unwrap().txns.len()
+    }
+
+    fn transaction_is_registered(&self, txn: StateTxn) -> bool {
+        self.inner.lock().unwrap().txns.contains_key(&txn.id)
+    }
+
+    /// Capture the pre-apply values for a transaction that is about to be
+    /// completed.  The returned token is bounded by the transaction itself
+    /// and lets a composite acknowledgement compensate a successful state
+    /// child if a later sibling fails.
+    fn capture_applied(&self, txn: StateTxn) -> Option<StateRollback> {
+        let inner = self.inner.lock().unwrap();
+        match inner.txns.get(&txn.id) {
+            Some(TxnState::Applied {
+                mutations,
+                previous,
+                previous_versions,
+                applied_versions,
+            }) => Some(StateRollback {
+                txn,
+                mutations: mutations.clone(),
+                previous: previous.clone(),
+                previous_versions: previous_versions.clone(),
+                applied_versions: applied_versions.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Restore a completed transaction's bytes conditionally.  Version
+    /// fencing in `restore_previous` prevents an older compensation from
+    /// erasing a newer commit on the same key.
+    fn undo_snapshot(&self, snapshot: &StateRollback) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        self.restore_previous(
+            &snapshot.mutations,
+            &snapshot.previous,
+            &snapshot.previous_versions,
+            &snapshot.applied_versions,
+        )
+    }
+
+    /// Re-stage a completed transaction after a compensating undo.  A
+    /// composite acknowledgement can finish its state child before a
+    /// sibling source acknowledgement fails; if the composite is retried,
+    /// the same transaction id must contain the original mutations again or
+    /// the retry would acknowledge the source without reapplying state.
+    fn restage_snapshot(&self, snapshot: &StateRollback) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.txns.contains_key(&snapshot.txn.id) {
+            return Ok(());
+        }
+        let bytes = snapshot
+            .mutations
+            .iter()
+            .map(StagedMutation::bytes)
+            .sum::<usize>();
+        if inner.txns.len() >= self.limits.max_pending_transactions {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-transaction pending bound",
+                self.limits.max_pending_transactions
+            )));
+        }
+        if inner.staged_bytes.saturating_add(bytes) > self.limits.max_staged_bytes {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-byte staging bound",
+                self.limits.max_staged_bytes
+            )));
+        }
+        inner.staged_bytes = inner.staged_bytes.saturating_add(bytes);
+        inner.txns.insert(
+            snapshot.txn.id,
+            TxnState::Staged(snapshot.mutations.clone()),
+        );
+        Ok(())
     }
 
     pub fn staged_bytes(&self) -> usize {
@@ -248,6 +371,60 @@ impl StateJournal {
                 ttl_ms,
             },
         )
+    }
+
+    /// Replace the snapshot for one key inside a staged transaction.
+    ///
+    /// Window buffers are serialized as complete values. Appending another
+    /// `Put` for the same open window on every input batch would make the
+    /// journal's byte bound grow with traffic even though only the latest
+    /// snapshot is live. This operation removes older mutations for the key
+    /// before staging the replacement while preserving the transaction's
+    /// overlay semantics.
+    pub fn put_compact(
+        &self,
+        txn: StateTxn,
+        namespace: &str,
+        key: &[u8],
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        let mutation = StagedMutation::Put {
+            namespace: namespace.to_owned(),
+            key: key.to_vec(),
+            value,
+            ttl_ms,
+        };
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let removed_bytes = {
+            let Some(TxnState::Staged(mutations)) = inner.txns.get(&txn.id) else {
+                return Err(Error::Process(
+                    "state journal transaction is no longer staged".into(),
+                ));
+            };
+            mutations
+                .iter()
+                .filter(|existing| existing.storage() == mutation.storage())
+                .map(StagedMutation::bytes)
+                .sum::<usize>()
+        };
+        let next_bytes = inner
+            .staged_bytes
+            .saturating_sub(removed_bytes)
+            .saturating_add(mutation.bytes());
+        if next_bytes > self.limits.max_staged_bytes {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-byte staging bound",
+                self.limits.max_staged_bytes
+            )));
+        }
+        inner.staged_bytes = next_bytes;
+        if let Some(TxnState::Staged(mutations)) = inner.txns.get_mut(&txn.id) {
+            mutations.retain(|existing| existing.storage() != mutation.storage());
+            mutations.push(mutation);
+        }
+        Ok(())
     }
 
     /// Stage a delete.
@@ -538,6 +715,150 @@ pub struct CommitOnAck {
     journal: Arc<StateJournal>,
     txn: StateTxn,
     inner: Arc<dyn Ack>,
+    completed_rollback: Mutex<Option<StateRollback>>,
+}
+
+/// Acknowledgement that atomically finalizes several journal transactions with
+/// one wrapped acknowledgement. Window firing can touch multiple groups in a
+/// single output; keeping the source acknowledgement inside this composite is
+/// what lets a source failure undo every group instead of leaving finalized
+/// window state behind.
+pub struct CommitGroupOnAck {
+    journal: Arc<StateJournal>,
+    txns: Vec<StateTxn>,
+    inner: Arc<dyn Ack>,
+    completed_rollbacks: Mutex<Option<Vec<StateRollback>>>,
+}
+
+impl CommitGroupOnAck {
+    pub fn new(journal: Arc<StateJournal>, txns: Vec<StateTxn>, inner: Arc<dyn Ack>) -> Self {
+        Self {
+            journal,
+            txns,
+            inner,
+            completed_rollbacks: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Ack for CommitGroupOnAck {
+    async fn ack(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                let mut applied = Vec::with_capacity(self.txns.len());
+                for txn in &self.txns {
+                    if let Err(error) = self.journal.apply(*txn) {
+                        for applied_txn in applied.iter().rev() {
+                            let _ = self.journal.undo(*applied_txn);
+                        }
+                        return Err(error);
+                    }
+                    applied.push(*txn);
+                }
+                match self.inner.ack().await {
+                    Ok(()) => {
+                        let rollbacks = self
+                            .txns
+                            .iter()
+                            .filter_map(|txn| self.journal.capture_applied(*txn))
+                            .collect::<Vec<_>>();
+                        for txn in &self.txns {
+                            self.journal.complete(*txn);
+                        }
+                        let should_store = !rollbacks.is_empty()
+                            || self.completed_rollbacks.lock().unwrap().is_none();
+                        if should_store {
+                            *self.completed_rollbacks.lock().unwrap() = Some(rollbacks);
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let mut rollback_error = None;
+                        for txn in applied.iter().rev() {
+                            if let Err(undo_error) = self.journal.undo(*txn) {
+                                rollback_error.get_or_insert(undo_error);
+                            }
+                        }
+                        match rollback_error {
+                            Some(undo_error) => Err(Error::Process(format!(
+                                "source acknowledgement failed ({error}); state rollback also failed ({undo_error})"
+                            ))),
+                            None => Err(error),
+                        }
+                    }
+                }
+            })
+            .await
+    }
+
+    fn mark_held(&self) {
+        self.inner.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.inner.release_held();
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                // Source compensation and state compensation are independent
+                // recovery steps.  Even if the source cannot currently undo,
+                // still restore the state snapshot; otherwise a retry can
+                // observe a durable state mutation with an uncommitted source
+                // position and apply it twice.
+                let mut first_error = self.inner.undo().await.err();
+                for txn in &self.txns {
+                    if self.journal.transaction_is_registered(*txn) {
+                        if let Err(error) = self.journal.undo(*txn) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                let completed_rollbacks = { self.completed_rollbacks.lock().unwrap().take() };
+                if let Some(rollbacks) = completed_rollbacks {
+                    for rollback in rollbacks.iter().rev() {
+                        if let Err(error) = self.journal.undo_snapshot(rollback) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    for rollback in &rollbacks {
+                        if let Err(error) = self.journal.restage_snapshot(rollback) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    *self.completed_rollbacks.lock().unwrap() = Some(rollbacks);
+                }
+                first_error.map_or(Ok(()), Err)
+            })
+            .await
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        // The output may fail before this acknowledgement is ever called.
+        // `fired_ack` has already removed the transactions from the window's
+        // lookup map, so explicitly discard their staged mutations here;
+        // otherwise a one-target send failure leaks a transaction forever and
+        // can eventually exhaust the journal bound.
+        self.journal
+            .with_finalize_scope(async {
+                let inner_result = self.inner.abort().await;
+                for txn in &self.txns {
+                    if self.journal.transaction_is_registered(*txn) {
+                        let _ = self.journal.undo(*txn);
+                        self.journal.rollback(*txn);
+                    }
+                }
+                if let Some(rollbacks) = self.completed_rollbacks.lock().unwrap().take() {
+                    for rollback in rollbacks.iter().rev() {
+                        let _ = self.journal.undo_snapshot(rollback);
+                    }
+                }
+                inner_result
+            })
+            .await
+    }
 }
 
 impl CommitOnAck {
@@ -546,6 +867,7 @@ impl CommitOnAck {
             journal,
             txn,
             inner,
+            completed_rollback: Mutex::new(None),
         }
     }
 }
@@ -553,32 +875,85 @@ impl CommitOnAck {
 #[async_trait]
 impl Ack for CommitOnAck {
     async fn ack(&self) -> Result<(), Error> {
-        // Keep a same-journal transaction from being interleaved with a
-        // later transaction while this one waits for its wrapped source ack.
-        // The conditional version check in `undo` remains necessary for
-        // direct apply/undo callers and compensation paths.
-        let _finalize_guard = self.journal.finalize_lock.lock().await;
-        // Idempotent at the journal level: a retry after a transient backend
-        // failure re-applies only the unapplied transaction.
-        self.journal.apply(self.txn)?;
-        match self.inner.ack().await {
-            Ok(()) => {
-                self.journal.complete(self.txn);
-                Ok(())
-            }
-            Err(error) => {
-                if let Err(undo_error) = self.journal.undo(self.txn) {
-                    return Err(Error::Process(format!(
-                        "source acknowledgement failed ({error}); state rollback also failed ({undo_error})"
-                    )));
+        self.journal
+            .with_finalize_scope(async {
+                // Idempotent at the journal level: a retry after a transient
+                // backend failure re-applies only the unapplied transaction.
+                self.journal.apply(self.txn)?;
+                match self.inner.ack().await {
+                    Ok(()) => {
+                        if let Some(rollback) = self.journal.capture_applied(self.txn) {
+                            *self.completed_rollback.lock().unwrap() = Some(rollback);
+                        }
+                        self.journal.complete(self.txn);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if let Err(undo_error) = self.journal.undo(self.txn) {
+                            return Err(Error::Process(format!(
+                                "source acknowledgement failed ({error}); state rollback also failed ({undo_error})"
+                            )));
+                        }
+                        Err(error)
+                    }
                 }
-                Err(error)
-            }
-        }
+            })
+            .await
     }
 
     fn mark_held(&self) {
         self.inner.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.inner.release_held();
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                // Do not let a source-side compensation error bypass the
+                // journal rollback.  The source remains retryable, while the
+                // in-memory/backend state must not retain an unacknowledged
+                // mutation.
+                let mut first_error = self.inner.undo().await.err();
+                if self.journal.transaction_is_registered(self.txn) {
+                    if let Err(error) = self.journal.undo(self.txn) {
+                        first_error.get_or_insert(error);
+                    }
+                } else {
+                    let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
+                    if let Some(rollback) = completed_rollback {
+                        if let Err(error) = self.journal.undo_snapshot(&rollback) {
+                            first_error.get_or_insert(error);
+                        }
+                        if let Err(error) = self.journal.restage_snapshot(&rollback) {
+                            first_error.get_or_insert(error);
+                        }
+                        *self.completed_rollback.lock().unwrap() = Some(rollback);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            })
+            .await
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                let inner_result = self.inner.abort().await;
+                if self.journal.transaction_is_registered(self.txn) {
+                    let _ = self.journal.undo(self.txn);
+                    self.journal.rollback(self.txn);
+                } else {
+                    let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
+                    if let Some(rollback) = completed_rollback {
+                        let _ = self.journal.undo_snapshot(&rollback);
+                    }
+                }
+                inner_result
+            })
+            .await
     }
 }
 
@@ -849,6 +1224,126 @@ mod tests {
             journal.backend().get("ns", b"k").unwrap(),
             Some(b"1".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn commit_group_on_ack_rolls_back_all_transactions_and_retries() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"first", 1, None).unwrap();
+        let second = journal.begin().unwrap();
+        journal
+            .update_i64(second, "ns", b"second", 2, None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![first, second],
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        // A source-side failure must undo every applied window transaction,
+        // rather than leaving a partially finalized aggregate behind.
+        assert!(ack.ack().await.is_err());
+        assert!(journal.backend().get("ns", b"first").unwrap().is_none());
+        assert!(journal.backend().get("ns", b"second").unwrap().is_none());
+        assert_eq!(journal.pending_transactions(), 2);
+
+        // Retrying the same composite re-stages/applies both transactions and
+        // completes them exactly once after the wrapped source ack succeeds.
+        inner
+            .fail
+            .store(false, std::sync::atomic::Ordering::Release);
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"first").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            journal.backend().get("ns", b"second").unwrap(),
+            Some(b"2".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_state_can_be_compensated_and_retried() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+
+        // A sibling acknowledgement failure may compensate a state child
+        // after its transaction has already completed. The next retry must
+        // re-stage the mutation, not merely re-ack the source.
+        ack.undo().await.unwrap();
+        assert!(journal.backend().get("ns", b"k").unwrap().is_none());
+        assert_eq!(journal.pending_transactions(), 1);
+
+        ack.ack().await.unwrap();
+        assert_eq!(journal.pending_transactions(), 0);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_same_journal_ack_does_not_deadlock() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let source = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let window_txn = journal.begin().unwrap();
+        journal
+            .update_i64(window_txn, "window", b"k", 1, None)
+            .unwrap();
+        let processor_txn = journal.begin().unwrap();
+        journal
+            .update_i64(processor_txn, "processor", b"k", 1, None)
+            .unwrap();
+        let processor_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            processor_txn,
+            source.clone() as Arc<dyn Ack>,
+        ));
+        let group: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![window_txn],
+            processor_ack,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), group.ack())
+            .await
+            .expect("nested journal acknowledgements must not deadlock")
+            .unwrap();
+        assert_eq!(
+            journal.backend().get("window", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            journal.backend().get("processor", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
     }
 
     #[test]

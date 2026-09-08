@@ -15,6 +15,27 @@ pub struct SourcePosition {
     pub offset: u64,
 }
 
+/// Event-time progress for one physical source partition.  Unlike the legacy
+/// task-level watermark, this identity remains unambiguous when one source
+/// subscribes to several topics or several physical partitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatermarkPosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub partition: u32,
+    pub watermark_ms: i64,
+}
+
+impl WatermarkPosition {
+    pub fn new(topic: Option<String>, partition: u32, watermark_ms: i64) -> Self {
+        Self {
+            topic,
+            partition,
+            watermark_ms,
+        }
+    }
+}
+
 impl SourcePosition {
     pub fn for_partition(partition: u32, offset: u64) -> Self {
         Self {
@@ -41,6 +62,10 @@ pub struct TaskCheckpointAck {
     pub state: StateSnapshot,
     pub source_positions: Vec<SourcePosition>,
     pub watermark_ms: Option<i64>,
+    /// Additive physical watermark state. Older agents only send
+    /// `watermark_ms`; recovery falls back to that field when this is empty.
+    #[serde(default)]
+    pub watermark_partitions: Vec<WatermarkPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +80,9 @@ pub struct CheckpointManifest {
     /// only unique within one source operator and cannot identify a Job-wide
     /// watermark when multiple sources are present.
     pub watermarks_ms: BTreeMap<String, i64>,
+    /// Physical watermark progress keyed by source task id.
+    #[serde(default)]
+    pub watermark_partitions: BTreeMap<String, Vec<WatermarkPosition>>,
     pub in_flight_barrier: CheckpointBarrier,
     pub state_snapshots: Vec<StateSnapshotRef>,
     pub format_version: u32,
@@ -450,6 +478,7 @@ pub struct RecoveryPlan {
     pub checkpoint_id: String,
     pub source_positions: Vec<SourcePosition>,
     pub watermarks_ms: BTreeMap<String, i64>,
+    pub watermark_partitions: BTreeMap<String, Vec<WatermarkPosition>>,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
 }
 
@@ -567,6 +596,7 @@ impl RecoveryPlan {
             checkpoint_id: manifest.checkpoint_id.clone(),
             source_positions: manifest.source_positions.clone(),
             watermarks_ms: manifest.watermarks_ms.clone(),
+            watermark_partitions: manifest.watermark_partitions.clone(),
             task_attempts: manifest.task_attempts.clone(),
         })
     }
@@ -696,10 +726,14 @@ impl CheckpointCoordinator {
             .ok_or_else(|| Error::Process("checkpoint barrier is missing".into()))?;
         let mut source_positions = Vec::new();
         let mut watermarks_ms = BTreeMap::new();
+        let mut watermark_partitions = BTreeMap::new();
         for ack in self.acknowledgements.values() {
             source_positions.extend(ack.source_positions.clone());
             if let Some(watermark) = ack.watermark_ms {
                 watermarks_ms.insert(ack.task_id.clone(), watermark);
+            }
+            if !ack.watermark_partitions.is_empty() {
+                watermark_partitions.insert(ack.task_id.clone(), ack.watermark_partitions.clone());
             }
         }
         let mut manifest = CheckpointManifest {
@@ -710,6 +744,7 @@ impl CheckpointCoordinator {
             task_attempts,
             source_positions,
             watermarks_ms,
+            watermark_partitions,
             in_flight_barrier: barrier,
             state_snapshots,
             format_version: self.format_version,
@@ -752,6 +787,7 @@ fn manifest_checksum(manifest: &CheckpointManifest) -> u64 {
         &manifest.task_attempts,
         &manifest.source_positions,
         &manifest.watermarks_ms,
+        &manifest.watermark_partitions,
         &manifest.in_flight_barrier,
         &manifest.state_snapshots,
         manifest.format_version,
@@ -806,6 +842,7 @@ mod tests {
                 offset: 10,
             }],
             watermark_ms: Some(100),
+            watermark_partitions: vec![],
         };
         assert!(!coordinator.acknowledge(ack("task-0")).unwrap());
         assert!(coordinator.acknowledge(ack("task-1")).unwrap());
@@ -867,6 +904,7 @@ mod tests {
             state: state(),
             source_positions: vec![],
             watermark_ms: None,
+            watermark_partitions: vec![],
         });
         assert!(result.is_err());
     }
@@ -890,6 +928,7 @@ mod tests {
             state: state(),
             source_positions: vec![],
             watermark_ms: None,
+            watermark_partitions: vec![],
         };
         assert!(coordinator.acknowledge(ack.clone()).is_err());
         ack.checkpoint_id = "cp-current".into();
@@ -919,6 +958,7 @@ mod tests {
                 offset: 10,
             }],
             watermarks_ms: BTreeMap::new(),
+            watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-1".into(),
                 generation: 1,
@@ -1021,6 +1061,7 @@ mod tests {
             }],
             source_positions: vec![],
             watermarks_ms: BTreeMap::new(),
+            watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-missing-state".into(),
                 generation: 1,
@@ -1065,6 +1106,7 @@ mod compatibility_tests {
                 .collect(),
             source_positions: vec![],
             watermarks_ms: BTreeMap::new(),
+            watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-compat".into(),
                 generation: 1,

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("job_state");
@@ -414,6 +414,10 @@ pub struct RedbStateBackend {
     max_bytes: Option<u64>,
     keys: AtomicU64,
     bytes: AtomicU64,
+    /// Serialize the read/check/write/update sequence used by
+    /// `put_with_ttl`, so concurrent writers cannot all pass the same stale
+    /// byte-budget check.
+    write_lock: Mutex<()>,
 }
 
 impl RedbStateBackend {
@@ -435,6 +439,7 @@ impl RedbStateBackend {
             max_bytes: None,
             keys: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            write_lock: Mutex::new(()),
         };
         let metrics = backend.metrics()?;
         backend.keys.store(metrics.keys, Ordering::Relaxed);
@@ -549,6 +554,7 @@ impl StateBackend for RedbStateBackend {
         }
         let storage_key = Self::storage_key(namespace, key);
         let encoded = encode_value(&entry.value, entry.expires_at_ms)?;
+        let _write_guard = self.write_lock.lock().unwrap();
         let tx = self
             .db
             .begin_write()
@@ -577,20 +583,8 @@ impl StateBackend for RedbStateBackend {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), Error> {
+        let _write_guard = self.write_lock.lock().unwrap();
         let storage_key = Self::storage_key(namespace, key);
-        let previous = self.get(namespace, key)?.map(|value| value.len() as u64);
-        if let Some(max_bytes) = self.max_bytes {
-            let next_bytes = self
-                .bytes
-                .load(Ordering::Relaxed)
-                .saturating_sub(previous.unwrap_or(0))
-                .saturating_add(value.len() as u64);
-            if next_bytes > max_bytes {
-                return Err(Error::Process(format!(
-                    "state budget exceeded: {next_bytes} > {max_bytes} bytes"
-                )));
-            }
-        }
         let encoded = encode_value(value, ttl_ms.map(|ttl| now_ms.saturating_add(ttl)))?;
         let tx = self
             .db
@@ -600,19 +594,54 @@ impl StateBackend for RedbStateBackend {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            let mut expired_keys = Vec::new();
+            let mut live_bytes = 0_u64;
+            let mut previous_bytes = 0_u64;
+            for item in table
+                .iter()
+                .map_err(|error| Error::Process(format!("state scan: {error}")))?
+            {
+                let (stored_key, stored_value) =
+                    item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
+                let stored_key = stored_key.value().to_owned();
+                let decoded = decode_value(stored_value.value())?;
+                if decoded
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= now_ms)
+                {
+                    expired_keys.push(stored_key);
+                    continue;
+                }
+                let bytes = decoded.value.len() as u64;
+                live_bytes = live_bytes.saturating_add(bytes);
+                if stored_key == storage_key {
+                    previous_bytes = bytes;
+                }
+            }
+            for expired_key in expired_keys {
+                table
+                    .remove(expired_key.as_str())
+                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
+            }
+            let next_bytes = live_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(value.len() as u64);
+            if let Some(max_bytes) = self.max_bytes {
+                if next_bytes > max_bytes {
+                    return Err(Error::Process(format!(
+                        "state budget exceeded: {next_bytes} > {max_bytes} bytes"
+                    )));
+                }
+            }
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state put: {error}")))?;
         }
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        if previous.is_none() {
-            self.keys.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(previous) = previous {
-            self.bytes.fetch_sub(previous, Ordering::Relaxed);
-        }
-        self.bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
+        let metrics = self.metrics()?;
+        self.keys.store(metrics.keys, Ordering::Relaxed);
+        self.bytes.store(metrics.bytes, Ordering::Relaxed);
         Ok(())
     }
 
@@ -627,6 +656,7 @@ impl StateBackend for RedbStateBackend {
         delta: i64,
         ttl_ms: Option<u64>,
     ) -> Result<i64, Error> {
+        let _write_guard = self.write_lock.lock().unwrap();
         let storage_key = Self::storage_key(namespace, key);
         let current_time_ms = now_ms();
         let tx = self
@@ -703,6 +733,7 @@ impl StateBackend for RedbStateBackend {
     }
 
     fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+        let _write_guard = self.write_lock.lock().unwrap();
         let storage_key = Self::storage_key(namespace, key);
         let tx = self
             .db
@@ -721,22 +752,23 @@ impl StateBackend for RedbStateBackend {
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        if let Some(bytes) = previous {
-            self.keys.fetch_sub(1, Ordering::Relaxed);
-            self.bytes.fetch_sub(bytes, Ordering::Relaxed);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let metrics = self.metrics()?;
+        self.keys.store(metrics.keys, Ordering::Relaxed);
+        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        Ok(previous.is_some())
     }
 
     fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+        let _write_guard = self.write_lock.lock().unwrap();
         let tx = self
             .db
-            .begin_read()
-            .map_err(|error| Error::Process(format!("state read: {error}")))?;
-        let mut expired = Vec::new();
-        if let Ok(table) = tx.open_table(STATE_TABLE) {
+            .begin_write()
+            .map_err(|error| Error::Process(format!("state write: {error}")))?;
+        let removed = {
+            let mut table = tx
+                .open_table(STATE_TABLE)
+                .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            let mut expired = Vec::new();
             for item in table
                 .iter()
                 .map_err(|error| Error::Process(format!("state scan: {error}")))?
@@ -750,15 +782,19 @@ impl StateBackend for RedbStateBackend {
                     expired.push(key.value().to_owned());
                 }
             }
-        }
-        drop(tx);
-        let mut removed = 0;
-        for storage_key in expired {
-            let (namespace, key) = Self::parse_key(&storage_key)?;
-            if self.delete(namespace, &key)? {
-                removed += 1;
+            let removed = expired.len() as u64;
+            for key in expired {
+                table
+                    .remove(key.as_str())
+                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
             }
-        }
+            removed
+        };
+        tx.commit()
+            .map_err(|error| Error::Process(format!("state commit: {error}")))?;
+        let metrics = self.metrics()?;
+        self.keys.store(metrics.keys, Ordering::Relaxed);
+        self.bytes.store(metrics.bytes, Ordering::Relaxed);
         Ok(removed)
     }
 
@@ -839,6 +875,7 @@ impl StateBackend for RedbStateBackend {
         if !snapshot.verify() {
             return Err(Error::Process("state snapshot checksum mismatch".into()));
         }
+        let _write_guard = self.write_lock.lock().unwrap();
         let tx = self
             .db
             .begin_write()
@@ -895,8 +932,15 @@ impl StateBackend for RedbStateBackend {
             {
                 let (_, value) =
                     item.map_err(|error| Error::Process(format!("state metrics: {error}")))?;
+                let decoded = decode_value(value.value())?;
+                if decoded
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= now_ms())
+                {
+                    continue;
+                }
                 metrics.keys += 1;
-                metrics.bytes += decode_value(value.value())?.value.len() as u64;
+                metrics.bytes += decoded.value.len() as u64;
             }
         }
         Ok(metrics)
@@ -1016,12 +1060,13 @@ mod tests {
         let backend = RedbStateBackend::open(dir.path(), 1)
             .unwrap()
             .with_max_bytes(2);
+        let base = now_ms();
         backend
-            .put_with_ttl("orders", b"a", b"1", Some(10), 100)
+            .put_with_ttl("orders", b"a", b"1", Some(10_000), base)
             .unwrap();
         assert!(backend.put("orders", b"b", b"22").is_err());
-        assert_eq!(backend.purge_expired(109).unwrap(), 0);
-        assert_eq!(backend.purge_expired(110).unwrap(), 1);
+        assert_eq!(backend.purge_expired(base + 9_999).unwrap(), 0);
+        assert_eq!(backend.purge_expired(base + 10_000).unwrap(), 1);
     }
 
     #[test]

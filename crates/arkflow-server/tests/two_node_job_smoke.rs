@@ -305,20 +305,28 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         cancel_a_restart.clone(),
     ));
 
+    let initial_start_ids = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .filter(|operation| {
+            operation.resource_id == job_id
+                && operation.operation == "job_start"
+                && operation.state == HubOperationState::Succeeded
+        })
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
     wait_until(|| {
         let hub = hub.clone();
         let job_id = job_id.clone();
+        let initial_start_ids = initial_start_ids.clone();
         async move {
-            hub.operations(None)
-                .await
-                .iter()
-                .filter(|operation| {
-                    operation.resource_id == job_id
-                        && operation.operation == "job_start"
-                        && operation.state == HubOperationState::Succeeded
-                })
-                .count()
-                >= 3
+            hub.operations(None).await.iter().any(|operation| {
+                operation.resource_id == job_id
+                    && operation.operation == "job_start"
+                    && operation.state == HubOperationState::Succeeded
+                    && !initial_start_ids.contains(&operation.id)
+            })
         }
     })
     .await;

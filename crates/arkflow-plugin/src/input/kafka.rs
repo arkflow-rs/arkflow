@@ -20,12 +20,14 @@ use arkflow_core::checkpoint::SourcePosition;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use arkflow_core::event_time::EventTimePartition;
 use arkflow_core::executor::commit::{AckAdvance, CommitFrontier};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Message as KafkaMessage, Timestamp};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, RwLock};
+use tokio_util::sync::CancellationToken;
 
 /// Kafka input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +78,8 @@ pub struct KafkaInput {
     /// Wakes acknowledgements waiting for an earlier offset to close the
     /// contiguous frontier gap.
     ack_notify: Arc<Notify>,
+    /// Cancels frontier waiters before the consumer is torn down.
+    close: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -104,8 +109,54 @@ impl KafkaInput {
             frontier: Arc::new(CommitFrontier::new()),
             ack_lock: Arc::new(tokio::sync::Mutex::new(())),
             ack_notify: Arc::new(Notify::new()),
+            close: CancellationToken::new(),
             codec,
         })
+    }
+
+    fn retryable_receive_error(error: &KafkaError) -> bool {
+        if matches!(error, KafkaError::Canceled) {
+            return true;
+        }
+        let Some(code) = (match error {
+            KafkaError::MessageConsumption(code)
+            | KafkaError::ConsumerQueueClose(code)
+            | KafkaError::Global(code) => Some(*code),
+            _ => None,
+        }) else {
+            return false;
+        };
+        matches!(
+            code,
+            RDKafkaErrorCode::TimedOutQueue
+                | RDKafkaErrorCode::Retry
+                | RDKafkaErrorCode::UnknownBroker
+                | RDKafkaErrorCode::AssignmentLost
+                | RDKafkaErrorCode::BrokerDestroy
+                | RDKafkaErrorCode::DestroyBroker
+                | RDKafkaErrorCode::BrokerTransportFailure
+                | RDKafkaErrorCode::Resolve
+                | RDKafkaErrorCode::AllBrokersDown
+                | RDKafkaErrorCode::OperationTimedOut
+                | RDKafkaErrorCode::WaitingForCoordinator
+                | RDKafkaErrorCode::LeaderNotAvailable
+                | RDKafkaErrorCode::NotLeaderForPartition
+                | RDKafkaErrorCode::RequestTimedOut
+                | RDKafkaErrorCode::BrokerNotAvailable
+                | RDKafkaErrorCode::ReplicaNotAvailable
+                | RDKafkaErrorCode::NetworkException
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::RebalanceInProgress
+                | RDKafkaErrorCode::ReassignmentInProgress
+                | RDKafkaErrorCode::FetchSessionIdNotFound
+                | RDKafkaErrorCode::InvalidFetchSessionEpoch
+                | RDKafkaErrorCode::FencedLeaderEpoch
+                | RDKafkaErrorCode::UnknownLeaderEpoch
+                | RDKafkaErrorCode::StaleBrokerEpoch
+                | RDKafkaErrorCode::OffsetNotAvailable
+        )
     }
 
     /// Merge checkpoint positions into the COMPLETE configured assignment for
@@ -357,6 +408,7 @@ impl Input for KafkaInput {
                     frontier: self.frontier.clone(),
                     ack_lock: self.ack_lock.clone(),
                     ack_notify: self.ack_notify.clone(),
+                    close: self.close.clone(),
                     topic: kafka_message.topic().to_string(),
                     partition,
                     offset,
@@ -364,6 +416,7 @@ impl Input for KafkaInput {
 
                 Ok((Arc::new(msg_batch), Arc::new(ack)))
             }
+            Err(e) if Self::retryable_receive_error(&e) => Err(Error::Disconnection),
             Err(e) => Err(Error::Connection(format!(
                 "Error receiving Kafka message: {}",
                 e
@@ -376,6 +429,92 @@ impl Input for KafkaInput {
         // acknowledgement still pending) holds the position back so a
         // checkpoint never skips unacknowledged records.
         Ok(self.frontier.contiguous_positions())
+    }
+
+    async fn watermark_partitions(&self) -> Result<Vec<EventTimePartition>, Error> {
+        let assigned = *self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?;
+        if let Some(partition) = assigned {
+            return Ok(self
+                .config
+                .topics
+                .iter()
+                .map(|topic| EventTimePartition::new(Some(topic.clone()), partition))
+                .collect());
+        }
+
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Err(Error::Connection("The input is not connected".into()));
+        };
+        let assignment = consumer
+            .assignment()
+            .map_err(|error| Error::Connection(format!("read Kafka assignment: {error}")))?;
+        Ok(assignment
+            .elements()
+            .into_iter()
+            .filter_map(|element| {
+                (element.partition() >= 0).then(|| {
+                    EventTimePartition::new(
+                        Some(element.topic().to_owned()),
+                        element.partition() as u32,
+                    )
+                })
+            })
+            .collect())
+    }
+
+    async fn ack_for_position(
+        &self,
+        position: &SourcePosition,
+    ) -> Result<Option<Arc<dyn Ack>>, Error> {
+        if position.offset == 0 {
+            return Ok(None);
+        }
+        if !self
+            .config
+            .topics
+            .iter()
+            .any(|topic| position.topic.as_deref() == Some(topic.as_str()))
+        {
+            return Ok(None);
+        }
+        if self
+            .assigned_partition
+            .try_read()
+            .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?
+            .is_some_and(|partition| partition != position.partition)
+        {
+            return Ok(None);
+        }
+        let topic = position
+            .topic
+            .clone()
+            .ok_or_else(|| Error::Process("Kafka source position is missing its topic".into()))?;
+        // WAL replay bypasses `read()`, so there was no opportunity to anchor
+        // the first delivered record in the in-memory frontier.  Anchor at
+        // the record offset (the checkpoint position is exclusive); otherwise
+        // an out-of-order replay acknowledgement can be mistaken for the
+        // first contiguous offset and skip an earlier replayed record.
+        self.frontier.anchor_delivery(&SourcePosition {
+            topic: Some(topic.clone()),
+            partition: position.partition,
+            offset: position.offset.saturating_sub(1),
+        });
+        let offset = i64::try_from(position.offset.saturating_sub(1))
+            .map_err(|_| Error::Process("Kafka source position exceeds i64".into()))?;
+        Ok(Some(Arc::new(KafkaAck {
+            consumer: self.consumer.clone(),
+            frontier: self.frontier.clone(),
+            ack_lock: self.ack_lock.clone(),
+            ack_notify: self.ack_notify.clone(),
+            close: self.close.clone(),
+            topic,
+            partition: position.partition as i32,
+            offset,
+        })))
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
@@ -470,6 +609,8 @@ impl Input for KafkaInput {
     }
 
     async fn close(&self) -> Result<(), Error> {
+        self.close.cancel();
+        self.ack_notify.notify_waiters();
         let mut consumer_guard = self.consumer.write().await;
         if let Some(consumer) = consumer_guard.take() {
             if let Err(e) = consumer.unassign() {
@@ -499,6 +640,7 @@ pub struct KafkaAck {
     frontier: Arc<CommitFrontier>,
     ack_lock: Arc<tokio::sync::Mutex<()>>,
     ack_notify: Arc<Notify>,
+    close: CancellationToken,
     topic: String,
     partition: i32,
     offset: i64,
@@ -524,6 +666,29 @@ impl Ack for KafkaAck {
                 // earlier offset. Otherwise two out-of-order acks can
                 // deadlock each other.
                 let _ack_guard = self.ack_lock.lock().await;
+                let consumer_mutex_guard = self.consumer.read().await;
+                let Some(consumer) = consumer_mutex_guard.as_ref() else {
+                    return Err(Error::Connection(
+                        "Kafka consumer is not connected; acknowledgement is retryable".into(),
+                    ));
+                };
+                let partition = self.partition.max(0) as u32;
+                if let Some(failure) = self.frontier.failure(Some(&self.topic), partition) {
+                    if failure.next_offset != position.offset {
+                        return Err(Error::Process(format!(
+                            "Kafka acknowledgement is blocked by an earlier source failure at next offset {}: {}",
+                            failure.next_offset, failure.error
+                        )));
+                    }
+                    // This is the failed delivery retrying its own source
+                    // commit.  Clear only the matching fence; later
+                    // deliveries must continue to observe it.
+                    self.frontier
+                        .clear_failure_if(Some(&self.topic), partition, position.offset);
+                }
+                let snapshot = self
+                    .frontier
+                    .snapshot_partition(Some(&self.topic), partition);
                 let next_offset = match self.frontier.acknowledge(&position) {
                     AckAdvance::Pending { .. } => None,
                     AckAdvance::Advanced { next_offset } => Some(next_offset),
@@ -540,15 +705,39 @@ impl Ack for KafkaAck {
                 match next_offset {
                     None => Ok::<Option<u64>, Error>(None),
                     Some(next_offset) => {
-                        let store_offset_value = i64::try_from(next_offset.saturating_sub(1))
+                        // librdkafka stores the next offset to consume, not
+                        // the offset of the last message.  `next_offset` is
+                        // already the exclusive contiguous frontier.
+                        let store_offset_value = i64::try_from(next_offset)
                             .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
-                        let consumer_mutex_guard = self.consumer.read().await;
-                        if let Some(consumer) = &*consumer_mutex_guard {
-                            consumer
-                                .store_offset(&self.topic, self.partition, store_offset_value)
-                                .map_err(|e| {
-                                    Error::Process(format!("Failed to store Kafka offset: {}", e))
-                                })?;
+                        if let Err(error) =
+                            consumer.store_offset(&self.topic, self.partition, store_offset_value)
+                        {
+                            let restored = self.frontier.restore_partition_if_current(
+                                Some(&self.topic),
+                                partition,
+                                next_offset,
+                                snapshot,
+                            );
+                            let message = if restored {
+                                format!("Failed to store Kafka offset: {error}")
+                            } else {
+                                format!(
+                                    "Failed to store Kafka offset: {error}; frontier changed during compensation"
+                                )
+                            };
+                            self.frontier.record_failure(
+                                Some(&self.topic),
+                                partition,
+                                position.offset,
+                                message.clone(),
+                            );
+                            // A later offset may be waiting for this
+                            // frontier.  Wake it so it observes the recorded
+                            // failure instead of waiting forever for a gap
+                            // that can no longer close.
+                            self.ack_notify.notify_waiters();
+                            return Err(Error::Process(message));
                         }
                         Ok::<Option<u64>, Error>(Some(next_offset))
                     }
@@ -563,11 +752,69 @@ impl Ack for KafkaAck {
                     return Ok(());
                 }
                 Ok(None) => {
-                    notified.await;
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = self.close.cancelled() => {
+                            return Err(Error::Process(
+                                "Kafka acknowledgement cancelled while waiting for an earlier offset".into(),
+                            ));
+                        }
+                    }
                 }
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        let position = SourcePosition {
+            topic: Some(self.topic.clone()),
+            partition: self.partition.max(0) as u32,
+            offset: u64::try_from(self.offset.saturating_add(1))
+                .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
+        };
+        let _ack_guard = self.ack_lock.lock().await;
+        let consumer_guard = self.consumer.read().await;
+        let Some(consumer) = consumer_guard.as_ref() else {
+            return Err(Error::Connection(
+                "Kafka consumer is not connected; acknowledgement compensation is retryable".into(),
+            ));
+        };
+        let current = self
+            .frontier
+            .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
+            .unwrap_or_default();
+        if current < position.offset {
+            return Ok(());
+        }
+        if current > position.offset {
+            return Err(Error::Process(
+                "cannot compensate Kafka acknowledgement behind a later offset".into(),
+            ));
+        }
+        // `store_offset` also takes the exclusive next offset.  Restoring a
+        // message at offset N therefore stores N, so the broker can redeliver
+        // that message after compensation.
+        let restored_broker_offset = position.offset.saturating_sub(1);
+        consumer
+            .store_offset(
+                &self.topic,
+                self.partition,
+                i64::try_from(restored_broker_offset)
+                    .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
+            )
+            .map_err(|error| Error::Process(format!("restore Kafka offset: {error}")))?;
+        if !self.frontier.rewind_position(
+            Some(&self.topic),
+            self.partition.max(0) as u32,
+            position.offset,
+        ) {
+            return Err(Error::Process(
+                "Kafka acknowledgement frontier changed during compensation".into(),
+            ));
+        }
+        self.ack_notify.notify_waiters();
+        Ok(())
     }
 }
 
@@ -690,18 +937,21 @@ mod tests {
             frontier: input.frontier.clone(),
             ack_lock: input.ack_lock.clone(),
             ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
         };
 
-        // Test acknowledgment, should have no effect since there is no actual consumer
-        let _ = ack.ack().await;
+        // Acknowledging without a live consumer must fail; treating this as
+        // success would advance the in-memory frontier while no broker offset
+        // was stored.
+        assert!(matches!(
+            ack.ack().await,
+            Err(Error::Connection(message)) if message.contains("not connected")
+        ));
         let positions = input.current_positions().await.unwrap();
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].topic.as_deref(), Some("test-topic"));
-        assert_eq!(positions[0].partition, 0);
-        assert_eq!(positions[0].offset, 101);
+        assert!(positions.is_empty());
     }
 
     /// Task 3.3: out-of-order acknowledgements expose only the contiguous
@@ -728,29 +978,32 @@ mod tests {
             partition: 0,
             offset: 5,
         });
-        let ack_at = |offset: i64| KafkaAck {
-            consumer: input.consumer.clone(),
-            frontier: input.frontier.clone(),
-            ack_lock: input.ack_lock.clone(),
-            ack_notify: input.ack_notify.clone(),
-            topic: "test-topic".to_string(),
-            partition: 0,
-            offset,
-        };
-        // The later branch of a fan-out cannot report success while the
-        // earlier offsets are still missing. It waits for the gap to close.
-        let later_ack = ack_at(7);
-        let later_task = tokio::spawn(async move { later_ack.ack().await });
-        tokio::task::yield_now().await;
-        let positions = input.current_positions().await.unwrap();
-        assert_eq!(positions[0].offset, 5, "the gap holds the frontier");
-        // Closing the first gap advances only to the next missing delivery.
-        ack_at(5).ack().await.unwrap();
-        assert_eq!(input.current_positions().await.unwrap()[0].offset, 6);
-        // The next acknowledgement drains the pending later branch and the
-        // waiting task can now finish with the durable frontier at 8.
-        ack_at(6).ack().await.unwrap();
-        later_task.await.unwrap().unwrap();
+        // The connector-level acknowledgement requires a live broker. The
+        // frontier itself remains unit-testable without one.
+        assert_eq!(
+            frontier.acknowledge(&SourcePosition {
+                topic: Some("test-topic".into()),
+                partition: 0,
+                offset: 8,
+            }),
+            AckAdvance::Pending { gap: 6 }
+        );
+        assert_eq!(
+            frontier.acknowledge(&SourcePosition {
+                topic: Some("test-topic".into()),
+                partition: 0,
+                offset: 6,
+            }),
+            AckAdvance::Advanced { next_offset: 6 }
+        );
+        assert_eq!(
+            frontier.acknowledge(&SourcePosition {
+                topic: Some("test-topic".into()),
+                partition: 0,
+                offset: 7,
+            }),
+            AckAdvance::Advanced { next_offset: 8 }
+        );
         assert_eq!(input.current_positions().await.unwrap()[0].offset, 8);
     }
 
@@ -781,18 +1034,19 @@ mod tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].partition, 3);
         assert_eq!(positions[0].offset, 42);
-        // A new acknowledgement continues from the restored cursor.
+        // A new acknowledgement cannot commit without a live consumer.
         let ack = KafkaAck {
             consumer: input.consumer.clone(),
             frontier: input.frontier.clone(),
             ack_lock: input.ack_lock.clone(),
             ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
             topic: "test-topic".to_string(),
             partition: 3,
             offset: 42,
         };
-        ack.ack().await.unwrap();
-        assert_eq!(input.current_positions().await.unwrap()[0].offset, 43);
+        assert!(ack.ack().await.is_err());
+        assert_eq!(input.current_positions().await.unwrap()[0].offset, 42);
     }
 
     /// Task 3.2: restoring a subset of configured partitions merges the
@@ -852,6 +1106,26 @@ mod tests {
             .elements()
             .iter()
             .all(|element| element.offset() == Offset::End));
+    }
+
+    #[test]
+    fn retryable_receive_errors_are_reconnectable() {
+        for code in [
+            RDKafkaErrorCode::TimedOutQueue,
+            RDKafkaErrorCode::Retry,
+            RDKafkaErrorCode::UnknownBroker,
+            RDKafkaErrorCode::AssignmentLost,
+            RDKafkaErrorCode::ReassignmentInProgress,
+            RDKafkaErrorCode::InvalidFetchSessionEpoch,
+            RDKafkaErrorCode::OffsetNotAvailable,
+        ] {
+            assert!(KafkaInput::retryable_receive_error(
+                &KafkaError::MessageConsumption(code)
+            ));
+        }
+        assert!(!KafkaInput::retryable_receive_error(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::Authentication)
+        ));
     }
 
     #[test]
@@ -916,6 +1190,57 @@ mod tests {
         assert_eq!(
             KafkaInput::validate_checkpoint_offset(20, 10, 20).unwrap(),
             20
+        );
+    }
+
+    #[test]
+    fn classifies_broker_transport_errors_as_reconnectable() {
+        assert!(KafkaInput::retryable_receive_error(&KafkaError::Global(
+            RDKafkaErrorCode::AllBrokersDown,
+        )));
+        assert!(KafkaInput::retryable_receive_error(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut,)
+        ));
+        assert!(!KafkaInput::retryable_receive_error(&KafkaError::Global(
+            RDKafkaErrorCode::InvalidArgument,
+        )));
+    }
+
+    #[tokio::test]
+    async fn closing_kafka_wakes_a_frontier_gap_waiter() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        input.frontier.anchor_delivery(&SourcePosition {
+            topic: Some("test-topic".into()),
+            partition: 0,
+            offset: 0,
+        });
+        let ack = KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
+            topic: "test-topic".into(),
+            partition: 0,
+            offset: 1,
+        };
+        let waiter = tokio::spawn(async move { ack.ack().await });
+        tokio::task::yield_now().await;
+        input.close().await.unwrap();
+        let result = waiter.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::Connection(message)) if message.contains("not connected"))
         );
     }
 

@@ -69,36 +69,17 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         },
     });
 
-    // Processor chain: one operator per configured processor, wired linearly.
-    // Stateful window buffers break the chain naturally (they compile to
-    // stateful window operators below).
+    // A legacy window emits a batch before the configured pipeline processors
+    // see it. Keep that established order in the compiled graph so processors
+    // transform the concatenated payload, rather than changing what is
+    // grouped and when it is emitted.
     let mut upstream = source_operator_id.clone();
-    for (position, processor) in stream.pipeline.processors.iter().enumerate() {
-        let operator_id = format!("p{position}-{}", sanitize_id(&processor.processor_type));
-        operators.push(OperatorSpec {
-            id: operator_id.clone(),
-            kind: OperatorKind::Map,
-            stateful: false,
-            key_field: None,
-            config: processor_config_payload(processor),
-        });
-        edges.push(EdgeSpec {
-            id: format!("edge-{upstream}-{operator_id}"),
-            from: upstream.clone(),
-            to: operator_id.clone(),
-            partitioned: false,
-        });
-        upstream = operator_id;
-    }
-
-    // Buffer mapping: window buffers become stateful window operators in
-    // processing-time mode; memory buffers are no-ops; join buffers reject
-    // compilation with a migration message.
+    let mut error_source_operator_ids = Vec::new();
     if let Some(buffer) = &stream.buffer {
         let buffer_type = buffer.buffer_type.as_str();
         match buffer_type {
             "memory" => { /* no-op: bounded channels already provide buffering */ }
-            "tumbling_window" | "sliding_window" | "session_window" => {
+            "tumbling_window" | "session_window" => {
                 let window_config = window_config(buffer_type, buffer)?;
                 let operator_id = "window".to_string();
                 operators.push(OperatorSpec {
@@ -120,7 +101,16 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
                     to: operator_id.clone(),
                     partitioned: false,
                 });
-                upstream = operator_id;
+                upstream = operator_id.clone();
+                error_source_operator_ids.push(operator_id);
+            }
+            "sliding_window" => {
+                return Err(Error::Config(
+                    "legacy sliding_window uses row-count window_size/slide_size and cannot be \
+                     represented by the event-time window operator; declare a Job window or use \
+                     an explicit processor for row-count batching"
+                        .into(),
+                ));
             }
             "join" => {
                 return Err(Error::Config(
@@ -135,6 +125,28 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
                 )));
             }
         }
+    }
+
+    // Processor chain: one operator per configured processor, wired linearly.
+    // Stateful window buffers already sit upstream, preserving legacy
+    // buffer-before-processor semantics.
+    for (position, processor) in stream.pipeline.processors.iter().enumerate() {
+        let operator_id = format!("p{position}-{}", sanitize_id(&processor.processor_type));
+        operators.push(OperatorSpec {
+            id: operator_id.clone(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: processor_config_payload(processor),
+        });
+        edges.push(EdgeSpec {
+            id: format!("edge-{upstream}-{operator_id}"),
+            from: upstream.clone(),
+            to: operator_id.clone(),
+            partitioned: false,
+        });
+        upstream = operator_id;
+        error_source_operator_ids.push(upstream.clone());
     }
 
     // Sink operator: the stream's output config rides in `config`.
@@ -158,10 +170,9 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         partitioned: false,
     });
 
-    // Error output: an additional sink operators route failures to. It must
-    // be reachable in the JobSpec graph, so the last pre-sink operator gains
-    // an edge to it (the kernel writes failing batches there, matching the
-    // legacy error_output routing).
+    // Error output: an additional sink operator routes failures from every
+    // relevant processor/window chain. This keeps failures before a window or
+    // in an unfused processor chain on the configured side output.
     if let Some(error_output) = &stream.error_output {
         let error_operator_id = "error-sink".to_string();
         operators.push(OperatorSpec {
@@ -174,12 +185,19 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
             // output builder.
             config: json!({"__arkflow_error_sink": true}),
         });
-        edges.push(EdgeSpec {
-            id: format!("edge-{upstream}-{error_operator_id}"),
-            from: upstream.clone(),
-            to: error_operator_id.clone(),
-            partitioned: false,
-        });
+        let error_sources = if error_source_operator_ids.is_empty() {
+            vec![upstream.clone()]
+        } else {
+            error_source_operator_ids
+        };
+        for error_source in error_sources {
+            edges.push(EdgeSpec {
+                id: format!("edge-{error_source}-{error_operator_id}"),
+                from: error_source,
+                to: error_operator_id.clone(),
+                partitioned: false,
+            });
+        }
         sinks.push(SinkSpec {
             operator_id: error_operator_id,
             output_type: error_output.output_type.clone(),
@@ -284,6 +302,13 @@ fn window_config(
     buffer: &crate::buffer::BufferConfig,
 ) -> Result<serde_json::Value, Error> {
     let config = buffer.config.clone().unwrap_or(json!({}));
+    if matches!(buffer_type, "tumbling_window" | "session_window") && config.get("join").is_some() {
+        return Err(Error::Config(
+            "legacy window buffers with 'join' cannot compile to the unified kernel; declare a Job \
+             DAG with an explicit join operator instead (see the Job API documentation)"
+                .into(),
+        ));
+    }
     let get_duration_ms = |field: &str| -> Result<i64, Error> {
         let value = config
             .get(field)
@@ -299,9 +324,10 @@ fn window_config(
             ))
         })
     };
-    // Legacy buffer field names: tumbling/sliding key on `interval`
-    // (sliding's `slide_size` is a row count; the window operator's slide
-    // falls back to the interval cadence), session on `gap`.
+    // Legacy buffer field names: tumbling keys on `interval`, session on
+    // `gap`. Sliding buffers are row-count based (`window_size` and
+    // `slide_size`) and are rejected explicitly by the caller because a
+    // time-window operator cannot preserve those cardinality semantics.
     let interval_ms = |field: &str| -> Result<i64, Error> {
         config
             .get(field)
@@ -318,8 +344,12 @@ fn window_config(
             json!({"kind": "tumbling", "size_ms": interval_ms("interval").or_else(|_| get_duration_ms("size"))?})
         }
         "sliding_window" => {
-            let size_ms = interval_ms("interval").or_else(|_| get_duration_ms("size"))?;
-            json!({"kind": "sliding", "size_ms": size_ms, "slide_ms": size_ms})
+            return Err(Error::Config(
+                "legacy sliding_window uses row-count window_size/slide_size and cannot be \
+                 represented by the event-time window operator; declare a Job window or use an \
+                 explicit processor for row-count batching"
+                    .into(),
+            ));
         }
         "session_window" => {
             json!({"kind": "session", "gap_ms": interval_ms("gap").or_else(|_| get_duration_ms("gap"))?})
@@ -364,6 +394,9 @@ fn window_config(
             "trigger_interval_ms".into(),
             json!(trigger_interval_ms.max(1)),
         );
+        if matches!(buffer_type, "tumbling_window" | "session_window") {
+            object.insert("legacy_payload".into(), json!(true));
+        }
     }
     Ok(window)
 }
@@ -570,21 +603,81 @@ mod window_mapping_tests {
     }
 
     #[test]
-    fn sliding_maps_interval_to_size_and_slide() {
-        let spec = window_stream(
-            "sliding_window",
-            json!({"interval": "30s", "slide_size": 5}),
-        );
-        let window = spec
-            .operators
-            .iter()
-            .find(|op| op.kind == OperatorKind::Window)
-            .unwrap();
-        assert_eq!(window.config.get("kind").unwrap(), "sliding");
-        assert_eq!(window.config.get("size_ms").unwrap(), 30_000);
-        // Legacy slide is a row count; the time-based slide falls back to
-        // the interval cadence until row-based slides exist.
-        assert_eq!(window.config.get("slide_ms").unwrap(), 30_000);
+    fn sliding_row_count_configuration_is_rejected_explicitly() {
+        let error = compile_stream(
+            &StreamConfig {
+                id: Some("w".into()),
+                input: crate::input::InputConfig {
+                    input_type: "generate".into(),
+                    name: None,
+                    codec: None,
+                    config: Some(json!({"count": 1})),
+                },
+                pipeline: crate::pipeline::PipelineConfig {
+                    thread_num: 1,
+                    processors: vec![],
+                },
+                output: crate::output::OutputConfig {
+                    output_type: "drop".into(),
+                    name: None,
+                    codec: None,
+                    config: None,
+                },
+                error_output: None,
+                buffer: Some(crate::buffer::BufferConfig {
+                    buffer_type: "sliding_window".into(),
+                    name: None,
+                    config: Some(json!({"interval": "30s", "slide_size": 5})),
+                }),
+                durability: None,
+                temporary: None,
+            },
+            0,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("row-count"), "{message}");
+        assert!(message.contains("Job"), "{message}");
+    }
+
+    #[test]
+    fn sliding_config_with_row_count_is_not_reinterpreted_as_time() {
+        let error = compile_stream(
+            &StreamConfig {
+                id: Some("w".into()),
+                input: crate::input::InputConfig {
+                    input_type: "generate".into(),
+                    name: None,
+                    codec: None,
+                    config: Some(json!({"count": 1})),
+                },
+                pipeline: crate::pipeline::PipelineConfig {
+                    thread_num: 1,
+                    processors: vec![],
+                },
+                output: crate::output::OutputConfig {
+                    output_type: "drop".into(),
+                    name: None,
+                    codec: None,
+                    config: None,
+                },
+                error_output: None,
+                buffer: Some(crate::buffer::BufferConfig {
+                    buffer_type: "sliding_window".into(),
+                    name: None,
+                    config: Some(json!({
+                        "window_size": 100,
+                        "interval": "5s",
+                        "slide_size": 10
+                    })),
+                }),
+                durability: None,
+                temporary: None,
+            },
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("row-count"));
     }
 
     #[test]

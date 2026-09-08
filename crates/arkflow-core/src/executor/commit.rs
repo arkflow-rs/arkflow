@@ -66,6 +66,17 @@ struct PartitionFrontier {
     pending: BTreeSet<u64>,
 }
 
+/// Snapshot of one partition frontier used by connectors that must
+/// compensate a durable source commit after a sibling acknowledgement fails.
+/// The fields stay private so callers can only restore a snapshot produced by
+/// this frontier.
+#[derive(Debug, Clone)]
+pub struct FrontierSnapshot {
+    active: bool,
+    next_offset: u64,
+    pending: BTreeSet<u64>,
+}
+
 /// An immutable sealed view of the acknowledged frontier at one instant.
 ///
 /// Sealed by the source event loop at barrier injection: positions and the
@@ -88,7 +99,19 @@ pub struct CheckpointCut {
 /// mutability keeps the ack path (`&self` on `Arc<dyn Ack>`) lock-friendly.
 pub struct CommitFrontier {
     partitions: Mutex<BTreeMap<PartitionKey, PartitionFrontier>>,
+    /// A failed durable source commit fences later acknowledgements for the
+    /// same physical partition.  Without this side channel, a later Kafka
+    /// acknowledgement that is waiting on the failed frontier could sleep
+    /// forever after the failed caller has already returned.
+    failures: Mutex<BTreeMap<PartitionKey, FrontierFailure>>,
     generation: Mutex<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrontierFailure {
+    /// Exclusive next offset whose durable source commit failed.
+    pub next_offset: u64,
+    pub error: String,
 }
 
 impl Default for CommitFrontier {
@@ -101,7 +124,61 @@ impl CommitFrontier {
     pub fn new() -> Self {
         Self {
             partitions: Mutex::new(BTreeMap::new()),
+            failures: Mutex::new(BTreeMap::new()),
             generation: Mutex::new(0),
+        }
+    }
+
+    /// Record a durable source failure for one partition.  Later deliveries
+    /// must observe this fence and fail/retry rather than waiting for a
+    /// frontier that cannot advance on its own.
+    pub fn record_failure(
+        &self,
+        topic: Option<&str>,
+        partition: u32,
+        next_offset: u64,
+        error: impl Into<String>,
+    ) {
+        self.failures.lock().unwrap().insert(
+            PartitionKey {
+                topic: topic.map(str::to_owned),
+                partition,
+            },
+            FrontierFailure {
+                next_offset,
+                error: error.into(),
+            },
+        );
+    }
+
+    /// Return the durable failure currently fencing one partition, if any.
+    pub fn failure(&self, topic: Option<&str>, partition: u32) -> Option<FrontierFailure> {
+        self.failures
+            .lock()
+            .unwrap()
+            .get(&PartitionKey {
+                topic: topic.map(str::to_owned),
+                partition,
+            })
+            .cloned()
+    }
+
+    /// Clear a failure only for the retrying next offset.  A retry for a
+    /// different/later offset must not accidentally remove the fence.
+    pub fn clear_failure_if(&self, topic: Option<&str>, partition: u32, next_offset: u64) -> bool {
+        let mut failures = self.failures.lock().unwrap();
+        let key = PartitionKey {
+            topic: topic.map(str::to_owned),
+            partition,
+        };
+        if failures
+            .get(&key)
+            .is_some_and(|failure| failure.next_offset == next_offset)
+        {
+            failures.remove(&key);
+            true
+        } else {
+            false
         }
     }
 
@@ -111,6 +188,7 @@ impl CommitFrontier {
     /// positions instead of an empty cursor.
     pub fn seed(&self, positions: &[SourcePosition]) {
         let mut partitions = self.partitions.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap();
         for position in positions {
             let frontier = partitions
                 .entry(PartitionKey::from_position(position))
@@ -121,6 +199,7 @@ impl CommitFrontier {
             // stale seed rather than merging with it.
             frontier.next_offset = position.offset;
             frontier.pending.clear();
+            failures.remove(&PartitionKey::from_position(position));
         }
     }
 
@@ -205,6 +284,92 @@ impl CommitFrontier {
             .map(|frontier| frontier.next_offset)
     }
 
+    /// Capture one partition before a tentative acknowledgement advances it.
+    pub fn snapshot_partition(&self, topic: Option<&str>, partition: u32) -> FrontierSnapshot {
+        let partitions = self.partitions.lock().unwrap();
+        partitions
+            .get(&PartitionKey {
+                topic: topic.map(str::to_owned),
+                partition,
+            })
+            .map(|frontier| FrontierSnapshot {
+                active: frontier.active,
+                next_offset: frontier.next_offset,
+                pending: frontier.pending.clone(),
+            })
+            .unwrap_or_else(|| FrontierSnapshot {
+                active: false,
+                next_offset: 0,
+                pending: BTreeSet::new(),
+            })
+    }
+
+    /// Restore a previously captured partition snapshot. Returns `false` if
+    /// another acknowledgement has already changed the partition, so a
+    /// caller never silently clobbers a later commit.
+    pub fn restore_partition_if_current(
+        &self,
+        topic: Option<&str>,
+        partition: u32,
+        expected_next_offset: u64,
+        snapshot: FrontierSnapshot,
+    ) -> bool {
+        let mut partitions = self.partitions.lock().unwrap();
+        let key = PartitionKey {
+            topic: topic.map(str::to_owned),
+            partition,
+        };
+        if !snapshot.active {
+            let removable = partitions
+                .get(&key)
+                .is_some_and(|frontier| frontier.next_offset == expected_next_offset);
+            if removable {
+                partitions.remove(&key);
+            }
+            return removable;
+        }
+        let Some(frontier) = partitions.get_mut(&key) else {
+            return false;
+        };
+        if !frontier.active || frontier.next_offset != expected_next_offset {
+            return false;
+        }
+        frontier.active = snapshot.active;
+        frontier.next_offset = snapshot.next_offset;
+        frontier.pending = snapshot.pending;
+        true
+    }
+
+    /// Rewind a single contiguous position by one next-offset. This is used
+    /// only after the corresponding durable source acknowledgement has been
+    /// compensated and is guarded by the expected current value.
+    pub fn rewind_position(
+        &self,
+        topic: Option<&str>,
+        partition: u32,
+        expected_next_offset: u64,
+    ) -> bool {
+        let mut partitions = self.partitions.lock().unwrap();
+        let Some(frontier) = partitions.get_mut(&PartitionKey {
+            topic: topic.map(str::to_owned),
+            partition,
+        }) else {
+            return false;
+        };
+        if !frontier.active || frontier.next_offset != expected_next_offset {
+            return false;
+        }
+        frontier.next_offset = expected_next_offset.saturating_sub(1);
+        frontier
+            .pending
+            .retain(|offset| *offset <= frontier.next_offset);
+        self.failures.lock().unwrap().remove(&PartitionKey {
+            topic: topic.map(str::to_owned),
+            partition,
+        });
+        true
+    }
+
     /// Seal the current acknowledged state into an immutable cut. Each seal
     /// bumps the generation; a cut sealed after this one observes a strictly
     /// larger generation even when the frontier did not move.
@@ -267,6 +432,34 @@ impl TrackingAck {
             ack_lock: tokio::sync::Mutex::new(()),
         }
     }
+
+    /// Make a compensated acknowledgement retryable.  A successful `ack`
+    /// increments `completed`; undoing that success removes the completion so
+    /// the source remains part of the next checkpoint cut until the caller
+    /// retries it.  An acknowledgement that never completed stays blocking
+    /// after a successful undo for the same reason.
+    fn settle_tracker_after_undo(&self) {
+        if self.completed.swap(false, Ordering::AcqRel) {
+            self.tracker.completed.fetch_sub(1, Ordering::AcqRel);
+        }
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.tracker.held.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// An aborted delivery will not be retried by this chain.  Count it as
+    /// terminally settled even when its inner acknowledgement failed before
+    /// ever reaching `ack()`, otherwise `dispatched - completed - held` keeps
+    /// the barrier blocked forever after an error path aborts the delivery.
+    fn settle_tracker_after_abort(&self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.tracker.completed.fetch_add(1, Ordering::AcqRel);
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.tracker.held.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 #[async_trait]
@@ -289,9 +482,36 @@ impl Ack for TrackingAck {
         result
     }
 
+    async fn undo(&self) -> Result<(), Error> {
+        // Serialize compensation with ack.  Without this guard a late undo
+        // can clear `completed` after a concurrent retry has already
+        // committed the same delivery, corrupting the barrier counters.
+        let _guard = self.ack_lock.lock().await;
+        let result = self.inner.undo().await;
+        if result.is_ok() {
+            self.settle_tracker_after_undo();
+        }
+        result
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        let _guard = self.ack_lock.lock().await;
+        let result = self.inner.abort().await;
+        if result.is_ok() {
+            self.settle_tracker_after_abort();
+        }
+        result
+    }
+
     fn mark_held(&self) {
         if !self.held.swap(true, Ordering::AcqRel) {
             self.tracker.held.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn release_held(&self) {
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.tracker.held.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -487,5 +707,38 @@ mod tests {
             frontier.acknowledge(&position("orders", 0, 6)),
             AckAdvance::Advanced { next_offset: 6 }
         );
+    }
+
+    #[tokio::test]
+    async fn released_held_ack_blocks_checkpoint_until_completion() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        ack.mark_held();
+        assert_eq!(tracker.blocking(), 0);
+
+        // Once a buffered row is handed to the downstream state/output path,
+        // it must count toward the checkpoint cut again until its final ack.
+        ack.release_held();
+        assert_eq!(tracker.blocking(), 1);
+        ack.ack().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+    }
+
+    #[tokio::test]
+    async fn aborted_ack_no_longer_blocks_checkpoint() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        assert_eq!(tracker.blocking(), 1);
+        ack.abort().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        // Abort is terminal and idempotent from the tracker perspective.
+        ack.abort().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
     }
 }

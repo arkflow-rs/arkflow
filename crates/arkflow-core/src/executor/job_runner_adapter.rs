@@ -128,6 +128,14 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
                         return Err(error);
                     }
                 }
+                if let Err(error) = seed_event_time_partitions(&graph, &watermark_gates).await {
+                    close_inputs(&inputs).await;
+                    let _ = state.close();
+                    let _ = startup
+                        .take()
+                        .map(|sender| sender.send(Err(error.to_string())));
+                    return Err(error);
+                }
                 for input in &inputs {
                     if let Err(error) = input.restore_positions(&manifest.source_positions).await {
                         close_inputs(&inputs).await;
@@ -137,8 +145,13 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
                         return Err(error);
                     }
                 }
-                restore_event_time_watermarks(&graph, &watermark_gates, &manifest.watermarks_ms)
-                    .await;
+                restore_event_time_watermarks(
+                    &graph,
+                    &watermark_gates,
+                    &manifest.watermarks_ms,
+                    &manifest.watermark_partitions,
+                )
+                .await;
                 prepared_inputs = true;
             }
         }
@@ -348,6 +361,8 @@ fn event_time_gates(
     Error,
 > {
     let mut gates = BTreeMap::new();
+    let mut shared_trackers =
+        BTreeMap::<String, Arc<std::sync::Mutex<crate::event_time::WatermarkTracker>>>::new();
     for chain in &graph.chains {
         let Some(source_time) = chain
             .source_time
@@ -356,9 +371,28 @@ fn event_time_gates(
         else {
             continue;
         };
-        let gate = crate::executor::event_time_gate::EventTimeGate::new(
+        let group = chain
+            .watermark_group
+            .clone()
+            .unwrap_or_else(|| chain.entry_task_id().to_owned());
+        // The group is the identity of the downstream watermark component.
+        // Source edges feeding the same Window must classify lateness against
+        // one shared minimum, even when their local source contracts or
+        // timing vectors were constructed independently.
+        let tracker_key = group;
+        let tracker = match shared_trackers.entry(tracker_key) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let tracker = crate::event_time::WatermarkTracker::from_time_spec(source_time)?;
+                let tracker = Arc::new(std::sync::Mutex::new(tracker));
+                entry.insert(tracker.clone());
+                tracker
+            }
+        };
+        let gate = crate::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
             source_time,
             chain.window_timings.clone(),
+            tracker,
         )?;
         gates.insert(
             chain.entry_task_id().to_owned(),
@@ -368,6 +402,49 @@ fn event_time_gates(
     Ok(gates)
 }
 
+/// Seed every event-time gate with the connector's complete assignment before
+/// restoring checkpointed progress.  A Kafka reader may have several idle
+/// physical partitions; leaving those partitions out would let the first fast
+/// partition advance the shared minimum before the idle partition's first
+/// record arrives.
+async fn seed_event_time_partitions(
+    graph: &crate::executor::graph::ExecutionGraph,
+    gates: &BTreeMap<
+        String,
+        Arc<tokio::sync::Mutex<Option<crate::executor::event_time_gate::EventTimeGate>>>,
+    >,
+) -> Result<(), Error> {
+    for chain in &graph.chains {
+        let Some(gate) = gates.get(chain.entry_task_id()) else {
+            continue;
+        };
+        let Some(source) = chain.source.as_ref() else {
+            continue;
+        };
+        let source_id = chain.entry_task_id();
+        let mut partitions = source
+            .watermark_partitions()
+            .await?
+            .into_iter()
+            .map(|partition| partition.with_source_identity(source_id))
+            .collect::<Vec<_>>();
+        if partitions.is_empty() {
+            if let Some(partition) = chain.source_partition {
+                partitions.push(crate::event_time::EventTimePartition::for_source(
+                    source_id, partition,
+                ));
+            }
+        }
+        if !partitions.is_empty() {
+            gate.lock()
+                .await
+                .as_mut()
+                .map(|gate| gate.seed_partitions(&partitions));
+        }
+    }
+    Ok(())
+}
+
 async fn restore_event_time_watermarks(
     graph: &crate::executor::graph::ExecutionGraph,
     gates: &BTreeMap<
@@ -375,15 +452,51 @@ async fn restore_event_time_watermarks(
         Arc<tokio::sync::Mutex<Option<crate::executor::event_time_gate::EventTimeGate>>>,
     >,
     watermarks_ms: &BTreeMap<String, i64>,
+    watermark_partitions: &BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
 ) {
+    for (task_id, partitions) in watermark_partitions {
+        if let Some(gate) = gates.get(task_id) {
+            let mut gate = gate.lock().await;
+            if let Some(gate) = gate.as_mut() {
+                for partition in partitions {
+                    gate.restore_partition_key(
+                        &crate::event_time::EventTimePartition::new(
+                            partition.topic.clone(),
+                            partition.partition,
+                        )
+                        .with_source_identity(task_id),
+                        partition.watermark_ms,
+                    );
+                }
+            }
+        }
+    }
     for chain in &graph.chains {
+        if watermark_partitions
+            .get(chain.entry_task_id())
+            .is_some_and(|partitions| !partitions.is_empty())
+        {
+            continue;
+        }
         let Some(watermark) = watermarks_ms.get(chain.entry_task_id()) else {
             continue;
         };
         if let Some(gate) = gates.get(chain.entry_task_id()) {
-            gate.lock().await.as_mut().map(|gate| {
-                gate.restore_partition(chain.source_partition.unwrap_or(0), *watermark)
-            });
+            let mut gate_guard = gate.lock().await;
+            if let Some(gate) = gate_guard.as_mut() {
+                let known = gate.known_partitions();
+                if known.is_empty() {
+                    let partition = crate::event_time::EventTimePartition::for_source(
+                        chain.entry_task_id(),
+                        chain.source_partition.unwrap_or(0),
+                    );
+                    gate.restore_partition_key(&partition, *watermark);
+                } else {
+                    for partition in known {
+                        gate.restore_partition_key(&partition, *watermark);
+                    }
+                }
+            }
         }
     }
 }
@@ -620,8 +733,8 @@ async fn run_local_checkpoint_loop(
                     .unwrap_or(sequence as u128);
                 let checkpoint_id = format!("local-{}-{timestamp}-{sequence}", plan.spec.id);
                 sequence = sequence.saturating_add(1);
-                match handle.checkpoint_barrier(checkpoint_id.clone(), 0).await {
-                    Ok((snapshot, source_positions, watermarks_ms)) => {
+                match handle.checkpoint_barrier_with_details(checkpoint_id.clone(), 0).await {
+                    Ok((snapshot, source_positions, watermarks_ms, watermark_partitions)) => {
                         if let Err(error) = persist_local_checkpoint(
                             &store,
                             &mut catalog,
@@ -631,6 +744,7 @@ async fn run_local_checkpoint_loop(
                             snapshot,
                             source_positions,
                             watermarks_ms,
+                            watermark_partitions,
                             &checkpoint_id,
                         ) {
                             tracing::warn!(job_id = %plan.spec.id, %error, "local Job checkpoint failed; data processing continues");
@@ -654,6 +768,7 @@ fn persist_local_checkpoint(
     snapshot: crate::state::StateSnapshot,
     source_positions: Vec<crate::checkpoint::SourcePosition>,
     watermarks_ms: BTreeMap<String, i64>,
+    watermark_partitions: BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
     checkpoint_id: &str,
 ) -> Result<(), Error> {
     let repository = crate::checkpoint::CheckpointRepository::new(store.clone());
@@ -701,6 +816,10 @@ fn persist_local_checkpoint(
                 Vec::new()
             },
             watermark_ms: watermarks_ms.get(task_id).copied(),
+            watermark_partitions: watermark_partitions
+                .get(task_id)
+                .cloned()
+                .unwrap_or_default(),
         })?;
     }
     let attempts = participants

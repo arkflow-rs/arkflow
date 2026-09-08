@@ -52,6 +52,23 @@ pub trait Ack: Send + Sync {
     /// observe the failure to apply backpressure or stop.
     async fn ack(&self) -> Result<(), Error>;
 
+    /// Compensate a successful acknowledgement when a sibling in the same
+    /// logical delivery fails. Connectors that cannot move their durable
+    /// cursor backwards may keep the default no-op and surface their existing
+    /// at-least-once limitation; local composites and WALs override it.
+    async fn undo(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Abort an acknowledgement that was handed to a downstream delivery
+    /// which could not be published.  Unlike `undo`, abort also prevents a
+    /// queued sibling from completing a fan-out parent after the routing
+    /// operation has already failed.  Connectors with a stronger rollback
+    /// boundary inherit the default compensation behavior.
+    async fn abort(&self) -> Result<(), Error> {
+        self.undo().await
+    }
+
     /// Signal that this acknowledgement is now held by a buffering operator
     /// (event-time gate or window) and may complete much later, or never
     /// before shutdown. Checkpoint barrier draining waits for in-flight
@@ -61,6 +78,13 @@ pub trait Ack: Send + Sync {
     /// execution-local journal until the buffer fires. The default is a
     /// no-op for acknowledgements that complete in ordinary sink latency.
     fn mark_held(&self) {}
+
+    /// Signal that a previously held acknowledgement is being released to
+    /// ordinary downstream processing.  Buffering operators use this to
+    /// re-enter the barrier's in-flight set before state/output/source
+    /// acknowledgement completes.  Ordinary acknowledgements remain a
+    /// no-op.
+    fn release_held(&self) {}
 }
 
 /// Split one source acknowledgement across several downstream deliveries.
@@ -78,12 +102,17 @@ pub fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn Ack>> {
         parent,
         remaining: AtomicUsize::new(branches),
         parent_lock: tokio::sync::Mutex::new(()),
+        parent_acked: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
+        children: std::sync::Mutex::new(Vec::with_capacity(branches)),
     });
     (0..branches)
         .map(|_| {
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            state.children.lock().unwrap().push(acknowledged.clone());
             Arc::new(FanoutAckPart {
                 state: state.clone(),
-                acknowledged: AtomicBool::new(false),
+                acknowledged,
             }) as Arc<dyn Ack>
         })
         .collect()
@@ -95,25 +124,44 @@ struct FanoutAckState {
     /// Serialize the final parent acknowledgement. A transient parent error
     /// can then roll the group back for a safe retry.
     parent_lock: tokio::sync::Mutex<()>,
+    parent_acked: AtomicBool,
+    aborted: AtomicBool,
+    children: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
 }
 
 struct FanoutAckPart {
     state: Arc<FanoutAckState>,
-    acknowledged: AtomicBool,
+    acknowledged: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl Ack for FanoutAckPart {
     async fn ack(&self) -> Result<(), Error> {
+        // Serialize the child state transition with abort.  A sibling may
+        // already be queued in a channel when another send fails; it must see
+        // the aborted flag before it can decrement the parent group.
+        let _guard = self.state.parent_lock.lock().await;
+        if self.state.aborted.load(Ordering::Acquire) {
+            // A queued sibling must not report a successful downstream
+            // acknowledgement after the fan-out was aborted.  Returning an
+            // error lets any state/output wrapper around that sibling roll
+            // back its own mutation instead of committing a delivery that can
+            // no longer reach the source parent.
+            return Err(Error::Process(
+                "fan-out acknowledgement was aborted".to_owned(),
+            ));
+        }
         // A downstream retry or a duplicated control path must not decrement
         // the group more than once.
         if self.acknowledged.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         if self.state.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _guard = self.state.parent_lock.lock().await;
             match self.state.parent.ack().await {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    self.state.parent_acked.store(true, Ordering::Release);
+                    Ok(())
+                }
                 Err(error) => {
                     // The child was only tentatively acknowledged. Keep the
                     // group pending when the parent could not commit so the
@@ -129,10 +177,59 @@ impl Ack for FanoutAckPart {
         }
     }
 
+    async fn undo(&self) -> Result<(), Error> {
+        let _guard = self.state.parent_lock.lock().await;
+        if self.state.aborted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let parent_was_acked = self.state.parent_acked.load(Ordering::Acquire);
+        if parent_was_acked {
+            self.state.parent.undo().await?;
+            self.state.parent_acked.store(false, Ordering::Release);
+        }
+        let children = self.state.children.lock().unwrap();
+        for child in children.iter() {
+            child.store(false, Ordering::Release);
+        }
+        self.state
+            .remaining
+            .store(children.len(), Ordering::Release);
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        let _guard = self.state.parent_lock.lock().await;
+        if self.state.aborted.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let parent_was_acked = self.state.parent_acked.swap(false, Ordering::AcqRel);
+        // An aborted fan-out may have no completed parent acknowledgement yet,
+        // while the parent still owns staged state (for example a
+        // CommitGroupOnAck wrapped around the source ack).  Abort that parent
+        // as well so a failed send cannot leave a transaction live forever.
+        let parent_result = if parent_was_acked {
+            self.state.parent.undo().await
+        } else {
+            self.state.parent.abort().await
+        };
+        let children = self.state.children.lock().unwrap();
+        for child in children.iter() {
+            child.store(false, Ordering::Release);
+        }
+        self.state
+            .remaining
+            .store(children.len(), Ordering::Release);
+        parent_result
+    }
+
     fn mark_held(&self) {
         // The held child may never ack before shutdown; propagate so the
         // group's source-side tracker excludes it from barrier draining.
         self.state.parent.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.state.parent.release_held();
     }
 }
 
@@ -154,6 +251,25 @@ pub trait Input: Send + Sync {
     /// Legacy inputs remain compatible through the empty default.
     async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
         Ok(Vec::new())
+    }
+
+    /// Return the physical event-time partitions assigned to this reader.
+    /// Seeded partitions participate in the watermark minimum before their
+    /// first record arrives.
+    async fn watermark_partitions(
+        &self,
+    ) -> Result<Vec<crate::event_time::EventTimePartition>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// Reconstruct an acknowledgement for a checkpoint/WAL source position
+    /// during replay. Connectors without a native position ack use `None` and
+    /// retain the legacy local-WAL-only behavior.
+    async fn ack_for_position(
+        &self,
+        _position: &SourcePosition,
+    ) -> Result<Option<Arc<dyn Ack>>, Error> {
+        Ok(None)
     }
 
     /// Bind this reader to a physical source partition owned by its task.
@@ -186,15 +302,54 @@ pub struct VecAck(pub Vec<Arc<dyn Ack>>);
 #[async_trait]
 impl Ack for VecAck {
     async fn ack(&self) -> Result<(), Error> {
-        for ack in &self.0 {
-            ack.ack().await?;
+        for (index, ack) in self.0.iter().enumerate() {
+            match ack.ack().await {
+                Ok(()) => {}
+                Err(error) => {
+                    // An acknowledgement may have advanced its durable
+                    // source before reporting an error. Compensate the
+                    // failed child as well as the earlier successful
+                    // children; otherwise a composite failure can roll back
+                    // state while one source cursor remains past the input.
+                    for child in self.0[..=index].iter().rev() {
+                        let _ = child.undo().await;
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(())
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        let mut first_error = None;
+        for ack in self.0.iter().rev() {
+            if let Err(error) = ack.undo().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        let mut first_error = None;
+        for ack in self.0.iter().rev() {
+            if let Err(error) = ack.abort().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn mark_held(&self) {
         for ack in &self.0 {
             ack.mark_held();
+        }
+    }
+
+    fn release_held(&self) {
+        for ack in &self.0 {
+            ack.release_held();
         }
     }
 }
@@ -229,14 +384,61 @@ pub struct ConcurrentAck(pub Vec<Arc<dyn Ack>>);
 #[async_trait]
 impl Ack for ConcurrentAck {
     async fn ack(&self) -> Result<(), Error> {
-        futures::future::try_join_all(self.0.iter().map(|ack| ack.ack()))
-            .await
-            .map(|_| ())
+        let results = futures::future::join_all(self.0.iter().map(|ack| ack.ack())).await;
+        let mut first_error = None;
+        for result in results {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        if first_error.is_some() {
+            // Any child may have advanced its durable source before returning
+            // an error. Compensate successful and failed children alike so a
+            // composite failure cannot roll back state while one source
+            // cursor remains past the input. Connector acks are required to
+            // make undo idempotent for the not-yet-committed case.
+            // Reverse order matters for source positions in one partition:
+            // undo a later durable cursor before compensating an earlier one.
+            for ack in self.0.iter().rev() {
+                if let Err(error) = ack.undo().await {
+                    first_error.get_or_insert(Error::Process(format!(
+                        "source acknowledgement failed and compensation failed: {error}"
+                    )));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        let mut first_error = None;
+        for ack in self.0.iter().rev() {
+            if let Err(error) = ack.undo().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        let mut first_error = None;
+        for ack in self.0.iter().rev() {
+            if let Err(error) = ack.abort().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn mark_held(&self) {
         for ack in &self.0 {
             ack.mark_held();
+        }
+    }
+
+    fn release_held(&self) {
+        for ack in &self.0 {
+            ack.release_held();
         }
     }
 }
@@ -269,6 +471,24 @@ mod tests {
     impl Ack for RecordingAck {
         async fn ack(&self) -> Result<(), Error> {
             self.acked.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct CompensatingAck {
+        acked: AtomicUsize,
+        undone: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Ack for CompensatingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn undo(&self) -> Result<(), Error> {
+            self.undone.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -346,6 +566,25 @@ mod tests {
             .await
             .expect("independent acknowledgements must not be serialized")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ack_compensates_successful_siblings() {
+        let healthy = Arc::new(CompensatingAck {
+            acked: AtomicUsize::new(0),
+            undone: AtomicUsize::new(0),
+        });
+        let failing = Arc::new(FailOnceAck {
+            calls: AtomicUsize::new(0),
+        });
+        let composite = ConcurrentAck(vec![
+            healthy.clone() as Arc<dyn Ack>,
+            failing as Arc<dyn Ack>,
+        ]);
+
+        assert!(composite.ack().await.is_err());
+        assert_eq!(healthy.acked.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy.undone.load(Ordering::Relaxed), 1);
     }
 }
 

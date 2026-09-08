@@ -141,6 +141,18 @@ pub trait WalStore: Send + Sync + 'static {
     /// should no-op when `seq <= current_cursor`.
     fn advance_cursor(&self, seq: u64) -> Result<(), Error>;
 
+    /// Move the committed cursor backwards to `seq` for acknowledgement
+    /// compensation. Backends that cannot durably rewind expose an error so a
+    /// caller never treats an un-compensated source commit as successful.
+    fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+        if seq >= self.cursor() {
+            return Ok(());
+        }
+        Err(Error::Process(
+            "WAL backend does not support cursor compensation".into(),
+        ))
+    }
+
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error>;
@@ -322,6 +334,23 @@ impl WalStore for RedbStore {
                 meta.insert(CURSOR_KEY, seq)
                     .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
             }
+        }
+        tx.commit()
+            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
+        {
+            let mut meta = tx
+                .open_table(META)
+                .map_err(|e| Error::Process(format!("WAL meta open failed: {}", e)))?;
+            meta.insert(CURSOR_KEY, seq)
+                .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
         }
         tx.commit()
             .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;

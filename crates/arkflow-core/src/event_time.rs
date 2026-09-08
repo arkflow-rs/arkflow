@@ -4,6 +4,7 @@ use crate::job::{LateEventPolicy, TimeSpec, WatermarkStrategy};
 use crate::{Error, MessageBatch};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -14,7 +15,49 @@ pub struct PartitionProgress {
     pub idle: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Identity of one physical event-time input partition.
+///
+/// Kafka partition numbers are only unique within a topic.  Keeping the topic
+/// optional preserves the old connector-neutral numeric API while allowing a
+/// subscription to multiple topics to maintain independent progress for
+/// `topic-a/0` and `topic-b/0`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EventTimePartition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub partition: u32,
+}
+
+impl EventTimePartition {
+    pub fn new(topic: Option<String>, partition: u32) -> Self {
+        Self { topic, partition }
+    }
+
+    pub fn numeric(partition: u32) -> Self {
+        Self::new(None, partition)
+    }
+
+    /// Give connector-neutral partitions a stable source identity when they
+    /// participate in a tracker shared by several source edges. A numeric
+    /// partition is only unique within one source; without this namespace,
+    /// two inputs that both expose partition 0 would overwrite each other's
+    /// watermark progress.
+    pub fn for_source(source_id: &str, partition: u32) -> Self {
+        Self::new(Some(format!("__arkflow_source__:{source_id}")), partition)
+    }
+
+    /// Preserve a connector-provided topic, while assigning a stable topic
+    /// namespace to connector-neutral physical partitions.
+    pub fn with_source_identity(self, source_id: &str) -> Self {
+        if self.topic.is_some() {
+            self
+        } else {
+            Self::for_source(source_id, self.partition)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowAction {
     Hold,
     Emit,
@@ -66,7 +109,11 @@ pub struct WatermarkTracker {
     strategy: WatermarkStrategy,
     out_of_orderness_ms: i64,
     idle_timeout_ms: Option<i64>,
+    /// Compatibility view for callers that only have numeric partitions.
     partitions: BTreeMap<u32, PartitionProgress>,
+    /// Canonical physical partition progress.  This is the only map used for
+    /// a multi-topic or multi-partition source.
+    physical_partitions: BTreeMap<EventTimePartition, PartitionProgress>,
     watermark_ms: Option<i64>,
 }
 
@@ -82,42 +129,69 @@ impl WatermarkTracker {
             out_of_orderness_ms: watermark.out_of_orderness_ms as i64,
             idle_timeout_ms: watermark.idle_timeout_ms.map(|value| value as i64),
             partitions: BTreeMap::new(),
+            physical_partitions: BTreeMap::new(),
             watermark_ms: None,
         })
     }
 
     pub fn observe(&mut self, partition: u32, event_time_ms: i64, observed_at_ms: i64) -> i64 {
+        self.observe_partition(
+            &EventTimePartition::numeric(partition),
+            event_time_ms,
+            observed_at_ms,
+        )
+    }
+
+    pub fn observe_partition(
+        &mut self,
+        partition: &EventTimePartition,
+        event_time_ms: i64,
+        observed_at_ms: i64,
+    ) -> i64 {
         let candidate = match self.strategy {
             WatermarkStrategy::BoundedOutOfOrderness => {
                 event_time_ms.saturating_sub(self.out_of_orderness_ms)
             }
             WatermarkStrategy::Monotonous => event_time_ms,
         };
-        let progress = self
-            .partitions
-            .entry(partition)
-            .or_insert(PartitionProgress {
-                watermark_ms: candidate,
-                last_event_at_ms: observed_at_ms,
-                idle: false,
-            });
+        let progress =
+            self.physical_partitions
+                .entry(partition.clone())
+                .or_insert(PartitionProgress {
+                    watermark_ms: candidate,
+                    last_event_at_ms: observed_at_ms,
+                    idle: false,
+                });
         progress.watermark_ms = progress.watermark_ms.max(candidate);
         progress.last_event_at_ms = observed_at_ms;
         progress.idle = false;
+        if partition.topic.is_none() {
+            self.partitions.insert(partition.partition, *progress);
+        }
         self.recompute()
     }
 
     pub fn mark_idle(&mut self, partition: u32) -> Option<i64> {
-        let progress = self.partitions.get_mut(&partition)?;
+        self.mark_partition_idle(&EventTimePartition::numeric(partition))
+    }
+
+    pub fn mark_partition_idle(&mut self, partition: &EventTimePartition) -> Option<i64> {
+        let progress = self.physical_partitions.get_mut(partition)?;
         progress.idle = true;
+        if partition.topic.is_none() {
+            self.partitions.insert(partition.partition, *progress);
+        }
         Some(self.recompute())
     }
 
     pub fn refresh_idle(&mut self, now_ms: i64) -> i64 {
         if let Some(timeout_ms) = self.idle_timeout_ms {
-            for progress in self.partitions.values_mut() {
+            for (partition, progress) in self.physical_partitions.iter_mut() {
                 if now_ms.saturating_sub(progress.last_event_at_ms) >= timeout_ms {
                     progress.idle = true;
+                }
+                if partition.topic.is_none() {
+                    self.partitions.insert(partition.partition, *progress);
                 }
             }
         }
@@ -132,15 +206,54 @@ impl WatermarkTracker {
         &self.partitions
     }
 
+    pub fn physical_partition_progress(&self) -> &BTreeMap<EventTimePartition, PartitionProgress> {
+        &self.physical_partitions
+    }
+
+    pub fn partition_progress_for(
+        &self,
+        partition: &EventTimePartition,
+    ) -> Option<&PartitionProgress> {
+        self.physical_partitions.get(partition)
+    }
+
+    /// Seed all partitions currently assigned by the connector.  A partition
+    /// that has not emitted a record is deliberately active at MIN so the
+    /// fastest partition cannot close a window before the first event from a
+    /// silent partition arrives.  `refresh_idle` can later remove it after the
+    /// configured idle timeout.
+    pub fn seed_partitions(&mut self, partitions: &[EventTimePartition]) {
+        let now = crate::state::now_ms() as i64;
+        for partition in partitions {
+            let progress =
+                self.physical_partitions
+                    .entry(partition.clone())
+                    .or_insert(PartitionProgress {
+                        watermark_ms: i64::MIN,
+                        last_event_at_ms: now,
+                        idle: false,
+                    });
+            if partition.topic.is_none() {
+                self.partitions.insert(partition.partition, *progress);
+            }
+        }
+        self.recompute();
+    }
+
     pub fn restore_partition(&mut self, partition: u32, watermark_ms: i64) {
-        self.partitions.insert(
-            partition,
-            PartitionProgress {
-                watermark_ms,
-                last_event_at_ms: crate::state::now_ms() as i64,
-                idle: false,
-            },
-        );
+        self.restore_partition_key(&EventTimePartition::numeric(partition), watermark_ms);
+    }
+
+    pub fn restore_partition_key(&mut self, partition: &EventTimePartition, watermark_ms: i64) {
+        let progress = PartitionProgress {
+            watermark_ms,
+            last_event_at_ms: crate::state::now_ms() as i64,
+            idle: false,
+        };
+        self.physical_partitions.insert(partition.clone(), progress);
+        if partition.topic.is_none() {
+            self.partitions.insert(partition.partition, progress);
+        }
         // Recovery installs partitions one by one. Recompute from the full
         // restored set instead of applying the normal runtime monotonic-max
         // rule: restoring a high partition first must not make the global
@@ -150,9 +263,13 @@ impl WatermarkTracker {
     }
 
     fn recompute(&mut self) -> i64 {
-        let next = self
-            .partitions
-            .values()
+        let values = if self.physical_partitions.is_empty() {
+            self.partitions.values().collect::<Vec<_>>()
+        } else {
+            self.physical_partitions.values().collect::<Vec<_>>()
+        };
+        let next = values
+            .iter()
             .filter(|progress| !progress.idle)
             .map(|progress| progress.watermark_ms)
             .min();

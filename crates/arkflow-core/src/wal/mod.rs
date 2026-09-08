@@ -27,8 +27,9 @@
 //! `arkflow-plugin` and is opt-in via `backend: s3`. Per-entry writes commit
 //! (and fsync) a transaction per append. `group-commit` and `periodic` policies
 //! coalesce concurrent appends into shared transactions to amortize the
-//! fsync / PUT cost, at the price of a small loss window if the process
-//! crashes mid-flush.
+//! fsync / PUT cost. Callers that hand an appended record to the pipeline
+//! flush it before returning the record; the background flusher remains useful
+//! for callers that explicitly stage writes.
 
 pub mod config;
 pub mod store;
@@ -247,8 +248,10 @@ pub struct Wal {
     /// maps to the exclusive next offset N+1 in this topic-less partition.
     frontier: Arc<crate::executor::commit::CommitFrontier>,
     /// Keeps the underlying source acknowledgements for out-of-order WAL
-    /// completions until every earlier sequence has completed too.
-    acknowledgements: Mutex<BTreeMap<u64, Arc<dyn crate::input::Ack>>>,
+    /// completions until every earlier sequence has completed too.  An entry
+    /// is processed only by the caller that owns that sequence; a gap-closing
+    /// acknowledgement must never drain a later entry on its behalf.
+    acknowledgements: Mutex<BTreeMap<u64, PendingWalAck>>,
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
@@ -256,11 +259,26 @@ pub struct Wal {
     // --- staging for group-commit / periodic ---
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     pending_notify: Notify,
+    /// Serialize background and explicit flushes.  Without this guard an
+    /// explicit read-side flush could observe an empty pending queue while a
+    /// background flusher had already taken the batch but was still writing
+    /// it, violating the durable-before-read boundary.
+    flush_lock: tokio::sync::Mutex<()>,
     /// Wakes acknowledgements that are waiting for an earlier WAL sequence
     /// to finish its source-side commit and cursor advance.
     ack_notify: Notify,
     close: CancellationToken,
     flusher: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct PendingWalAck {
+    ack: Arc<dyn crate::input::Ack>,
+    in_flight: bool,
+    /// The source-side commit failed after this sequence became the cursor
+    /// frontier. Keep the failed sequence registered as a fence so later
+    /// acknowledgements fail promptly instead of waiting forever for a
+    /// sequence that will not advance until its caller retries.
+    last_error: Option<String>,
 }
 
 impl Wal {
@@ -311,6 +329,7 @@ impl Wal {
             policy: sync_policy,
             pending: Mutex::new(Vec::new()),
             pending_notify: Notify::new(),
+            flush_lock: tokio::sync::Mutex::new(()),
             ack_notify: Notify::new(),
             close: CancellationToken::new(),
             flusher: Mutex::new(None),
@@ -358,11 +377,10 @@ impl Wal {
     /// Persist a message and return its assigned sequence number.
     ///
     /// `per-entry` commits (fsyncs) before returning — fully durable. `group-
-    /// commit` and `periodic` stage the entry and return immediately; the
-    /// background flusher commits batches to amortize the fsync cost. Under
-    /// those two policies a crash before the next flush loses staged entries
-    /// (the documented small loss window) — pick `per-entry` when every entry
-    /// must survive a crash regardless of timing.
+    /// commit` and `periodic` stage the entry; callers that need a durable
+    /// hand-off should call [`Wal::flush`] before publishing the record to the
+    /// pipeline. The background flusher still batches explicitly staged
+    /// appends.
     ///
     /// The store's blocking calls (redb `commit`, S3 `PUT`) are wrapped in
     /// `spawn_blocking` for `per-entry` to keep the async executor from
@@ -414,73 +432,111 @@ impl Wal {
         Ok(())
     }
 
-    /// Complete one WAL delivery. The durable cursor advances only through
-    /// the highest contiguous set of acknowledged sequences, while the
-    /// wrapped source acks are invoked in sequence order once their gap closes.
-    /// Each source acknowledgement is completed before the corresponding WAL
-    /// cursor advance. If the source-side commit fails, the cursor stays before
-    /// that sequence and the entry remains replayable after a restart.
+    /// Complete one WAL delivery. Every sequence is processed by its own
+    /// caller, strictly after all earlier registered sequences have finished.
+    /// The WAL cursor is advanced before the wrapped source acknowledgement so
+    /// the two durable cursors follow the documented commit ordering. If the
+    /// source-side commit fails, the cursor is compensated and the entry stays
+    /// retryable; no later sequence is allowed to run while this one is
+    /// in-flight.
     async fn acknowledge(&self, seq: u64, inner: Arc<dyn crate::input::Ack>) -> Result<(), Error> {
         {
             let mut acknowledgements = self.acknowledgements.lock().await;
-            acknowledgements.entry(seq).or_insert(inner);
-            self.frontier
-                .acknowledge(&crate::checkpoint::SourcePosition::for_partition(
-                    0,
-                    seq.saturating_add(1),
-                ));
+            acknowledgements.entry(seq).or_insert(PendingWalAck {
+                ack: inner,
+                in_flight: false,
+                last_error: None,
+            });
         }
 
-        // Do not hold the pending-map lock while awaiting a source
-        // acknowledgement. A later sequence may already be waiting for this
-        // one, and the gap-closing call must be able to drain the map and
-        // wake it. More importantly, this method does not report success for
-        // a sequence that is merely pending in memory: its caller may be the
-        // checkpoint barrier, so completion must mean that the durable WAL
-        // cursor has reached this sequence.
         loop {
             let notified = self.ack_notify.notified();
             let work = {
                 let mut acknowledgements = self.acknowledgements.lock().await;
-                let cursor = self.store.cursor();
-                while let Some((&stale, _)) = acknowledgements.iter().next() {
-                    if stale <= cursor {
-                        acknowledgements.remove(&stale);
-                    } else {
-                        break;
-                    }
-                }
-                let next_seq = cursor.saturating_add(1);
-                if let Some(ack) = acknowledgements.remove(&next_seq) {
-                    Some((next_seq, ack))
-                } else if cursor >= seq {
-                    return Ok(());
+                let first_seq = acknowledgements.keys().next().copied();
+                let blocked_error = if first_seq != Some(seq) {
+                    acknowledgements
+                        .values()
+                        .next()
+                        .and_then(|entry| entry.last_error.clone())
                 } else {
                     None
+                };
+                let Some(entry) = acknowledgements.get_mut(&seq) else {
+                    // Another concurrent caller for the same sequence may
+                    // have completed it. Its success is shared.
+                    return Ok(());
+                };
+
+                // A later delivery must not inherit the result of an earlier
+                // delivery's source failure. Return a retryable error to the
+                // later caller while preserving both entries so the earlier
+                // caller can retry and the later caller can retry afterwards.
+                if let Some(error) = blocked_error {
+                    return Err(Error::Process(format!(
+                        "WAL acknowledgement is blocked by an earlier source failure: {error}"
+                    )));
+                }
+
+                // Only the lowest outstanding sequence may run. This remains
+                // true even after the WAL cursor has been advanced before
+                // its source-side acknowledgement: later callers must not
+                // overtake an in-flight earlier source commit.
+                let cursor = self.store.cursor();
+                if first_seq != Some(seq)
+                    || entry.in_flight
+                    // A caller may acknowledge a later WAL sequence before
+                    // the earlier delivery has even reached its sink. Keep
+                    // that acknowledgement parked until the missing
+                    // sequence is registered and committed; otherwise the
+                    // source cursor would skip the gap.
+                    || (cursor < seq && cursor.saturating_add(1) != seq)
+                {
+                    None
+                } else {
+                    // This is a retry of the lowest failed sequence. Clear
+                    // the fence only for the attempt that is about to run;
+                    // another caller for a later sequence remains parked.
+                    entry.last_error = None;
+                    let cursor_advanced = if cursor < seq {
+                        self.store.advance_cursor(seq)?;
+                        true
+                    } else {
+                        false
+                    };
+                    entry.in_flight = true;
+                    Some((entry.ack.clone(), cursor_advanced))
                 }
             };
 
             match work {
-                Some((next_seq, ack)) => {
+                Some((ack, cursor_advanced)) => {
                     if let Err(error) = ack.ack().await {
-                        self.acknowledgements
-                            .lock()
-                            .await
-                            .entry(next_seq)
-                            .or_insert(ack);
+                        let compensation = if cursor_advanced {
+                            self.store.rewind_cursor(seq.saturating_sub(1)).err()
+                        } else {
+                            None
+                        };
+                        if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {
+                            entry.in_flight = false;
+                            entry.last_error = Some(error.to_string());
+                        }
                         self.ack_notify.notify_waiters();
-                        return Err(error);
+                        return match compensation {
+                            Some(compensation) => Err(Error::Process(format!(
+                                "WAL source acknowledgement failed: {error}; cursor compensation failed: {compensation}"
+                            ))),
+                            None => Err(error),
+                        };
                     }
-                    if let Err(error) = self.store.advance_cursor(next_seq) {
-                        self.acknowledgements
-                            .lock()
-                            .await
-                            .entry(next_seq)
-                            .or_insert(ack);
-                        self.ack_notify.notify_waiters();
-                        return Err(error);
-                    }
+                    self.acknowledgements.lock().await.remove(&seq);
+                    self.frontier
+                        .acknowledge(&crate::checkpoint::SourcePosition::for_partition(
+                            0,
+                            seq.saturating_add(1),
+                        ));
                     self.ack_notify.notify_waiters();
+                    return Ok(());
                 }
                 None => {
                     tokio::select! {
@@ -496,10 +552,152 @@ impl Wal {
         }
     }
 
+    /// Compensate one already-completed WAL acknowledgement. Compensation is
+    /// only safe for the current cursor frontier; callers must undo a
+    /// composite acknowledgement in reverse order so a later sequence is
+    /// removed before an earlier one.
+    async fn undo_ack(&self, seq: u64, inner: Arc<dyn crate::input::Ack>) -> Result<(), Error> {
+        enum PendingUndo {
+            /// The WAL acknowledgement was registered but its source-side
+            /// acknowledgement had not been attempted yet.
+            Removed,
+            /// The source-side acknowledgement failed and must be
+            /// compensated before the WAL delivery can be discarded.
+            Retry(Arc<dyn crate::input::Ack>),
+        }
+
+        // A source acknowledgement can fail after the WAL cursor was
+        // tentatively advanced.  Keep that entry registered as a retryable
+        // fence, but do not silently remove it when a surrounding composite
+        // aborts: the source side may have committed partially and needs its
+        // own compensation before the WAL delivery is discarded.
+        let pending = {
+            let mut acknowledgements = self.acknowledgements.lock().await;
+            if let Some(entry) = acknowledgements.get_mut(&seq) {
+                if entry.in_flight {
+                    return Err(Error::Process(
+                        "cannot undo an in-flight WAL acknowledgement".into(),
+                    ));
+                }
+                let cursor = self.store.cursor();
+                if cursor > seq {
+                    return Err(Error::Process(
+                        "cannot undo a WAL acknowledgement behind a later cursor".into(),
+                    ));
+                }
+                if entry.last_error.is_some() {
+                    entry.in_flight = true;
+                    Some(PendingUndo::Retry(entry.ack.clone()))
+                } else {
+                    acknowledgements.remove(&seq);
+                    self.ack_notify.notify_waiters();
+                    Some(PendingUndo::Removed)
+                }
+            } else {
+                None
+            }
+        };
+
+        match pending {
+            Some(PendingUndo::Removed) => return Ok(()),
+            Some(PendingUndo::Retry(source_ack)) => {
+                if let Err(error) = source_ack.abort().await {
+                    if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {
+                        entry.in_flight = false;
+                        entry.last_error = Some(error.to_string());
+                    }
+                    self.ack_notify.notify_waiters();
+                    return Err(error);
+                }
+                let cursor = self.store.cursor();
+                if cursor == seq {
+                    self.store.rewind_cursor(seq.saturating_sub(1))?;
+                } else if cursor > seq {
+                    if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {
+                        entry.in_flight = false;
+                    }
+                    self.ack_notify.notify_waiters();
+                    return Err(Error::Process(
+                        "cannot undo a WAL acknowledgement behind a later cursor".into(),
+                    ));
+                }
+                self.acknowledgements.lock().await.remove(&seq);
+                self.ack_notify.notify_waiters();
+                return Ok(());
+            }
+            None => {}
+        }
+
+        let cursor = self.store.cursor();
+        if cursor < seq {
+            return Ok(());
+        }
+        if cursor > seq {
+            return Err(Error::Process(
+                "cannot undo a WAL acknowledgement behind a later cursor".into(),
+            ));
+        }
+
+        // The source-side commit is undone before the WAL cursor is rewound;
+        // otherwise a crash in this compensation window could replay a record
+        // whose connector offset had already been restored.
+        inner.undo().await?;
+        self.store.rewind_cursor(seq.saturating_sub(1))?;
+        if !self
+            .frontier
+            .rewind_position(None, 0, seq.saturating_add(1))
+        {
+            return Err(Error::Process(
+                "WAL acknowledgement frontier changed before compensation".into(),
+            ));
+        }
+        self.ack_notify.notify_waiters();
+        Ok(())
+    }
+
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     pub async fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
         self.store.read_after_cursor()
+    }
+
+    /// Flush staged appends before a record is exposed to downstream
+    /// processing. This is the durability boundary for group-commit and
+    /// periodic policies: a process crash after `read()` returns must leave
+    /// the record replayable from the WAL.
+    pub async fn flush(&self) -> Result<(), Error> {
+        self.flush_pending().await
+    }
+
+    /// Reconcile WAL entries already covered by a restored connector
+    /// checkpoint. Such entries must advance the local cursor as well as being
+    /// removed from the replay queue; otherwise the next newly-read sequence
+    /// waits forever for acknowledgements for the skipped prefix.
+    pub async fn reconcile_covered(&self, sequences: &[u64]) -> Result<(), Error> {
+        let mut covered = sequences.to_vec();
+        covered.sort_unstable();
+        covered.dedup();
+
+        let _guard = self.acknowledgements.lock().await;
+        let cursor = self.store.cursor();
+        let mut target = cursor;
+        for sequence in covered {
+            if sequence == target.saturating_add(1) {
+                target = sequence;
+            } else if sequence > target.saturating_add(1) {
+                break;
+            }
+        }
+        if target > cursor {
+            self.store.advance_cursor(target)?;
+            self.frontier
+                .seed(&[crate::checkpoint::SourcePosition::for_partition(
+                    0,
+                    target.saturating_add(1),
+                )]);
+            self.ack_notify.notify_waiters();
+        }
+        Ok(())
     }
 
     /// Current committed watermark (highest acked sequence, 0 if none).
@@ -508,6 +706,7 @@ impl Wal {
     }
 
     async fn flush_pending(&self) -> Result<(), Error> {
+        let _flush_guard = self.flush_lock.lock().await;
         let batch: Vec<(u64, Vec<u8>)> = {
             let mut p = self.pending.lock().await;
             if p.is_empty() {
@@ -515,7 +714,22 @@ impl Wal {
             }
             std::mem::take(p.as_mut())
         };
-        self.store.append_batch(batch)
+        match self.store.append_batch(batch.clone()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A background flusher may be the caller here. Put the batch
+                // back ahead of entries appended while the store write was in
+                // flight so an explicit read-side flush, or the final close,
+                // can retry instead of observing an empty queue and
+                // incorrectly treating the record as durable.
+                let mut pending = self.pending.lock().await;
+                let mut retry = batch;
+                retry.extend(std::mem::take(&mut *pending));
+                *pending = retry;
+                self.pending_notify.notify_one();
+                Err(error)
+            }
+        }
     }
 
     /// Flush any staged appends and stop the background flusher. After this
@@ -543,9 +757,10 @@ impl Wal {
     }
 }
 
-/// Acknowledgement decorator that commits the wrapped source acknowledgement
-/// before advancing the WAL cursor. Wired into the stream so a source-side
-/// failure leaves the record before both durable cursors and replayable.
+/// Acknowledgement decorator that advances the WAL cursor before committing
+/// the wrapped source acknowledgement. Wired into the stream so WAL ordering
+/// remains deterministic while transient source commit failures stay retryable
+/// in the in-memory acknowledgement frontier.
 pub struct WalAck {
     wal: Arc<Wal>,
     seq: u64,
@@ -564,8 +779,16 @@ impl crate::input::Ack for WalAck {
         self.wal.acknowledge(self.seq, self.inner.clone()).await
     }
 
+    async fn undo(&self) -> Result<(), Error> {
+        self.wal.undo_ack(self.seq, self.inner.clone()).await
+    }
+
     fn mark_held(&self) {
         self.inner.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.inner.release_held();
     }
 }
 

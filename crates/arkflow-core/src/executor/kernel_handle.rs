@@ -100,6 +100,28 @@ impl KernelJobHandle {
         ),
         Error,
     > {
+        self.checkpoint_barrier_with_details(checkpoint_id, generation)
+            .await
+            .map(|(snapshot, positions, watermarks, _)| (snapshot, positions, watermarks))
+    }
+
+    /// Detailed checkpoint variant retaining every physical event-time
+    /// watermark. The three-value method above remains compatible with older
+    /// callers; Agent/local recovery uses this method for multi-topic and
+    /// multi-partition restore.
+    pub async fn checkpoint_barrier_with_details(
+        &self,
+        checkpoint_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<
+        (
+            StateSnapshot,
+            Vec<crate::checkpoint::SourcePosition>,
+            BTreeMap<String, i64>,
+            BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
+        ),
+        Error,
+    > {
         let started = Instant::now();
         let result = self
             .checkpoint_barrier_inner(checkpoint_id.into(), generation)
@@ -122,6 +144,7 @@ impl KernelJobHandle {
             StateSnapshot,
             Vec<crate::checkpoint::SourcePosition>,
             BTreeMap<String, i64>,
+            BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
         ),
         Error,
     > {
@@ -199,6 +222,7 @@ impl KernelJobHandle {
         let mut state_entries = BTreeMap::<(String, Vec<u8>), StateEntry>::new();
         let mut positions = Vec::new();
         let mut watermarks = BTreeMap::new();
+        let mut watermark_partitions = BTreeMap::new();
         for report in snapshots.values() {
             if !report.state.verify() {
                 return Err(Error::Process(format!(
@@ -221,11 +245,16 @@ impl KernelJobHandle {
             if let Some(watermark) = report.watermark_ms {
                 watermarks.insert(report.task_id.clone(), watermark);
             }
+            if !report.watermark_partitions.is_empty() {
+                watermark_partitions
+                    .insert(report.task_id.clone(), report.watermark_partitions.clone());
+            }
         }
         Ok((
             StateSnapshot::new(format_version, state_entries.into_values().collect()),
             positions,
             watermarks,
+            watermark_partitions,
         ))
     }
 
@@ -248,17 +277,60 @@ impl KernelJobHandle {
         &self,
         watermarks_ms: &BTreeMap<String, i64>,
     ) -> Result<(), Error> {
-        for (task_id, watermark) in watermarks_ms {
-            let partition = self
-                .gate_partitions
-                .get(task_id)
-                .copied()
-                .unwrap_or_default();
+        self.restore_watermarks_with_partitions(watermarks_ms, &BTreeMap::new())
+            .await
+    }
+
+    /// Restore physical watermark progress for every assigned topic/partition,
+    /// falling back to the legacy task-level value for older checkpoints.
+    pub async fn restore_watermarks_with_partitions(
+        &self,
+        watermarks_ms: &BTreeMap<String, i64>,
+        watermark_partitions: &BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
+    ) -> Result<(), Error> {
+        for (task_id, partitions) in watermark_partitions {
             if let Some(gate) = self.watermark_gates.get(task_id) {
-                gate.lock()
-                    .await
-                    .as_mut()
-                    .map(|gate| gate.restore_partition(partition, *watermark));
+                let mut gate = gate.lock().await;
+                if let Some(gate) = gate.as_mut() {
+                    for partition in partitions {
+                        gate.restore_partition_key(
+                            &crate::event_time::EventTimePartition::new(
+                                partition.topic.clone(),
+                                partition.partition,
+                            )
+                            .with_source_identity(task_id),
+                            partition.watermark_ms,
+                        );
+                    }
+                }
+            }
+        }
+        for (task_id, watermark) in watermarks_ms {
+            if watermark_partitions
+                .get(task_id)
+                .is_some_and(|partitions| !partitions.is_empty())
+            {
+                continue;
+            }
+            if let Some(gate) = self.watermark_gates.get(task_id) {
+                let mut gate_guard = gate.lock().await;
+                if let Some(gate) = gate_guard.as_mut() {
+                    let known = gate.known_partitions();
+                    if known.is_empty() {
+                        let partition = self
+                            .gate_partitions
+                            .get(task_id)
+                            .copied()
+                            .unwrap_or_default();
+                        let partition =
+                            crate::event_time::EventTimePartition::for_source(task_id, partition);
+                        gate.restore_partition_key(&partition, *watermark);
+                    } else {
+                        for partition in known {
+                            gate.restore_partition_key(&partition, *watermark);
+                        }
+                    }
+                }
             }
         }
         Ok(())

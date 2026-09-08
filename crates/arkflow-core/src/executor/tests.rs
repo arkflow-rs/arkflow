@@ -649,6 +649,19 @@ async fn fanout_ack_waits_for_every_branch_and_is_idempotent() {
 }
 
 #[tokio::test]
+async fn aborted_fanout_rejects_queued_sibling_acknowledgements() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let parent: Arc<dyn Ack> = Arc::new(CountingAck {
+        acknowledgements: acknowledgements.clone(),
+    });
+    let children = fanout_ack(parent, 2);
+
+    children[0].abort().await.unwrap();
+    assert!(children[1].ack().await.is_err());
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn multi_input_chain_preserves_every_upstream_channel() {
     let left = Arc::new(VecInput::new(vec![vec![(1, "left".into())]]));
     let right = Arc::new(VecInput::new(vec![vec![(2, "right".into())]]));
@@ -1276,6 +1289,7 @@ async fn coordinator_completes_only_after_all_participants() {
         state: crate::state::StateSnapshot::new(1, vec![]),
         source_positions: vec![],
         watermark_ms: None,
+        watermark_partitions: vec![],
     };
     // First participant reports; checkpoint stays incomplete (no error, still running).
     report_tx.send(report("source-0", "cp-9")).unwrap();

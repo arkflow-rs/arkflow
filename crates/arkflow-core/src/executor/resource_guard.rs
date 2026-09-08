@@ -175,12 +175,25 @@ impl JobResourceGuard {
 }
 
 async fn connect_guarded(connected: &mut Vec<Guarded>, resource: Guarded) -> Result<(), Error> {
-    match &resource {
-        Guarded::Temporary { temporary, .. } => temporary.connect().await?,
-        Guarded::Source(source) => source.connect().await?,
-        Guarded::Sink(sink) => sink.connect().await?,
+    let result = match &resource {
+        Guarded::Temporary { temporary, .. } => temporary.connect().await,
+        Guarded::Source(source) => source.connect().await,
+        Guarded::Sink(sink) => sink.connect().await,
         // State backends are open from construction.
-        Guarded::State { .. } => {}
+        Guarded::State { .. } => Ok(()),
+    };
+    if let Err(error) = result {
+        // A connector may allocate a WAL/consumer before discovering a
+        // startup error. It is not in `connected` yet, so close this failed
+        // resource explicitly before the caller cleans up earlier resources.
+        if let Err(close_error) = resource.close().await {
+            tracing::warn!(
+                %close_error,
+                resource = %resource.label(),
+                "failed to close resource whose connection failed"
+            );
+        }
+        return Err(error);
     }
     connected.push(resource);
     Ok(())
@@ -343,6 +356,8 @@ mod tests {
         // The temporary and source connected before the failure were closed.
         assert_eq!(temporary.closes.load(Ordering::SeqCst), 1);
         assert_eq!(source.closes.load(Ordering::SeqCst), 1);
-        assert_eq!(failing_sink.closes.load(Ordering::SeqCst), 0);
+        // The failing connector itself may have acquired resources before
+        // returning its error, so it is closed as part of startup cleanup.
+        assert_eq!(failing_sink.closes.load(Ordering::SeqCst), 1);
     }
 }

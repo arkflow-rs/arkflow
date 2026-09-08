@@ -26,13 +26,17 @@ Job 可以声明事件时间字段、每分区 watermark、空闲分区超时和
 
 Kafka 的检查点位置是每个 topic-partition 的**最高连续已确认 offset**:乱序完成的 fan-out 分支不会跳过间隙中未确认的记录。单个源任务保持连接器的全分区订阅,只有多个物理任务才执行显式分区分配;恢复时 checkpoint 位置合并进完整配置 assignment,未记录的分区保留配置起点,并且恢复位置直接作为下一轮 checkpoint 的游标。
 
+启用 WAL 的输入在 `read()` 返回前完成持久化 flush;确认时先推进 WAL 游标,再提交原生源端 offset。恢复会把已被 checkpoint 覆盖的 WAL 连续前缀并入本地游标,因此过滤 replay 不会留下确认缺口。关闭、重连和 processor 并发池都监听取消信号;停止时先等待 worker/collector 结束,再关闭源、sink 和 WAL。
+
 只有携带完整计划任务集合的 manifest 才会被封存为 Completed:缺失、重复或多余任务条目都会导致拒绝,节点离线时保留上一个有效恢复点。**状态格式相同即允许目标 Job 版本升级**(较新的版本恢复较旧的 savepoint);降级或格式变更没有迁移路径,双方一致拒绝。
 
 ## 控制面与兼容性
 
 Hub 持久化 Job、版本、任务分配和恢复记录,使用 generation 防止旧任务报告覆盖新意图。Agent 通过能力声明确认 Job runtime、状态后端和 checkpoint 协议版本。旧的 `Stream` YAML API 不被转换或删除,可继续按原路径运行。
 
-Job 的观察状态由同一 (generation, action) 下**全部预期 assignment 的聚合结果**推导:所有 assignment 成功才报告 running/stopped,任一仍在 pending 或可重试降级时保持 converging,单个节点的暂态失败不会覆盖健康节点。checkpoint 提交同样要求完整的预期 assignment 集合,离线节点的部分结果不会发布为可恢复 artifact。Agent 的报告身份是**注册 session 令牌**:每次重新注册从序列 0 开始,旧 session 的迟到报告被拒绝且不会回退新 session 的观察快照。
+Job 的观察状态由同一 (generation, action) 下**全部预期 assignment 的聚合结果**推导:所有 assignment 成功才报告 running/stopped,任一仍在 pending 或可重试降级时保持 converging,单个节点的暂态失败不会覆盖健康节点。checkpoint 提交同样要求完整的预期 assignment 集合,离线节点的部分结果不会发布为可恢复 artifact。Agent 使用稳定的**进程 boot identity**区分实际重启,使用注册 session 令牌保护请求;每次重新注册的 report 序列从 0 开始,旧 session 的迟到报告被拒绝且不会回退新 session 的观察快照。长时间 checkpoint 在后台执行,heartbeat、report 和取消轮询仍持续运行;命令失败会返回带 correlation metadata 的 terminal `Failed` 结果。
+
+分区边按照 JobPlan 的 key-group range 选择下游 task,而不是按物理 source subtask 取模。同一个 key 从不同 source partition 到达时仍归属同一个下游 owner。旧 YAML Stream 的 tumbling/session buffer 保持“先聚合缓冲、再进入 pipeline”的顺序并输出原始 schema/rows;旧的 row-count `sliding_window` 不会被误读成时间窗口,不兼容配置会在编译期给出迁移提示。
 
 ### 失败与就绪状态
 

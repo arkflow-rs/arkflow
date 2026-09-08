@@ -2,7 +2,7 @@
 //! by bounded in-process channels, with operator-chain fusion.
 
 use crate::input::Input;
-use crate::job::{JobComponentAdapter, JobPlan, TaskSpec};
+use crate::job::{JobComponentAdapter, JobPlan, KeyGroupRange, OperatorKind, TaskSpec};
 use crate::output::Output;
 use crate::processor::Processor;
 use crate::Error;
@@ -23,6 +23,11 @@ pub enum EdgeTarget {
     Partitioned {
         channels: Vec<Sender<super::envelope::Envelope>>,
         key_field: String,
+        /// Key-group ownership for each channel, in the same order as
+        /// `channels`.  Routing must use the JobPlan's max-parallelism
+        /// assignment rather than modulo the number of physical tasks.
+        key_group_ranges: Vec<KeyGroupRange>,
+        max_parallelism: u32,
     },
     /// Send to every downstream subtask channel (non-partitioned fan-out).
     Broadcast(Vec<Sender<super::envelope::Envelope>>),
@@ -63,6 +68,10 @@ pub struct Chain {
     pub processor_parallelism: usize,
     /// Downstream window timing definitions used by the source gate.
     pub window_timings: Vec<super::event_time_gate::WindowTiming>,
+    /// Stable group identity for event-time gates that feed the same normal
+    /// watermark windows. Sources in one group share only the tracker; their
+    /// held deliveries remain on their own gate.
+    pub watermark_group: Option<String>,
 }
 
 impl Chain {
@@ -87,6 +96,7 @@ impl Chain {
             source_partition: None,
             processor_parallelism: 1,
             window_timings: Vec::new(),
+            watermark_group: None,
         }
     }
 
@@ -163,7 +173,12 @@ impl<'a> PlanIndex<'a> {
             .spec
             .operators
             .iter()
-            .map(|operator| (operator.id.as_str(), operator.stateful))
+            .map(|operator| {
+                (
+                    operator.id.as_str(),
+                    operator.stateful || operator.kind == OperatorKind::Window,
+                )
+            })
             .collect();
         let mut upstream: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         let mut downstream: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -217,13 +232,19 @@ impl<'a> PlanIndex<'a> {
         self.plan.task(task_id)
     }
 
-    /// Whether `from`'s task with `subtask` routes to exactly the one task
-    /// (`to`, `subtask`) over this edge.
+    /// Whether the edge has exactly one downstream task in this plan. A
+    /// partitioned edge still needs every downstream subtask as a hash bucket;
+    /// fusing it while several buckets exist would bypass that routing.
     fn edge_routes_single_subtask(&self, from: &str, to: &str) -> bool {
-        let Some(partitioned) = self.edge_partitioned.get(&(from, to)).copied() else {
+        if !self.edge_partitioned.contains_key(&(from, to)) {
             return false;
-        };
-        partitioned || self.plan.spec.parallelism == 1
+        }
+        self.plan
+            .tasks
+            .iter()
+            .filter(|task| task.operator_id == to)
+            .count()
+            <= 1
     }
 
     /// Whether the operator pair (from, to) may fuse into one chain.
@@ -296,6 +317,7 @@ impl ExecutionGraphBuilder {
         resource: &Resource,
     ) -> Result<ExecutionGraph, Error> {
         plan.spec.validate()?;
+        validate_shared_watermark_specs(plan)?;
         let index = PlanIndex::new(plan);
         let tasks = task_ids
             .iter()
@@ -328,6 +350,16 @@ impl ExecutionGraphBuilder {
             }
             None => None,
         };
+        // All stateful operators in one materialized graph share the same
+        // journal.  A window and a keyed processor can be in different
+        // chains, yet still mutate the same backend during one delivery
+        // epoch; separate journals would give them separate finalize locks
+        // and version maps, allowing an older rollback to overwrite a later
+        // commit.  Namespaces keep their state isolated while the journal
+        // serializes the apply/ack/undo boundary across the graph.
+        let shared_journal = state_backend
+            .clone()
+            .map(|backend| Arc::new(super::state_journal::StateJournal::new(backend)));
         let _assigned: BTreeSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
 
         // 1. Group tasks into fusable runs. Tasks are visited in plan order
@@ -378,21 +410,10 @@ impl ExecutionGraphBuilder {
                 };
                 // Downstream tasks of this operator inside the assignment,
                 // with the edge's routing rule (mirrors the legacy runner).
-                let target_tasks: Vec<&TaskSpec> = if partitioned {
-                    runs.iter()
-                        .flatten()
-                        .find(|candidate| {
-                            candidate.operator_id == downstream_operator
-                                && candidate.subtask == task.subtask
-                        })
-                        .into_iter()
-                        .collect()
-                } else {
-                    tasks
-                        .iter()
-                        .filter(|candidate| candidate.operator_id == downstream_operator)
-                        .collect()
-                };
+                let target_tasks: Vec<&TaskSpec> = tasks
+                    .iter()
+                    .filter(|candidate| candidate.operator_id == downstream_operator)
+                    .collect();
                 if target_tasks.is_empty() {
                     return Err(Error::Config(format!(
                         "Job assignment splits edge '{}->{}'; connected tasks must be co-located",
@@ -421,6 +442,25 @@ impl ExecutionGraphBuilder {
                     .iter()
                     .map(|run_index| runs[*run_index][0].id.clone())
                     .collect::<Vec<_>>();
+                let key_group_ranges = if partitioned {
+                    target_runs
+                        .iter()
+                        .map(|run_index| {
+                            runs[*run_index]
+                                .first()
+                                .and_then(|task| task.partitions.first())
+                                .map(|partition| partition.key_group.clone())
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "target run for '{}->{}' has no key-group partition",
+                                        task.operator_id, downstream_operator
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?
+                } else {
+                    Vec::new()
+                };
                 let kind = if partitioned {
                     OutboundKind::Route
                 } else if targets.len() == 1 {
@@ -436,6 +476,8 @@ impl ExecutionGraphBuilder {
                         error: index.is_error_sink(&downstream_operator),
                         late_route: false,
                         targets,
+                        key_group_ranges,
+                        max_parallelism: plan.spec.max_parallelism,
                         key_field: index
                             .plan
                             .spec
@@ -499,6 +541,97 @@ impl ExecutionGraphBuilder {
                                 error: false,
                                 late_route: true,
                                 targets,
+                                key_group_ranges: Vec::new(),
+                                max_parallelism: plan.spec.max_parallelism,
+                                key_field: index
+                                    .plan
+                                    .spec
+                                    .operators
+                                    .iter()
+                                    .find(|operator| operator.id == route_operator)
+                                    .and_then(|operator| operator.key_field.clone())
+                                    .unwrap_or_default(),
+                            });
+                    }
+                }
+            }
+
+            // Event-time Session windows own their dynamic per-key deadline.
+            // Their late rows therefore bypass the source gate and need a
+            // side edge from the window task itself.  The source-side route
+            // edge above remains necessary for tumbling/sliding windows;
+            // this additional edge is only materialized for unified,
+            // watermark-triggered Session operators.
+            let dynamic_session_window = plan
+                .spec
+                .operators
+                .iter()
+                .find(|operator| operator.id == task.operator_id)
+                .and_then(|operator| {
+                    serde_json::from_value::<super::window::WindowOperatorConfig>(
+                        operator.config.clone(),
+                    )
+                    .ok()
+                })
+                .is_some_and(|config| {
+                    config.trigger == super::window::WindowTrigger::Watermark
+                        && !config.legacy_payload
+                        && matches!(config.kind, super::window::WindowKind::Session { .. })
+                });
+            if dynamic_session_window {
+                let route_operators = plan
+                    .spec
+                    .sources
+                    .iter()
+                    .filter(|source| source.time.mode == crate::job::TimeMode::EventTime)
+                    .filter(|source| {
+                        source.time.late_event_route.is_some()
+                            && operator_reachable(plan, &source.operator_id, &task.operator_id)
+                    })
+                    .filter_map(|source| source.time.late_event_route.clone())
+                    .collect::<BTreeSet<_>>();
+                for route_operator in route_operators {
+                    let target_tasks = tasks
+                        .iter()
+                        .filter(|candidate| candidate.operator_id == route_operator)
+                        .collect::<Vec<_>>();
+                    if target_tasks.is_empty() {
+                        return Err(Error::Config(format!(
+                            "late-event route target '{}' for window '{}' is not in this Job assignment",
+                            route_operator, task.operator_id
+                        )));
+                    }
+                    let upstream_run = *run_of_task
+                        .get(task.id.as_str())
+                        .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
+                    let mut target_runs = Vec::new();
+                    for target in target_tasks {
+                        let target_run = *run_of_task.get(target.id.as_str()).ok_or_else(|| {
+                            Error::Config(format!("task '{}' lost its run", target.id))
+                        })?;
+                        if target_run != upstream_run && !target_runs.contains(&target_run) {
+                            target_runs.push(target_run);
+                        }
+                    }
+                    if !target_runs.is_empty() {
+                        let targets = target_runs
+                            .iter()
+                            .map(|run_index| runs[*run_index][0].id.clone())
+                            .collect::<Vec<_>>();
+                        outbound
+                            .entry(task.id.clone())
+                            .or_default()
+                            .push(OutboundEdge {
+                                kind: if targets.len() == 1 {
+                                    OutboundKind::Forward
+                                } else {
+                                    OutboundKind::Broadcast
+                                },
+                                error: false,
+                                late_route: true,
+                                targets,
+                                key_group_ranges: Vec::new(),
+                                max_parallelism: plan.spec.max_parallelism,
                                 key_field: index
                                     .plan
                                     .spec
@@ -619,20 +752,31 @@ impl ExecutionGraphBuilder {
                             })?;
                         config.validate()?;
                         let namespace = format!("job:{}:task:{}", plan.spec.id, task.id);
-                        Arc::new(super::window::ColumnarWindowOperator::with_journal(
+                        let event_time_source = event_time_source_for_operator(plan, &operator.id);
+                        let late_event_policy = event_time_source
+                            .map(|source| source.time.late_event_policy)
+                            .unwrap_or_default();
+                        let late_event_route_configured = event_time_source
+                            .and_then(|source| source.time.late_event_route.as_ref())
+                            .is_some();
+                        Arc::new(
+                        super::window::ColumnarWindowOperator::with_journal_and_late_event_policy(
                             config,
                             backend,
-                            Arc::new(super::state_journal::StateJournal::new(
-                                state_backend.clone().expect("window backend checked above"),
-                            )),
+                            shared_journal
+                                .clone()
+                                .expect("window backend checked above"),
                             namespace,
-                        ))
+                            late_event_policy,
+                            late_event_route_configured,
+                        ),
+                    )
                     } else {
                         let processor = adapter.build_processor(operator, resource)?;
                         if !operator.stateful {
                             processor
                         } else {
-                            let backend = state_backend.clone().ok_or_else(|| {
+                            state_backend.as_ref().ok_or_else(|| {
                                 Error::Config(format!(
                                     "stateful operator '{}' requires a Job state backend",
                                     operator.id
@@ -640,7 +784,7 @@ impl ExecutionGraphBuilder {
                             })?;
                             Arc::new(super::stateful::StatefulOperator::with_journal(
                                 processor,
-                                Arc::new(super::state_journal::StateJournal::new(backend)),
+                                shared_journal.clone().expect("state backend checked above"),
                                 format!("job:{}:task:{}", plan.spec.id, task.id),
                                 operator.key_field.clone().ok_or_else(|| {
                                     Error::Config(format!(
@@ -690,6 +834,8 @@ impl ExecutionGraphBuilder {
                             OutboundKind::Route => EdgeTarget::Partitioned {
                                 channels,
                                 key_field: edge.key_field,
+                                key_group_ranges: edge.key_group_ranges,
+                                max_parallelism: edge.max_parallelism,
                             },
                         };
                         if edge.late_route {
@@ -731,7 +877,20 @@ impl ExecutionGraphBuilder {
                     None
                 },
                 source_partition: if is_source {
-                    first.partitions.first().map(|partition| partition.id)
+                    // A single source task deliberately keeps the connector's
+                    // subscription to all physical partitions. Its plan
+                    // partition 0 is a task identity, not a physical Kafka
+                    // assignment, so do not use it as a watermark fallback.
+                    let source_task_count = plan
+                        .tasks
+                        .iter()
+                        .filter(|candidate| candidate.operator_id == first.operator_id)
+                        .count();
+                    first
+                        .partitions
+                        .first()
+                        .filter(|partition| source_task_count > 1 || partition.id != 0)
+                        .map(|partition| partition.id)
                 } else {
                     None
                 },
@@ -747,6 +906,11 @@ impl ExecutionGraphBuilder {
                     window_timings_for_source(plan, &first.operator_id)?
                 } else {
                     Vec::new()
+                },
+                watermark_group: if is_source {
+                    Some(watermark_group_for_source(plan, &first.operator_id))
+                } else {
+                    None
                 },
             });
         }
@@ -777,6 +941,8 @@ struct OutboundEdge {
     late_route: bool,
     targets: Vec<String>,
     key_field: String,
+    key_group_ranges: Vec<KeyGroupRange>,
+    max_parallelism: u32,
 }
 
 fn build_source_input<A: JobComponentAdapter>(
@@ -856,17 +1022,24 @@ fn window_timings_for_source(
                         ))
                     })?;
                 config.validate()?;
-                timings.push(match config.kind {
-                    super::window::WindowKind::Tumbling { size_ms } => {
-                        super::event_time_gate::WindowTiming::Tumbling { size_ms }
-                    }
-                    super::window::WindowKind::Sliding { size_ms, slide_ms } => {
-                        super::event_time_gate::WindowTiming::Sliding { size_ms, slide_ms }
-                    }
-                    super::window::WindowKind::Session { gap_ms } => {
-                        super::event_time_gate::WindowTiming::Session { gap_ms }
-                    }
-                });
+                // Only watermark-triggered event-time windows belong in the
+                // source gate. Processing-time windows must receive future
+                // timestamps immediately so their interval timer can fire;
+                // session windows have dynamic, per-key boundaries owned by
+                // the window operator and cannot use a static event+gap end.
+                if config.trigger == super::window::WindowTrigger::Watermark {
+                    timings.push(match config.kind {
+                        super::window::WindowKind::Tumbling { size_ms } => {
+                            super::event_time_gate::WindowTiming::Tumbling { size_ms }
+                        }
+                        super::window::WindowKind::Sliding { size_ms, slide_ms } => {
+                            super::event_time_gate::WindowTiming::Sliding { size_ms, slide_ms }
+                        }
+                        super::window::WindowKind::Session { gap_ms } => {
+                            super::event_time_gate::WindowTiming::Session { gap_ms }
+                        }
+                    });
+                }
             }
             queue.extend(
                 plan.spec
@@ -878,4 +1051,167 @@ fn window_timings_for_source(
         }
     }
     Ok(timings)
+}
+
+fn operator_reachable(plan: &JobPlan, from: &str, target: &str) -> bool {
+    let mut queue = vec![from.to_owned()];
+    let mut visited = BTreeSet::new();
+    while let Some(operator_id) = queue.pop() {
+        if !visited.insert(operator_id.clone()) {
+            continue;
+        }
+        if operator_id == target {
+            return true;
+        }
+        queue.extend(
+            plan.spec
+                .edges
+                .iter()
+                .filter(|edge| edge.from == operator_id)
+                .map(|edge| edge.to.clone()),
+        );
+    }
+    false
+}
+
+/// Find an event-time source whose normal path reaches an operator.  Shared
+/// watermark validation guarantees that sources feeding the same window have
+/// a compatible time contract; the first source is therefore sufficient for
+/// the window's dynamic late-event policy and route configuration.
+fn event_time_source_for_operator<'a>(
+    plan: &'a JobPlan,
+    operator_id: &str,
+) -> Option<&'a crate::job::SourceSpec> {
+    plan.spec.sources.iter().find(|source| {
+        source.time.mode == crate::job::TimeMode::EventTime
+            && operator_reachable(plan, &source.operator_id, operator_id)
+    })
+}
+
+fn reachable_watermark_windows(plan: &JobPlan, source_operator_id: &str) -> BTreeSet<String> {
+    let mut queue = plan
+        .spec
+        .edges
+        .iter()
+        .filter(|edge| edge.from == source_operator_id)
+        .map(|edge| edge.to.clone())
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut windows = BTreeSet::new();
+    while let Some(operator_id) = queue.pop() {
+        if !visited.insert(operator_id.clone()) {
+            continue;
+        }
+        if let Some(operator) = plan
+            .spec
+            .operators
+            .iter()
+            .find(|operator| operator.id == operator_id)
+        {
+            if operator.kind == crate::job::OperatorKind::Window {
+                let is_watermark_window = serde_json::from_value::<
+                    super::window::WindowOperatorConfig,
+                >(operator.config.clone())
+                .map(|config| config.trigger == super::window::WindowTrigger::Watermark)
+                .unwrap_or(false);
+                if is_watermark_window {
+                    windows.insert(operator.id.clone());
+                }
+            }
+            queue.extend(
+                plan.spec
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.from == operator_id)
+                    .map(|edge| edge.to.clone()),
+            );
+        }
+    }
+    windows
+}
+
+/// Identify the connected watermark-window component reachable from a source.
+/// Using the complete connected component matters for overlapping paths: if
+/// source A reaches windows X and Y while source B reaches only Y, the two
+/// sources must share a tracker. A simple `join(X,Y)` versus `join(Y)` key
+/// would incorrectly create two independent minima.
+fn watermark_group_for_source(plan: &JobPlan, source_operator_id: &str) -> String {
+    let source_windows = plan
+        .spec
+        .sources
+        .iter()
+        .filter(|source| source.time.mode == crate::job::TimeMode::EventTime)
+        .map(|source| {
+            (
+                source.operator_id.clone(),
+                reachable_watermark_windows(plan, &source.operator_id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let Some(initial_windows) = source_windows.get(source_operator_id) else {
+        return format!("source:{source_operator_id}");
+    };
+    if initial_windows.is_empty() {
+        return format!("source:{source_operator_id}");
+    }
+
+    let mut component_sources = BTreeSet::from([source_operator_id.to_owned()]);
+    let mut component_windows = initial_windows.clone();
+    loop {
+        let mut changed = false;
+        for (source_id, windows) in &source_windows {
+            if component_sources.contains(source_id)
+                || !windows
+                    .iter()
+                    .any(|window| component_windows.contains(window))
+            {
+                continue;
+            }
+            component_sources.insert(source_id.clone());
+            component_windows.extend(windows.iter().cloned());
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    format!(
+        "watermark:{}",
+        component_sources.into_iter().collect::<Vec<_>>().join("|")
+    )
+}
+
+/// A shared downstream watermark tracker can only combine sources that use
+/// the same event-time contract.  The tracker owns the strategy,
+/// out-of-orderness and idle policy, while each gate owns timestamp extraction
+/// and late-event handling; silently selecting the first source's tracker
+/// configuration for an incompatible sibling would make either source's
+/// watermark invalid.  Reject that graph at build time instead of letting the
+/// two source chains classify rows against different semantics.
+fn validate_shared_watermark_specs(plan: &JobPlan) -> Result<(), Error> {
+    let mut groups = BTreeMap::<String, Vec<&crate::job::SourceSpec>>::new();
+    for source in &plan.spec.sources {
+        if source.time.mode == crate::job::TimeMode::EventTime {
+            groups
+                .entry(watermark_group_for_source(plan, &source.operator_id))
+                .or_default()
+                .push(source);
+        }
+    }
+    for (group, sources) in groups {
+        let Some(reference) = sources.first() else {
+            continue;
+        };
+        if let Some(incompatible) = sources
+            .iter()
+            .skip(1)
+            .find(|source| source.time != reference.time)
+        {
+            return Err(Error::Config(format!(
+                "event-time sources '{}' and '{}' share watermark group '{}' but have incompatible TimeSpec values",
+                reference.operator_id, incompatible.operator_id, group
+            )));
+        }
+    }
+    Ok(())
 }

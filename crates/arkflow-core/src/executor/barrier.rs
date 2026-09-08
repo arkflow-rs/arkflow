@@ -22,6 +22,10 @@ pub struct Aligner {
     buffered: BTreeMap<usize, Vec<super::envelope::Envelope>>,
     /// Indices of inputs whose barrier has arrived.
     aligned: BTreeSet<usize>,
+    /// Inputs that can still produce a barrier. An EOS removes an input from
+    /// this set, because a bounded input that ended before the next
+    /// checkpoint can no longer send one.
+    active_inputs: BTreeSet<usize>,
     input_count: usize,
     /// Upper bound on buffered envelopes before the checkpoint fails.
     max_buffered: usize,
@@ -42,6 +46,7 @@ impl Aligner {
         Self {
             buffered: BTreeMap::new(),
             aligned: BTreeSet::new(),
+            active_inputs: (0..input_count).collect(),
             input_count,
             max_buffered,
             passthrough: None,
@@ -65,7 +70,40 @@ impl Aligner {
                 self.input_count
             )));
         }
+        if matches!(&envelope, super::envelope::Envelope::Eos) {
+            self.active_inputs.remove(&index);
+            if let Some(barrier) = self.in_flight.clone() {
+                // EOS is an implicit barrier for this input. Retain the EOS
+                // behind the checkpoint so the snapshot/release path can
+                // still flush and forward it in order.
+                self.aligned.insert(index);
+                self.buffered
+                    .entry(index)
+                    .or_default()
+                    .push(super::envelope::Envelope::Eos);
+                if self.barrier_complete() {
+                    self.aligned.clear();
+                    self.in_flight = None;
+                    self.last_completed = Some(barrier.clone());
+                    return Ok(Some(barrier));
+                }
+            } else if self.aligned.is_empty() && self.buffered.is_empty() {
+                self.passthrough = Some(super::envelope::Envelope::Eos);
+            } else {
+                self.buffered
+                    .entry(index)
+                    .or_default()
+                    .push(super::envelope::Envelope::Eos);
+            }
+            return Ok(None);
+        }
         if let super::envelope::Envelope::Barrier(barrier) = envelope {
+            if !self.active_inputs.contains(&index) {
+                return Err(crate::Error::Process(format!(
+                    "barrier '{}' arrived from ended input {index}",
+                    barrier.checkpoint_id
+                )));
+            }
             if self
                 .last_completed
                 .as_ref()
@@ -113,7 +151,7 @@ impl Aligner {
                 self.in_flight = Some(barrier.clone());
                 self.aligned.insert(index);
             }
-            if self.aligned.len() == self.input_count {
+            if self.barrier_complete() {
                 self.aligned.clear();
                 self.in_flight = None;
                 self.last_completed = Some(barrier.clone());
@@ -150,7 +188,13 @@ impl Aligner {
     /// Whether `index` is currently held back by alignment (its data must be
     /// buffered rather than processed).
     pub fn is_aligning(&self) -> bool {
-        !self.aligned.is_empty() || !self.buffered.is_empty()
+        self.in_flight.is_some() || !self.aligned.is_empty() || !self.buffered.is_empty()
+    }
+
+    fn barrier_complete(&self) -> bool {
+        self.active_inputs
+            .iter()
+            .all(|index| self.aligned.contains(index))
     }
 
     /// Drain buffered envelopes after alignment completes (or fails).
@@ -183,6 +227,7 @@ pub struct ChainSnapshot {
     pub state: StateSnapshot,
     pub source_positions: Vec<crate::checkpoint::SourcePosition>,
     pub watermark_ms: Option<i64>,
+    pub watermark_partitions: Vec<crate::checkpoint::WatermarkPosition>,
 }
 
 /// Injects barriers on a timer and completes checkpoints from chain reports.
@@ -259,6 +304,7 @@ impl BarrierCoordinator {
                         state: report.state.clone(),
                         source_positions: report.source_positions.clone(),
                         watermark_ms: report.watermark_ms,
+                        watermark_partitions: report.watermark_partitions.clone(),
                     };
                     match coordinator.acknowledge(ack) {
                         Ok(complete) => {

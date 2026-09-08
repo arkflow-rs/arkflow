@@ -7,7 +7,7 @@
 //! codecs, names, temporary tables, and the WAL-backed input wrapper.
 
 use crate::executor::stream_compiler::CODEC_PAYLOAD_KEY;
-use crate::input::{Input, InputConfig};
+use crate::input::{ConcurrentAck, Input, InputConfig};
 use crate::job::{JobComponentAdapter, OperatorSpec, SinkSpec, SourceSpec};
 use crate::wal::{Wal, WalAck, WalConfig};
 use crate::Error;
@@ -220,20 +220,35 @@ impl WalInput {
             .get_or_try_init(|| async {
                 let entries = self.wal.read_after_cursor().await?;
                 let positions = self.checkpoint_positions.read().await.clone();
-                let entries = if let Some(positions) = positions.as_deref() {
-                    entries
-                        .into_iter()
-                        .filter(|(seq, batch)| {
-                            !Self::batch_is_covered_by_checkpoint(*seq, batch, positions)
-                        })
-                        .collect()
+                let replay = if let Some(positions) = positions.as_deref() {
+                    let mut next_seq = self.wal.cursor().await?.saturating_add(1);
+                    let mut covered = Vec::new();
+                    let mut replay = Vec::new();
+                    for (seq, batch) in entries {
+                        // Only discard the covered prefix that can be
+                        // reconciled contiguously. A covered entry after an
+                        // uncovered WAL sequence must remain replayable;
+                        // otherwise the cursor would never be able to cross
+                        // that missing sequence and a later acknowledgement
+                        // would wait forever on a filtered-out entry.
+                        if seq == next_seq
+                            && Self::batch_is_covered_by_checkpoint(seq, &batch, positions)
+                        {
+                            covered.push(seq);
+                            next_seq = next_seq.saturating_add(1);
+                        } else {
+                            replay.push((seq, batch));
+                        }
+                    }
+                    self.wal.reconcile_covered(&covered).await?;
+                    replay
                 } else {
                     entries
                 };
-                if !entries.is_empty() {
-                    tracing::info!(count = entries.len(), "WAL recovery: replaying entries");
+                if !replay.is_empty() {
+                    tracing::info!(count = replay.len(), "WAL recovery: replaying entries");
                 }
-                Ok::<_, Error>(tokio::sync::Mutex::new(entries.into_iter().collect()))
+                Ok::<_, Error>(tokio::sync::Mutex::new(replay.into_iter().collect()))
             })
             .await?;
         // SAFETY-free: OnceCell::get is Some after get_or_init resolves.
@@ -254,16 +269,24 @@ impl Input for WalInput {
             let queue = self.replay_queue().await?;
             let mut queue = queue.lock().await;
             if let Some((seq, msg)) = queue.pop_front() {
-                let ack: Arc<dyn crate::input::Ack> = Arc::new(WalAck::new(
-                    self.wal.clone(),
-                    seq,
-                    Arc::new(crate::input::NoopAck),
-                ));
+                drop(queue);
+                // A replayed WAL record still represents the original source
+                // delivery. Rebuild its source-position acknowledgement when
+                // the connector supports it; using NoopAck here would leave
+                // Kafka's broker cursor behind and allow the same record to
+                // be delivered again after recovery.
+                let source_ack = self.replay_source_ack(&msg).await?;
+                let ack: Arc<dyn crate::input::Ack> =
+                    Arc::new(WalAck::new(self.wal.clone(), seq, source_ack));
                 return Ok((msg, ack));
             }
         }
         let (batch, ack) = self.inner.read().await?;
         let seq = self.wal.append(&batch).await?;
+        // Group-commit and periodic WALs stage appends asynchronously. The
+        // record is now being published to downstream processing, so force the
+        // durable hand-off before returning it from read().
+        self.wal.flush().await?;
         Ok((batch, Arc::new(WalAck::new(self.wal.clone(), seq, ack))))
     }
 
@@ -289,6 +312,19 @@ impl Input for WalInput {
         )])
     }
 
+    async fn watermark_partitions(
+        &self,
+    ) -> Result<Vec<crate::event_time::EventTimePartition>, Error> {
+        self.inner.watermark_partitions().await
+    }
+
+    async fn ack_for_position(
+        &self,
+        position: &crate::checkpoint::SourcePosition,
+    ) -> Result<Option<Arc<dyn crate::input::Ack>>, Error> {
+        self.inner.ack_for_position(position).await
+    }
+
     fn supports_partitioning(&self) -> bool {
         self.inner.supports_partitioning()
     }
@@ -312,6 +348,78 @@ impl Input for WalInput {
             (Ok(()), Ok(())) => Ok(()),
         }
     }
+}
+
+impl WalInput {
+    /// Reconstruct source-side acknowledgements for all distinct source
+    /// positions represented by a replayed batch. A single connector read can
+    /// decode several rows, but it must still commit each physical source
+    /// position exactly once.
+    async fn replay_source_ack(
+        &self,
+        batch: &crate::MessageBatch,
+    ) -> Result<Arc<dyn crate::input::Ack>, Error> {
+        let record = batch.record_batch();
+        let partitions = record
+            .column_by_name(crate::meta_columns::PARTITION)
+            .and_then(array_u32_values);
+        let offsets = record
+            .column_by_name(crate::meta_columns::OFFSET)
+            .and_then(array_u64_values);
+        let Some((partitions, offsets)) = partitions.zip(offsets) else {
+            return Ok(Arc::new(crate::input::NoopAck));
+        };
+        if partitions.len() != offsets.len() || partitions.len() != batch.len() {
+            return Err(Error::Process(
+                "WAL replay source metadata has inconsistent lengths".into(),
+            ));
+        }
+
+        let mut positions = Vec::new();
+        for row in 0..batch.len() {
+            let topic = batch_topic(record, row);
+            let position = crate::checkpoint::SourcePosition {
+                topic,
+                partition: partitions[row],
+                offset: offsets[row].saturating_add(1),
+            };
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+        }
+
+        let mut acks = Vec::new();
+        for position in &positions {
+            if let Some(ack) = self.inner.ack_for_position(position).await? {
+                acks.push(ack);
+            }
+        }
+        match acks.len() {
+            0 => Ok(Arc::new(crate::input::NoopAck)),
+            1 => Ok(acks.remove(0)),
+            _ => Ok(Arc::new(ConcurrentAck(acks))),
+        }
+    }
+}
+
+fn array_u32_values(column: &Arc<dyn Array>) -> Option<Vec<u32>> {
+    if let Some(array) = column.as_any().downcast_ref::<UInt32Array>() {
+        return Some((0..array.len()).map(|row| array.value(row)).collect());
+    }
+    let array = column.as_any().downcast_ref::<Int32Array>()?;
+    (0..array.len())
+        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u32))
+        .collect()
+}
+
+fn array_u64_values(column: &Arc<dyn Array>) -> Option<Vec<u64>> {
+    if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
+        return Some((0..array.len()).map(|row| array.value(row)).collect());
+    }
+    let array = column.as_any().downcast_ref::<Int64Array>()?;
+    (0..array.len())
+        .map(|row| (!array.is_null(row)).then_some(array.value(row) as u64))
+        .collect()
 }
 
 fn batch_topic(batch: &datafusion::arrow::record_batch::RecordBatch, row: usize) -> Option<String> {
@@ -519,6 +627,22 @@ mod tests {
         let entries = queue.lock().await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries.front().unwrap().0, 2);
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        drop(entries);
+
+        // The covered prefix is now part of the local cursor. A replay of
+        // sequence 2 can complete, and the first newly appended sequence 3
+        // must not wait forever for the filtered sequence 1.
+        let (_, replay_ack) = input.read().await.unwrap();
+        replay_ack.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+        let sequence = wal.append(&metadata_batch(2, 12, "orders")).await.unwrap();
+        assert_eq!(sequence, 3);
+        WalAck::new(wal.clone(), sequence, Arc::new(crate::input::NoopAck))
+            .ack()
+            .await
+            .unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 3);
 
         wal.close().await.unwrap();
     }
@@ -528,6 +652,7 @@ mod tests {
 mod wal_lifecycle_tests {
     use super::*;
     use crate::wal::{SyncPolicy, Wal, WalConfig};
+    use std::sync::Mutex;
 
     struct EmptyInput;
 
@@ -541,6 +666,37 @@ mod wal_lifecycle_tests {
         ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
             Err(Error::EOF)
         }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct OneInput {
+        batch: Mutex<Option<crate::MessageBatchRef>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for OneInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            self.batch
+                .lock()
+                .unwrap()
+                .take()
+                .map(|batch| {
+                    (
+                        batch,
+                        Arc::new(crate::input::NoopAck) as Arc<dyn crate::input::Ack>,
+                    )
+                })
+                .ok_or(Error::EOF)
+        }
+
         async fn close(&self) -> Result<(), Error> {
             Ok(())
         }
@@ -617,5 +773,38 @@ mod wal_lifecycle_tests {
         // The next adapter can open the same redb path.
         let second = Wal::open(&config).unwrap();
         second.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_read_flushes_group_and_periodic_entries_before_publish() {
+        for sync in [
+            SyncPolicy::GroupCommit,
+            SyncPolicy::Periodic(std::time::Duration::from_secs(60)),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let config =
+                WalConfig::local(true, directory.path().to_string_lossy().to_string(), sync);
+            let wal = Wal::open(&config).unwrap();
+            let input = WalInput::new(
+                Arc::new(OneInput {
+                    batch: Mutex::new(Some(trivial_batch())),
+                }),
+                wal.clone(),
+            );
+            input.connect().await.unwrap();
+            let _ = input.read().await.unwrap();
+
+            // The read has crossed the publication boundary. It must already
+            // be present in storage even though both policies normally stage
+            // appends for a later flusher tick.
+            assert_eq!(wal.read_after_cursor().await.unwrap().len(), 1);
+            input.close().await.unwrap();
+            drop(input);
+            drop(wal);
+
+            let reopened = Wal::open(&config).unwrap();
+            assert_eq!(reopened.read_after_cursor().await.unwrap().len(), 1);
+            reopened.close().await.unwrap();
+        }
     }
 }

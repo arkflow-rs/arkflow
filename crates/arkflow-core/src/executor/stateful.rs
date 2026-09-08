@@ -224,7 +224,10 @@ impl Processor for StatefulOperator {
                 Ok(crate::ProcessResult::SingleWithAck(output, commit_ack))
             }
             crate::ProcessResult::Multiple(outputs) if outputs.is_empty() => {
-                commit_ack.ack().await?;
+                if let Err(error) = commit_ack.ack().await {
+                    let _ = commit_ack.abort().await;
+                    return Err(error);
+                }
                 Ok(crate::ProcessResult::None)
             }
             crate::ProcessResult::Multiple(outputs) => {
@@ -234,7 +237,10 @@ impl Processor for StatefulOperator {
                 ))
             }
             crate::ProcessResult::None => {
-                commit_ack.ack().await?;
+                if let Err(error) = commit_ack.ack().await {
+                    let _ = commit_ack.abort().await;
+                    return Err(error);
+                }
                 Ok(crate::ProcessResult::None)
             }
             crate::ProcessResult::SingleWithAck(output, replacement) => {

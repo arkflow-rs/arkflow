@@ -489,7 +489,9 @@ impl RuntimeManager {
         };
 
         if let Some(handle) = stale_handle {
-            await_task(handle).await?;
+            let wait_result = await_task(handle).await;
+            settle_detached_task(&entry, &wait_result, "stale-startup-task").await;
+            wait_result?;
         }
 
         let metrics = entry.lock().await.metrics.clone();
@@ -594,20 +596,34 @@ impl RuntimeManager {
                 config.durability.as_ref(),
                 config.temporary.clone(),
             )?;
-            let mut resource = adapter.build_resource()?;
-            crate::executor::run_job_with_metrics_started(
-                &spec,
-                &adapter,
-                &mut resource,
-                cancellation,
-                Some(metrics),
-                Some(startup_tx),
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
-                error
-            })
+            // The adapter owns the WAL flusher. Close it even when resource
+            // construction or graph startup fails before the graph takes
+            // ownership of the source.
+            let run_result = async {
+                let mut resource = adapter.build_resource()?;
+                crate::executor::run_job_with_metrics_started(
+                    &spec,
+                    &adapter,
+                    &mut resource,
+                    cancellation,
+                    Some(metrics),
+                    Some(startup_tx),
+                )
+                .await
+            }
+            .await;
+            let close_result = adapter.close().await;
+            match (run_result, close_result) {
+                (Err(error), _) => {
+                    tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
+                    Err(error)
+                }
+                (Ok(()), Err(error)) => {
+                    tracing::warn!(stream_id = %stream_id, %error, "kernel stream adapter close failed");
+                    Err(error)
+                }
+                (Ok(()), Ok(())) => Ok(()),
+            }
         });
 
         match startup_rx.await {
@@ -639,18 +655,33 @@ impl RuntimeManager {
                     "stream '{}' resource startup failed: {message}",
                     id
                 ));
-                match await_task(handle).await {
-                    Ok(()) => Err(startup_error),
-                    Err(error) => Err(error),
+                let wait_result = await_task(handle).await;
+                settle_detached_task(&entry, &wait_result, "startup").await;
+                if wait_result.is_ok() {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("startup", startup_error.to_string());
+                    Err(startup_error)
+                } else {
+                    Err(wait_result.expect_err("startup task result was checked"))
                 }
             }
-            Err(_) => match await_task(handle).await {
-                Err(error) => Err(error),
-                Ok(()) => Err(Error::Process(format!(
+            Err(_) => {
+                let startup_error = Error::Process(format!(
                     "stream '{}' stopped before reporting startup readiness",
                     id
-                ))),
-            },
+                ));
+                let wait_result = await_task(handle).await;
+                settle_detached_task(&entry, &wait_result, "startup").await;
+                if wait_result.is_ok() {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("startup", startup_error.to_string());
+                    Err(startup_error)
+                } else {
+                    Err(wait_result.expect_err("startup task result was checked"))
+                }
+            }
         }
     }
 
@@ -810,13 +841,20 @@ impl RuntimeManager {
             runtime.handle.take()
         };
 
-        if let Some(handle) = handle {
-            await_task(handle).await?;
-        }
-
+        let wait_result = match handle {
+            Some(handle) => await_task(handle).await,
+            None => Ok(()),
+        };
         let mut runtime = entry.lock().await;
-        runtime.state = StreamState::Stopped;
+        match &wait_result {
+            Ok(()) => runtime.state = StreamState::Stopped,
+            Err(error) => {
+                runtime.state = StreamState::Failed;
+                runtime.record_error("shutdown", error.to_string());
+            }
+        }
         drop(runtime);
+        wait_result?;
         self.record_event("stream_stop", Some(id.to_string()), "succeeded", None)
             .await;
         Ok(())
@@ -862,14 +900,22 @@ impl RuntimeManager {
             let mut runtime = entry.lock().await;
             runtime.handle.take()
         };
-        if let Some(handle) = handle {
-            await_task(handle).await?;
-        }
+        let wait_result = match handle {
+            Some(handle) => await_task(handle).await,
+            None => Ok(()),
+        };
         {
             let mut runtime = entry.lock().await;
-            runtime.state = StreamState::Stopped;
+            match &wait_result {
+                Ok(()) => runtime.state = StreamState::Stopped,
+                Err(error) => {
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("restart", error.to_string());
+                }
+            }
             runtime.metrics.restarts.fetch_add(1, Ordering::Relaxed);
         }
+        wait_result?;
         self.record_event("stream_restart", Some(id.to_string()), "requested", None)
             .await;
         self.start(id).await
@@ -883,10 +929,42 @@ impl RuntimeManager {
         for entry in entries {
             let handle = entry.lock().await.handle.take();
             if let Some(handle) = handle {
-                await_task(handle).await?;
+                let wait_result = await_task(handle).await;
+                settle_detached_task(&entry, &wait_result, "wait-all").await;
+                wait_result?;
             }
         }
         Ok(())
+    }
+}
+
+/// A task handle is removed from its registry before it is awaited.  If the
+/// bounded wait expires, the task is aborted and no supervisor continuation is
+/// left to move the entry out of `Stopping`, `Restarting`, or `Running`.  Keep
+/// the registry truthful for every caller that owns a detached handle,
+/// including startup and `wait_all` paths.
+async fn settle_detached_task(
+    entry: &Arc<Mutex<RuntimeEntry>>,
+    result: &Result<(), Error>,
+    phase: &str,
+) {
+    let mut runtime = entry.lock().await;
+    match result {
+        Ok(()) => {
+            if matches!(
+                runtime.state,
+                StreamState::Starting
+                    | StreamState::Running
+                    | StreamState::Stopping
+                    | StreamState::Restarting
+            ) {
+                runtime.state = StreamState::Stopped;
+            }
+        }
+        Err(error) => {
+            runtime.state = StreamState::Failed;
+            runtime.record_error(phase, error.to_string());
+        }
     }
 }
 
@@ -897,6 +975,13 @@ async fn await_task(mut handle: JoinHandle<Result<(), Error>>) -> Result<(), Err
         }
         Err(_) => {
             handle.abort();
+            // Await the cancellation briefly so resource guards (WAL
+            // flushers, temporary stores, and source connections) are
+            // dropped before the caller is allowed to restart the stream.
+            // A task stuck in a non-cooperative blocking call must not make
+            // shutdown wait forever, so the original timeout remains the
+            // reported lifecycle error.
+            let _ = timeout(Duration::from_secs(1), handle).await;
             Err(Error::Timeout)
         }
     }

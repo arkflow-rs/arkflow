@@ -7,7 +7,10 @@
 //! them). Unlike the legacy implementation this operates on the kernel's
 //! source-chain loop and preserves batch boundaries where the policy allows.
 
-use crate::event_time::{window_action, FieldTimestampExtractor, WatermarkTracker, WindowAction};
+use crate::checkpoint::WatermarkPosition;
+use crate::event_time::{
+    window_action, EventTimePartition, FieldTimestampExtractor, WatermarkTracker, WindowAction,
+};
 use crate::input::{fanout_ack, Ack, NoopAck};
 use crate::job::{LateEventPolicy, TimeSpec};
 use crate::Error;
@@ -17,7 +20,7 @@ use std::sync::Arc;
 /// is safe to release.  Keeping this separate from the window operator's
 /// aggregate configuration lets the source gate handle sliding/session
 /// windows without pretending every window is tumbling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WindowTiming {
     Tumbling { size_ms: i64 },
     Sliding { size_ms: i64, slide_ms: i64 },
@@ -60,9 +63,11 @@ impl WindowTiming {
                 }
                 ends
             }
-            Self::Session { gap_ms } if gap_ms > 0 => {
-                event_time_ms.checked_add(gap_ms).into_iter().collect()
-            }
+            // Session boundaries are dynamic and key-dependent. The source
+            // gate cannot know whether a later row will extend or bridge a
+            // session, so session timing is deliberately owned by the window
+            // operator rather than converted into a stale event+gap deadline.
+            Self::Session { .. } => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -71,7 +76,7 @@ impl WindowTiming {
 /// Per-source event-time state.
 pub struct EventTimeGate {
     extractor: Option<FieldTimestampExtractor>,
-    tracker: Option<WatermarkTracker>,
+    tracker: Option<Arc<std::sync::Mutex<WatermarkTracker>>>,
     late_policy: LateEventPolicy,
     allowed_lateness_ms: u64,
     window_timings: Vec<WindowTiming>,
@@ -97,7 +102,59 @@ struct RowDecision {
     action: WindowAction,
     invalid_timestamp: bool,
     excluded_window_ends: Vec<i64>,
+    /// A held row can have memberships that need a late side-output copy
+    /// while its latest membership still belongs on the main path.
+    route_late: bool,
+    /// Window ends that should be corrected by a late Update. The window
+    /// operator uses this row-local marker so other containing memberships can
+    /// still be processed normally in the same delivery.
+    update_window_ends: Vec<i64>,
     expired_window_ends: Vec<i64>,
+}
+
+struct OutcomeGroup {
+    action: WindowAction,
+    invalid_timestamp: bool,
+    keep: Vec<bool>,
+    times: Vec<Option<i64>>,
+    exclusions: Vec<Vec<i64>>,
+    updates: Vec<Vec<i64>>,
+    expired: Vec<Vec<i64>>,
+}
+
+fn add_outcome_group(
+    groups: &mut Vec<OutcomeGroup>,
+    action: WindowAction,
+    invalid_timestamp: bool,
+    index: usize,
+    event_time_ms: Option<i64>,
+    excluded_window_ends: Vec<i64>,
+    update_window_ends: Vec<i64>,
+    expired_window_ends: Vec<i64>,
+    batch_len: usize,
+) {
+    if let Some(group) = groups
+        .iter_mut()
+        .find(|group| group.action == action && group.invalid_timestamp == invalid_timestamp)
+    {
+        group.keep[index] = true;
+        group.times.push(event_time_ms);
+        group.exclusions.push(excluded_window_ends);
+        group.updates.push(update_window_ends);
+        group.expired.push(expired_window_ends);
+        return;
+    }
+    let mut keep = vec![false; batch_len];
+    keep[index] = true;
+    groups.push(OutcomeGroup {
+        action,
+        invalid_timestamp,
+        keep,
+        times: vec![event_time_ms],
+        exclusions: vec![excluded_window_ends],
+        updates: vec![update_window_ends],
+        expired: vec![expired_window_ends],
+    });
 }
 
 /// The decision for one inbound batch plus everything released by this step.
@@ -117,6 +174,11 @@ pub struct GateDecision {
     pub late_event_rows: u64,
     /// The watermark after this observation (None before the first event).
     pub watermark_ms: Option<i64>,
+    /// Index in `ready` at which slices from the current source observation
+    /// begin. Held slices are emitted first so their data reaches a window
+    /// before the watermark that released them; current slices may need the
+    /// watermark control envelope first for dynamic Session deadlines.
+    pub current_ready_start: Option<usize>,
 }
 
 impl GateDecision {
@@ -128,6 +190,7 @@ impl GateDecision {
             dropped_acks: Vec::new(),
             late_event_rows: 0,
             watermark_ms,
+            current_ready_start: None,
         }
     }
 }
@@ -154,6 +217,29 @@ impl EventTimeGate {
         window_timings: Vec<T>,
     ) -> Result<Self, Error> {
         let tracker = WatermarkTracker::from_time_spec(time)?;
+        Self::with_tracker(
+            time,
+            window_timings,
+            Arc::new(std::sync::Mutex::new(tracker)),
+        )
+    }
+
+    /// Build a gate sharing an event-time tracker with compatible sibling
+    /// source gates. Held batches remain local to this gate; only the
+    /// downstream watermark frontier is shared.
+    pub fn new_with_shared_tracker<T: Into<WindowTiming>>(
+        time: &TimeSpec,
+        window_timings: Vec<T>,
+        tracker: Arc<std::sync::Mutex<WatermarkTracker>>,
+    ) -> Result<Self, Error> {
+        Self::with_tracker(time, window_timings, tracker)
+    }
+
+    fn with_tracker<T: Into<WindowTiming>>(
+        time: &TimeSpec,
+        window_timings: Vec<T>,
+        tracker: Arc<std::sync::Mutex<WatermarkTracker>>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             extractor: Some(FieldTimestampExtractor {
                 field: time.timestamp_field.clone().ok_or_else(|| {
@@ -174,23 +260,104 @@ impl EventTimeGate {
 
     /// Current watermark (restored or observed).
     pub fn watermark(&self) -> Option<i64> {
-        self.tracker.as_ref().and_then(WatermarkTracker::watermark)
+        self.tracker
+            .as_ref()
+            .and_then(|tracker| tracker.lock().ok()?.watermark())
     }
 
     /// The tracked watermark of one physical partition (restore
     /// verification and multi-input minimum-progress checks).
     pub fn partition_watermark(&self, partition: u32) -> Option<i64> {
+        let tracker = self.tracker.as_ref()?.lock().ok()?;
+        if let Some(progress) = tracker.partition_progress().get(&partition) {
+            return Some(progress.watermark_ms);
+        }
+        // Connector-neutral source identities are namespaced in the
+        // canonical physical map so two source edges that both expose
+        // partition 0 cannot collide.  Keep this legacy numeric accessor
+        // useful when the gate has exactly one matching physical partition;
+        // return None for an ambiguous shared tracker instead of exposing a
+        // misleading value from another source.
+        let matches = tracker
+            .physical_partition_progress()
+            .iter()
+            .filter(|(key, _)| key.partition == partition)
+            .map(|(_, progress)| progress.watermark_ms)
+            .collect::<Vec<_>>();
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    pub fn physical_partition_watermark(&self, partition: &EventTimePartition) -> Option<i64> {
         self.tracker
             .as_ref()?
-            .partition_progress()
-            .get(&partition)
+            .lock()
+            .ok()?
+            .partition_progress_for(partition)
             .map(|progress| progress.watermark_ms)
+    }
+
+    /// Return every known physical partition watermark for checkpointing.
+    pub fn watermark_positions(&self) -> Vec<WatermarkPosition> {
+        let Some(tracker) = &self.tracker else {
+            return Vec::new();
+        };
+        let Ok(tracker) = tracker.lock() else {
+            return Vec::new();
+        };
+        tracker
+            .physical_partition_progress()
+            .iter()
+            .map(|(partition, progress)| {
+                WatermarkPosition::new(
+                    partition.topic.clone(),
+                    partition.partition,
+                    progress.watermark_ms,
+                )
+            })
+            .collect()
+    }
+
+    /// Return the physical partitions currently known by this gate.  Legacy
+    /// task-level checkpoints do not carry partition entries, but recovery
+    /// can still seed the complete connector assignment before applying that
+    /// one watermark value.  Exposing the tracker keys keeps that fallback
+    /// from silently restoring only partition zero.
+    pub fn known_partitions(&self) -> Vec<EventTimePartition> {
+        let Some(tracker) = &self.tracker else {
+            return Vec::new();
+        };
+        let Ok(tracker) = tracker.lock() else {
+            return Vec::new();
+        };
+        tracker
+            .physical_partition_progress()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn seed_partitions(&mut self, partitions: &[EventTimePartition]) {
+        if let Some(tracker) = &self.tracker {
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.seed_partitions(partitions);
+            }
+        }
     }
 
     /// Restore a checkpointed watermark for one partition.
     pub fn restore_partition(&mut self, partition: u32, watermark_ms: i64) {
         if let Some(tracker) = &mut self.tracker {
-            tracker.restore_partition(partition, watermark_ms);
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.restore_partition(partition, watermark_ms);
+            }
+        }
+    }
+
+    pub fn restore_partition_key(&mut self, partition: &EventTimePartition, watermark_ms: i64) {
+        if let Some(tracker) = &self.tracker {
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.restore_partition_key(partition, watermark_ms);
+            }
         }
     }
 
@@ -216,7 +383,11 @@ impl EventTimeGate {
         batch: crate::MessageBatchRef,
         ack: std::sync::Arc<dyn Ack>,
     ) -> Result<GateDecision, Error> {
-        self.observe_partitioned_with_ack(vec![(partition, batch, ack)])
+        self.observe_physical_partitioned_with_ack(vec![(
+            EventTimePartition::numeric(partition),
+            batch,
+            ack,
+        )])
     }
 
     /// Observe all physical partition slices of one source delivery as one
@@ -227,6 +398,26 @@ impl EventTimeGate {
     pub fn observe_partitioned_with_ack(
         &mut self,
         partitions: Vec<(u32, crate::MessageBatchRef, std::sync::Arc<dyn Ack>)>,
+    ) -> Result<GateDecision, Error> {
+        self.observe_physical_partitioned_with_ack(
+            partitions
+                .into_iter()
+                .map(|(partition, batch, ack)| (EventTimePartition::numeric(partition), batch, ack))
+                .collect(),
+        )
+    }
+
+    /// Physical-partition variant used by connectors whose task subscribes to
+    /// more than one topic or Kafka partition. Topic and partition remain
+    /// attached to the watermark observation all the way through the shared
+    /// tracker.
+    pub fn observe_physical_partitioned_with_ack(
+        &mut self,
+        partitions: Vec<(
+            EventTimePartition,
+            crate::MessageBatchRef,
+            std::sync::Arc<dyn Ack>,
+        )>,
     ) -> Result<GateDecision, Error> {
         if self.tracker.is_none() {
             let mut decision = GateDecision::new(None);
@@ -258,11 +449,14 @@ impl EventTimeGate {
         // like [2100, 100] makes row 100 late the moment row 2100 is
         // observed, and only genuinely future rows stay held.
         let watermark_after = {
-            let tracker = self.tracker.as_mut().unwrap();
+            let tracker = self.tracker.as_ref().unwrap();
+            let mut tracker = tracker
+                .lock()
+                .map_err(|_| Error::Process("event-time tracker lock is poisoned".into()))?;
             tracker.refresh_idle(now_ms);
             for (partition, _, _, event_times_ms) in &observed {
                 for event_time_ms in event_times_ms.iter().flatten().copied() {
-                    tracker.observe(*partition, event_time_ms, now_ms);
+                    tracker.observe_partition(partition, event_time_ms, now_ms);
                 }
             }
             tracker.watermark()
@@ -297,6 +491,7 @@ impl EventTimeGate {
         }
         // Current batch rows: slice the batch by decision (contiguous runs
         // preserved; columnar layout kept — no per-row batch copies).
+        let current_ready_start = decision.ready.len();
         for (_, batch, ack, event_times_ms) in observed {
             let current_actions = event_times_ms
                 .iter()
@@ -313,6 +508,7 @@ impl EventTimeGate {
                 .collect::<Vec<_>>();
             self.collect_outcomes(batch, event_times_ms, current_actions, ack, &mut decision)?;
         }
+        decision.current_ready_start = Some(current_ready_start);
 
         Ok(decision)
     }
@@ -326,7 +522,10 @@ impl EventTimeGate {
         let (late_policy, allowed_lateness_ms) = (self.late_policy, self.allowed_lateness_ms);
         let now_ms = crate::state::now_ms() as i64;
         let watermark = {
-            let tracker = self.tracker.as_mut().unwrap();
+            let tracker = self.tracker.as_ref().unwrap();
+            let mut tracker = tracker
+                .lock()
+                .map_err(|_| Error::Process("event-time tracker lock is poisoned".into()))?;
             tracker.refresh_idle(now_ms);
             tracker.watermark()
         };
@@ -362,24 +561,34 @@ impl EventTimeGate {
     /// Flush held rows when a bounded source reaches EOS. There is no future
     /// watermark after EOS, so rows that were valid but still held are emitted
     /// before the source's EOS control envelope is forwarded.
-    pub fn finish(&mut self) -> GateDecision {
+    pub async fn finish(&mut self) -> Result<GateDecision, Error> {
         let mut decision = GateDecision::new(self.watermark());
+        let (late_policy, allowed_lateness_ms) = (self.late_policy, self.allowed_lateness_ms);
         for pending in std::mem::take(&mut self.held) {
-            // EOS is an explicit release of valid held rows. Preserve any
-            // sliding memberships whose windows already fired while the row
-            // was waiting behind a later window.
             let actions = pending
                 .event_times_ms
                 .iter()
                 .zip(pending.expired_window_ends.iter())
-                .map(|(_, expired)| RowDecision {
-                    action: WindowAction::Emit,
-                    invalid_timestamp: false,
-                    excluded_window_ends: expired.clone(),
-                    expired_window_ends: Vec::new(),
+                .map(|(event_time_ms, expired)| {
+                    // Treat EOS as a watermark beyond every containing
+                    // window, but still classify memberships that already
+                    // closed while the row was held according to the late
+                    // policy. The latest membership is the only one that is
+                    // released as an on-time row.
+                    self.classify_row(
+                        *event_time_ms,
+                        Some(i64::MAX),
+                        true,
+                        expired,
+                        late_policy,
+                        allowed_lateness_ms,
+                    )
                 })
                 .collect::<Vec<_>>();
             // `collect_outcomes` consumes the batch and owns the source ack.
+            // Keep a clone so a malformed marker or batch can still abort the
+            // delivery after the gate has taken ownership of it.
+            let pending_ack = pending.ack.clone();
             if let Err(error) = self.collect_outcomes(
                 pending.batch,
                 pending.event_times_ms,
@@ -387,10 +596,37 @@ impl EventTimeGate {
                 pending.ack,
                 &mut decision,
             ) {
-                tracing::error!(%error, "failed to release held event-time rows at EOS");
+                let _ = pending_ack.abort().await;
+                let _ = self.abort_held().await;
+                return Err(error);
             }
         }
-        decision
+        Ok(decision)
+    }
+
+    /// Abort every delivery still retained by the gate.  This is used when a
+    /// refresh/observation or downstream dispatch fails after a row has been
+    /// classified as `Hold`: merely dropping the gate would leave a WAL or
+    /// source acknowledgement pending forever and would also keep its
+    /// checkpoint tracker entry alive.
+    pub async fn abort_held(&mut self) -> Result<(), Error> {
+        let mut first_error = None;
+        for ack in self.take_held_acknowledgements() {
+            if let Err(error) = ack.abort().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Take ownership of acknowledgements retained by held rows.  Callers
+    /// that need to await them should use this synchronous extraction first so
+    /// the gate mutex can be released before the futures are polled.
+    pub fn take_held_acknowledgements(&mut self) -> Vec<std::sync::Arc<dyn Ack>> {
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|pending| pending.ack)
+            .collect()
     }
 
     /// Compatibility hook for callers of the pre-kernel gate API. Acks now
@@ -427,58 +663,63 @@ impl EventTimeGate {
             ));
         }
 
-        let mut groups: Vec<(
-            WindowAction,
-            bool,
-            Vec<bool>,
-            Vec<Option<i64>>,
-            Vec<Vec<i64>>,
-            Vec<Vec<i64>>,
-        )> = Vec::new();
+        let late_rows = decisions
+            .iter()
+            .filter(|row| {
+                row.invalid_timestamp
+                    || row.route_late
+                    || !row.update_window_ends.is_empty()
+                    || !row.excluded_window_ends.is_empty()
+                    || matches!(
+                        row.action,
+                        WindowAction::Drop | WindowAction::Route | WindowAction::Update
+                    )
+            })
+            .count() as u64;
+        decision.late_event_rows = decision.late_event_rows.saturating_add(late_rows);
+
+        let mut groups = Vec::new();
         for (index, row) in decisions.into_iter().enumerate() {
-            let Some((_, _, keep, times, exclusions, expired)) =
-                groups
-                    .iter_mut()
-                    .find(|(group_action, invalid, _, _, _, _)| {
-                        *group_action == row.action && *invalid == row.invalid_timestamp
-                    })
-            else {
-                let mut keep = vec![false; batch.len()];
-                keep[index] = true;
-                groups.push((
-                    row.action,
+            add_outcome_group(
+                &mut groups,
+                row.action,
+                row.invalid_timestamp,
+                index,
+                event_times_ms[index],
+                row.excluded_window_ends,
+                row.update_window_ends,
+                row.expired_window_ends,
+                batch.len(),
+            );
+            // A held row may have one or more containing memberships that are
+            // late-routed while its latest membership remains on the main
+            // path. Emit a second, row-local copy for that side branch and
+            // let fanout_ack keep both outcomes tied to the source delivery.
+            if row.route_late && row.action != WindowAction::Route {
+                add_outcome_group(
+                    &mut groups,
+                    WindowAction::Route,
                     row.invalid_timestamp,
-                    keep,
-                    vec![event_times_ms[index]],
-                    vec![row.excluded_window_ends],
-                    vec![row.expired_window_ends],
-                ));
-                continue;
-            };
-            keep[index] = true;
-            times.push(event_times_ms[index]);
-            exclusions.push(row.excluded_window_ends);
-            expired.push(row.expired_window_ends);
+                    index,
+                    event_times_ms[index],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    batch.len(),
+                );
+            }
         }
 
         let child_acks = fanout_ack(ack, groups.len());
-        for ((action, invalid, keep, group_times, exclusions, expired), child_ack) in
-            groups.into_iter().zip(child_acks)
-        {
-            if matches!(
-                action,
-                WindowAction::Drop | WindowAction::Route | WindowAction::Update
-            ) || exclusions.iter().any(|ends| !ends.is_empty())
-            {
-                decision.late_event_rows = decision
-                    .late_event_rows
-                    .saturating_add(group_times.len() as u64);
+        for (group, child_ack) in groups.into_iter().zip(child_acks) {
+            let mut filtered = filter_batch(&batch, &group.keep)?;
+            if group.exclusions.iter().any(|ends| !ends.is_empty()) {
+                filtered = mark_window_exclusions(filtered, &group.exclusions)?;
             }
-            let mut filtered = filter_batch(&batch, &keep)?;
-            if exclusions.iter().any(|ends| !ends.is_empty()) {
-                filtered = mark_window_exclusions(filtered, &exclusions)?;
+            if group.updates.iter().any(|ends| !ends.is_empty()) {
+                filtered = mark_window_updates(filtered, &group.updates)?;
             }
-            match action {
+            match group.action {
                 WindowAction::Hold => {
                     // Held rows keep their acknowledgement pending until the
                     // watermark opens their window; barrier draining must not
@@ -486,16 +727,26 @@ impl EventTimeGate {
                     child_ack.mark_held();
                     self.held.push(HeldBatch {
                         batch: filtered,
-                        event_times_ms: group_times,
-                        expired_window_ends: expired,
+                        event_times_ms: group.times,
+                        expired_window_ends: group.expired,
                         ack: child_ack,
                     })
                 }
-                WindowAction::Drop => decision.dropped_acks.push(child_ack),
+                WindowAction::Drop => {
+                    // This child may have been held by an earlier gate pass.
+                    // Re-enter the source in-flight set before the drop ack
+                    // completes so a checkpoint cannot seal state/source
+                    // positions before this outcome is settled.
+                    child_ack.release_held();
+                    decision.dropped_acks.push(child_ack)
+                }
                 other => {
+                    child_ack.release_held();
                     decision.ready.push((filtered, other));
                     decision.ready_acks.push(child_ack);
-                    decision.ready_invalid_timestamps.push(invalid);
+                    decision
+                        .ready_invalid_timestamps
+                        .push(group.invalid_timestamp);
                 }
             }
         }
@@ -530,6 +781,8 @@ impl EventTimeGate {
                 },
                 invalid_timestamp: true,
                 excluded_window_ends: Vec::new(),
+                route_late: false,
+                update_window_ends: Vec::new(),
                 expired_window_ends: Vec::new(),
             };
         };
@@ -539,6 +792,8 @@ impl EventTimeGate {
                 action: WindowAction::Emit,
                 invalid_timestamp: false,
                 excluded_window_ends: Vec::new(),
+                route_late: false,
+                update_window_ends: Vec::new(),
                 expired_window_ends: Vec::new(),
             };
         }
@@ -555,7 +810,6 @@ impl EventTimeGate {
                     expired.push(*end);
                 }
             }
-            let newly_closed = closed.iter().any(|end| !previously_expired.contains(end));
             if window_ends.iter().any(|end| *end > watermark) {
                 return RowDecision {
                     action: WindowAction::Hold,
@@ -564,18 +818,66 @@ impl EventTimeGate {
                     // while a later containing window is still open. Carry
                     // those memberships forward so the eventual release does
                     // not reintroduce the row into an expired window.
-                    excluded_window_ends: closed.clone(),
+                    excluded_window_ends: match late_policy {
+                        // A Drop decision is irreversible and can be marked
+                        // immediately. Route/Update need to retain the row so
+                        // their membership-specific action can be decided at
+                        // the final release.
+                        LateEventPolicy::Drop => closed.clone(),
+                        LateEventPolicy::Route | LateEventPolicy::Update => Vec::new(),
+                    },
+                    route_late: false,
+                    update_window_ends: Vec::new(),
                     expired_window_ends: expired,
                 };
             }
-            if newly_closed {
-                // Release once a later containing window closes. Memberships
-                // that already fired are excluded, while the newly closing
-                // membership is still processed as an on-time row.
+            if !closed.is_empty() {
+                // Release once the last containing window closes. The latest
+                // containing window is still the row's on-time membership;
+                // every earlier membership is already behind the watermark
+                // when this held delivery is released and must follow the
+                // configured late policy. This is deliberately based on the
+                // complete set of closed memberships, not only on
+                // `previously_expired`: a watermark can jump over several
+                // sliding ends in one observation, and all of those ends
+                // will be fired before the held row reaches the window.
+                let latest_end = window_ends.iter().copied().max();
+                let mut excluded_window_ends = Vec::new();
+                let mut update_window_ends = Vec::new();
+                let mut route_late = false;
+                for end in closed.iter().copied() {
+                    if Some(end) == latest_end {
+                        continue;
+                    }
+                    match window_action(
+                        end,
+                        event_time_ms,
+                        watermark_ms,
+                        allowed_lateness_ms,
+                        late_policy,
+                    ) {
+                        WindowAction::Drop => excluded_window_ends.push(end),
+                        WindowAction::Update => update_window_ends.push(end),
+                        WindowAction::Route => {
+                            route_late = true;
+                            // The main copy must not reintroduce a routed
+                            // membership; collect_outcomes creates its side
+                            // output copy separately.
+                            excluded_window_ends.push(end);
+                        }
+                        WindowAction::Hold | WindowAction::Emit => {}
+                    }
+                }
                 return RowDecision {
-                    action: WindowAction::Emit,
+                    action: if !update_window_ends.is_empty() {
+                        WindowAction::Update
+                    } else {
+                        WindowAction::Emit
+                    },
                     invalid_timestamp: false,
-                    excluded_window_ends: previously_expired.to_vec(),
+                    excluded_window_ends,
+                    route_late,
+                    update_window_ends,
                     expired_window_ends: Vec::new(),
                 };
             }
@@ -597,7 +899,12 @@ impl EventTimeGate {
             return RowDecision {
                 action: WindowAction::Hold,
                 invalid_timestamp: false,
-                excluded_window_ends: closed.clone(),
+                excluded_window_ends: match late_policy {
+                    LateEventPolicy::Drop => closed.clone(),
+                    LateEventPolicy::Route | LateEventPolicy::Update => Vec::new(),
+                },
+                route_late: false,
+                update_window_ends: Vec::new(),
                 expired_window_ends: closed,
             };
         }
@@ -619,6 +926,12 @@ impl EventTimeGate {
             action,
             invalid_timestamp: false,
             excluded_window_ends,
+            route_late: false,
+            update_window_ends: actions
+                .iter()
+                .zip(window_ends.iter())
+                .filter_map(|(action, end)| (*action == WindowAction::Update).then_some(*end))
+                .collect(),
             expired_window_ends: Vec::new(),
         }
     }
@@ -646,7 +959,7 @@ fn mark_window_exclusions(
     batch: crate::MessageBatchRef,
     exclusions: &[Vec<i64>],
 ) -> Result<crate::MessageBatchRef, Error> {
-    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::array::{Array, ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
 
@@ -656,24 +969,57 @@ fn mark_window_exclusions(
         ));
     }
     let marker = "__arkflow_late_window_ends";
-    let values = exclusions
+    let mut values = exclusions
         .iter()
         .map(|ends| {
             (!ends.is_empty()).then(|| {
-                ends.iter()
-                    .map(ToString::to_string)
+                let ends = ends
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                ends.into_iter()
+                    .map(|end| end.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
             })
         })
         .collect::<Vec<_>>();
-    if batch.record_batch().column_by_name(marker).is_some() {
-        return Ok(batch);
+    if let Some(existing) = batch.record_batch().column_by_name(marker) {
+        let existing = existing
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                Error::Process("event-time window exclusion marker has an invalid type".into())
+            })?;
+        for row in 0..batch.len() {
+            let mut merged = std::collections::BTreeSet::new();
+            if existing.is_valid(row) {
+                for end in existing.value(row).split(',') {
+                    if let Ok(end) = end.parse::<i64>() {
+                        merged.insert(end);
+                    }
+                }
+            }
+            if let Some(new_values) = exclusions.get(row) {
+                merged.extend(new_values.iter().copied());
+            }
+            values[row] = (!merged.is_empty()).then(|| {
+                merged
+                    .into_iter()
+                    .map(|end| end.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+        }
     }
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
     let mut columns = batch.columns().to_vec();
-    fields.push(Arc::new(Field::new(marker, DataType::Utf8, true)));
-    columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+    if let Some(index) = batch.schema().index_of(marker).ok() {
+        columns[index] = Arc::new(StringArray::from(values)) as ArrayRef;
+    } else {
+        fields.push(Arc::new(Field::new(marker, DataType::Utf8, true)));
+        columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+    }
     let marked = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| Error::Process(format!("mark late window memberships: {error}")))?;
     let mut marked = crate::MessageBatch::new_arrow(marked);
@@ -681,25 +1027,136 @@ fn mark_window_exclusions(
     Ok(Arc::new(marked))
 }
 
-/// Split one source delivery by its physical metadata partition. Kafka can
-/// legitimately return rows from several topic partitions in one batch when a
-/// single task subscribes to all partitions; feeding that batch through one
-/// logical watermark partition would let a fast partition close windows for a
-/// lagging one.
-pub(crate) fn split_by_partition(
+/// Attach the per-row sliding-window memberships that a late Update should
+/// correct. Keeping this separate from `__arkflow_late_window_ends` lets the
+/// window operator update closed memberships while still admitting the
+/// latest containing window as a normal contribution.
+fn mark_window_updates(
+    batch: crate::MessageBatchRef,
+    updates: &[Vec<i64>],
+) -> Result<crate::MessageBatchRef, Error> {
+    use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    if updates.len() != batch.len() {
+        return Err(Error::Process(
+            "event-time window update lengths differ from batch".into(),
+        ));
+    }
+    let marker = "__arkflow_late_window_updates";
+    let mut values = updates
+        .iter()
+        .map(|ends| {
+            (!ends.is_empty()).then(|| {
+                let ends = ends
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                ends.into_iter()
+                    .map(|end| end.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(existing) = batch.record_batch().column_by_name(marker) {
+        let existing = existing
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                Error::Process("event-time window update marker has an invalid type".into())
+            })?;
+        for row in 0..batch.len() {
+            let mut merged = std::collections::BTreeSet::new();
+            if existing.is_valid(row) {
+                for end in existing.value(row).split(',') {
+                    if let Ok(end) = end.parse::<i64>() {
+                        merged.insert(end);
+                    }
+                }
+            }
+            if let Some(new_values) = updates.get(row) {
+                merged.extend(new_values.iter().copied());
+            }
+            values[row] = (!merged.is_empty()).then(|| {
+                merged
+                    .into_iter()
+                    .map(|end| end.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+        }
+    }
+    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    let mut columns = batch.columns().to_vec();
+    if let Some(index) = batch.schema().index_of(marker).ok() {
+        columns[index] = Arc::new(StringArray::from(values)) as ArrayRef;
+    } else {
+        fields.push(Arc::new(Field::new(marker, DataType::Utf8, true)));
+        columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+    }
+    let marked = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| Error::Process(format!("mark late window updates: {error}")))?;
+    let mut marked = crate::MessageBatch::new_arrow(marked);
+    marked.set_input_name(batch.get_input_name());
+    Ok(Arc::new(marked))
+}
+
+fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<String> {
+    use datafusion::arrow::array::{Array, MapArray, StringArray};
+
+    let column = batch
+        .record_batch()
+        .column_by_name(crate::meta_columns::EXT)?;
+    let map = column.as_any().downcast_ref::<MapArray>()?;
+    let entries = map.entries();
+    let keys = entries.column(0).as_any().downcast_ref::<StringArray>()?;
+    let values = entries.column(1).as_any().downcast_ref::<StringArray>()?;
+    let offsets = map.offsets();
+    let start = offsets.get(row).copied()? as usize;
+    let end = offsets.get(row + 1).copied()? as usize;
+    (start..end)
+        .find_map(|index| (keys.value(index) == "topic").then(|| values.value(index).to_owned()))
+}
+
+/// Split one source delivery by its complete physical metadata identity.
+/// Kafka can legitimately return rows from several topics and partitions in a
+/// single batch; numeric partition alone would merge topic-a/0 with topic-b/0
+/// and let one stream's progress release the other stream's windows.
+pub(crate) fn split_by_physical_partition(
     batch: &crate::MessageBatchRef,
     fallback_partition: u32,
-) -> Result<Vec<(u32, crate::MessageBatchRef)>, Error> {
+) -> Result<Vec<(EventTimePartition, crate::MessageBatchRef)>, Error> {
+    split_by_physical_partition_for_source(batch, fallback_partition, None)
+}
+
+/// Split one source delivery while preserving a stable identity for
+/// connector-neutral partitions. Multiple source edges feeding one window
+/// share a watermark tracker, so their fallback partition 0 values must not
+/// collide merely because neither connector exposes a topic in row metadata.
+pub(crate) fn split_by_physical_partition_for_source(
+    batch: &crate::MessageBatchRef,
+    fallback_partition: u32,
+    source_id: Option<&str>,
+) -> Result<Vec<(EventTimePartition, crate::MessageBatchRef)>, Error> {
     use datafusion::arrow::array::{Array, UInt32Array};
     use datafusion::arrow::compute::cast;
     use datafusion::arrow::datatypes::DataType;
     use std::collections::BTreeMap;
 
+    let fallback = |partition: u32| {
+        source_id.map_or_else(
+            || EventTimePartition::numeric(partition),
+            |source_id| EventTimePartition::for_source(source_id, partition),
+        )
+    };
+
     let Some(column) = batch
         .record_batch()
         .column_by_name(crate::meta_columns::PARTITION)
     else {
-        return Ok(vec![(fallback_partition, batch.clone())]);
+        return Ok(vec![(fallback(fallback_partition), batch.clone())]);
     };
     let casted = if column.data_type() == &DataType::UInt32 {
         None
@@ -713,15 +1170,19 @@ pub(crate) fn split_by_partition(
         .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
         .or_else(|| column.as_any().downcast_ref::<UInt32Array>())
         .ok_or_else(|| Error::Process("physical partition metadata is not UInt32".into()))?;
-    let mut groups = BTreeMap::<u32, Vec<bool>>::new();
+    let mut groups = BTreeMap::<EventTimePartition, Vec<bool>>::new();
     for row in 0..batch.len() {
         let partition = if values.is_null(row) {
             fallback_partition
         } else {
             values.value(row)
         };
+        let physical = EventTimePartition::new(topic_for_row(batch, row), partition);
+        let physical = source_id.map_or(physical.clone(), |source_id| {
+            physical.with_source_identity(source_id)
+        });
         let keep = groups
-            .entry(partition)
+            .entry(physical)
             .or_insert_with(|| vec![false; batch.len()]);
         keep[row] = true;
     }
@@ -729,6 +1190,20 @@ pub(crate) fn split_by_partition(
         .into_iter()
         .map(|(partition, keep)| filter_batch(batch, &keep).map(|batch| (partition, batch)))
         .collect()
+}
+
+/// Compatibility wrapper for connector-neutral callers and old tests. The
+/// runtime uses [`split_by_physical_partition`] so topic identity is retained.
+pub(crate) fn split_by_partition(
+    batch: &crate::MessageBatchRef,
+    fallback_partition: u32,
+) -> Result<Vec<(u32, crate::MessageBatchRef)>, Error> {
+    split_by_physical_partition(batch, fallback_partition).map(|groups| {
+        groups
+            .into_iter()
+            .map(|(partition, batch)| (partition.partition, batch))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -961,7 +1436,83 @@ mod tests {
             .column_by_name("__arkflow_late_window_ends")
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .unwrap();
-        assert_eq!(marker.value(0), "5");
+        assert_eq!(marker.value(0), "5,7");
+    }
+
+    #[test]
+    fn sliding_route_keeps_latest_membership_on_main_path() {
+        let mut gate = EventTimeGate::new(
+            &time_spec(LateEventPolicy::Route),
+            vec![WindowTiming::Sliding {
+                size_ms: 5,
+                slide_ms: 2,
+            }],
+        )
+        .unwrap();
+        gate.observe(0, batch(vec![4])).unwrap();
+
+        // The memberships ending at 5 and 7 are late-routed, while the
+        // latest membership ending at 9 remains an ordinary main-path
+        // contribution. The current timestamp-9 row is still held.
+        let decision = gate.observe(0, batch(vec![9])).unwrap();
+        assert_eq!(decision.ready.len(), 2);
+        let routed = decision
+            .ready
+            .iter()
+            .find(|(_, action)| *action == WindowAction::Route)
+            .expect("closed memberships should be routed");
+        let emitted = decision
+            .ready
+            .iter()
+            .find(|(_, action)| *action == WindowAction::Emit)
+            .expect("latest membership should stay on the main path");
+        for (candidate, _) in [routed, emitted] {
+            let values = candidate
+                .record_batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(values.values(), &[4]);
+        }
+        let exclusions = emitted
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(exclusions.value(0), "5,7");
+    }
+
+    #[test]
+    fn sliding_update_marks_only_closed_memberships() {
+        let mut spec = time_spec(LateEventPolicy::Update);
+        spec.allowed_lateness_ms = 1_000;
+        let mut gate = EventTimeGate::new(
+            &spec,
+            vec![WindowTiming::Sliding {
+                size_ms: 5,
+                slide_ms: 2,
+            }],
+        )
+        .unwrap();
+        gate.observe(0, batch(vec![4])).unwrap();
+
+        let decision = gate.observe(0, batch(vec![9])).unwrap();
+        assert_eq!(decision.ready.len(), 1);
+        assert_eq!(decision.ready[0].1, WindowAction::Update);
+        let updates = decision.ready[0]
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_updates")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(updates.value(0), "5,7");
+        assert!(decision.ready[0]
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .is_none());
     }
 
     #[test]
@@ -984,6 +1535,22 @@ mod tests {
         assert_eq!(decision.watermark_ms, Some(100));
         assert!(decision.ready.is_empty());
         assert!(gate.has_held());
+    }
+
+    #[test]
+    fn connector_neutral_sources_get_distinct_watermark_partitions() {
+        let source_a = split_by_physical_partition_for_source(&batch(vec![1]), 0, Some("a"))
+            .unwrap()
+            .remove(0)
+            .0;
+        let source_b = split_by_physical_partition_for_source(&batch(vec![1]), 0, Some("b"))
+            .unwrap()
+            .remove(0)
+            .0;
+
+        assert_ne!(source_a, source_b);
+        assert_eq!(source_a.partition, source_b.partition);
+        assert_ne!(source_a.topic, source_b.topic);
     }
 }
 
