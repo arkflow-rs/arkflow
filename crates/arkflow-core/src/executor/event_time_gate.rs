@@ -1746,4 +1746,64 @@ mod cut_consistency_tests {
         assert_eq!(times_of(&decision), vec![Some(100), Some(300)]);
         assert!(gate.has_held(), "the future row stays held");
     }
+
+    /// Verification (repair-kernel-review-findings task 2.4): the three
+    /// subtler late-count branches that the multi-row tumbling test cannot
+    /// reach — a held row counted while still held (Drop marks closed
+    /// memberships as exclusions immediately), a released row counted
+    /// through its exclusions although its action is Emit, and a
+    /// `route_late` row counted exactly once even though `collect_outcomes`
+    /// publishes a second Route output group for it.
+    #[test]
+    fn late_event_rows_count_sliding_exclusions_and_route_late_once() {
+        let sliding = vec![WindowTiming::Sliding {
+            size_ms: 5,
+            slide_ms: 2,
+        }];
+
+        // (a) Drop policy: the held ts=4 row is counted the moment its [0,5)
+        // membership closes, while it is still held for [2,7) and [4,9).
+        let mut gate =
+            EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), sliding.clone()).unwrap();
+        gate.observe(0, nullable_batch(vec![Some(4)])).unwrap();
+        let held_count = gate.observe(0, nullable_batch(vec![Some(6)])).unwrap();
+        assert_eq!(
+            held_count.late_event_rows, 1,
+            "held row counted via its closed-membership exclusions"
+        );
+
+        // (b) A fresh gate: the release of the held row counts through its
+        // exclusions even though its action is Emit (the latest membership
+        // is the row's on-time one). The current ts=9 row holds, so it
+        // contributes no count.
+        let mut gate =
+            EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), sliding.clone()).unwrap();
+        gate.observe(0, nullable_batch(vec![Some(4)])).unwrap();
+        let released = gate.observe(0, nullable_batch(vec![Some(9)])).unwrap();
+        assert_eq!(
+            released.late_event_rows, 1,
+            "released row counted once through its exclusions"
+        );
+        assert_eq!(released.ready.len(), 1);
+        assert_eq!(released.ready[0].1, WindowAction::Emit);
+        let exclusions = released.ready[0]
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(exclusions.value(0), "5,7");
+
+        // (c) Route policy: the same release produces TWO output groups (the
+        // Emit main path and the Route side output) but the row is counted
+        // exactly once.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Route, 0), sliding).unwrap();
+        gate.observe(0, nullable_batch(vec![Some(4)])).unwrap();
+        let routed = gate.observe(0, nullable_batch(vec![Some(9)])).unwrap();
+        assert_eq!(routed.ready.len(), 2, "Emit group plus Route group");
+        assert_eq!(
+            routed.late_event_rows, 1,
+            "a route_late row is counted once, not once per output group"
+        );
+    }
 }

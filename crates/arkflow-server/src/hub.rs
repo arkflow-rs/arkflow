@@ -2693,16 +2693,6 @@ impl Hub {
                 HubOperationState::Failed | HubOperationState::Superseded
             )
         };
-        let _retryable = |state: &HubOperationState| {
-            matches!(
-                state,
-                HubOperationState::Queued
-                    | HubOperationState::Dispatched
-                    | HubOperationState::Acknowledged
-                    | HubOperationState::TimedOut
-                    | HubOperationState::NodeUnavailable
-            )
-        };
         // Single-assignment operations keep the direct derivation.
         if peers.len() <= 1 {
             return Ok(Some(if succeeded(&result.state) {
@@ -5699,8 +5689,11 @@ mod tests {
         );
         assert_eq!(observed.convergence, "reconciling");
 
-        // Peer B reports a retryable degradation: the healthy peer's
-        // observation must not be overwritten as failed.
+        // Peer B reports a retryable degradation (a TimedOut state, as the
+        // Agent produces for an expired lease). The aggregation is driven
+        // purely by operation states — failure_class is informational — and
+        // a retryable state must keep the healthy peer's observation
+        // neutral instead of overwriting it as failed.
         let command_b = hub
             .commands(AgentAuth {
                 node_id: "compute-2".into(),
@@ -5741,6 +5734,178 @@ mod tests {
             "a retryable peer degradation must stay observed-neutral"
         );
         assert_eq!(observed.convergence, "reconciling");
+
+        // The retry is re-enqueued by reconciliation; once it succeeds too,
+        // the complete assignment set is successful and the Job reports
+        // running (the terminal half of the aggregation contract).
+        assert_eq!(hub.reconcile_jobs().await.unwrap(), 1);
+        let retry = hub
+            .commands(AgentAuth {
+                node_id: "compute-2".into(),
+                session_token: node_b.session_token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("the timed-out peer receives a replacement start command");
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-2".into(),
+                session_token: node_b.session_token.clone(),
+            },
+            CommandResult {
+                command_id: retry.id.clone(),
+                operation_id: retry.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: retry.correlation_id,
+                generation: retry.generation,
+                observed_generation: Some(job.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let observed = hub.job("orders").await.unwrap().unwrap();
+        assert_eq!(
+            observed.observed_state, "running",
+            "every planned assignment succeeded, so the Job reports running"
+        );
+        assert_eq!(observed.convergence, "converged");
+    }
+
+    /// Verification (repair-kernel-review-findings task 2.3): the terminal
+    /// failure half of the aggregation — once the complete assignment set is
+    /// evaluated and any assignment reports a permanent execution failure,
+    /// the Job reports failed even though a peer succeeded.
+    #[tokio::test]
+    async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        let node_a = hub
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let node_b = hub
+            .register(RegisterRequest {
+                node_id: "compute-2".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let job = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: serde_json::json!({
+                    "id": "orders",
+                    "version": 1,
+                    "max_parallelism": 1,
+                    "parallelism": 1,
+                    "operators": [
+                        {"id": "source-a", "kind": "source"},
+                        {"id": "sink-a", "kind": "sink"},
+                        {"id": "source-b", "kind": "source"},
+                        {"id": "sink-b", "kind": "sink"}
+                    ],
+                    "edges": [
+                        {"id": "edge-a", "from": "source-a", "to": "sink-a"},
+                        {"id": "edge-b", "from": "source-b", "to": "sink-b"}
+                    ],
+                    "sources": [
+                        {"operator_id": "source-a", "input_type": "memory", "time": {"mode": "processing_time"}},
+                        {"operator_id": "source-b", "input_type": "memory", "time": {"mode": "processing_time"}}
+                    ],
+                    "sinks": [
+                        {"operator_id": "sink-a", "output_type": "drop"},
+                        {"operator_id": "sink-b", "output_type": "drop"}
+                    ]
+                })
+                .to_string(),
+                desired_state: "running".into(),
+                observed_state: "starting".into(),
+                convergence: "reconciling".into(),
+                generation: 1,
+                node_ids: vec!["compute-1".into(), "compute-2".into()],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        for (node_id, token, state, error) in [
+            (
+                "compute-1",
+                node_a.session_token.clone(),
+                HubOperationState::Succeeded,
+                None,
+            ),
+            (
+                "compute-2",
+                node_b.session_token.clone(),
+                HubOperationState::Failed,
+                Some("runner process exited".into()),
+            ),
+        ] {
+            let command = hub
+                .commands(AgentAuth {
+                    node_id: node_id.into(),
+                    session_token: token.clone(),
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|command| command.operation == "job_start")
+                .expect("each peer receives a start assignment");
+            hub.command_result(
+                AgentAuth {
+                    node_id: node_id.into(),
+                    session_token: token,
+                },
+                CommandResult {
+                    command_id: command.id.clone(),
+                    operation_id: command.operation_id.clone(),
+                    state,
+                    progress: 100,
+                    error,
+                    correlation_id: command.correlation_id,
+                    generation: command.generation,
+                    observed_generation: Some(job.generation),
+                    action_id: None,
+                    failure_class: None,
+                    config_version_id: None,
+                    rollout_id: None,
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let observed = hub.job("orders").await.unwrap().unwrap();
+        assert_eq!(
+            observed.observed_state, "failed",
+            "a complete set with a permanent failure aggregates to failed"
+        );
     }
 
     #[tokio::test]

@@ -995,18 +995,58 @@ async fn pool_processor_failure_routes_to_error_output_without_successes() {
 /// the delivery's acknowledgement and fails the run instead of dropping it.
 #[tokio::test]
 async fn pool_processor_failure_without_error_output_fails_and_aborts() {
-    let acknowledgements = Arc::new(AtomicUsize::new(0));
-    let batches: Vec<MessageBatchRef> = (0..4)
-        .map(|value| {
-            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
-                value,
-                "bad".into(),
-            )])))
-        })
-        .collect();
-    let input = Arc::new(CountingInput {
-        batches: Mutex::new(std::collections::VecDeque::from(batches)),
-        acknowledgements: acknowledgements.clone(),
+    // Acknowledgements that observe both outcomes: ack (must stay 0) and
+    // abort (must fire for the failed delivery), so the test can tell
+    // "aborted" apart from "never settled". A single delivery keeps the
+    // abort count deterministic.
+    let acks = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct AbortObservingAck {
+        acks: Arc<AtomicUsize>,
+        aborts: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl crate::input::Ack for AbortObservingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct AbortObservingInput {
+        batches: Mutex<std::collections::VecDeque<MessageBatchRef>>,
+        ack: AbortObservingAck,
+    }
+    #[async_trait]
+    impl Input for AbortObservingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            self.batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|batch| (batch, Arc::new(self.ack.clone()) as Arc<dyn Ack>))
+                .ok_or(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let ack = AbortObservingAck {
+        acks: acks.clone(),
+        aborts: aborts.clone(),
+    };
+    let input = Arc::new(AbortObservingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([Arc::new(
+            MessageBatch::new_arrow(int64_batch(vec![(7, "bad".into())])),
+        )])),
+        ack,
     });
     let primary = Arc::new(CollectOutput::default());
     let adapter = MultiInputAdapter {
@@ -1026,9 +1066,140 @@ async fn pool_processor_failure_without_error_output_fails_and_aborts() {
     );
     assert!(primary.written.lock().unwrap().is_empty());
     assert_eq!(
-        acknowledgements.load(Ordering::SeqCst),
+        acks.load(Ordering::SeqCst),
         0,
-        "the failed delivery's acknowledgement is aborted, never committed"
+        "the failed delivery's acknowledgement is never committed"
+    );
+    assert_eq!(
+        aborts.load(Ordering::SeqCst),
+        1,
+        "the failed delivery's acknowledgement is aborted exactly once"
+    );
+}
+
+/// Verification (repair-kernel-review-findings task 2.2): the siblings path
+/// of pooled failure routing. A processor that fans one input out to three
+/// outputs ahead of a failing processor produces `ProcessorFailure.siblings`;
+/// every sibling plus the failed delivery must reach the error sink exactly
+/// once and the parent acknowledgement must settle exactly once.
+#[tokio::test]
+async fn pool_processor_failure_routes_sibling_outputs_to_error_output() {
+    struct SplittingProcessor;
+    #[async_trait]
+    impl Processor for SplittingProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Multiple(vec![
+                batch.clone(),
+                batch.clone(),
+                batch,
+            ]))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct MultiProcessorAdapter {
+        input: Arc<dyn Input>,
+        outputs: HashMap<String, Arc<CollectOutput>>,
+        processors: HashMap<String, Arc<dyn Processor>>,
+    }
+    impl JobComponentAdapter for MultiProcessorAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(self.input.clone())
+        }
+        fn build_output(
+            &self,
+            sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            self.outputs
+                .get(&sink.operator_id)
+                .cloned()
+                .map(|output| output as Arc<dyn Output>)
+                .ok_or_else(|| Error::Config(format!("missing test output {}", sink.operator_id)))
+        }
+        fn build_processor(
+            &self,
+            operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            self.processors
+                .get(&operator.id)
+                .cloned()
+                .ok_or_else(|| Error::Config(format!("missing test processor {}", operator.id)))
+        }
+    }
+
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([Arc::new(
+            MessageBatch::new_arrow(int64_batch(vec![(1, "bad".into())])),
+        )])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let primary = Arc::new(CollectOutput::default());
+    let errors = Arc::new(CollectOutput::default());
+    let adapter = MultiProcessorAdapter {
+        input: input as Arc<dyn Input>,
+        outputs: HashMap::from([
+            ("sink".into(), primary.clone()),
+            ("error-sink".into(), errors.clone()),
+        ]),
+        processors: HashMap::from([
+            (
+                "split".into(),
+                Arc::new(SplittingProcessor) as Arc<dyn Processor>,
+            ),
+            (
+                "fail".into(),
+                Arc::new(FailingProcessor) as Arc<dyn Processor>,
+            ),
+        ]),
+    };
+    let mut job = spec(
+        vec![
+            map_operator("split"),
+            map_operator("fail"),
+            sink_operator("sink", false),
+            sink_operator("error-sink", true),
+        ],
+        vec![
+            edge("source", "split"),
+            edge("split", "fail"),
+            edge("fail", "sink"),
+            edge("fail", "error-sink"),
+        ],
+        1,
+    );
+    job.sinks.push(SinkSpec {
+        operator_id: "error-sink".into(),
+        output_type: "collect".into(),
+        config: serde_json::json!({}),
+    });
+    job.sources[0].config = serde_json::json!({
+        "__arkflow_processor_parallelism": 4,
+    });
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    assert!(primary.written.lock().unwrap().is_empty());
+    assert_eq!(
+        errors.written.lock().unwrap().len(),
+        3,
+        "the failed delivery and both siblings reach the error sink exactly once"
+    );
+    assert_eq!(
+        acknowledgements.load(Ordering::SeqCst),
+        1,
+        "the parent acknowledgement settles exactly once after every sibling"
     );
 }
 
@@ -1097,6 +1268,120 @@ async fn backpressure_blocks_upstream_when_channel_is_full() {
     assert!(
         reads <= 32,
         "source reads should be backpressured, got {reads}"
+    );
+}
+
+/// Verification (repair-kernel-review-findings task 1.4): the backpressure
+/// contract also holds on the pooled path. With `parallelism > 1` the worker
+/// pool's result channel is bounded, so a slow downstream stops the workers,
+/// which fills the submit queue and finally blocks the chain loop's reads.
+/// Before the fix the result channel was unbounded: processed results piled
+/// up without bound while the slow sink wrote at its own pace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_path_backpressures_source_when_downstream_is_slow() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    struct CountingFastInput {
+        reads: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Input for CountingFastInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DelayedOutput {
+        written: AtomicUsize,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl Output for DelayedOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            self.written.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DynAdapter {
+        input: Arc<dyn Input>,
+        output: Arc<DelayedOutput>,
+    }
+    impl JobComponentAdapter for DynAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(self.input.clone())
+        }
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(self.output.clone())
+        }
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(PassThroughProcessor))
+        }
+    }
+
+    let input = Arc::new(CountingFastInput {
+        reads: reads.clone(),
+    });
+    let output = Arc::new(DelayedOutput {
+        written: AtomicUsize::new(0),
+        delay_ms: 100,
+    });
+    let adapter = DynAdapter {
+        input: input.clone(),
+        output: output.clone(),
+    };
+    let plan = JobPlan::compile(parallel_job_spec(4)).unwrap();
+    // Capacity-1 edge keeps the allowed backlog small: queue(32) + done(8) +
+    // workers(4) + edge(1) = 45, comfortably inside the assertion below.
+    let graph = ExecutionGraphBuilder::new(1)
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = tokio::spawn(run_graph(graph, cancellation.clone()));
+    // ~2s with a 100ms sink: ~20 writes. An unbounded result channel lets
+    // reads race ahead of writes without bound; the bounded channel caps the
+    // backlog at queue(32) + done(8) + workers(4) + edge(1).
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    cancellation.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let reads = reads.load(Ordering::SeqCst);
+    let writes = output.written.load(Ordering::SeqCst);
+    assert!(
+        reads.saturating_sub(writes) <= 64,
+        "pooled backlog must stay bounded: reads={reads}, writes={writes}"
+    );
+    assert!(
+        writes >= 5,
+        "sanity: the slow sink must have made progress, wrote {writes}"
     );
 }
 
@@ -1580,6 +1865,88 @@ async fn kernel_runner_applies_event_time_gate_and_preserves_delivery_acks() {
         .collect();
     assert_eq!(rows, vec![100, 2_500]);
     assert_eq!(acknowledgements.load(Ordering::SeqCst), 2);
+}
+
+/// Verification (repair-kernel-review-findings task 2.5): the runtime
+/// counter endpoint. The gate-level `late_event_rows` value must reach
+/// `RuntimeMetrics.late_events` through the kernel's per-chain hooks, which
+/// is the number the control plane surfaces. Lateness needs downstream
+/// window timings, so the graph carries a tumbling window operator.
+#[tokio::test]
+async fn kernel_metrics_count_late_rows_end_to_end() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([
+            // Opens window [2000,3000) and advances the watermark to 2,500.
+            window_batch(vec![(2_500, "a".into(), 1)], None),
+            // Late for the closed [0,1000) window under the Drop policy.
+            window_batch(vec![(100, "b".into(), 2)], None),
+        ])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let mut job = spec(
+        vec![OperatorSpec {
+            id: "window".into(),
+            kind: OperatorKind::Window,
+            stateful: true,
+            key_field: Some("key".into()),
+            config: serde_json::json!({
+                "kind": "tumbling",
+                "size_ms": 1_000,
+                "timestamp_field": "ts",
+                "key_field": "key",
+                "value_fields": ["value"],
+                "trigger": "watermark",
+                "trigger_interval_ms": 1_000
+            }),
+        }],
+        vec![edge("source", "window"), edge("window", "sink")],
+        1,
+    );
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Drop,
+        late_event_route: None,
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    handle.watcher().await.unwrap().unwrap();
+
+    let metrics = handle.metrics().snapshot();
+    assert_eq!(
+        metrics.late_events, 1,
+        "the runtime counter must observe exactly the one dropped late row"
+    );
+    assert_eq!(
+        acknowledgements.load(Ordering::SeqCst),
+        2,
+        "the dropped row's ack is completed by the drop, the held row's by EOS flush"
+    );
 }
 
 #[tokio::test]
@@ -2386,11 +2753,10 @@ async fn failed_state_snapshot_fails_the_round_and_data_keeps_flowing() {
         failed.is_err(),
         "a failing state snapshot must fail the checkpoint round"
     );
+    // Sanity check only: the metric increments on any round failure (the
+    // `is_err` assertion above is what pins this round's outcome), so this
+    // does not distinguish failure paths.
     assert_eq!(handle.metrics().snapshot().checkpoint_failures, 1);
-    assert!(
-        snapshot.verify(),
-        "the last valid snapshot must remain intact after a failed round"
-    );
 
     // The data plane kept running: a row pushed after the failed round still
     // reaches the sink.

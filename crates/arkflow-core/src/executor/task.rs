@@ -1535,7 +1535,12 @@ impl ProcessorWorkerPool {
         let shared = Arc::new(chain.share_for_workers());
         let metrics = hook.metrics.clone();
         let (work_tx, work_rx) = flume::bounded::<(u64, PoolDelivery)>(64.min(parallelism * 8));
-        let (done_tx, done_rx) = flume::unbounded::<(u64, PoolResult)>();
+        // Bounded so a blocked reorder collector backpressures the workers
+        // and, through the submit queue, the chain loop and the source. When
+        // the collector exits (cancellation), dropping its receiver fails
+        // every blocked send with `SendError`, which the workers handle by
+        // aborting the delivery's acknowledgements.
+        let (done_tx, done_rx) = flume::bounded::<(u64, PoolResult)>(parallelism * 2);
         let (fail_tx, fail_rx) = flume::bounded::<Error>(1);
         let error_targets = chain.error_outputs.clone();
         let flushed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1563,8 +1568,14 @@ impl ProcessorWorkerPool {
                     let (sequence, (batch, ack)) = submit;
                     match process_chain(&shared, batch, ack, metrics.as_ref()).await {
                         Ok(outputs) => {
+                            // Publish asynchronously: a blocking send here
+                            // would park a tokio worker thread and, once the
+                            // result channel fills, freeze the whole runtime
+                            // (the collector shares the same worker pool).
                             if let Err(flume::SendError((_, PoolResult::Outputs(outputs)))) =
-                                done_tx.send((sequence, PoolResult::Outputs(outputs)))
+                                done_tx
+                                    .send_async((sequence, PoolResult::Outputs(outputs)))
+                                    .await
                             {
                                 let _ = abort_acknowledgements(
                                     outputs.into_iter().map(|output| output.ack).collect(),
@@ -1583,8 +1594,9 @@ impl ProcessorWorkerPool {
                                 if let Err(flume::SendError((
                                     _,
                                     PoolResult::ProcessorFailure(failure),
-                                ))) =
-                                    done_tx.send((sequence, PoolResult::ProcessorFailure(failure)))
+                                ))) = done_tx
+                                    .send_async((sequence, PoolResult::ProcessorFailure(failure)))
+                                    .await
                                 {
                                     let _ = abort_processor_failure(failure).await;
                                     return;
