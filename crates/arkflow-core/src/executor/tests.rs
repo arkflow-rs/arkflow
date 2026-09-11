@@ -915,6 +915,123 @@ async fn processor_failure_uses_error_output_without_receiving_successes() {
     assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
 }
 
+/// Pooled (parallelism > 1) variant of the job above: source -> fail -> sink,
+/// with the processor chain carrying a bounded worker pool.
+fn pooled_failure_job_spec(parallelism: u64, with_error_sink: bool) -> JobSpec {
+    let mut operators = vec![map_operator("fail"), sink_operator("sink", false)];
+    let mut edges = vec![edge("source", "fail"), edge("fail", "sink")];
+    if with_error_sink {
+        operators.push(sink_operator("error-sink", true));
+        edges.push(edge("fail", "error-sink"));
+    }
+    let mut job = spec(operators, edges, 1);
+    if with_error_sink {
+        job.sinks.push(SinkSpec {
+            operator_id: "error-sink".into(),
+            output_type: "collect".into(),
+            config: serde_json::json!({}),
+        });
+    }
+    job.sources[0].config = serde_json::json!({
+        "__arkflow_processor_parallelism": parallelism,
+    });
+    job
+}
+
+/// Verification 2026-09-11 (repair-unified-runtime-review-regressions task
+/// 5.2): a processor failure inside a worker pool uses the same error-only
+/// routing as the single-worker path — every failed batch and its
+/// acknowledgement reach the error sink exactly once, and no success reaches
+/// the primary sink.
+#[tokio::test]
+async fn pool_processor_failure_routes_to_error_output_without_successes() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let batches: Vec<MessageBatchRef> = (0..4)
+        .map(|value| {
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                value,
+                "bad".into(),
+            )])))
+        })
+        .collect();
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from(batches)),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let primary = Arc::new(CollectOutput::default());
+    let errors = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([("source".into(), input as Arc<dyn Input>)]),
+        outputs: HashMap::from([
+            ("sink".into(), primary.clone()),
+            ("error-sink".into(), errors.clone()),
+        ]),
+        processor: Arc::new(FailingProcessor),
+    };
+    let plan = JobPlan::compile(pooled_failure_job_spec(4, true)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    assert!(
+        primary.written.lock().unwrap().is_empty(),
+        "no success reaches the primary sink"
+    );
+    assert_eq!(
+        errors.written.lock().unwrap().len(),
+        4,
+        "every failed batch reaches the error sink exactly once"
+    );
+    assert_eq!(
+        acknowledgements.load(Ordering::SeqCst),
+        4,
+        "every failed batch is acknowledged exactly once through the error sink"
+    );
+}
+
+/// Verification 2026-09-11 (repair-unified-runtime-review-regressions task
+/// 5.2): without a configured error edge, a pooled processor failure aborts
+/// the delivery's acknowledgement and fails the run instead of dropping it.
+#[tokio::test]
+async fn pool_processor_failure_without_error_output_fails_and_aborts() {
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let batches: Vec<MessageBatchRef> = (0..4)
+        .map(|value| {
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                value,
+                "bad".into(),
+            )])))
+        })
+        .collect();
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from(batches)),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let primary = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([("source".into(), input as Arc<dyn Input>)]),
+        outputs: HashMap::from([("sink".into(), primary.clone())]),
+        processor: Arc::new(FailingProcessor),
+    };
+    let plan = JobPlan::compile(pooled_failure_job_spec(4, false)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+
+    assert!(
+        result.is_err(),
+        "a pool delivery failure without an error edge fails the run"
+    );
+    assert!(primary.written.lock().unwrap().is_empty());
+    assert_eq!(
+        acknowledgements.load(Ordering::SeqCst),
+        0,
+        "the failed delivery's acknowledgement is aborted, never committed"
+    );
+}
+
 #[tokio::test]
 async fn backpressure_blocks_upstream_when_channel_is_full() {
     struct SlowInput {
@@ -2149,6 +2266,164 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
         "post-barrier mutation for 'd' leaked into the checkpoint cut: {keys:?}"
     );
     assert!(snapshot.verify());
+
+    cancellation.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle.watcher())
+        .await
+        .expect("kernel did not stop after cancellation");
+}
+
+/// Verification 2026-09-11 (harden re-audit WARNING 2): a failing state
+/// snapshot fails the checkpoint round through the failure reporter while
+/// the data plane keeps flowing, the failure is counted, and the last valid
+/// snapshot is preserved.
+#[tokio::test]
+async fn failed_state_snapshot_fails_the_round_and_data_keeps_flowing() {
+    struct ToggleSnapshotBackend {
+        inner: Arc<dyn crate::state::StateBackend>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    impl crate::state::StateBackend for ToggleSnapshotBackend {
+        fn format_version(&self) -> u32 {
+            self.inner.format_version()
+        }
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            self.inner.get(namespace, key)
+        }
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            ttl_ms: Option<u64>,
+            now_ms: u64,
+        ) -> Result<(), Error> {
+            self.inner
+                .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        }
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            self.inner.update_i64(namespace, key, delta)
+        }
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            self.inner.delete(namespace, key)
+        }
+        fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+            self.inner.purge_expired(now_ms)
+        }
+        fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            self.inner.scan(namespace)
+        }
+        fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Error::Process("injected state snapshot failure".into()));
+            }
+            self.inner.snapshot_at(now_ms)
+        }
+        fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            self.inner.restore(snapshot)
+        }
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            self.inner.metrics()
+        }
+        fn close(&self) -> Result<(), Error> {
+            self.inner.close()
+        }
+    }
+
+    let input = ParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+        (1, "a".into()),
+    ])))]);
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let backend = Arc::new(ToggleSnapshotBackend {
+        inner: Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap()),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    let states = BTreeMap::from([(
+        "source-0".to_string(),
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    )]);
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input.clone()],
+        states,
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Round 1: a healthy snapshot — the last valid artifact recovery keeps.
+    let (snapshot, _, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.checkpoint_barrier("cp-good", 1),
+    )
+    .await
+    .expect("first checkpoint timed out")
+    .unwrap();
+    assert!(snapshot.verify());
+
+    // Round 2: the backend fails — the round must fail via the failure
+    // reporter and the failure must be counted.
+    backend.fail.store(true, Ordering::SeqCst);
+    let failed = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.checkpoint_barrier("cp-bad", 2),
+    )
+    .await
+    .expect("failed checkpoint timed out");
+    assert!(
+        failed.is_err(),
+        "a failing state snapshot must fail the checkpoint round"
+    );
+    assert_eq!(handle.metrics().snapshot().checkpoint_failures, 1);
+    assert!(
+        snapshot.verify(),
+        "the last valid snapshot must remain intact after a failed round"
+    );
+
+    // The data plane kept running: a row pushed after the failed round still
+    // reaches the sink.
+    input.push_rows(vec![(2, "b".into())]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let written_rows = || {
+        output
+            .written
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>()
+    };
+    while written_rows() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        written_rows() >= 2,
+        "data must keep flowing through a failed checkpoint round"
+    );
+
+    // A later healthy round succeeds again; the failure was local to one
+    // round rather than poisoning the checkpoint machinery.
+    backend.fail.store(false, Ordering::SeqCst);
+    let (recovered, _, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.checkpoint_barrier("cp-good-2", 3),
+    )
+    .await
+    .expect("recovery checkpoint timed out")
+    .unwrap();
+    assert!(recovered.verify());
 
     cancellation.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.watcher())

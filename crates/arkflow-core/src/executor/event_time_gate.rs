@@ -1690,4 +1690,60 @@ mod cut_consistency_tests {
         let second = gate.observe(0, nullable_batch(vec![Some(1_500)])).unwrap();
         assert!(times_of(&second).contains(&Some(100)));
     }
+
+    /// Verification 2026-09-11 (repair-unified-runtime-review-regressions
+    /// task 4.2): exact counter assertions over multi-row batches for every
+    /// late decision — Drop, Route, and Update — plus rows without a
+    /// timestamp. `GateDecision::late_event_rows` is the value the runtime
+    /// feeds into the kernel late-event counter (`executor/task.rs`,
+    /// `record_late_event_rows`); the unwired `EventTimeMetrics` type is
+    /// deliberately not asserted here.
+    #[test]
+    fn late_event_rows_count_each_late_decision_exactly() {
+        // Drop: a batch [2_100, 100, 300, None, 2_500] advances the watermark
+        // to 2_500 first; 100 and 300 fall into the closed [0,1000) window
+        // (two drops), the null row is invalid (one drop), and the 2_100 and
+        // 2_500 rows stay held in the open [2000,3000) window.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(
+                0,
+                nullable_batch(vec![Some(2_100), Some(100), Some(300), None, Some(2_500)]),
+            )
+            .unwrap();
+        assert_eq!(
+            decision.late_event_rows, 3,
+            "two late drops plus one invalid timestamp"
+        );
+        assert!(decision.ready.is_empty(), "Drop: nothing is ready");
+        // One acknowledgement per dropped outcome group: the two late rows
+        // share one group, the invalid row forms its own.
+        assert_eq!(decision.dropped_acks.len(), 2);
+        assert!(gate.has_held(), "the two future rows stay held");
+
+        // Route: both late rows are routed to the side output in one grouped
+        // delivery and counted; the future row stays held.
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Route, 0), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(2_400), Some(100), Some(300)]))
+            .unwrap();
+        assert_eq!(decision.late_event_rows, 2, "two late routes");
+        assert_eq!(decision.ready.len(), 1);
+        assert_eq!(decision.ready[0].1, WindowAction::Route);
+        assert_eq!(times_of(&decision), vec![Some(100), Some(300)]);
+        assert!(gate.has_held(), "the future row stays held");
+
+        // Update: within allowed lateness both late rows are marked for the
+        // window update and counted; the future row stays held.
+        let mut gate =
+            EventTimeGate::new(&spec(LateEventPolicy::Update, 2_000), vec![1_000]).unwrap();
+        let decision = gate
+            .observe(0, nullable_batch(vec![Some(2_100), Some(100), Some(300)]))
+            .unwrap();
+        assert_eq!(decision.late_event_rows, 2, "two late updates");
+        assert_eq!(decision.ready.len(), 1);
+        assert_eq!(decision.ready[0].1, WindowAction::Update);
+        assert_eq!(times_of(&decision), vec![Some(100), Some(300)]);
+        assert!(gate.has_held(), "the future row stays held");
+    }
 }

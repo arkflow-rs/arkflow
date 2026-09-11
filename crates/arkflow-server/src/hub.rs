@@ -5583,6 +5583,166 @@ mod tests {
             .any(|command| command.operation == "job_start"));
     }
 
+    /// Verification 2026-09-11 (harden-unified-streaming-runtime re-audit,
+    /// WARNING 1): the Job-level observed state aggregates every planned
+    /// assignment — one peer's success while another is still pending leaves
+    /// the Job converging, and a retryable peer degradation never overwrites
+    /// the healthy peer's observation as failed.
+    #[tokio::test]
+    async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_peer_degradation()
+    {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        let node_a = hub
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let node_b = hub
+            .register(RegisterRequest {
+                node_id: "compute-2".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        // Two components so each node receives one start assignment.
+        let job = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: serde_json::json!({
+                    "id": "orders",
+                    "version": 1,
+                    "max_parallelism": 1,
+                    "parallelism": 1,
+                    "operators": [
+                        {"id": "source-a", "kind": "source"},
+                        {"id": "sink-a", "kind": "sink"},
+                        {"id": "source-b", "kind": "source"},
+                        {"id": "sink-b", "kind": "sink"}
+                    ],
+                    "edges": [
+                        {"id": "edge-a", "from": "source-a", "to": "sink-a"},
+                        {"id": "edge-b", "from": "source-b", "to": "sink-b"}
+                    ],
+                    "sources": [
+                        {"operator_id": "source-a", "input_type": "memory", "time": {"mode": "processing_time"}},
+                        {"operator_id": "source-b", "input_type": "memory", "time": {"mode": "processing_time"}}
+                    ],
+                    "sinks": [
+                        {"operator_id": "sink-a", "output_type": "drop"},
+                        {"operator_id": "sink-b", "output_type": "drop"}
+                    ]
+                })
+                .to_string(),
+                desired_state: "running".into(),
+                observed_state: "starting".into(),
+                convergence: "reconciling".into(),
+                generation: 1,
+                node_ids: vec!["compute-1".into(), "compute-2".into()],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // Peer A succeeds while peer B is still pending: the Job must stay
+        // non-terminal until every planned assignment reports success.
+        let command_a = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: node_a.session_token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("compute-1 receives a start assignment");
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: node_a.session_token.clone(),
+            },
+            CommandResult {
+                command_id: command_a.id.clone(),
+                operation_id: command_a.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: command_a.correlation_id,
+                generation: command_a.generation,
+                observed_generation: Some(job.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let observed = hub.job("orders").await.unwrap().unwrap();
+        assert_eq!(
+            observed.observed_state, "starting",
+            "one peer's success must not report a fully running Job"
+        );
+        assert_eq!(observed.convergence, "reconciling");
+
+        // Peer B reports a retryable degradation: the healthy peer's
+        // observation must not be overwritten as failed.
+        let command_b = hub
+            .commands(AgentAuth {
+                node_id: "compute-2".into(),
+                session_token: node_b.session_token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("compute-2 receives a start assignment");
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-2".into(),
+                session_token: node_b.session_token.clone(),
+            },
+            CommandResult {
+                command_id: command_b.id.clone(),
+                operation_id: command_b.operation_id.clone(),
+                state: HubOperationState::TimedOut,
+                progress: 0,
+                error: Some("command lease expired".into()),
+                correlation_id: command_b.correlation_id,
+                generation: command_b.generation,
+                observed_generation: Some(job.generation),
+                action_id: None,
+                failure_class: Some("temporary_execution".into()),
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let observed = hub.job("orders").await.unwrap().unwrap();
+        assert_eq!(
+            observed.observed_state, "starting",
+            "a retryable peer degradation must stay observed-neutral"
+        );
+        assert_eq!(observed.convergence, "reconciling");
+    }
+
     #[tokio::test]
     async fn periodic_job_reconciliation_retries_a_failed_runtime() {
         let storage =
