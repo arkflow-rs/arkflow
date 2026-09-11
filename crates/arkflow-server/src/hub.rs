@@ -4106,6 +4106,55 @@ mod tests {
 
     // ---------- review P1 regressions (repair-control-plane-review-defects) ----------
 
+    /// Session credentials authenticate every agent request; they must be
+    /// independent high-entropy values, not a sequential counter an attacker
+    /// can enumerate.
+    #[tokio::test]
+    async fn session_tokens_are_random_and_unique() {
+        let hub = Hub::new(config());
+        let mut tokens = Vec::new();
+        for node_id in ["node-a", "node-b", "node-c"] {
+            let session = hub
+                .register(RegisterRequest {
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: "v1".into(),
+                    capabilities: vec!["stream_lifecycle".into()],
+                    boot_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                session.session_token.len() >= 32,
+                "session token must carry real entropy"
+            );
+            assert!(
+                !session.session_token.starts_with("node-session-"),
+                "session token must not be a sequential counter"
+            );
+            tokens.push(session.session_token);
+        }
+        let unique: std::collections::BTreeSet<_> = tokens.iter().collect();
+        assert_eq!(
+            unique.len(),
+            tokens.len(),
+            "every session token must be unique"
+        );
+        // Re-registration issues an independent token, not the next counter
+        // value.
+        let re_registered = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(!tokens.contains(&re_registered.session_token));
+    }
+
     /// A terminal-failure operation must not wedge its intent: the retry
     /// attempt enqueued by the reconciler replaces the failed record and a
     /// fresh command reaches the node.
