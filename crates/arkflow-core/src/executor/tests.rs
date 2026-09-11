@@ -1637,6 +1637,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
             event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
             partition: Some(0),
             metrics: None,
+            finished_reporter: None,
         },
     );
 
@@ -3462,4 +3463,391 @@ fn thread_num_does_not_change_source_partition_topology() {
         .filter(|task| task.operator_id == "source")
         .count();
     assert_eq!(source_tasks, 1, "the source stays a single task");
+}
+
+// ---------- ended-chain checkpoint exemption (repair-kernel-review-defects) ----------
+
+struct BoundedPositionedInput {
+    reads: AtomicUsize,
+    max_reads: usize,
+}
+
+#[async_trait]
+impl Input for BoundedPositionedInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+        if offset >= self.max_reads {
+            return Err(Error::EOF);
+        }
+        Ok((
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                offset as i64,
+                "bounded".into(),
+            )]))),
+            Arc::new(crate::input::NoopAck),
+        ))
+    }
+    async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+        Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+            0,
+            self.reads.load(Ordering::SeqCst) as u64,
+        )])
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+struct ForeverPositionedInput {
+    reads: AtomicUsize,
+}
+
+#[async_trait]
+impl Input for ForeverPositionedInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Ok((
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                offset as i64,
+                "forever".into(),
+            )]))),
+            Arc::new(crate::input::NoopAck),
+        ))
+    }
+    async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+        Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+            0,
+            self.reads.load(Ordering::SeqCst) as u64,
+        )])
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// One bounded source plus one continuous source: once the bounded subtree
+/// drains and its chain exits, barrier rounds must still complete with the
+/// remaining live participants instead of parking forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_source_drain_keeps_checkpoints_running() {
+    let bounded = Arc::new(BoundedPositionedInput {
+        reads: AtomicUsize::new(0),
+        max_reads: 2,
+    });
+    let forever = Arc::new(ForeverPositionedInput {
+        reads: AtomicUsize::new(0),
+    });
+    let output_a = Arc::new(CollectOutput::default());
+    let output_b = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([
+            ("source-a".into(), bounded.clone() as Arc<dyn Input>),
+            ("source-b".into(), forever.clone() as Arc<dyn Input>),
+        ]),
+        outputs: HashMap::from([
+            ("sink-a".into(), output_a.clone()),
+            ("sink-b".into(), output_b.clone()),
+        ]),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let job = JobSpec {
+        id: JobId::new("test-job").unwrap(),
+        version: JobVersion(1),
+        max_parallelism: 2,
+        parallelism: 1,
+        operators: vec![
+            OperatorSpec {
+                id: "source-a".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            map_operator("map-a"),
+            sink_operator("sink-a", false),
+            OperatorSpec {
+                id: "source-b".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            map_operator("map-b"),
+            sink_operator("sink-b", false),
+        ],
+        edges: vec![
+            edge("source-a", "map-a"),
+            edge("map-a", "sink-a"),
+            edge("source-b", "map-b"),
+            edge("map-b", "sink-b"),
+        ],
+        sources: vec![source_spec("source-a"), source_spec("source-b")],
+        sinks: vec![
+            SinkSpec {
+                operator_id: "sink-a".into(),
+                output_type: "collect".into(),
+                config: serde_json::json!({}),
+            },
+            SinkSpec {
+                operator_id: "sink-b".into(),
+                output_type: "collect".into(),
+                config: serde_json::json!({}),
+            },
+        ],
+        state: None,
+        checkpoint: None,
+        recovery: Default::default(),
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![bounded.clone(), forever.clone()],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Wait until the bounded subtree drained and its chain task returned.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if output_a.written.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded source did not drain");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The round must complete with only the live source reporting.
+    let (snapshot, positions, _watermarks) =
+        tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot())
+            .await
+            .expect("checkpoint round hung after a participant chain ended")
+            .unwrap();
+    assert!(snapshot.verify());
+    assert_eq!(
+        positions.len(),
+        1,
+        "only the live source reports checkpoint positions"
+    );
+    assert!(positions[0].offset > 0);
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle.watcher())
+        .await
+        .expect("kernel did not stop after cancellation")
+        .unwrap()
+        .unwrap();
+}
+
+// ---------- pooled tick ordering + fence liveness (repair-kernel-review-defects) ----------
+
+/// Generates a marker batch on every tick while passing data through slowly,
+/// so a tick racing in-flight pooled deliveries is observable at the sink.
+struct TickMarkerProcessor {
+    first_process_delay: Duration,
+    delayed: AtomicUsize,
+}
+
+#[async_trait]
+impl Processor for TickMarkerProcessor {
+    async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        if self.delayed.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(self.first_process_delay).await;
+        }
+        Ok(ProcessResult::Single(batch))
+    }
+    async fn on_tick(&self) -> Result<ProcessResult, Error> {
+        Ok(ProcessResult::Single(Arc::new(MessageBatch::new_arrow(
+            int64_batch(vec![(-1, "tick".into())]),
+        ))))
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// With `pipeline.thread_num > 1`, an idle tick that fires while an earlier
+/// delivery is still inside the worker pool must not publish its generated
+/// batch before that delivery (per-edge ordered delivery).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tick_output_does_not_overtake_in_flight_pooled_data() {
+    struct GatedInput {
+        reads: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for GatedInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+            match offset {
+                0 => Ok((
+                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                    Arc::new(crate::input::NoopAck),
+                )),
+                1 => {
+                    // Keep the chain alive past the first 100ms tick.
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    Ok((
+                        Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
+                        Arc::new(crate::input::NoopAck),
+                    ))
+                }
+                _ => Err(Error::EOF),
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let processor = Arc::new(TickMarkerProcessor {
+        first_process_delay: Duration::from_millis(250),
+        delayed: AtomicUsize::new(0),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: Arc::new(GatedInput {
+            reads: AtomicUsize::new(0),
+        }),
+        output: output.clone(),
+        processor,
+    };
+    let mut job = spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    );
+    job.sources[0].config = serde_json::json!({ "__arkflow_processor_parallelism": 2 });
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+
+    let keys: Vec<String> = output
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|value| value.unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let first_tick = keys
+        .iter()
+        .position(|key| key == "tick")
+        .expect("tick output must reach the sink");
+    assert!(
+        first_tick > 0,
+        "tick output overtook in-flight pooled data: {keys:?}"
+    );
+    assert_eq!(
+        keys[0], "a",
+        "the first data delivery must be published before any tick output"
+    );
+}
+
+/// Stress the worker-pool control fence: rapid barrier rounds against a slow
+/// pooled processor must all complete — no lost `notify_waiters` wakeup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pooled_control_fences_survive_rapid_barriers() {
+    struct EndlessSlowInput {
+        reads: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for EndlessSlowInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                    offset as i64,
+                    "a".into(),
+                )]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(EndlessSlowInput {
+        reads: AtomicUsize::new(0),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(SlowCountingProcessor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+        }),
+    };
+    let mut job = spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    );
+    job.sources[0].config = serde_json::json!({ "__arkflow_processor_parallelism": 4 });
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+
+    for round in 0..10 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.checkpoint_barrier(format!("cp-stress-{round}"), 1),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("barrier round {round} stalled in the pool fence"))
+        .unwrap();
+    }
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle.watcher())
+        .await
+        .expect("kernel did not stop after cancellation")
+        .unwrap()
+        .unwrap();
 }

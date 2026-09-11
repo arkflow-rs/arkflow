@@ -54,6 +54,10 @@ pub struct CheckpointHook {
     /// Runtime counters for control-plane snapshots (source chains bump
     /// input counts; dispatch paths bump output/error counts).
     pub metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
+    /// Reports this chain's exit to the coordinator: a chain whose event loop
+    /// returned can no longer process barriers or send checkpoint reports, so
+    /// barrier rounds must exempt it from the required participant set.
+    pub finished_reporter: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 pub async fn run_graph(
@@ -276,6 +280,15 @@ async fn run_chain(
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
     let result = run_chain_inner(&chain, &hook, &cancellation).await;
+
+    // The event loop has returned: this chain can no longer process barriers
+    // or send checkpoint reports. Tell the coordinator on every exit path so
+    // barrier rounds stop requiring (and stop injecting barriers into) it.
+    if let Some(finished) = &hook.finished_reporter {
+        if let Some(task_id) = hook.task_id.as_deref() {
+            let _ = finished.send(task_id.to_owned());
+        }
+    }
 
     // Close owned components on every exit path, keeping the first close
     // failure observable while still attempting every remaining component.
@@ -1174,6 +1187,13 @@ async fn run_interior_chain_loop(
                 return shutdown_interior_chain(chain, pool).await;
             }
             _ = idle_tick.tick() => {
+                // The tick is a control event that can generate data; fence
+                // the pool first so tick output cannot overtake deliveries
+                // the workers are still publishing (same discipline as the
+                // barrier and watermark paths).
+                if let Some(pool) = pool.as_ref() {
+                    pool.flush().await?;
+                }
                 tick_chain(chain).await?;
                 continue;
             }
@@ -1772,15 +1792,22 @@ impl ProcessorWorkerPool {
                     "processor worker pool failed before control fence".into(),
                 ));
             }
+            // Register interest before checking the condition: the collector
+            // signals with `notify_waiters`, which stores no permit, so a
+            // store+notify landing between a condition check and waiter
+            // registration would otherwise be lost and park this fence
+            // forever.
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.flushed.load(std::sync::atomic::Ordering::Acquire) >= target {
                 return Ok(());
             }
-            let notified = self.progress.notified();
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
                     return Err(Error::Process("processor worker pool was cancelled".into()));
                 }
-                _ = notified => {}
+                _ = &mut notified => {}
             }
         }
     }

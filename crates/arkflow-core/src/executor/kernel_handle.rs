@@ -50,6 +50,11 @@ pub struct KernelJobHandle {
         tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>,
     >,
     checkpoint_errors: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Error>>>,
+    /// Exit notifications from chains, used to exempt ended chains from
+    /// barrier rounds. The handle holds a keep-alive sender so the receiver
+    /// only reports real notifications, never channel closure.
+    chain_finished: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    _finished_keepalive: tokio::sync::mpsc::UnboundedSender<String>,
     checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     next_snapshot_id: AtomicU64,
     /// Shared job metrics.  The runner installs the corresponding
@@ -158,18 +163,44 @@ impl KernelJobHandle {
                 "kernel graph has no source barrier channel".into(),
             ));
         }
-        for sender in self.barrier_senders.values() {
+        // Chains whose event loop already exited can neither receive barriers
+        // (their barrier receiver dropped with the hook) nor send reports.
+        // Exempt them from this round instead of parking the wait loop on a
+        // report that will never arrive.
+        let mut ended = BTreeSet::new();
+        {
+            let mut finished = self.chain_finished.lock().await;
+            while let Ok(task_id) = finished.try_recv() {
+                ended.insert(task_id);
+            }
+        }
+        for (task_id, sender) in &self.barrier_senders {
+            if ended.contains(task_id) {
+                continue;
+            }
             sender
                 .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
                 .await
                 .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
         }
+        let mut remaining: BTreeSet<String> = self
+            .participants
+            .iter()
+            .filter(|task_id| !ended.contains(*task_id))
+            .cloned()
+            .collect();
+        if remaining.is_empty() {
+            return Err(Error::Process(
+                "kernel ended before checkpoint completed".into(),
+            ));
+        }
 
         let mut snapshots = BTreeMap::new();
-        while snapshots.len() < self.participants.len() {
+        while !remaining.is_empty() {
             let report = {
                 let mut reports = self.reports.lock().await;
                 let mut checkpoint_errors = self.checkpoint_errors.lock().await;
+                let mut chain_finished = self.chain_finished.lock().await;
                 tokio::select! {
                     _ = self.cancellation.cancelled() => {
                         return Err(Error::Process("kernel cancelled during checkpoint".into()));
@@ -179,6 +210,17 @@ impl KernelJobHandle {
                             return Err(error);
                         }
                         return Err(Error::Process("checkpoint error channel closed".into()));
+                    }
+                    finished = chain_finished.recv() => {
+                        // Unreachable None while the handle holds a keep-alive
+                        // sender; treat it defensively as full termination.
+                        let Some(task_id) = finished else {
+                            return Err(Error::Process(
+                                "kernel ended before checkpoint completed".into(),
+                            ));
+                        };
+                        remaining.remove(&task_id);
+                        continue;
                     }
                     report = reports.recv() => report,
                 }
@@ -209,9 +251,11 @@ impl KernelJobHandle {
                     report.task_id
                 )));
             }
-            if snapshots.insert(report.task_id.clone(), report).is_some() {
+            let reported_task_id = report.task_id.clone();
+            if snapshots.insert(reported_task_id.clone(), report).is_some() {
                 return Err(Error::Process("duplicate chain checkpoint report".into()));
             }
+            remaining.remove(&reported_task_id);
         }
 
         // The checkpoint's state format is the CONFIGURED Job/backend
@@ -550,8 +594,10 @@ impl KernelJobRunner {
         let completion: Completion = Arc::new(tokio::sync::Mutex::new(None));
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
         let (checkpoint_error_tx, checkpoint_error_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (chain_finished_tx, chain_finished_rx) = tokio::sync::mpsc::unbounded_channel();
         let reports = Arc::new(tokio::sync::Mutex::new(report_rx));
         let checkpoint_errors = Arc::new(tokio::sync::Mutex::new(checkpoint_error_rx));
+        let chain_finished = Arc::new(tokio::sync::Mutex::new(chain_finished_rx));
         let runtime_metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
         let mut barrier_senders = BTreeMap::new();
         let mut participants = BTreeSet::new();
@@ -629,7 +675,7 @@ impl KernelJobRunner {
                     event_time_gate,
                     partition: chain.source_partition,
                     metrics: Some(runtime_metrics.clone()),
-                    ..Default::default()
+                    finished_reporter: Some(chain_finished_tx.clone()),
                 },
             );
         }
@@ -676,6 +722,8 @@ impl KernelJobRunner {
             participants,
             reports,
             checkpoint_errors,
+            chain_finished,
+            _finished_keepalive: chain_finished_tx,
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_snapshot_id: AtomicU64::new(0),
             metrics: runtime_metrics.kernel.clone(),
