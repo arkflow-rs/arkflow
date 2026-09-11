@@ -390,6 +390,16 @@ enum StorageCommand {
         last_error: Option<String>,
         response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
     },
+    UpdateJobObservation {
+        job_id: String,
+        observed_state: String,
+        convergence: String,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
     UpdateJobDesiredState {
         job_id: String,
         desired_state: String,
@@ -598,6 +608,26 @@ impl StorageActor {
                             observed_state.as_deref(),
                             convergence.as_deref(),
                             generation,
+                            checkpoint_id.as_deref(),
+                            last_error.as_deref(),
+                        ));
+                    }
+                    StorageCommand::UpdateJobObservation {
+                        job_id,
+                        observed_state,
+                        convergence,
+                        generation,
+                        expected_generation,
+                        checkpoint_id,
+                        last_error,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job_observation(
+                            &job_id,
+                            &observed_state,
+                            &convergence,
+                            generation,
+                            expected_generation,
                             checkpoint_id.as_deref(),
                             last_error.as_deref(),
                         ));
@@ -892,6 +922,33 @@ impl StorageActor {
                 observed_state,
                 convergence,
                 generation,
+                checkpoint_id,
+                last_error,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_observation(
+        &self,
+        job_id: impl Into<String>,
+        observed_state: impl Into<String>,
+        convergence: impl Into<String>,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobObservation {
+                job_id: job_id.into(),
+                observed_state: observed_state.into(),
+                convergence: convergence.into(),
+                generation,
+                expected_generation,
                 checkpoint_id,
                 last_error,
                 response,
@@ -2759,6 +2816,61 @@ impl ControlPlaneStore {
                     row_to_job,
                 )
                 .optional()
+        })
+    }
+
+    /// CAS observation update: applies the observed state only while the
+    /// Job's generation still equals `expected_generation`. A concurrent
+    /// desired-state change or placement move must never be rolled back by a
+    /// stale report — that would fence every newer observation and pin the
+    /// Job in a reconciling loop.
+    pub fn update_job_observation(
+        &self,
+        job_id: &str,
+        observed_state: &str,
+        convergence: &str,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET observed_state=?2, convergence=?3, generation=?4, checkpoint_id=COALESCE(?5, checkpoint_id), last_error=?6, updated_at_ms=?7 WHERE job_id=?1 AND generation=?8",
+                rusqlite::params![
+                    job_id,
+                    observed_state,
+                    convergence,
+                    generation,
+                    checkpoint_id,
+                    last_error,
+                    now_ms(),
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return match current {
+                    Some(current) => Err(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current,
+                    }),
+                    None => Ok(None),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
         })
     }
 

@@ -582,6 +582,41 @@ impl Hub {
             };
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
         if operation == "job_start" {
+            // Auto-placement fencing: when the reconciler re-places a Job
+            // (its previous placement lost its lease or was partitioned), the
+            // abandoned node's Succeeded start at THIS generation still
+            // claims the assignment. Without invalidating it, the node is
+            // deduped back into the sticky target set on its return and both
+            // nodes run the same Job forever. Mark those starts Superseded so
+            // the placement history stops claiming them and the nodes receive
+            // a stop command when they reappear.
+            let abandoned: Vec<HubOperation> = {
+                let operations = self.operations.read().await;
+                operations
+                    .values()
+                    .filter(|operation_record| {
+                        operation_record.resource_id == job.job_id
+                            && operation_record.operation == "job_start"
+                            && operation_record.generation == job.generation
+                            && operation_record.state == HubOperationState::Succeeded
+                            && !target_ids.contains(&operation_record.node_id)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if !abandoned.is_empty() {
+                let mut operations = self.operations.write().await;
+                for mut record in abandoned {
+                    record.state = HubOperationState::Superseded;
+                    record.superseded_generation = Some(job.generation);
+                    operations.insert(record.id.clone(), record.clone());
+                    if let Some(storage) = self.storage.as_ref() {
+                        persist_operation(storage, &record)
+                            .await
+                            .map_err(HubError::from)?;
+                    }
+                }
+            }
             // A target that is still valid for the new generation does not
             // need a stop/start bounce. Every historical placement outside
             // the desired set is stale and must be fenced, including starts
@@ -801,23 +836,39 @@ impl Hub {
                 "reconciling"
             };
         let updated = if let Some(storage) = &self.storage {
-            storage
-                .update_job(
+            // The observation is a compare-and-set on the generation the
+            // caller read. A concurrent desired-state change or placement
+            // move that bumped the generation must not be rolled back by a
+            // stale report — that would fence every newer observation and
+            // pin the Job in a reconciling loop.
+            match storage
+                .update_job_observation(
                     job_id,
-                    None,
-                    Some(observed_state.into()),
-                    Some(convergence.into()),
-                    Some(generation),
+                    observed_state,
+                    convergence,
+                    generation,
+                    generation,
                     checkpoint_id.map(str::to_owned),
                     last_error.map(str::to_owned),
                 )
                 .await
-                .map_err(HubError::from)?
+            {
+                Ok(updated) => updated,
+                Err(StorageError::GenerationConflict { .. }) => {
+                    return self.job(job_id).await;
+                }
+                Err(error) => return Err(HubError::from(error)),
+            }
         } else {
             let mut jobs = self.jobs.write().await;
             let Some(job) = jobs.get_mut(job_id) else {
                 return Ok(None);
             };
+            if job.generation != generation {
+                // Stale report under the same lock: a newer generation is
+                // already recorded and must not be rolled back.
+                return Ok(Some(job.clone()));
+            }
             job.observed_state = observed_state.into();
             job.convergence = convergence.into();
             job.generation = generation;
@@ -1517,10 +1568,18 @@ impl Hub {
             return Err(HubError::Invalid(message));
         }
         let now = now_ms();
-        let session_token = format!(
-            "node-session-{}",
-            SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
+        // Session tokens authenticate every agent request after registration,
+        // so they MUST come from a CSPRNG: a sequential counter would be
+        // enumerable by anyone who can reach the Hub and defeat the
+        // constant-time comparisons downstream.
+        let session_token: String = {
+            use rand::TryRngCore;
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut bytes)
+                .expect("OS RNG cannot fail");
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
         // Older clients do not send a process identity. Keep them compatible
         // by treating the fresh session token as their boot identity; the
         // built-in Agent sends its stable `NodeAgentConfig::boot_id`.
@@ -2224,9 +2283,25 @@ impl Hub {
         if let Some(operation_id) = operation_id_override.as_deref() {
             if let Some(existing) = operations.get(operation_id) {
                 if existing.generation == generation {
-                    return Ok(existing.clone());
+                    // Idempotent replay: an operation still in flight — or one
+                    // that terminally SUCCEEDED — returns the existing record.
+                    // A terminal FAILURE must not wedge the intent: the
+                    // reconciler enqueues retry attempts with fresh command
+                    // ids, and the replacement operation below supersedes the
+                    // failed record under the same intent id.
+                    if matches!(
+                        existing.state,
+                        HubOperationState::Queued
+                            | HubOperationState::Dispatched
+                            | HubOperationState::Acknowledged
+                            | HubOperationState::Running
+                            | HubOperationState::Succeeded
+                    ) {
+                        return Ok(existing.clone());
+                    }
+                } else {
+                    return Err(HubError::IdempotencyKeyReused);
                 }
-                return Err(HubError::IdempotencyKeyReused);
             }
         } else if let Some(existing) = operations.values().find(|item| {
             item.node_id == node_id
@@ -3916,7 +3991,6 @@ fn job_state_format_version(spec: &arkflow_core::job::JobSpec) -> u32 {
         .map(|state| state.format_version)
         .unwrap_or(1)
 }
-static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -4028,6 +4102,320 @@ mod tests {
         assert_eq!(records[0].job_version, 2);
         assert_eq!(records[0].format_version, 3);
         assert_eq!(records[0].status, "completed");
+    }
+
+    // ---------- review P1 regressions (repair-control-plane-review-defects) ----------
+
+    /// A terminal-failure operation must not wedge its intent: the retry
+    /// attempt enqueued by the reconciler replaces the failed record and a
+    /// fresh command reaches the node.
+    #[tokio::test]
+    async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage.clone());
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let intent = hub
+            .set_desired_state(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let dispatched = hub.reconcile_once("dispatch").await.unwrap().unwrap();
+        assert_eq!(dispatched.id, intent.intent_id);
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session.session_token.clone(),
+        };
+        let polled = hub.commands(auth.clone()).await.unwrap();
+        assert_eq!(polled.len(), 1);
+        let command_id = polled[0].id.clone();
+        // The agent reports a transient execution failure: the intent must
+        // move to `retrying` with a due retry row.
+        hub.command_result(
+            auth.clone(),
+            CommandResult {
+                command_id,
+                operation_id: dispatched.id.clone(),
+                state: HubOperationState::Failed,
+                progress: 0,
+                error: Some("agent worker crashed".into()),
+                correlation_id: None,
+                generation: dispatched.generation,
+                observed_generation: None,
+                action_id: None,
+                failure_class: Some("temporary_execution".into()),
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Wait past the 1s retry backoff, then reconcile: the retry attempt
+        // must enqueue a fresh command instead of returning the terminal
+        // record without queueing anything.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // The node's short test lease expired during the backoff; the agent
+        // reconnects before the reconciler retries.
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["stream_lifecycle".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let retried = hub.reconcile_once("retry").await.unwrap();
+        assert!(retried.is_some(), "retry attempt must be enqueued");
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session.session_token,
+        };
+        let commands = hub.commands(auth).await.unwrap();
+        assert!(
+            !commands.is_empty(),
+            "a retried intent must produce a fresh command"
+        );
+    }
+
+    /// The observation write is a compare-and-set on the generation the
+    /// caller read: a concurrent desired-state bump must not be rolled back
+    /// by a stale report.
+    #[tokio::test]
+    async fn stale_job_observation_cannot_rollback_generation() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = StorageActor::start(store, 8);
+        let spec_json = serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        })
+        .to_string();
+        storage
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json,
+                desired_state: "running".into(),
+                observed_state: "starting".into(),
+                convergence: "reconciling".into(),
+                generation: 1,
+                node_ids: vec![],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        let applied = storage
+            .update_job_observation("orders", "running", "converged", 1, 1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.generation, 1);
+        // A concurrent desired-state change bumps the generation.
+        let bumped = storage
+            .update_job_desired_state("orders", "stopped", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bumped.generation, 2);
+        // The stale observation (still expecting generation 1) must be
+        // rejected instead of writing generation 1 back.
+        let conflict = storage
+            .update_job_observation("orders", "running", "converged", 1, 1, None, None)
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(StorageError::GenerationConflict {
+                expected: 1,
+                current: 2
+            })
+        ));
+        let current = storage.get_job("orders").await.unwrap().unwrap();
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.desired_state, "stopped");
+        // A fresh report at the current generation still applies.
+        let fresh = storage
+            .update_job_observation("orders", "stopped", "converged", 2, 2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.generation, 2);
+        assert_eq!(fresh.observed_state, "stopped");
+    }
+
+    /// Re-placement after a node blip must fence the abandoned node: its
+    /// current-generation Succeeded start is marked Superseded and the node
+    /// receives a stop when it reappears, instead of being deduped back into
+    /// the target set and double-running the Job.
+    #[tokio::test]
+    async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
+        let hub = Hub::new(config());
+        hub.register(RegisterRequest {
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let job = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: serde_json::json!({
+                    "id": "orders",
+                    "version": 1,
+                    "operators": [
+                        {"id": "source", "kind": "source"},
+                        {"id": "sink", "kind": "sink"}
+                    ],
+                    "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+                    "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+                    "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+                })
+                .to_string(),
+                desired_state: "running".into(),
+                observed_state: "stopped".into(),
+                convergence: "reconciling".into(),
+                generation: 1,
+                node_ids: vec![],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        // Auto-place on the only online node and let its start succeed.
+        hub.reconcile_job(&job).await.unwrap();
+        let start_op_id = {
+            let operations = hub.operations.read().await;
+            operations
+                .values()
+                .find(|operation| {
+                    operation.resource_id == "orders"
+                        && operation.operation == "job_start"
+                        && operation.node_id == "node-a"
+                        && operation.generation == 1
+                })
+                .map(|operation| operation.id.clone())
+                .expect("job_start dispatched to node-a")
+        };
+        {
+            let mut operations = hub.operations.write().await;
+            let operation = operations.get_mut(&start_op_id).unwrap();
+            operation.state = HubOperationState::Succeeded;
+        }
+        // node-a loses its lease (partition); node-b joins. The reconciler
+        // must move the Job to node-b and fence node-a's stale claim.
+        hub.nodes
+            .write()
+            .await
+            .get_mut("node-a")
+            .unwrap()
+            .resource
+            .lease_expires_at_ms = now_ms();
+        hub.register(RegisterRequest {
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        hub.reconcile_job(&job).await.unwrap();
+        {
+            let operations = hub.operations.read().await;
+            let abandoned = operations
+                .values()
+                .find(|operation| operation.id == start_op_id)
+                .unwrap();
+            assert_eq!(
+                abandoned.state,
+                HubOperationState::Superseded,
+                "the abandoned placement must be fenced"
+            );
+            assert!(operations.values().any(|operation| {
+                operation.node_id == "node-b"
+                    && operation.operation == "job_start"
+                    && operation.generation == 1
+                    && operation.state == HubOperationState::Queued
+            }));
+        }
+        // node-b's start succeeds; node-a reappears. The reconciler must NOT
+        // dedupe node-a back into the target set: it receives a stop.
+        {
+            let mut operations = hub.operations.write().await;
+            for operation in operations.values_mut() {
+                if operation.node_id == "node-b"
+                    && operation.operation == "job_start"
+                    && operation.generation == 1
+                {
+                    operation.state = HubOperationState::Succeeded;
+                }
+            }
+        }
+        hub.nodes
+            .write()
+            .await
+            .get_mut("node-a")
+            .unwrap()
+            .resource
+            .lease_expires_at_ms = now_ms() + config().lease_ttl_ms;
+        hub.reconcile_job(&job).await.unwrap();
+        let nodes = hub.nodes.read().await;
+        let node_a = nodes.get("node-a").unwrap();
+        assert!(
+            node_a
+                .commands
+                .iter()
+                .any(|command| command.operation == "job_stop"),
+            "the abandoned node must receive a stop command"
+        );
+        assert_eq!(
+            node_a
+                .commands
+                .iter()
+                .filter(|command| command.operation == "job_start")
+                .count(),
+            1,
+            "only the original start remains queued; the abandoned node must not be re-targeted"
+        );
+        assert!(
+            !nodes
+                .get("node-b")
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| command.operation == "job_stop"),
+            "the live placement must keep running"
+        );
     }
 
     fn config() -> HubConfig {
