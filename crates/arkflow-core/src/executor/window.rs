@@ -54,6 +54,18 @@ impl NumericKind {
             Self::Float64 => DataType::Float64,
         }
     }
+
+    /// The wider of two aggregate kinds (Int64 < Float32 < Float64), matching
+    /// the merge rule in `AggregateBuffer::merge`. A fired batch builds its
+    /// output with the widest kind present so integer aggregates widen instead
+    /// of truncating float sums back into integers.
+    pub fn wider(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Float64, _) | (_, Self::Float64) => Self::Float64,
+            (Self::Float32, _) | (_, Self::Float32) => Self::Float32,
+            _ => Self::Int64,
+        }
+    }
 }
 
 /// Serialized aggregate for one (window, key) pair. Kept as a compact JSON
@@ -902,6 +914,12 @@ impl ColumnarWindowOperator {
             .column_by_name("__arkflow_late_window_updates")
             .and_then(|column| column.as_any().downcast_ref::<StringArray>());
         let mut buffers = self.buffers.lock().unwrap();
+        // The operator's watermark frontier can advance ahead of the source
+        // gate's classification view (batch-embedded watermark columns,
+        // shared-tracker forwarding from another source edge, concurrent
+        // held-row release). Read it once per batch and use it as the
+        // admission guard below.
+        let current_watermark = *self.watermark_ms.lock().unwrap();
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
         let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
@@ -988,6 +1006,25 @@ impl ColumnarWindowOperator {
                         })
                     });
                 if excluded {
+                    continue;
+                }
+                // A membership whose window already closed behind this
+                // operator's watermark frontier and whose buffer was already
+                // fired and cleaned must not be re-opened as a fresh
+                // aggregate: the next fire would duplicate an already
+                // emitted window result. The gate marks known-late
+                // memberships with exclusion markers; this guard covers the
+                // release race where an unmarked row reaches the operator
+                // after the frontier moved past its window. Session timing
+                // is excluded: its dynamic per-key lateness is owned by
+                // `session_late_masks`, and bridged sessions legitimately
+                // re-key closed windows.
+                if !self.config.legacy_payload
+                    && !matches!(self.config.kind, WindowKind::Session { .. })
+                    && !late_update_flags.is_some_and(|flags| flags.value(row))
+                    && current_watermark.is_some_and(|watermark| window_end <= watermark)
+                    && !buffers.contains_key(&(window_start, key.clone()))
+                {
                     continue;
                 }
                 // A late Update corrects an already retained aggregate. Do
@@ -1195,6 +1232,16 @@ impl ColumnarWindowOperator {
         let mut legacy_messages = Vec::new();
         let journal = self.journal.clone();
         for ((start, key), buffer) in ready {
+            // A buffer that never observed a value carries no aggregate: its
+            // rows held only NULL values (or none at all). Drop it instead of
+            // emitting a fabricated count=0/sum=0 sentinel row. Legacy
+            // payloads keep the original-row emission contract regardless of
+            // observations.
+            if buffer.count == 0 && !self.config.legacy_payload && buffer.legacy_batches.is_empty()
+            {
+                buffers.remove(&(start, key.clone()));
+                continue;
+            }
             if let Some(buffer_state) = buffers.get_mut(&(start, key.clone())) {
                 buffer_state.emitted = true;
                 buffer_state.updated_since_emit = false;
@@ -1262,10 +1309,14 @@ impl ColumnarWindowOperator {
             merged.set_input_name(legacy_messages[0].get_input_name());
             return Ok(Some((Arc::new(merged), fired_keys)));
         }
+        // The batch's output kind is the WIDEST kind across the fired
+        // buffers, not whichever buffer happens to come first: an Int64-kind
+        // buffer firing next to Float64 aggregates must widen the integers,
+        // never truncate the float sums back into integers.
         let kind = sum_values
-            .first()
+            .iter()
             .map(NumericValue::kind)
-            .unwrap_or(NumericKind::Int64);
+            .fold(NumericKind::Int64, NumericKind::wider);
         let sum_column = numeric_array(&sum_values, kind)?;
         let min_column = numeric_array(&min_values, kind)?;
         let max_column = numeric_array(&max_values, kind)?;
@@ -3432,6 +3483,167 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(amounts.values(), &[7]);
+    }
+
+    /// Rows with a nullable Float64 value column.
+    fn nullable_float_batch(
+        rows: Vec<(i64, &str, Option<f64>)>,
+        watermark: Option<i64>,
+    ) -> MessageBatchRef {
+        let mut fields = vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(I64::from(rows.iter().map(|row| row.0).collect::<Vec<_>>())),
+            Arc::new(datafusion::arrow::array::StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(datafusion::arrow::array::Float64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ];
+        if let Some(watermark) = watermark {
+            fields.push(Field::new("__watermark_ms", DataType::Int64, false));
+            columns.push(Arc::new(I64::from(vec![watermark; rows.len()])));
+        }
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+        ))
+    }
+
+    /// A NULL value must not fabricate a count=0 zero-sentinel aggregate, and
+    /// a NULL-only buffer firing next to float aggregates must not truncate
+    /// the batch output kind back to Int64.
+    #[tokio::test]
+    async fn null_values_never_fabricate_or_truncate_aggregates() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = operator(WindowTrigger::Watermark, backend);
+        op.process(nullable_float_batch(
+            vec![
+                (1_000, "a", None),
+                (2_000, "b", Some(1.5)),
+                (3_000, "b", Some(1.0)),
+            ],
+            None,
+        ))
+        .await
+        .unwrap();
+        let fired = op
+            .process(nullable_float_batch(
+                vec![(11_000, "b", Some(2.0))],
+                Some(10_000),
+            ))
+            .await
+            .unwrap();
+        let ProcessResult::Single(fired) = fired else {
+            panic!("window should fire");
+        };
+        let keys = fired
+            .record_batch()
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let sums = fired
+            .record_batch()
+            .column_by_name("sum")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "the NULL-only key must not emit a phantom aggregate row"
+        );
+        assert_eq!(keys.value(0), "b");
+        assert_eq!(counts.value(0), 2);
+        assert_eq!(
+            sums.value(0),
+            2.5,
+            "the float sum must not be truncated to an integer"
+        );
+        assert_eq!(
+            fired
+                .record_batch()
+                .column_by_name("sum")
+                .unwrap()
+                .data_type(),
+            &DataType::Float64,
+        );
+    }
+
+    /// A row released by a source gate after the operator's watermark
+    /// frontier already fired and cleaned its window must not re-open the
+    /// window as a fresh aggregate (duplicate initial emission).
+    #[tokio::test]
+    async fn released_row_never_reopens_a_fired_and_cleaned_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = operator(WindowTrigger::Watermark, backend);
+        op.process(batch(vec![(5_000, "a", 1)], None))
+            .await
+            .unwrap();
+        // Watermark 60_000 fires [0, 10000) and holds [60000, 70000);
+        // watermark 95_000 fires [60000, 70000); watermark 99_500 cleans
+        // both (allowed_lateness_ms = 0), leaving only [90000, 100000).
+        let fired = op
+            .process(batch(vec![(61_000, "a", 2)], Some(60_000)))
+            .await
+            .unwrap();
+        assert!(matches!(fired, ProcessResult::Single(_)));
+        let fired = op
+            .process(batch(vec![(96_000, "a", 3)], Some(95_000)))
+            .await
+            .unwrap();
+        assert!(matches!(fired, ProcessResult::Single(_)));
+        let cleaned = op
+            .process(batch(vec![(99_600, "a", 4)], Some(99_500)))
+            .await
+            .unwrap();
+        assert!(matches!(cleaned, ProcessResult::None));
+        // The gate release race: an unmarked row for a closed window
+        // arrives after the frontier moved past it. It must be treated as
+        // a late membership, not re-open the window.
+        let released = op
+            .process(batch(vec![(5_000, "a", 7)], None))
+            .await
+            .unwrap();
+        assert!(matches!(released, ProcessResult::None));
+        let refired = op
+            .process(batch(vec![(199_600, "a", 5)], Some(199_500)))
+            .await
+            .unwrap();
+        let ProcessResult::Single(refired) = refired else {
+            panic!("the held far-future window should fire");
+        };
+        let starts = refired
+            .record_batch()
+            .column_by_name("window_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for index in 0..starts.len() {
+            assert_ne!(
+                starts.value(index),
+                0,
+                "the fired-and-cleaned [0,10000) window must not be re-emitted"
+            );
+        }
     }
 }
 
