@@ -1,8 +1,5 @@
-# stream-backpressure Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change redesign-backpressure-notify. Update Purpose after archive.
-## Requirements
 ### Requirement: In-flight messages stay bounded
 Pipeline stages SHALL be connected by bounded channels, and the number of in-flight envelopes a stage holds — those sent but not yet consumed downstream — SHALL NOT exceed the edge's configured capacity (default 1024). A stage whose downstream edge is full SHALL await send rather than buffer without bound, so that a slow downstream propagates backpressure up to the source chain, which stops reading new input until capacity is released.
 
@@ -38,4 +35,3 @@ The ordered-delivery guarantee SHALL be independent of backpressure: data envelo
 #### Scenario: Still written in order across repeated backpressure cycles
 - **WHEN** backpressure is entered and exited repeatedly during a run
 - **THEN** the sink still observes batches in source order, with no reordering or loss
-

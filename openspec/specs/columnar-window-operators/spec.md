@@ -1,7 +1,8 @@
 # columnar-window-operators Specification
 
-## ADDED Requirements
-
+## Purpose
+TBD - created by archiving change rebuild-unified-streaming-engine. Update Purpose after archive.
+## Requirements
 ### Requirement: Vectorized window assignment
 
 Window assignment SHALL be computed with Arrow columnar operations over entire
@@ -71,8 +72,6 @@ windows SHALL follow the same assignment/state/trigger contracts.
 - **WHEN** a sliding window has size 10m and slide 2m
 - **THEN** one event contributes to the windows whose intervals contain its timestamp
 
-## MODIFIED Requirements
-
 ### Requirement: Window semantics live in operators
 
 `event-time-processing` window semantics SHALL be enforced by window operators
@@ -82,3 +81,4 @@ inside the execution kernel rather than by buffer-layer plugins.
 
 - **WHEN** a StreamConfig declares `buffer: tumbling_window` and is compiled
 - **THEN** the resulting JobSpec contains a window operator in processing-time mode and no buffer plugin is instantiated
+
