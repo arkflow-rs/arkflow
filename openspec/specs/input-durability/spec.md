@@ -30,6 +30,22 @@ The WAL cursor SHALL advance through a contiguous acknowledged frontier, and the
 - **WHEN** an earlier WAL acknowledgement closes a gap and a later source acknowledgement fails
 - **THEN** the earlier caller retains its successful result, the later delivery reports its own retryable failure, and the WAL does not skip the failed source commit
 
+#### Scenario: Out-of-order acknowledgements do not skip a gap
+- **WHEN** records at offsets N and N+1 are delivered and N+1 is acknowledged before N
+- **THEN** the exposed checkpoint position remains at the next offset after the last contiguous acknowledgement and advances past N+1 only after N is acknowledged
+
+#### Scenario: Fan-out acknowledgements preserve a gap
+- **WHEN** a WAL sequence `N` fans out to multiple children and a child for `N+1` completes before the children for `N`
+- **THEN** the durable cursor remains at the last contiguous sequence before `N` and recovery still replays `N`
+
+#### Scenario: Duplicate child acknowledgement is idempotent
+- **WHEN** the same fan-out child acknowledgement is delivered more than once
+- **THEN** it does not advance the frontier twice or move the durable cursor beyond the highest contiguous completed sequence
+
+#### Scenario: Restored cursor survives an immediate checkpoint
+- **WHEN** a stream restores a WAL cursor and reaches a checkpoint before acknowledging a new input record
+- **THEN** the checkpoint reports the restored cursor rather than replacing it with an empty or earlier position
+
 ### Requirement: Crash recovery replays unacknowledged entries
 On startup, the Engine SHALL open each durability-enabled stream's WAL and replay every entry past the committed cursor into the stream before normal processing resumes. A replayed entry SHALL reconstruct the wrapped source-position acknowledgement when the input connector supports it; otherwise it SHALL use the connector's documented recovery behavior.
 
@@ -56,11 +72,11 @@ The system SHALL provide at-least-once delivery: after a crash and recovery, in-
 - **THEN** on recovery the message is replayed and MAY be delivered to the output again, while keyed state follows the successful acknowledgement boundary
 
 ### Requirement: Durability is orthogonal to windowing
-A stream MAY combine a durable ingest WAL with a windowing buffer. Enabling durability SHALL NOT disable or conflict with the configured `buffer`, and the buffer continues to operate on in-memory windowing semantics.
+A stream MAY combine a durable ingest WAL with event-time window operators. Enabling durability SHALL NOT disable or conflict with window operator behavior: windowed streams compile to window operators in the execution kernel (no buffer plugin is instantiated), and durability wraps only the input boundary.
 
-#### Scenario: Durability and window buffer coexist
+#### Scenario: Durability and window operators coexist
 - **WHEN** a stream is configured with both `durability.enabled: true` and a windowing `buffer`
-- **THEN** messages are persisted to the WAL on read AND pass through the windowing buffer as before
+- **THEN** messages are persisted to the WAL on read and the compiled Job processes them through the kernel's window operator with unchanged window semantics
 
 ### Requirement: Configurable and opt-in durability
 Durability SHALL be opt-in per stream via a `durability` configuration section. Streams without `durability` (or with `enabled: false`) SHALL retain today's in-memory, non-durable behavior. The sync policy (`per-entry` | `group-commit` | `periodic`) SHALL be configurable.

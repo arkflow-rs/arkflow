@@ -12,6 +12,11 @@ Each completed checkpoint SHALL identify the Job version, task assignments, comp
 - **WHEN** all participating sources and stateful tasks acknowledge the checkpoint barrier and durable state files are verified
 - **THEN** the checkpoint becomes the latest valid recovery point with a durable manifest whose task set exactly matches the complete planned assignment and whose source positions and state snapshots come from one acknowledged cut
 
+#### Scenario: Data acknowledgement is pending at barrier injection
+
+- **WHEN** a source has delivered a record but its downstream output acknowledgement has not completed when the barrier is sealed
+- **THEN** the record and its uncommitted state mutation are excluded from the checkpoint cut, and recovery replays it from the recorded source position
+
 #### Scenario: Local execution fuses stateless processors
 
 - **WHEN** adjacent stateless processors are represented by one execution chain and local recovery persists a checkpoint

@@ -40,8 +40,20 @@ The runtime SHALL track watermark progress by the complete physical input identi
 - **WHEN** an event-time source feeds a window whose trigger is processing time
 - **THEN** the source event-time gate forwards the row immediately and the processing-time trigger remains responsible for emission
 
+#### Scenario: A slower partition is first observed
+- **WHEN** partition 0 reports watermark 2,000 and partition 1 is then first observed at 1,000
+- **THEN** the active watermark reflects the minimum active progress and does not remain at 2,000 solely because that value was previously observed
+
+#### Scenario: One connector task multiplexes partitions
+- **WHEN** a single source task consumes physical partitions 0 and 1 and their deliveries carry those partition identities
+- **THEN** event-time progress for partition 0 cannot advance or close windows on behalf of partition 1
+
+#### Scenario: Restore a non-zero partition watermark
+- **WHEN** a source subtask assigned to physical partition 3 restores a checkpointed watermark
+- **THEN** the watermark is installed for partition 3 and no synthetic partition 0 participates in the calculation
+
 ### Requirement: Windows SHALL define lateness behavior
-Event-time windows SHALL define closure, allowed lateness, late-event handling, and emitted result behavior. Session windows SHALL retain and merge dynamic per-key session boundaries; a late row that bridges an emitted session SHALL produce an update rather than a new initial result.
+Event-time windows SHALL define closure, allowed lateness, late-event handling, and emitted result behavior. A late Update within the allowed-lateness deadline SHALL modify the already emitted window result rather than create an unrelated partial window. For sliding windows, each row SHALL be classified against every containing window membership rather than a single latest window end. Runtime metrics SHALL count each late or invalid row regardless of whether the policy drops, routes, or updates it. Session windows SHALL retain and merge dynamic per-key session boundaries; a late row that bridges an emitted session SHALL produce an update rather than a new initial result.
 
 #### Scenario: A late event arrives within allowed lateness
 - **WHEN** an event arrives after the window watermark but before the allowed-lateness deadline
@@ -50,6 +62,18 @@ Event-time windows SHALL define closure, allowed lateness, late-event handling, 
 #### Scenario: A late event exceeds allowed lateness
 - **WHEN** an event arrives after the allowed-lateness deadline
 - **THEN** the runtime routes or drops it according to the configured late-event policy and records the outcome
+
+#### Scenario: Update targets an already emitted window
+- **WHEN** a late event marked for Update arrives before the window's allowed-lateness deadline
+- **THEN** the runtime reopens the retained closed aggregate, emits a complete corrected result with an update marker, and acknowledges the input only after that result is written
+
+#### Scenario: A sliding row belongs to multiple windows
+- **WHEN** a row belongs to sliding windows ending at 5 and 9 and the first membership has already expired
+- **THEN** the first membership is classified as late independently and is not reintroduced as a new on-time aggregate merely because the later membership remains open
+
+#### Scenario: Dropped rows are counted
+- **WHEN** a batch contains multiple late rows and the policy drops them, including rows with invalid timestamps
+- **THEN** the late-event metric increases by the number of affected rows, not by one per action group
 
 ### Requirement: Event timestamps SHALL accept supported Arrow units
 An event-time source SHALL accept Int64 timestamps and Arrow timestamp columns in seconds, milliseconds, microseconds, or nanoseconds, normalize them to checked millisecond values, and reject overflow or unsupported types before processing.

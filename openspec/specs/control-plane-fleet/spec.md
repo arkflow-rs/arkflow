@@ -20,6 +20,11 @@ The Hub SHALL expose Node, Stream, configuration version, Operation, Audit Event
 
 The Hub SHALL accept Agent observations only from the authenticated session and SHALL reject or ignore reports with an older boot identity or report sequence without changing the current observed snapshot. The Agent SHALL report the process boot identity established at registration, not a session credential that can make a fresh process appear to be the old runtime.
 
+#### Scenario: Accept the first report of a new session
+
+- **WHEN** an Agent registers a new authenticated session and submits report sequence 1 with the new session identity
+- **THEN** the Hub resets that node's report cursor for the new session and accepts the report
+
 #### Scenario: Reject a stale observation
 
 - **WHEN** a node submits a report older than the stored boot and sequence cursor

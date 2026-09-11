@@ -26,7 +26,7 @@ buffered data.
 
 #### Scenario: Alignment buffer is bounded
 
-- **WHEN** alignment buffering exceeds the configured cap
+- **WHEN** alignment buffering exceeds the aligner's fixed cap
 - **THEN** the checkpoint fails with a bounded-alignment error and data flow resumes, rather than growing memory unboundedly
 
 ### Requirement: Snapshot does not stall processing

@@ -19,10 +19,10 @@ The `Output` trait SHALL provide `write_batch(&self, msgs: &[MessageBatchRef]) -
 - **THEN** the ack is not called, the WAL cursor does not advance, and the ack range is replayed on recovery
 
 ### Requirement: Transaction boundary equals the buffer aggregation unit
-When a buffer (memory, tumbling/sliding/session window, or join) aggregates multiple input messages into one output batch, that batch's composite ack (e.g. `VecAck` / `ArrayAck`) SHALL be delivered to a single `write_batch` call. A transactional output SHALL treat one `write_batch` call as one atomic transaction unit covering all constituent input acks. No buffer SHALL drop, split, or silently merge acks in a way that breaks the one-`write_batch`-per-ack-range invariant.
+When deliveries are aggregated before one output call — a window operator emission batch or a batched composite delivery — that batch's composite ack (e.g. `VecAck` / `ArrayAck`) SHALL be delivered to a single `write_batch` call. A transactional output SHALL treat one `write_batch` call as one atomic transaction unit covering all constituent input acks. No aggregation point SHALL drop, split, or silently merge acks in a way that breaks the one-`write_batch`-per-ack-range invariant.
 
 #### Scenario: Window aggregation is one transaction unit
-- **WHEN** a tumbling window aggregates messages from three input reads whose acks are combined into a single composite ack
+- **WHEN** a tumbling window operator emits one aggregate covering messages from three input reads whose acks are combined into a single composite ack
 - **THEN** the aggregated batch is delivered to exactly one `write_batch` call, and a transactional sink commits the whole window atomically
 
 ### Requirement: Kafka transactional output (L2)

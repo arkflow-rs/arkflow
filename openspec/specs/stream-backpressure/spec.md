@@ -25,7 +25,7 @@ Releasing backpressure SHALL be event-driven: when a consumer takes an envelope 
 Every chain SHALL terminate on input end (EOF/EOS) or cancellation without deadlocking on a backpressure wait: a producer awaiting send on a full edge SHALL be released when the downstream consumer stops and closes its endpoint, and consumers SHALL keep draining in order until the edge is empty so that pending envelopes and EOS can flow through.
 
 #### Scenario: Drains and exits despite backpressure at input EOF
-- **WHEN** the source reaches EOF while edges hold more in-flight envelopes than their capacity and producers are awaiting send
+- **WHEN** the source reaches EOF while edges are at capacity and producers are awaiting send
 - **THEN** consumers keep draining in order, producers send the remaining envelopes as capacity is released, EOS is forwarded through every chain, and all chains exit
 
 #### Scenario: Cancellation unblocks a full edge

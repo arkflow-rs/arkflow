@@ -41,7 +41,7 @@ vertex SHALL await send and thereby propagate backpressure to its source.
 
 #### Scenario: Capacity is configurable
 
-- **WHEN** a JobSpec sets a channel capacity
+- **WHEN** a graph is built through the builder API with a non-default channel capacity
 - **THEN** edges are constructed with that capacity, defaulting to 1024
 
 ### Requirement: Ordered delivery per edge
