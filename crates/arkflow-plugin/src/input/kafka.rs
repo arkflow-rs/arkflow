@@ -298,10 +298,21 @@ impl Input for KafkaInput {
             .try_read()
             .map_err(|_| Error::Process("Kafka partition assignment lock is unavailable".into()))?
         {
-            let mut assignment = TopicPartitionList::new();
-            for topic in &self.config.topics {
-                assignment.add_partition(topic, partition as i32);
-            }
+            // Build the explicit assignment from the CONTIGUOUS ACKNOWLEDGED
+            // frontier. On the first connect the frontier is empty and the
+            // configured start applies (End/Beginning mirrors the
+            // `auto.offset.reset` policy). On a reconnect — the only path
+            // that re-enters `connect()` while a cursor exists — the
+            // acknowledged frontier becomes explicit offsets: without them
+            // librdkafka would apply `auto.offset.reset`, which either skips
+            // every record produced during the outage (`latest`) or replays
+            // the whole retained log (`earliest`).
+            let assignment = Self::merged_restore_assignment(
+                &self.config.topics,
+                partition,
+                &self.frontier.contiguous_positions(),
+                self.config.start_from_latest,
+            );
             consumer.assign(&assignment).map_err(|e| {
                 Error::Connection(format!("You cannot assign Kafka partitions: {}", e))
             })?;
@@ -1047,6 +1058,81 @@ mod tests {
         };
         assert!(ack.ack().await.is_err());
         assert_eq!(input.current_positions().await.unwrap()[0].offset, 42);
+    }
+
+    /// A reconnect must rebuild the explicit assignment from the contiguous
+    /// acknowledged frontier instead of letting `auto.offset.reset` skip the
+    /// outage window (`latest`) or replay the whole retained log
+    /// (`earliest`).
+    #[tokio::test]
+    async fn reconnect_assignment_uses_the_acknowledged_frontier() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        input
+            .assign_partition(3)
+            .expect("explicit partition assignment");
+        // Acknowledged progress before the disconnection.
+        input.frontier.seed(&[SourcePosition {
+            topic: Some("test-topic".into()),
+            partition: 3,
+            offset: 42,
+        }]);
+        input.connect().await.unwrap();
+        let consumer_guard = input.consumer.read().await;
+        let consumer = consumer_guard.as_ref().expect("connected consumer");
+        let assignment = consumer.assignment().expect("assignment readable");
+        let element = assignment
+            .find_partition("test-topic", 3)
+            .expect("configured partition assigned");
+        assert!(
+            matches!(element.offset(), Offset::Offset(42)),
+            "the reconnect assignment must resume at the acknowledged frontier, got {:?}",
+            element.offset()
+        );
+    }
+
+    /// The first connect keeps the configured start: with an empty frontier
+    /// and `start_from_latest`, the explicit assignment starts at the end —
+    /// the same semantics the previous `auto.offset.reset` path produced.
+    #[tokio::test]
+    async fn first_connect_keeps_configured_start_semantics() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: true,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        input
+            .assign_partition(0)
+            .expect("explicit partition assignment");
+        input.connect().await.unwrap();
+        let consumer_guard = input.consumer.read().await;
+        let consumer = consumer_guard.as_ref().expect("connected consumer");
+        let assignment = consumer.assignment().expect("assignment readable");
+        let element = assignment
+            .find_partition("test-topic", 0)
+            .expect("configured partition assigned");
+        assert!(
+            matches!(element.offset(), Offset::End),
+            "an empty frontier must keep the configured start, got {:?}",
+            element.offset()
+        );
     }
 
     /// Task 3.2: restoring a subset of configured partitions merges the
