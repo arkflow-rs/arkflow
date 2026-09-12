@@ -451,6 +451,18 @@ impl ColumnarWindowOperator {
         }
     }
 
+    /// Roll the in-memory runtime back to `snapshot` after a failed
+    /// accumulation or firing. Journal transactions stay staged — their
+    /// overlays are idempotent across a retry — but the working buffers and
+    /// watermark must not keep partially applied rows, or a replay would
+    /// aggregate them twice.
+    fn restore_runtime(&self, snapshot: &WindowRuntimeSnapshot) {
+        *self.buffers.lock().unwrap() = snapshot.buffers.clone();
+        *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
+        *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;
+        *self.last_processing_activity_ms.lock().unwrap() = snapshot.last_processing_activity_ms;
+    }
+
     fn rollback_state(
         &self,
         before: WindowRuntimeSnapshot,
@@ -1179,10 +1191,7 @@ impl ColumnarWindowOperator {
     /// Emit aggregates for windows whose end has passed the trigger
     /// threshold, persisting nothing (buffers are the working state; the
     /// barrier snapshot serializes them on demand).
-    fn fire_ready(
-        &self,
-        threshold: i64,
-    ) -> Result<Option<(MessageBatchRef, Vec<(i64, String)>)>, Error> {
+    fn fire_ready(&self, threshold: i64) -> Result<WindowFiring, Error> {
         let window_size = match self.config.kind {
             WindowKind::Tumbling { size_ms } | WindowKind::Sliding { size_ms, .. } => size_ms,
             WindowKind::Session { gap_ms } => gap_ms,
@@ -1206,8 +1215,16 @@ impl ColumnarWindowOperator {
             })
             .map(|((start, key), _)| (*start, key.clone()))
             .collect::<Vec<_>>();
-        for key in &expired {
+        // Expired windows emit nothing, but their deliveries (a late Update
+        // the operator deadline rejects) still hold pending acknowledgements.
+        // Discard their staged transactions — the update they staged is
+        // rejected — and report the keys so the caller settles the delivery
+        // acknowledgements; leaving them out strands the acknowledgements in
+        // `pending_acks` forever and freezes the checkpoint frontier.
+        let mut dropped_keys = expired;
+        for key in &dropped_keys {
             buffers.remove(key);
+            self.rollback_window_txn(key);
         }
         let ready = buffers
             .iter_mut()
@@ -1217,9 +1234,6 @@ impl ColumnarWindowOperator {
             })
             .map(|((start, key), buffer)| ((*start, key.clone()), buffer.clone()))
             .collect::<Vec<_>>();
-        if ready.is_empty() {
-            return Ok(None);
-        }
         let mut starts = Vec::new();
         let mut ends = Vec::new();
         let mut key_strings: Vec<String> = Vec::new();
@@ -1228,8 +1242,8 @@ impl ColumnarWindowOperator {
         let mut min_values: Vec<NumericValue> = Vec::new();
         let mut max_values: Vec<NumericValue> = Vec::new();
         let mut updates = Vec::new();
-        let mut fired_keys = Vec::new();
         let mut legacy_messages = Vec::new();
+        let mut fired_keys = Vec::new();
         let journal = self.journal.clone();
         for ((start, key), buffer) in ready {
             // A buffer that never observed a value carries no aggregate: its
@@ -1239,7 +1253,13 @@ impl ColumnarWindowOperator {
             // observations.
             if buffer.count == 0 && !self.config.legacy_payload && buffer.legacy_batches.is_empty()
             {
+                // The delivery acknowledgements of an empty group are still
+                // open even though nothing can be emitted. Discard its staged
+                // (count-0) transaction and settle the delivery through the
+                // dropped set, or the source frontier strands here forever.
                 buffers.remove(&(start, key.clone()));
+                self.rollback_window_txn(&(start, key.clone()));
+                dropped_keys.push((start, key.clone()));
                 continue;
             }
             if let Some(buffer_state) = buffers.get_mut(&(start, key.clone())) {
@@ -1292,6 +1312,14 @@ impl ColumnarWindowOperator {
             }
         }
         drop(buffers);
+        if fired_keys.is_empty() {
+            // Only expired or empty groups fired this round: nothing to emit,
+            // but the caller still settles their delivery acknowledgements.
+            return Ok(WindowFiring {
+                output: None,
+                dropped_keys,
+            });
+        }
         if self.config.legacy_payload {
             if legacy_messages.is_empty() {
                 return Err(Error::Process(
@@ -1307,7 +1335,10 @@ impl ColumnarWindowOperator {
                 .map_err(|error| Error::Process(format!("merge legacy window batches: {error}")))?;
             let mut merged = crate::MessageBatch::new_arrow(merged);
             merged.set_input_name(legacy_messages[0].get_input_name());
-            return Ok(Some((Arc::new(merged), fired_keys)));
+            return Ok(WindowFiring {
+                output: Some((Arc::new(merged), fired_keys)),
+                dropped_keys,
+            });
         }
         // The batch's output kind is the WIDEST kind across the fired
         // buffers, not whichever buffer happens to come first: an Int64-kind
@@ -1345,11 +1376,21 @@ impl ColumnarWindowOperator {
             ],
         )
         .map_err(|error| Error::Process(format!("build window aggregate batch: {error}")))?;
-        Ok(Some((
-            Arc::new(crate::MessageBatch::new_arrow(batch)),
-            fired_keys,
-        )))
+        Ok(WindowFiring {
+            output: Some((Arc::new(crate::MessageBatch::new_arrow(batch)), fired_keys)),
+            dropped_keys,
+        })
     }
+}
+
+/// The outcome of one window firing round.
+struct WindowFiring {
+    /// Aggregate rows to emit together with the window keys they belong to.
+    output: Option<(MessageBatchRef, Vec<(i64, String)>)>,
+    /// Groups that emit nothing — expired windows and empty (never-observed)
+    /// buffers — but whose staged transactions were discarded and whose
+    /// delivery acknowledgements the caller must still settle.
+    dropped_keys: Vec<(i64, String)>,
 }
 
 /// One typed aggregate output value.
@@ -1519,22 +1560,32 @@ impl Processor for ColumnarWindowOperator {
         let operation_guard = self.operation_lock.clone().lock_owned().await;
         self.load_from_backend()?;
         let before = self.runtime_snapshot();
-        let fired = self.fire_ready(i64::MAX)?;
+        let firing = self
+            .fire_ready(i64::MAX)
+            .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
-            fired
+            firing
+                .output
                 .as_ref()
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
-        )?;
-        Ok(match fired {
+        )
+        .inspect_err(|_error| self.restore_runtime(&before))?;
+        let dropped_acks = self.take_acks(&firing.dropped_keys);
+        Ok(match firing.output {
             Some((emitted, fired_keys)) => {
                 let after = self.runtime_snapshot();
                 ProcessResult::SingleWithAck(
                     emitted,
-                    self.fired_ack(&fired_keys, Vec::new(), before, after, operation_guard),
+                    self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
                 )
             }
             None => {
+                // Only expired or empty groups fired: settle their deliveries
+                // directly so the source frontier still advances.
+                if !dropped_acks.is_empty() {
+                    ConcurrentAck(dropped_acks).ack().await?;
+                }
                 drop(operation_guard);
                 ProcessResult::None
             }
@@ -1584,22 +1635,32 @@ impl Processor for ColumnarWindowOperator {
         // event timestamps. The timestamp only determines the aggregate key;
         // it must not prevent an idle timer from emitting old or future-dated
         // records.
-        let fired = self.fire_ready(i64::MAX)?;
+        let firing = self
+            .fire_ready(i64::MAX)
+            .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
-            fired
+            firing
+                .output
                 .as_ref()
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
-        )?;
-        Ok(match fired {
+        )
+        .inspect_err(|_error| self.restore_runtime(&before))?;
+        let dropped_acks = self.take_acks(&firing.dropped_keys);
+        Ok(match firing.output {
             Some((emitted, fired_keys)) => {
                 let after = self.runtime_snapshot();
                 ProcessResult::SingleWithAck(
                     emitted,
-                    self.fired_ack(&fired_keys, Vec::new(), before, after, operation_guard),
+                    self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
                 )
             }
             None => {
+                // Only expired or empty groups fired: settle their deliveries
+                // directly so the source frontier still advances.
+                if !dropped_acks.is_empty() {
+                    ConcurrentAck(dropped_acks).ack().await?;
+                }
                 drop(operation_guard);
                 ProcessResult::None
             }
@@ -1618,22 +1679,32 @@ impl Processor for ColumnarWindowOperator {
             drop(operation_guard);
             return Ok(ProcessResult::None);
         }
-        let fired = self.fire_ready(watermark_ms)?;
+        let firing = self
+            .fire_ready(watermark_ms)
+            .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
-            fired
+            firing
+                .output
                 .as_ref()
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
-        )?;
-        Ok(match fired {
+        )
+        .inspect_err(|_error| self.restore_runtime(&before))?;
+        let dropped_acks = self.take_acks(&firing.dropped_keys);
+        Ok(match firing.output {
             Some((emitted, fired_keys)) => {
                 let after = self.runtime_snapshot();
                 ProcessResult::SingleWithAck(
                     emitted,
-                    self.fired_ack(&fired_keys, Vec::new(), before, after, operation_guard),
+                    self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
                 )
             }
             None => {
+                // Only expired or empty groups fired: settle their deliveries
+                // directly so the source frontier still advances.
+                if !dropped_acks.is_empty() {
+                    ConcurrentAck(dropped_acks).ack().await?;
+                }
                 drop(operation_guard);
                 ProcessResult::None
             }
@@ -1765,7 +1836,14 @@ impl ColumnarWindowOperator {
             };
             let touched = match self.accumulate(&accepted_batch) {
                 Ok(touched) => touched,
-                Err(error) => return Err(compensate_window_acks(error, owned_acks).await),
+                Err(error) => {
+                    // Rows already folded into buffers before the failure
+                    // must not survive: the delivery is replayed after the
+                    // ack compensation, and a partial aggregate would count
+                    // them twice.
+                    self.restore_runtime(&before);
+                    return Err(compensate_window_acks(error, owned_acks).await);
+                }
             };
             return match self
                 .finish_processed_batch(
@@ -1773,17 +1851,28 @@ impl ColumnarWindowOperator {
                     ack,
                     late_output,
                     has_ack_flow,
-                    before,
+                    before.clone(),
                     operation_guard,
                 )
                 .await
             {
                 Ok(result) => Ok(result),
-                Err(error) => Err(compensate_window_acks(error, owned_acks).await),
+                Err(error) => {
+                    self.restore_runtime(&before);
+                    Err(compensate_window_acks(error, owned_acks).await)
+                }
             };
         }
 
-        let touched = self.accumulate(&batch)?;
+        let touched = match self.accumulate(&batch) {
+            Ok(touched) => touched,
+            Err(error) => {
+                // Drop partially applied rows before the delivery is
+                // replayed, mirroring the WindowFiredAck failure path.
+                self.restore_runtime(&before);
+                return Err(error);
+            }
+        };
         let threshold = match self.config.trigger {
             WindowTrigger::Watermark => *self.watermark_ms.lock().unwrap(),
             WindowTrigger::ProcessingTime if self.config.legacy_payload => {
@@ -1822,15 +1911,22 @@ impl ColumnarWindowOperator {
 
         let Some(ack) = ack else {
             let fired = match threshold {
-                Some(threshold) => self.fire_ready(threshold)?,
-                None => None,
+                Some(threshold) => self
+                    .fire_ready(threshold)
+                    .inspect_err(|_error| self.restore_runtime(&before))?,
+                None => WindowFiring {
+                    output: None,
+                    dropped_keys: Vec::new(),
+                },
             };
             self.persist_buffers_for_fired(
                 fired
+                    .output
                     .as_ref()
                     .map(|(_, keys)| keys.as_slice())
                     .unwrap_or(&[]),
-            )?;
+            )
+            .inspect_err(|_error| self.restore_runtime(&before))?;
             // No acknowledgement flow gates the commit, so fired windows
             // and still-open window mutations commit immediately (legacy
             // direct-persist semantics).  Committing only fired keys would
@@ -1838,7 +1934,7 @@ impl ColumnarWindowOperator {
             // no-ack caller, eventually exhausting the journal bound.
             self.commit_all_window_txns()?;
             drop(operation_guard);
-            return Ok(match fired {
+            return Ok(match fired.output {
                 Some((emitted, _)) => ProcessResult::Single(emitted),
                 None => ProcessResult::None,
             });
@@ -1855,17 +1951,34 @@ impl ColumnarWindowOperator {
         }
 
         let fired = match threshold {
-            Some(threshold) => self.fire_ready(threshold)?,
-            None => None,
+            Some(threshold) => self.fire_ready(threshold).inspect_err(|_error| {
+                // A half-fired round (some buffers already marked emitted)
+                // must not keep that memory state: the error surfaces as a
+                // replay, and `emitted`-but-never-emitted windows would
+                // never fire again.
+                self.restore_runtime(&before);
+            })?,
+            None => WindowFiring {
+                output: None,
+                dropped_keys: Vec::new(),
+            },
         };
         self.persist_buffers_for_fired(
             fired
+                .output
                 .as_ref()
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
-        )?;
+        )
+        .inspect_err(|_error| self.restore_runtime(&before))?;
 
-        let Some((emitted, fired_keys)) = fired else {
+        let dropped_acks = self.take_acks(&fired.dropped_keys);
+        let Some((emitted, fired_keys)) = fired.output else {
+            // Nothing was emitted, but expired or empty groups still settled:
+            // acknowledge their deliveries now so the source frontier moves.
+            if !dropped_acks.is_empty() {
+                ConcurrentAck(dropped_acks).ack().await?;
+            }
             if touched.is_empty() {
                 ack.ack().await?;
             }
@@ -1873,13 +1986,18 @@ impl ColumnarWindowOperator {
             return Ok(ProcessResult::Deferred);
         };
 
-        let extra = if touched.is_empty() {
+        let mut extra = if touched.is_empty() {
             // A watermark-only batch still has to be committed, but only
             // after the output produced by that watermark has been written.
             vec![ack]
         } else {
             Vec::new()
         };
+        // Dropped groups (expired windows, empty buffers) settle together
+        // with the fired output: their state was rolled back, so releasing
+        // their deliveries alongside the aggregate commit keeps one
+        // settlement boundary.
+        extra.extend(dropped_acks);
         let after = self.runtime_snapshot();
         Ok(ProcessResult::SingleWithAck(
             emitted,
@@ -1947,19 +2065,34 @@ impl ColumnarWindowOperator {
         }
 
         let fired = match threshold {
-            Some(threshold) => self.fire_ready(threshold)?,
-            None => None,
+            Some(threshold) => self.fire_ready(threshold).inspect_err(|_error| {
+                // Same rollback contract as the direct path: a half-fired
+                // round must not survive as emitted-but-unemitted memory.
+                self.restore_runtime(&before);
+            })?,
+            None => WindowFiring {
+                output: None,
+                dropped_keys: Vec::new(),
+            },
         };
         self.persist_buffers_for_fired(
             fired
+                .output
                 .as_ref()
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
-        )?;
+        )
+        .inspect_err(|_error| self.restore_runtime(&before))?;
 
-        match fired {
+        let dropped_acks = self.take_acks(&fired.dropped_keys);
+        match fired.output {
             None => {
                 if has_ack_flow {
+                    if !dropped_acks.is_empty() {
+                        // Expired or empty groups settled without an output:
+                        // release their deliveries directly.
+                        ConcurrentAck(dropped_acks).ack().await?;
+                    }
                     if touched.is_empty() {
                         // A watermark-only batch still has to be acknowledged
                         // even when it did not mutate a window. In the
@@ -1981,7 +2114,7 @@ impl ColumnarWindowOperator {
                 }
             }
             Some((emitted, fired_keys)) if has_ack_flow => {
-                let extra = if touched.is_empty() {
+                let mut extra = if touched.is_empty() {
                     // A watermark-only batch still has to be committed, but
                     // only after the output produced by that watermark is
                     // written.
@@ -1989,6 +2122,9 @@ impl ColumnarWindowOperator {
                 } else {
                     Vec::new()
                 };
+                // Dropped groups settle together with the fired output so a
+                // source failure rolls the whole round back consistently.
+                extra.extend(dropped_acks);
                 let after = self.runtime_snapshot();
                 Ok(append_late_session_output(
                     ProcessResult::SingleWithAck(
@@ -2413,7 +2549,7 @@ fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Float64Array, Int64Array as I64, StringArray};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FailOnceAck {
         fail: AtomicBool,
@@ -2427,6 +2563,18 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct CountingAck {
+        acked: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Ack for CountingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.fetch_add(1, Ordering::AcqRel);
+            Ok(())
         }
     }
 
@@ -3511,6 +3659,94 @@ mod tests {
         Arc::new(crate::MessageBatch::new_arrow(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
         ))
+    }
+
+    /// Regression: a window group whose rows all carried NULL values emits
+    /// no aggregate, but its delivery acknowledgement must still settle when
+    /// the window fires — otherwise the acknowledgement strands in
+    /// `pending_acks` forever, the source frontier freezes, and its journal
+    /// transaction leaks toward the pending bound.
+    #[tokio::test]
+    async fn empty_null_window_settles_its_source_acknowledgement() {
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(
+            backend.clone(),
+        ));
+        let op = ColumnarWindowOperator::with_journal(
+            WindowOperatorConfig {
+                kind: WindowKind::Tumbling { size_ms: 1_000 },
+                timestamp_field: "ts".into(),
+                key_field: "key".into(),
+                value_fields: vec!["value".into()],
+                trigger: WindowTrigger::Watermark,
+                trigger_interval_ms: 1_000,
+                watermark_field: "__watermark_ms".into(),
+                allowed_lateness_ms: 0,
+                legacy_payload: false,
+            },
+            backend.clone(),
+            journal.clone(),
+            "null-window-ack-test",
+        );
+        let source_ack = Arc::new(CountingAck {
+            acked: AtomicUsize::new(0),
+        });
+
+        // A NULL-only group: the row buffers the window but never produces a
+        // value, so the group can only be dropped at fire time.
+        op.process_with_ack(
+            nullable_float_batch(vec![(100, "a", None)], None),
+            source_ack.clone() as Arc<dyn Ack>,
+        )
+        .await
+        .unwrap();
+        assert!(
+            op.pending_acks
+                .lock()
+                .unwrap()
+                .contains_key(&(0, "a".to_string())),
+            "the delivery is held by the open window"
+        );
+        assert_eq!(journal.pending_transactions(), 1);
+
+        // The watermark fires the window; the NULL-only group must settle its
+        // delivery and discard its transaction instead of stranding them.
+        let fired = op
+            .process_with_ack(
+                nullable_float_batch(vec![(2_000, "b", Some(1.0))], Some(1_000)),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(fired, ProcessResult::Deferred),
+            "a NULL-only round emits no aggregate row"
+        );
+
+        assert_eq!(
+            source_ack.acked.load(Ordering::Acquire),
+            1,
+            "the NULL-only window's delivery must be acknowledged"
+        );
+        assert!(
+            !op.window_txns
+                .lock()
+                .unwrap()
+                .contains_key(&(0, "a".to_string())),
+            "the empty window's transaction must be discarded"
+        );
+        // The still-open window for key "b" keeps its staged transaction.
+        assert_eq!(journal.pending_transactions(), 1);
+        {
+            let pending = op.pending_acks.lock().unwrap();
+            assert!(
+                !pending.contains_key(&(0, "a".to_string())),
+                "the NULL-only window's acknowledgement must not strand"
+            );
+            // The open "b" window legitimately holds its delivery.
+            assert!(pending.contains_key(&(2_000, "b".to_string())));
+        }
     }
 
     /// A NULL value must not fabricate a count=0 zero-sentinel aggregate, and

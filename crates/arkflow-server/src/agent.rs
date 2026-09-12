@@ -52,7 +52,15 @@ pub struct NodeAgentConfig {
 struct JobRuntime {
     tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
     starts: Arc<Mutex<()>>,
+    /// Finished-task observations whose delivery to the Hub failed. They are
+    /// retried by the next session; dropping them would leave the Hub
+    /// reporting a dead job as running forever (the start operation stays
+    /// `Succeeded` and reconcile skips the re-dispatch).
+    pending_observations: Arc<Mutex<Vec<FinishedJob>>>,
 }
+
+/// One finished kernel task and the outcome its Hub observation carries.
+type FinishedJob = (String, u64, Result<(), String>);
 
 struct JobTask {
     generation: u64,
@@ -744,8 +752,8 @@ impl JobRuntime {
         ))
     }
 
-    async fn take_finished(&self) -> Vec<(String, u64, Result<(), String>)> {
-        let mut finished = Vec::new();
+    async fn take_finished(&self) -> Vec<FinishedJob> {
+        let mut finished = std::mem::take(&mut *self.pending_observations.lock().await);
         let mut tasks = self.tasks.lock().await;
         let ids = tasks
             .iter()
@@ -764,6 +772,15 @@ impl JobRuntime {
             }
         }
         finished
+    }
+
+    /// Park undelivered finished-task observations so the next session
+    /// retries them. `take_finished` drains the parked queue first.
+    async fn park_observations(&self, observations: Vec<FinishedJob>) {
+        if observations.is_empty() {
+            return;
+        }
+        self.pending_observations.lock().await.extend(observations);
     }
 
     async fn stop_all(&self) {
@@ -1289,25 +1306,35 @@ async fn run_session(
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime).await).await?; }
             _ = poll.tick() => {
-                for (job_id, generation, outcome) in job_runtime.take_finished().await {
+                let finished = job_runtime.take_finished().await;
+                for (index, (job_id, generation, outcome)) in finished.iter().enumerate() {
                     let (state, error) = match outcome {
                         Ok(()) => ("stopped".into(), None),
-                        Err(error) => ("failed".into(), Some(error)),
+                        Err(error) => ("failed".into(), Some(error.clone())),
                     };
-                    post_json(
+                    if let Err(delivery) = post_json(
                         client,
                         format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/job-observations"),
                         &crate::hub::JobObservationRequest {
                             auth: auth.clone(),
-                            job_id,
-                            generation,
+                            job_id: job_id.clone(),
+                            generation: *generation,
                             state,
                             error,
                         },
-                    ).await?;
+                    ).await {
+                        // Park this observation and everything behind it: the
+                        // task is already removed from the runtime map, so
+                        // dropping the observation would leave the Hub
+                        // reporting the job as running forever.
+                        let mut undelivered = finished[index..].to_vec();
+                        undelivered[0] = (job_id.clone(), *generation, outcome.clone());
+                        job_runtime.park_observations(undelivered).await;
+                        return Err(delivery);
+                    }
                 }
-                let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).append_pair("session_token", &auth.session_token).finish();
-                let commands: Vec<AgentCommand> = client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)).send().await?.error_for_status()?.json().await?;
+                let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).finish();
+                let commands: Vec<AgentCommand> = bearer_auth(client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)), &auth.session_token).send().await?.error_for_status()?.json().await?;
                 for command in commands {
                     if let Some(result) = replay_cached_command(completed_commands, &command.id) {
                         send_result(client, config, &auth, result).await?;
@@ -1827,21 +1854,21 @@ async fn send_result(
     auth: &AgentAuth,
     result: CommandResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    post_json(
-        client,
-        format!(
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("node_id", &auth.node_id)
+        .finish();
+    bearer_auth(
+        client.post(format!(
             "{}{}/agent/commands/{}/result?{}",
-            config.hub_url,
-            config.api_prefix,
-            result.command_id,
-            url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("node_id", &auth.node_id)
-                .append_pair("session_token", &auth.session_token)
-                .finish()
-        ),
-        &result,
+            config.hub_url, config.api_prefix, result.command_id, query
+        )),
+        &auth.session_token,
     )
-    .await
+    .json(&result)
+    .send()
+    .await?
+    .error_for_status()?;
+    Ok(())
 }
 async fn post_json<T: Serialize>(
     client: &Client,
@@ -1855,6 +1882,14 @@ async fn post_json<T: Serialize>(
         .await?
         .error_for_status()?;
     Ok(())
+}
+/// Attach the session credential as a Bearer header: tokens in URL query
+/// strings leak into reverse-proxy and access logs.
+fn bearer_auth(builder: reqwest::RequestBuilder, session_token: &str) -> reqwest::RequestBuilder {
+    builder.header(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {session_token}"),
+    )
 }
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1875,6 +1910,31 @@ fn command_is_stale(command_generation: u64, latest_generation: Option<u64>) -> 
 mod tests {
     use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+
+    /// A finished-task observation whose delivery failed must survive the
+    /// session rebuild: the task is already gone from the runtime map, so
+    /// dropping the observation would leave the Hub reporting the job as
+    /// running forever.
+    #[tokio::test]
+    async fn parked_job_observations_are_redelivered_by_the_next_session() {
+        let runtime = JobRuntime::default();
+        runtime
+            .park_observations(vec![
+                ("orders".into(), 3, Err("kernel failed".into())),
+                ("billing".into(), 1, Ok(())),
+            ])
+            .await;
+
+        let finished = runtime.take_finished().await;
+        assert_eq!(finished.len(), 2, "parked observations are retried");
+        assert_eq!(finished[0].0, "orders");
+        assert_eq!(finished[0].1, 3);
+        assert!(finished[0].2.is_err());
+        assert_eq!(finished[1].0, "billing");
+
+        // A later session with no new finishes must not re-deliver them.
+        assert!(runtime.take_finished().await.is_empty());
+    }
 
     #[test]
     fn agent_mode_requires_hub_and_stable_identity() {

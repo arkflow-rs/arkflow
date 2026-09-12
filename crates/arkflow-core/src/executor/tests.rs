@@ -440,6 +440,7 @@ fn stateful_operator_breaks_the_chain() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
@@ -1442,6 +1443,7 @@ async fn partitioned_edge_routes_by_key_hash() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
@@ -2233,6 +2235,7 @@ fn stateful_operator_wrapped_with_task_namespace() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -2288,6 +2291,7 @@ fn stateful_operator_without_backend_is_rejected() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
@@ -2347,6 +2351,7 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = UnpartitionedAdapter(Adapter {
@@ -2552,6 +2557,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
             namespace: None,
             ttl_ms: None,
             format_version: 1,
+            max_pending_transactions: None,
         }),
         checkpoint: None,
         recovery: Default::default(),
@@ -2891,6 +2897,7 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
         namespace: None,
         ttl_ms: None,
         format_version: 1,
+        max_pending_transactions: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let dir = tempfile::tempdir().unwrap();

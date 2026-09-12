@@ -423,6 +423,10 @@ enum StorageCommand {
         mutation: NodeMutation,
         response: oneshot::Sender<Result<(), StorageError>>,
     },
+    ResetObservedCursors {
+        node_id: String,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
     SetDesired {
         mutation: DesiredMutation,
         response: oneshot::Sender<Result<IntentRecord, StorageError>>,
@@ -659,6 +663,9 @@ impl StorageActor {
                     }
                     StorageCommand::UpsertNode { mutation, response } => {
                         let _ = response.send(store.upsert_node(mutation));
+                    }
+                    StorageCommand::ResetObservedCursors { node_id, response } => {
+                        let _ = response.send(store.reset_observed_cursors(&node_id));
                     }
                     StorageCommand::SetDesired { mutation, response } => {
                         let _ = response.send(store.set_desired(mutation));
@@ -1037,6 +1044,21 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::UpsertNode { mutation, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn reset_observed_cursors(
+        &self,
+        node_id: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ResetObservedCursors {
+                node_id: node_id.into(),
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1713,6 +1735,22 @@ impl ControlPlaneStore {
                     mutation.maintenance_state,
                     mutation.maintenance_updated_at_ms,
                 ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Reset every per-stream report cursor for a node. The Agent restarts
+    /// `report_seq` from 1 on each session rebuild (register), so a cursor
+    /// left at the previous session's high-water mark would silently drop
+    /// every new report until the node caught up to it — blinding stream
+    /// convergence, configuration rollout, and reconcile for the whole
+    /// previous session's duration.
+    pub fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE cp_stream_observed SET report_seq = 0 WHERE node_id = ?1",
+                rusqlite::params![node_id],
             )?;
             Ok(())
         })
@@ -2806,7 +2844,7 @@ impl ControlPlaneStore {
     ) -> Result<Option<JobRecord>, StorageError> {
         self.with_connection(|connection| {
             connection.execute(
-                "UPDATE cp_jobs SET desired_state=COALESCE(?2, desired_state), observed_state=COALESCE(?3, observed_state), convergence=COALESCE(?4, convergence), generation=COALESCE(?5, generation), checkpoint_id=COALESCE(?6, checkpoint_id), last_error=?7, updated_at_ms=?8 WHERE job_id=?1",
+                "UPDATE cp_jobs SET desired_state=COALESCE(?2, desired_state), observed_state=COALESCE(?3, observed_state), convergence=COALESCE(?4, convergence), generation=COALESCE(?5, generation), checkpoint_id=COALESCE(?6, checkpoint_id), last_error=COALESCE(?7, last_error), updated_at_ms=?8 WHERE job_id=?1",
                 rusqlite::params![job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error, now_ms()],
             )?;
             connection
@@ -3866,6 +3904,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(observed, "running");
+    }
+
+    /// A session rebuild (re-register with the same stable boot identity)
+    /// restarts the Agent's report_seq at 1. The Hub resets the per-stream
+    /// cursors at register; without that reset every new observation is
+    /// silently dropped until the node re-reaches the previous session's
+    /// high-water mark, blinding convergence for the whole rebuild gap.
+    #[test]
+    fn stable_boot_session_rebuild_resets_the_observation_cursor() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let observed = |seq: u64, state: &str| ObservedMutation {
+            node_id: "node-a".into(),
+            stream_id: "orders".into(),
+            boot_id: Some("boot-stable".into()),
+            report_seq: seq,
+            observed_generation: Some(1),
+            observed_state: state.into(),
+            config_version_id: None,
+            action_id: None,
+            snapshot_json: "{}".into(),
+            last_error_code: None,
+            last_error_message: None,
+        };
+        store.record_observed(observed(7, "running")).unwrap();
+        // Re-register resets the stored cursors for this node.
+        store.reset_observed_cursors("node-a").unwrap();
+        // Sequence 1 of the rebuilt session must be accepted, not dropped
+        // as stale under the previous session's cursor of 7.
+        store.record_observed(observed(1, "failed")).unwrap();
+        let (state, seq): (String, u64) = store
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT observed_state, report_seq FROM cp_stream_observed WHERE node_id = 'node-a' AND stream_id = 'orders'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((state.as_str(), seq), ("failed", 1));
     }
 
     #[test]

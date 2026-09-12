@@ -1028,7 +1028,7 @@ async fn hub_job_upgrade(
 
 async fn hub_job_upgrade_rollback(
     State(hub): State<hub::Hub>,
-    Path((job_id, _upgrade_id)): Path<(String, String)>,
+    Path((job_id, upgrade_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_operator_action(
@@ -1056,14 +1056,35 @@ async fn hub_job_upgrade_rollback(
         Ok(versions) => versions,
         Err(error) => return hub_problem(error),
     };
-    let Some(previous) = versions
-        .into_iter()
-        .find(|version| version.version < current.version)
-    else {
+    // The console requests a specific version ("restore-v{N}"); honour it
+    // instead of always stepping back to the immediately previous one.
+    // An opaque upgrade id falls back to the previous-version semantics.
+    let requested = upgrade_id
+        .trim()
+        .trim_start_matches("restore-")
+        .trim_start_matches('v')
+        .parse::<u64>()
+        .ok();
+    let previous = match requested {
+        Some(target) => versions
+            .into_iter()
+            .find(|version| version.version == target)
+            .filter(|version| version.version < current.version),
+        None => versions
+            .into_iter()
+            .find(|version| version.version < current.version),
+    };
+    let Some(previous) = previous else {
         return problem(
             StatusCode::CONFLICT,
             "no_previous_job_version",
-            "No previous Job version is available for recovery".into(),
+            match requested {
+                Some(target) => format!(
+                    "Job {job_id} has no restorable version {target} below the current version {}",
+                    current.version
+                ),
+                None => "No previous Job version is available for recovery".into(),
+            },
         );
     };
     let restored_spec_json =
@@ -2395,11 +2416,48 @@ async fn agent_job_observation(
         Err(error) => hub_problem(error),
     }
 }
+/// Session tokens embedded in URL query strings leak into reverse-proxy and
+/// access logs. Prefer the `Authorization: Bearer` header; the query param
+/// remains accepted for older Agents.
+fn bearer_session_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+/// Query parameters for the agent command endpoints. The session token is
+/// optional here: it travels in the `Authorization: Bearer` header; the query
+/// field remains accepted for older Agents.
+#[derive(serde::Deserialize)]
+struct AgentCommandsQuery {
+    node_id: String,
+    session_token: Option<String>,
+}
+
 async fn agent_commands(
     State(hub): State<hub::Hub>,
-    Query(auth): Query<hub::AgentAuth>,
+    headers: HeaderMap,
+    Query(query): Query<AgentCommandsQuery>,
 ) -> Response {
-    match hub.commands(auth).await {
+    let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing session token".into(),
+        );
+    };
+    match hub
+        .commands(hub::AgentAuth {
+            node_id: query.node_id,
+            session_token,
+        })
+        .await
+    {
         Ok(commands) => Json(commands).into_response(),
         Err(error) => hub_problem(error),
     }
@@ -2407,10 +2465,27 @@ async fn agent_commands(
 async fn agent_command_result(
     State(hub): State<hub::Hub>,
     Path(_id): Path<String>,
-    Query(auth): Query<hub::AgentAuth>,
+    headers: HeaderMap,
+    Query(query): Query<AgentCommandsQuery>,
     Json(result): Json<hub::CommandResult>,
 ) -> Response {
-    match hub.command_result(auth, result).await {
+    let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing session token".into(),
+        );
+    };
+    match hub
+        .command_result(
+            hub::AgentAuth {
+                node_id: query.node_id,
+                session_token,
+            },
+            result,
+        )
+        .await
+    {
         Ok(operation) => Json(operation).into_response(),
         Err(error) => hub_problem(error),
     }

@@ -416,7 +416,11 @@ impl AckTracker {
 pub struct TrackingAck {
     tracker: Arc<AckTracker>,
     inner: Arc<dyn Ack>,
-    held: std::sync::atomic::AtomicBool,
+    /// Outstanding hold claims on this delivery. A fan-out branch (or a
+    /// nested buffering operator on one branch) each contribute one claim;
+    /// the tracker only counts the delivery as held while the claim count
+    /// transitions between zero and non-zero.
+    held: std::sync::atomic::AtomicUsize,
     completed: std::sync::atomic::AtomicBool,
     ack_lock: tokio::sync::Mutex<()>,
 }
@@ -427,7 +431,7 @@ impl TrackingAck {
         Self {
             tracker,
             inner,
-            held: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::atomic::AtomicUsize::new(0),
             completed: std::sync::atomic::AtomicBool::new(false),
             ack_lock: tokio::sync::Mutex::new(()),
         }
@@ -442,7 +446,8 @@ impl TrackingAck {
         if self.completed.swap(false, Ordering::AcqRel) {
             self.tracker.completed.fetch_sub(1, Ordering::AcqRel);
         }
-        if self.held.swap(false, Ordering::AcqRel) {
+        let claims = self.held.swap(0, Ordering::AcqRel);
+        if claims > 0 {
             self.tracker.held.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -456,7 +461,8 @@ impl TrackingAck {
             return;
         }
         self.tracker.completed.fetch_add(1, Ordering::AcqRel);
-        if self.held.swap(false, Ordering::AcqRel) {
+        let claims = self.held.swap(0, Ordering::AcqRel);
+        if claims > 0 {
             self.tracker.held.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -475,7 +481,8 @@ impl Ack for TrackingAck {
             self.tracker.completed.fetch_add(1, Ordering::AcqRel);
             // A held acknowledgement that eventually completes (a window
             // fired) no longer blocks later barriers.
-            if self.held.swap(false, Ordering::AcqRel) {
+            let claims = self.held.swap(0, Ordering::AcqRel);
+            if claims > 0 {
                 self.tracker.held.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -504,14 +511,35 @@ impl Ack for TrackingAck {
     }
 
     fn mark_held(&self) {
-        if !self.held.swap(true, Ordering::AcqRel) {
+        // Multiple fan-out branches (and nested buffering operators) can hold
+        // this delivery at once; the tracker excludes the delivery exactly
+        // once while any claim is outstanding.
+        let previous = self.held.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
             self.tracker.held.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn release_held(&self) {
-        if self.held.swap(false, Ordering::AcqRel) {
-            self.tracker.held.fetch_sub(1, Ordering::AcqRel);
+        let mut current = self.held.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.held.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if current == 1 {
+                        self.tracker.held.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 }

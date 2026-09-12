@@ -113,6 +113,7 @@ pub fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn Ack>> {
             Arc::new(FanoutAckPart {
                 state: state.clone(),
                 acknowledged,
+                held: Arc::new(AtomicBool::new(false)),
             }) as Arc<dyn Ack>
         })
         .collect()
@@ -132,6 +133,12 @@ struct FanoutAckState {
 struct FanoutAckPart {
     state: Arc<FanoutAckState>,
     acknowledged: Arc<AtomicBool>,
+    /// Per-branch hold state. Siblings of one fan-out hold and release
+    /// independently (for example a gate dispatch splits one delivery into a
+    /// held window group and ready groups), so the shared parent must only
+    /// observe hold *transitions* of each branch, never a branch's release of
+    /// a hold it does not own.
+    held: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -155,6 +162,12 @@ impl Ack for FanoutAckPart {
         // the group more than once.
         if self.acknowledged.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        // A branch that completes while still marked held (its operator acked
+        // without an explicit release) must not leave the shared tracker
+        // excluding it from barrier draining forever.
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.state.parent.release_held();
         }
         if self.state.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             match self.state.parent.ack().await {
@@ -224,12 +237,18 @@ impl Ack for FanoutAckPart {
 
     fn mark_held(&self) {
         // The held child may never ack before shutdown; propagate so the
-        // group's source-side tracker excludes it from barrier draining.
-        self.state.parent.mark_held();
+        // group's source-side tracker excludes it from barrier draining. Only
+        // this branch's first hold transitions the parent — a sibling's hold
+        // or release must not consume it.
+        if !self.held.swap(true, Ordering::AcqRel) {
+            self.state.parent.mark_held();
+        }
     }
 
     fn release_held(&self) {
-        self.state.parent.release_held();
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.state.parent.release_held();
+        }
     }
 }
 
@@ -507,6 +526,55 @@ mod tests {
         // A duplicate downstream acknowledgement is idempotent.
         children[1].ack().await.unwrap();
         assert_eq!(parent_impl.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// A gate dispatch splits one source delivery into independently held and
+    /// ready branches. The ready branch's release must not cancel the held
+    /// branch's exclusion from barrier draining, or every checkpoint round
+    /// waits out the drain timeout while an open window holds rows.
+    #[tokio::test]
+    async fn fanout_branches_hold_and_release_independently() {
+        use crate::executor::commit::{AckTracker, TrackingAck};
+
+        let tracker = Arc::new(AckTracker::new());
+        let source = Arc::new(RecordingAck {
+            acked: AtomicUsize::new(0),
+        });
+        let tracking = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            source.clone() as Arc<dyn Ack>,
+        ));
+        let children = fanout_ack(tracking.clone() as Arc<dyn Ack>, 2);
+
+        // Branch 0 is held by an open window; branch 1 is ready immediately.
+        children[0].mark_held();
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "a held branch must not block barrier draining"
+        );
+
+        // The ready branch passes through the gate (mark→release would also
+        // happen on a re-classified held batch) and completes downstream.
+        children[1].mark_held();
+        children[1].release_held();
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "a sibling release must not resurrect the held branch as blocking"
+        );
+        children[1].ack().await.unwrap();
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "a ready sibling completing must not block on the held branch"
+        );
+
+        // The window eventually fires branch 0.
+        children[0].release_held();
+        children[0].ack().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        assert_eq!(source.acked.load(Ordering::Relaxed), 1);
     }
 
     /// Task 1.5: a composite acknowledgement must surface a constituent's

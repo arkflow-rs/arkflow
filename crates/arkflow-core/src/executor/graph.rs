@@ -357,9 +357,23 @@ impl ExecutionGraphBuilder {
         // and version maps, allowing an older rollback to overwrite a later
         // commit.  Namespaces keep their state isolated while the journal
         // serializes the apply/ack/undo boundary across the graph.
-        let shared_journal = state_backend
-            .clone()
-            .map(|backend| Arc::new(super::state_journal::StateJournal::new(backend)));
+        let journal_limits = plan
+            .spec
+            .state
+            .as_ref()
+            .and_then(|state| state.max_pending_transactions)
+            .map(
+                |max_pending_transactions| super::state_journal::JournalLimits {
+                    max_pending_transactions,
+                    ..super::state_journal::JournalLimits::default()
+                },
+            );
+        let shared_journal = state_backend.clone().map(|backend| match journal_limits {
+            Some(limits) => Arc::new(super::state_journal::StateJournal::with_limits(
+                backend, limits,
+            )),
+            None => Arc::new(super::state_journal::StateJournal::new(backend)),
+        });
         let _assigned: BTreeSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
 
         // 1. Group tasks into fusable runs. Tasks are visited in plan order

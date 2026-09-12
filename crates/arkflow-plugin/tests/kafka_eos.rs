@@ -55,11 +55,36 @@ const CLUSTER_ID: &str = "1RlfgIc1TZWvdfLySKufPw";
 const KAFKA_HOST_PORT: u16 = 9092;
 
 /// Shared broker — started once, reused by every (serial) test to avoid the
-/// fixed-port release race between back-to-back containers.
-static BROKER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+/// fixed-port release race between back-to-back containers. `None` marks a
+/// probe-detected Docker-less environment: every test then skips instead of
+/// panicking on the missing container engine.
+static BROKER: OnceCell<Option<ContainerAsync<GenericImage>>> = OnceCell::const_new();
 
-async fn broker() {
-    BROKER.get_or_init(start_broker).await;
+async fn broker() -> bool {
+    let container = BROKER
+        .get_or_init(|| async {
+            if !docker_available() {
+                eprintln!(
+                    "skipping kafka_eos tests: Docker is unavailable \
+                     (no /var/run/docker.sock and no tcp:// DOCKER_HOST)"
+                );
+                return None;
+            }
+            Some(start_broker().await)
+        })
+        .await;
+    container.is_some()
+}
+
+/// Probe for a usable container engine: the default Unix socket or an
+/// explicitly configured non-unix DOCKER_HOST.
+fn docker_available() -> bool {
+    if let Ok(host) = std::env::var("DOCKER_HOST") {
+        if host.starts_with("tcp://") || host.starts_with("http://") {
+            return true;
+        }
+    }
+    std::path::Path::new("/var/run/docker.sock").exists()
 }
 
 /// Register all output builders exactly once.
@@ -254,7 +279,10 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn smoke_broker_and_roundtrip() {
-    broker().await;
+    if !broker().await {
+        eprintln!("skipping: Docker unavailable");
+        return;
+    }
     let topic = format!("eos-smoke-{}", std::process::id());
     let output = build_output(&topic, false, None).await;
     output
@@ -276,7 +304,10 @@ async fn smoke_broker_and_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn atomic_commit_observes_whole_batch() {
-    broker().await;
+    if !broker().await {
+        eprintln!("skipping: Docker unavailable");
+        return;
+    }
     let topic = format!("eos-atomic-{}", std::process::id());
     let tx_id = format!("atomic-tx-{}", std::process::id());
 
@@ -305,7 +336,10 @@ async fn atomic_commit_observes_whole_batch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn zombie_fenced_across_restart() {
-    broker().await;
+    if !broker().await {
+        eprintln!("skipping: Docker unavailable");
+        return;
+    }
     let topic = format!("eos-fence-{}", std::process::id());
     let tx_id = format!("fence-tx-{}", std::process::id());
 
@@ -341,7 +375,10 @@ async fn zombie_fenced_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn post_commit_crash_duplicates() {
-    broker().await;
+    if !broker().await {
+        eprintln!("skipping: Docker unavailable");
+        return;
+    }
     let topic = format!("eos-dup-{}", std::process::id());
     let tx_id = format!("dup-tx-{}", std::process::id());
 

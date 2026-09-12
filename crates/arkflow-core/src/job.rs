@@ -199,6 +199,13 @@ pub struct StateSpec {
     pub ttl_ms: Option<u64>,
     #[serde(default = "default_state_format_version")]
     pub format_version: u32,
+    /// Maximum simultaneously staged state journal transactions for this Job
+    /// (one per open window group or unacknowledged output). Raise it when a
+    /// window operator sees very high per-window key cardinality; the
+    /// default bounds staged memory, so pair a raise with realistic
+    /// capacity planning.
+    #[serde(default)]
+    pub max_pending_transactions: Option<usize>,
 }
 
 fn default_state_format_version() -> u32 {
@@ -343,6 +350,27 @@ impl JobSpec {
                 return Err(Error::Config(format!(
                     "edge '{}' references an unknown operator",
                     edge.id
+                )));
+            }
+            // Sources have no input port and sinks have no output port; a
+            // misdirected edge otherwise surfaces only as a runtime failure
+            // (or a silently dead channel for sink out-edges).
+            let kind_of = |id: &str| {
+                self.operators
+                    .iter()
+                    .find(|operator| operator.id == id)
+                    .map(|operator| operator.kind)
+            };
+            if kind_of(&edge.from) == Some(OperatorKind::Sink) {
+                return Err(Error::Config(format!(
+                    "edge '{}' takes input from sink operator '{}', which has no output port",
+                    edge.id, edge.from
+                )));
+            }
+            if kind_of(&edge.to) == Some(OperatorKind::Source) {
+                return Err(Error::Config(format!(
+                    "edge '{}' feeds source operator '{}', which has no input port",
+                    edge.id, edge.to
                 )));
             }
             if !edge_pairs.insert((edge.from.clone(), edge.to.clone())) {
@@ -983,6 +1011,7 @@ mod tests {
                 namespace: Some("orders".into()),
                 ttl_ms: None,
                 format_version: 1,
+                max_pending_transactions: None,
             }),
             checkpoint: Some(CheckpointSpec {
                 interval_ms: 1_000,
@@ -1001,6 +1030,47 @@ mod tests {
     #[test]
     fn rejects_cyclic_operator_graphs() {
         let mut job = base_job();
+        // A cycle between two interior operators: edges into/out of sources
+        // are rejected by the port-direction check before reachability runs.
+        job.operators.push(OperatorSpec {
+            id: "enrich".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.edges.push(EdgeSpec {
+            id: "aggregate-enrich".into(),
+            from: "aggregate".into(),
+            to: "enrich".into(),
+            partitioned: true,
+        });
+        job.edges.push(EdgeSpec {
+            id: "enrich-aggregate".into(),
+            from: "enrich".into(),
+            to: "aggregate".into(),
+            partitioned: true,
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("operator graph must be acyclic"));
+    }
+
+    #[test]
+    fn rejects_edges_into_a_source_or_out_of_a_sink() {
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: "sink-aggregate".into(),
+            from: "sink".into(),
+            to: "aggregate".into(),
+            partitioned: false,
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("no output port"),
+            "edges out of a sink are rejected at validate time: {error}"
+        );
+
+        let mut job = base_job();
         job.edges.push(EdgeSpec {
             id: "aggregate-source".into(),
             from: "aggregate".into(),
@@ -1008,7 +1078,10 @@ mod tests {
             partitioned: true,
         });
         let error = job.validate().unwrap_err().to_string();
-        assert!(error.contains("operator graph must be acyclic"));
+        assert!(
+            error.contains("no input port"),
+            "edges into a source are rejected at validate time: {error}"
+        );
     }
 
     #[test]

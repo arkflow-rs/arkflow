@@ -427,6 +427,13 @@ async fn run_source_chain(
                                     tracker.blocking()
                                 )));
                             }
+                            // Abort the round: the barrier is consumed but not
+                            // sealed and not forwarded, so no cut can persist
+                            // positions ahead of acknowledgements still in
+                            // flight (recovery would lose that window). The
+                            // reported failure fails the round; the next round
+                            // injects a fresh barrier once the pipeline drains.
+                            continue;
                         }
                     }
                 }
@@ -1190,9 +1197,18 @@ async fn run_interior_chain_loop(
                 // The tick is a control event that can generate data; fence
                 // the pool first so tick output cannot overtake deliveries
                 // the workers are still publishing (same discipline as the
-                // barrier and watermark paths).
-                if let Some(pool) = pool.as_ref() {
-                    pool.flush().await?;
+                // barrier and watermark paths). A cancellation that races
+                // the fence must surface as the clean shutdown path, not as
+                // a chain failure (a SIGTERM would otherwise be recorded as
+                // StreamState::Failed depending on tick timing).
+                if let Some(pool_ref) = pool.as_ref() {
+                    if let Err(error) = pool_ref.flush().await {
+                        if cancellation.is_cancelled() {
+                            let pool = pool.take();
+                            return shutdown_interior_chain(chain, pool).await;
+                        }
+                        return Err(error);
+                    }
                 }
                 tick_chain(chain).await?;
                 continue;
@@ -1203,10 +1219,22 @@ async fn run_interior_chain_loop(
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(pool) = pool.take() {
-                    let _ = pool.cancel_and_join().await;
+                match failure {
+                    Some(error) => {
+                        if let Some(pool) = pool.take() {
+                            let _ = pool.cancel_and_join().await;
+                        }
+                        return Err(error);
+                    }
+                    None => {
+                        // Workers exited without recording a failure — the
+                        // shutdown race with the cancellation branch. Retire
+                        // the pool so this arm parks instead of failing the
+                        // chain with a placeholder error.
+                        pool.take();
+                        continue;
+                    }
                 }
-                return Err(failure);
             }
             read = readers.next() => read,
         };
@@ -1813,10 +1841,13 @@ impl ProcessorWorkerPool {
     }
 
     /// Await the first worker failure (called from the chain loop's select).
-    async fn fail(&self) -> Error {
+    /// `None` means the failure channel disconnected — every worker exited
+    /// without recording a failure, which is the clean shutdown path, not a
+    /// chain failure.
+    async fn fail(&self) -> Option<Error> {
         match self.failure.recv_async().await {
-            Ok(error) => error,
-            Err(_) => Error::Process("processor worker pool failed".into()),
+            Ok(error) => Some(error),
+            Err(_) => None,
         }
     }
 }

@@ -122,6 +122,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String) -> JobSpec {
             namespace: None,
             ttl_ms: None,
             format_version: 1,
+            max_pending_transactions: None,
         }),
         checkpoint: Some(CheckpointSpec {
             interval_ms: 60_000,

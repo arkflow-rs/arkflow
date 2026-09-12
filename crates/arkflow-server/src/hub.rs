@@ -458,7 +458,20 @@ impl Hub {
         let jobs = self.jobs().await?;
         let mut dispatched = 0;
         for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
-            dispatched += self.reconcile_job(&job).await?;
+            match self.reconcile_job(&job).await {
+                Ok(count) => dispatched += count,
+                // One Job whose target is at capacity (or whose persisted
+                // spec no longer compiles) must not stall the tick for every
+                // other Job; the same ordering failure would repeat each tick.
+                Err(error @ (HubError::Capacity | HubError::Invalid(_))) => {
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        error = %error,
+                        "skipping Job reconciliation this tick"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(dispatched)
     }
@@ -921,23 +934,34 @@ impl Hub {
         record: JobCheckpointRecord,
     ) -> Result<Option<JobRecord>, HubError> {
         let record_for_dispatch = record.clone();
+        // A checkpoint produced by a different Job deployment (version) must
+        // never repoint the live record's recovery pointer: the artifact row
+        // is kept for audit, but recovery keeps its current selection.
+        let version_matches = self
+            .job(&record.job_id)
+            .await
+            .map(|job| job.is_some_and(|job| job.version == record.job_version))?;
         if let Some(storage) = &self.storage {
             storage
                 .upsert_job_checkpoint(record.clone())
                 .await
                 .map_err(HubError::from)?;
-            let job = storage
-                .update_job(
-                    &record.job_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(record.checkpoint_id.clone()),
-                    None,
-                )
-                .await
-                .map_err(HubError::from)?;
+            let job = if version_matches {
+                storage
+                    .update_job(
+                        &record.job_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(record.checkpoint_id.clone()),
+                        None,
+                    )
+                    .await
+                    .map_err(HubError::from)?
+            } else {
+                self.job(&record.job_id).await.map_err(HubError::from)?
+            };
             if let Some(job) = &job {
                 self.jobs
                     .write()
@@ -966,7 +990,9 @@ impl Hub {
         let Some(job) = jobs.get_mut(&record.job_id) else {
             return Ok(None);
         };
-        job.checkpoint_id = Some(record.checkpoint_id.clone());
+        if version_matches {
+            job.checkpoint_id = Some(record.checkpoint_id.clone());
+        }
         job.updated_at_ms = now_ms();
         let result = job.clone();
         drop(jobs);
@@ -1698,6 +1724,14 @@ impl Hub {
                 })
                 .await
                 .map_err(HubError::from)?;
+            // The Agent restarts report_seq from 1 on every session rebuild,
+            // so the previous session's stored per-stream cursors would
+            // silently drop every new observation. Reset them together with
+            // the in-memory cursor above.
+            storage
+                .reset_observed_cursors(request.node_id.clone())
+                .await
+                .map_err(HubError::from)?;
             for operation in &invalidated_job_starts {
                 persist_operation(storage, operation)
                     .await
@@ -2380,7 +2414,33 @@ impl Hub {
         };
         node.commands.push_back(command);
         if operations.len() >= MAX_OPERATIONS {
-            if let Some(oldest) = operations.keys().next().cloned() {
+            // Evict the oldest TERMINAL operation when one exists; the map is
+            // keyed by id (not insertion order), so lexicographically-first
+            // is not oldest, and evicting an in-flight operation would make
+            // the Agent's eventual command result miss with a 404 — which the
+            // Agent treats as a fatal session error.
+            let terminal = |operation: &HubOperation| {
+                matches!(
+                    operation.state,
+                    HubOperationState::Succeeded
+                        | HubOperationState::Failed
+                        | HubOperationState::TimedOut
+                        | HubOperationState::NodeUnavailable
+                        | HubOperationState::Cancelled
+                        | HubOperationState::Superseded
+                )
+            };
+            let eviction = operations
+                .values()
+                .filter(|operation| terminal(operation))
+                .min_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)))
+                .or_else(|| {
+                    operations
+                        .values()
+                        .min_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)))
+                })
+                .map(|operation| operation.id.clone());
+            if let Some(oldest) = eviction {
                 operations.remove(&oldest);
             }
         }

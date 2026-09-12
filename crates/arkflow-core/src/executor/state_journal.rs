@@ -312,7 +312,10 @@ impl StateJournal {
         let mut inner = self.inner.lock().unwrap();
         if inner.txns.len() >= self.limits.max_pending_transactions {
             return Err(Error::Process(format!(
-                "state journal exceeds the {}-transaction pending bound",
+                "state journal exceeds the {}-transaction pending bound: one transaction is \
+                 held per open window group (window key) or unacknowledged output, so very \
+                 high per-window key cardinality can exhaust the bound — raise \
+                 state.max_pending_transactions or reduce the live key set",
                 self.limits.max_pending_transactions
             )));
         }
