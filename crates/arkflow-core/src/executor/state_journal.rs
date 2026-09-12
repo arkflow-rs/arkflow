@@ -124,12 +124,14 @@ enum TxnState {
     /// Mutations not yet applied to the backend.
     Staged(Vec<StagedMutation>),
     /// Applied to the backend; `previous` holds the pre-apply value of every
-    /// mutation (in apply order) so `undo` can compensate.
+    /// mutation (in apply order) so `undo` can compensate. `applied_versions`
+    /// is aligned with `mutations`; `None` marks a mutation skipped by the
+    /// version fence (it owns nothing and is never restored).
     Applied {
         mutations: Vec<StagedMutation>,
         previous: Vec<Option<StateEntry>>,
         previous_versions: Vec<Option<u64>>,
-        applied_versions: Vec<u64>,
+        applied_versions: Vec<Option<u64>>,
     },
 }
 
@@ -143,7 +145,7 @@ pub struct StateRollback {
     mutations: Vec<StagedMutation>,
     previous: Vec<Option<StateEntry>>,
     previous_versions: Vec<Option<u64>>,
-    applied_versions: Vec<u64>,
+    applied_versions: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +155,12 @@ struct JournalInner {
     txns: BTreeMap<u64, TxnState>,
     staged_bytes: usize,
     key_versions: BTreeMap<(String, Vec<u8>), u64>,
+    /// Version fence, per transaction and aligned with its staged mutations:
+    /// the version each key held when the mutation was staged. A retried
+    /// apply (after an undo or a delayed attempt) must not overwrite a value
+    /// a later committed transaction owns — the staged snapshot is stale and
+    /// the replay re-accumulates the same rows into the newer value.
+    apply_fences: BTreeMap<u64, Vec<Option<u64>>>,
 }
 
 impl JournalInner {
@@ -300,6 +308,12 @@ impl StateJournal {
             snapshot.txn.id,
             TxnState::Staged(snapshot.mutations.clone()),
         );
+        // Re-arm the version fence with the transaction's pre-apply versions
+        // so a retried composite acknowledgement cannot overwrite a value a
+        // later committed transaction owns.
+        inner
+            .apply_fences
+            .insert(snapshot.txn.id, snapshot.previous_versions.clone());
         Ok(())
     }
 
@@ -423,10 +437,46 @@ impl StateJournal {
             )));
         }
         inner.staged_bytes = next_bytes;
+        // Rebuild the transaction's mutation list and its version fence
+        // together so the two stay aligned while compacting away replaced
+        // entries. The journal inner is behind a mutex guard, so the reads
+        // are collected as owned data before anything is written back.
+        let storage = mutation.storage();
+        let storage = (storage.0.to_owned(), storage.1.to_vec());
+        let removed_fence = inner.apply_fences.remove(&txn.id);
+        let (mut kept_mutations, mut kept_fence) = {
+            let Some(TxnState::Staged(mutations)) = inner.txns.get(&txn.id) else {
+                return Ok(());
+            };
+            let mut kept_mutations = Vec::with_capacity(mutations.len());
+            let mut kept_fence = Vec::with_capacity(mutations.len());
+            let mut fence = removed_fence.unwrap_or_default().into_iter();
+            for existing in mutations.iter() {
+                let version = fence.next().flatten();
+                let existing_storage = existing.storage();
+                if existing_storage.0 != storage.0 || existing_storage.1 != storage.1.as_slice() {
+                    kept_mutations.push(existing.clone());
+                    kept_fence.push(version);
+                }
+            }
+            (kept_mutations, kept_fence)
+        };
+        kept_mutations.push(mutation);
+        let (namespace, key) = kept_mutations
+            .last()
+            .map(StagedMutation::storage)
+            .expect("a compacted transaction always retains one mutation");
+        kept_fence.push(
+            inner
+                .key_versions
+                .get(&(namespace.to_owned(), key.to_vec()))
+                .copied(),
+        );
+        kept_fence.resize(kept_mutations.len(), None);
         if let Some(TxnState::Staged(mutations)) = inner.txns.get_mut(&txn.id) {
-            mutations.retain(|existing| existing.storage() != mutation.storage());
-            mutations.push(mutation);
+            *mutations = kept_mutations;
         }
+        inner.apply_fences.insert(txn.id, kept_fence);
         Ok(())
     }
 
@@ -486,9 +536,21 @@ impl StateJournal {
             )));
         }
         inner.staged_bytes += byte_len;
+        let fence_version = {
+            let (namespace, key) = mutation.storage();
+            inner
+                .key_versions
+                .get(&(namespace.to_owned(), key.to_vec()))
+                .copied()
+        };
         if let Some(TxnState::Staged(mutations)) = inner.txns.get_mut(&txn.id) {
             mutations.push(mutation);
         }
+        inner
+            .apply_fences
+            .entry(txn.id)
+            .or_default()
+            .push(fence_version);
         Ok(())
     }
 
@@ -499,22 +561,32 @@ impl StateJournal {
     /// returns the transaction to the staged state so the caller may retry.
     pub fn apply(&self, txn: StateTxn) -> Result<(), Error> {
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let (mutations, previous_versions) = {
+        let (mutations, staged_versions) = {
             let inner = self.inner.lock().unwrap();
             match inner.txns.get(&txn.id) {
-                Some(TxnState::Staged(mutations)) => (
-                    mutations.clone(),
-                    mutations
-                        .iter()
-                        .map(|mutation| {
-                            let (namespace, key) = mutation.storage();
-                            inner
-                                .key_versions
-                                .get(&(namespace.to_owned(), key.to_vec()))
-                                .copied()
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                Some(TxnState::Staged(mutations)) => {
+                    // The fence records the key version each mutation observed
+                    // when it was staged (falling back to the current version
+                    // for transactions staged before a fence existed). A
+                    // retried apply must not overwrite a value a later
+                    // committed transaction owns: the staged snapshot is
+                    // stale, and the replay re-accumulates the same rows into
+                    // the newer value.
+                    let staged_versions = match inner.apply_fences.get(&txn.id) {
+                        Some(fence) => fence.clone(),
+                        None => mutations
+                            .iter()
+                            .map(|mutation| {
+                                let (namespace, key) = mutation.storage();
+                                inner
+                                    .key_versions
+                                    .get(&(namespace.to_owned(), key.to_vec()))
+                                    .copied()
+                            })
+                            .collect::<Vec<_>>(),
+                    };
+                    (mutations.clone(), staged_versions)
+                }
                 Some(TxnState::Applied { .. }) | None => return Ok(()),
             }
         };
@@ -525,9 +597,41 @@ impl StateJournal {
             let (namespace, key) = mutation.storage();
             previous.push(self.backend.get_entry(namespace, key)?);
         }
-        let mut applied = 0usize;
-        let mut applied_versions = Vec::with_capacity(mutations.len());
-        for mutation in &mutations {
+        let mut applied_versions: Vec<Option<u64>> = vec![None; mutations.len()];
+        // Versions written by THIS apply pass: a later mutation of the same
+        // transaction on the same key legitimately builds on them instead of
+        // being fenced out.
+        let mut local_versions = std::collections::BTreeMap::<(String, Vec<u8>), u64>::new();
+        for (index, mutation) in mutations.iter().enumerate() {
+            let (namespace, key) = mutation.storage();
+            let version_key = (namespace.to_owned(), key.to_vec());
+            let current = {
+                let inner = self.inner.lock().unwrap();
+                local_versions
+                    .get(&version_key)
+                    .copied()
+                    .or_else(|| inner.key_versions.get(&version_key).copied())
+            };
+            let owned_by_this_pass = local_versions.contains_key(&version_key);
+            // Only an absolute snapshot (Put) can stale-overwrite a newer
+            // commit. Relative increments compose across pending transactions
+            // by design (`update_i64` builds on the staged overlay), and a
+            // delete is a cleanup guarded on the compensation side by
+            // `restore_previous`.
+            let fenced = match mutation {
+                StagedMutation::Put { .. } => {
+                    !owned_by_this_pass && current != staged_versions[index]
+                }
+                StagedMutation::Delete { .. } | StagedMutation::Increment { .. } => false,
+            };
+            if fenced {
+                tracing::debug!(
+                    namespace = %namespace,
+                    key = %String::from_utf8_lossy(key),
+                    "skipping stale journal mutation fenced by a newer committed value"
+                );
+                continue;
+            }
             let result = match mutation {
                 StagedMutation::Put {
                     namespace,
@@ -566,16 +670,18 @@ impl StateJournal {
                             .insert((namespace.to_owned(), key.to_vec()), version);
                         version
                     };
-                    applied_versions.push(version);
-                    applied += 1;
+                    applied_versions[index] = Some(version);
+                    local_versions.insert(version_key, version);
                 }
                 Err(error) => {
-                    // Compensate the applied prefix so the backend does not
+                    // Compensate the applied mutations so the backend does not
                     // keep a partial transaction a retry would double-apply.
+                    // Fenced (skipped) mutations own nothing and are excluded
+                    // by the None entries.
                     if let Err(rollback_error) = self.restore_previous(
-                        &mutations[..applied],
-                        &previous[..applied],
-                        &previous_versions[..applied],
+                        &mutations,
+                        &previous,
+                        &staged_versions,
                         &applied_versions,
                     ) {
                         return Err(Error::Process(format!(
@@ -592,7 +698,7 @@ impl StateJournal {
                 *state = TxnState::Applied {
                     mutations,
                     previous,
-                    previous_versions,
+                    previous_versions: staged_versions,
                     applied_versions,
                 };
             }
@@ -605,6 +711,7 @@ impl StateJournal {
     pub fn complete(&self, txn: StateTxn) {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
+        inner.apply_fences.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
             match state {
                 TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
@@ -660,13 +767,15 @@ impl StateJournal {
     }
 
     /// Restore pre-apply values in reverse order (a transaction may mutate
-    /// the same key more than once).
+    /// the same key more than once). `applied_versions` is aligned with
+    /// `mutations`; `None` entries were skipped by the version fence and own
+    /// nothing, so restoring them would erase a newer committed value.
     fn restore_previous(
         &self,
         mutations: &[StagedMutation],
         previous: &[Option<StateEntry>],
         previous_versions: &[Option<u64>],
-        applied_versions: &[u64],
+        applied_versions: &[Option<u64>],
     ) -> Result<(), Error> {
         for (((mutation, value), previous_version), applied_version) in mutations
             .iter()
@@ -675,6 +784,10 @@ impl StateJournal {
             .zip(applied_versions)
             .rev()
         {
+            let Some(applied_version) = applied_version else {
+                continue;
+            };
+            let applied_version = *applied_version;
             let (namespace, key) = mutation.storage();
             let version_key = (namespace.to_owned(), key.to_vec());
             let owns_current_value = self
@@ -684,7 +797,7 @@ impl StateJournal {
                 .key_versions
                 .get(&version_key)
                 .copied()
-                == Some(*applied_version);
+                == Some(applied_version);
             if !owns_current_value {
                 // A later committed transaction owns this key. Restoring the
                 // older bytes would erase that valid commit.
@@ -692,7 +805,7 @@ impl StateJournal {
             }
             self.backend.restore_entry(namespace, key, value.as_ref())?;
             let mut inner = self.inner.lock().unwrap();
-            if inner.key_versions.get(&version_key).copied() == Some(*applied_version) {
+            if inner.key_versions.get(&version_key).copied() == Some(applied_version) {
                 match previous_version {
                     Some(version) => {
                         inner.key_versions.insert(version_key, *version);
@@ -1022,6 +1135,34 @@ mod tests {
         assert!(journal.get("ns", b"k").unwrap().is_none());
         assert_eq!(journal.staged_bytes(), 0);
         assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[test]
+    fn retried_apply_does_not_overwrite_a_newer_committed_value() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal
+            .put(first, "ns", b"k", b"stale".to_vec(), None)
+            .unwrap();
+        journal.apply(first).unwrap();
+        // The wrapped acknowledgement failed: undo returns the transaction to
+        // the staged state so the caller retries it.
+        journal.undo(first).unwrap();
+        // Meanwhile a later transaction commits the same key.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+        // The retry must be fenced: applying the stale snapshot over the
+        // newer commit would erase a valid value (the replay re-accumulates
+        // the same rows into the newer transaction instead).
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
     }
 
     #[test]

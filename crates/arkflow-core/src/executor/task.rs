@@ -13,8 +13,10 @@ use crate::output::Output;
 use crate::Error;
 use crate::ProcessResult;
 use datafusion::arrow::array::{
-    Array, BinaryArray, Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, Date32Array, Date64Array, Decimal128Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -279,7 +281,22 @@ async fn run_chain(
     hook: CheckpointHook,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
-    let result = run_chain_inner(&chain, &hook, &cancellation).await;
+    // Catch a panicking event loop so the owned components are still closed:
+    // `hand_off_stream_resources` gave the chains their source/sink close
+    // paths, and an unwinding panic would otherwise skip every close and
+    // leak the connector/WAL handles for the remaining process lifetime.
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_chain_inner(
+        &chain,
+        &hook,
+        &cancellation,
+    )))
+    .await
+    .unwrap_or_else(|panic| {
+        Err(Error::Process(format!(
+            "chain task panicked: {}",
+            panic_payload(&panic)
+        )))
+    });
 
     // The event loop has returned: this chain can no longer process barriers
     // or send checkpoint reports. Tell the coordinator on every exit path so
@@ -712,6 +729,16 @@ async fn run_source_chain(
                         }
                     };
                 let parent_ack = ack.clone();
+                if partitions.is_empty() {
+                    // Only an empty batch produces no partition slices: there
+                    // is nothing to observe and nothing to lose, so settle the
+                    // delivery. Leaving the tracking ack unsettled would park
+                    // every later checkpoint drain at its timeout.
+                    if let Err(error) = ack.ack().await {
+                        return Err(error);
+                    }
+                    continue;
+                }
                 let child_acks = crate::input::fanout_ack(ack, partitions.len());
                 let (
                     ready,
@@ -1183,7 +1210,22 @@ async fn run_interior_chain_loop(
     // deliveries fan out to N workers while the chain's control flow
     // (barriers, watermarks, EOS, ticks) stays in this loop. A reorder
     // collector preserves per-delivery output order.
+    // The window operator counts its own session-late/invalid rows (the
+    // source gate cannot classify them); surface the counter's delta into
+    // the kernel `late_events` metric every iteration (best-effort).
+    let window_late_rows = chain.window_late_event_rows.clone();
+    let mut surfaced_late_rows = window_late_rows.as_ref().map_or(0, |counter| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    });
     loop {
+        if let Some(counter) = &window_late_rows {
+            let current = counter.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = current.saturating_sub(surfaced_late_rows);
+            if delta > 0 {
+                surfaced_late_rows = current;
+                record_late_event_rows(hook, delta);
+            }
+        }
         let read = tokio::select! {
             _ = cancellation.cancelled() => {
                 // Upstream chains also observe cancellation and close their
@@ -1380,6 +1422,17 @@ async fn run_interior_chain_loop(
                 readers.push(recv_envelope(index, receiver.clone()));
             }
         }
+    }
+}
+
+/// Extract a printable message from a caught panic payload.
+pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -2658,7 +2711,7 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
     macro_rules! integer_column {
         ($array:ty, $tag:literal) => {
             if let Some(values) = column.as_any().downcast_ref::<$array>() {
-                return Ok(values
+                return values
                     .iter()
                     .map(|value| {
                         let group = match value {
@@ -2671,7 +2724,7 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
                         };
                         Ok(Some(group))
                     })
-                    .collect::<Result<Vec<Option<u32>>, Error>>()?);
+                    .collect::<Result<Vec<Option<u32>>, Error>>();
             }
         };
     }
@@ -2683,6 +2736,33 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
     integer_column!(UInt16Array, "u16");
     integer_column!(UInt32Array, "u32");
     integer_column!(UInt64Array, "u64");
+    // Temporal and decimal keys hash their raw integer representation with a
+    // type tag: the column type is fixed per operator schema, so the raw
+    // value is deterministic across batches and cannot fabricate collisions
+    // between distinct logical keys.
+    integer_column!(Date32Array, "date32");
+    integer_column!(Date64Array, "date64");
+    integer_column!(TimestampSecondArray, "ts_s");
+    integer_column!(TimestampMillisecondArray, "ts_ms");
+    integer_column!(TimestampMicrosecondArray, "ts_us");
+    integer_column!(TimestampNanosecondArray, "ts_ns");
+    integer_column!(Decimal128Array, "decimal128");
+    if let Some(values) = column
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+    {
+        return Ok(values
+            .iter()
+            .map(|value| {
+                let group = match value {
+                    Some(true) => key_group(b"bool:1", max_parallelism)?,
+                    Some(false) => key_group(b"bool:0", max_parallelism)?,
+                    None => key_group(b"null:bool", max_parallelism)?,
+                };
+                Ok(Some(group))
+            })
+            .collect::<Result<Vec<Option<u32>>, Error>>()?);
+    }
     if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
         return Ok(values
             .iter()

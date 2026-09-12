@@ -21,7 +21,7 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
   }
   useEffect(() => {
     if (!selected) return
-    const timer = window.setInterval(() => { void api.jobDetail(selected.job.job_id).then(setSelected).catch(() => undefined) }, 5000)
+    const timer = window.setInterval(() => { void api.jobDetail(selected.job.job_id).then(setSelected).catch(cause => console.warn('Job detail refresh failed; showing the last known state', cause)) }, 5000)
     return () => window.clearInterval(timer)
   }, [selected?.job.job_id])
   const action = async (label: string, fn: () => Promise<unknown>) => {

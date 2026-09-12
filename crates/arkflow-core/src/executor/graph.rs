@@ -72,6 +72,11 @@ pub struct Chain {
     /// watermark windows. Sources in one group share only the tracker; their
     /// held deliveries remain on their own gate.
     pub watermark_group: Option<String>,
+    /// Session-late row counter of this chain's window operator (if any).
+    /// The chain event loop surfaces its delta into the kernel
+    /// `late_events` metric because the source gate cannot classify
+    /// session lateness.
+    pub window_late_event_rows: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Chain {
@@ -97,6 +102,7 @@ impl Chain {
             processor_parallelism: 1,
             window_timings: Vec::new(),
             watermark_group: None,
+            window_late_event_rows: self.window_late_event_rows.clone(),
         }
     }
 
@@ -737,6 +743,7 @@ impl ExecutionGraphBuilder {
             };
 
             let mut processors = Vec::with_capacity(run.len());
+            let mut window_late_event_rows = None;
             for task in run {
                 if index.is_source(&task.operator_id) || index.is_sink(&task.operator_id) {
                     continue;
@@ -773,7 +780,7 @@ impl ExecutionGraphBuilder {
                         let late_event_route_configured = event_time_source
                             .and_then(|source| source.time.late_event_route.as_ref())
                             .is_some();
-                        Arc::new(
+                        let operator_instance = Arc::new(
                         super::window::ColumnarWindowOperator::with_journal_and_late_event_policy(
                             config,
                             backend,
@@ -784,7 +791,9 @@ impl ExecutionGraphBuilder {
                             late_event_policy,
                             late_event_route_configured,
                         ),
-                    )
+                    );
+                        window_late_event_rows = Some(operator_instance.late_event_row_counter());
+                        operator_instance
                     } else {
                         let processor = adapter.build_processor(operator, resource)?;
                         if !operator.stateful {
@@ -926,6 +935,7 @@ impl ExecutionGraphBuilder {
                 } else {
                     None
                 },
+                window_late_event_rows,
             });
         }
 

@@ -34,4 +34,21 @@ impl Envelope {
     pub fn watermark(watermark_ms: i64) -> Self {
         Self::Watermark(watermark_ms)
     }
+
+    /// Mark a buffered envelope's acknowledgement as held by a buffering
+    /// operator (see [`Ack::mark_held`]). Non-data envelopes have no
+    /// acknowledgement and are unaffected.
+    pub(crate) fn mark_held(&self) {
+        if let Self::Data(_, ack) = self {
+            ack.mark_held();
+        }
+    }
+
+    /// Release a previously held acknowledgement back into ordinary
+    /// processing (see [`Ack::release_held`]).
+    pub(crate) fn release_held(&self) {
+        if let Self::Data(_, ack) = self {
+            ack.release_held();
+        }
+    }
 }

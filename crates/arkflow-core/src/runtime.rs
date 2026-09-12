@@ -626,13 +626,27 @@ impl RuntimeManager {
             }
         });
 
+        {
+            // Make the task joinable from spawn time, not only after the
+            // startup handshake: the spawned adapter already opened the WAL,
+            // so a stop() during `Starting` must await THIS task before
+            // reporting `Stopped` (an immediate start() would otherwise race
+            // the old adapter for the exclusive WAL lock).
+            entry.lock().await.handle = Some(handle);
+        }
+
         match startup_rx.await {
             Ok(Ok(())) => {
                 let mut runtime = entry.lock().await;
                 if runtime.state != StreamState::Starting {
                     let state = runtime.state;
+                    let task_handle = runtime.handle.take();
                     drop(runtime);
-                    let result = await_task(handle).await;
+                    let result = match task_handle {
+                        Some(task_handle) => await_task(task_handle).await,
+                        // A concurrent stop()/restart() already joined the task.
+                        None => Ok(()),
+                    };
                     return match result {
                         Ok(()) if matches!(state, StreamState::Stopped) => Ok(()),
                         Ok(()) => Err(Error::Process(format!(
@@ -644,7 +658,6 @@ impl RuntimeManager {
                 }
                 runtime.state = StreamState::Running;
                 runtime.started_at_ms = Some(now_ms());
-                runtime.handle = Some(handle);
                 drop(runtime);
                 self.record_event("stream_start", Some(id.to_string()), "succeeded", None)
                     .await;
@@ -655,7 +668,12 @@ impl RuntimeManager {
                     "stream '{}' resource startup failed: {message}",
                     id
                 ));
-                let wait_result = await_task(handle).await;
+                let task_handle = entry.lock().await.handle.take();
+                let wait_result = match task_handle {
+                    Some(task_handle) => await_task(task_handle).await,
+                    // A concurrent stop() joined the task and settled the state.
+                    None => Ok(()),
+                };
                 settle_detached_task(&entry, &wait_result, "startup").await;
                 if wait_result.is_ok() {
                     let mut runtime = entry.lock().await;
@@ -671,7 +689,12 @@ impl RuntimeManager {
                     "stream '{}' stopped before reporting startup readiness",
                     id
                 ));
-                let wait_result = await_task(handle).await;
+                let task_handle = entry.lock().await.handle.take();
+                let wait_result = match task_handle {
+                    Some(task_handle) => await_task(task_handle).await,
+                    // A concurrent stop() joined the task and settled the state.
+                    None => Ok(()),
+                };
                 settle_detached_task(&entry, &wait_result, "startup").await;
                 if wait_result.is_ok() {
                     let mut runtime = entry.lock().await;

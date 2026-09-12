@@ -219,6 +219,51 @@ impl KernelJobHandle {
                                 "kernel ended before checkpoint completed".into(),
                             ));
                         };
+                        // A chain sends its report before its finished
+                        // notification, so once the exit is observed the
+                        // report is already queued (possibly behind reports
+                        // from other chains). Drain it here: removing the
+                        // task without its report could seal a checkpoint
+                        // that is missing this chain's state and source
+                        // positions, and the sealed manifest would still
+                        // pass validation as the recovery point.
+                        loop {
+                            match reports.try_recv() {
+                                Ok(report) => {
+                                    if report.barrier != barrier {
+                                        tracing::warn!(
+                                            task = %report.task_id,
+                                            checkpoint = %report.barrier.checkpoint_id,
+                                            generation = report.barrier.generation,
+                                            expected = %barrier.checkpoint_id,
+                                            expected_generation = barrier.generation,
+                                            "ignoring stale checkpoint report"
+                                        );
+                                        continue;
+                                    }
+                                    if !self.participants.contains(&report.task_id) {
+                                        return Err(Error::Config(format!(
+                                            "checkpoint report from unknown chain '{}'",
+                                            report.task_id
+                                        )));
+                                    }
+                                    let reported_task_id = report.task_id.clone();
+                                    if snapshots
+                                        .insert(reported_task_id.clone(), report)
+                                        .is_some()
+                                    {
+                                        return Err(Error::Process(
+                                            "duplicate chain checkpoint report".into(),
+                                        ));
+                                    }
+                                    remaining.remove(&reported_task_id);
+                                }
+                                Err(
+                                    tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                                ) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            }
+                        }
                         remaining.remove(&task_id);
                         continue;
                     }
@@ -684,14 +729,25 @@ impl KernelJobRunner {
             let cancellation = cancellation.clone();
             let completion = completion.clone();
             tokio::spawn(async move {
-                let result = super::task::run_graph_with_hooks_startup(
-                    graph,
-                    cancellation,
-                    hooks,
-                    sources_preconnected || connect_inputs,
-                    Some(startup_tx),
-                )
-                .await;
+                // Catch a panicking graph run: the completion slot must
+                // resolve on every path, or every watcher() task spins
+                // forever (a task leak per panicking startup).
+                let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    super::task::run_graph_with_hooks_startup(
+                        graph,
+                        cancellation,
+                        hooks,
+                        sources_preconnected || connect_inputs,
+                        Some(startup_tx),
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|panic| {
+                    Err(Error::Process(format!(
+                        "kernel graph task panicked: {}",
+                        crate::executor::task::panic_payload(&panic)
+                    )))
+                });
                 KernelJobHandle::complete(&completion, result).await;
             });
         }

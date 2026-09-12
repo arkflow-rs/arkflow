@@ -561,10 +561,21 @@ impl JobRuntime {
             .checkpoint_store_uri
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
-        let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(store_uri)?);
-        let state_ref = repository
-            .write_state_snapshot(checkpoint_id, &snapshot)
-            .map_err(|error| error.to_string())?;
+        let store_uri_owned = store_uri.to_owned();
+        let checkpoint_id_owned = checkpoint_id.to_owned();
+        let snapshot_for_write = snapshot.clone();
+        // Object-store round trips are blocking I/O (the CheckpointStore
+        // trait is synchronous): run them on the blocking pool so a slow S3
+        // write cannot stall the async runtime's worker threads.
+        let state_ref = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let repository =
+                CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri_owned)?);
+            repository
+                .write_state_snapshot(&checkpoint_id_owned, &snapshot_for_write)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("checkpoint state write task failed: {error}"))??;
         let state_refs = task
             .assignments
             .iter()
@@ -638,9 +649,19 @@ impl JobRuntime {
             "{prefix}/{checkpoint_id}/manifests/{}.json",
             node_id.replace('/', "_")
         );
-        let artifact = repository
-            .write_manifest(&manifest, kind, manifest_key)
-            .map_err(|error| error.to_string())?;
+        let manifest_key_owned = manifest_key.clone();
+        let store_uri_for_manifest = store_uri.to_owned();
+        let manifest_for_write = manifest.clone();
+        let artifact = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(
+                &store_uri_for_manifest,
+            )?);
+            repository
+                .write_manifest(&manifest_for_write, kind, manifest_key_owned)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("checkpoint manifest write task failed: {error}"))??;
         let uri = format!(
             "{}/{}",
             store_uri.trim_end_matches('/'),
@@ -669,7 +690,6 @@ impl JobRuntime {
             .checkpoint_store_uri
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
-        let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(store_uri)?);
         let kind = if savepoint {
             RecoveryArtifactKind::Savepoint
         } else {
@@ -682,6 +702,8 @@ impl JobRuntime {
         };
         let mut aggregate: Option<arkflow_core::checkpoint::CheckpointManifest> = None;
         let mut task_ids = std::collections::BTreeSet::new();
+        let job_version = task.assignments[0].job_version;
+        let format_version = task.state.format_version();
         for node_id in manifest_nodes {
             let key = format!(
                 "{prefix}/{checkpoint_id}/manifests/{}.json",
@@ -691,14 +713,24 @@ impl JobRuntime {
                 id: checkpoint_id.to_owned(),
                 kind,
                 manifest_key: key,
-                job_version: task.assignments[0].job_version,
-                format_version: task.state.format_version(),
+                job_version,
+                format_version,
                 created_at_ms: 0,
                 status: CheckpointStatus::Completed,
             };
-            let manifest = repository
-                .read_manifest(&artifact)
-                .map_err(|error| error.to_string())?;
+            let store_uri_for_read = store_uri.to_owned();
+            let artifact_for_read = artifact.clone();
+            // Blocking object-store reads run on the blocking pool.
+            let manifest = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(
+                    &store_uri_for_read,
+                )?);
+                repository
+                    .read_manifest(&artifact_for_read)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| format!("checkpoint manifest read task failed: {error}"))??;
             if let Some(target) = aggregate.as_mut() {
                 if target.job_id != manifest.job_id
                     || target.job_version != manifest.job_version
@@ -742,9 +774,26 @@ impl JobRuntime {
         if planned_tasks.is_empty() {
             return Err("checkpoint has no planned task assignments".into());
         }
-        let artifact = repository
-            .write_manifest_with_plan(&manifest, kind, final_key, &planned_tasks)
-            .map_err(|error| error.to_string())?;
+        let artifact = {
+            let store_uri_for_write = store_uri.to_owned();
+            let manifest_for_write = manifest.clone();
+            let planned_tasks_for_write = planned_tasks.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, String> {
+                let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(
+                    &store_uri_for_write,
+                )?);
+                repository
+                    .write_manifest_with_plan(
+                        &manifest_for_write,
+                        kind,
+                        final_key,
+                        &planned_tasks_for_write,
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| format!("checkpoint aggregate write task failed: {error}"))??
+        };
         Ok(format!(
             "{}/{}",
             store_uri.trim_end_matches('/'),
@@ -1703,6 +1752,66 @@ async fn execute_command(
                 )
                 .await;
             }
+        } else {
+            // The local operation record is gone (e.g. evicted from the bounded
+            // operation store), so its outcome can no longer be observed. The
+            // execution itself keeps running; report an ambiguous temporary
+            // failure so the Hub settles the command through its retry path
+            // instead of this watcher spinning forever.
+            return deliver_result(
+                client,
+                config,
+                auth,
+                CommandResult {
+                    command_id: command.id.clone(),
+                    operation_id: operation.id,
+                    state: HubOperationState::Failed,
+                    progress: 100,
+                    error: Some(format!(
+                        "operation record {} is no longer observable on the agent",
+                        command.operation_id
+                    )),
+                    correlation_id: command.correlation_id.clone(),
+                    generation: command.generation,
+                    observed_generation: None,
+                    action_id: command.action_id.clone(),
+                    failure_class: Some("temporary_execution".into()),
+                    config_version_id: command.config_version_id.clone(),
+                    rollout_id: command.rollout_id.clone(),
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                },
+            )
+            .await;
+        }
+        if command_expired(command.expires_at_ms, now_ms()) {
+            // The command deadline passed without a terminal observation; the
+            // Hub has already stopped waiting for this command.
+            return deliver_result(
+                client,
+                config,
+                auth,
+                CommandResult {
+                    command_id: command.id.clone(),
+                    operation_id: operation.id,
+                    state: HubOperationState::TimedOut,
+                    progress: 100,
+                    error: Some(
+                        "operation did not reach a terminal state before the command deadline"
+                            .into(),
+                    ),
+                    correlation_id: command.correlation_id.clone(),
+                    generation: command.generation,
+                    observed_generation: None,
+                    action_id: command.action_id.clone(),
+                    failure_class: Some("temporary_execution".into()),
+                    config_version_id: command.config_version_id.clone(),
+                    rollout_id: command.rollout_id.clone(),
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                },
+            )
+            .await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

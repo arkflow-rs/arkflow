@@ -412,13 +412,21 @@ pub struct RedbStateBackend {
     root: PathBuf,
     format_version: u32,
     max_bytes: Option<u64>,
+    /// Physical row count / value bytes of the state table, maintained
+    /// incrementally by every mutation. Write paths never rescan the table.
     keys: AtomicU64,
     bytes: AtomicU64,
+    /// Write counter for the amortized expired-entry purge cadence.
+    writes: AtomicU64,
     /// Serialize the read/check/write/update sequence used by
     /// `put_with_ttl`, so concurrent writers cannot all pass the same stale
     /// byte-budget check.
     write_lock: Mutex<()>,
 }
+
+/// How many writes between amortized expired-entry purges. Reads already
+/// hide expired values, so the purge is space reclamation only.
+const PURGE_INTERVAL_WRITES: u64 = 4096;
 
 impl RedbStateBackend {
     pub fn open(root: impl AsRef<Path>, format_version: u32) -> Result<Self, Error> {
@@ -439,12 +447,70 @@ impl RedbStateBackend {
             max_bytes: None,
             keys: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
             write_lock: Mutex::new(()),
         };
-        let metrics = backend.metrics()?;
+        let metrics = backend.physical_metrics()?;
         backend.keys.store(metrics.keys, Ordering::Relaxed);
         backend.bytes.store(metrics.bytes, Ordering::Relaxed);
         Ok(backend)
+    }
+
+    /// Size of the physical table (expired-but-unpurged rows included): the
+    /// invariant the incremental counters maintain. The budget check reads
+    /// this, so including unpurged rows only makes the bound conservative.
+    fn physical_metrics(&self) -> Result<StateMetrics, Error> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|error| Error::Process(format!("state read: {error}")))?;
+        let mut metrics = StateMetrics::default();
+        if let Ok(table) = tx.open_table(STATE_TABLE) {
+            for item in table
+                .iter()
+                .map_err(|error| Error::Process(format!("state metrics: {error}")))?
+            {
+                let (_, value) =
+                    item.map_err(|error| Error::Process(format!("state metrics: {error}")))?;
+                metrics.bytes += decode_value(value.value())?.value.len() as u64;
+                metrics.keys += 1;
+            }
+        }
+        Ok(metrics)
+    }
+
+    /// Remove expired rows inside an open write transaction. Returns the
+    /// value bytes and row count they freed so callers keep the incremental
+    /// counters consistent. Reads already hide expired values, so this is
+    /// space reclamation rather than a visibility fix.
+    fn remove_expired_in_table(
+        table: &mut redb::Table<'_, &str, &[u8]>,
+        now_ms: u64,
+    ) -> Result<(u64, u64), Error> {
+        let mut expired = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|error| Error::Process(format!("state scan: {error}")))?
+        {
+            let (key, value) =
+                item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
+            let decoded = decode_value(value.value())?;
+            if decoded
+                .expires_at_ms
+                .is_some_and(|expires| expires <= now_ms)
+            {
+                expired.push((key.value().to_owned(), decoded.value.len() as u64));
+            }
+        }
+        let mut bytes = 0_u64;
+        let keys = expired.len() as u64;
+        for (key, len) in expired {
+            table
+                .remove(key.as_str())
+                .map_err(|error| Error::Process(format!("state purge: {error}")))?;
+            bytes += len;
+        }
+        Ok((bytes, keys))
     }
 
     pub fn root(&self) -> &Path {
@@ -590,43 +656,42 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        {
+        let (previous_bytes, had_previous, freed_bytes, freed_keys) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
-            let mut expired_keys = Vec::new();
-            let mut live_bytes = 0_u64;
-            let mut previous_bytes = 0_u64;
-            for item in table
-                .iter()
-                .map_err(|error| Error::Process(format!("state scan: {error}")))?
+            let mut freed_bytes = 0_u64;
+            let mut freed_keys = 0_u64;
+            // A configured byte budget must reclaim expired bytes before the
+            // check (the exact contract of the budget tests); without a
+            // budget the purge is amortized space reclamation.
+            if self.max_bytes.is_some()
+                || self.writes.fetch_add(1, Ordering::Relaxed).is_multiple_of(PURGE_INTERVAL_WRITES)
             {
-                let (stored_key, stored_value) =
-                    item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
-                let stored_key = stored_key.value().to_owned();
-                let decoded = decode_value(stored_value.value())?;
-                if decoded
-                    .expires_at_ms
-                    .is_some_and(|expires| expires <= now_ms)
-                {
-                    expired_keys.push(stored_key);
-                    continue;
-                }
-                let bytes = decoded.value.len() as u64;
-                live_bytes = live_bytes.saturating_add(bytes);
-                if stored_key == storage_key {
-                    previous_bytes = bytes;
-                }
+                let (bytes, keys) = Self::remove_expired_in_table(&mut table, now_ms)?;
+                freed_bytes += bytes;
+                freed_keys += keys;
             }
-            for expired_key in expired_keys {
-                table
-                    .remove(expired_key.as_str())
-                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
-            }
-            let next_bytes = live_bytes
-                .saturating_sub(previous_bytes)
-                .saturating_add(value.len() as u64);
+            let previous = table
+                .get(storage_key.as_str())
+                .map_err(|error| Error::Process(format!("state get: {error}")))?
+                .map(|value| decode_value(value.value()))
+                .transpose()?;
+            let (previous_bytes, had_previous) = match previous {
+                // A live previous row is replaced: its bytes leave the table.
+                Some(entry) if !entry.expires_at_ms.is_some_and(|expires| expires <= now_ms) => {
+                    (entry.value.len() as u64, true)
+                }
+                // Missing or expired previous rows are logically absent.
+                _ => (0, false),
+            };
             if let Some(max_bytes) = self.max_bytes {
+                let next_bytes = self
+                    .bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(previous_bytes)
+                    .saturating_sub(freed_bytes)
+                    .saturating_add(value.len() as u64);
                 if next_bytes > max_bytes {
                     return Err(Error::Process(format!(
                         "state budget exceeded: {next_bytes} > {max_bytes} bytes"
@@ -636,12 +701,19 @@ impl StateBackend for RedbStateBackend {
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state put: {error}")))?;
-        }
+            (previous_bytes, had_previous, freed_bytes, freed_keys)
+        };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        // Incremental accounting instead of a full-table metrics rescan.
+        if had_previous {
+            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
+        } else {
+            self.keys.fetch_add(1, Ordering::Relaxed);
+        }
+        self.bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
+        self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        self.keys.fetch_sub(freed_keys, Ordering::Relaxed);
         Ok(())
     }
 
@@ -663,39 +735,37 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        let (_, next, _) = {
+        let (previous_bytes, had_previous, next, next_len, freed_bytes, freed_keys) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
-            let mut expired_keys = Vec::new();
-            let mut live_bytes = 0_u64;
-            for item in table
-                .iter()
-                .map_err(|error| Error::Process(format!("state scan: {error}")))?
+            let mut freed_bytes = 0_u64;
+            let mut freed_keys = 0_u64;
+            // A configured byte budget must reclaim expired bytes before the
+            // check; without a budget the purge is amortized space
+            // reclamation (reads hide expired values either way).
+            if self.max_bytes.is_some()
+                || self.writes.fetch_add(1, Ordering::Relaxed).is_multiple_of(PURGE_INTERVAL_WRITES)
             {
-                let (stored_key, value) =
-                    item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
-                let decoded = decode_value(value.value())?;
-                if decoded
-                    .expires_at_ms
-                    .is_some_and(|expires| expires <= current_time_ms)
-                {
-                    expired_keys.push(stored_key.value().to_owned());
-                } else if stored_key.value() != storage_key {
-                    live_bytes = live_bytes.saturating_add(decoded.value.len() as u64);
-                }
-            }
-            for expired_key in expired_keys {
-                table
-                    .remove(expired_key.as_str())
-                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
+                let (bytes, keys) = Self::remove_expired_in_table(&mut table, current_time_ms)?;
+                freed_bytes += bytes;
+                freed_keys += keys;
             }
             let previous = table
                 .get(storage_key.as_str())
                 .map_err(|error| Error::Process(format!("state get: {error}")))?
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
-            let previous_bytes = previous.as_ref().map(|value| value.value.len() as u64);
+            let (previous_bytes, had_previous) = match &previous {
+                Some(entry)
+                    if !entry
+                        .expires_at_ms
+                        .is_some_and(|expires| expires <= current_time_ms) =>
+                {
+                    (entry.value.len() as u64, true)
+                }
+                _ => (0, false),
+            };
             let current = previous
                 .filter(|value| {
                     !value
@@ -708,7 +778,12 @@ impl StateBackend for RedbStateBackend {
             let next = current.saturating_add(delta);
             let next_value = serde_json::to_vec(&next)?;
             if let Some(max_bytes) = self.max_bytes {
-                let next_total = live_bytes.saturating_add(next_value.len() as u64);
+                let next_total = self
+                    .bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(previous_bytes)
+                    .saturating_sub(freed_bytes)
+                    .saturating_add(next_value.len() as u64);
                 if next_total > max_bytes {
                     return Err(Error::Process(format!(
                         "state budget exceeded: {next_total} > {max_bytes} bytes"
@@ -722,13 +797,25 @@ impl StateBackend for RedbStateBackend {
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state put: {error}")))?;
-            (previous_bytes, next, next_value.len() as u64)
+            (
+                previous_bytes,
+                had_previous,
+                next,
+                next_value.len() as u64,
+                freed_bytes,
+                freed_keys,
+            )
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        if had_previous {
+            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
+        } else {
+            self.keys.fetch_add(1, Ordering::Relaxed);
+        }
+        self.bytes.fetch_add(next_len, Ordering::Relaxed);
+        self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        self.keys.fetch_sub(freed_keys, Ordering::Relaxed);
         Ok(next)
     }
 
@@ -752,9 +839,10 @@ impl StateBackend for RedbStateBackend {
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        if let Some(previous_bytes) = previous {
+            self.keys.fetch_sub(1, Ordering::Relaxed);
+            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
+        }
         Ok(previous.is_some())
     }
 
@@ -782,19 +870,27 @@ impl StateBackend for RedbStateBackend {
                     expired.push(key.value().to_owned());
                 }
             }
-            let removed = expired.len() as u64;
+            let mut removed = 0_u64;
+            let mut freed_bytes = 0_u64;
             for key in expired {
-                table
+                let freed = table
                     .remove(key.as_str())
-                    .map_err(|error| Error::Process(format!("state purge: {error}")))?;
+                    .map_err(|error| Error::Process(format!("state purge: {error}")))?
+                    .map(|guard| {
+                        decode_value(guard.value())
+                            .map(|decoded| decoded.value.len() as u64)
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                freed_bytes += freed;
+                removed += 1;
             }
+            self.keys.fetch_sub(removed, Ordering::Relaxed);
+            self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
             removed
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
         Ok(removed)
     }
 

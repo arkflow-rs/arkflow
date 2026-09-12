@@ -345,93 +345,119 @@ impl Input for KafkaInput {
         }
         let consumer = consumer_guard.as_ref().unwrap();
 
-        match consumer.recv().await {
-            Ok(kafka_message) => {
-                // Get payload from Kafka message
-                let payload = kafka_message.payload().ok_or_else(|| {
-                    Error::Process("The Kafka message has no content".to_string())
-                })?;
+        loop {
+            match consumer.recv().await {
+                Ok(kafka_message) => {
+                    // Compacted topics deliver deletion markers with a null
+                    // payload. They are ordinary Kafka data: acknowledge and skip
+                    // them here. Treating them as a fatal error re-delivers the
+                    // same tombstone after every restart and crashes the stream
+                    // in a loop; skipping without an acknowledgement would replay
+                    // it forever because the acknowledged frontier never moves
+                    // past it.
+                    let Some(payload) = kafka_message.payload() else {
+                        let ack = KafkaAck {
+                            consumer: self.consumer.clone(),
+                            frontier: self.frontier.clone(),
+                            ack_lock: self.ack_lock.clone(),
+                            ack_notify: self.ack_notify.clone(),
+                            close: self.close.clone(),
+                            topic: kafka_message.topic().to_string(),
+                            partition: kafka_message.partition(),
+                            offset: kafka_message.offset(),
+                        };
+                        self.frontier.anchor_delivery(&SourcePosition {
+                            topic: Some(kafka_message.topic().to_string()),
+                            partition: kafka_message.partition() as u32,
+                            offset: kafka_message.offset() as u64,
+                        });
+                        ack.ack().await?;
+                        continue;
+                    };
 
-                // Apply codec if configured
-                let mut msg_batch =
-                    crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec)
-                        .await?;
-                msg_batch.set_input_name(self.input_name.clone());
+                    // Apply codec if configured
+                    let mut msg_batch =
+                        crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec)
+                            .await?;
+                    msg_batch.set_input_name(self.input_name.clone());
 
-                // Convert to RecordBatch to add metadata
-                let mut record_batch: datafusion::arrow::record_batch::RecordBatch =
-                    msg_batch.into();
+                    // Convert to RecordBatch to add metadata
+                    let mut record_batch: datafusion::arrow::record_batch::RecordBatch =
+                        msg_batch.into();
 
-                // Add core metadata
-                record_batch = metadata::with_source(record_batch, "kafka")?;
+                    // Add core metadata
+                    record_batch = metadata::with_source(record_batch, "kafka")?;
 
-                let partition = kafka_message.partition();
-                record_batch = metadata::with_partition(record_batch, partition as u32)?;
+                    let partition = kafka_message.partition();
+                    record_batch = metadata::with_partition(record_batch, partition as u32)?;
 
-                let offset = kafka_message.offset();
-                record_batch = metadata::with_offset(record_batch, offset as u64)?;
+                    let offset = kafka_message.offset();
+                    record_batch = metadata::with_offset(record_batch, offset as u64)?;
 
-                // Add key if present
-                if let Some(key) = kafka_message.key() {
-                    record_batch = metadata::with_key(record_batch, key)?;
-                }
-
-                // Add timestamp if available
-                let kafka_timestamp = kafka_message.timestamp();
-                if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
-                    if let Some(timestamp) = Self::convert_kafka_timestamp(millis_since_epoch) {
-                        record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                    // Add key if present
+                    if let Some(key) = kafka_message.key() {
+                        record_batch = metadata::with_key(record_batch, key)?;
                     }
+
+                    // Add timestamp if available
+                    let kafka_timestamp = kafka_message.timestamp();
+                    if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
+                        if let Some(timestamp) = Self::convert_kafka_timestamp(millis_since_epoch) {
+                            record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                        }
+                    }
+                    // Add ingest time
+                    let ingest_time = SystemTime::now();
+                    record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
+
+                    // Add extended metadata (topic, headers)
+                    let topic = kafka_message.topic().to_string();
+
+                    // Anchor the partition's frontier at this delivery: an
+                    // out-of-order FIRST acknowledgement (fan-out completing a
+                    // later branch first) cannot then claim the earlier records
+                    // of this delivery were acknowledged.
+                    self.frontier.anchor_delivery(&SourcePosition {
+                        topic: Some(topic.clone()),
+                        partition: kafka_message.partition() as u32,
+                        offset: kafka_message.offset() as u64,
+                    });
+
+                    let mut ext_metadata = HashMap::new();
+                    ext_metadata.insert("topic".to_string(), topic);
+
+                    // Add headers if present
+                    // Note: rdkafka Headers API varies by version, skipping for now
+                    // TODO: Implement headers extraction based on rdkafka version
+
+                    record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
+
+                    // Convert back to MessageBatch
+                    let mut msg_batch = MessageBatch::new_arrow(record_batch);
+                    msg_batch.set_input_name(self.input_name.clone());
+
+                    // Create acknowledgment object
+                    let ack = KafkaAck {
+                        consumer: self.consumer.clone(),
+                        frontier: self.frontier.clone(),
+                        ack_lock: self.ack_lock.clone(),
+                        ack_notify: self.ack_notify.clone(),
+                        close: self.close.clone(),
+                        topic: kafka_message.topic().to_string(),
+                        partition,
+                        offset,
+                    };
+
+                    return Ok((Arc::new(msg_batch), Arc::new(ack)));
                 }
-                // Add ingest time
-                let ingest_time = SystemTime::now();
-                record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
-
-                // Add extended metadata (topic, headers)
-                let topic = kafka_message.topic().to_string();
-
-                // Anchor the partition's frontier at this delivery: an
-                // out-of-order FIRST acknowledgement (fan-out completing a
-                // later branch first) cannot then claim the earlier records
-                // of this delivery were acknowledged.
-                self.frontier.anchor_delivery(&SourcePosition {
-                    topic: Some(topic.clone()),
-                    partition: kafka_message.partition() as u32,
-                    offset: kafka_message.offset() as u64,
-                });
-
-                let mut ext_metadata = HashMap::new();
-                ext_metadata.insert("topic".to_string(), topic);
-
-                // Add headers if present
-                // Note: rdkafka Headers API varies by version, skipping for now
-                // TODO: Implement headers extraction based on rdkafka version
-
-                record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
-
-                // Convert back to MessageBatch
-                let mut msg_batch = MessageBatch::new_arrow(record_batch);
-                msg_batch.set_input_name(self.input_name.clone());
-
-                // Create acknowledgment object
-                let ack = KafkaAck {
-                    consumer: self.consumer.clone(),
-                    frontier: self.frontier.clone(),
-                    ack_lock: self.ack_lock.clone(),
-                    ack_notify: self.ack_notify.clone(),
-                    close: self.close.clone(),
-                    topic: kafka_message.topic().to_string(),
-                    partition,
-                    offset,
-                };
-
-                Ok((Arc::new(msg_batch), Arc::new(ack)))
+                Err(e) if Self::retryable_receive_error(&e) => return Err(Error::Disconnection),
+                Err(e) => {
+                    return Err(Error::Connection(format!(
+                        "Error receiving Kafka message: {}",
+                        e
+                    )))
+                }
             }
-            Err(e) if Self::retryable_receive_error(&e) => Err(Error::Disconnection),
-            Err(e) => Err(Error::Connection(format!(
-                "Error receiving Kafka message: {}",
-                e
-            ))),
         }
     }
 
@@ -578,15 +604,28 @@ impl Input for KafkaInput {
             None => {
                 // Subscription mode: keep the full subscription; seek each
                 // checkpointed partition to its offset. A partition the group
-                // has not assigned yet may reject the seek right after
-                // (re)connect — retry briefly for the assignment to arrive.
+                // has not assigned yet rejects the seek right after
+                // (re)connect — wait (bounded) for the assignment instead of
+                // burning the retry budget while the rebalance is still in
+                // flight, then re-check before every seek.
                 for position in &applicable {
                     let offset =
                         Self::validate_checkpoint_offset(position.offset, i64::MIN, i64::MAX)?;
                     let topic = position.topic.as_deref().unwrap_or_default();
                     let partition = position.partition as i32;
-                    let mut attempt = 0;
+                    let deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
+                    let mut attempt = 0_u32;
                     loop {
+                        if !KafkaAck::partition_assigned(consumer, topic, partition) {
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(Error::Process(format!(
+                                    "restore Kafka position for {topic}-{partition}: partition was not assigned within {}s",
+                                    KAFKA_ASSIGNMENT_WAIT.as_secs()
+                                )));
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
                         match consumer.seek(
                             topic,
                             partition,
@@ -594,13 +633,17 @@ impl Input for KafkaInput {
                             Duration::from_secs(5),
                         ) {
                             Ok(()) => break,
-                            Err(error) if attempt < 2 => {
+                            Err(error) if tokio::time::Instant::now() < deadline => {
                                 attempt += 1;
                                 tracing::warn!(
                                     %error, topic, partition,
                                     "Kafka restore seek failed; waiting for group assignment"
                                 );
-                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                tokio::time::sleep(
+                                    Duration::from_millis(200 * attempt as u64)
+                                        .min(Duration::from_secs(1)),
+                                )
+                                .await;
                             }
                             Err(error) => {
                                 return Err(Error::Process(format!(
@@ -655,6 +698,45 @@ pub struct KafkaAck {
     topic: String,
     partition: i32,
     offset: i64,
+}
+
+/// How long an in-flight acknowledgement waits for the consumer to (re)gain
+/// its partition assignment before settling locally without a broker offset
+/// store. Covers a subscription-mode group (re)join after a reconnect or a
+/// rebalance.
+const KAFKA_ASSIGNMENT_WAIT: Duration = Duration::from_secs(60);
+
+impl KafkaAck {
+    /// Whether the consumer currently owns `partition` of `topic`.
+    fn partition_assigned(consumer: &StreamConsumer, topic: &str, partition: i32) -> bool {
+        consumer
+            .assignment()
+            .map(|assignment| {
+                assignment
+                    .elements()
+                    .iter()
+                    .any(|element| element.topic() == topic && element.partition() == partition)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Wait until the consumer owns the partition again (or the delivery is
+    /// shut down, or the wait expires). A reconnect or a rebalance can leave
+    /// an in-flight acknowledgement racing the (re)assignment: `store_offset`
+    /// on an unassigned partition fails, and an acknowledgement error fails
+    /// the whole stream — so the wait replaces the failure.
+    async fn wait_for_assignment(&self, consumer: &StreamConsumer) -> bool {
+        let deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
+        loop {
+            if Self::partition_assigned(consumer, &self.topic, self.partition) {
+                return true;
+            }
+            if self.close.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -721,34 +803,63 @@ impl Ack for KafkaAck {
                         // already the exclusive contiguous frontier.
                         let store_offset_value = i64::try_from(next_offset)
                             .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
-                        if let Err(error) =
-                            consumer.store_offset(&self.topic, self.partition, store_offset_value)
-                        {
-                            let restored = self.frontier.restore_partition_if_current(
-                                Some(&self.topic),
-                                partition,
-                                next_offset,
-                                snapshot,
-                            );
-                            let message = if restored {
-                                format!("Failed to store Kafka offset: {error}")
-                            } else {
-                                format!(
-                                    "Failed to store Kafka offset: {error}; frontier changed during compensation"
-                                )
-                            };
-                            self.frontier.record_failure(
-                                Some(&self.topic),
-                                partition,
-                                position.offset,
-                                message.clone(),
-                            );
-                            // A later offset may be waiting for this
-                            // frontier.  Wake it so it observes the recorded
-                            // failure instead of waiting forever for a gap
-                            // that can no longer close.
-                            self.ack_notify.notify_waiters();
-                            return Err(Error::Process(message));
+                        // A reconnect or rebalance can leave this in-flight
+                        // acknowledgement racing the partition (re)assignment.
+                        // Storing an offset for an unassigned partition fails
+                        // and the failure fence would kill the stream, so wait
+                        // for the assignment first; if it does not return, the
+                        // new partition owner (or a later restart) re-delivers
+                        // from the last committed offset — at-least-once holds.
+                        let skip_broker_store = if Self::partition_assigned(
+                            consumer,
+                            &self.topic,
+                            self.partition,
+                        ) {
+                            false
+                        } else {
+                            let assigned = self.wait_for_assignment(consumer).await;
+                            if !assigned {
+                                tracing::warn!(
+                                    topic = %self.topic,
+                                    partition,
+                                    next_offset,
+                                    "Kafka partition is no longer assigned; acknowledging without a broker offset store (the record may be delivered again)"
+                                );
+                            }
+                            !assigned
+                        };
+                        if !skip_broker_store {
+                            if let Err(error) = consumer.store_offset(
+                                &self.topic,
+                                self.partition,
+                                store_offset_value,
+                            ) {
+                                let restored = self.frontier.restore_partition_if_current(
+                                    Some(&self.topic),
+                                    partition,
+                                    next_offset,
+                                    snapshot,
+                                );
+                                let message = if restored {
+                                    format!("Failed to store Kafka offset: {error}")
+                                } else {
+                                    format!(
+                                        "Failed to store Kafka offset: {error}; frontier changed during compensation"
+                                    )
+                                };
+                                self.frontier.record_failure(
+                                    Some(&self.topic),
+                                    partition,
+                                    position.offset,
+                                    message.clone(),
+                                );
+                                // A later offset may be waiting for this
+                                // frontier.  Wake it so it observes the recorded
+                                // failure instead of waiting forever for a gap
+                                // that can no longer close.
+                                self.ack_notify.notify_waiters();
+                                return Err(Error::Process(message));
+                            }
                         }
                         Ok::<Option<u64>, Error>(Some(next_offset))
                     }

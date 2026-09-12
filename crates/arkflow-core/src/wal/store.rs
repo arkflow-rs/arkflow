@@ -335,6 +335,28 @@ impl WalStore for RedbStore {
                     .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
             }
         }
+        // Reclaim the acked prefix: every entry at or below the cursor is
+        // fully committed at the source and never replayed
+        // (`read_after_cursor` skips them); a crash inside the
+        // advance-before-source-commit window is covered by the source's own
+        // re-delivery. Without this the local store grows with total
+        // throughput for the stream's lifetime.
+        if let Ok(mut entries) = tx.open_table(ENTRIES) {
+            let mut acked = Vec::new();
+            for item in entries
+                .range(..=seq)
+                .map_err(|e| Error::Process(format!("WAL reclaim scan failed: {}", e)))?
+            {
+                let (key, _) =
+                    item.map_err(|e| Error::Process(format!("WAL reclaim scan failed: {}", e)))?;
+                acked.push(key.value());
+            }
+            for key in acked {
+                entries
+                    .remove(key)
+                    .map_err(|e| Error::Process(format!("WAL reclaim failed: {}", e)))?;
+            }
+        }
         tx.commit()
             .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
         Ok(())
@@ -399,11 +421,10 @@ impl WalStore for RedbStore {
     }
 
     fn next_seq_hint(&self) -> u64 {
-        // For local redb we know the exact max seq. Anything simpler would
-        // under-count after a restart where the cursor advanced past the
-        // tail of the table.
+        // Reclaim removes acked entries, so the max KEY can lag the cursor:
+        // the next sequence must never reuse or fall below an acked one.
         self.max_seq()
-            .map(|m| m.saturating_add(1))
+            .map(|m| m.max(self.cursor()).saturating_add(1))
             .unwrap_or(1)
             .max(1)
     }

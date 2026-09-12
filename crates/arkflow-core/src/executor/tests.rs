@@ -1555,6 +1555,40 @@ fn aligner_passes_data_through_when_not_aligning() {
     assert!(aligner.release().is_empty());
 }
 
+/// A delivery buffered by alignment must stop blocking its source's barrier
+/// drain (held), and re-enter the in-flight set when alignment releases it:
+/// otherwise a source whose data sits in a downstream aligner can never seal
+/// its own cut and every multi-input checkpoint round times out.
+#[test]
+fn aligner_holds_buffered_acknowledgements_until_release() {
+    use crate::executor::commit::{AckTracker, TrackingAck};
+
+    let tracker = Arc::new(AckTracker::new());
+    let mut aligner = Aligner::new(2, 100);
+    assert!(aligner.observe(0, barrier("cp-1")).unwrap().is_none());
+    // The second input's data arrives while alignment is in flight: the
+    // aligner buffers it and its acknowledgement must be excluded from the
+    // drain (`blocking() == 0`).
+    let inner: Arc<dyn Ack> = Arc::new(NoopAck);
+    let ack = Arc::new(TrackingAck::new(tracker.clone(), inner));
+    assert_eq!(tracker.blocking(), 1);
+    let batch: crate::MessageBatchRef = Arc::new(crate::MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )));
+    assert!(aligner
+        .observe(1, Envelope::Data(batch, ack.clone()))
+        .unwrap()
+        .is_none());
+    assert_eq!(tracker.blocking(), 0);
+    // The completing barrier releases the buffer: the held delivery re-enters
+    // the in-flight set until its acknowledgement finally completes.
+    assert!(aligner.observe(1, barrier("cp-1")).unwrap().is_some());
+    assert_eq!(aligner.release().len(), 1);
+    assert_eq!(tracker.blocking(), 1);
+    futures::executor::block_on(ack.ack()).unwrap();
+    assert_eq!(tracker.blocking(), 0);
+}
+
 // ---------- end-to-end barrier tests ----------
 
 use crate::executor::barrier::ChainSnapshot;
@@ -3711,8 +3745,8 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                     Arc::new(crate::input::NoopAck),
                 )),
                 1 => {
-                    // Keep the chain alive past the first 100ms tick.
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    // Keep the chain alive past the first 100ms ticks.
+                    tokio::time::sleep(Duration::from_millis(600)).await;
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -3726,7 +3760,7 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         }
     }
     let processor = Arc::new(TickMarkerProcessor {
-        first_process_delay: Duration::from_millis(250),
+        first_process_delay: Duration::from_millis(400),
         delayed: AtomicUsize::new(0),
     });
     let output = Arc::new(CollectOutput::default());
@@ -3766,17 +3800,24 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    let first_tick = keys
-        .iter()
-        .position(|key| key == "tick")
-        .expect("tick output must reach the sink");
+    // The interval's FIRST tick fires immediately at chain startup and can
+    // legitimately publish before the first delivery is even submitted —
+    // nothing is in flight yet, so there is nothing to overtake. Every LATER
+    // tick (the ones that fire inside the delivery's 400ms in-flight window)
+    // must follow the delivery, otherwise per-edge ordering is broken.
     assert!(
-        first_tick > 0,
+        keys.iter().any(|key| key == "tick"),
+        "tick output must reach the sink"
+    );
+    let leading_ticks = keys.iter().take_while(|key| key.as_str() == "tick").count();
+    assert!(
+        leading_ticks <= 1,
         "tick output overtook in-flight pooled data: {keys:?}"
     );
     assert_eq!(
-        keys[0], "a",
-        "the first data delivery must be published before any tick output"
+        keys.get(leading_ticks).map(String::as_str),
+        Some("a"),
+        "the first data delivery must be published before any tick output that fired while it was in flight: {keys:?}"
     );
 }
 

@@ -369,6 +369,16 @@ impl Hub {
         self.storage.is_some()
     }
 
+    /// Startup diagnostics for the fail-open token defaults: an unset token
+    /// means the corresponding route class accepts unauthenticated callers.
+    pub fn operator_token_is_set(&self) -> bool {
+        self.config.operator_token.is_some()
+    }
+
+    pub fn node_token_is_set(&self) -> bool {
+        self.config.node_token.is_some()
+    }
+
     pub async fn jobs(&self) -> Result<Vec<JobRecord>, HubError> {
         if let Some(storage) = &self.storage {
             return storage.list_jobs().await.map_err(HubError::from);
@@ -431,6 +441,79 @@ impl Hub {
             self.reconcile_job(&job).await?;
         }
         Ok(job)
+    }
+
+    /// Generation-fenced Job record replacement for upgrade and rollback.
+    /// The handlers read the Job, await several round trips and then write;
+    /// the fence makes a concurrent desired-state change (or reconciler
+    /// write) that bumped the generation surface as a conflict instead of
+    /// being silently overwritten by the older read.
+    pub async fn update_job_with_expected_generation(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, HubError> {
+        let version_record = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
+            .ok()
+            .and_then(|spec| {
+                arkflow_core::job::JobPlan::compile(spec)
+                    .ok()
+                    .and_then(|plan| serde_json::to_string(&plan).ok())
+                    .map(|plan_json| JobVersionRecord {
+                        job_id: job.job_id.clone(),
+                        version: job.version,
+                        spec_json: job.spec_json.clone(),
+                        plan_json,
+                        created_at_ms: now_ms(),
+                    })
+            });
+        let updated = if let Some(storage) = &self.storage {
+            let updated = storage
+                .update_job_with_expected_generation(job.clone(), expected_generation)
+                .await
+                .map_err(HubError::from)?;
+            if let Some(record) = version_record.clone() {
+                storage
+                    .upsert_job_version(record)
+                    .await
+                    .map_err(HubError::from)?;
+            }
+            self.jobs
+                .write()
+                .await
+                .insert(updated.job_id.clone(), updated.clone());
+            updated
+        } else {
+            let mut jobs = self.jobs.write().await;
+            match jobs.get(&job.job_id) {
+                Some(current) if current.generation == expected_generation => {
+                    let mut updated = job;
+                    updated.generation = expected_generation.saturating_add(1);
+                    jobs.insert(updated.job_id.clone(), updated.clone());
+                    updated
+                }
+                Some(current) => {
+                    return Err(HubError::from(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current: current.generation,
+                    }));
+                }
+                None => {
+                    return Err(HubError::from(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current: 0,
+                    }));
+                }
+            }
+        };
+        if let Some(record) = version_record {
+            let mut versions = self.job_versions.write().await;
+            let entries = versions.entry(record.job_id.clone()).or_default();
+            entries.retain(|existing| existing.version != record.version);
+            entries.push(record);
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.version));
+        }
+        Ok(updated)
     }
 
     pub async fn job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, HubError> {
@@ -1279,7 +1362,17 @@ impl Hub {
                 created_at_ms: record.created_at_ms,
                 status: arkflow_core::checkpoint::CheckpointStatus::Completed,
             };
-            delete_checkpoint_artifact(spec, &artifact).map_err(HubError::Invalid)?;
+            // The artifact delete performs blocking object-store I/O; keep it
+            // off the async runtime's worker threads (this runs inside
+            // reconciliation and request handling).
+            let spec_for_delete = spec.clone();
+            tokio::task::spawn_blocking(move || {
+                delete_checkpoint_artifact(&spec_for_delete, &artifact).map_err(HubError::Invalid)
+            })
+            .await
+            .map_err(|error| {
+                HubError::Invalid(format!("checkpoint retention task failed: {error}"))
+            })??;
             if let Some(storage) = &self.storage {
                 storage
                     .delete_job_checkpoint(&record.job_id, &record.checkpoint_id)

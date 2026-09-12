@@ -99,6 +99,15 @@ pub struct AggregateBuffer {
     /// is being upgraded.
     #[serde(default)]
     pub session_end_ms: i64,
+    /// Number of integer observations in this buffer. A buffer that observed
+    /// both integer and float values (per-batch JSON schema inference makes
+    /// this routine) keeps both contributions; the fired aggregate folds them
+    /// into the wider kind instead of silently dropping one side.
+    #[serde(default)]
+    pub int_observations: u64,
+    /// Number of float observations in this buffer.
+    #[serde(default)]
+    pub float_observations: u64,
     /// Serialized input batches retained for legacy buffer compatibility. The
     /// old tumbling/session buffers emitted the original rows and schema, not
     /// aggregate metadata, so the unified operator keeps that payload beside
@@ -115,17 +124,32 @@ impl AggregateBuffer {
         self.count += other.count;
         self.sum_i64 = self.sum_i64.wrapping_add(other.sum_i64);
         self.sum_float += other.sum_float;
-        if other.count > 0 && self.count == other.count {
-            self.min_i64 = other.min_i64;
-            self.max_i64 = other.max_i64;
-            self.min_float = other.min_float;
-            self.max_float = other.max_float;
-        } else if other.count > 0 {
-            self.min_i64 = self.min_i64.min(other.min_i64);
-            self.max_i64 = self.max_i64.max(other.max_i64);
-            self.min_float = self.min_float.min(other.min_float);
-            self.max_float = self.max_float.max(other.max_float);
+        // Combine each representation only over the sides that actually
+        // observed values: an all-float buffer's untouched integer min/max
+        // (and vice versa) must not fabricate a boundary for the merged
+        // aggregate.
+        if other.int_observations > 0 {
+            if self.int_observations > 0 {
+                self.min_i64 = self.min_i64.min(other.min_i64);
+                self.max_i64 = self.max_i64.max(other.max_i64);
+            } else {
+                self.min_i64 = other.min_i64;
+                self.max_i64 = other.max_i64;
+            }
         }
+        if other.float_observations > 0 {
+            if self.float_observations > 0 {
+                self.min_float = self.min_float.min(other.min_float);
+                self.max_float = self.max_float.max(other.max_float);
+            } else {
+                self.min_float = other.min_float;
+                self.max_float = other.max_float;
+            }
+        }
+        self.int_observations = self.int_observations.saturating_add(other.int_observations);
+        self.float_observations = self
+            .float_observations
+            .saturating_add(other.float_observations);
         self.kind = match (self.kind, other.kind) {
             // A merged buffer keeps the wider of the two kinds.
             (NumericKind::Float64, _) | (_, NumericKind::Float64) => NumericKind::Float64,
@@ -155,15 +179,17 @@ impl AggregateBuffer {
             self.max_i64 = self.max_i64.max(value);
         }
         self.sum_i64 = self.sum_i64.wrapping_add(value);
+        self.int_observations = self.int_observations.saturating_add(1);
         self.count += 1;
         self.updated_since_emit = self.emitted;
     }
 
     /// Observe a floating value of the given kind. The internal
     /// representation is f64; the emitted schema narrows back to Float32 for
-    /// Float32 aggregates.
+    /// Float32 aggregates. Float min/max seed from the first FLOAT value —
+    /// integer observations share neither representation nor sentinel.
     pub fn observe_float(&mut self, value: f64, kind: NumericKind) {
-        if self.count == 0 {
+        if self.float_observations == 0 {
             self.min_float = value;
             self.max_float = value;
         } else {
@@ -171,6 +197,7 @@ impl AggregateBuffer {
             self.max_float = self.max_float.max(value);
         }
         self.sum_float += value;
+        self.float_observations = self.float_observations.saturating_add(1);
         self.kind = match (self.kind, kind) {
             (NumericKind::Float64, _) | (_, NumericKind::Float64) => NumericKind::Float64,
             (NumericKind::Float32, _) | (_, NumericKind::Float32) => NumericKind::Float32,
@@ -178,6 +205,33 @@ impl AggregateBuffer {
         };
         self.count += 1;
         self.updated_since_emit = self.emitted;
+    }
+
+    /// The sum over both representations, folded into the buffer's widened
+    /// float representation. Integer contributions survive a kind widening
+    /// instead of being dropped because only the float side was read.
+    fn widened_sum(&self) -> f64 {
+        self.sum_float + self.sum_i64 as f64
+    }
+
+    /// The minimum over both representations. Each side participates only if
+    /// it actually observed a value; the untouched side's default field would
+    /// fabricate a boundary (e.g. `0.0` or `i64::MIN`).
+    fn widened_min(&self) -> f64 {
+        match (self.int_observations > 0, self.float_observations > 0) {
+            (true, true) => (self.min_i64 as f64).min(self.min_float),
+            (true, false) => self.min_i64 as f64,
+            (false, _) => self.min_float,
+        }
+    }
+
+    /// The maximum over both representations (see [`Self::widened_min`]).
+    fn widened_max(&self) -> f64 {
+        match (self.int_observations > 0, self.float_observations > 0) {
+            (true, true) => (self.max_i64 as f64).max(self.max_float),
+            (true, false) => self.max_i64 as f64,
+            (false, _) => self.max_float,
+        }
     }
 }
 
@@ -260,6 +314,22 @@ impl WindowOperatorConfig {
                 "window trigger_interval_ms must be positive".into(),
             ));
         }
+        if self.value_fields.len() > 1 {
+            // The operator aggregates a single value column and emits one
+            // sum/min/max trio; silently dropping the extra fields would emit
+            // wrong counts with no error.
+            return Err(Error::Config(format!(
+                "window aggregate supports exactly one value field, got {}",
+                self.value_fields.len()
+            )));
+        }
+        if self.legacy_payload && matches!(self.kind, WindowKind::Sliding { .. }) {
+            // The stream compiler rejects this combination for stream configs;
+            // a Job spec bypasses the compiler, and `windows_for` would panic.
+            return Err(Error::Config(
+                "legacy_payload is not supported for sliding windows".into(),
+            ));
+        }
         match self.kind {
             WindowKind::Tumbling { size_ms } if size_ms > 0 => {}
             WindowKind::Sliding { size_ms, slide_ms } if size_ms > 0 && slide_ms > 0 => {
@@ -267,6 +337,16 @@ impl WindowOperatorConfig {
                     return Err(Error::Config(
                         "sliding window slide_ms must not exceed size_ms".into(),
                     ));
+                }
+                // Every event joins each aligned window that contains it: an
+                // extreme size/slide ratio would enumerate (and buffer) that
+                // many memberships per event. Cap the fan-out so a validated
+                // config cannot stall the task or exhaust memory.
+                if size_ms / slide_ms > MAX_SLIDING_MEMBERSHIPS_PER_EVENT {
+                    return Err(Error::Config(format!(
+                        "sliding window size_ms/slide_ms would assign each event to more than \
+                         {MAX_SLIDING_MEMBERSHIPS_PER_EVENT} windows; enlarge slide_ms or shrink size_ms"
+                    )));
                 }
             }
             WindowKind::Session { gap_ms } if gap_ms > 0 => {}
@@ -302,6 +382,10 @@ fn default_watermark_field() -> String {
     "__watermark_ms".to_string()
 }
 
+/// Upper bound on the memberships one event can join in a sliding window
+/// (enforced by `WindowOperatorConfig::validate`).
+const MAX_SLIDING_MEMBERSHIPS_PER_EVENT: i64 = 10_000;
+
 /// The columnar window operator. One instance per stateful operator task;
 /// state is namespaced under the operator id so parallel subtasks stay
 /// isolated.
@@ -313,6 +397,11 @@ pub struct ColumnarWindowOperator {
     /// default.
     late_event_policy: LateEventPolicy,
     late_event_route_configured: bool,
+    /// Session-late/invalid rows counted by this operator. The source gate
+    /// cannot see session lateness (it is key- and state-dependent), so the
+    /// operator counts its own masks here and the chain loop surfaces the
+    /// counter into the kernel's `late_events` metric.
+    late_event_rows: Arc<std::sync::atomic::AtomicU64>,
     backend: Arc<dyn StateBackend>,
     namespace: String,
     /// Output-gated state commits: buffer mutations stage in the journal and
@@ -526,6 +615,7 @@ impl ColumnarWindowOperator {
             config,
             late_event_policy,
             late_event_route_configured,
+            late_event_rows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backend,
             namespace: namespace.into(),
             journal,
@@ -574,6 +664,12 @@ impl ColumnarWindowOperator {
             late_event_route_configured,
             Some(journal),
         )
+    }
+
+    /// The counter of session-late/invalid rows this operator has classified.
+    /// The chain loop surfaces its delta into the kernel `late_events` metric.
+    pub fn late_event_row_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.late_event_rows)
     }
 
     /// The journal transaction owning one window group's staged state.
@@ -1291,18 +1387,20 @@ impl ColumnarWindowOperator {
             counts.push(buffer.count);
             sum_values.push(match buffer.kind {
                 NumericKind::Int64 => NumericValue::Int(buffer.sum_i64),
-                NumericKind::Float32 => NumericValue::Float(buffer.sum_float, NumericKind::Float32),
-                NumericKind::Float64 => NumericValue::Float(buffer.sum_float, NumericKind::Float64),
+                other_kind => {
+                    // A buffer that observed mixed Int64/Float64 values keeps
+                    // both contributions; fold the integer side into the
+                    // widened float aggregate instead of dropping it.
+                    NumericValue::Float(buffer.widened_sum(), other_kind)
+                }
             });
             min_values.push(match buffer.kind {
                 NumericKind::Int64 => NumericValue::Int(buffer.min_i64),
-                NumericKind::Float32 => NumericValue::Float(buffer.min_float, NumericKind::Float32),
-                NumericKind::Float64 => NumericValue::Float(buffer.min_float, NumericKind::Float64),
+                other_kind => NumericValue::Float(buffer.widened_min(), other_kind),
             });
             max_values.push(match buffer.kind {
                 NumericKind::Int64 => NumericValue::Int(buffer.max_i64),
-                NumericKind::Float32 => NumericValue::Float(buffer.max_float, NumericKind::Float32),
-                NumericKind::Float64 => NumericValue::Float(buffer.max_float, NumericKind::Float64),
+                other_kind => NumericValue::Float(buffer.widened_max(), other_kind),
             });
             updates.push(is_update);
             if self.config.legacy_payload {
@@ -1755,6 +1853,14 @@ impl ColumnarWindowOperator {
         // the parent is not committed until every outcome is settled.
         let (keep, late, invalid_timestamps) = self.session_late_masks(&batch)?;
         let late_count = late.iter().filter(|is_late| **is_late).count();
+        if late_count > 0 {
+            // The gate cannot classify session lateness; these rows would
+            // otherwise never reach the kernel `late_events` metric, which the
+            // spec requires to count every late or invalid row regardless of
+            // whether the policy drops, routes, or updates it.
+            self.late_event_rows
+                .fetch_add(late_count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let has_accepted_rows = keep.iter().any(|keep| *keep);
         let route_late = late_count > 0
             && self.late_event_policy == LateEventPolicy::Route
@@ -2479,6 +2585,22 @@ impl LegacyAggregateBuffer {
 }
 
 fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
+    // A real legacy payload written by the pre-typed kernel parses
+    // successfully as a V2 `AggregateBuffer` (it carried every field the
+    // typed struct requires and `is_float` is an ignored unknown field), so
+    // peeking for the flag BEFORE the typed parse is the only way to route
+    // it to the migration guard: a legacy FLOAT aggregate stores min/max as
+    // integer sentinels and would otherwise restore as a corrupted Int64
+    // aggregate.
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        if value.get("is_float").is_some_and(|flag| flag.is_boolean()) {
+            let legacy =
+                serde_json::from_value::<LegacyAggregateBuffer>(value).map_err(|error| {
+                    Error::Process(format!("decode legacy window aggregate state: {error}"))
+                })?;
+            return legacy.migrate();
+        }
+    }
     // Typed V2 payload (carries the `kind` field).
     if let Ok(buffer) = serde_json::from_slice::<AggregateBuffer>(bytes) {
         return Ok(buffer);
@@ -3966,5 +4088,117 @@ mod sliding_enumeration_tests {
         let mut windows = op.windows_for(6);
         windows.sort();
         assert_eq!(windows, vec![(0, 10), (5, 15)]);
+    }
+
+    #[test]
+    fn mixed_int_and_float_observations_keep_both_contributions() {
+        // Per-batch JSON schema inference routinely makes the same field
+        // Int64 in one delivery and Float64 in the next. A buffer that
+        // observed both must fold the integer side into the widened
+        // aggregate instead of dropping it (or fabricating a 0.0 boundary).
+        let mut buffer = AggregateBuffer::default();
+        buffer.observe_i64(100);
+        buffer.observe_float(99.5, NumericKind::Float64);
+        assert_eq!(buffer.count, 2);
+        assert_eq!(buffer.kind, NumericKind::Float64);
+        assert!((buffer.widened_sum() - 199.5).abs() < 1e-9);
+        assert!((buffer.widened_min() - 99.5).abs() < 1e-9);
+        assert!((buffer.widened_max() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merged_buffers_do_not_fabricate_boundaries_from_untouched_kinds() {
+        let mut int_only = AggregateBuffer::default();
+        int_only.observe_i64(-7);
+        let mut float_only = AggregateBuffer::default();
+        float_only.observe_float(2.5, NumericKind::Float64);
+        int_only.merge(&float_only);
+        assert_eq!(int_only.kind, NumericKind::Float64);
+        assert!((int_only.widened_sum() - (-4.5)).abs() < 1e-9);
+        assert!((int_only.widened_min() - (-7.0)).abs() < 1e-9);
+        assert!((int_only.widened_max() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_float_state_with_sentinel_min_max_fails_to_migrate() {
+        // A REAL legacy payload written by the pre-typed kernel: every field
+        // present (the typed parse would otherwise succeed with
+        // `kind = Int64` and restore fabricated integer sentinels).
+        let legacy = serde_json::json!({
+            "count": 3,
+            "sum_i64": 0,
+            "sum_float": 7.5,
+            "min_i64": i64::MIN,
+            "max_i64": i64::MAX,
+            "is_float": true,
+            "session_end_ms": 0
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(decode_buffer(&bytes).is_err());
+        // Integer legacy aggregates still migrate losslessly.
+        let legacy_int = serde_json::json!({
+            "count": 2,
+            "sum_i64": 9,
+            "sum_float": 0.0,
+            "min_i64": 4,
+            "max_i64": 5,
+            "is_float": false,
+            "session_end_ms": 0
+        });
+        let bytes = serde_json::to_vec(&legacy_int).unwrap();
+        let migrated = decode_buffer(&bytes).unwrap();
+        assert_eq!(migrated.kind, NumericKind::Int64);
+        assert_eq!(migrated.sum_i64, 9);
+    }
+
+    fn config_with(
+        kind: WindowKind,
+        legacy_payload: bool,
+        value_fields: Vec<String>,
+    ) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind,
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields,
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 0,
+            legacy_payload,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_pathological_sliding_ratio() {
+        let config = config_with(
+            WindowKind::Sliding {
+                size_ms: 315_360_000_000,
+                slide_ms: 1,
+            },
+            false,
+            vec!["value".into()],
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("more than"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_legacy_sliding_and_multiple_value_fields() {
+        let legacy_sliding = config_with(
+            WindowKind::Sliding {
+                size_ms: 10_000,
+                slide_ms: 1_000,
+            },
+            true,
+            vec!["value".into()],
+        );
+        assert!(legacy_sliding.validate().is_err());
+        let multi_value = config_with(
+            WindowKind::Tumbling { size_ms: 10_000 },
+            false,
+            vec!["a".into(), "b".into()],
+        );
+        assert!(multi_value.validate().is_err());
     }
 }

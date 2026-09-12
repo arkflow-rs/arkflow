@@ -164,6 +164,12 @@ impl Aligner {
             self.passthrough = Some(envelope);
             return Ok(None);
         }
+        // Hold the envelope's acknowledgement while it sits in the alignment
+        // buffer. Otherwise its source can never drain (the ack completes only
+        // when this vertex processes the envelope, which waits for the
+        // source's barrier, which waits for the drain) and every multi-input
+        // checkpoint round under backpressure would time out.
+        envelope.mark_held();
         let buffered = self.buffered.entry(index).or_default();
         buffered.push(envelope);
         let total: usize = self.buffered.values().map(Vec::len).sum();
@@ -203,6 +209,10 @@ impl Aligner {
         let buffered = std::mem::take(&mut self.buffered);
         for (index, envelopes) in buffered {
             for envelope in envelopes {
+                // Back into the in-flight set: the released data must be
+                // acknowledged (or replayed from the sealed cut) before a
+                // later barrier can seal past it.
+                envelope.release_held();
                 drained.push((index, envelope));
             }
         }

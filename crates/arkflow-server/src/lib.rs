@@ -172,7 +172,10 @@ fn page_items<T>(items: Vec<T>, query: &PageQuery) -> Page<T> {
     Page {
         items: items
             .into_iter()
-            .skip((page - 1) * page_size)
+            // The page number is unvalidated query input: saturating
+            // arithmetic keeps a `?page=usize::MAX` request from
+            // overflowing (debug panic / wrapped release offsets).
+            .skip(page.saturating_sub(1).saturating_mul(page_size))
             .take(page_size)
             .collect(),
         page,
@@ -371,6 +374,19 @@ pub async fn serve_hub(
     }
     arkflow_plugin::initialize()?;
     hub.recover_persisted_state().await?;
+    if !hub.operator_token_is_set() {
+        tracing::warn!(
+            "Hub is running WITHOUT an operator token: every operator API grants full Admin access. \
+             Set operator_token before exposing this Hub beyond localhost."
+        );
+    }
+    if !hub.node_token_is_set() {
+        tracing::warn!(
+            "Hub is running WITHOUT a node token: any caller can register arbitrary compute nodes \
+             (including re-registering an existing node's id). Set node_token before exposing this \
+             Hub beyond localhost."
+        );
+    }
     let address: SocketAddr = config.address.parse()?;
     let listener = TcpListener::bind(address).await?;
     let sweep_hub = hub.clone();
@@ -1011,7 +1027,13 @@ async fn hub_job_upgrade(
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
     };
-    match hub.upsert_job(upgraded).await {
+    // The generation fence covers the whole read-validate-write sequence: a
+    // concurrent mutation that bumped the generation must surface as a
+    // conflict instead of being silently overwritten by this older read.
+    match hub
+        .update_job_with_expected_generation(upgraded, request.expected_generation)
+        .await
+    {
         Ok(job) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -1022,6 +1044,11 @@ async fn hub_job_upgrade(
             })),
         )
             .into_response(),
+        Err(hub::HubError::GenerationConflict { expected, current }) => problem(
+            StatusCode::PRECONDITION_FAILED,
+            "generation_conflict",
+            format!("Expected generation {expected}, current generation {current}"),
+        ),
         Err(error) => hub_problem(error),
     }
 }
@@ -1136,8 +1163,18 @@ async fn hub_job_upgrade_rollback(
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
     };
-    match hub.upsert_job(restored).await {
+    // Same generation fence as the upgrade path: the version list may have
+    // been read before a concurrent mutation bumped the generation.
+    match hub
+        .update_job_with_expected_generation(restored, current.generation)
+        .await
+    {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Err(hub::HubError::GenerationConflict { expected, current }) => problem(
+            StatusCode::PRECONDITION_FAILED,
+            "generation_conflict",
+            format!("Expected generation {expected}, current generation {current}"),
+        ),
         Err(error) => hub_problem(error),
     }
 }
@@ -2444,6 +2481,14 @@ async fn agent_commands(
     headers: HeaderMap,
     Query(query): Query<AgentCommandsQuery>,
 ) -> Response {
+    if query.session_token.is_some() {
+        // The query parameter leaks the live session credential into
+        // tracing/proxy logs (the trace layer records the full URI).
+        tracing::warn!(
+            node_id = %query.node_id,
+            "agent session token supplied via query parameter; this is deprecated and will be removed - send it in the Authorization: Bearer header"
+        );
+    }
     let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
         return problem(
             StatusCode::UNAUTHORIZED,
@@ -2469,6 +2514,12 @@ async fn agent_command_result(
     Query(query): Query<AgentCommandsQuery>,
     Json(result): Json<hub::CommandResult>,
 ) -> Response {
+    if query.session_token.is_some() {
+        tracing::warn!(
+            node_id = %query.node_id,
+            "agent session token supplied via query parameter; this is deprecated and will be removed - send it in the Authorization: Bearer header"
+        );
+    }
     let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
         return problem(
             StatusCode::UNAUTHORIZED,
@@ -2730,7 +2781,18 @@ async fn operation(State(cp): State<ControlPlane>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn cancel_operation(State(cp): State<ControlPlane>, Path(id): Path<String>) -> Response {
+async fn cancel_operation(
+    State(cp): State<ControlPlane>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&cp, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid Bearer token is required".into(),
+        );
+    }
     match cp.cancel_operation(&id).await {
         Some(value) => Json(value).into_response(),
         None => problem(
@@ -3067,29 +3129,36 @@ async fn correlation_middleware(mut request: Request<Body>, next: Next) -> Respo
     }
     let response = next.run(request).await;
     let (mut parts, body) = response.into_parts();
+    // Only error responses are buffered so a correlation id can be injected.
+    // Success responses (including streaming bodies such as the SSE event
+    // stream) must pass through untouched or the stream never delivers.
+    if !parts.status.is_client_error() && !parts.status.is_server_error() {
+        if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+            parts.headers.insert("x-correlation-id", value);
+        }
+        return Response::from_parts(parts, body);
+    }
     let body_bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
     let mut replacement = None;
-    if parts.status.is_client_error() || parts.status.is_server_error() {
-        match serde_json::from_slice::<ApiError>(&body_bytes) {
-            Ok(mut error) => {
-                if error.correlation_id.is_none() {
-                    error.correlation_id = Some(correlation_id.clone());
-                }
-                replacement = serde_json::to_vec(&error).ok();
+    match serde_json::from_slice::<ApiError>(&body_bytes) {
+        Ok(mut error) => {
+            if error.correlation_id.is_none() {
+                error.correlation_id = Some(correlation_id.clone());
             }
-            Err(_) if parts.status == StatusCode::BAD_REQUEST => {
-                replacement = serde_json::to_vec(&ApiError {
-                    code: "invalid_query".into(),
-                    message: "Request query or body is invalid".into(),
-                    field: None,
-                    stream_id: None,
-                    correlation_id: Some(correlation_id.clone()),
-                    details: None,
-                })
-                .ok();
-            }
-            Err(_) => {}
+            replacement = serde_json::to_vec(&error).ok();
         }
+        Err(_) if parts.status == StatusCode::BAD_REQUEST => {
+            replacement = serde_json::to_vec(&ApiError {
+                code: "invalid_query".into(),
+                message: "Request query or body is invalid".into(),
+                field: None,
+                stream_id: None,
+                correlation_id: Some(correlation_id.clone()),
+                details: None,
+            })
+            .ok();
+        }
+        Err(_) => {}
     }
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         parts.headers.insert("x-correlation-id", value);

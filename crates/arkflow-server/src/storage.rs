@@ -365,6 +365,11 @@ enum StorageCommand {
         job: JobRecord,
         response: oneshot::Sender<Result<JobRecord, StorageError>>,
     },
+    UpdateJobWithExpectedGeneration {
+        job: JobRecord,
+        expected_generation: u64,
+        response: oneshot::Sender<Result<JobRecord, StorageError>>,
+    },
     GetJob {
         job_id: String,
         response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
@@ -583,6 +588,15 @@ impl StorageActor {
                 match command {
                     StorageCommand::UpsertJob { job, response } => {
                         let _ = response.send(store.upsert_job(job));
+                    }
+                    StorageCommand::UpdateJobWithExpectedGeneration {
+                        job,
+                        expected_generation,
+                        response,
+                    } => {
+                        let _ = response.send(
+                            store.update_job_with_expected_generation(job, expected_generation),
+                        );
                     }
                     StorageCommand::GetJob { job_id, response } => {
                         let _ = response.send(store.get_job(&job_id));
@@ -857,6 +871,23 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::UpsertJob { job, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_with_expected_generation(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobWithExpectedGeneration {
+                job,
+                expected_generation,
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -2268,10 +2299,24 @@ impl ControlPlaneStore {
                 )
                 .optional()?;
             if let Some((boot_id, report_seq)) = current {
-                if boot_id.as_deref() == mutation.boot_id.as_deref()
-                    && mutation.report_seq <= report_seq
-                {
-                    return Ok(());
+                match (boot_id.as_deref(), mutation.boot_id.as_deref()) {
+                    // Same fencible session: the sequence cursor rejects
+                    // replays (every report of a session carries a strictly
+                    // increasing seq).
+                    (Some(stored), Some(incoming)) if stored == incoming => {
+                        if mutation.report_seq <= report_seq {
+                            return Ok(());
+                        }
+                    }
+                    // No fencible identity on either side: boot-less agents
+                    // report seq 0 forever, so a seq gate here would freeze
+                    // the observed state at the first report. Accept the
+                    // report; convergence runs on its content.
+                    (None, None) => {}
+                    // The session identity changed (an agent re-registered
+                    // with or without a boot id): the incoming report
+                    // supersedes the stored session.
+                    _ => {}
                 }
             }
             let now = now_ms();
@@ -2771,6 +2816,55 @@ impl ControlPlaneStore {
                     job.updated_at_ms,
                 ],
             )?;
+            Ok(job)
+        })
+    }
+
+    /// Replace a Job record only when its stored generation still matches
+    /// `expected_generation`, bumping the generation on success. The
+    /// upgrade/rollback handlers read the Job, await several round trips and
+    /// then write: without this CAS a concurrent desired-state change that
+    /// bumps the generation can be silently overwritten by the older read.
+    pub fn update_job_with_expected_generation(
+        &self,
+        mut job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            job.generation = expected_generation.saturating_add(1);
+            let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
+                StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET version=?2, spec_json=?3, desired_state=?4, observed_state=?5, convergence=?6, generation=?7, node_ids_json=?8, checkpoint_id=?9, last_error=?10, updated_at_ms=?11 WHERE job_id=?1 AND generation=?12",
+                rusqlite::params![
+                    job.job_id,
+                    job.version,
+                    job.spec_json,
+                    job.desired_state,
+                    job.observed_state,
+                    job.convergence,
+                    job.generation,
+                    node_ids,
+                    job.checkpoint_id,
+                    job.last_error,
+                    job.updated_at_ms,
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [&job.job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return Err(StorageError::GenerationConflict {
+                    expected: expected_generation,
+                    current: current.unwrap_or(0),
+                });
+            }
             Ok(job)
         })
     }
