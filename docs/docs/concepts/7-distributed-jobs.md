@@ -6,6 +6,45 @@ sidebar_position: 7
 
 ArkFlow 的 Job 是面向有状态流处理的新运行时契约，与现有 YAML Stream 并行存在。Job 由带稳定 ID 的算子和边组成，提交后生成不可变的 `JobVersion` 与物理任务计划。
 
+## 总体架构
+
+Hub 是纯控制面：持久化意图（SQLite）、做放置决策、聚合观察；Agent 是数据面，各自运行统一内核的共置子图。Agent 之间没有直连数据通道，只共享对象存储（恢复工件）与外部系统（源/汇）。
+
+```mermaid
+flowchart TB
+    C["Console (Vite web app)<br/>DAG orchestrator · workbench · runtime views"]
+    subgraph HUB["Hub — single control plane"]
+        direction TB
+        API["HTTP API /api/v1<br/>jobs · nodes · streams · checkpoints"]
+        DB[("SQLite storage actor<br/>intents · outbox · observed · catalog")]
+        REC["reconcile_once()<br/>outbox claim-lease dispatch · retry · expire"]
+        PL["Placement + fencing<br/>assignments_for_nodes(generation)<br/>completeness gate"]
+        API --> DB
+        DB --> REC
+        REC --> PL
+    end
+    subgraph NA["Agent node-a"]
+        KA["JobRuntime → kernel<br/>co-located subgraph"]
+    end
+    subgraph NB["Agent node-b"]
+        KB["JobRuntime → kernel<br/>co-located subgraph"]
+    end
+    OS[("Object store (file:// or s3://)<br/>manifests · state snapshots · artifacts")]
+    EXT[("External systems<br/>Kafka · SQL · MQTT · HTTP …<br/>the only cross-node bridge")]
+
+    C -- "Bearer (operator)" --> API
+    PL -- "commands (agent poll, session token)" --> NA
+    PL --> NB
+    NA -- "heartbeat · report" --> PL
+    NB -- "heartbeat · report" --> PL
+    NA -- "artifacts" --> OS
+    NB -- "artifacts" --> OS
+    NA -- "data" --> EXT
+    NB -- "data" --> EXT
+```
+
+控制流自上而下（写意图 → outbox 认领派发 → Agent 轮询取命令）；观察流自下而上（心跳续租、report 单调上报，generation fencing 拒绝旧代）。
+
 ## 时间语义
 
 Job 可以声明事件时间字段、每分区 watermark、空闲分区超时和允许迟到时间。watermark 由活跃分区的最小进度聚合；超过窗口边界的事件按 `drop`、`route` 或 `update` 策略处理。
@@ -19,6 +58,23 @@ Job 可以声明事件时间字段、每分区 watermark、空闲分区超时和
 ## 嵌入式状态与检查点
 
 热路径状态保存在 Compute 本地的嵌入式 KV 中,按 Job、算子和 key namespace 隔离,并支持 TTL、大小计量和格式版本。检查点将状态快照、源位置和 watermark 以校验和保护的 manifest 写入共享对象存储;恢复顺序是先恢复状态和源位置,再开始读取输入。
+
+单个节点上,命令驱动的执行与 checkpoint 流转如下:
+
+```mermaid
+flowchart TB
+    CMD["poll → StartJob(assignments, generation, recovery?)"] --> SP["spawn_kernel_job(plan, task_ids)<br/>build_subgraph — chain co-location · bounded flume (cap 1024)<br/>restore BEFORE read: state · positions · per-partition watermarks"]
+    SP --> DP
+    subgraph DP["data path (unified kernel)"]
+        direction LR
+        SRC["[Source]"] --> GATE["EventTimeGate"] --> OPS["fused operator chain"] --> SINK["[Sink]"]
+        ALI["Aligner: buffers the fast input,<br/>holds acks until every barrier aligned"]
+    end
+    DP --> ST["StateBackend (redb · namespace · TTL)"]
+    ST -- "snapshot" --> ACK["TaskCheckpointAck<br/>positions · per-partition watermarks · state refs"]
+    ACK --> HG["Hub completeness gate<br/>seal manifest only if EVERY planned task is in the cut"]
+    HG --> MAN[("manifest: checksum · format_version<br/>checkpoint / savepoint artifacts")]
+```
 
 ### 已确认切点(acknowledged cut)
 

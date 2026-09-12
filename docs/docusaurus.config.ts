@@ -38,6 +38,7 @@ const config: Config = {
   onBrokenAnchors: 'throw',
 
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
@@ -155,7 +156,7 @@ const config: Config = {
       darkTheme: prismThemes.dracula,
     },
   } satisfies Preset.ThemeConfig,
-  themes: [],
+  themes: ['@docusaurus/theme-mermaid'],
   plugins: [
     function disableIncompatibleWebpackBar() {
       return {
