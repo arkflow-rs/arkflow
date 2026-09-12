@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -202,10 +202,11 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
 - Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 复用现有 upsert（零代码）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future。
 
-### 下一步
-1. **合入 v1**：跟进 PR #1219 评审，其后将 v1 剩余提交（`Build distributed Job workbench` + `feat(console): add visual job DAG orchestrator`）以正式 PR 合入 main。
-2. **OpenSpec 归档清欠**：8 个未归档变更中 MongoDB(#1214)/InfluxDB(#1213)/backpressure(#1196)/close-wal(#1184)/add-control-plane/make-control-plane-hub 的 PR 均已合入 main，`add-distributed-stateful-streaming-runtime` 与 `add-visual-job-dag-orchestrator` 待 v1 合入后一并 verify → archive（delta 合并 `openspec/specs/`）。
-3. **方向①③④ roadmap 展开**：方向② 四项已全部落地，规划重心转向 AI/ML processor（①）、可观测性（③）、开发者生态（④），或 Hub 平台路线（第五节）的后续阶段。
+### 下一步（2026-09-12 对齐）
+
+1. **合入 v1**：v1 领先 main 51 个提交、main 零领先（单向干净窗口）。评审整改已全部归档，`openspec/changes/` 仅剩 `archive/`。合并 v1 是一切新方向的前置，拖久合并风险增大。
+2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。
+3. **方向选择**：方向② 四项全部闭环后，从第七节候选方向中确认下一主线（推荐序：数据面可观测性 → 企业集成安全 → AI 轻量切口），确认后展开 roadmap 并按 OpenSpec 立项。
 
 ---
 
@@ -225,9 +226,9 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - **内核指标**（`metrics.rs`）：per-chain 吞吐/平均延迟/在途/错误 + checkpoint 时长/失败 + watermark lag + 迟到计数。
 - **性能基线**：generate→json_to_arrow→sql→drop（20 万行，batch=1000）：内核 528ms vs legacy 559ms（快 6%，`kernel_perf_baseline.rs`）。
 
-### 待办（1 项）
+### 待办（已清零，2026-09-12 核实）
 
-1. **5.6 双节点 smoke**：两节点 Hub–Agent Job + barrier checkpoint + kill/restart 恢复（需要多进程环境，建议专项做）。
+- ~~5.6 双节点 smoke~~：已由自动化测试 `crates/arkflow-server/tests/two_node_job_smoke.rs` 闭环（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing；2026-09-12 实测通过，随 `3499843` 引入、`b17690d` 加固）。
 
 第三批（2026-08-28）完成：5.4 双执行器删除（-2966 行；迁移 partition-guard/Route-vs-Update 测试到 executor；WAL 重放迁入 WalInput 惰性队列；temporary 表经 StreamJobAdapter::build_resource 进入内核 Resource——修复了内核丢 temporary 的缺口）；4.5 examples 等价回归（inline 管道 + durability_example 含 WAL 重放路径）；2.6 故障注入（注入 snapshot 失败→checkpoint 失败但数据继续；恢复位置 ≤ checkpoint 位点）；3.5 sliding/session 窗口（多窗口隶属分配、会话按 gap 合并扩展，编译器按 legacy 字段名 interval/gap 映射）；5.2 指标接通（run_job_with_metrics → RuntimeMetrics：input/processing/output/error 计数）；6.2 CLAUDE.md 对齐；6.3 tasks 勾选。
 
@@ -330,3 +331,42 @@ Hub 的近期目标是成为可靠的单 Hub、多节点运营控制面，而不
 3. 配置发布与批量节点运营。
 4. RBAC、审计与告警。
 5. Hub 高可用与外部存储。
+
+---
+
+## 七、未来方向探索（2026-09-12）
+
+v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为候选结论，**尚未立项**，方向由用户确认后展开。
+
+### 7.1 现状刷新（相对 2026-08-27）
+
+- 统一内核自 2026-08-28 起是唯一运行时，其后 5 批提交全部为评审整改（kernel / event-time / control-plane / kafka-reconnect），2026-09-11/12 全部归档；5.6 双节点 smoke 已由自动化测试闭环。
+- **v1 未合入 main**：`main..v1` 领先 51 提交、`v1..main` 为 0。
+- 依赖盘点：`prometheus` 0.13、`redb` 2、`reqwest` 已在 workspace；**无任何 ML 推理库、无 OpenTelemetry、无 WASM 运行时**——①③④ 的基建半成品状态。
+
+### 7.2 分布式模型的真实边界（2026-09-12 核实）
+
+`ExecutionGraphBuilder::build_subgraph`（`crates/arkflow-core/src/executor/graph.rs:309`）注释明确：**assignment 不允许把一条边拆到两个节点，Hub placement 保证算子链共置**。因此当前分布式 = 「轻量 Hub 调度 + 按源分区/子任务水平扩展 + 分布式 barrier checkpoint 容错」：
+
+- 水平扩展路径是源分区切分（如 Kafka 20 分区两节点各消费一半）与独立子任务；
+- **没有跨节点 network shuffle**：单算子中间数据不出节点，跨节点数据交换走外部系统（如 Kafka 重分区）；
+- 适用：多分区并行消费、独立子任务、多节点 IoT 就近采集；不适用：需要 shuffle 的重型有状态聚合/join——与 1.3 节「避开 RisingWave/Arroyo 主场」的定位自洽。
+
+### 7.3 候选方向与推荐优先序
+
+| 序 | 方向 | 要点 |
+| --- | --- | --- |
+| 0 | **v1 合入 main + 收口** | 51 提交积压，一切新方向的前置 |
+| 1 | **③ 数据面可观测性** | 内核已有 `KernelMetricsSnapshot`、Hub 已有控制面 metrics spec（`control-plane-observability`），缺数据面 Prometheus 导出、单进程 `/ready`（issue #768）、OTel trace；`prometheus` crate 已就位，小投入补齐「生产可用」叙事 |
+| 2 | **⑤ 企业集成安全（本次新发现）** | Kafka SASL/SSL **零实现**（issue #902，核实 `input/kafka.rs`/`output/kafka.rs` 无命中）——企业环境接不了带认证的 Kafka，是入场券级缺口；延伸：全组件 TLS 核查、Secret 引用机制（为 Hub 阶段 4 Secret Manager 铺路） |
+| 3 | **① AI 轻量切口** | LLM/embedding processor（reqwest 调 OpenAI 兼容 API，列式批量天然友好）+ 向量库 output（qdrant/milvus/pgvector）；2026 行业主流叙事即 streaming + agentic AI（RisingWave 已全面转向，蓝海收窄但仍有时机）；README 宣传与实现的脱节是最大差异化机会 |
+| 4 | **① 本地推理 + ④ 生态** | ONNX(ort)/candle 推理 processor（IoT 异常检测与 Modbus 场景契合）、WASM processor（issue #88）、公开 benchmark（issue #87，扩展 `kernel_perf_baseline.rs`） |
+| 5 | **Hub 平台阶段 2 穿插** | Agent session token 改 Authorization Header（5.2-4 明文安全债，未动）、RBAC/OIDC、审计 |
+
+推荐逻辑：0-2 在 1-2 个月内把项目从「内核先进」推进到「能进企业生产」；3-4 打开差异化叙事。方向②打下的 CDC/Schema/EOS 底座恰是方向①「给 AI 供可靠数据」的叙事衔接点——两条线是承接而非切换。
+
+### 7.4 本次探索同步修复的文档缺口
+
+- `docs/docs/configuration/1-top-level.md` 补 `jobs` 字段与 JobSpec 文档（此前零覆盖）；
+- `docs/docs/control-plane/http-api-v1.md` 补 Job API 路由（此前零覆盖）；
+- `docs/docs/concepts/7-distributed-jobs.md` 显式声明 7.2 节的链共置/无 shuffle 边界。
