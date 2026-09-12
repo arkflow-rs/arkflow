@@ -349,12 +349,21 @@ impl Input for KafkaInput {
             match consumer.recv().await {
                 Ok(kafka_message) => {
                     // Compacted topics deliver deletion markers with a null
-                    // payload. They are ordinary Kafka data: acknowledge and skip
-                    // them here. Treating them as a fatal error re-delivers the
-                    // same tombstone after every restart and crashes the stream
-                    // in a loop; skipping without an acknowledgement would replay
+                    // payload. They are ordinary Kafka data: settle them here.
+                    // Treating them as a fatal error re-delivers the same
+                    // tombstone after every restart and crashes the stream in
+                    // a loop; skipping without an acknowledgement would replay
                     // it forever because the acknowledged frontier never moves
                     // past it.
+                    //
+                    // The settlement is handed to its own task rather than
+                    // awaited inline: an acknowledgement can wait for a
+                    // partition (re)assignment, and `read` is this source's only
+                    // path for records AND injected control events, so blocking
+                    // it would stall checkpoints and watermarks. A settlement
+                    // failure still surfaces as the frontier failure fence that
+                    // the next acknowledged delivery reports, which is the same
+                    // retry contract a forwarded delivery gets.
                     let Some(payload) = kafka_message.payload() else {
                         let ack = KafkaAck {
                             consumer: self.consumer.clone(),
@@ -371,7 +380,14 @@ impl Input for KafkaInput {
                             partition: kafka_message.partition() as u32,
                             offset: kafka_message.offset() as u64,
                         });
-                        ack.ack().await?;
+                        tokio::spawn(async move {
+                            if let Err(error) = ack.ack().await {
+                                tracing::warn!(
+                                    %error,
+                                    "Kafka tombstone settlement failed; the frontier fence reports it to the next acknowledgement"
+                                );
+                            }
+                        });
                         continue;
                     };
 
@@ -753,6 +769,40 @@ impl Ack for KafkaAck {
             // the gap-closing ack completes between these two operations, the
             // Notify permit is retained and this wait still wakes.
             let notified = self.ack_notify.notified();
+            // A reconnect or rebalance can leave this in-flight acknowledgement
+            // racing the partition (re)assignment. `store_offset` for an
+            // unassigned partition fails and the failure fence would fail the
+            // stream, so wait for the assignment — but NEVER inside the lock
+            // scope below: that lock serializes every acknowledgement of this
+            // input, and the consumer read guard blocks the `connect` that
+            // installs the consumer whose assignment this wait is watching for.
+            // Holding either one across the wait wedges unrelated partitions
+            // (and the checkpoint drain behind them) until it expires.
+            let assigned = {
+                let consumer_guard = self.consumer.read().await;
+                match consumer_guard.as_ref() {
+                    Some(consumer) if Self::partition_assigned(
+                        consumer,
+                        &self.topic,
+                        self.partition,
+                    ) =>
+                    {
+                        true
+                    }
+                    // No consumer at all: the acknowledgement retries below
+                    // with an explicit error instead of waiting.
+                    None => true,
+                    Some(consumer) => self.wait_for_assignment(consumer).await,
+                }
+            };
+            if !assigned {
+                tracing::warn!(
+                    topic = %self.topic,
+                    partition = self.partition,
+                    offset = position.offset,
+                    "Kafka partition is no longer assigned; acknowledging without a broker offset store (the record may be delivered again)"
+                );
+            }
             let result = {
                 // Keep frontier advancement and broker-side store_offset in
                 // one order, but never hold this lock while waiting for an
@@ -803,32 +853,10 @@ impl Ack for KafkaAck {
                         // already the exclusive contiguous frontier.
                         let store_offset_value = i64::try_from(next_offset)
                             .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
-                        // A reconnect or rebalance can leave this in-flight
-                        // acknowledgement racing the partition (re)assignment.
-                        // Storing an offset for an unassigned partition fails
-                        // and the failure fence would kill the stream, so wait
-                        // for the assignment first; if it does not return, the
-                        // new partition owner (or a later restart) re-delivers
-                        // from the last committed offset — at-least-once holds.
-                        let skip_broker_store = if Self::partition_assigned(
-                            consumer,
-                            &self.topic,
-                            self.partition,
-                        ) {
-                            false
-                        } else {
-                            let assigned = self.wait_for_assignment(consumer).await;
-                            if !assigned {
-                                tracing::warn!(
-                                    topic = %self.topic,
-                                    partition,
-                                    next_offset,
-                                    "Kafka partition is no longer assigned; acknowledging without a broker offset store (the record may be delivered again)"
-                                );
-                            }
-                            !assigned
-                        };
-                        if !skip_broker_store {
+                        // The assignment was checked (and waited for) before
+                        // the lock scope, so this critical section never spans
+                        // a rebalance.
+                        if assigned {
                             if let Err(error) = consumer.store_offset(
                                 &self.topic,
                                 self.partition,
@@ -986,6 +1014,32 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `wait_for_assignment` used to run inside the per-input
+    /// acknowledgement lock and its consumer read guard, so one partition
+    /// waiting out a rebalance blocked every sibling acknowledgement — and the
+    /// consumer read guard blocked the `connect` that installs the
+    /// reassignment it was waiting for. The wait must start before the lock
+    /// scope, so the critical section never spans it.
+    #[test]
+    fn assignment_wait_starts_before_the_acknowledgement_lock() {
+        let source = include_str!("kafka.rs");
+        let ack_start = source
+            .find("impl Ack for KafkaAck")
+            .expect("the Kafka acknowledgement exists");
+        let wait_at = ack_start
+            + source[ack_start..]
+                .find("self.wait_for_assignment(consumer)")
+                .expect("the assignment wait exists");
+        let lock_at = ack_start
+            + source[ack_start..]
+                .find("let _ack_guard = self.ack_lock.lock().await;")
+                .expect("the acknowledgement lock exists");
+        assert!(
+            wait_at < lock_at,
+            "the assignment wait must be outside the acknowledgement lock scope"
+        );
+    }
 
     #[tokio::test]
     async fn test_kafka_input_new() {

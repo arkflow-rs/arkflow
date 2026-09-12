@@ -80,6 +80,29 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// A minimal chain that owns a processor worker pool, for tests that
+    /// exercise the pool's own failure and fence contracts without building a
+    /// whole graph.
+    #[cfg(test)]
+    pub fn for_pool_test(parallelism: usize, processors: Vec<Arc<dyn Processor>>) -> Chain {
+        Chain {
+            task_ids: Vec::new(),
+            source: None,
+            processors,
+            sink: None,
+            inputs: Vec::new(),
+            outputs: BTreeMap::new(),
+            error_outputs: BTreeMap::new(),
+            late_event_outputs: BTreeMap::new(),
+            source_time: None,
+            source_partition: None,
+            processor_parallelism: parallelism,
+            window_timings: Vec::new(),
+            watermark_group: None,
+            window_late_event_rows: None,
+        }
+    }
+
     pub fn is_source(&self) -> bool {
         self.source.is_some()
     }

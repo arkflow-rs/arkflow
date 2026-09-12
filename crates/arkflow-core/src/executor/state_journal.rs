@@ -598,6 +598,12 @@ impl StateJournal {
             previous.push(self.backend.get_entry(namespace, key)?);
         }
         let mut applied_versions: Vec<Option<u64>> = vec![None; mutations.len()];
+        // The version each mutation actually REPLACED, captured at apply time.
+        // `restore_previous` writes this back into the version map, so recording
+        // the version observed when the mutation was STAGED would write back a
+        // value older than a concurrent commit and silently disable the
+        // ownership check for the transaction that owns it.
+        let mut previous_versions: Vec<Option<u64>> = vec![None; mutations.len()];
         // Versions written by THIS apply pass: a later mutation of the same
         // transaction on the same key legitimately builds on them instead of
         // being fenced out.
@@ -612,25 +618,55 @@ impl StateJournal {
                     .copied()
                     .or_else(|| inner.key_versions.get(&version_key).copied())
             };
+            previous_versions[index] = current;
             let owned_by_this_pass = local_versions.contains_key(&version_key);
-            // Only an absolute snapshot (Put) can stale-overwrite a newer
-            // commit. Relative increments compose across pending transactions
-            // by design (`update_i64` builds on the staged overlay), and a
-            // delete is a cleanup guarded on the compensation side by
-            // `restore_previous`.
-            let fenced = match mutation {
-                StagedMutation::Put { .. } => {
-                    !owned_by_this_pass && current != staged_versions[index]
+            // A mutation is stale when the key's version moved since the
+            // mutation was staged, because its staged snapshot then predates a
+            // newer committed value.
+            //
+            // `Increment` is exempt: its mutation is a relative delta that the
+            // backend applies to whatever value is current, so it composes
+            // across transactions in any order and a version move does not make
+            // it wrong. `Delete` is destructive and therefore fenced, and it
+            // cannot be partially skipped without leaving the transaction's
+            // post-conditions inconsistent, so a stale delete fails the whole
+            // apply and the caller compensates and retries.
+            let destructive = !matches!(mutation, StagedMutation::Increment { .. });
+            let stale = destructive && !owned_by_this_pass && current != staged_versions[index];
+            if stale {
+                match mutation {
+                    StagedMutation::Put { .. } => {
+                        tracing::debug!(
+                            namespace = %namespace,
+                            key = %String::from_utf8_lossy(key),
+                            "skipping stale journal mutation fenced by a newer committed value"
+                        );
+                        continue;
+                    }
+                    StagedMutation::Delete { .. } | StagedMutation::Increment { .. } => {
+                        if let Err(rollback_error) = self.restore_previous(
+                            &mutations,
+                            &previous,
+                            &previous_versions,
+                            &applied_versions,
+                        ) {
+                            return Err(Error::Process(format!(
+                                "state journal apply refused a stale mutation; rollback also \
+                                 failed ({rollback_error})"
+                            )));
+                        }
+                        return Err(Error::Process(format!(
+                            "state journal refused a stale {} for key '{}': the staged snapshot \
+                             predates a newer committed value",
+                            if matches!(mutation, StagedMutation::Delete { .. }) {
+                                "delete"
+                            } else {
+                                "increment"
+                            },
+                            String::from_utf8_lossy(key)
+                        )));
+                    }
                 }
-                StagedMutation::Delete { .. } | StagedMutation::Increment { .. } => false,
-            };
-            if fenced {
-                tracing::debug!(
-                    namespace = %namespace,
-                    key = %String::from_utf8_lossy(key),
-                    "skipping stale journal mutation fenced by a newer committed value"
-                );
-                continue;
             }
             let result = match mutation {
                 StagedMutation::Put {
@@ -681,7 +717,7 @@ impl StateJournal {
                     if let Err(rollback_error) = self.restore_previous(
                         &mutations,
                         &previous,
-                        &staged_versions,
+                        &previous_versions,
                         &applied_versions,
                     ) {
                         return Err(Error::Process(format!(
@@ -698,7 +734,7 @@ impl StateJournal {
                 *state = TxnState::Applied {
                     mutations,
                     previous,
-                    previous_versions: staged_versions,
+                    previous_versions,
                     applied_versions,
                 };
             }
@@ -1162,6 +1198,127 @@ mod tests {
         assert_eq!(
             journal.backend().get("ns", b"k").unwrap(),
             Some(b"fresh".to_vec())
+        );
+    }
+
+    /// Regression: the fence exempted `Delete`, so a compensated transaction
+    /// that was retried replayed its stale delete over a value a later
+    /// transaction had committed — and the replay that should have restored the
+    /// window's rows had already been acknowledged.
+    #[test]
+    fn retried_delete_does_not_erase_a_newer_committed_value() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal.delete(first, "ns", b"k").unwrap();
+        journal.apply(first).unwrap();
+        // The wrapped acknowledgement failed: undo returns the transaction to
+        // the staged state so the caller retries it.
+        journal.undo(first).unwrap();
+        // Meanwhile a later transaction commits a value for the same key.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+        // The retry must not erase the newer commit; it reports the stale
+        // mutation so the caller can compensate rather than silently corrupt.
+        let error = journal.apply(first).unwrap_err().to_string();
+        assert!(error.contains("stale delete"), "{error}");
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+    }
+
+    /// A stale `Increment` still applies: its delta composes with whatever the
+    /// key holds now, which is the documented counter contract. Only the
+    /// destructive kinds are fenced.
+    #[test]
+    fn increments_stay_exempt_from_the_version_fence() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        journal.apply(first).unwrap();
+        journal.undo(first).unwrap();
+        // A later transaction replaces the value outright.
+        let second = journal.begin().unwrap();
+        journal.put(second, "ns", b"k", b"5".to_vec(), None).unwrap();
+        journal.commit(second).unwrap();
+        // The retry of the relative mutation still lands on the newer value.
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"6".to_vec())
+        );
+    }
+
+    /// Regression: `undo` must write back the version it actually replaced. A
+    /// compensation that stored the STAGE-time version wrote an older version
+    /// into the map, so the transaction owning the newer value no longer
+    /// recognized its own key and skipped its rollback — the mutation stayed
+    /// applied while its source position was uncommitted, and the replay
+    /// applied it twice.
+    #[tokio::test]
+    async fn undo_restores_the_version_it_replaced_so_the_owner_still_recognizes_it() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let failing = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let succeeding = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        // Both transactions stage their increment before either applies.
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        let second = journal.begin().unwrap();
+        journal.update_i64(second, "ns", b"k", 1, None).unwrap();
+
+        // The second transaction commits first, and its acknowledgement keeps
+        // the compensation data for a later sibling failure.
+        let second_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            second,
+            succeeding.clone() as Arc<dyn Ack>,
+        ));
+        second_ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+
+        // The first transaction applies over the newer value and then its
+        // acknowledgement fails, so the journal compensates it.
+        let first_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            first,
+            failing.clone() as Arc<dyn Ack>,
+        ));
+        assert!(first_ack.ack().await.is_err());
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec()),
+            "the compensation restores the value the first transaction replaced"
+        );
+
+        // A sibling failure now compensates the already-completed second
+        // transaction. It must still recognize the key as its own: before the
+        // fix the version written back by the first compensation was the one
+        // observed at STAGE time, so the ownership check failed and the
+        // increment survived.
+        second_ack.undo().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            None,
+            "the owning transaction's rollback must still recognize its version"
         );
     }
 

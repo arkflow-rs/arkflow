@@ -168,10 +168,19 @@ impl AggregateBuffer {
             || other.updated_since_emit
             || (other.count > 0 && self_emitted)
             || (self.count > 0 && other_emitted && !self_emitted);
+        debug_assert!(
+            self.count == self.int_observations + self.float_observations,
+            "window aggregate observation counters drifted from count"
+        );
     }
 
     pub fn observe_i64(&mut self, value: i64) {
-        if self.count == 0 {
+        // Seed from the first INTEGER observation. `count` counts both
+        // representations, so an integer arriving after a float would take the
+        // extend branch against the field's zero default and fabricate a
+        // boundary; the integer counter is the right guard, and `decode_buffer`
+        // makes it consistent for restored state that predates the counters.
+        if self.int_observations == 0 {
             self.min_i64 = value;
             self.max_i64 = value;
         } else {
@@ -182,6 +191,10 @@ impl AggregateBuffer {
         self.int_observations = self.int_observations.saturating_add(1);
         self.count += 1;
         self.updated_since_emit = self.emitted;
+        debug_assert!(
+            self.count == self.int_observations + self.float_observations,
+            "window aggregate observation counters drifted from count"
+        );
     }
 
     /// Observe a floating value of the given kind. The internal
@@ -205,6 +218,10 @@ impl AggregateBuffer {
         };
         self.count += 1;
         self.updated_since_emit = self.emitted;
+        debug_assert!(
+            self.count == self.int_observations + self.float_observations,
+            "window aggregate observation counters drifted from count"
+        );
     }
 
     /// The sum over both representations, folded into the buffer's widened
@@ -231,6 +248,48 @@ impl AggregateBuffer {
             (true, true) => (self.max_i64 as f64).max(self.max_float),
             (true, false) => self.max_i64 as f64,
             (false, _) => self.max_float,
+        }
+    }
+
+    /// Make the observation counters consistent with the accumulated state for
+    /// a buffer that did not come from `observe_*`: state written before the
+    /// counters existed decodes with `count > 0` and zeroed counters, and the
+    /// legacy migration builds its buffer by hand.
+    ///
+    /// A payload that observed both representations carries a non-empty float
+    /// side, so the counters already present are kept and the unattributed
+    /// observations are added to the side the state implies. Only a
+    /// single-representation payload — the kind it widened to is the only one
+    /// that ever produced `min`/`max` — is attributed wholesale, and a buffer
+    /// with no observations stays fresh with zero counters.
+    fn normalize_observation_counters(&mut self) {
+        if self.count == 0 {
+            self.int_observations = 0;
+            self.float_observations = 0;
+            return;
+        }
+        let attributed = self.int_observations.saturating_add(self.float_observations);
+        if self.float_observations > 0 && self.sum_float != 0.0 {
+            // The payload kept float observations; any observation the counters
+            // do not name yet was integer-side state written before the
+            // counters existed.
+            self.int_observations = self
+                .int_observations
+                .saturating_add(self.count.saturating_sub(attributed));
+            if self.int_observations.saturating_add(self.float_observations) > self.count {
+                self.int_observations = self.count.saturating_sub(self.float_observations);
+            }
+            return;
+        }
+        match self.kind {
+            NumericKind::Int64 => {
+                self.int_observations = self.count;
+                self.float_observations = 0;
+            }
+            NumericKind::Float32 | NumericKind::Float64 => {
+                self.int_observations = 0;
+                self.float_observations = self.count;
+            }
         }
     }
 }
@@ -2540,15 +2599,16 @@ fn encode_buffer(buffer: &AggregateBuffer) -> Result<Vec<u8>, Error> {
         .map_err(|error| Error::Process(format!("encode window aggregate state: {error}")))
 }
 
-/// A window aggregate written by the pre-typed state format.
+/// A window aggregate written by the pre-typed state format. The legacy float
+/// sum is deliberately absent: the writer that produced this envelope set
+/// `is_float` together with a non-zero `sum_float`, and a payload with
+/// `is_float && count > 0` is rejected by `migrate`, so a migratable payload
+/// carries no float contribution to preserve.
 #[derive(serde::Deserialize)]
 struct LegacyAggregateBuffer {
     count: u64,
-    #[allow(dead_code)]
     #[serde(default)]
     sum_i64: i64,
-    #[serde(default)]
-    sum_float: f64,
     #[serde(default)]
     min_i64: i64,
     #[serde(default)]
@@ -2572,19 +2632,42 @@ impl LegacyAggregateBuffer {
                     .into(),
             ));
         }
+        // A legacy payload that observed nothing carries `i64::MIN`/`i64::MAX`
+        // as min/max placeholders. They must not survive the migration: a later
+        // merge folds this buffer's bounds into the wider aggregate and would
+        // fabricate a boundary no row ever produced. The observation counters
+        // follow the integer payload the migration reconstructs, so a later
+        // merge keeps this buffer's contribution instead of dropping it.
+        if self.count == 0 {
+            return Ok(AggregateBuffer::default());
+        }
         Ok(AggregateBuffer {
             count: self.count,
             kind: NumericKind::Int64,
             sum_i64: self.sum_i64,
             min_i64: self.min_i64,
             max_i64: self.max_i64,
+            int_observations: self.count,
             session_end_ms: self.session_end_ms,
             ..Default::default()
         })
     }
 }
 
+/// Decode one persisted aggregate buffer and make its observation counters
+/// consistent with the state it carries. State written before the counters
+/// existed decodes with `count > 0` and zeroed counters; leaving it that way
+/// would re-seed a min/max from the next single observation and discard the
+/// restored range.
 fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
+    let mut buffer = decode_buffer_unchecked(bytes)?;
+    if buffer.count != buffer.int_observations + buffer.float_observations {
+        buffer.normalize_observation_counters();
+    }
+    Ok(buffer)
+}
+
+fn decode_buffer_unchecked(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
     // A real legacy payload written by the pre-typed kernel parses
     // successfully as a V2 `AggregateBuffer` (it carried every field the
     // typed struct requires and `is_float` is an ignored unknown field), so
@@ -2651,7 +2734,6 @@ fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
                     return LegacyAggregateBuffer {
                         count,
                         sum_i64,
-                        sum_float: 0.0,
                         min_i64,
                         max_i64,
                         is_float,
@@ -4104,6 +4186,144 @@ mod sliding_enumeration_tests {
         assert!((buffer.widened_sum() - 199.5).abs() < 1e-9);
         assert!((buffer.widened_min() - 99.5).abs() < 1e-9);
         assert!((buffer.widened_max() - 100.0).abs() < 1e-9);
+    }
+
+    /// Regression: an integer observation that follows a float one must seed
+    /// the integer bounds from ITS OWN first value. Seeding from `count`
+    /// instead takes the `else` branch against the `Default` zero and the
+    /// widened aggregate then reports a fabricated boundary.
+    #[test]
+    fn integer_observation_after_float_does_not_fabricate_a_zero_boundary() {
+        let mut buffer = AggregateBuffer::default();
+        buffer.observe_float(99.5, NumericKind::Float64);
+        buffer.observe_i64(100);
+        assert_eq!(buffer.count, 2);
+        assert_eq!(buffer.int_observations, 1);
+        assert_eq!(buffer.float_observations, 1);
+        assert_eq!(buffer.kind, NumericKind::Float64);
+        assert!(
+            (buffer.widened_min() - 99.5).abs() < 1e-9,
+            "min must be 99.5, got {}",
+            buffer.widened_min()
+        );
+        assert!(
+            (buffer.widened_max() - 100.0).abs() < 1e-9,
+            "max must be 100.0, got {}",
+            buffer.widened_max()
+        );
+
+        // The symmetric case: all-negative floats then a negative integer.
+        let mut negative = AggregateBuffer::default();
+        negative.observe_float(-10.0, NumericKind::Float64);
+        negative.observe_i64(-5);
+        assert!(
+            (negative.widened_max() - (-5.0)).abs() < 1e-9,
+            "max must be -5.0, got {}",
+            negative.widened_max()
+        );
+        assert!((negative.widened_min() - (-10.0)).abs() < 1e-9);
+    }
+
+    /// Regression: state written before the observation counters existed
+    /// decodes with `count > 0` and zeroed counters. The restored range must
+    /// survive the next observation instead of being replaced by it.
+    #[test]
+    fn restored_buffer_keeps_its_range_before_the_next_observation() {
+        let persisted = serde_json::json!({
+            "count": 2,
+            "kind": "float64",
+            "sum_i64": 0,
+            "sum_float": 8.0,
+            "min_i64": 0,
+            "max_i64": 0,
+            "min_float": 3.0,
+            "max_float": 5.0,
+            "emitted": false,
+            "updated_since_emit": false,
+            "session_end_ms": 0
+        });
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let mut buffer = decode_buffer(&bytes).unwrap();
+        assert_eq!(buffer.float_observations, 2, "counters are back-filled");
+        assert_eq!(buffer.count, 2);
+
+        buffer.observe_float(100.0, NumericKind::Float64);
+        assert!(
+            (buffer.widened_min() - 3.0).abs() < 1e-9,
+            "restored min must survive, got {}",
+            buffer.widened_min()
+        );
+        assert!((buffer.widened_max() - 100.0).abs() < 1e-9);
+
+        // A buffer whose counters already describe its state keeps them
+        // exactly, including a mixed payload.
+        let consistent = serde_json::json!({
+            "count": 3,
+            "kind": "float64",
+            "sum_i64": 4,
+            "sum_float": 1.5,
+            "min_i64": 4,
+            "max_i64": 4,
+            "min_float": 0.5,
+            "max_float": 1.0,
+            "int_observations": 1,
+            "float_observations": 2
+        });
+        let decoded = decode_buffer(&serde_json::to_vec(&consistent).unwrap()).unwrap();
+        assert_eq!((decoded.int_observations, decoded.float_observations), (1, 2));
+        assert!((decoded.widened_min() - 0.5).abs() < 1e-9);
+        assert!((decoded.widened_max() - 4.0).abs() < 1e-9);
+    }
+
+    /// Regression: a migrated legacy buffer must carry observation counters
+    /// consistent with its count, so a later merge folds its contribution
+    /// instead of dropping it, and an empty legacy buffer must not contribute
+    /// its sentinel bounds to that merge.
+    #[test]
+    fn migrated_legacy_buffer_merges_its_contribution_and_empty_stays_neutral() {
+        let legacy = serde_json::json!({
+            "count": 2,
+            "sum_i64": 10,
+            "sum_float": 0.0,
+            "min_i64": 4,
+            "max_i64": 6,
+            "is_float": false,
+            "session_end_ms": 0
+        });
+        let migrated = decode_buffer(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(migrated.kind, NumericKind::Int64);
+        assert_eq!(migrated.count, 2);
+        assert_eq!(migrated.int_observations, 2, "counters describe the payload");
+
+        let mut merged = migrated;
+        merged.observe_float(0.5, NumericKind::Float64);
+        assert_eq!(merged.kind, NumericKind::Float64);
+        assert!(
+            (merged.widened_sum() - 10.5).abs() < 1e-9,
+            "the migrated integer sum must survive the widening, got {}",
+            merged.widened_sum()
+        );
+        assert!((merged.widened_min() - 0.5).abs() < 1e-9);
+        assert!((merged.widened_max() - 6.0).abs() < 1e-9);
+
+        // An empty legacy payload carries i64::MIN / i64::MAX placeholders; a
+        // merge must not adopt them as a boundary.
+        let empty_legacy = serde_json::json!({
+            "count": 0,
+            "sum_i64": 0,
+            "sum_float": 0.0,
+            "min_i64": i64::MIN,
+            "max_i64": i64::MAX,
+            "is_float": false,
+            "session_end_ms": 0
+        });
+        let mut merged = decode_buffer(&serde_json::to_vec(&empty_legacy).unwrap()).unwrap();
+        assert_eq!(merged.count, 0);
+        assert_eq!(merged.min_i64, 0, "sentinels do not survive migration");
+        merged.observe_i64(7);
+        merged.observe_float(2.5, NumericKind::Float64);
+        assert!((merged.widened_min() - 2.5).abs() < 1e-9);
+        assert!((merged.widened_max() - 7.0).abs() < 1e-9);
     }
 
     #[test]

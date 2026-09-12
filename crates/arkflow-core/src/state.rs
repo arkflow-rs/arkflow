@@ -456,9 +456,11 @@ impl RedbStateBackend {
         Ok(backend)
     }
 
-    /// Size of the physical table (expired-but-unpurged rows included): the
-    /// invariant the incremental counters maintain. The budget check reads
-    /// this, so including unpurged rows only makes the bound conservative.
+    /// Size of the physical table (expired-but-unpurged rows included). Used
+    /// once at `open` to seed the incremental counters and to reconcile them
+    /// after a mutation whose exact size the caller measured; the counters are
+    /// observability only and never gate a write, because a configured byte
+    /// budget measures the table inside its own write transaction.
     fn physical_metrics(&self) -> Result<StateMetrics, Error> {
         let tx = self
             .db
@@ -511,6 +513,50 @@ impl RedbStateBackend {
             bytes += len;
         }
         Ok((bytes, keys))
+    }
+
+    /// Classify a previous row for accounting: `(bytes, live)`. A live row's
+    /// bytes leave the table when it is replaced; a missing or expired row is
+    /// logically absent (its bytes, if any, belong to the purge).
+    fn previous_row(previous: &Option<StoredStateValue>, now_ms: u64) -> (u64, bool) {
+        match previous {
+            Some(entry) if !entry.expires_at_ms.is_some_and(|expires| expires <= now_ms) => {
+                (entry.value.len() as u64, true)
+            }
+            _ => (0, false),
+        }
+    }
+
+    /// Decrement a tracked counter by at most its current value. The counters
+    /// are observability only — the configured byte budget measures the table
+    /// exactly — so a counter that is momentarily below the amount being
+    /// released must saturate at zero rather than wrap to `u64::MAX` and
+    /// poison every later report.
+    fn release_bytes(counter: &AtomicU64, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(amount);
+            if next == current {
+                return;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Row-count counterpart of [`Self::release_bytes`].
+    fn release_keys(counter: &AtomicU64, amount: u64) {
+        Self::release_bytes(counter, amount);
     }
 
     pub fn root(&self) -> &Path {
@@ -625,19 +671,34 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        {
+        let previous_bytes = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            let previous = table
+                .get(storage_key.as_str())
+                .map_err(|error| Error::Process(format!("state get: {error}")))?
+                .map(|value| decode_value(value.value()))
+                .transpose()?;
+            let (bytes, had_live) = Self::previous_row(&previous, now_ms());
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state restore: {error}")))?;
-        }
+            (bytes, had_live)
+        };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        // Adjust the tracked counters for exactly the row this restore touched.
+        // Rescanning the table from `metrics()` was the reason a counter could
+        // disagree with the bytes the budget measured.
+        let (previous_bytes, had_live) = previous_bytes;
+        if had_live {
+            Self::release_bytes(&self.bytes, previous_bytes);
+        } else {
+            self.keys.fetch_add(1, Ordering::Relaxed);
+        }
+        self.bytes
+            .fetch_add(entry.value.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -656,7 +717,7 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        let (previous_bytes, had_previous, freed_bytes, freed_keys) = {
+        let (previous_bytes, had_previous, freed_bytes, freed_keys, budget_delta) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
@@ -677,43 +738,90 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state get: {error}")))?
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
-            let (previous_bytes, had_previous) = match previous {
-                // A live previous row is replaced: its bytes leave the table.
-                Some(entry) if !entry.expires_at_ms.is_some_and(|expires| expires <= now_ms) => {
-                    (entry.value.len() as u64, true)
-                }
-                // Missing or expired previous rows are logically absent.
-                _ => (0, false),
-            };
-            if let Some(max_bytes) = self.max_bytes {
-                let next_bytes = self
-                    .bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(previous_bytes)
-                    .saturating_sub(freed_bytes)
-                    .saturating_add(value.len() as u64);
-                if next_bytes > max_bytes {
-                    return Err(Error::Process(format!(
-                        "state budget exceeded: {next_bytes} > {max_bytes} bytes"
-                    )));
-                }
+            let (previous_bytes, had_previous) = Self::previous_row(&previous, now_ms);
+            let present_but_expired = previous.is_some() && !had_previous;
+            if present_but_expired {
+                // The row exists but its TTL has passed, so it is not a live
+                // previous value. Purge it instead of overwriting it: the
+                // overwrite would leave the key counter incrementing for a row
+                // that was already physically present, and the purge also
+                // credits the reclaimed bytes.
+                let (bytes, keys) = Self::remove_expired_in_table(&mut table, now_ms)?;
+                freed_bytes = freed_bytes.saturating_add(bytes);
+                freed_keys = freed_keys.saturating_add(keys);
             }
+            // The budget is checked against the table's exact size inside this
+            // write transaction: the tracked counters are observability only
+            // and must not gate a write, because a counter that ever wrapped or
+            // drifted would reject every future write. `max_bytes` is the one
+            // configuration that needs an exact answer, so it pays for the
+            // scan and reconciles the counter to the measurement afterwards.
+            let budget_delta = if self.max_bytes.is_some() {
+                let mut live_bytes = 0_u64;
+                let mut live_keys = 0_u64;
+                for item in table
+                    .iter()
+                    .map_err(|error| Error::Process(format!("state scan: {error}")))?
+                {
+                    let (stored_key, stored_value) =
+                        item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
+                    if stored_key.value() == storage_key.as_str() {
+                        continue;
+                    }
+                    let decoded = decode_value(stored_value.value())?;
+                    if decoded
+                        .expires_at_ms
+                        .is_some_and(|expires| expires <= now_ms)
+                    {
+                        continue;
+                    }
+                    live_bytes = live_bytes.saturating_add(decoded.value.len() as u64);
+                    live_keys = live_keys.saturating_add(1);
+                }
+                let next_bytes = live_bytes.saturating_add(value.len() as u64);
+                if let Some(max_bytes) = self.max_bytes {
+                    if next_bytes > max_bytes {
+                        return Err(Error::Process(format!(
+                            "state budget exceeded: {next_bytes} > {max_bytes} bytes"
+                        )));
+                    }
+                }
+                Some((next_bytes, live_keys.saturating_add(1)))
+            } else {
+                None
+            };
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state put: {error}")))?;
-            (previous_bytes, had_previous, freed_bytes, freed_keys)
+            (
+                previous_bytes,
+                had_previous,
+                freed_bytes,
+                freed_keys,
+                budget_delta,
+            )
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        // Incremental accounting instead of a full-table metrics rescan.
-        if had_previous {
-            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
-        } else {
-            self.keys.fetch_add(1, Ordering::Relaxed);
+        match budget_delta {
+            // The budget scan measured the table exactly: adopt the
+            // measurement so the counters cannot stay wedged or drifted.
+            Some((next_bytes, next_keys)) => {
+                self.bytes.store(next_bytes, Ordering::Relaxed);
+                self.keys.store(next_keys, Ordering::Relaxed);
+            }
+            // Incremental accounting instead of a full-table metrics rescan.
+            None => {
+                if had_previous {
+                    Self::release_bytes(&self.bytes, previous_bytes);
+                } else {
+                    self.keys.fetch_add(1, Ordering::Relaxed);
+                }
+                self.bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
+                Self::release_bytes(&self.bytes, freed_bytes);
+                Self::release_keys(&self.keys, freed_keys);
+            }
         }
-        self.bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
-        self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
-        self.keys.fetch_sub(freed_keys, Ordering::Relaxed);
         Ok(())
     }
 
@@ -735,7 +843,15 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        let (previous_bytes, had_previous, next, next_len, freed_bytes, freed_keys) = {
+        let (
+            previous_bytes,
+            had_previous,
+            next,
+            next_len,
+            freed_bytes,
+            freed_keys,
+            budget_delta,
+        ) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
@@ -756,16 +872,16 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state get: {error}")))?
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
-            let (previous_bytes, had_previous) = match &previous {
-                Some(entry)
-                    if !entry
-                        .expires_at_ms
-                        .is_some_and(|expires| expires <= current_time_ms) =>
-                {
-                    (entry.value.len() as u64, true)
-                }
-                _ => (0, false),
-            };
+            let (previous_bytes, had_previous) = Self::previous_row(&previous, current_time_ms);
+            if previous.is_some() && !had_previous {
+                // Same rule as `put_with_ttl`: an expired row is purged rather
+                // than overwritten, so the key counter does not increment for a
+                // row that was already present.
+                let (bytes, keys) =
+                    Self::remove_expired_in_table(&mut table, current_time_ms)?;
+                freed_bytes = freed_bytes.saturating_add(bytes);
+                freed_keys = freed_keys.saturating_add(keys);
+            }
             let current = previous
                 .filter(|value| {
                     !value
@@ -777,19 +893,43 @@ impl StateBackend for RedbStateBackend {
                 .unwrap_or_default();
             let next = current.saturating_add(delta);
             let next_value = serde_json::to_vec(&next)?;
-            if let Some(max_bytes) = self.max_bytes {
-                let next_total = self
-                    .bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(previous_bytes)
-                    .saturating_sub(freed_bytes)
-                    .saturating_add(next_value.len() as u64);
-                if next_total > max_bytes {
-                    return Err(Error::Process(format!(
-                        "state budget exceeded: {next_total} > {max_bytes} bytes"
-                    )));
+            // The budget is measured inside the write transaction for the same
+            // reason as `put_with_ttl`: the tracked counters are observability
+            // only, and a drifted counter must not reject a legal write.
+            let budget_delta = if self.max_bytes.is_some() {
+                let mut live_bytes = 0_u64;
+                let mut live_keys = 0_u64;
+                for item in table
+                    .iter()
+                    .map_err(|error| Error::Process(format!("state scan: {error}")))?
+                {
+                    let (stored_key, stored_value) =
+                        item.map_err(|error| Error::Process(format!("state scan: {error}")))?;
+                    if stored_key.value() == storage_key.as_str() {
+                        continue;
+                    }
+                    let decoded = decode_value(stored_value.value())?;
+                    if decoded
+                        .expires_at_ms
+                        .is_some_and(|expires| expires <= current_time_ms)
+                    {
+                        continue;
+                    }
+                    live_bytes = live_bytes.saturating_add(decoded.value.len() as u64);
+                    live_keys = live_keys.saturating_add(1);
                 }
-            }
+                let next_total = live_bytes.saturating_add(next_value.len() as u64);
+                if let Some(max_bytes) = self.max_bytes {
+                    if next_total > max_bytes {
+                        return Err(Error::Process(format!(
+                            "state budget exceeded: {next_total} > {max_bytes} bytes"
+                        )));
+                    }
+                }
+                Some((next_total, live_keys.saturating_add(1)))
+            } else {
+                None
+            };
             let encoded = encode_value(
                 &next_value,
                 ttl_ms.map(|ttl| current_time_ms.saturating_add(ttl)),
@@ -804,18 +944,27 @@ impl StateBackend for RedbStateBackend {
                 next_value.len() as u64,
                 freed_bytes,
                 freed_keys,
+                budget_delta,
             )
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        if had_previous {
-            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
-        } else {
-            self.keys.fetch_add(1, Ordering::Relaxed);
+        match budget_delta {
+            Some((next_total, next_keys)) => {
+                self.bytes.store(next_total, Ordering::Relaxed);
+                self.keys.store(next_keys, Ordering::Relaxed);
+            }
+            None => {
+                if had_previous {
+                    Self::release_bytes(&self.bytes, previous_bytes);
+                } else {
+                    self.keys.fetch_add(1, Ordering::Relaxed);
+                }
+                self.bytes.fetch_add(next_len, Ordering::Relaxed);
+                Self::release_bytes(&self.bytes, freed_bytes);
+                Self::release_keys(&self.keys, freed_keys);
+            }
         }
-        self.bytes.fetch_add(next_len, Ordering::Relaxed);
-        self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
-        self.keys.fetch_sub(freed_keys, Ordering::Relaxed);
         Ok(next)
     }
 
@@ -840,8 +989,8 @@ impl StateBackend for RedbStateBackend {
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
         if let Some(previous_bytes) = previous {
-            self.keys.fetch_sub(1, Ordering::Relaxed);
-            self.bytes.fetch_sub(previous_bytes, Ordering::Relaxed);
+            Self::release_keys(&self.keys, 1);
+            Self::release_bytes(&self.bytes, previous_bytes);
         }
         Ok(previous.is_some())
     }
@@ -882,15 +1031,18 @@ impl StateBackend for RedbStateBackend {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default();
-                freed_bytes += freed;
-                removed += 1;
+                freed_bytes = freed_bytes.saturating_add(freed);
+                removed = removed.saturating_add(1);
             }
-            self.keys.fetch_sub(removed, Ordering::Relaxed);
-            self.bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
-            removed
+            (removed, freed_bytes)
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
+        // Counters are released only after the commit: a failed commit leaves
+        // the rows in the table, so decrementing before it would under-report.
+        let (removed, freed_bytes) = removed;
+        Self::release_keys(&self.keys, removed);
+        Self::release_bytes(&self.bytes, freed_bytes);
         Ok(removed)
     }
 
@@ -976,7 +1128,7 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        {
+        let restored = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
@@ -993,6 +1145,8 @@ impl StateBackend for RedbStateBackend {
                     .remove(key.as_str())
                     .map_err(|error| Error::Process(format!("state restore clear: {error}")))?;
             }
+            let mut restored_keys = 0_u64;
+            let mut restored_bytes = 0_u64;
             for entry in &snapshot.entries {
                 let key = Self::storage_key(&entry.namespace, &entry.key);
                 if entry
@@ -1005,13 +1159,19 @@ impl StateBackend for RedbStateBackend {
                 table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(|error| Error::Process(format!("state restore: {error}")))?;
+                restored_keys = restored_keys.saturating_add(1);
+                restored_bytes = restored_bytes.saturating_add(entry.value.len() as u64);
             }
-        }
+            (restored_keys, restored_bytes)
+        };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        let metrics = self.metrics()?;
-        self.keys.store(metrics.keys, Ordering::Relaxed);
-        self.bytes.store(metrics.bytes, Ordering::Relaxed);
+        // A restore replaces the whole table, so the exact post-restore size is
+        // the count of live snapshot entries — no rescan needed, and the
+        // counters cannot keep a stale size from before the restore.
+        let (restored_keys, restored_bytes) = restored;
+        self.keys.store(restored_keys, Ordering::Relaxed);
+        self.bytes.store(restored_bytes, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1163,6 +1323,87 @@ mod tests {
         assert!(backend.put("orders", b"b", b"22").is_err());
         assert_eq!(backend.purge_expired(base + 9_999).unwrap(), 0);
         assert_eq!(backend.purge_expired(base + 10_000).unwrap(), 1);
+    }
+
+    /// Regression: the byte counters are observability only. They used to gate
+    /// the budget check, and a compensation that resynchronized them from a
+    /// scan that hides expired rows left them below the bytes a later purge
+    /// released — `AtomicU64::fetch_sub` then wrapped to ~`u64::MAX` and every
+    /// subsequent write failed `state budget exceeded` for the process
+    /// lifetime.
+    #[test]
+    fn expired_purge_after_a_resync_does_not_wedge_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1)
+            .unwrap()
+            .with_max_bytes(1_000);
+        let base = now_ms();
+        // A large TTL row fills most of the budget.
+        backend
+            .put_with_ttl("orders", b"a", &vec![b'x'; 900], Some(1), base)
+            .unwrap();
+        // Let it expire without a TTL-aware reader touching it, then run a
+        // state-journal compensation (`restore_entry` with the entry it
+        // replaced).
+        backend
+            .restore_entry("orders", b"a", Some(&StateEntry {
+                namespace: "orders".into(),
+                key: b"a".to_vec(),
+                value: vec![b'x'; 900],
+                expires_at_ms: Some(base + 1),
+            }))
+            .unwrap();
+        // The next write purges the expired row. The budget measures the table
+        // exactly, so a legal write must still succeed.
+        backend.put("orders", b"b", b"22").unwrap();
+        assert_eq!(backend.get("orders", b"b").unwrap(), Some(b"22".to_vec()));
+        let metrics = backend.metrics().unwrap();
+        assert_eq!(metrics.keys, 1);
+        assert_eq!(metrics.bytes, 2);
+    }
+
+    /// Regression: overwriting an expired-but-unpurged row must not count as a
+    /// new key. The old code took the "no live previous row" branch and
+    /// incremented the key counter for a row that was already present.
+    #[test]
+    fn overwriting_an_expired_row_does_not_inflate_the_key_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        // A past base keeps the TTL live relative to wall-clock `metrics`.
+        let base = now_ms().saturating_sub(1_000);
+        backend
+            .put_with_ttl("orders", b"a", b"1", Some(10_000), base)
+            .unwrap();
+        assert_eq!(backend.metrics().unwrap().keys, 1);
+        // Overwrite after the TTL passed but before any purge ran.
+        backend
+            .put_with_ttl("orders", b"a", b"2", Some(10_000), base + 11)
+            .unwrap();
+        assert_eq!(
+            backend.metrics().unwrap().keys,
+            1,
+            "the row was physically present, so the key count must not grow"
+        );
+        assert_eq!(backend.get("orders", b"a").unwrap(), Some(b"2".to_vec()));
+    }
+
+    /// The purge releases counters only after its transaction commits.
+    #[test]
+    fn purge_and_delete_release_counters_without_underflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms();
+        backend
+            .put_with_ttl("orders", b"a", b"1234", Some(1), base)
+            .unwrap();
+        backend.put("orders", b"b", b"12").unwrap();
+        assert_eq!(backend.purge_expired(base + 2).unwrap(), 1);
+        assert_eq!(backend.metrics().unwrap().keys, 1);
+        assert_eq!(backend.metrics().unwrap().bytes, 2);
+        assert!(backend.delete("orders", b"b").unwrap());
+        assert!(!backend.delete("orders", b"b").unwrap());
+        assert_eq!(backend.metrics().unwrap().keys, 0);
+        assert_eq!(backend.metrics().unwrap().bytes, 0);
     }
 
     #[test]

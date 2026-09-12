@@ -1382,7 +1382,7 @@ async fn run_session(
                         return Err(delivery);
                     }
                 }
-                let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("node_id", &auth.node_id).finish();
+                let query = agent_auth_query(&auth);
                 let commands: Vec<AgentCommand> = bearer_auth(client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)), &auth.session_token).send().await?.error_for_status()?.json().await?;
                 for command in commands {
                     if let Some(result) = replay_cached_command(completed_commands, &command.id) {
@@ -1963,9 +1963,7 @@ async fn send_result(
     auth: &AgentAuth,
     result: CommandResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("node_id", &auth.node_id)
-        .finish();
+    let query = agent_auth_query(auth);
     bearer_auth(
         client.post(format!(
             "{}{}/agent/commands/{}/result?{}",
@@ -1992,6 +1990,21 @@ async fn post_json<T: Serialize>(
         .error_for_status()?;
     Ok(())
 }
+/// Build the agent command query string.
+///
+/// The session token travels in the `Authorization: Bearer` header because a
+/// query string leaks into reverse-proxy and access logs — but it is ALSO sent
+/// here for one transition window, so an Agent deployed against a Hub that
+/// still requires the query credential keeps polling and reporting commands
+/// instead of failing its session with a 400. The Hub prefers the header when
+/// both are present.
+fn agent_auth_query(auth: &AgentAuth) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("node_id", &auth.node_id)
+        .append_pair("session_token", &auth.session_token)
+        .finish()
+}
+
 /// Attach the session credential as a Bearer header: tokens in URL query
 /// strings leak into reverse-proxy and access logs.
 fn bearer_auth(builder: reqwest::RequestBuilder, session_token: &str) -> reqwest::RequestBuilder {
@@ -2019,6 +2032,35 @@ fn command_is_stale(command_generation: u64, latest_generation: Option<u64>) -> 
 mod tests {
     use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+
+    /// Regression: the session credential moved to the `Authorization` header,
+    /// but an Agent deployed against a Hub that still requires the query
+    /// parameter must keep polling. Sending both transports for one transition
+    /// window keeps either upgrade order working; the Hub prefers the header.
+    #[test]
+    fn agent_commands_carry_the_token_in_both_transports() {
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: "secret-token".into(),
+        };
+        let query = agent_auth_query(&auth);
+        assert!(query.contains("node_id=node-a"), "{query}");
+        assert!(
+            query.contains("session_token=secret-token"),
+            "the legacy transport must stay populated for an older Hub: {query}"
+        );
+
+        // The header is the preferred transport and carries the same credential.
+        let request = bearer_auth(reqwest::Client::new().get("http://example.invalid"), &auth.session_token);
+        let request = request.build().unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret-token")
+        );
+    }
 
     /// A finished-task observation whose delivery failed must survive the
     /// session rebuild: the task is already gone from the runtime map, so

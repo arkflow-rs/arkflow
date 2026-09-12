@@ -2825,6 +2825,11 @@ impl ControlPlaneStore {
     /// upgrade/rollback handlers read the Job, await several round trips and
     /// then write: without this CAS a concurrent desired-state change that
     /// bumps the generation can be silently overwritten by the older read.
+    ///
+    /// The recovery pointer is not written: it belongs to the checkpoint path,
+    /// which moves it without bumping the generation, so a rollback copying its
+    /// earlier read back would regress recovery to a checkpoint retention may
+    /// already have deleted.
     pub fn update_job_with_expected_generation(
         &self,
         mut job: JobRecord,
@@ -2835,10 +2840,20 @@ impl ControlPlaneStore {
             let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
                 StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
+            // The recovery pointer is fenced by PRESERVATION: a checkpoint
+            // that lands between the caller's read and this write updated the
+            // `checkpoint_id` is deliberately NOT in the SET list: the
+            // recovery pointer is owned by the checkpoint path, which updates
+            // it without bumping the generation (see `update_job`). A
+            // conditional write that copied the caller's older read back would
+            // regress recovery to a pointer retention may already have deleted.
+            // The version/spec change from a rollback does not need to re-point
+            // recovery: selection filters artifacts by job version and state
+            // format, so preserving the newest pointer is both safe and the
+            // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?2, spec_json=?3, desired_state=?4, observed_state=?5, convergence=?6, generation=?7, node_ids_json=?8, checkpoint_id=?9, last_error=?10, updated_at_ms=?11 WHERE job_id=?1 AND generation=?12",
+                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=? WHERE job_id=? AND generation=?",
                 rusqlite::params![
-                    job.job_id,
                     job.version,
                     job.spec_json,
                     job.desired_state,
@@ -2846,9 +2861,9 @@ impl ControlPlaneStore {
                     job.convergence,
                     job.generation,
                     node_ids,
-                    job.checkpoint_id,
                     job.last_error,
                     job.updated_at_ms,
+                    job.job_id,
                     expected_generation,
                 ],
             )?;
@@ -2865,7 +2880,17 @@ impl ControlPlaneStore {
                     current: current.unwrap_or(0),
                 });
             }
-            Ok(job)
+            // Report the row as stored: the recovery pointer may have been
+            // preserved from a concurrent checkpoint rather than taken from the
+            // request, and the caller caches this record.
+            let stored = connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [&job.job_id],
+                    row_to_job,
+                )
+                .optional()?;
+            Ok(stored.unwrap_or(job))
         })
     }
 
@@ -3854,6 +3879,84 @@ mod tests {
                 idempotency_key: None,
                 ..Default::default()
             }),
+            Err(StorageError::GenerationConflict { .. })
+        ));
+    }
+
+    /// Regression: a checkpoint that lands between a rollback handler's read
+    /// and its conditional write updates `checkpoint_id` WITHOUT bumping the
+    /// generation (the checkpoint path deliberately leaves the generation
+    /// alone). The write must therefore preserve the stored pointer instead of
+    /// writing the caller's older one back — a regressed pointer can reference
+    /// a checkpoint retention has already deleted, degrading the next start to
+    /// a stateless one.
+    #[test]
+    fn conditional_job_write_preserves_a_newer_recovery_pointer() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let job = |checkpoint_id: Option<&str>| JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: "{}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: checkpoint_id.map(str::to_owned),
+            last_error: None,
+            updated_at_ms: 0,
+        };
+        store.upsert_job(job(Some("ckpt-old"))).unwrap();
+
+        // A concurrent checkpoint observation moves the pointer without
+        // touching the generation.
+        let concurrent = store
+            .update_job("orders", None, None, None, None, Some("ckpt-new".into()), None)
+            .unwrap();
+        assert_eq!(
+            concurrent.as_ref().and_then(|job| job.checkpoint_id.clone()),
+            Some("ckpt-new".to_string())
+        );
+
+        // The rollback handler writes the record it read (the older pointer).
+        let written = store
+            .update_job_with_expected_generation(job(Some("ckpt-old")), 1)
+            .unwrap();
+        assert_eq!(
+            written.checkpoint_id.as_deref(),
+            Some("ckpt-new"),
+            "the returned record reports the pointer the row actually holds"
+        );
+        let stored = store.get_job("orders").unwrap().unwrap();
+        assert_eq!(
+            stored.checkpoint_id.as_deref(),
+            Some("ckpt-new"),
+            "a concurrent checkpoint must not be regressed by the rollback write"
+        );
+
+        // The conditional write never moves the pointer in either direction,
+        // so a NULL pointer stays NULL and the version/spec change lands.
+        store
+            .immediate_transaction(|connection| -> Result<(), StorageError> {
+                connection.execute(
+                    "UPDATE cp_jobs SET checkpoint_id = NULL WHERE job_id = 'orders'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let written = store
+            .update_job_with_expected_generation(job(Some("ckpt-fresh")), 2)
+            .unwrap();
+        assert_eq!(
+            written.checkpoint_id, None,
+            "the rollback write must not invent a recovery pointer"
+        );
+        assert_eq!(written.version, 2);
+
+        // A stale generation still conflicts.
+        assert!(matches!(
+            store.update_job_with_expected_generation(job(None), 1),
             Err(StorageError::GenerationConflict { .. })
         ));
     }

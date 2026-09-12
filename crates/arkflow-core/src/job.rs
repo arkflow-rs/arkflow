@@ -272,6 +272,15 @@ fn default_parallelism() -> u32 {
 impl JobSpec {
     pub fn validate(&self) -> Result<(), Error> {
         JobId::new(self.id.as_str())?;
+        if let Some(state) = self.state.as_ref() {
+            if state.max_pending_transactions == Some(0) {
+                // A zero bound fails every journal begin at runtime; reject it
+                // where the operator can still fix the spec.
+                return Err(Error::Config(
+                    "state.max_pending_transactions must be positive".into(),
+                ));
+            }
+        }
         if self.sources.is_empty() {
             return Err(Error::Config(
                 "Job requires at least one executable source".into(),
@@ -1053,6 +1062,33 @@ mod tests {
         });
         let error = job.validate().unwrap_err().to_string();
         assert!(error.contains("operator graph must be acyclic"));
+    }
+
+    /// A zero pending bound validates at config time and then fails every
+    /// journal begin at runtime, so the spec is rejected where the operator can
+    /// still fix it.
+    #[test]
+    fn rejects_a_zero_pending_transaction_bound() {
+        let mut job = base_job();
+        job.state = Some(StateSpec {
+            backend: "embedded_kv".into(),
+            namespace: Some("orders".into()),
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: Some(0),
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("max_pending_transactions"), "{error}");
+
+        // A positive bound and the default are accepted.
+        if let Some(state) = job.state.as_mut() {
+            state.max_pending_transactions = Some(64);
+        }
+        job.validate().unwrap();
+        if let Some(state) = job.state.as_mut() {
+            state.max_pending_transactions = None;
+        }
+        job.validate().unwrap();
     }
 
     #[test]

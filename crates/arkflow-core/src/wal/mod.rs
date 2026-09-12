@@ -427,6 +427,16 @@ impl Wal {
             .saturating_sub(1);
         if target > self.store.cursor() {
             self.store.advance_cursor(target)?;
+            // `target` is the contiguous acknowledged frontier, so every entry
+            // below it is past both watermarks. Reclamation stays best-effort:
+            // it costs disk space, not correctness.
+            if let Err(error) = self.store.mark_committed(target) {
+                tracing::warn!(
+                    target,
+                    %error,
+                    "WAL entry reclamation failed; entries remain until the next commit"
+                );
+            }
             self.ack_notify.notify_waiters();
         }
         Ok(())
@@ -436,9 +446,10 @@ impl Wal {
     /// caller, strictly after all earlier registered sequences have finished.
     /// The WAL cursor is advanced before the wrapped source acknowledgement so
     /// the two durable cursors follow the documented commit ordering. If the
-    /// source-side commit fails, the cursor is compensated and the entry stays
-    /// retryable; no later sequence is allowed to run while this one is
-    /// in-flight.
+    /// source-side commit fails, the cursor is compensated, the entry stays
+    /// retryable, and nothing is reclaimed — entries below the committed floor
+    /// are removed only once their source commit has succeeded. No later
+    /// sequence is allowed to run while this one is in-flight.
     async fn acknowledge(&self, seq: u64, inner: Arc<dyn crate::input::Ack>) -> Result<(), Error> {
         {
             let mut acknowledgements = self.acknowledgements.lock().await;
@@ -530,6 +541,18 @@ impl Wal {
                         };
                     }
                     self.acknowledgements.lock().await.remove(&seq);
+                    // The wrapped source commit succeeded, so every entry below
+                    // this sequence is past both acknowledgement watermarks and
+                    // can be reclaimed. A reclamation failure costs disk space,
+                    // not correctness — the acknowledgement itself stands — so
+                    // it is reported and not propagated.
+                    if let Err(error) = self.store.mark_committed(seq) {
+                        tracing::warn!(
+                            seq,
+                            %error,
+                            "WAL entry reclamation failed; entries remain until the next commit"
+                        );
+                    }
                     self.frontier
                         .acknowledge(&crate::checkpoint::SourcePosition::for_partition(
                             0,

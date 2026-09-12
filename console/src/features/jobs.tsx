@@ -43,7 +43,7 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
       </div>)}</div>}
     </section>
     {selected && <JobDetailPanel detail={selected} nodes={nodes} canMutate={canMutate} busy={!!busy} onClose={() => setSelected(undefined)} onError={onError} onRefresh={() => void load(selected.job.job_id)} onAction={action} onUpgrade={(savepoint) => setEditor({ mode: 'upgrade', job: selected.job, savepoint })} />}
-    {editor && <VisualJobEditor mode={editor.mode} job={editor.job} savepoint={editor.savepoint} nodes={nodes} busy={!!busy} onClose={() => setEditor(undefined)} onError={onError} onSaved={() => { setEditor(undefined); onRefresh(); if (editor.job) void load(editor.job.job_id) }} onAction={action} />}
+    {editor && <VisualJobEditor mode={editor.mode} job={editor.job} savepoint={editor.savepoint} nodes={nodes} busy={!!busy} onClose={() => setEditor(undefined)} onError={onError} onSaved={() => { setEditor(undefined); onRefresh(); if (editor.job) void load(editor.job.job_id) }} onRefresh={onRefresh} onAction={action} />}
   </>
 }
 

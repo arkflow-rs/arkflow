@@ -1120,17 +1120,6 @@ fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<String> {
         .find_map(|index| (keys.value(index) == "topic").then(|| values.value(index).to_owned()))
 }
 
-/// Split one source delivery by its complete physical metadata identity.
-/// Kafka can legitimately return rows from several topics and partitions in a
-/// single batch; numeric partition alone would merge topic-a/0 with topic-b/0
-/// and let one stream's progress release the other stream's windows.
-pub(crate) fn split_by_physical_partition(
-    batch: &crate::MessageBatchRef,
-    fallback_partition: u32,
-) -> Result<Vec<(EventTimePartition, crate::MessageBatchRef)>, Error> {
-    split_by_physical_partition_for_source(batch, fallback_partition, None)
-}
-
 /// Split one source delivery while preserving a stable identity for
 /// connector-neutral partitions. Multiple source edges feeding one window
 /// share a watermark tracker, so their fallback partition 0 values must not
@@ -1190,20 +1179,6 @@ pub(crate) fn split_by_physical_partition_for_source(
         .into_iter()
         .map(|(partition, keep)| filter_batch(batch, &keep).map(|batch| (partition, batch)))
         .collect()
-}
-
-/// Compatibility wrapper for connector-neutral callers and old tests. The
-/// runtime uses [`split_by_physical_partition`] so topic identity is retained.
-pub(crate) fn split_by_partition(
-    batch: &crate::MessageBatchRef,
-    fallback_partition: u32,
-) -> Result<Vec<(u32, crate::MessageBatchRef)>, Error> {
-    split_by_physical_partition(batch, fallback_partition).map(|groups| {
-        groups
-            .into_iter()
-            .map(|(partition, batch)| (partition.partition, batch))
-            .collect()
-    })
 }
 
 #[cfg(test)]

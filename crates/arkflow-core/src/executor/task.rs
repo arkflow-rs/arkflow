@@ -30,6 +30,18 @@ use tokio_util::sync::CancellationToken;
 /// blocking the source indefinitely behind a wedged sink.
 const BARRIER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upper bound on how long a chain's control-event fence waits for the
+/// processor worker pool to publish an in-flight delivery. A pool whose worker
+/// or collector exited without recording a failure cannot advance its sequence,
+/// and an unbounded fence would park the chain with no error and no checkpoint
+/// progress; exceeding this bound reports the condition instead.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on joining a pool's result collector during shutdown. The
+/// collector's final drain flushes downstream, which can block on a full edge
+/// whose consumer already stopped.
+const COLLECTOR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Drive every chain in the graph to completion (cancellation or all-source
 /// end-of-stream). Connects inputs/outputs first and closes them after.
 /// Optional per-chain checkpoint hook: barriers injected at sources are
@@ -1261,22 +1273,20 @@ async fn run_interior_chain_loop(
                     None => std::future::pending().await,
                 }
             } => {
-                match failure {
-                    Some(error) => {
-                        if let Some(pool) = pool.take() {
-                            let _ = pool.cancel_and_join().await;
-                        }
-                        return Err(error);
-                    }
-                    None => {
-                        // Workers exited without recording a failure — the
-                        // shutdown race with the cancellation branch. Retire
-                        // the pool so this arm parks instead of failing the
-                        // chain with a placeholder error.
-                        pool.take();
-                        continue;
-                    }
+                // A pool that exits because the chain is shutting down is not
+                // a failure: `cancel_and_join` cancels the pool, its workers
+                // and collector drop the failure channel, and the disconnect
+                // must not be reported as a fault (the same judgement the tick
+                // arm above makes). Only a disconnect while the chain is still
+                // running is the silent-death case.
+                if cancellation.is_cancelled() {
+                    let pool = pool.take();
+                    return shutdown_interior_chain(chain, pool).await;
                 }
+                if let Some(pool) = pool.take() {
+                    let _ = pool.cancel_and_join().await;
+                }
+                return Err(failure);
             }
             read = readers.next() => read,
         };
@@ -1823,10 +1833,17 @@ impl ProcessorWorkerPool {
         while let Ok((_, (_, ack))) = pending_work.try_recv() {
             let _ = ack.abort().await;
         }
-        if let Err(error) = collector.await {
-            join_error.get_or_insert_with(|| {
-                Error::Process(format!("processor result collector failed: {error}"))
-            });
+        // The collector's shutdown drain flushes downstream over an edge that
+        // may itself be blocked (a full channel whose consumer already
+        // stopped), which would park this join forever on the failure path
+        // where the cancellation token is not set. Bound the join: exceeding
+        // it leaves the collector to finish on its own and reports the
+        // condition instead of wedging the chain's shutdown.
+        if let Err(_elapsed) = tokio::time::timeout(COLLECTOR_DRAIN_TIMEOUT, collector).await {
+            tracing::warn!(
+                timeout_secs = COLLECTOR_DRAIN_TIMEOUT.as_secs(),
+                "processor result collector did not finish draining; abandoning the join"
+            );
         }
         if let Some(error) = join_error {
             return Err(error);
@@ -1865,8 +1882,14 @@ impl ProcessorWorkerPool {
 
     /// Wait until every delivery submitted before this control event has been
     /// published downstream.
+    ///
+    /// The wait is bounded: a worker that panicked without recording a failure
+    /// (or one otherwise stuck on a poisoned shared lock) leaves the collector
+    /// unable to advance its sequence, and an unbounded fence would park the
+    /// chain forever with no error, no output, and no checkpoint progress.
     async fn flush(&self) -> Result<(), Error> {
         let target = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+        let deadline = tokio::time::Instant::now() + FLUSH_TIMEOUT;
         loop {
             if self.failed.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(Error::Process(
@@ -1884,9 +1907,17 @@ impl ProcessorWorkerPool {
             if self.flushed.load(std::sync::atomic::Ordering::Acquire) >= target {
                 return Ok(());
             }
+            let tick = tokio::time::sleep_until(deadline);
+            tokio::pin!(tick);
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
                     return Err(Error::Process("processor worker pool was cancelled".into()));
+                }
+                _ = &mut tick => {
+                    return Err(Error::Process(format!(
+                        "processor worker pool did not publish delivery {target} within {}s",
+                        FLUSH_TIMEOUT.as_secs()
+                    )));
                 }
                 _ = &mut notified => {}
             }
@@ -1894,14 +1925,25 @@ impl ProcessorWorkerPool {
     }
 
     /// Await the first worker failure (called from the chain loop's select).
-    /// `None` means the failure channel disconnected — every worker exited
-    /// without recording a failure, which is the clean shutdown path, not a
-    /// chain failure.
-    async fn fail(&self) -> Option<Error> {
-        match self.failure.recv_async().await {
-            Ok(error) => Some(error),
-            Err(_) => None,
-        }
+    ///
+    /// A disconnected failure channel is a failure too: it means every worker
+    /// and the collector exited without recording an error (a panicking worker
+    /// drops its sender). Treating that as a clean shutdown dropped the pool
+    /// without settling its queued deliveries, which strands the source
+    /// frontier and silently disables this chain's ordering fences.
+    async fn fail(&self) -> Error {
+        pool_failure(&self.failure).await
+    }
+}
+
+/// Map one failure-channel outcome to the chain's error. A disconnected channel
+/// is a failure, not a clean shutdown (see `ProcessorWorkerPool::fail`).
+async fn pool_failure(failure: &flume::Receiver<Error>) -> Error {
+    match failure.recv_async().await {
+        Ok(error) => error,
+        Err(_) => Error::Process(
+            "processor worker pool exited without recording a failure".into(),
+        ),
     }
 }
 
@@ -2903,6 +2945,109 @@ mod routing_tests {
                 .map(|batch| batch.len())
                 .sum::<usize>(),
             3
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_pool_tests {
+    use super::*;
+    use crate::executor::graph::Chain;
+    use crate::processor::Processor;
+    use crate::MessageBatchRef;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A processor that stalls every delivery forever, so the pool's collector
+    /// can never advance its ordered sequence.
+    struct StallingProcessor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Processor for StallingProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn pool_chain(parallelism: usize, started: Arc<AtomicUsize>) -> Chain {
+        Chain::for_pool_test(
+            parallelism,
+            vec![Arc::new(StallingProcessor { started })],
+        )
+    }
+
+    /// Regression: the failure channel disconnecting means every worker and the
+    /// collector exited WITHOUT recording a failure (a panicking worker drops
+    /// its sender). Reading that as a clean shutdown retired the pool without
+    /// settling its queued deliveries and silently disabled the chain's
+    /// ordering fences; it must be reported as a failure.
+    #[tokio::test]
+    async fn a_disconnected_failure_channel_is_a_failure_not_a_clean_shutdown() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let chain = pool_chain(2, started.clone());
+        let pool = ProcessorWorkerPool::start(
+            &chain,
+            &CheckpointHook::default(),
+            &CancellationToken::new(),
+        )
+        .expect("a chain with parallelism > 1 owns a pool");
+        // Retire the pool: every worker returns, then the collector drains and
+        // exits, so the failure channel disconnects with no error recorded —
+        // exactly the state a panicking worker leaves behind.
+        let failure = pool.failure.clone();
+        pool.cancel_and_join().await.expect("the pool drains");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool_failure(&failure),
+        )
+        .await
+        .expect("the failure report must resolve once the pool exits");
+        assert!(
+            error.to_string().contains("exited without recording a failure"),
+            "a silently dead pool must be reported: {error}"
+        );
+    }
+
+    /// Regression: the control-event fence used to wait for the pool with no
+    /// bound, so one stalled delivery parked the chain forever (no error, no
+    /// output, no checkpoint progress). The fence now reports the condition
+    /// within its bound; paused time exercises the real bound instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_pool_fails_the_control_fence_within_its_bound() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let chain = pool_chain(2, started.clone());
+        let pool = ProcessorWorkerPool::start(
+            &chain,
+            &CheckpointHook::default(),
+            &CancellationToken::new(),
+        )
+        .expect("a chain with parallelism > 1 owns a pool");
+        pool.submit((
+            Arc::new(crate::MessageBatch::new_arrow(
+                datafusion::arrow::array::RecordBatch::new_empty(std::sync::Arc::new(
+                    datafusion::arrow::datatypes::Schema::empty(),
+                )),
+            )),
+            Arc::new(crate::input::NoopAck),
+        ))
+        .await
+        .unwrap();
+        // The delivery never publishes, so the fence must report the condition
+        // once its bound elapses rather than parking the chain.
+        let error = pool
+            .flush()
+            .await
+            .expect_err("a delivery that never publishes must fail the fence");
+        assert!(
+            error.to_string().contains("did not publish delivery"),
+            "the fence reports the stalled delivery: {error}"
         );
     }
 }

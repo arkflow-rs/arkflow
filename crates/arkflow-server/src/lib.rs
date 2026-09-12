@@ -1114,6 +1114,42 @@ async fn hub_job_upgrade_rollback(
             },
         );
     };
+    // Apply the same state-format compatibility check the upgrade path
+    // performs, against the artifact this Job would actually restore (its
+    // current recovery pointer). Without it a rollback to a version whose
+    // state layout differs is accepted, and recovery then silently discards
+    // the incompatible artifact and starts the Job without state.
+    if let Some(checkpoint_id) = current.checkpoint_id.as_deref() {
+        let artifact_format = hub
+            .job_checkpoints(&job_id)
+            .await
+            .map(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.checkpoint_id == checkpoint_id)
+                    .map(|record| record.format_version)
+            })
+            .map_err(hub_problem);
+        let artifact_format = match artifact_format {
+            Ok(format) => format,
+            Err(response) => return response,
+        };
+        let restored_format = serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json)
+            .ok()
+            .and_then(|spec| spec.state.map(|state| state.format_version))
+            .unwrap_or(1);
+        let compatible = artifact_format == Some(restored_format);
+        if !compatible {
+            return problem(
+                StatusCode::CONFLICT,
+                "state_format_incompatible",
+                format!(
+                    "Job {job_id} cannot roll back to version {}: its state format is                      incompatible with the artifact the Job would restore",
+                    previous.version
+                ),
+            );
+        }
+    }
     let restored_spec_json =
         match serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json) {
             Ok(mut spec) => {
@@ -2456,6 +2492,14 @@ async fn agent_job_observation(
 /// Session tokens embedded in URL query strings leak into reverse-proxy and
 /// access logs. Prefer the `Authorization: Bearer` header; the query param
 /// remains accepted for older Agents.
+/// Resolve the Agent session credential from its two accepted transports. The
+/// header wins so a client that sends both is never authenticated by the stale
+/// query value; the query parameter is the deprecated fallback that keeps older
+/// Agents working through the transition window.
+fn agent_session_token(headers: &HeaderMap, query_token: Option<String>) -> Option<String> {
+    bearer_session_token(headers).or(query_token)
+}
+
 fn bearer_session_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -2489,7 +2533,7 @@ async fn agent_commands(
             "agent session token supplied via query parameter; this is deprecated and will be removed - send it in the Authorization: Bearer header"
         );
     }
-    let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
+    let Some(session_token) = agent_session_token(&headers, query.session_token) else {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2520,7 +2564,7 @@ async fn agent_command_result(
             "agent session token supplied via query parameter; this is deprecated and will be removed - send it in the Authorization: Bearer header"
         );
     }
-    let Some(session_token) = bearer_session_token(&headers).or(query.session_token) else {
+    let Some(session_token) = agent_session_token(&headers, query.session_token) else {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -3177,6 +3221,53 @@ async fn correlation_middleware(mut request: Request<Body>, next: Next) -> Respo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn headers_with(authorization: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = authorization {
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// Regression: the Hub must authenticate the Agent's session from BOTH
+    /// transports for one transition window. An Agent that only sends the
+    /// legacy query parameter keeps working (Hub upgraded first), and an Agent
+    /// that sends both is authenticated from the header, never from the stale
+    /// query value.
+    #[test]
+    fn agent_session_token_is_accepted_from_the_header_or_the_query() {
+        // Header only: the new transport.
+        assert_eq!(
+            agent_session_token(&headers_with(Some("Bearer header-token")), None).as_deref(),
+            Some("header-token")
+        );
+        // Query only: an older Agent against a newer Hub.
+        assert_eq!(
+            agent_session_token(&headers_with(None), Some("query-token".into())).as_deref(),
+            Some("query-token")
+        );
+        // Both: the header wins over the deprecated query credential.
+        assert_eq!(
+            agent_session_token(
+                &headers_with(Some("Bearer header-token")),
+                Some("query-token".into())
+            )
+            .as_deref(),
+            Some("header-token"),
+            "the header transport takes precedence over the query parameter"
+        );
+        // Neither: the handler answers 401.
+        assert_eq!(agent_session_token(&headers_with(None), None), None);
+        // A malformed or empty header credential never falls through.
+        assert_eq!(bearer_session_token(&headers_with(Some("Basic x"))), None);
+        assert_eq!(bearer_session_token(&headers_with(Some("Bearer   "))), None);
+    }
+
     use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
     use arkflow_core::engine::Engine;

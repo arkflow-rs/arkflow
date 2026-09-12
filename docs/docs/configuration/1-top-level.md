@@ -132,7 +132,7 @@ jobs:
 | `edges` | array&lt;object&gt; | no | `[]` | DAG edges: `id`, `from`, `to`, `partitioned` (key-group routing instead of same-subtask). |
 | `sources` | array&lt;object&gt; | no | `[]` | Attach a component input to a `source` operator: `operator_id`, `input_type`, `config`, `time`. |
 | `sinks` | array&lt;object&gt; | no | `[]` | Attach a component output to a `sink` operator: `operator_id`, `output_type`, `config`. |
-| `state` | object | no | — | `backend` (e.g. `embedded_kv`), `namespace`, `ttl_ms`, `format_version`. Required by stateful operators. |
+| `state` | object | no | — | `backend` (e.g. `embedded_kv`), `namespace`, `ttl_ms`, `format_version`, `max_pending_transactions` (positive; default 4096; raise it when a window sees very high per-window key cardinality, since one transaction is held per open window group or unacknowledged output). Required by stateful operators. |
 | `checkpoint` | object | no | — | `interval_ms`, `retention`, `object_store_uri` (e.g. `file://...` or `s3://...`). |
 | `recovery` | string | no | `latest_checkpoint` | `latest_checkpoint`, `latest_savepoint`, or `fail`. |
 

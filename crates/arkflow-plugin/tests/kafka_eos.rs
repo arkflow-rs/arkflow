@@ -65,8 +65,7 @@ async fn broker() -> bool {
         .get_or_init(|| async {
             if !docker_available() {
                 eprintln!(
-                    "skipping kafka_eos tests: Docker is unavailable \
-                     (no /var/run/docker.sock and no tcp:// DOCKER_HOST)"
+                    "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
                 );
                 return None;
             }
@@ -76,15 +75,51 @@ async fn broker() -> bool {
     container.is_some()
 }
 
+/// Skip one case loudly. A green run of this suite must never mean "zero
+/// assertions ran": when `ARKFLOW_REQUIRE_DOCKER` is set (CI), an unavailable
+/// engine fails the case instead of passing it silently.
+fn skip_without_docker(case: &str) {
+    if std::env::var_os("ARKFLOW_REQUIRE_DOCKER").is_some() {
+        panic!(
+            "{case}: Docker is required (ARKFLOW_REQUIRE_DOCKER is set) but no daemon is reachable"
+        );
+    }
+    eprintln!("--- SKIPPED {case}: Docker is unavailable ---");
+}
+
 /// Probe for a usable container engine: the default Unix socket or an
 /// explicitly configured non-unix DOCKER_HOST.
 fn docker_available() -> bool {
     if let Ok(host) = std::env::var("DOCKER_HOST") {
+        // A non-unix endpoint names a reachable daemon; a unix:// endpoint
+        // names the socket to probe below.
         if host.starts_with("tcp://") || host.starts_with("http://") {
             return true;
         }
+        if let Some(path) = host.strip_prefix("unix://") {
+            return std::path::Path::new(path).exists();
+        }
     }
-    std::path::Path::new("/var/run/docker.sock").exists()
+    // The default socket plus the paths Docker Desktop, Colima, Rancher, and
+    // podman publish. A probe that only knew /var/run/docker.sock reported a
+    // running daemon as absent and silently skipped every case.
+    [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+    ]
+    .iter()
+    .any(|path| std::path::Path::new(path).exists())
+        || std::env::var_os("HOME").is_some_and(|home| {
+            let home = std::path::PathBuf::from(home);
+            [
+                ".docker/run/docker.sock",
+                ".colima/default/docker.sock",
+                ".rd/docker.sock",
+                ".local/share/containers/podman/machine/podman.sock",
+            ]
+            .iter()
+            .any(|relative| home.join(relative).exists())
+        })
 }
 
 /// Register all output builders exactly once.
@@ -280,7 +315,7 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
 #[serial_test::serial]
 async fn smoke_broker_and_roundtrip() {
     if !broker().await {
-        eprintln!("skipping: Docker unavailable");
+        skip_without_docker("smoke_broker_and_roundtrip");
         return;
     }
     let topic = format!("eos-smoke-{}", std::process::id());
@@ -305,7 +340,7 @@ async fn smoke_broker_and_roundtrip() {
 #[serial_test::serial]
 async fn atomic_commit_observes_whole_batch() {
     if !broker().await {
-        eprintln!("skipping: Docker unavailable");
+        skip_without_docker("atomic_commit_observes_whole_batch");
         return;
     }
     let topic = format!("eos-atomic-{}", std::process::id());
@@ -337,7 +372,7 @@ async fn atomic_commit_observes_whole_batch() {
 #[serial_test::serial]
 async fn zombie_fenced_across_restart() {
     if !broker().await {
-        eprintln!("skipping: Docker unavailable");
+        skip_without_docker("zombie_fenced_across_restart");
         return;
     }
     let topic = format!("eos-fence-{}", std::process::id());
@@ -376,7 +411,7 @@ async fn zombie_fenced_across_restart() {
 #[serial_test::serial]
 async fn post_commit_crash_duplicates() {
     if !broker().await {
-        eprintln!("skipping: Docker unavailable");
+        skip_without_docker("post_commit_crash_duplicates");
         return;
     }
     let topic = format!("eos-dup-{}", std::process::id());

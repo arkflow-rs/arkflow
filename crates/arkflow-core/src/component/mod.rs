@@ -562,6 +562,11 @@ fn job_schema() -> serde_json::Value {
                         "minimum": 1,
                         "default": 1,
                         "description": "State format contract; savepoint compatibility keys on it."
+                    },
+                    "max_pending_transactions": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum simultaneously staged state-journal transactions (one per open window group or unacknowledged output). Raise it with realistic capacity planning when a window sees very high per-window key cardinality."
                     }
                 }
             },
