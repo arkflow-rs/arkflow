@@ -1839,11 +1839,22 @@ impl ProcessorWorkerPool {
         // where the cancellation token is not set. Bound the join: exceeding
         // it leaves the collector to finish on its own and reports the
         // condition instead of wedging the chain's shutdown.
-        if let Err(_elapsed) = tokio::time::timeout(COLLECTOR_DRAIN_TIMEOUT, collector).await {
-            tracing::warn!(
-                timeout_secs = COLLECTOR_DRAIN_TIMEOUT.as_secs(),
-                "processor result collector did not finish draining; abandoning the join"
-            );
+        match tokio::time::timeout(COLLECTOR_DRAIN_TIMEOUT, collector).await {
+            Ok(Ok(())) => {}
+            // The collector panicked: its buffered deliveries were never
+            // published and their acknowledgements were never settled, which
+            // is a failure the chain must not report as a clean drain.
+            Ok(Err(error)) => {
+                join_error.get_or_insert_with(|| {
+                    Error::Process(format!("processor result collector failed: {error}"))
+                });
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_secs = COLLECTOR_DRAIN_TIMEOUT.as_secs(),
+                    "processor result collector did not finish draining; abandoning the join"
+                );
+            }
         }
         if let Some(error) = join_error {
             return Err(error);

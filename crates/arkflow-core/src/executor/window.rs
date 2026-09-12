@@ -256,40 +256,59 @@ impl AggregateBuffer {
     /// counters existed decodes with `count > 0` and zeroed counters, and the
     /// legacy migration builds its buffer by hand.
     ///
-    /// A payload that observed both representations carries a non-empty float
-    /// side, so the counters already present are kept and the unattributed
-    /// observations are added to the side the state implies. Only a
-    /// single-representation payload — the kind it widened to is the only one
-    /// that ever produced `min`/`max` — is attributed wholesale, and a buffer
-    /// with no observations stays fresh with zero counters.
+    /// Counters the payload already names are kept, and each side's remaining
+    /// observations are attributed from the state it accumulated: both integer
+    /// bounds default to zero and any integer observation moves at least one of
+    /// them, so a non-zero bound proves the integer side observed something.
+    /// (A float sum would be the obvious test, but `[-1.0, 1.0]` is a non-empty
+    /// float contribution whose sum is exactly zero.)
+    ///
+    /// A payload that observed BOTH representations cannot be split exactly
+    /// when neither count survived — the per-side counts were not recorded — so
+    /// each evidenced side keeps at least one observation. That keeps the
+    /// widened `sum`/`min`/`max` honest (both sides contribute) at the cost of
+    /// an approximate count split that only this unrecoverable input can see.
     fn normalize_observation_counters(&mut self) {
         if self.count == 0 {
             self.int_observations = 0;
             self.float_observations = 0;
             return;
         }
-        let attributed = self.int_observations.saturating_add(self.float_observations);
-        if self.float_observations > 0 && self.sum_float != 0.0 {
-            // The payload kept float observations; any observation the counters
-            // do not name yet was integer-side state written before the
-            // counters existed.
-            self.int_observations = self
-                .int_observations
-                .saturating_add(self.count.saturating_sub(attributed));
-            if self.int_observations.saturating_add(self.float_observations) > self.count {
-                self.int_observations = self.count.saturating_sub(self.float_observations);
-            }
+        if matches!(self.kind, NumericKind::Int64) {
+            self.int_observations = self.count;
+            self.float_observations = 0;
             return;
         }
-        match self.kind {
-            NumericKind::Int64 => {
-                self.int_observations = self.count;
-                self.float_observations = 0;
-            }
-            NumericKind::Float32 | NumericKind::Float64 => {
-                self.int_observations = 0;
-                self.float_observations = self.count;
-            }
+        let int_evidenced =
+            self.int_observations > 0 || self.min_i64 != 0 || self.max_i64 != 0;
+        if !int_evidenced {
+            // A float-kind payload with no integer evidence: every observation
+            // came from the float side.
+            self.int_observations = 0;
+            self.float_observations = self.count;
+            return;
+        }
+        let float_evidenced =
+            self.float_observations > 0 || self.min_float != 0.0 || self.max_float != 0.0;
+        let named = self.int_observations.saturating_add(self.float_observations);
+        let unnamed = self.count.saturating_sub(named);
+        if self.float_observations > 0 {
+            // The payload named its own float observations; the remainder is
+            // integer-side state written before the counters existed.
+            self.int_observations = self.int_observations.saturating_add(unnamed);
+        } else if float_evidenced && self.count > 1 {
+            // Both sides accumulated values but neither count survived: reserve
+            // one observation for the integer side so its bounds keep
+            // contributing.
+            self.int_observations = 1;
+            self.float_observations = self.count.saturating_sub(1);
+        } else {
+            self.int_observations = self.count;
+            self.float_observations = 0;
+        }
+        if self.int_observations.saturating_add(self.float_observations) != self.count {
+            self.int_observations = self.count;
+            self.float_observations = 0;
         }
     }
 }
@@ -4273,6 +4292,39 @@ mod sliding_enumeration_tests {
         assert_eq!((decoded.int_observations, decoded.float_observations), (1, 2));
         assert!((decoded.widened_min() - 0.5).abs() < 1e-9);
         assert!((decoded.widened_max() - 4.0).abs() < 1e-9);
+    }
+
+    /// Regression: pre-counter state that observed BOTH representations must
+    /// keep both. Detecting the integer side from the min/max it accumulated is
+    /// what makes this work; a sum-based test would misread a float
+    /// contribution that happens to sum to zero (`[-1.0, 1.0]`).
+    #[test]
+    fn restored_mixed_payload_keeps_both_representations() {
+        let persisted = serde_json::json!({
+            "count": 3,
+            "kind": "float64",
+            "sum_i64": 1000,
+            "sum_float": 0.0,
+            "min_i64": 1000,
+            "max_i64": 1000,
+            "min_float": -1.0,
+            "max_float": 1.0
+        });
+        let decoded = decode_buffer(&serde_json::to_vec(&persisted).unwrap()).unwrap();
+        assert_eq!(
+            decoded.int_observations + decoded.float_observations,
+            decoded.count,
+            "the counters must describe the whole buffer"
+        );
+        assert!(decoded.int_observations > 0, "the integer side is evidenced");
+        assert!(decoded.float_observations > 0, "the float side is evidenced");
+        assert!((decoded.widened_min() - (-1.0)).abs() < 1e-9);
+        assert!(
+            (decoded.widened_max() - 1000.0).abs() < 1e-9,
+            "the restored integer maximum must survive, got {}",
+            decoded.widened_max()
+        );
+        assert!((decoded.widened_sum() - 1000.0).abs() < 1e-9);
     }
 
     /// Regression: a migrated legacy buffer must carry observation counters

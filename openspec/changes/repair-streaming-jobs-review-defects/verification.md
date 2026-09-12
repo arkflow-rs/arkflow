@@ -34,6 +34,24 @@ and the fix restored.
 - `console`: `npm run typecheck` and `npm run build` pass.
 - `docs`: `npm run docs:check` passes (75 pages, 39 inventory entries).
 
+## Defects the post-repair review found in the repair itself
+
+The second review pass (run against the repair commit) confirmed four defects
+that the repair introduced or left open. All four are fixed and covered:
+
+| Defect | Pre-fix evidence | Fix |
+| --- | --- | --- |
+| `restage_snapshot` re-armed the version fence with the version a SKIPPED mutation observed while being skipped, so a retried transaction compared equal and wrote the stale snapshot the skip existed to prevent | with the old re-arm: `fence must keep the staged version … left: [Some(1)] right: [None]` | `StateRollback` carries `staged_versions`; the re-arm keeps the staged version for a skipped mutation and the applied version for one that applied. `a_restaged_transaction_keeps_skipping_the_mutation_it_was_fenced_on` |
+| The Hub's non-storage `update_job_with_expected_generation` still copied the caller's earlier `checkpoint_id` back, so the in-memory deployment regressed recovery while the sqlite one did not | code inspection: the in-memory branch inserted `job` unchanged | the in-memory branch preserves the stored pointer, matching sqlite |
+| `Wal::advance` reclaimed entries although it performs no wrapped source commit, contradicting `mark_committed`'s own documented contract | code inspection: `advance` called `mark_committed(target)` | `advance` only advances the cursor; reclamation happens exclusively after a successful wrapped source commit |
+| `restore_entry` counted a physically present (expired) row as a new key | code inspection: the `had_live == false` branch incremented `keys` | the replace path releases the old bytes without adding a key |
+
+Also fixed from that pass: the collector `JoinError` is reported again (the
+timeout wrapper had swallowed it), a tombstone settlement retries inside its
+task instead of leaving a permanent frontier fence, the console spec comparison
+covers the whole derived spec (not just `operators`), and `tokio`'s `test-util`
+feature is scoped to `arkflow-core`'s dev-dependencies.
+
 ## One race this change introduced and fixed
 
 Making the pool's disconnected failure channel a failure also fired during the

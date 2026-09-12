@@ -365,6 +365,7 @@ impl Input for KafkaInput {
                     // the next acknowledged delivery reports, which is the same
                     // retry contract a forwarded delivery gets.
                     let Some(payload) = kafka_message.payload() else {
+                        let close_for_retry = self.close.clone();
                         let ack = KafkaAck {
                             consumer: self.consumer.clone(),
                             frontier: self.frontier.clone(),
@@ -381,12 +382,24 @@ impl Input for KafkaInput {
                             offset: kafka_message.offset() as u64,
                         });
                         tokio::spawn(async move {
-                            if let Err(error) = ack.ack().await {
-                                tracing::warn!(
-                                    %error,
-                                    "Kafka tombstone settlement failed; the frontier fence reports it to the next acknowledgement"
-                                );
+                            // Retry inside the task: a settlement that leaves
+                            // the frontier short of this offset blocks every
+                            // later acknowledgement of the partition behind a
+                            // gap that can no longer close, and no redelivery
+                            // retries it (the tombstone is not forwarded).
+                            for attempt in 0..4 {
+                                if let Ok(()) = ack.ack().await {
+                                    return;
+                                }
+                                if close_for_retry.is_cancelled() {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1)))
+                                    .await;
                             }
+                            tracing::warn!(
+                                "Kafka tombstone settlement failed after retries; the frontier fence reports it to the next acknowledgement"
+                            );
                         });
                         continue;
                     };

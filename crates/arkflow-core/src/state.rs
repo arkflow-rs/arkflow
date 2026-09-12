@@ -688,14 +688,13 @@ impl StateBackend for RedbStateBackend {
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
-        // Adjust the tracked counters for exactly the row this restore touched.
-        // Rescanning the table from `metrics()` was the reason a counter could
-        // disagree with the bytes the budget measured.
+        // Adjust the tracked counters for exactly the row this restore touched:
+        // a row that physically existed is replaced by the restore, so the key
+        // count is unchanged even when its TTL had already passed.
         let (previous_bytes, had_live) = previous_bytes;
-        if had_live {
+        let _ = had_live;
+        if previous_bytes > 0 {
             Self::release_bytes(&self.bytes, previous_bytes);
-        } else {
-            self.keys.fetch_add(1, Ordering::Relaxed);
         }
         self.bytes
             .fetch_add(entry.value.len() as u64, Ordering::Relaxed);

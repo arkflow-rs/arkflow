@@ -487,8 +487,16 @@ impl Hub {
             let mut jobs = self.jobs.write().await;
             match jobs.get(&job.job_id) {
                 Some(current) if current.generation == expected_generation => {
+                    // Same rule as the storage backend: the recovery pointer
+                    // belongs to the checkpoint path, which moves it without
+                    // bumping the generation, so this write must not copy the
+                    // caller's earlier read back over it.
+                    let stored_checkpoint = current.checkpoint_id.clone();
                     let mut updated = job;
                     updated.generation = expected_generation.saturating_add(1);
+                    if stored_checkpoint.is_some() {
+                        updated.checkpoint_id = stored_checkpoint;
+                    }
                     jobs.insert(updated.job_id.clone(), updated.clone());
                     updated
                 }

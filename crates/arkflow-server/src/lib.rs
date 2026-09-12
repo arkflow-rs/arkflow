@@ -3268,7 +3268,6 @@ mod tests {
         assert_eq!(bearer_session_token(&headers_with(Some("Bearer   "))), None);
     }
 
-    use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
     use arkflow_core::engine::Engine;
     use futures_util::StreamExt;

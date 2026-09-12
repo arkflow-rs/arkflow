@@ -426,17 +426,12 @@ impl Wal {
             .unwrap_or_default()
             .saturating_sub(1);
         if target > self.store.cursor() {
+            // Cursor advancement only. Reclaiming here would delete entries
+            // this path has no wrapped source commit for, and the trait's
+            // contract keeps every entry above the reclaim floor replayable for
+            // a cursor compensation — so only `acknowledge`, after the wrapped
+            // source commit succeeds, marks a sequence committed.
             self.store.advance_cursor(target)?;
-            // `target` is the contiguous acknowledged frontier, so every entry
-            // below it is past both watermarks. Reclamation stays best-effort:
-            // it costs disk space, not correctness.
-            if let Err(error) = self.store.mark_committed(target) {
-                tracing::warn!(
-                    target,
-                    %error,
-                    "WAL entry reclamation failed; entries remain until the next commit"
-                );
-            }
             self.ack_notify.notify_waiters();
         }
         Ok(())

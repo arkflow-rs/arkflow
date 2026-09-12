@@ -144,8 +144,13 @@ pub struct StateRollback {
     txn: StateTxn,
     mutations: Vec<StagedMutation>,
     previous: Vec<Option<StateEntry>>,
+    /// Versions the mutations replaced at apply time (what a compensation
+    /// restores). `None` for a mutation the version fence skipped.
     previous_versions: Vec<Option<u64>>,
     applied_versions: Vec<Option<u64>>,
+    /// Versions the mutations were staged at, kept so a restage can re-arm the
+    /// fence with the staged version for a mutation the fence skipped.
+    staged_versions: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -257,6 +262,11 @@ impl StateJournal {
                 previous: previous.clone(),
                 previous_versions: previous_versions.clone(),
                 applied_versions: applied_versions.clone(),
+                staged_versions: inner
+                    .apply_fences
+                    .get(&txn.id)
+                    .cloned()
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -308,13 +318,32 @@ impl StateJournal {
             snapshot.txn.id,
             TxnState::Staged(snapshot.mutations.clone()),
         );
-        // Re-arm the version fence with the transaction's pre-apply versions
-        // so a retried composite acknowledgement cannot overwrite a value a
-        // later committed transaction owns.
-        inner
-            .apply_fences
-            .insert(snapshot.txn.id, snapshot.previous_versions.clone());
+        // Re-arm the version fence so a retried composite acknowledgement
+        // cannot overwrite a value a later committed transaction owns.
+        //
+        // A mutation that actually applied keeps the version it replaced (the
+        // value a compensation writes back). A mutation the fence SKIPPED must
+        // keep the version it was STAGED at: its `previous_versions` entry
+        // records the newer version it observed while being skipped, and
+        // re-arming with that value would make the retry compare equal and
+        // write the stale snapshot the skip existed to prevent.
+        let fence = snapshot
+            .previous_versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| match snapshot.applied_versions.get(index) {
+                Some(Some(_)) => *version,
+                _ => snapshot.staged_versions.get(index).copied().flatten(),
+            })
+            .collect::<Vec<_>>();
+        inner.apply_fences.insert(snapshot.txn.id, fence);
         Ok(())
+    }
+
+    /// The version fence a transaction currently carries (test observability).
+    #[cfg(test)]
+    fn fence_for_test(&self, txn: StateTxn) -> Option<Vec<Option<u64>>> {
+        self.inner.lock().unwrap().apply_fences.get(&txn.id).cloned()
     }
 
     pub fn staged_bytes(&self) -> usize {
@@ -1264,6 +1293,64 @@ mod tests {
     /// recognized its own key and skipped its rollback — the mutation stayed
     /// applied while its source position was uncommitted, and the replay
     /// applied it twice.
+    /// Regression: a mutation the fence SKIPPED records the newer version it
+    /// observed while being skipped. Re-arming the fence with that value made
+    /// the retry compare equal, so the stale snapshot the skip existed to
+    /// prevent was written after all.
+    #[test]
+    fn a_restaged_transaction_keeps_skipping_the_mutation_it_was_fenced_on() {
+        let journal = StateJournal::new(backend());
+        // Transaction A stages a snapshot write for a key that does not exist.
+        let first = journal.begin().unwrap();
+        journal
+            .put(first, "ns", b"k", b"old".to_vec(), None)
+            .unwrap();
+        // A later transaction commits a newer value for the same key first.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+
+        // A sibling failure restages A before it ever applies: the transaction
+        // returns to staged with the fence it staged at.
+        // A's attempt is skipped by the fence.
+        journal.apply(first).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+        let rollback = journal
+            .capture_applied(first)
+            .expect("the skipped transaction still carries compensation data");
+        assert_eq!(
+            rollback.applied_versions,
+            vec![None],
+            "the mutation was skipped, not applied"
+        );
+
+        // The acknowledgement succeeded, so the transaction is completed; a
+        // later sibling failure restages it from the retained rollback data.
+        journal.complete(first);
+        journal.restage_snapshot(&rollback).unwrap();
+        assert_eq!(
+            journal
+                .fence_for_test(first)
+                .expect("the restaged transaction is fenced"),
+            vec![None],
+            "the fence must keep the staged version, not the version seen while skipped"
+        );
+
+        // The retry must still be fenced: the skip was not a one-off.
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec()),
+            "the restaged transaction must not write its stale snapshot over the newer commit"
+        );
+    }
+
     #[tokio::test]
     async fn undo_restores_the_version_it_replaced_so_the_owner_still_recognizes_it() {
         let journal = Arc::new(StateJournal::new(backend()));
