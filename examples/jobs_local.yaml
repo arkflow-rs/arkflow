@@ -1,0 +1,63 @@
+# Local streaming job example.
+#
+# A `job` is a declarative operator DAG with explicit event-time, state,
+# checkpoint, and recovery settings. Jobs run locally through the same
+# unified execution kernel as streams, and the same JobSpec shape is what
+# the Hub distributes to compute nodes — so a job you debug locally can be
+# submitted to the control plane unchanged.
+#
+# Validate first (deep checks are the same as startup):
+#   ./target/release/arkflow --config examples/jobs_local.yaml --validate
+# Then run:
+#   ./target/release/arkflow --config examples/jobs_local.yaml
+
+streams: []
+
+jobs:
+  - id: sensor-window-job
+    version: 1
+    parallelism: 1
+    max_parallelism: 128
+
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: e1
+        from: source
+        to: sink
+        partitioned: true
+
+    sources:
+      - operator_id: source
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "sensor": "temp_1", "value": 10, "ts": 1757000000000 }'
+          interval: 100ms
+          batch_size: 10
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+          allowed_lateness_ms: 5000
+          late_event_policy: update
+
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+
+    state:
+      backend: embedded_kv
+      ttl_ms: 3600000
+      format_version: 1
+    checkpoint:
+      interval_ms: 30000
+      retention: 3
+      object_store_uri: "file://./data/checkpoints"
+    recovery: latest_checkpoint

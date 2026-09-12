@@ -91,6 +91,29 @@ executed side effect. Before dispatch, pending work is suppressed. After
 dispatch, the Attempt outcome remains visible and the API does not claim that
 a restart or other non-idempotent action was undone.
 
+## Jobs
+
+Jobs are managed with the same desired-state semantics as streams. All
+mutations accept a validated job specification (`spec`) and return `202
+Accepted` with an operation reference; they do not imply that a node has
+converged.
+
+| Route | Purpose |
+|-------|---------|
+| `POST /api/v1/jobs/validate` | Deep-validate a spec (same checks as deployment) against the target `node_ids` before creating anything. |
+| `POST /api/v1/jobs` | Create a job with `{"spec": ..., "desired_state": "stopped" \| "running"}`. |
+| `GET /api/v1/jobs/{id}` / `/{id}/detail` / `/{id}/versions` | Observed state, assignment/convergence detail, and version history. |
+| `GET /api/v1/jobs/{id}/plan` | Explain the plan: operator boundaries, partition routes, stateful operators, checkpoint policy. |
+| `PUT /api/v1/jobs/{id}/desired-state` | Start/stop with the same `If-Match` / `Idempotency-Key` contract as streams. |
+| `POST /api/v1/jobs/{id}/checkpoints` / `/{id}/savepoints` | Trigger a barrier checkpoint or savepoint; `GET` lists recovery artifacts. |
+| `POST /api/v1/jobs/{id}/upgrades` and `/{id}/upgrades/{upgrade_id}/rollback` | Version upgrades (job must be stopped and converged) and rollback to a compatible savepoint. |
+| `POST /api/v1/jobs/{id}/actions/{action}` | One-shot actions, equivalent in lifecycle semantics to stream actions. |
+
+Recommended submit flow: `validate` first, submit with `desired_state:
+"stopped"`, inspect `detail` and `plan`, then switch to `running`. Recovery
+artifacts are bound to the job version and state format version; an
+incompatible artifact is rejected before restore instead of corrupting state.
+
 ## Problem envelope
 
 Errors use a stable `code`, human-readable `message`, echoed

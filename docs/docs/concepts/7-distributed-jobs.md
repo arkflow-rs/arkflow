@@ -38,6 +38,8 @@ Job 的观察状态由同一 (generation, action) 下**全部预期 assignment �
 
 分区边按照 JobPlan 的 key-group range 选择下游 task,而不是按物理 source subtask 取模。同一个 key 从不同 source partition 到达时仍归属同一个下游 owner。旧 YAML Stream 的 tumbling/session buffer 保持“先聚合缓冲、再进入 pipeline”的顺序并输出原始 schema/rows;旧的 row-count `sliding_window` 不会被误读成时间窗口,不兼容配置会在编译期给出迁移提示。
 
+**任务放置以算子链为单位共置**:任务分配(assignment)不允许把一条边拆到两个节点,Hub placement 保证相邻算子位于同一 Compute 节点。因此当前模型**没有跨节点 network shuffle**:水平扩展通过源分区切分(如 Kafka 多分区分散到多节点)与独立子任务实现,单个算子的中间数据不出节点;需要跨节点交换的计算应经过外部系统(例如按 key 重分区的 Kafka topic)串联两段 Job。适用场景是多分区并行消费、独立子任务与多节点就近采集,而非需要 shuffle 的重型有状态聚合。
+
 ### 失败与就绪状态
 
 所有校验入口(`--validate`、配置 API、YAML 声明的本地 Job、编译后的 Stream)执行与真实启动相同的免副作用深度构建:未知组件、不支持的状态后端、非法图边在校验期报错,而不是运行期。dry-run 打开的 WAL 在返回前关闭,同一 redb 路径可立即被真实运行时重开。进入 `Starting` 的运行时若在 dry-run、图构建或资源连接处失败,先转为 `Failed` 再返回错误;本地 Job 构建失败会让引擎启动失败而不是带病宣布就绪。临时资源(temporary)、源和 sink 在任何任务循环启动前按依赖顺序连接,部分启动按逆序关闭已连接资源。

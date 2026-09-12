@@ -30,6 +30,7 @@ const sidebars: SidebarsConfig = {
   tutorialSidebar: [
     'start-here',
     'build-pipelines',
+    'streaming-jobs',
     {type: 'category', label: 'Understand ArkFlow', items: [
       'concepts/architecture', 'concepts/backpressure-ordering', 'concepts/metadata',
       'concepts/delivery-semantics', 'concepts/wal-optimization', 'concepts/exactly-once',
