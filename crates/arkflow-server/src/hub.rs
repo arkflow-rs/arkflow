@@ -271,6 +271,11 @@ pub struct HubOperation {
     pub state: HubOperationState,
     pub progress: u8,
     pub created_at_ms: u64,
+    /// Delivery window after which the expiry sweep stops treating the
+    /// operation as in flight. Absent on rows persisted before this field
+    /// existed; those rows never expire, which preserves their old behavior.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
     pub dispatched_at_ms: Option<u64>,
     pub acknowledged_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -328,6 +333,7 @@ pub struct Hub {
     jobs: Arc<RwLock<BTreeMap<String, JobRecord>>>,
     job_versions: Arc<RwLock<BTreeMap<String, Vec<JobVersionRecord>>>>,
     job_checkpoints: Arc<RwLock<BTreeMap<String, Vec<JobCheckpointRecord>>>>,
+    command_metrics: Arc<CommandMetrics>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,6 +345,132 @@ struct HubLifecycle {
     last_error_at_ms: Option<u64>,
     last_duration_ms: Option<u64>,
     last_failure_class: Option<String>,
+}
+
+/// Fixed latency buckets (milliseconds) for command dispatch accounting.
+const COMMAND_METRIC_BUCKETS_MS: &[u64] = &[
+    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+];
+
+/// An operation whose (Job, generation, operation) key has been retried this
+/// many times by the expiry sweep reaches a terminal failed state and is no
+/// longer re-enqueued.
+const MAX_JOB_OPERATION_RETRIES: u32 = 3;
+
+/// Low-cardinality command dispatch accounting: fixed command-type labels,
+/// fixed outcome classes, fixed latency buckets. Counters live in process
+/// memory and reset on Hub restart, in line with Prometheus counter
+/// semantics.
+#[derive(Default)]
+pub struct CommandMetrics {
+    latencies: std::sync::Mutex<BTreeMap<String, CommandLatency>>,
+    outcomes: std::sync::Mutex<BTreeMap<(String, String), u64>>,
+}
+
+#[derive(Default)]
+struct CommandLatency {
+    buckets: Vec<u64>,
+    sum_ms: u64,
+    count: u64,
+}
+
+impl CommandMetrics {
+    /// Bound the label vocabulary: recognized command names pass through;
+    /// anything else collapses into `other` so dynamic operation strings
+    /// cannot grow the series space.
+    fn command_label(operation: &str) -> String {
+        const KNOWN: &[&str] = &[
+            "job_start",
+            "job_stop",
+            "job_checkpoint",
+            "job_savepoint",
+            "job_checkpoint_commit",
+            "job_savepoint_commit",
+            "start",
+            "stop",
+            "restart",
+            "apply_configuration",
+        ];
+        if KNOWN.contains(&operation) {
+            operation.to_owned()
+        } else {
+            "other".to_owned()
+        }
+    }
+
+    fn outcome_label(state: HubOperationState) -> Option<&'static str> {
+        match state {
+            HubOperationState::Succeeded => Some("succeeded"),
+            HubOperationState::Failed => Some("failed"),
+            HubOperationState::TimedOut => Some("timed_out"),
+            HubOperationState::NodeUnavailable => Some("node_unavailable"),
+            HubOperationState::Cancelled => Some("cancelled"),
+            HubOperationState::Superseded => Some("superseded"),
+            HubOperationState::Queued
+            | HubOperationState::Dispatched
+            | HubOperationState::Acknowledged
+            | HubOperationState::Running => None,
+        }
+    }
+
+    fn record_outcome(&self, operation: &str, outcome: &str) {
+        let label = Self::command_label(operation);
+        if let Ok(mut outcomes) = self.outcomes.lock() {
+            *outcomes.entry((label, outcome.to_owned())).or_default() += 1;
+        }
+    }
+
+    fn record_latency(&self, operation: &str, duration_ms: u64) {
+        let label = Self::command_label(operation);
+        let Ok(mut latencies) = self.latencies.lock() else {
+            return;
+        };
+        let latency = latencies.entry(label).or_default();
+        if latency.buckets.is_empty() {
+            latency.buckets = vec![0; COMMAND_METRIC_BUCKETS_MS.len() + 1];
+        }
+        let index = COMMAND_METRIC_BUCKETS_MS.partition_point(|bound| *bound < duration_ms);
+        latency.buckets[index] += 1;
+        latency.sum_ms += duration_ms;
+        latency.count += 1;
+    }
+
+    /// Render the Prometheus text exposition for command dispatch metrics.
+    /// Series are bounded by the fixed command-type and outcome-class
+    /// enumerations; resource IDs and error texts never appear.
+    pub fn render(&self) -> String {
+        let mut body = String::new();
+        if let Ok(latencies) = self.latencies.lock() {
+            for (command, latency) in latencies.iter() {
+                for (index, bound) in COMMAND_METRIC_BUCKETS_MS.iter().enumerate() {
+                    body.push_str(&format!(
+                        "arkflow_command_duration_bucket{{command=\"{command}\",le=\"{bound}\"}} {}\n",
+                        latency.buckets[index]
+                    ));
+                }
+                body.push_str(&format!(
+                    "arkflow_command_duration_bucket{{command=\"{command}\",le=\"+Inf\"}} {}\n",
+                    latency.count
+                ));
+                body.push_str(&format!(
+                    "arkflow_command_duration_count{{command=\"{command}\"}} {}\n",
+                    latency.count
+                ));
+                body.push_str(&format!(
+                    "arkflow_command_duration_sum{{command=\"{command}\"}} {}\n",
+                    latency.sum_ms
+                ));
+            }
+        }
+        if let Ok(outcomes) = self.outcomes.lock() {
+            for ((command, outcome), total) in outcomes.iter() {
+                body.push_str(&format!(
+                    "arkflow_command_total{{command=\"{command}\",outcome=\"{outcome}\"}} {total}\n"
+                ));
+            }
+        }
+        body
+    }
 }
 
 impl Hub {
@@ -356,6 +488,7 @@ impl Hub {
             jobs: Arc::new(RwLock::new(BTreeMap::new())),
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
+            command_metrics: Arc::new(CommandMetrics::default()),
         }
     }
 
@@ -1372,6 +1505,118 @@ impl Hub {
             scheduled += 1;
         }
         Ok(scheduled)
+    }
+
+    /// Prometheus accounting for command dispatch. Counters reset on Hub
+    /// restart in line with counter semantics.
+    pub fn command_metrics(&self) -> &CommandMetrics {
+        &self.command_metrics
+    }
+
+    /// Expire queued/dispatched `job_start`/`job_stop` operations whose
+    /// delivery window passed. Each expiry increments the retry count; once
+    /// the count reaches `MAX_JOB_OPERATION_RETRIES` the operation settles
+    /// as terminal `failed`/`expired` and reconciliation stops re-enqueueing
+    /// it. The undeliverable command is dropped so a late Agent poll cannot
+    /// execute it, and the transition is persisted so a Hub restart sees the
+    /// same state. Expiry marks the operation terminal-but-retriable: the
+    /// next `reconcile_jobs` tick re-enqueues it with the inherited retry
+    /// count. Checkpoint/savepoint triggers are deliberately out of scope:
+    /// their retry path is the poll handler's expired-command re-enqueue,
+    /// which replays the original payload — expiring them here would drop
+    /// the trigger instead.
+    pub async fn expire_stale_job_operations(&self) -> Result<usize, HubError> {
+        let now = now_ms();
+        let expired: Vec<String> = {
+            let operations = self.operations.read().await;
+            operations
+                .values()
+                .filter(|record| {
+                    matches!(record.operation.as_str(), "job_start" | "job_stop")
+                        && matches!(
+                            record.state,
+                            HubOperationState::Queued | HubOperationState::Dispatched
+                        )
+                        && record.expires_at_ms.is_some_and(|expires| expires <= now)
+                })
+                .map(|record| record.id.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let mut mutated: Vec<HubOperation> = Vec::with_capacity(expired.len());
+        {
+            let mut operations = self.operations.write().await;
+            for id in expired {
+                let Some(record) = operations.get_mut(&id) else {
+                    continue;
+                };
+                // Re-check under the write lock: a command result may have
+                // settled the operation between the scan and this transition.
+                if !matches!(
+                    record.state,
+                    HubOperationState::Queued | HubOperationState::Dispatched
+                ) || !record.expires_at_ms.is_some_and(|expires| expires <= now)
+                {
+                    continue;
+                }
+                record.retry_count += 1;
+                record.failure_class = Some("expired".into());
+                record.next_retry_at_ms = Some(now);
+                if record.retry_count >= MAX_JOB_OPERATION_RETRIES {
+                    record.state = HubOperationState::Failed;
+                } else {
+                    record.state = HubOperationState::TimedOut;
+                }
+                mutated.push(record.clone());
+            }
+        }
+        if mutated.is_empty() {
+            return Ok(0);
+        }
+        // Drop the undeliverable commands. The operations lock must be
+        // released first: enqueue takes the nodes lock before the operations
+        // lock, so the reverse order here could deadlock against it.
+        {
+            let mut nodes = self.nodes.write().await;
+            for record in &mutated {
+                if let Some(node) = nodes.get_mut(&record.node_id) {
+                    node.commands
+                        .retain(|command| command.operation_id != record.id);
+                    node.leased_commands.remove(&record.command_id);
+                }
+            }
+        }
+        if let Some(storage) = self.storage.as_ref() {
+            for record in &mutated {
+                persist_operation(storage, record)
+                    .await
+                    .map_err(HubError::from)?;
+            }
+        }
+        for record in &mutated {
+            self.command_metrics.record_outcome(
+                &record.operation,
+                CommandMetrics::outcome_label(record.state)
+                    .unwrap_or("failed"),
+            );
+        }
+        Ok(mutated.len())
+    }
+
+    /// Reclaim audit history past the retention window and count bound so
+    /// the trail stays bounded without losing recent records.
+    pub async fn prune_audit_history(&self) -> Result<(), HubError> {
+        const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        const RETENTION_MAX: i64 = 100_000;
+        if let Some(storage) = &self.storage {
+            storage
+                .prune_audit_events(now_ms() as i64 - RETENTION_MS, RETENTION_MAX)
+                .await
+                .map_err(HubError::from)?;
+        }
+        Ok(())
     }
 
     /// Bounded retention for the operation history. The reconciler's
@@ -2495,11 +2740,34 @@ impl Hub {
     ) -> Result<HubOperation, HubError> {
         let now = now_ms();
         let mut nodes = self.nodes.write().await;
-        let node = nodes.get_mut(&node_id).ok_or(HubError::NodeUnavailable)?;
+        if !nodes.contains_key(&node_id) {
+            drop(nodes);
+            self.reject_enqueue(
+                &operation,
+                &resource_id,
+                &node_id,
+                correlation_id.as_deref(),
+                generation,
+                "node_unavailable",
+            )
+            .await;
+            return Err(HubError::NodeUnavailable);
+        }
+        let node = nodes.get_mut(&node_id).expect("node presence checked above");
         if node.resource.state != NodeConnectionState::Online
             || node.resource.lease_expires_at_ms <= now
             || node.resource.maintenance_state != NodeMaintenanceState::Active
         {
+            drop(nodes);
+            self.reject_enqueue(
+                &operation,
+                &resource_id,
+                &node_id,
+                correlation_id.as_deref(),
+                generation,
+                "node_unavailable",
+            )
+            .await;
             return Err(HubError::NodeUnavailable);
         }
         let required_capabilities = required_capabilities(&operation);
@@ -2533,22 +2801,37 @@ impl Hub {
         {
             let message = format!("node lacks capability for {operation}");
             drop(nodes);
-            let _ = self
-                .record_audit_event(crate::storage::AuditRecord {
-                    event_id: 0,
-                    actor: None,
-                    action: "command.dispatch".into(),
-                    resource_type: "stream".into(),
-                    resource_id: Some(resource_id),
-                    node_id: Some(node_id),
-                    stream_id: None,
-                    correlation_id,
-                    outcome: "rejected".into(),
-                    failure_code: Some("incompatible_capability".into()),
-                    message: Some(message.clone()),
-                    occurred_at_ms: now,
-                })
+            self.command_metrics
+                .record_outcome(&operation, "rejected");
+            if Self::job_audit_action(&operation).is_some() {
+                self.record_job_operation_audit(
+                    &operation,
+                    &resource_id,
+                    Some(&node_id),
+                    correlation_id.as_deref(),
+                    "rejected",
+                    Some("incompatible_capability"),
+                    message.clone(),
+                )
                 .await;
+            } else {
+                let _ = self
+                    .record_audit_event(crate::storage::AuditRecord {
+                        event_id: 0,
+                        actor: None,
+                        action: "command.dispatch".into(),
+                        resource_type: "stream".into(),
+                        resource_id: Some(resource_id),
+                        node_id: Some(node_id),
+                        stream_id: None,
+                        correlation_id,
+                        outcome: "rejected".into(),
+                        failure_code: Some("incompatible_capability".into()),
+                        message: Some(message.clone()),
+                        occurred_at_ms: now,
+                    })
+                    .await;
+            }
             return Err(HubError::Invalid(message));
         }
         let mut operations = self.operations.write().await;
@@ -2603,7 +2886,55 @@ impl Hub {
         let command_id = command_id_override
             .unwrap_or_else(|| format!("cmd-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
         if node.commands.len() + node.leased_commands.len() >= MAX_COMMANDS_PER_NODE {
+            drop(nodes);
+            drop(operations);
+            self.reject_enqueue(
+                &operation,
+                &resource_id,
+                &node_id,
+                correlation_id.as_deref(),
+                generation,
+                "capacity",
+            )
+            .await;
             return Err(HubError::Capacity);
+        }
+        // Retry memory across re-enqueues: a replacement for the same
+        // (node, resource, operation, generation) inherits the retry count
+        // accumulated by its expired predecessors, so the sweep's cap bounds
+        // the lifecycle of the logical command, not of one row. Job-scoped by
+        // design: stream attempts keep their own reconciler retry semantics
+        // and must never hit this cap.
+        let inherited_retry_count = if operation.starts_with("job_") {
+            operations
+                .values()
+                .filter(|item| {
+                    item.node_id == node_id
+                        && item.resource_id == resource_id
+                        && item.operation == operation
+                        && item.generation == generation
+                })
+                .map(|item| item.retry_count)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if inherited_retry_count >= MAX_JOB_OPERATION_RETRIES {
+            drop(nodes);
+            drop(operations);
+            self.reject_enqueue(
+                &operation,
+                &resource_id,
+                &node_id,
+                correlation_id.as_deref(),
+                generation,
+                "expired",
+            )
+            .await;
+            return Err(HubError::Invalid(format!(
+                "operation {operation} for {resource_id} exhausted its retry budget at generation {generation}"
+            )));
         }
         let operation_record = HubOperation {
             id,
@@ -2623,6 +2954,7 @@ impl Hub {
             state: HubOperationState::Queued,
             progress: 0,
             created_at_ms: now,
+            expires_at_ms: Some(now + self.config.lease_ttl_ms),
             dispatched_at_ms: None,
             acknowledged_at_ms: None,
             finished_at_ms: None,
@@ -2631,7 +2963,7 @@ impl Hub {
             failure_class: None,
             intent_state: None,
             convergence_state: None,
-            retry_count: 0,
+            retry_count: inherited_retry_count,
             next_retry_at_ms: None,
             superseded_by_intent_id: None,
             superseded_generation: None,
@@ -2686,6 +3018,15 @@ impl Hub {
                 operations.remove(&oldest);
             }
         }
+        // Audit the logical mutation once: reconciler re-dispatches of the
+        // same (resource, operation, generation) are mechanics, not new
+        // mutations, and would otherwise write one audit row per tick for a
+        // persistently failing Job. Dispatch metrics count every attempt.
+        let is_first_dispatch = !operations.values().any(|item| {
+            item.resource_id == operation_record.resource_id
+                && item.operation == operation_record.operation
+                && item.generation == operation_record.generation
+        });
         operations.insert(operation_record.id.clone(), operation_record.clone());
         drop(operations);
         drop(nodes);
@@ -2694,7 +3035,61 @@ impl Hub {
                 .await
                 .map_err(HubError::from)?;
         }
+        self.command_metrics
+            .record_outcome(&operation_record.operation, "enqueued");
+        // Accepted-mutation audits cover the desired-state lifecycle only:
+        // checkpoint/savepoint dispatches also flow through this funnel for
+        // both operator triggers AND the periodic scheduler, so auditing
+        // them here would log scheduler mechanics as operator mutations —
+        // the HTTP trigger handler records those instead. Rejections of any
+        // Job operation (below) stay audited at dispatch time.
+        if is_first_dispatch
+            && matches!(
+                operation_record.operation.as_str(),
+                "job_start" | "job_stop"
+            )
+        {
+            self.record_job_operation_audit(
+                &operation_record.operation,
+                &operation_record.resource_id,
+                Some(&operation_record.node_id),
+                operation_record.correlation_id.as_deref(),
+                "accepted",
+                None,
+                format!(
+                    "{} generation={} queued for {}",
+                    operation_record.operation, operation_record.generation, operation_record.node_id
+                ),
+            )
+            .await;
+        }
         Ok(operation_record)
+    }
+
+    /// Account and audit an enqueue that never reached the node's command
+    /// queue. Metrics record every command class; the audit trail records
+    /// Job lifecycle operations only, per the Actor-aware audit scope.
+    async fn reject_enqueue(
+        &self,
+        operation: &str,
+        resource_id: &str,
+        node_id: &str,
+        correlation_id: Option<&str>,
+        generation: u64,
+        failure_code: &str,
+    ) {
+        self.command_metrics
+            .record_outcome(operation, failure_code);
+        self.record_job_operation_audit(
+            operation,
+            resource_id,
+            Some(node_id),
+            correlation_id,
+            "rejected",
+            Some(failure_code),
+            format!("{operation} generation={generation} rejected: {failure_code}"),
+        )
+        .await;
     }
 
     pub async fn command_result(
@@ -2761,7 +3156,20 @@ impl Hub {
             operation.finished_at_ms = Some(now_ms());
         }
         if matches!(result.state, HubOperationState::Acknowledged) {
-            operation.acknowledged_at_ms = Some(now_ms());
+            let now = now_ms();
+            operation.acknowledged_at_ms = Some(now);
+            // Enqueue-to-acknowledgement latency, the metric the spec
+            // commits to; terminal outcomes settle the outcome counters.
+            self.command_metrics.record_latency(
+                &operation.operation,
+                now.saturating_sub(operation.created_at_ms),
+            );
+            self.command_metrics
+                .record_outcome(&operation.operation, "acknowledged");
+        }
+        if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
+            self.command_metrics
+                .record_outcome(&operation.operation, outcome);
         }
         let updated = operation.clone();
         let attempt_id = operation.attempt_id.clone();
@@ -3364,6 +3772,50 @@ impl Hub {
     ) -> Result<i64, HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         storage.record_audit(record).await.map_err(HubError::from)
+    }
+
+    /// Audit action name for a dispatched operation: `job_start` becomes
+    /// `job.start`, mirroring the dotted style of the existing audit
+    /// vocabulary. Non-Job operations have no Job audit action.
+    fn job_audit_action(operation: &str) -> Option<String> {
+        operation
+            .strip_prefix("job_")
+            .map(|verb| format!("job.{verb}"))
+    }
+
+    /// Record the acceptance or rejection of a Job lifecycle operation.
+    /// The message carries scalar operation metadata only — never the Job
+    /// spec or configuration body (`control-plane-identity` MUST NOT).
+    /// Best effort: audit failures never fail the mutation itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_job_operation_audit(
+        &self,
+        operation: &str,
+        resource_id: &str,
+        node_id: Option<&str>,
+        correlation_id: Option<&str>,
+        outcome: &str,
+        failure_code: Option<&str>,
+        message: String,
+    ) {
+        let Some(action) = Self::job_audit_action(operation) else {
+            return;
+        };
+        let record = crate::storage::AuditRecord {
+            event_id: 0,
+            actor: Some("operator".into()),
+            action,
+            resource_type: "job".into(),
+            resource_id: Some(resource_id.to_owned()),
+            node_id: node_id.map(str::to_owned),
+            stream_id: None,
+            correlation_id: correlation_id.map(str::to_owned),
+            outcome: outcome.to_owned(),
+            failure_code: failure_code.map(str::to_owned),
+            message: Some(message),
+            occurred_at_ms: now_ms(),
+        };
+        let _ = self.record_audit_event(record).await;
     }
 
     pub async fn prune_events(&self, retain: usize) -> Result<usize, HubError> {
@@ -4129,6 +4581,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
         generation: intent.generation,
         attempt_id: None,
         config_version_id: intent.config_version_id,
+        expires_at_ms: None,
         state,
         progress: if state == HubOperationState::Succeeded {
             100
@@ -4790,6 +5243,7 @@ mod tests {
             resource_id: "orders".into(),
             checkpoint_id: None,
             generation: 1,
+            expires_at_ms: None,
             attempt_id: None,
             config_version_id: None,
             state: HubOperationState::Succeeded,
@@ -7086,6 +7540,387 @@ mod tests {
                 && command.resource_id == "orders"
                 && command.generation == job.generation
         }));
+    }
+
+    // ===== Job operation audit + command metrics + expiry
+    // (add-hub-job-audit-and-command-metrics) =====
+
+    /// A storage-backed Hub with one online node and one Job whose spec
+    /// carries an injected `connection_string` so tests can prove audit
+    /// records never echo configuration bodies.
+    async fn audited_job_hub(secret_marker: &str) -> (Hub, crate::hub::RegisterResponse) {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "compute-1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let spec = serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {"backend": "embedded_kv", "format_version": 3},
+            "connection_string": format!("password={secret_marker}")
+        });
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "stopped".into(),
+            convergence: "reconciling".into(),
+            generation: 1,
+            node_ids: vec!["compute-1".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        (hub, session)
+    }
+
+    #[tokio::test]
+    async fn job_start_is_audited_without_configuration_bodies() {
+        let (hub, _session) = audited_job_hub("super-secret-42").await;
+        let audits = hub.audit(Some("orders")).await.unwrap();
+        let starts: Vec<&crate::storage::AuditRecord> = audits
+            .iter()
+            .filter(|record| record.action == "job.start")
+            .collect();
+        assert_eq!(starts.len(), 1, "the accepted start is audited exactly once");
+        assert_eq!(starts[0].resource_type, "job");
+        assert_eq!(starts[0].outcome, "accepted");
+        assert_eq!(starts[0].node_id.as_deref(), Some("compute-1"));
+        // The audit trail identifies the operation without echoing the
+        // configuration: the injected secret must not surface anywhere in
+        // the record, and neither must the spec field that carried it.
+        let rendered = format!(
+            "{} {}",
+            starts[0].message.as_deref().unwrap_or_default(),
+            serde_json::to_string(starts[0]).unwrap()
+        );
+        assert!(!rendered.contains("super-secret-42"));
+        assert!(!rendered.contains("connection_string"));
+    }
+
+    #[tokio::test]
+    async fn job_stop_rejection_for_unknown_node_is_audited() {
+        let (hub, _session) = audited_job_hub("irrelevant").await;
+        let error = hub
+            .enqueue(
+                "ghost".into(),
+                "job_stop".into(),
+                "orders".into(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HubError::NodeUnavailable));
+        let audits = hub.audit(Some("orders")).await.unwrap();
+        assert!(audits.iter().any(|record| {
+            record.action == "job.stop"
+                && record.outcome == "rejected"
+                && record.failure_code.as_deref() == Some("node_unavailable")
+        }));
+    }
+
+    #[tokio::test]
+    async fn command_metrics_track_enqueues_latency_and_rejections() {
+        let (hub, session) = audited_job_hub("irrelevant").await;
+        // The start dispatch inside the setup counted one enqueued job_start.
+        assert!(hub
+            .command_metrics()
+            .render()
+            .contains("arkflow_command_total{command=\"job_start\",outcome=\"enqueued\"} 1"));
+        // Acknowledgement records the enqueue→ack latency into the buckets.
+        let command = hub
+            .commands(AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: session.session_token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("compute-1 receives the start command");
+        hub.command_result(
+            AgentAuth {
+                node_id: "compute-1".into(),
+                session_token: session.session_token.clone(),
+            },
+            CommandResult {
+                command_id: command.id.clone(),
+                operation_id: command.operation_id.clone(),
+                state: HubOperationState::Acknowledged,
+                progress: 10,
+                error: None,
+                correlation_id: command.correlation_id.clone(),
+                generation: command.generation,
+                observed_generation: None,
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let rendered = hub.command_metrics().render();
+        assert!(rendered.contains(
+            "arkflow_command_duration_bucket{command=\"job_start\",le=\"+Inf\"} 1"
+        ));
+        assert!(rendered
+            .contains("arkflow_command_duration_count{command=\"job_start\"} 1"));
+        assert!(rendered.contains(
+            "arkflow_command_total{command=\"job_start\",outcome=\"acknowledged\"} 1"
+        ));
+        // A dispatch to an unknown node counts the fixed outcome class.
+        let _ = hub
+            .enqueue("ghost".into(), "job_stop".into(), "orders".into(), None)
+            .await;
+        assert!(hub.command_metrics().render().contains(
+            "arkflow_command_total{command=\"job_stop\",outcome=\"node_unavailable\"} 1"
+        ));
+        // Dynamic operation names collapse into the `other` label so the
+        // series space stays bounded by the fixed enumeration.
+        let _ = hub
+            .enqueue(
+                "compute-1".into(),
+                "exotic-operation".into(),
+                "orders".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(hub
+            .command_metrics()
+            .render()
+            .contains("arkflow_command_total{command=\"other\",outcome=\"enqueued\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn expired_job_operations_retry_then_reach_the_terminal_cap() {
+        let (hub, session) = audited_job_hub("irrelevant").await;
+        let rewind_expiry = |operations: &mut BTreeMap<String, HubOperation>, id: &str| {
+            if let Some(record) = operations.get_mut(id) {
+                record.expires_at_ms = Some(1);
+            }
+        };
+        let mut current_id = {
+            let commands = hub
+                .commands(AgentAuth {
+                    node_id: "compute-1".into(),
+                    session_token: session.session_token.clone(),
+                })
+                .await
+                .unwrap();
+            let start = commands
+                .iter()
+                .find(|command| command.operation == "job_start")
+                .expect("the start command is queued");
+            let operations = hub.operations.read().await;
+            let queued = operations
+                .values()
+                .find(|record| record.command_id == start.id)
+                .expect("the queued operation exists")
+                .id
+                .clone();
+            drop(operations);
+            {
+                let mut operations = hub.operations.write().await;
+                rewind_expiry(&mut operations, &queued);
+            }
+            queued
+        };
+        // Two expiry sweeps retry the operation (TimedOut, retry_count 1
+        // then 2); each re-enqueue inherits the accumulated count.
+        for expected_retry in [1, 2] {
+            assert_eq!(hub.expire_stale_job_operations().await.unwrap(), 1);
+            let operations = hub.operations.read().await;
+            let expired = operations.get(&current_id).unwrap();
+            assert_eq!(expired.state, HubOperationState::TimedOut);
+            assert_eq!(expired.retry_count, expected_retry);
+            assert_eq!(expired.failure_class.as_deref(), Some("expired"));
+            drop(operations);
+            // Re-enqueue at the SAME generation the expired start used (the
+            // reconciler always passes job.generation) so the retry count
+            // inheritance lookup matches.
+            let replacement = hub
+                .enqueue_with_metadata(
+                    "compute-1".into(),
+                    "job_start".into(),
+                    "orders".into(),
+                    None,
+                    None,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.retry_count, expected_retry);
+            // The retry is reconciler mechanics, not a new mutation: the
+            // audit trail must still hold exactly one accepted job.start.
+            let starts = hub
+                .audit(Some("orders"))
+                .await
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    record.action == "job.start" && record.outcome == "accepted"
+                })
+                .count();
+            assert_eq!(
+                starts, 1,
+                "reconciler re-dispatches must not add audit rows"
+            );
+            current_id = replacement.id.clone();
+            let mut operations = hub.operations.write().await;
+            rewind_expiry(&mut operations, &current_id);
+        }
+        // The third expiry exhausts the budget: terminal failed/expired.
+        assert_eq!(hub.expire_stale_job_operations().await.unwrap(), 1);
+        {
+            let operations = hub.operations.read().await;
+            let failed = operations.get(&current_id).unwrap();
+            assert_eq!(failed.state, HubOperationState::Failed);
+            assert_eq!(failed.retry_count, 3);
+            assert_eq!(failed.failure_class.as_deref(), Some("expired"));
+        }
+        // And the exhausted budget refuses further re-enqueue attempts.
+        let error = hub
+            .enqueue_with_metadata(
+                "compute-1".into(),
+                "job_start".into(),
+                "orders".into(),
+                None,
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HubError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn periodic_checkpoint_scheduling_writes_no_audit_rows() {
+        // The periodic scheduler funnels through the same dispatch path as
+        // operator triggers; only the latter is a mutation and may appear in
+        // the audit trail.
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        hub.register(RegisterRequest {
+            node_id: "compute-1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: serde_json::json!({
+                "id": "orders",
+                "version": 1,
+                "operators": [
+                    {"id": "source", "kind": "source"},
+                    {"id": "sink", "kind": "sink"}
+                ],
+                "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+                "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+                "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+                "state": {"backend": "embedded_kv", "format_version": 3},
+                "checkpoint": {"interval_ms": 1, "object_store_uri": "file:///tmp/checkpoints"}
+            })
+            .to_string(),
+            desired_state: "running".into(),
+            observed_state: "running".into(),
+            convergence: "converged".into(),
+            generation: 1,
+            node_ids: vec!["compute-1".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        // One scheduling round dispatches the auto checkpoint; the second is
+        // deduplicated by the pending record's created_at gate.
+        let scheduled = hub.schedule_periodic_checkpoints().await.unwrap();
+        assert_eq!(scheduled, 1, "the auto checkpoint was scheduled");
+        let audits = hub.audit(Some("orders")).await.unwrap();
+        assert!(
+            !audits
+                .iter()
+                .any(|record| record.action == "job.checkpoint"),
+            "scheduler mechanics must not appear in the audit trail"
+        );
+        // The dispatch itself is still metriced like any command.
+        assert!(hub
+            .command_metrics()
+            .render()
+            .contains("command=\"job_checkpoint\""));
+    }
+
+    #[tokio::test]
+    async fn audit_history_prunes_old_records_but_keeps_recent() {
+        let storage =
+            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+        let hub = Hub::with_storage(config(), storage);
+        let now = now_ms() as i64;
+        let day_ms = 24 * 60 * 60 * 1000;
+        for (action, occurred_at_ms) in [
+            ("job.start", now - 31 * day_ms),
+            ("job.stop", now - 60 * 60 * 1000),
+        ] {
+            hub.record_audit_event(crate::storage::AuditRecord {
+                event_id: 0,
+                actor: Some("operator".into()),
+                action: action.into(),
+                resource_type: "job".into(),
+                resource_id: Some("orders".into()),
+                node_id: None,
+                stream_id: None,
+                correlation_id: None,
+                outcome: "accepted".into(),
+                failure_code: None,
+                message: None,
+                occurred_at_ms: occurred_at_ms as u64,
+            })
+            .await
+            .unwrap();
+        }
+        hub.prune_audit_history().await.unwrap();
+        let remaining = hub.audit(None).await.unwrap();
+        assert_eq!(remaining.len(), 1, "only the recent record survives");
+        assert_eq!(remaining[0].action, "job.stop");
     }
 }
 

@@ -11,6 +11,16 @@ the configured operator-token boundary or an authenticated monitoring proxy;
 never publish bearer tokens, configuration payloads, node IDs as metric
 labels, or error text as labels.
 
+Command dispatch metrics cover enqueue-to-acknowledgement latency
+(`arkflow_command_duration_bucket`/`_count`/`_sum`) and per-outcome counters
+(`arkflow_command_total`) with fixed `command` and `outcome` label
+vocabularies. These counters reset on Hub restart, consistent with Prometheus
+counter semantics. Job lifecycle mutations (`job_start`, `job_stop`,
+`job_checkpoint`, `job_savepoint`) are additionally audited with actor,
+correlation, outcome, and failure-code metadata; audit history is retained
+within a bounded window (30 days, 100k records) and queryable at
+`/api/v1/audit`.
+
 Readiness is deliberately stricter than liveness. A live process can return
 `200` from `/liveness` while `/readiness` returns `503` during startup recovery
 or storage failure. Alert on readiness, reconciliation failures, stale nodes,

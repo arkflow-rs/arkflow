@@ -475,6 +475,11 @@ enum StorageCommand {
         older_than_ms: i64,
         response: oneshot::Sender<Result<usize, StorageError>>,
     },
+    PruneAuditEvents {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
     ClaimAttempt {
         intent_id: String,
         response: oneshot::Sender<Result<Option<AttemptRecord>, StorageError>>,
@@ -740,6 +745,14 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response.send(store.prune_job_checkpoint_records(older_than_ms));
+                    }
+                    StorageCommand::PruneAuditEvents {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_audit_events(older_than_ms, max_retained));
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
@@ -1266,6 +1279,23 @@ impl StorageActor {
         self.sender
             .send(StorageCommand::PruneJobCheckpointRecords {
                 older_than_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn prune_audit_events(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneAuditEvents {
+                older_than_ms,
+                max_retained,
                 response,
             })
             .await
@@ -2137,6 +2167,26 @@ impl ControlPlaneStore {
             let deleted = transaction.execute(
                 "DELETE FROM cp_job_checkpoints WHERE status IN ('pending', 'failed') AND updated_at_ms < ?1",
                 [older_than_ms],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim audit history by age and count bound. Recent records within
+    /// both bounds always survive; the trail stays queryable but bounded.
+    pub fn prune_audit_events(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_audit_events WHERE occurred_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_audit_events WHERE event_id NOT IN (SELECT event_id FROM cp_audit_events ORDER BY event_id DESC LIMIT ?1)",
+                [max_retained],
             )?;
             Ok(deleted)
         })

@@ -414,8 +414,10 @@ pub async fn serve_hub(
                     let _ = reconcile_hub.reconcile_jobs().await;
                     let _ = reconcile_hub.reconcile_rollouts().await;
                     let _ = reconcile_hub.prune_events(2048).await;
+                    let _ = reconcile_hub.expire_stale_job_operations().await;
                     let _ = reconcile_hub.prune_operation_history().await;
                     let _ = reconcile_hub.prune_stale_checkpoint_records().await;
+                    let _ = reconcile_hub.prune_audit_history().await;
                 }
                 _ = reconcile_cancel.cancelled() => break,
             }
@@ -1252,7 +1254,7 @@ async fn hub_job_recovery_artifact(
     let record = crate::storage::JobCheckpointRecord {
         job_id: job_id.clone(),
         job_version: current.version,
-        checkpoint_id: id,
+        checkpoint_id: id.clone(),
         kind: kind.into(),
         status: "pending".into(),
         manifest_uri: None,
@@ -1264,7 +1266,29 @@ async fn hub_job_recovery_artifact(
         updated_at_ms: hub::now_ms_for_metrics(),
     };
     match hub.record_job_checkpoint(record).await {
-        Ok(Some(job)) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(Some(job)) => {
+            // The operator-triggered recovery artifact is the audited
+            // mutation; periodic scheduling and the dispatch funnel are
+            // mechanics and stay out of the audit trail.
+            hub.record_job_operation_audit(
+                if kind == "savepoint" {
+                    "job_savepoint"
+                } else {
+                    "job_checkpoint"
+                },
+                &job_id,
+                None,
+                None,
+                "accepted",
+                None,
+                format!(
+                    "{kind} trigger accepted, checkpoint_id={id}, generation={}",
+                    current.generation
+                ),
+            )
+            .await;
+            (StatusCode::ACCEPTED, Json(job)).into_response()
+        }
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",
@@ -2347,6 +2371,7 @@ async fn hub_metrics(
             ));
         }
     }
+    body.push_str(&hub.command_metrics().render());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -3842,6 +3867,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn job_action_route_leaves_an_audit_trail() {
+        let store = storage::ControlPlaneStore::in_memory().unwrap();
+        let hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator-secret".into()),
+                node_token: Some("node-secret".into()),
+                lease_ttl_ms: 10_000,
+                poll_interval_ms: 100,
+            },
+            storage::StorageActor::start(store, 8),
+        );
+        hub.register(hub::RegisterRequest {
+            node_id: "compute-1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let app = hub_router(hub.clone(), &ServerConfig::default());
+        let spec = serde_json::json!({
+            "id": "audit-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"spec": spec, "desired_state": "stopped"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // The start action funnels into the audited enqueue path.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs/audit-job/actions/start")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/audit?resource_id=audit-job")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let actions: Vec<&str> = page["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["action"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            actions.contains(&"job.start"),
+            "the start action must be audited, got {actions:?}"
+        );
+        // The hub-level funnel keeps working for direct dispatches too.
+        assert!(hub.audit(Some("audit-job")).await.unwrap().iter().any(
+            |record| record.action == "job.start" && record.outcome == "accepted"
+        ));
+        // The operator-triggered checkpoint is audited exactly once at the
+        // trigger, not per dispatch and not by the periodic scheduler.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs/audit-job/checkpoints")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let checkpoint_audits = hub
+            .audit(Some("audit-job"))
+            .await
+            .unwrap()
+            .iter()
+            .filter(|record| record.action == "job.checkpoint")
+            .count();
+        assert_eq!(
+            checkpoint_audits, 1,
+            "the trigger is audited exactly once"
+        );
     }
 
     #[tokio::test]

@@ -114,6 +114,37 @@ Recommended submit flow: `validate` first, submit with `desired_state:
 artifacts are bound to the job version and state format version; an
 incompatible artifact is rejected before restore instead of corrupting state.
 
+## Audit trail
+
+`GET /api/v1/audit?resource_id={id}` lists bounded audit history for accepted
+and rejected mutations. Job lifecycle operations are audited with dotted
+actions derived from the dispatched operation:
+
+| Action | Recorded when |
+|--------|---------------|
+| `job.start` / `job.stop` | A `job_start` / `job_stop` operation is accepted or rejected by dispatch. |
+| `job.checkpoint` / `job.savepoint` | A recovery-artifact trigger is accepted or rejected. |
+
+Records carry actor, target resource, node, correlation ID, outcome
+(`accepted`/`rejected`), and a stable failure code (`node_unavailable`,
+`capacity`, `incompatible_capability`, `expired`). Messages contain scalar
+operation metadata only — never credentials or job configuration bodies.
+History is retained within a bounded window and pruned by age and count.
+
+## Metrics
+
+`GET /api/v1/metrics` renders Prometheus text exposition. Beyond readiness,
+reconciliation, outbox, and fleet-state gauges, command dispatch exposes
+`arkflow_command_duration_bucket{command,le}` (enqueue-to-acknowledgement
+latency with `_count`/`_sum` companions) and
+`arkflow_command_total{command,outcome}`. Labels come from fixed
+vocabularies — command types (`job_start`, `job_stop`, `job_checkpoint`,
+`job_savepoint`, stream actions) and outcome classes (`enqueued`,
+`acknowledged`, `succeeded`, `failed`, `timed_out`, `node_unavailable`,
+`capacity`, `rejected`); unknown command names collapse into `other`, and
+resource IDs, correlation IDs, and error text never become labels. Counters
+reset on Hub restart.
+
 ## Problem envelope
 
 Errors use a stable `code`, human-readable `message`, echoed
