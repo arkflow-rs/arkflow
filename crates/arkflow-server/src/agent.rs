@@ -1366,7 +1366,7 @@ pub async fn run(
                 job_runtime.stop_all().await;
                 return Ok(())
             },
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(jittered_backoff(backoff)) => {}
         }
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
@@ -1480,7 +1480,7 @@ async fn run_session(
                         return Err(delivery);
                     }
                 }
-                let query = agent_auth_query(&auth);
+                let query = agent_auth_query(&auth.node_id);
                 let commands: Vec<AgentCommand> = bearer_auth(client.get(format!("{}{}{}?{}", config.hub_url, config.api_prefix, "/agent/commands", query)), &auth.session_token).send().await?.error_for_status()?.json().await?;
                 for command in commands {
                     if let Some(result) = replay_cached_command(completed_commands, &command.id) {
@@ -2079,7 +2079,11 @@ fn replay_cached_command(cache: &CompletedCommandCache, command_id: &str) -> Opt
     cache.replay(command_id)
 }
 
-fn remember_completed_command(cache: &mut CompletedCommandCache, command_id: String, result: CommandResult) {
+fn remember_completed_command(
+    cache: &mut CompletedCommandCache,
+    command_id: String,
+    result: CommandResult,
+) {
     cache.remember(command_id, result);
 }
 
@@ -2089,7 +2093,7 @@ async fn send_result(
     auth: &AgentAuth,
     result: CommandResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let query = agent_auth_query(auth);
+    let query = agent_auth_query(&auth.node_id);
     bearer_auth(
         client.post(format!(
             "{}{}/agent/commands/{}/result?{}",
@@ -2118,16 +2122,12 @@ async fn post_json<T: Serialize>(
 }
 /// Build the agent command query string.
 ///
-/// The session token travels in the `Authorization: Bearer` header because a
-/// query string leaks into reverse-proxy and access logs — but it is ALSO sent
-/// here for one transition window, so an Agent deployed against a Hub that
-/// still requires the query credential keeps polling and reporting commands
-/// instead of failing its session with a 400. The Hub prefers the header when
-/// both are present.
-fn agent_auth_query(auth: &AgentAuth) -> String {
+/// The session credential travels only in the `Authorization: Bearer` header:
+/// a query string leaks into reverse-proxy and access logs, and an Agent from
+/// this release therefore requires a Hub from the same release or later.
+fn agent_auth_query(node_id: &str) -> String {
     url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("node_id", &auth.node_id)
-        .append_pair("session_token", &auth.session_token)
+        .append_pair("node_id", node_id)
         .finish()
 }
 
@@ -2150,8 +2150,45 @@ fn command_expired(expires_at_ms: u64, now: u64) -> bool {
     expires_at_ms <= now
 }
 
+/// Equal-jitter backoff: sleep uniformly in `[backoff/2, backoff]`.
+///
+/// Many Agents losing their session at the same moment (a Hub restart, a fleet
+/// of expired credentials) would otherwise retry in lockstep — the exponential
+/// growth is identical for every node. Randomizing within the window keeps the
+/// exponential bound while desynchronizing the re-registration burst.
+fn jittered_backoff(backoff: Duration) -> Duration {
+    use rand::Rng;
+    if backoff.is_zero() {
+        return backoff;
+    }
+    let low = (backoff / 2).as_millis() as u64;
+    let high = backoff.as_millis() as u64;
+    Duration::from_millis(rand::rng().random_range(low..=high))
+}
+
 fn command_is_stale(command_generation: u64, latest_generation: Option<u64>) -> bool {
     latest_generation.is_some_and(|latest| command_generation < latest)
+}
+
+/// The jitter must stay inside the equal-jitter window `[backoff/2, backoff]`
+/// so the exponential bound survives while simultaneous retries desynchronize.
+#[test]
+fn jittered_backoff_stays_within_the_equal_jitter_window() {
+    for backoff in [
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+        Duration::from_secs(10),
+    ] {
+        for _ in 0..200 {
+            let sleep = jittered_backoff(backoff);
+            assert!(
+                sleep >= backoff / 2 && sleep <= backoff,
+                "sleep {sleep:?} outside [{:?}, {backoff:?}]",
+                backoff / 2
+            );
+        }
+    }
+    assert_eq!(jittered_backoff(Duration::ZERO), Duration::ZERO);
 }
 
 #[cfg(test)]
@@ -2159,25 +2196,30 @@ mod tests {
     use super::*;
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
 
-    /// Regression: the session credential moved to the `Authorization` header,
-    /// but an Agent deployed against a Hub that still requires the query
-    /// parameter must keep polling. Sending both transports for one transition
-    /// window keeps either upgrade order working; the Hub prefers the header.
+    /// Regression: the session credential used to travel in the URL query
+    /// string for the transition window. It now rides only in the
+    /// `Authorization: Bearer` header — query strings leak into reverse-proxy
+    /// and access logs. An Agent from this release therefore requires a Hub
+    /// from the same release or later; the Hub keeps accepting query-only
+    /// credentials from Agents that predate this change.
     #[test]
-    fn agent_commands_carry_the_token_in_both_transports() {
+    fn agent_commands_carry_the_credential_only_in_the_header() {
         let auth = AgentAuth {
             node_id: "node-a".into(),
             session_token: "secret-token".into(),
         };
-        let query = agent_auth_query(&auth);
+        let query = agent_auth_query(&auth.node_id);
         assert!(query.contains("node_id=node-a"), "{query}");
         assert!(
-            query.contains("session_token=secret-token"),
-            "the legacy transport must stay populated for an older Hub: {query}"
+            !query.contains("session_token"),
+            "the query string must not carry the credential anymore: {query}"
         );
 
-        // The header is the preferred transport and carries the same credential.
-        let request = bearer_auth(reqwest::Client::new().get("http://example.invalid"), &auth.session_token);
+        // The header is the only transport for the session credential.
+        let request = bearer_auth(
+            reqwest::Client::new().get("http://example.invalid"),
+            &auth.session_token,
+        );
         let request = request.build().unwrap();
         assert_eq!(
             request

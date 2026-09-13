@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         node_token: config.node_token.clone(),
         lease_ttl_ms: config.lease_ttl_ms,
         poll_interval_ms: config.poll_interval_ms,
+        session_ttl_ms: config.session_ttl_ms,
     };
     let hub = if let Ok(path) = std::env::var("ARKFLOW_HUB_STORAGE") {
         let store = ControlPlaneStore::open(path)?;

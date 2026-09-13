@@ -66,6 +66,7 @@ API and the Hub agent when `hub_url` is set (see
 | `node_id` | string | no | — | Stable identity this process reports to its Hub. |
 | `node_token` | string | no | — | Shared node registration credential. Never included in reports. |
 | `agent_lease_ttl_ms` | integer | no | `15000` | Lease duration (ms) a compute node advertises to its Hub. |
+| `agent_session_ttl_ms` | integer | no | `3600000` | Hard lifetime (ms) of a Hub-issued agent session credential; the Agent re-registers transparently when it elapses. |
 
 ## stream
 

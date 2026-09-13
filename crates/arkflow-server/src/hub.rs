@@ -61,6 +61,14 @@ pub struct HubConfig {
     pub node_token: Option<String>,
     pub lease_ttl_ms: u64,
     pub poll_interval_ms: u64,
+    /// Hard lifetime of an issued agent session credential. Credentials are
+    /// never renewed: after expiry every agent request is rejected and the
+    /// Agent transparently re-registers through its normal reconnect loop.
+    pub session_ttl_ms: u64,
+}
+
+pub fn default_session_ttl_ms() -> u64 {
+    3_600_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +90,8 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub node_id: String,
     pub session_token: String,
+    #[serde(default)]
+    pub session_ttl_ms: u64,
     pub lease_ttl_ms: u64,
     pub poll_interval_ms: u64,
     pub protocol_version: String,
@@ -305,6 +315,9 @@ pub struct HubOperation {
 struct NodeRecord {
     resource: HubNode,
     session_token: String,
+    /// Wall-clock instant after which the session token stops authenticating.
+    /// Credentials are never renewed; only re-registration mints a new one.
+    session_expires_at_ms: u64,
     boot_id: Option<String>,
     report_seq: u64,
     commands: VecDeque<AgentCommand>,
@@ -348,9 +361,7 @@ struct HubLifecycle {
 }
 
 /// Fixed latency buckets (milliseconds) for command dispatch accounting.
-const COMMAND_METRIC_BUCKETS_MS: &[u64] = &[
-    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
-];
+const COMMAND_METRIC_BUCKETS_MS: &[u64] = &[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
 /// An operation whose (Job, generation, operation) key has been retried this
 /// many times by the expiry sweep reaches a terminal failed state and is no
@@ -690,9 +701,7 @@ impl Hub {
                 // for every other Job; the same ordering failure would repeat
                 // each tick.
                 Err(
-                    error @ (HubError::Capacity
-                    | HubError::Invalid(_)
-                    | HubError::NodeUnavailable),
+                    error @ (HubError::Capacity | HubError::Invalid(_) | HubError::NodeUnavailable),
                 ) => {
                     tracing::warn!(
                         job_id = %job.job_id,
@@ -1181,7 +1190,8 @@ impl Hub {
                 .session_token
                 .as_bytes()
                 .ct_eq(node.session_token.as_bytes()),
-        ) {
+        ) || now_ms() > node.session_expires_at_ms
+        {
             return Err(HubError::Unauthorized);
         }
         drop(nodes);
@@ -1598,8 +1608,7 @@ impl Hub {
         for record in &mutated {
             self.command_metrics.record_outcome(
                 &record.operation,
-                CommandMetrics::outcome_label(record.state)
-                    .unwrap_or("failed"),
+                CommandMetrics::outcome_label(record.state).unwrap_or("failed"),
             );
         }
         Ok(mutated.len())
@@ -1663,7 +1672,10 @@ impl Hub {
             .iter()
             .filter(|(_, record)| terminal(&record.state))
             .map(|(id, record)| {
-                ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64, id.clone())
+                (
+                    (record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64,
+                    id.clone(),
+                )
             })
             .collect();
         terminal_ids.sort();
@@ -1697,10 +1709,7 @@ impl Hub {
                     .iter()
                     .filter(|record| {
                         (record.updated_at_ms as i64) < cutoff
-                            && matches!(
-                                record.status.as_str(),
-                                "pending" | "failed"
-                            )
+                            && matches!(record.status.as_str(), "pending" | "failed")
                     })
                     .map(|record| (job_id.clone(), record.checkpoint_id.clone()))
                     .collect::<Vec<_>>()
@@ -2127,6 +2136,7 @@ impl Hub {
             NodeRecord {
                 resource,
                 session_token: session_token.clone(),
+                session_expires_at_ms: now.saturating_add(self.config.session_ttl_ms),
                 boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
                 // Commands queued for an old process belong to a runtime that
@@ -2253,6 +2263,7 @@ impl Hub {
         Ok(RegisterResponse {
             node_id: request.node_id,
             session_token,
+            session_ttl_ms: self.config.session_ttl_ms,
             lease_ttl_ms: self.config.lease_ttl_ms,
             poll_interval_ms: self.config.poll_interval_ms,
             protocol_version: default_protocol_version(),
@@ -2753,7 +2764,9 @@ impl Hub {
             .await;
             return Err(HubError::NodeUnavailable);
         }
-        let node = nodes.get_mut(&node_id).expect("node presence checked above");
+        let node = nodes
+            .get_mut(&node_id)
+            .expect("node presence checked above");
         if node.resource.state != NodeConnectionState::Online
             || node.resource.lease_expires_at_ms <= now
             || node.resource.maintenance_state != NodeMaintenanceState::Active
@@ -2801,8 +2814,7 @@ impl Hub {
         {
             let message = format!("node lacks capability for {operation}");
             drop(nodes);
-            self.command_metrics
-                .record_outcome(&operation, "rejected");
+            self.command_metrics.record_outcome(&operation, "rejected");
             if Self::job_audit_action(&operation).is_some() {
                 self.record_job_operation_audit(
                     &operation,
@@ -3058,7 +3070,9 @@ impl Hub {
                 None,
                 format!(
                     "{} generation={} queued for {}",
-                    operation_record.operation, operation_record.generation, operation_record.node_id
+                    operation_record.operation,
+                    operation_record.generation,
+                    operation_record.node_id
                 ),
             )
             .await;
@@ -3078,8 +3092,7 @@ impl Hub {
         generation: u64,
         failure_code: &str,
     ) {
-        self.command_metrics
-            .record_outcome(operation, failure_code);
+        self.command_metrics.record_outcome(operation, failure_code);
         self.record_job_operation_audit(
             operation,
             resource_id,
@@ -3103,7 +3116,8 @@ impl Hub {
             auth.session_token
                 .as_bytes()
                 .ct_eq(node.session_token.as_bytes()),
-        ) {
+        ) || now_ms() > node.session_expires_at_ms
+        {
             return Err(HubError::Unauthorized);
         }
         // A terminal result settles the command lease as well as the
@@ -4532,7 +4546,8 @@ fn authenticated_node<'a>(
         auth.session_token
             .as_bytes()
             .ct_eq(node.session_token.as_bytes()),
-    ) {
+    ) || now_ms() > node.session_expires_at_ms
+    {
         return Err(HubError::Unauthorized);
     }
     Ok(node)
@@ -5172,15 +5187,15 @@ mod tests {
         assert!(dispatched >= 1, "the healthy Job must still dispatch");
         let operations = hub.operations.read().await;
         assert!(
-            operations
-                .values()
-                .any(|record| record.resource_id == "job-healthy"
-                    && record.operation == "job_start"),
+            operations.values().any(
+                |record| record.resource_id == "job-healthy" && record.operation == "job_start"
+            ),
             "the healthy Job's start must be enqueued"
         );
         assert!(
-            !operations.values().any(|record| record.resource_id == "job-blocked"
-                && record.operation == "job_start"),
+            !operations.values().any(
+                |record| record.resource_id == "job-blocked" && record.operation == "job_start"
+            ),
             "the blocked Job's start must be skipped, not enqueued"
         );
     }
@@ -5510,6 +5525,7 @@ mod tests {
             node_token: Some("node-secret".into()),
             lease_ttl_ms: 1000,
             poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
         }
     }
 
@@ -7601,7 +7617,11 @@ mod tests {
             .iter()
             .filter(|record| record.action == "job.start")
             .collect();
-        assert_eq!(starts.len(), 1, "the accepted start is audited exactly once");
+        assert_eq!(
+            starts.len(),
+            1,
+            "the accepted start is audited exactly once"
+        );
         assert_eq!(starts[0].resource_type, "job");
         assert_eq!(starts[0].outcome, "accepted");
         assert_eq!(starts[0].node_id.as_deref(), Some("compute-1"));
@@ -7621,12 +7641,7 @@ mod tests {
     async fn job_stop_rejection_for_unknown_node_is_audited() {
         let (hub, _session) = audited_job_hub("irrelevant").await;
         let error = hub
-            .enqueue(
-                "ghost".into(),
-                "job_stop".into(),
-                "orders".into(),
-                None,
-            )
+            .enqueue("ghost".into(), "job_stop".into(), "orders".into(), None)
             .await
             .unwrap_err();
         assert!(matches!(error, HubError::NodeUnavailable));
@@ -7682,14 +7697,11 @@ mod tests {
         .await
         .unwrap();
         let rendered = hub.command_metrics().render();
-        assert!(rendered.contains(
-            "arkflow_command_duration_bucket{command=\"job_start\",le=\"+Inf\"} 1"
-        ));
         assert!(rendered
-            .contains("arkflow_command_duration_count{command=\"job_start\"} 1"));
-        assert!(rendered.contains(
-            "arkflow_command_total{command=\"job_start\",outcome=\"acknowledged\"} 1"
-        ));
+            .contains("arkflow_command_duration_bucket{command=\"job_start\",le=\"+Inf\"} 1"));
+        assert!(rendered.contains("arkflow_command_duration_count{command=\"job_start\"} 1"));
+        assert!(rendered
+            .contains("arkflow_command_total{command=\"job_start\",outcome=\"acknowledged\"} 1"));
         // A dispatch to an unknown node counts the fixed outcome class.
         let _ = hub
             .enqueue("ghost".into(), "job_stop".into(), "orders".into(), None)
@@ -7785,9 +7797,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .filter(|record| {
-                    record.action == "job.start" && record.outcome == "accepted"
-                })
+                .filter(|record| record.action == "job.start" && record.outcome == "accepted")
                 .count();
             assert_eq!(
                 starts, 1,
@@ -7927,6 +7937,7 @@ mod tests {
 #[cfg(test)]
 mod session_report_tests {
     use super::*;
+    use std::time::Duration;
 
     fn config() -> HubConfig {
         HubConfig {
@@ -7934,6 +7945,7 @@ mod session_report_tests {
             node_token: Some("node-secret".into()),
             lease_ttl_ms: 1000,
             poll_interval_ms: 1000,
+            session_ttl_ms: default_session_ttl_ms(),
         }
     }
 
@@ -8028,6 +8040,287 @@ mod session_report_tests {
             streams[0].1.state,
             arkflow_core::control::StreamState::Failed
         );
+    }
+
+    // --- Session credential lifetime (harden-agent-session-credentials) ---
+
+    fn short_session_config() -> HubConfig {
+        HubConfig {
+            session_ttl_ms: 80,
+            ..config()
+        }
+    }
+
+    fn heartbeat_request(session_token: &str) -> HeartbeatRequest {
+        HeartbeatRequest {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: session_token.to_owned(),
+            },
+            state: "online".into(),
+            protocol_version: Some("v1".into()),
+            software_version: None,
+            capabilities: vec![],
+            rollout_id: None,
+        }
+    }
+
+    async fn register_with_boot(hub: &Hub, boot_id: &str) -> RegisterResponse {
+        hub.register(RegisterRequest {
+            node_id: "n1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec![],
+            boot_id: Some(boot_id.to_owned()),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// An expired session credential stops authenticating agent requests, and
+    /// the rejection must not mutate the node registry.
+    #[tokio::test]
+    async fn expired_session_is_rejected_without_registry_mutation() {
+        let hub = Hub::new(short_session_config());
+        let session = register_with_boot(&hub, "boot-1").await;
+        // The registration response advertises the configured session TTL.
+        assert_eq!(session.session_ttl_ms, 80);
+
+        hub.heartbeat(heartbeat_request(&session.session_token))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        assert!(matches!(
+            hub.heartbeat(heartbeat_request(&session.session_token))
+                .await,
+            Err(HubError::Unauthorized)
+        ));
+
+        // Registry unchanged: the node is still present, online, untouched.
+        let nodes = hub.nodes().await;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "n1");
+        assert_eq!(nodes[0].state, NodeConnectionState::Online);
+    }
+
+    /// Re-registration mints a fresh credential and kills the previous one;
+    /// resources reported by the old session survive when the boot identity
+    /// is stable.
+    #[tokio::test]
+    async fn re_registration_rotates_the_credential_and_preserves_state() {
+        let hub = Hub::new(config());
+        let first = register_with_boot(&hub, "boot-1").await;
+        let report = |session: &RegisterResponse, seq: u64| NodeReport {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: session.session_token.clone(),
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![stream("running")],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some("boot-1".into()),
+            report_seq: seq,
+        };
+        hub.report(report(&first, 1)).await.unwrap();
+
+        let second = register_with_boot(&hub, "boot-1").await;
+        assert_ne!(first.session_token, second.session_token);
+        assert!(matches!(
+            hub.heartbeat(heartbeat_request(&first.session_token)).await,
+            Err(HubError::Unauthorized)
+        ));
+        hub.heartbeat(heartbeat_request(&second.session_token))
+            .await
+            .unwrap();
+        let streams = hub.streams(Some("n1")).await;
+        assert_eq!(streams.len(), 1);
+    }
+
+    /// Agents built before `session_ttl_ms` existed must keep parsing
+    /// registration responses from a Hub that does not send it yet.
+    #[test]
+    fn register_response_without_session_ttl_is_accepted() {
+        let legacy: RegisterResponse = serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "session_token": "credential",
+            "lease_ttl_ms": 1,
+            "poll_interval_ms": 1,
+            "protocol_version": "v1"
+        }))
+        .unwrap();
+        assert_eq!(legacy.session_ttl_ms, 0);
+    }
+
+    /// The session TTL elapsing while a command executes must not lose the
+    /// terminal result: the Agent re-registers, the command-lease replay path
+    /// re-enqueues the command, and the Hub settles exactly one terminal
+    /// outcome through it.
+    #[tokio::test]
+    async fn expired_session_mid_command_still_settles_one_terminal_result() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-e2e', 'digest', '{}', 'json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut hub_config = config();
+        hub_config.lease_ttl_ms = 1_000; // command lease duration
+        hub_config.session_ttl_ms = 80; // expires long before the command lease
+        let hub = Hub::with_storage(hub_config, StorageActor::start(store, 8));
+        let registration = hub
+            .register(RegisterRequest {
+                node_id: "agent-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+                boot_id: Some("boot-1".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "agent-a".into(),
+            session_token: registration.session_token.clone(),
+        };
+
+        hub.create_rollout(
+            "cfg-e2e".into(),
+            vec!["agent-a".into()],
+            1,
+            Some("operator".into()),
+            Some("e2e-session-expiry".into()),
+        )
+        .await
+        .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let operation = hub
+            .reconcile_once("e2e-session-expiry")
+            .await
+            .unwrap()
+            .unwrap();
+        let commands = hub.commands(auth_a.clone()).await.unwrap();
+        assert_eq!(commands.len(), 1);
+        let command = commands[0].clone();
+
+        // The session expires while the Agent executes the command.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let result = hub
+            .command_result(
+                auth_a.clone(),
+                CommandResult {
+                    command_id: command.id.clone(),
+                    operation_id: command.operation_id.clone(),
+                    state: HubOperationState::Succeeded,
+                    progress: 100,
+                    error: None,
+                    correlation_id: command.correlation_id.clone(),
+                    generation: command.generation,
+                    observed_generation: Some(command.generation),
+                    action_id: command.action_id.clone(),
+                    failure_class: None,
+                    config_version_id: Some("cfg-e2e".into()),
+                    rollout_id: command.rollout_id.clone(),
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(HubError::Unauthorized)));
+
+        // The Agent re-registers with its stable boot identity: leased command
+        // state survives because the boot did not change.
+        let reauth = hub
+            .register(RegisterRequest {
+                node_id: "agent-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+                boot_id: Some("boot-1".into()),
+            })
+            .await
+            .unwrap();
+        let auth_b = AgentAuth {
+            node_id: "agent-a".into(),
+            session_token: reauth.session_token.clone(),
+        };
+        // The command lease is still valid, so nothing is redelivered yet.
+        assert!(hub.commands(auth_b.clone()).await.unwrap().is_empty());
+
+        // Let the command lease expire. Session B's own TTL also elapses
+        // during the wait — with a hard TTL every long gap ends in another
+        // re-registration, exactly like the real Agent reconnect loop.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let reauth2 = hub
+            .register(RegisterRequest {
+                node_id: "agent-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["configuration".into()],
+                boot_id: Some("boot-1".into()),
+            })
+            .await
+            .unwrap();
+        let auth_c = AgentAuth {
+            node_id: "agent-a".into(),
+            session_token: reauth2.session_token.clone(),
+        };
+        // Refresh the node lease before polling so the replay re-enqueue
+        // finds the node online.
+        hub.heartbeat(HeartbeatRequest {
+            auth: auth_c.clone(),
+            state: "online".into(),
+            protocol_version: Some("v1".into()),
+            software_version: None,
+            capabilities: vec!["configuration".into()],
+            rollout_id: None,
+        })
+        .await
+        .unwrap();
+        // The first poll triggers the lease-expiry sweep that re-enqueues the
+        // command; the replacement lands in the queue after the pop loop, so
+        // the next poll hands it back.
+        let _ = hub.commands(auth_c.clone()).await.unwrap();
+        let redelivered = hub.commands(auth_c.clone()).await.unwrap();
+        assert_eq!(redelivered.len(), 1);
+
+        hub.command_result(
+            auth_c.clone(),
+            CommandResult {
+                command_id: redelivered[0].id.clone(),
+                operation_id: redelivered[0].operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: redelivered[0].correlation_id.clone(),
+                generation: redelivered[0].generation,
+                observed_generation: Some(redelivered[0].generation),
+                action_id: redelivered[0].action_id.clone(),
+                failure_class: None,
+                config_version_id: Some("cfg-e2e".into()),
+                rollout_id: redelivered[0].rollout_id.clone(),
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        let settled = hub.operation(&redelivered[0].operation_id).await.unwrap();
+        assert_eq!(settled.state, HubOperationState::Succeeded);
+        // The pre-expiry operation was timed out by the lease expiry — the
+        // result rejected with 401 never settled it. Exactly one terminal
+        // outcome exists per operation record.
+        let original = hub.operation(&operation.id).await.unwrap();
+        assert_eq!(original.state, HubOperationState::TimedOut);
     }
 
     /// Task 7.3: a delayed report from an older session arrives after the new

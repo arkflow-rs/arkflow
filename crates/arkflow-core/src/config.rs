@@ -90,6 +90,9 @@ pub struct HealthCheckConfig {
     /// Lease duration advertised by a compute node to its Hub.
     #[serde(default = "default_agent_lease_ttl_ms")]
     pub agent_lease_ttl_ms: u64,
+    /// Lifetime of a Hub-issued agent session credential.
+    #[serde(default = "default_agent_session_ttl_ms")]
+    pub agent_session_ttl_ms: u64,
 }
 
 /// Engine configuration
@@ -212,6 +215,10 @@ fn default_agent_lease_ttl_ms() -> u64 {
     15_000
 }
 
+fn default_agent_session_ttl_ms() -> u64 {
+    3_600_000
+}
+
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
@@ -227,6 +234,7 @@ impl Default for HealthCheckConfig {
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
+            agent_session_ttl_ms: default_agent_session_ttl_ms(),
         }
     }
 }
@@ -364,6 +372,7 @@ mod tests {
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
+            agent_session_ttl_ms: default_agent_session_ttl_ms(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();

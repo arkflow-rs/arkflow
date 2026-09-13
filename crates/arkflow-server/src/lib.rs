@@ -62,6 +62,8 @@ pub struct ServerConfig {
     pub lease_ttl_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_session_ttl_ms")]
+    pub session_ttl_ms: u64,
 }
 
 impl ServerConfig {
@@ -78,6 +80,7 @@ impl ServerConfig {
             node_token: health.node_token.clone(),
             lease_ttl_ms: health.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
+            session_ttl_ms: health.agent_session_ttl_ms,
         }
     }
 }
@@ -95,6 +98,7 @@ impl Default for ServerConfig {
             node_token: None,
             lease_ttl_ms: default_lease_ttl_ms(),
             poll_interval_ms: default_poll_interval_ms(),
+            session_ttl_ms: default_session_ttl_ms(),
         }
     }
 }
@@ -122,6 +126,9 @@ fn default_lease_ttl_ms() -> u64 {
 }
 fn default_poll_interval_ms() -> u64 {
     1_000
+}
+fn default_session_ttl_ms() -> u64 {
+    hub::default_session_ttl_ms()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3309,6 +3316,7 @@ mod tests {
                 node_token: None,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             }),
             &ServerConfig::default(),
         );
@@ -3697,6 +3705,7 @@ mod tests {
             node_token: Some("node-secret".into()),
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
         });
         let app = hub_router(hub, &ServerConfig::default());
         let response = app
@@ -3757,6 +3766,7 @@ mod tests {
             node_token: Some("node-secret".into()),
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
         });
         let app = hub_router(hub, &ServerConfig::default());
         let response = app
@@ -3799,6 +3809,7 @@ mod tests {
             node_token: None,
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
         });
         let app = hub_router(hub, &ServerConfig::default());
         let spec = serde_json::json!({
@@ -3878,6 +3889,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage::StorageActor::start(store, 8),
         );
@@ -3996,6 +4008,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage::StorageActor::start(store, 8),
         );
@@ -4049,6 +4062,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage::StorageActor::start(store, 8),
         );
@@ -4083,6 +4097,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage::StorageActor::start(store, 8),
         );
@@ -4293,6 +4308,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage.clone(),
         );
@@ -4402,6 +4418,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage,
         );
@@ -4444,6 +4461,7 @@ mod tests {
                 node_token: Some("node-secret".into()),
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
+                session_ttl_ms: default_session_ttl_ms(),
             },
             storage.clone(),
         );
@@ -4563,6 +4581,7 @@ mod tests {
             node_token: Some("node-secret".into()),
             lease_ttl_ms: 10_000,
             poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
         });
         let app = hub_router(hub.clone(), &ServerConfig::default());
 

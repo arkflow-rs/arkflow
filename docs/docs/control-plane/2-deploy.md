@@ -40,3 +40,16 @@ filters and `Last-Event-ID`; clients must reload REST snapshots after a
 For reverse proxies, preserve `Authorization`, `X-Correlation-ID`, and the
 SSE `text/event-stream` response without buffering. Do not put credentials in
 query parameters.
+
+## Upgrading a mixed fleet
+
+Agents present their session credential only in the `Authorization: Bearer`
+header. The Hub still accepts the legacy query parameter so Agents from older
+releases keep polling after the Hub is upgraded, but an upgraded Agent requires
+a Hub from the same release or later: in a rolling upgrade, upgrade the Hub
+before upgrading any Agent. Agent reconnects use randomized backoff, so a Hub
+restart does not produce synchronized re-registration bursts. The Hub
+session TTL (`health_check.agent_session_ttl_ms`, one hour by default) bounds
+how long a leaked session credential can authenticate; Agents re-register
+transparently when it elapses, so keep it comfortably above the longest
+expected command (for example a long checkpoint) to avoid result resubmission.

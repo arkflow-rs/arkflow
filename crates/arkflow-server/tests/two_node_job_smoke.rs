@@ -165,6 +165,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         node_token: None,
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
+        session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

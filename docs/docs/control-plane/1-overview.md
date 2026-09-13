@@ -50,7 +50,11 @@ Configuration snapshots are redacted before they are retained by the Hub.
 
 ## Node sessions and leases
 
-The Hub uses short-lived node sessions and leases. A stale node remains visible
+The Hub issues every Agent session a hard expiry (`session_ttl_ms`, one hour by
+default) on top of the node lease. An expired session stops authenticating, and
+the Agent treats the rejection like any session loss: it re-registers with its
+stable boot identity, preserving queued commands and reported resources. A
+stale node remains visible
 but cannot receive new commands; a node marked stale shows its last-seen time,
 and mutating actions that require Agent dispatch are disabled or explained
 rather than silently queued.
