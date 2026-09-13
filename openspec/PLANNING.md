@@ -256,16 +256,23 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 
 核心职责划分：Hub 管理节点目录、聚合资源和期望操作；Compute Node Agent 管理本地执行、观测状态和命令结果。
 
-### 5.2 剩余生产化缺口（对照 2026-08-02 清单修订）
+### 5.2 剩余生产化缺口（对照 2026-08-02 清单修订；2026-09-13 按 v1 代码逐项核实）
 
 1. ~~Hub 运行历史内存态，重启丢失~~ → ✅ SQLite 持久化已落地（PR #1204）。
-2. ~~操作取消/超时/重试/重连 reconciliation 未闭环~~ → ✅ 大部分已落地（#1204、#1216）；Job 级重平衡/恢复编排仍在 v1 演进。
-3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。（未动）
-4. Agent 命令轮询与结果上报仍用 URL 查询参数携带 session token（`agent.rs:892`、`:1382`），需改为 Authorization Header，避免被代理访问日志记录。（未动，已核实）
+2. ~~操作取消/超时/重试/重连 reconciliation 未闭环~~ → ✅ 已落地（#1204、#1216）；Job 级重平衡/恢复编排仍在 v1 演进。
+3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。（未动；RBAC 属阶段 4。注意阶段 3 的配置审批流隐含依赖多身份，建议排在 RBAC 之后避免返工）
+4. ~~Agent 命令轮询与结果上报用 URL 查询参数携带 session token~~ → ✅ 已完成（2026-09-13 核实）：`bearer_auth` 走 `Authorization: Bearer`（`agent.rs` `bearer_auth`），Hub 优先读 header，查询参数仅保留为升级窗口兼容。
 5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；批量发布/审批流未做。
 6. ~~Console Overview/Runtime/配置编辑未补全~~ → ✅ 已补齐（含组件目录、可视化 Job DAG 编排器）。
-7. 双节点端到端测试：Stream 层面已覆盖；分布式 Job 的多节点故障注入测试在 v1 上部分完成（checkpoint 恢复、代际隔离等 25 个 fix 均出自评审整改）。
-8. **新增**：v1 合入 main 前需完成 PR #1219 评审闭环；分布式 Job 的生产化验证（长稳、规模上限、状态后端除 embedded_kv 外的选项）未做。
+7. ~~双节点端到端测试~~ → ✅ 已闭环：`crates/arkflow-server/tests/two_node_job_smoke.rs`（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing）；Stream 层面亦已覆盖。
+8. **新增**：v1 合入 main 前需完成 PR #1219 评审闭环（`repair-v1-review-defects` 已 38/38，待归档）；分布式 Job 的生产化验证（长稳、规模上限、状态后端除 embedded_kv 外的选项）未做。
+9. **2026-09-13 新核实的阶段 2 真剩余**（5.5 清单大部分已落地，勿重复立项，已完成项见下）：
+   - ~~**Job 操作零审计**~~ → ✅ `add-hub-job-audit-and-command-metrics` 已归档（2026-09-13）：job_start/stop/checkpoint/savepoint 接受与拒绝均落 `cp_audit_events`（接受审计 = 首次派发去重；checkpoint 触发审计在 HTTP handler，周期调度不进审计）；
+   - ~~**命令延迟/失败率直方图缺失**~~ → ✅ 同上 change：`arkflow_command_duration_bucket/_count/_sum` + `arkflow_command_total`，固定低基数标签，重启归零；
+   - ~~**Job 命令幂等元数据弱于 stream intents**~~ → ✅ 同上 change：`expires_at_ms`（serde 默认字段，零迁移）+ sweep 有界重试（上限常量 3，重试继承），仅覆盖 job_start/stop，工件触发走 command-lease 重放；
+   - ~~`cp_audit_events` 无界增长~~（核实中附带发现）→ ✅ 同上 change：30 天 + 100k 双界清理接入周期 sweep；
+   - **Session token 会话期静态**：CSPRNG 生成、常量时间比较，但仅 re-register 才轮换；5.5「短期凭证」未做（涉协议演进，独立 change）——阶段 2 现存唯一开发项；
+   - 长稳与规模上限验证（item 8 后半）仍未做。
 
 ### 5.3 推荐交付顺序
 
@@ -292,6 +299,8 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 - 验证 Rust workspace、WAL 行为、Console 构建和 Hub 断连时本地数据面不受影响。
 
 ### 5.5 阶段 2：Hub 生产基础
+
+> **2026-09-13 状态**：本清单大部分已落地（持久化、操作状态机、幂等键、Authorization Header、审计基础、兼容性信息、记录保留）。真剩余收敛为 5.2-9 的四项，其中「Job 操作审计 + 命令延迟/失败率直方图 + Job 命令幂等元数据」立为一个收尾 change；session token 短期化涉协议演进，单独立项。
 
 建议新增独立 OpenSpec change `harden-hub-production-foundation`，重点包括：
 
@@ -361,7 +370,7 @@ v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为
 | 2 | **⑤ 企业集成安全（本次新发现）** | Kafka SASL/SSL **零实现**（issue #902，核实 `input/kafka.rs`/`output/kafka.rs` 无命中）——企业环境接不了带认证的 Kafka，是入场券级缺口；延伸：全组件 TLS 核查、Secret 引用机制（为 Hub 阶段 4 Secret Manager 铺路） |
 | 3 | **① AI 轻量切口** | LLM/embedding processor（reqwest 调 OpenAI 兼容 API，列式批量天然友好）+ 向量库 output（qdrant/milvus/pgvector）；2026 行业主流叙事即 streaming + agentic AI（RisingWave 已全面转向，蓝海收窄但仍有时机）；README 宣传与实现的脱节是最大差异化机会 |
 | 4 | **① 本地推理 + ④ 生态** | ONNX(ort)/candle 推理 processor（IoT 异常检测与 Modbus 场景契合）、WASM processor（issue #88）、公开 benchmark（issue #87，扩展 `kernel_perf_baseline.rs`） |
-| 5 | **Hub 平台阶段 2 穿插** | Agent session token 改 Authorization Header（5.2-4 明文安全债，未动）、RBAC/OIDC、审计 |
+| 5 | **Hub 平台阶段 2 穿插** | ~~Authorization Header~~ 已完成（v1）；剩余 session token 短期化/轮换、Job 操作审计、命令延迟直方图（见 5.2-9）、RBAC/OIDC |
 
 推荐逻辑：0-2 在 1-2 个月内把项目从「内核先进」推进到「能进企业生产」；3-4 打开差异化叙事。方向②打下的 CDC/Schema/EOS 底座恰是方向①「给 AI 供可靠数据」的叙事衔接点——两条线是承接而非切换。
 
