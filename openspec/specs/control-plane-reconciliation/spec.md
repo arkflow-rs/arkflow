@@ -45,7 +45,7 @@ The Hub SHALL increment a resource generation for every desired-state mutation, 
 - **THEN** reconciliation sends a stop for the prior-generation placement on node A and a start for the current generation on node B
 
 ### Requirement: Reconciliation triggers and recovery
-The Hub SHALL trigger reconciliation after desired-state changes, rollout batch changes, Job deployment or recovery changes, node registration, valid reports, lease recovery, checkpoint completion or failure, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism. Recovery SHALL restore unfinished Operations, Rollouts, and Job deployments from durable state before reporting readiness. A lifecycle operation whose terminal result already satisfies the desired state at the current generation SHALL be remembered as a dispatch skip condition: the periodic scan SHALL NOT re-enqueue that operation while the desired state, generation, and operation are unchanged. A failure to enqueue commands for one Job (node unavailable, queue capacity, or a lost race with node expiry) SHALL be recorded and SHALL skip only that Job for the tick instead of aborting reconciliation of the remaining Jobs. Operation records and checkpoint attempt records SHALL be retained under a bounded retention policy that also reclaims non-completed records, so the durable operation and checkpoint stores cannot grow without bound.
+The Hub SHALL trigger reconciliation after desired-state changes, rollout batch changes, Job deployment or recovery changes, node registration, valid reports, lease recovery, checkpoint completion or failure, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism. Recovery SHALL restore unfinished Operations, Rollouts, and Job deployments from durable state before reporting readiness. A lifecycle operation whose terminal result already satisfies the desired state at the current generation SHALL be remembered as a dispatch skip condition: the periodic scan SHALL NOT re-enqueue that operation while the desired state, generation, and operation are unchanged. A failure to enqueue commands for one Job (node unavailable, queue capacity, or a lost race with node expiry) SHALL be recorded and SHALL skip only that Job for the tick instead of aborting reconciliation of the remaining Jobs. Operation records, checkpoint attempt records, processed reconciliation outbox rows, and terminal Attempt records SHALL be retained under a bounded retention policy that also reclaims non-completed and processed records, so the durable operation, checkpoint, outbox, and attempt stores cannot grow without bound. Unprocessed outbox rows and active Attempt records SHALL NOT be reclaimed by retention.
 
 #### Scenario: Agent reconnects with stale observed state
 - **WHEN** a node reconnects and its full report does not match the persisted desired Stream or Job state
@@ -78,6 +78,14 @@ The Hub SHALL trigger reconciliation after desired-state changes, rollout batch 
 #### Scenario: Non-completed checkpoint records are reclaimed
 - **WHEN** checkpoint attempt records remain pending or failed beyond the retention bound
 - **THEN** the retention sweep reclaims them and the durable checkpoint store does not grow without bound
+
+#### Scenario: Processed outbox rows converge under steady churn
+- **WHEN** reconciliation continuously inserts outbox rows that are claimed and marked processed, and the retention sweep runs
+- **THEN** processed rows older than the retention window or beyond the count bound are reclaimed, the unprocessed backlog is untouched, and the outbox store does not grow without bound
+
+#### Scenario: Terminal attempt records are reclaimed without touching active attempts
+- **WHEN** Attempt records have reached a terminal state with a completion time beyond the retention window, while an Attempt for another (node, stream, generation) remains active
+- **THEN** the retention sweep reclaims the terminal records and the active Attempt row is preserved unchanged
 
 ### Requirement: Failure classification and retry
 The Hub SHALL distinguish rejected requests, transient failures, unavailable nodes, permanent execution failures, ambiguous results, and superseded commands, and SHALL apply bounded retry with recorded attempt count and next retry time to retryable failures. An expired command lease is a retryable or ambiguous attempt, not a silently discarded operation. A retryable failure SHALL always converge to a fresh queued command after its backoff expires, even when the prior operation record for the intent is terminal.

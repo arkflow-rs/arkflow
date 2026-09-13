@@ -272,7 +272,7 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
    - ~~**Job 命令幂等元数据弱于 stream intents**~~ → ✅ 同上 change：`expires_at_ms`（serde 默认字段，零迁移）+ sweep 有界重试（上限常量 3，重试继承），仅覆盖 job_start/stop，工件触发走 command-lease 重放；
    - ~~`cp_audit_events` 无界增长~~（核实中附带发现）→ ✅ 同上 change：30 天 + 100k 双界清理接入周期 sweep；
    - ~~**Session token 会话期静态**~~ → ✅ `harden-agent-session-credentials` 已归档（2026-09-13）：绝对 TTL（默认 1h，`health_check.agent_session_ttl_ms`，无滑动续期）、过期 401 走既有 re-register 循环、`RegisterResponse.session_ttl_ms` 通告、Agent 收口 query 泄漏通道（Bearer-only；Hub 保留 legacy 回退 + deprecation 警告）、重连退避 equal-jitter。混布升级顺序约束（先 Hub 后 Agent）写入 spec 与部署文档；
-   - 长稳与规模上限验证（item 8 后半）仍未做——阶段 2 现存唯一剩余项。
+   - ~~长稳与规模上限验证的阻塞项~~ → ✅ `bound-control-plane-storage-history` 已归档（2026-09-13）：`cp_outbox` 已处理行与终态 `cp_attempts` 接入 24h/4096 双界清扫（未处理行/active 行永不回收）、retention 六件套移出 1s reconcile tick 改独立 60s 维护任务、vestigial `cp_job_observations` 表定义删除。长稳与规模上限验证（item 8 后半）本身仍未做——现为阶段 2 现存唯一剩余项，且所有「表行数收敛」断言已可硬，随时可立项 verification-only change。
 
 ### 5.3 推荐交付顺序
 
