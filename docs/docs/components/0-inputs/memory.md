@@ -1,4 +1,5 @@
 ---
+components: [input/memory]
 sidebar_label: Memory
 ---
 

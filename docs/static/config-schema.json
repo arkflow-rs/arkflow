@@ -1,0 +1,5287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArkFlow engine configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "logging": {
+      "type": "object",
+      "description": "Logging configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "default": "info",
+          "description": "Log level."
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Optional path to a log file."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "json"
+          ],
+          "default": "plain",
+          "description": "Log output format."
+        }
+      }
+    },
+    "health_check": {
+      "type": "object",
+      "description": "Health check HTTP server configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "address": {
+          "type": "string",
+          "default": "127.0.0.1:8080"
+        },
+        "health_path": {
+          "type": "string",
+          "default": "/health"
+        },
+        "readiness_path": {
+          "type": "string",
+          "default": "/readiness"
+        },
+        "liveness_path": {
+          "type": "string",
+          "default": "/liveness"
+        },
+        "api_prefix": {
+          "type": "string",
+          "default": "/api/v1"
+        },
+        "api_token": {
+          "type": "string",
+          "writeOnly": true
+        },
+        "cors_origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "streams": {
+      "type": "array",
+      "description": "List of stream processing pipelines.",
+      "items": {
+        "$ref": "#/$defs/stream"
+      }
+    },
+    "jobs": {
+      "type": "array",
+      "description": "Local Jobs declared directly in the configuration; they execute on the unified kernel without a Hub.",
+      "items": {
+        "$ref": "#/$defs/job"
+      }
+    }
+  },
+  "anyOf": [
+    {
+      "required": [
+        "streams"
+      ]
+    },
+    {
+      "required": [
+        "jobs"
+      ]
+    }
+  ],
+  "$defs": {
+    "input": {
+      "type": "object",
+      "description": "Select a registered input component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "description": "input component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "file",
+          "description": "Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file",
+              "description": "Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "input_type": {
+              "type": "object",
+              "description": "Format-specific input settings (type: csv/json/parquet/avro/arrow)."
+            },
+            "ballista": {
+              "type": "object",
+              "description": "Optional Ballista distributed compute configuration."
+            },
+            "query": {
+              "type": "object",
+              "description": "Optional SQL query and table name to filter the read."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "input_type": {
+                "type": "parquet",
+                "path": "s3://bucket/data.parquet"
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "generate",
+          "description": "Generates synthetic text messages on a fixed interval (useful for testing and load simulation).",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "generate",
+              "description": "Generates synthetic text messages on a fixed interval (useful for testing and load simulation)."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "context": {
+              "type": "string",
+              "description": "Payload string emitted on every read."
+            },
+            "interval": {
+              "type": "string",
+              "description": "Delay between batches (e.g. '100ms', '1s'). Accepts any humantime duration."
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional total number of messages to emit before signalling EOF."
+            },
+            "batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "description": "Number of messages returned per read call."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "context": "hello",
+              "interval": "1s",
+              "count": 100,
+              "batch_size": 10
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "http",
+          "description": "Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "http",
+              "description": "Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "address": {
+              "type": "string",
+              "description": "Bind address (server mode) or base URL (client mode)."
+            },
+            "path": {
+              "type": "string",
+              "description": "Path to accept messages on (server mode) or full request path (client mode)."
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "PATCH"
+              ],
+              "description": "HTTP method (client mode)."
+            },
+            "interval": {
+              "type": "string",
+              "description": "Polling interval in humantime format (client mode, e.g. '5s')."
+            },
+            "cors_enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable CORS for the server."
+            },
+            "auth": {
+              "type": "object",
+              "description": "Authentication configuration."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "address": "0.0.0.0:8080",
+              "path": "/ingest",
+              "cors_enabled": true
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "kafka",
+          "description": "Consumes messages from Apache Kafka topics with a consumer group.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "kafka",
+              "description": "Consumes messages from Apache Kafka topics with a consumer group."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "brokers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of Kafka broker addresses."
+            },
+            "topics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Topics to subscribe to."
+            },
+            "consumer_group": {
+              "type": "string",
+              "description": "Consumer group ID for offset coordination."
+            },
+            "client_id": {
+              "type": "string",
+              "description": "Optional client identifier."
+            },
+            "start_from_latest": {
+              "type": "boolean",
+              "default": false,
+              "description": "When true, ignore committed offsets and start from the latest message."
+            },
+            "fetch_min_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Minimum bytes before the broker responds to a fetch request."
+            },
+            "fetch_max_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum bytes for a fetch request."
+            },
+            "fetch_max_partition_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum bytes per partition in a fetch request."
+            },
+            "fetch_wait_max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum time to wait for fetch data in milliseconds."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "brokers": [
+                "localhost:9092"
+              ],
+              "topics": [
+                "events"
+              ],
+              "consumer_group": "arkflow"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "memory",
+          "description": "In-memory input queue seeded with an initial list of messages. Primarily for tests and demos.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "memory",
+              "description": "In-memory input queue seeded with an initial list of messages. Primarily for tests and demos."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "messages": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Initial messages to enqueue."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "messages": [
+                "hello",
+                "world"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "modbus",
+          "description": "Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "modbus",
+              "description": "Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "addr": {
+              "type": "string",
+              "description": "Modbus server address (host:port)."
+            },
+            "slave_id": {
+              "type": "integer",
+              "description": "Modbus unit / slave ID."
+            },
+            "points": {
+              "type": "array",
+              "description": "Points to read on every poll.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "coils",
+                      "discrete_inputs",
+                      "holding_registers",
+                      "input_registers"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "address": {
+                    "type": "integer"
+                  },
+                  "quantity": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "address",
+                  "quantity"
+                ]
+              }
+            },
+            "interval": {
+              "type": "string",
+              "description": "Poll interval (humantime)."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "addr": "127.0.0.1:502",
+              "slave_id": 1,
+              "interval": "1s",
+              "points": [
+                {
+                  "type": "holding_registers",
+                  "name": "voltage",
+                  "address": 0,
+                  "quantity": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "mqtt",
+          "description": "Subscribes to an MQTT broker and forwards messages from the configured topics.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mqtt",
+              "description": "Subscribes to an MQTT broker and forwards messages from the configured topics."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "host": {
+              "type": "string",
+              "description": "MQTT broker hostname."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "MQTT broker port."
+            },
+            "client_id": {
+              "type": "string",
+              "description": "Unique client identifier."
+            },
+            "username": {
+              "type": "string",
+              "description": "Optional username."
+            },
+            "password": {
+              "type": "string",
+              "description": "Optional password."
+            },
+            "topics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Topics to subscribe to (MQTT wildcards supported)."
+            },
+            "qos": {
+              "type": "integer",
+              "enum": [
+                0,
+                1,
+                2
+              ],
+              "default": 0,
+              "description": "Quality of Service level."
+            },
+            "clean_session": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether to use a clean session."
+            },
+            "keep_alive": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Keep-alive interval in seconds."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "host": "localhost",
+              "port": 1883,
+              "client_id": "arkflow",
+              "topics": [
+                "sensors/#"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "multiple_inputs",
+          "description": "Combines multiple input sources into a single stream. Each source is tagged with __meta_source.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "multiple_inputs",
+              "description": "Combines multiple input sources into a single stream. Each source is tagged with __meta_source."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "inputs": {
+              "type": "array",
+              "description": "List of input components to combine.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "description": "Input type (e.g. 'kafka', 'http')."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Optional logical name for this source."
+                  }
+                },
+                "required": [
+                  "type"
+                ]
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "inputs": [
+                {
+                  "type": "kafka",
+                  "name": "events",
+                  "topics": [
+                    "events"
+                  ]
+                },
+                {
+                  "type": "kafka",
+                  "name": "logs",
+                  "topics": [
+                    "logs"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "nats",
+          "description": "Consumes messages from NATS, supporting both regular subjects and JetStream consumers.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "nats",
+              "description": "Consumes messages from NATS, supporting both regular subjects and JetStream consumers."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "NATS server URL (e.g. nats://localhost:4222)."
+            },
+            "mode": {
+              "type": "object",
+              "description": "Select between plain NATS and JetStream subscriptions.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "regular"
+                    },
+                    "subject": {
+                      "type": "string"
+                    },
+                    "queue_group": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "subject"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "jet_stream"
+                    },
+                    "stream": {
+                      "type": "string"
+                    },
+                    "consumer_name": {
+                      "type": "string"
+                    },
+                    "durable_name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "stream",
+                    "consumer_name"
+                  ]
+                }
+              ]
+            },
+            "auth": {
+              "type": "object",
+              "description": "NATS authentication configuration."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "nats://localhost:4222",
+              "mode": {
+                "type": "regular",
+                "subject": "events"
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "pulsar",
+          "description": "Subscribes to an Apache Pulsar topic with configurable subscription type and authentication.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pulsar",
+              "description": "Subscribes to an Apache Pulsar topic with configurable subscription type and authentication."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "service_url": {
+              "type": "string",
+              "description": "Pulsar service URL (e.g. pulsar://localhost:6650)."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Topic to subscribe to."
+            },
+            "subscription_name": {
+              "type": "string",
+              "description": "Subscription name."
+            },
+            "subscription_type": {
+              "type": "string",
+              "enum": [
+                "Exclusive",
+                "Shared",
+                "Failover",
+                "KeyShared"
+              ],
+              "description": "Subscription type."
+            },
+            "auth": {
+              "type": "object",
+              "description": "Pulsar authentication configuration."
+            },
+            "retry_config": {
+              "type": "object",
+              "description": "Retry behaviour for failed messages."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "service_url": "pulsar://localhost:6650",
+              "topic": "persistent://public/default/events",
+              "subscription_name": "arkflow"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "redis",
+          "description": "Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "redis",
+              "description": "Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "mode": {
+              "type": "object",
+              "description": "Connection mode.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "cluster"
+                    },
+                    "urls": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "urls"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "single"
+                    },
+                    "url": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "url"
+                  ]
+                }
+              ]
+            },
+            "redis_type": {
+              "type": "object",
+              "description": "Data structure to consume from.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "subscribe"
+                    },
+                    "subscribe": {
+                      "type": "object",
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "type": {
+                              "const": "channels"
+                            },
+                            "channels": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "channels"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "const": "patterns"
+                            },
+                            "patterns": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "patterns"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "subscribe"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "list"
+                    },
+                    "list": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "list"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "mode": {
+                "type": "single",
+                "url": "redis://localhost:6379"
+              },
+              "redis_type": {
+                "type": "list",
+                "list": [
+                  "events"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "sql",
+          "description": "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sql",
+              "description": "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "select_sql": {
+              "type": "string",
+              "description": "SELECT statement to execute on every poll."
+            },
+            "poll_interval": {
+              "type": "string",
+              "description": "Optional poll interval (humantime)."
+            },
+            "ballista": {
+              "type": "object",
+              "description": "Optional Ballista distributed compute configuration."
+            },
+            "input_type": {
+              "type": "object",
+              "description": "Database connection settings."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "select_sql": "SELECT id, name FROM users",
+              "poll_interval": "10s",
+              "input_type": {
+                "type": "sqlite",
+                "uri": "file:./data.db"
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "websocket",
+          "description": "Connects to a WebSocket server and forwards each incoming message as a batch.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "websocket",
+              "description": "Connects to a WebSocket server and forwards each incoming message as a batch."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "WebSocket server URL (ws:// or wss://)."
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Headers included in the WebSocket handshake."
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Connection timeout in seconds."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "ws://localhost:8080/stream"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Select a registered output component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "description": "output component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "drop",
+          "description": "Discards all messages. Useful for performance benchmarks and dead-end pipelines.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "drop",
+              "description": "Discards all messages. Useful for performance benchmarks and dead-end pipelines."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "http",
+          "description": "Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "http",
+              "description": "Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "Destination URL."
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "PATCH"
+              ],
+              "default": "POST",
+              "description": "HTTP method."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Request timeout in milliseconds."
+            },
+            "retry_count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of retry attempts on failure."
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Custom HTTP headers."
+            },
+            "body_field": {
+              "type": "string",
+              "description": "Record field that holds the request body."
+            },
+            "auth": {
+              "type": "object",
+              "description": "Authentication configuration."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "https://example.com/ingest",
+              "method": "POST",
+              "timeout_ms": 5000,
+              "retry_count": 3
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "influxdb",
+          "description": "Writes time-series data to InfluxDB v2.x using the Line Protocol.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "influxdb",
+              "description": "Writes time-series data to InfluxDB v2.x using the Line Protocol."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "InfluxDB server URL (e.g. http://localhost:8086)."
+            },
+            "org": {
+              "type": "string",
+              "description": "Organization name."
+            },
+            "bucket": {
+              "type": "string",
+              "description": "Destination bucket."
+            },
+            "token": {
+              "type": "string",
+              "description": "Authentication token."
+            },
+            "measurement": {
+              "type": "string",
+              "description": "Measurement name."
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "field": {
+                    "type": "string"
+                  },
+                  "tag_name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "field",
+                  "tag_name"
+                ]
+              },
+              "description": "Tag mappings (label fields)."
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "field": {
+                    "type": "string"
+                  },
+                  "field_name": {
+                    "type": "string"
+                  },
+                  "field_type": {
+                    "enum": [
+                      "float",
+                      "integer",
+                      "boolean",
+                      "string"
+                    ]
+                  }
+                },
+                "required": [
+                  "field",
+                  "field_name"
+                ]
+              },
+              "description": "Field mappings (value fields)."
+            },
+            "timestamp_field": {
+              "type": "string",
+              "description": "Source field for the point timestamp."
+            },
+            "batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Batch size for write requests."
+            },
+            "flush_interval": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum seconds to wait before flushing a partial batch."
+            },
+            "retry_count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of HTTP attempts per flush."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "HTTP request timeout in milliseconds."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "http://localhost:8086",
+              "org": "arkflow",
+              "bucket": "metrics",
+              "token": "${INFLUX_TOKEN}",
+              "measurement": "sensor",
+              "tags": [
+                {
+                  "field": "sensor",
+                  "tag_name": "sensor"
+                }
+              ],
+              "fields": [
+                {
+                  "field": "value",
+                  "field_name": "value",
+                  "field_type": "float"
+                }
+              ],
+              "timestamp_field": "timestamp"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "kafka",
+          "description": "Produces messages to Apache Kafka. Supports key-based partitioning and compression.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "kafka",
+              "description": "Produces messages to Apache Kafka. Supports key-based partitioning and compression."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "brokers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of Kafka broker addresses."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Destination topic (supports {field} placeholders)."
+            },
+            "key": {
+              "type": "string",
+              "description": "Field used as the message key for partitioning."
+            },
+            "client_id": {
+              "type": "string",
+              "description": "Optional client identifier."
+            },
+            "compression": {
+              "type": "string",
+              "enum": [
+                "none",
+                "gzip",
+                "snappy",
+                "lz4",
+                "zstd"
+              ],
+              "description": "Compression algorithm."
+            },
+            "acks": {
+              "type": "string",
+              "enum": [
+                "0",
+                "1",
+                "all"
+              ],
+              "description": "Acknowledgment level."
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Record field used as the message payload."
+            },
+            "exactly_once": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable exactly-once transactional production (L2)."
+            },
+            "transactional_id": {
+              "type": "string",
+              "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "brokers": [
+                "localhost:9092"
+              ],
+              "topic": "events"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "mongodb",
+          "description": "Writes Arrow rows to MongoDB as BSON documents.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mongodb",
+              "description": "Writes Arrow rows to MongoDB as BSON documents."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "uri": {
+              "type": "string",
+              "description": "MongoDB connection URI."
+            },
+            "database": {
+              "type": "string",
+              "description": "Target database name."
+            },
+            "collection": {
+              "type": "string",
+              "description": "Target collection name."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "uri": "mongodb://localhost:27017",
+              "database": "arkflow",
+              "collection": "events"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "mqtt",
+          "description": "Publishes messages to an MQTT broker topic.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mqtt",
+              "description": "Publishes messages to an MQTT broker topic."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "host": {
+              "type": "string",
+              "description": "MQTT broker hostname."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "MQTT broker port."
+            },
+            "client_id": {
+              "type": "string",
+              "description": "Client identifier."
+            },
+            "username": {
+              "type": "string",
+              "description": "Optional username."
+            },
+            "password": {
+              "type": "string",
+              "description": "Optional password."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Destination topic (supports {field} placeholders)."
+            },
+            "qos": {
+              "type": "integer",
+              "enum": [
+                0,
+                1,
+                2
+              ],
+              "default": 0,
+              "description": "Quality of Service."
+            },
+            "clean_session": {
+              "type": "boolean",
+              "default": true
+            },
+            "keep_alive": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Keep-alive interval in seconds."
+            },
+            "retain": {
+              "type": "boolean",
+              "default": false,
+              "description": "Whether to retain the message on the broker."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "host": "localhost",
+              "port": 1883,
+              "client_id": "arkflow",
+              "topic": "sensors/data"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "nats",
+          "description": "Publishes to NATS, either to a regular subject or a JetStream stream.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "nats",
+              "description": "Publishes to NATS, either to a regular subject or a JetStream stream."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "NATS server URL."
+            },
+            "mode": {
+              "type": "object",
+              "description": "Select regular or JetStream publishing.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "regular"
+                    },
+                    "subject": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "subject"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "jet_stream"
+                    },
+                    "stream": {
+                      "type": "string"
+                    },
+                    "subject": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "stream",
+                    "subject"
+                  ]
+                }
+              ]
+            },
+            "auth": {
+              "type": "object",
+              "description": "NATS authentication configuration."
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Record field used as the payload."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "nats://localhost:4222",
+              "mode": {
+                "type": "regular",
+                "subject": "events"
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "pulsar",
+          "description": "Produces messages to an Apache Pulsar topic.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pulsar",
+              "description": "Produces messages to an Apache Pulsar topic."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "service_url": {
+              "type": "string",
+              "description": "Pulsar service URL."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Destination topic (supports {field} placeholders)."
+            },
+            "auth": {
+              "type": "object",
+              "description": "Pulsar authentication configuration."
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Record field used as the payload."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "service_url": "pulsar://localhost:6650",
+              "topic": "persistent://public/default/events"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "redis",
+          "description": "Writes messages to Redis: streams, lists, or pub/sub channels.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "redis",
+              "description": "Writes messages to Redis: streams, lists, or pub/sub channels."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "mode": {
+              "type": "object",
+              "description": "Connection mode (single or cluster).",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "cluster"
+                    },
+                    "urls": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "urls"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "single"
+                    },
+                    "url": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "url"
+                  ]
+                }
+              ]
+            },
+            "redis_type": {
+              "type": "object",
+              "description": "Destination data structure.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "stream"
+                    },
+                    "stream": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "stream"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "list"
+                    },
+                    "list": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "list"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "channel"
+                    },
+                    "channel": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "channel"
+                  ]
+                }
+              ]
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Record field used as the payload."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "mode": {
+                "type": "single",
+                "url": "redis://localhost:6379"
+              },
+              "redis_type": {
+                "type": "stream",
+                "stream": "events"
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "sql",
+          "description": "Batch-inserts records into a SQL database. Supports upsert and transaction management.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sql",
+              "description": "Batch-inserts records into a SQL database. Supports upsert and transaction management."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "connection": {
+              "type": "object",
+              "description": "Database connection settings (type, uri, etc.)."
+            },
+            "table": {
+              "type": "string",
+              "description": "Destination table."
+            },
+            "batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of rows per insert batch."
+            },
+            "upsert": {
+              "type": "boolean",
+              "default": false,
+              "description": "Use upsert (ON CONFLICT) instead of plain insert."
+            },
+            "upsert_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Columns used to detect conflicts for upsert."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "connection": {
+                "type": "postgres",
+                "uri": "postgres://user:pass@localhost/db"
+              },
+              "table": "events",
+              "batch_size": 500
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "stdout",
+          "description": "Writes each message to the console. Useful for debugging and demos.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "stdout",
+              "description": "Writes each message to the console. Useful for debugging and demos."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "pretty": {
+              "type": "boolean",
+              "default": false,
+              "description": "Pretty-print JSON output."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "pretty": true
+            }
+          ]
+        }
+      ]
+    },
+    "processor": {
+      "type": "object",
+      "description": "Select a registered processor component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "description": "processor component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "arrow_to_json",
+          "description": "Converts an Arrow RecordBatch into JSON byte payloads (one per row).",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "arrow_to_json",
+              "description": "Converts an Arrow RecordBatch into JSON byte payloads (one per row)."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "pretty": {
+              "type": "boolean",
+              "default": false,
+              "description": "Pretty-print JSON output."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "arrow_to_protobuf",
+          "description": "Serializes Arrow RecordBatches into Protobuf wire-format bytes.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "arrow_to_protobuf",
+              "description": "Serializes Arrow RecordBatches into Protobuf wire-format bytes."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "message_type": {
+              "type": "string",
+              "description": "Fully-qualified Protobuf message type name."
+            },
+            "proto_inputs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Paths to .proto files."
+            },
+            "proto_includes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Include paths for proto resolution."
+            },
+            "fields_to_include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional allow-list of field names to include when serializing to Protobuf."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "batch",
+          "description": "Batches messages by count, size, or time interval before forwarding.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "batch",
+              "description": "Batches messages by count, size, or time interval before forwarding."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum number of messages per batch."
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Approximate maximum byte size per batch."
+            },
+            "interval": {
+              "type": "string",
+              "description": "Maximum time to wait before flushing a partial batch (humantime)."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "count": 100,
+              "interval": "5s"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "json_to_arrow",
+          "description": "Parses JSON byte payloads into an Arrow RecordBatch with inferred schema.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "json_to_arrow",
+              "description": "Parses JSON byte payloads into an Arrow RecordBatch with inferred schema."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Rows per output batch."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "protobuf_to_arrow",
+          "description": "Decodes Protobuf wire-format bytes into Arrow RecordBatches.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "protobuf_to_arrow",
+              "description": "Decodes Protobuf wire-format bytes into Arrow RecordBatches."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "message_type": {
+              "type": "string",
+              "description": "Fully-qualified Protobuf message type name."
+            },
+            "proto_inputs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Paths to .proto files."
+            },
+            "proto_includes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Include paths for proto resolution."
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Name of the binary column holding the Protobuf wire-format bytes (defaults to '__value')."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "python",
+          "description": "Runs a user-defined Python function (with PyArrow) against each batch.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "python",
+              "description": "Runs a user-defined Python function (with PyArrow) against each batch."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "script": {
+              "type": "string",
+              "description": "Python source defining the transform function."
+            },
+            "function": {
+              "type": "string",
+              "description": "Name of the function to invoke for each batch."
+            },
+            "extra_packages": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional list of pip packages to install before running."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "script": "def transform(batch):\n    return batch",
+              "function": "transform"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "sql",
+          "description": "Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sql",
+              "description": "Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "query": {
+              "type": "string",
+              "description": "SQL query to run on every batch."
+            },
+            "table_name": {
+              "type": "string",
+              "description": "Name used for the batch table in the query (default 'flow')."
+            },
+            "temporary_list": {
+              "type": "array",
+              "description": "Temporary tables to register before running the query.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table_name": {
+                    "type": "string"
+                  },
+                  "key": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "table_name",
+                  "key"
+                ]
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "query": "SELECT *, __meta_source AS source FROM flow"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "vrl",
+          "description": "Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "vrl",
+              "description": "Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "statement": {
+              "type": "string",
+              "description": "VRL program source."
+            },
+            "timezone": {
+              "type": "string",
+              "description": "Optional timezone for VRL timestamp operations (e.g. 'Asia/Shanghai', 'UTC', 'local'). Defaults to the platform local timezone; invalid values fall back to the default with a warning."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "statement": ".message = parse_json!(.message)\n.timestamp = now()"
+            }
+          ]
+        }
+      ]
+    },
+    "buffer": {
+      "type": "object",
+      "description": "Select a registered buffer component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "description": "buffer component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "memory",
+          "description": "In-memory buffer that releases a batch when it reaches capacity or after a timeout.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "memory",
+              "description": "In-memory buffer that releases a batch when it reaches capacity or after a timeout."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "capacity": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum number of messages to accumulate before releasing."
+            },
+            "timeout": {
+              "type": "string",
+              "description": "Maximum time to wait before releasing a partial batch (humantime)."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "capacity": 1000,
+              "timeout": "5s"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "session_window",
+          "description": "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "session_window",
+              "description": "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "gap": {
+              "type": "string",
+              "description": "Maximum idle time before a session is closed (humantime)."
+            },
+            "join": {
+              "type": "object",
+              "description": "Optional SQL join across input sources.",
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "value_field": {
+                  "type": "string"
+                },
+                "codec": {
+                  "type": "object"
+                },
+                "thread_num": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "gap": "30s"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "sliding_window",
+          "description": "Overlapping time windows that slide forward by a fixed interval.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sliding_window",
+              "description": "Overlapping time windows that slide forward by a fixed interval."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "window_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of messages included in each window."
+            },
+            "interval": {
+              "type": "string",
+              "description": "Time interval between window emissions (humantime)."
+            },
+            "slide_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of messages to advance the window by on each emission."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "window_size": 100,
+              "interval": "5s",
+              "slide_size": 20
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "tumbling_window",
+          "description": "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tumbling_window",
+              "description": "Fixed-size, non-overlapping time windows. Supports SQL joins across sources."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "interval": {
+              "type": "string",
+              "description": "Window duration (humantime)."
+            },
+            "join": {
+              "type": "object",
+              "description": "Optional SQL join across input sources.",
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "value_field": {
+                  "type": "string"
+                },
+                "codec": {
+                  "type": "object"
+                },
+                "thread_num": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "interval": "1m"
+            }
+          ]
+        }
+      ]
+    },
+    "codec": {
+      "type": "object",
+      "description": "Select a registered codec component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "description": "codec component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "debezium_json",
+          "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "debezium_json",
+              "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "json",
+          "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "json",
+              "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "pretty": {
+              "type": "boolean",
+              "default": false,
+              "description": "Pretty-print JSON output."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "protobuf",
+          "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "protobuf",
+              "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "message_type": {
+              "type": "string",
+              "description": "Fully-qualified Protobuf message type name."
+            },
+            "proto_inputs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Paths to .proto files."
+            },
+            "proto_includes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Include paths for proto resolution."
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "schema_registry",
+          "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "schema_registry",
+              "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "registry_url": {
+              "type": "string",
+              "description": "Confluent Schema Registry base URL."
+            },
+            "message_type": {
+              "type": "string",
+              "description": "Fully-qualified Protobuf message type."
+            },
+            "auth": {
+              "type": "object",
+              "description": "Optional registry authentication.",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "basic",
+                    "bearer"
+                  ]
+                },
+                "username": {
+                  "type": "string"
+                },
+                "password": {
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "temporary": {
+      "type": "object",
+      "description": "Select a registered temporary component.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            null
+          ],
+          "description": "temporary component type."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional logical name for this component instance."
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "redis",
+          "description": "Redis-backed temporary lookup store (single node or cluster) read through a codec.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "redis",
+              "description": "Redis-backed temporary lookup store (single node or cluster) read through a codec."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "type": "object",
+              "description": "Codec used to decode stored values."
+            },
+            "mode": {
+              "description": "Redis connection mode.",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "single",
+                  "properties": {
+                    "type": {
+                      "const": "single"
+                    },
+                    "url": {
+                      "type": "string",
+                      "description": "Redis URL, e.g. redis://127.0.0.1:6379."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "url"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "cluster",
+                  "properties": {
+                    "type": {
+                      "const": "cluster"
+                    },
+                    "urls": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Redis cluster node URLs."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "urls"
+                  ]
+                }
+              ]
+            },
+            "redis_type": {
+              "description": "Redis structure holding the values.",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "list",
+                  "properties": {
+                    "type": {
+                      "const": "list"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "string",
+                  "properties": {
+                    "type": {
+                      "const": "string"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "job": {
+      "type": "object",
+      "description": "A local Job executed by the unified streaming kernel.",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "operators",
+        "edges",
+        "sources",
+        "sinks"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Job identity."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonic Job version; upgrades restore compatible savepoints."
+        },
+        "max_parallelism": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Upper bound on physical task parallelism."
+        },
+        "parallelism": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Requested task parallelism."
+        },
+        "operators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/job_operator"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "from",
+              "to"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "partitioned": {
+                "type": "boolean",
+                "default": false,
+                "description": "Route by key hash instead of broadcasting."
+              }
+            }
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/job_source"
+          }
+        },
+        "sinks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operator_id",
+              "output_type"
+            ],
+            "properties": {
+              "operator_id": {
+                "type": "string"
+              },
+              "output_type": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "backend"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "embedded_kv",
+                "redb"
+              ],
+              "description": "Keyed-state backend (local execution)."
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "ttl_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "format_version": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "description": "State format contract; savepoint compatibility keys on it."
+            },
+            "max_pending_transactions": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum simultaneously staged state-journal transactions (one per open window group or unacknowledged output). Raise it with realistic capacity planning when a window sees very high per-window key cardinality."
+            }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "interval_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "object_store_uri": {
+              "type": "string"
+            },
+            "retention": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "recovery": {
+          "type": "string",
+          "enum": [
+            "fail",
+            "latest_checkpoint",
+            "latest_savepoint"
+          ],
+          "default": "fail",
+          "description": "Recovery policy on restart."
+        }
+      }
+    },
+    "job_operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "source",
+            "map",
+            "aggregate",
+            "window",
+            "join",
+            "sink"
+          ]
+        },
+        "stateful": {
+          "type": "boolean",
+          "default": false
+        },
+        "key_field": {
+          "type": "string"
+        },
+        "config": {
+          "type": "object"
+        }
+      }
+    },
+    "job_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operator_id",
+        "input_type",
+        "time"
+      ],
+      "properties": {
+        "operator_id": {
+          "type": "string"
+        },
+        "input_type": {
+          "type": "string"
+        },
+        "config": {
+          "type": "object"
+        },
+        "time": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "processing_time",
+                "event_time"
+              ],
+              "description": "Time semantics for this source."
+            },
+            "timestamp_field": {
+              "type": "string",
+              "description": "Event-time field (Int64 ms or an Arrow timestamp column)."
+            },
+            "watermark": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "strategy": {
+                  "type": "string",
+                  "enum": [
+                    "monotonous",
+                    "bounded_out_of_orderness"
+                  ]
+                },
+                "out_of_orderness_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "idle_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "allowed_lateness_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "description": "Fired windows stay correctable (late Update) until end + lateness."
+            },
+            "late_event_policy": {
+              "type": "string",
+              "enum": [
+                "drop",
+                "update",
+                "route"
+              ],
+              "default": "drop"
+            },
+            "late_event_route": {
+              "type": "string",
+              "description": "Operator receiving routed late/invalid-timestamp rows."
+            }
+          }
+        }
+      }
+    },
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "pipeline"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Stable logical identifier for control-plane operations."
+        },
+        "input": {
+          "$ref": "#/$defs/input"
+        },
+        "output": {
+          "$ref": "#/$defs/output"
+        },
+        "error_output": {
+          "$ref": "#/$defs/output"
+        },
+        "pipeline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "processors"
+          ],
+          "properties": {
+            "thread_num": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "description": "Number of processor worker threads."
+            },
+            "processors": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/processor"
+              }
+            },
+            "input": {
+              "type": "object",
+              "description": "Stream-level input overrides (currently unused, reserved for future).",
+              "additionalProperties": true
+            },
+            "output": {
+              "type": "object",
+              "description": "Stream-level output overrides (currently unused, reserved for future).",
+              "additionalProperties": true
+            }
+          }
+        },
+        "buffer": {
+          "$ref": "#/$defs/buffer"
+        },
+        "temporary": {
+          "type": "array",
+          "description": "Optional temporary (lookup) components shared by the pipeline.",
+          "items": {
+            "$ref": "#/$defs/temporary"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 ---
+components: [input/pulsar]
 sidebar_label: Pulsar
 ---
 

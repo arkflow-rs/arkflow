@@ -1,0 +1,44 @@
+# Case: IoT sensor telemetry with tumbling-window batching.
+#
+# Synthetic sensor readings (swap `generate` for `mqtt`/`kafka` in production) are
+# accumulated into 10-second tumbling windows. Each window is emitted as one
+# batch, aggregated with SQL (count/min/max/avg per sensor), and the summary
+# rows are printed to stdout.
+#
+# Validate offline:
+#   ./target/release/arkflow --config examples/case_telemetry_windows.yaml --validate
+
+logging:
+  level: info
+
+streams:
+  - id: telemetry-window-agg
+    input:
+      type: generate
+      context: '{ "sensor": "temp_1", "value": 21.5, "ts": 1757000000000 }'
+      interval: 100ms
+      batch_size: 1
+
+    # Accumulate messages and release them together every 10 seconds.
+    buffer:
+      type: tumbling_window
+      interval: 10s
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: |
+            SELECT
+              sensor,
+              count(*) AS samples,
+              min(value) AS min_value,
+              max(value) AS max_value,
+              avg(value) AS avg_value
+            FROM flow
+            GROUP BY sensor
+        - type: arrow_to_json
+
+    output:
+      type: stdout

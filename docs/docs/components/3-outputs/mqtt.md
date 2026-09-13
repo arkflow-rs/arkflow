@@ -1,4 +1,5 @@
 ---
+components: [output/mqtt]
 description: ArkFlow documentation page.
 ---
 

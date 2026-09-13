@@ -1,4 +1,5 @@
 ---
+components: [output/kafka]
 description: ArkFlow documentation page.
 ---
 

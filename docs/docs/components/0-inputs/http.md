@@ -1,4 +1,5 @@
 ---
+components: [input/http]
 sidebar_label: HTTP
 ---
 

@@ -1,4 +1,5 @@
 ---
+components: [debezium_json]
 sidebar_label: Debezium JSON
 ---
 

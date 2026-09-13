@@ -1,4 +1,5 @@
 ---
+components: [output/pulsar]
 description: ArkFlow documentation page.
 ---
 

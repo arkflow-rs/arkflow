@@ -1,4 +1,5 @@
 ---
+components: [session_window]
 description: ArkFlow documentation page.
 ---
 

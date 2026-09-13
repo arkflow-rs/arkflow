@@ -1,4 +1,5 @@
 ---
+components: [stdout]
 description: ArkFlow documentation page.
 ---
 

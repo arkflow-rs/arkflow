@@ -1,4 +1,5 @@
 ---
+components: [input/sql]
 sidebar_label: SQL
 ---
 

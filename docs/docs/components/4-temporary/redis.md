@@ -1,4 +1,5 @@
 ---
+components: [temporary/redis]
 sidebar_label: Redis
 ---
 

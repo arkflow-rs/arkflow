@@ -14,8 +14,8 @@
 
 //! Component metadata registry
 //!
-//! Each component (input / output / processor / buffer / codec) can be
-//! registered with a `ComponentMetadata` entry that describes it. The
+//! Each component (input / output / processor / buffer / codec / temporary)
+//! can be registered with a `ComponentMetadata` entry that describes it. The
 //! metadata powers three capabilities:
 //!
 //! 1. **Discovery** — `list_components()` lets callers enumerate every
@@ -41,6 +41,7 @@ pub enum ComponentKind {
     Processor,
     Buffer,
     Codec,
+    Temporary,
 }
 
 impl ComponentKind {
@@ -52,17 +53,19 @@ impl ComponentKind {
             ComponentKind::Processor => "processor",
             ComponentKind::Buffer => "buffer",
             ComponentKind::Codec => "codec",
+            ComponentKind::Temporary => "temporary",
         }
     }
 
     /// All kinds, in the canonical order used by listings and the schema.
-    pub const fn all() -> [ComponentKind; 5] {
+    pub const fn all() -> [ComponentKind; 6] {
         [
             ComponentKind::Input,
             ComponentKind::Output,
             ComponentKind::Processor,
             ComponentKind::Buffer,
             ComponentKind::Codec,
+            ComponentKind::Temporary,
         ]
     }
 }
@@ -83,8 +86,9 @@ impl std::str::FromStr for ComponentKind {
             "processor" => Ok(ComponentKind::Processor),
             "buffer" => Ok(ComponentKind::Buffer),
             "codec" => Ok(ComponentKind::Codec),
+            "temporary" => Ok(ComponentKind::Temporary),
             other => Err(Error::Config(format!(
-                "Unknown component kind: {} (expected one of: input, output, processor, buffer, codec)",
+                "Unknown component kind: {} (expected one of: input, output, processor, buffer, codec, temporary)",
                 other
             ))),
         }
@@ -164,6 +168,8 @@ lazy_static::lazy_static! {
         RwLock::new(BTreeMap::new());
     static ref CODEC_METADATA: RwLock<BTreeMap<String, Arc<ComponentMetadata>>> =
         RwLock::new(BTreeMap::new());
+    static ref TEMPORARY_METADATA: RwLock<BTreeMap<String, Arc<ComponentMetadata>>> =
+        RwLock::new(BTreeMap::new());
 }
 
 macro_rules! register_metadata {
@@ -210,6 +216,11 @@ register_metadata!(
     CODEC_METADATA,
     ComponentKind::Codec
 );
+register_metadata!(
+    register_temporary_metadata,
+    TEMPORARY_METADATA,
+    ComponentKind::Temporary
+);
 
 macro_rules! list_metadata {
     ($fn_name:ident, $registry:ident) => {
@@ -226,6 +237,7 @@ list_metadata!(list_output_components, OUTPUT_METADATA);
 list_metadata!(list_processor_components, PROCESSOR_METADATA);
 list_metadata!(list_buffer_components, BUFFER_METADATA);
 list_metadata!(list_codec_components, CODEC_METADATA);
+list_metadata!(list_temporary_components, TEMPORARY_METADATA);
 
 /// Look up the metadata registry for a given kind.
 fn registry_for(kind: ComponentKind) -> &'static RwLock<BTreeMap<String, Arc<ComponentMetadata>>> {
@@ -235,6 +247,7 @@ fn registry_for(kind: ComponentKind) -> &'static RwLock<BTreeMap<String, Arc<Com
         ComponentKind::Processor => &PROCESSOR_METADATA,
         ComponentKind::Buffer => &BUFFER_METADATA,
         ComponentKind::Codec => &CODEC_METADATA,
+        ComponentKind::Temporary => &TEMPORARY_METADATA,
     }
 }
 
@@ -250,6 +263,7 @@ pub fn register_component_metadata(
         ComponentKind::Processor => register_processor_metadata(metadata),
         ComponentKind::Buffer => register_buffer_metadata(metadata),
         ComponentKind::Codec => register_codec_metadata(metadata),
+        ComponentKind::Temporary => register_temporary_metadata(metadata),
     }
 }
 
@@ -280,6 +294,44 @@ pub fn list_components() -> Vec<(ComponentKind, Arc<ComponentMetadata>)> {
                 .map(move |m| (kind, m))
         })
         .collect()
+}
+
+/// One component in the machine-readable registry export.
+#[derive(Serialize)]
+struct ComponentExportEntry {
+    kind: ComponentKind,
+    name: String,
+    description: String,
+    config_optional: bool,
+    config_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_example: Option<serde_json::Value>,
+}
+
+/// Serialize the full component registry as a deterministic JSON document:
+/// format `version` 2 with one entry per registered component carrying its
+/// kind, name, description, configuration schema, and example.
+///
+/// The output backs `components list --format json`, the committed
+/// documentation inventory, and its snapshot test, so all three consumers
+/// share one serializer and cannot diverge. Ordering is canonical kind order
+/// then name (the registries are `BTreeMap`s).
+pub fn export_registry() -> serde_json::Value {
+    let components: Vec<ComponentExportEntry> = list_components()
+        .into_iter()
+        .map(|(kind, m)| ComponentExportEntry {
+            kind,
+            name: m.name.clone(),
+            description: m.description.clone(),
+            config_optional: m.config_optional,
+            config_schema: m.config_schema.clone(),
+            config_example: m.config_example.clone(),
+        })
+        .collect();
+    serde_json::json!({
+        "version": 2,
+        "components": components
+    })
 }
 
 /// Build a JSON Schema describing the top-level engine configuration.
@@ -369,6 +421,7 @@ pub fn build_config_schema() -> serde_json::Value {
     let processor_variants = variant_schemas(ComponentKind::Processor);
     let buffer_variants = variant_schemas(ComponentKind::Buffer);
     let codec_variants = variant_schemas(ComponentKind::Codec);
+    let temporary_variants = variant_schemas(ComponentKind::Temporary);
 
     let component_union =
         |variants: &serde_json::Value, kind: ComponentKind| -> serde_json::Value {
@@ -421,6 +474,10 @@ pub fn build_config_schema() -> serde_json::Value {
         "codec".to_string(),
         component_union(&codec_variants, ComponentKind::Codec),
     );
+    defs.insert(
+        "temporary".to_string(),
+        component_union(&temporary_variants, ComponentKind::Temporary),
+    );
     defs.insert("job".to_string(), job_schema());
     defs.insert("job_operator".to_string(), job_operator_schema_fragment());
     defs.insert("job_source".to_string(), job_source_schema_fragment());
@@ -466,7 +523,12 @@ pub fn build_config_schema() -> serde_json::Value {
                         }
                     }
                 },
-                "buffer": {"$ref": "#/$defs/buffer"}
+                "buffer": {"$ref": "#/$defs/buffer"},
+                "temporary": {
+                    "type": "array",
+                    "description": "Optional temporary (lookup) components shared by the pipeline.",
+                    "items": {"$ref": "#/$defs/temporary"}
+                }
             }
         }),
     );
@@ -825,10 +887,22 @@ mod tests {
         register_buffer_metadata(ComponentMetadata::unit(name, "Listing test.")).unwrap();
 
         let list = list_components();
-        let kinds: Vec<ComponentKind> = list.iter().map(|(k, _)| *k).collect();
-        let mut sorted = kinds.clone();
-        sorted.dedup();
-        assert_eq!(kinds, sorted, "kinds should appear in canonical order");
+        let canonical = ComponentKind::all();
+        let ranks: Vec<usize> = list
+            .iter()
+            .map(|(k, _)| {
+                canonical
+                    .iter()
+                    .position(|candidate| candidate == k)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        // Kinds must be grouped in canonical order. Other tests in this
+        // process share the global registry and may have left several
+        // entries for one kind, so allow repeats within a kind group.
+        let mut sorted_ranks = ranks.clone();
+        sorted_ranks.sort_unstable();
+        assert_eq!(ranks, sorted_ranks, "kinds should appear in canonical order");
 
         let found = list
             .iter()
@@ -853,6 +927,89 @@ mod tests {
                 |v| v.pointer("/properties/type/const").and_then(|c| c.as_str()) == Some(name)
             ),
             "registered component should appear in output schema variants"
+        );
+    }
+
+    #[test]
+    fn export_registry_is_deterministic_and_typed() {
+        let _guard = REGISTER_LOCK.lock().unwrap();
+        register_temporary_metadata(ComponentMetadata::unit(
+            "test_export_temp",
+            "Export test.",
+        ))
+        .unwrap();
+        register_processor_metadata(
+            ComponentMetadata::with_schema(
+                "test_export_proc",
+                "Export processor.",
+                serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}}),
+            )
+            .with_example(serde_json::json!({"x": 1})),
+        )
+        .unwrap();
+
+        let first = export_registry();
+        let second = export_registry();
+        assert_eq!(first, second, "export must be deterministic");
+
+        assert_eq!(first["version"], 2);
+        let components = first["components"].as_array().unwrap();
+
+        // Entries appear in canonical kind order (input .. temporary) and
+        // name order within a kind.
+        let kind_rank = |k: &str| {
+            ComponentKind::all()
+                .iter()
+                .position(|kind| kind.as_str() == k)
+                .unwrap()
+        };
+        let ranks: Vec<usize> = components
+            .iter()
+            .map(|c| kind_rank(c["kind"].as_str().unwrap()))
+            .collect();
+        let mut sorted = ranks.clone();
+        sorted.sort();
+        assert_eq!(
+            ranks, sorted,
+            "entries must follow canonical kind order; saw {ranks:?}"
+        );
+
+        let temp = components
+            .iter()
+            .find(|c| c["name"] == "test_export_temp")
+            .expect("temporary component exported");
+        assert_eq!(temp["kind"], "temporary");
+        assert!(temp.get("config_example").is_none());
+
+        let proc = components
+            .iter()
+            .find(|c| c["name"] == "test_export_proc")
+            .expect("processor exported");
+        assert_eq!(proc["kind"], "processor");
+        assert_eq!(proc["config_example"]["x"], 1);
+        assert!(proc["config_schema"]["properties"]["x"].is_object());
+    }
+
+    #[test]
+    fn build_config_schema_exposes_temporary_kind() {
+        let _guard = REGISTER_LOCK.lock().unwrap();
+        let name = "test_schema_temporary";
+        register_temporary_metadata(ComponentMetadata::unit(name, "Schema temp.")).unwrap();
+
+        let schema = build_config_schema();
+        let temporary = schema
+            .pointer("/$defs/stream/properties/temporary")
+            .expect("stream schema exposes the temporary property");
+        assert_eq!(temporary["type"], "array");
+        let variants = schema
+            .pointer("/$defs/temporary/oneOf")
+            .expect("temporary variants present in $defs");
+        let variants = variants.as_array().unwrap();
+        assert!(
+            variants.iter().any(
+                |v| v.pointer("/properties/type/const").and_then(|c| c.as_str()) == Some(name)
+            ),
+            "registered temporary component should appear in schema variants"
         );
     }
 }

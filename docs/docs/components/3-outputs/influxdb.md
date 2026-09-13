@@ -1,4 +1,5 @@
 ---
+components: [influxdb]
 description: ArkFlow documentation page.
 ---
 

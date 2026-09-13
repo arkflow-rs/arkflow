@@ -8,47 +8,49 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 
 <!-- COMPONENT_INVENTORY_START -->
 
-| Kind | Component | Documentation |
-| --- | --- | --- |
-| buffer | `memory` | [reference](../components/buffers/memory) |
-| buffer | `session_window` | [reference](../components/buffers/session_window) |
-| buffer | `sliding_window` | [reference](../components/buffers/sliding_window) |
-| buffer | `tumbling_window` | [reference](../components/buffers/tumbling_window) |
-| codec | `debezium` | [reference](../components/codecs/debezium) |
-| codec | `json` | [reference](../components/codecs/json) |
-| codec | `protobuf` | [reference](../components/codecs/protobuf) |
-| codec | `schema-registry` | [reference](../components/codecs/schema-registry) |
-| input | `file` | [reference](../components/inputs/file) |
-| input | `generate` | [reference](../components/inputs/generate) |
-| input | `http` | [reference](../components/inputs/http) |
-| input | `kafka` | [reference](../components/inputs/kafka) |
-| input | `memory` | [reference](../components/inputs/memory) |
-| input | `modbus` | [reference](../components/inputs/modbus) |
-| input | `mqtt` | [reference](../components/inputs/mqtt) |
-| input | `multiple_inputs` | [reference](../components/inputs/multiple_inputs) |
-| input | `nats` | [reference](../components/inputs/nats) |
-| input | `pulsar` | [reference](../components/inputs/pulsar) |
-| input | `redis` | [reference](../components/inputs/redis) |
-| input | `sql` | [reference](../components/inputs/sql) |
-| input | `websocket` | [reference](../components/inputs/websocket) |
-| output | `drop` | [reference](../components/outputs/drop) |
-| output | `http` | [reference](../components/outputs/http) |
-| output | `influxdb` | [reference](../components/outputs/influxdb) |
-| output | `kafka` | [reference](../components/outputs/kafka) |
-| output | `mongodb` | [reference](../components/outputs/mongodb) |
-| output | `mqtt` | [reference](../components/outputs/mqtt) |
-| output | `nats` | [reference](../components/outputs/nats) |
-| output | `pulsar` | [reference](../components/outputs/pulsar) |
-| output | `redis` | [reference](../components/outputs/redis) |
-| output | `sql` | [reference](../components/outputs/sql) |
-| output | `stdout` | [reference](../components/outputs/stdout) |
-| processor | `batch` | [reference](../components/processors/batch) |
-| processor | `json_to_arrow` | [reference](../components/processors/json) |
-| processor | `protobuf` | [reference](../components/processors/protobuf) |
-| processor | `python` | [reference](../components/processors/python) |
-| processor | `sql` | [reference](../components/processors/sql) |
-| processor | `vrl` | [reference](../components/processors/vrl) |
-| temporary | `redis` | [reference](../components/temporary/redis) |
+| Kind | Component | Description | Documentation |
+| --- | --- | --- | --- |
+| buffer | `memory` | In-memory buffer that releases a batch when it reaches capacity or after a timeout. | [reference](../components/buffers/memory) |
+| buffer | `session_window` | Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources. | [reference](../components/buffers/session_window) |
+| buffer | `sliding_window` | Overlapping time windows that slide forward by a fixed interval. | [reference](../components/buffers/sliding_window) |
+| buffer | `tumbling_window` | Fixed-size, non-overlapping time windows. Supports SQL joins across sources. | [reference](../components/buffers/tumbling_window) |
+| codec | `debezium_json` | Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset. | [reference](../components/codecs/debezium) |
+| codec | `json` | Encodes/decodes Arrow RecordBatches as JSON byte payloads. | [reference](../components/codecs/json) |
+| codec | `protobuf` | Encodes/decodes Arrow RecordBatches using a Protobuf descriptor. | [reference](../components/codecs/protobuf) |
+| codec | `schema_registry` | Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry. | [reference](../components/codecs/schema-registry) |
+| input | `file` | Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats. | [reference](../components/inputs/file) |
+| input | `generate` | Generates synthetic text messages on a fixed interval (useful for testing and load simulation). | [reference](../components/inputs/generate) |
+| input | `http` | Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint. | [reference](../components/inputs/http) |
+| input | `kafka` | Consumes messages from Apache Kafka topics with a consumer group. | [reference](../components/inputs/kafka) |
+| input | `memory` | In-memory input queue seeded with an initial list of messages. Primarily for tests and demos. | [reference](../components/inputs/memory) |
+| input | `modbus` | Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers. | [reference](../components/inputs/modbus) |
+| input | `mqtt` | Subscribes to an MQTT broker and forwards messages from the configured topics. | [reference](../components/inputs/mqtt) |
+| input | `multiple_inputs` | Combines multiple input sources into a single stream. Each source is tagged with __meta_source. | [reference](../components/inputs/multiple_inputs) |
+| input | `nats` | Consumes messages from NATS, supporting both regular subjects and JetStream consumers. | [reference](../components/inputs/nats) |
+| input | `pulsar` | Subscribes to an Apache Pulsar topic with configurable subscription type and authentication. | [reference](../components/inputs/pulsar) |
+| input | `redis` | Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups. | [reference](../components/inputs/redis) |
+| input | `sql` | Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches. | [reference](../components/inputs/sql) |
+| input | `websocket` | Connects to a WebSocket server and forwards each incoming message as a batch. | [reference](../components/inputs/websocket) |
+| output | `drop` | Discards all messages. Useful for performance benchmarks and dead-end pipelines. | [reference](../components/outputs/drop) |
+| output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
+| output | `influxdb` | Writes time-series data to InfluxDB v2.x using the Line Protocol. | [reference](../components/outputs/influxdb) |
+| output | `kafka` | Produces messages to Apache Kafka. Supports key-based partitioning and compression. | [reference](../components/outputs/kafka) |
+| output | `mongodb` | Writes Arrow rows to MongoDB as BSON documents. | [reference](../components/outputs/mongodb) |
+| output | `mqtt` | Publishes messages to an MQTT broker topic. | [reference](../components/outputs/mqtt) |
+| output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |
+| output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
+| output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |
+| output | `sql` | Batch-inserts records into a SQL database. Supports upsert and transaction management. | [reference](../components/outputs/sql) |
+| output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
+| processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
+| processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
+| processor | `batch` | Batches messages by count, size, or time interval before forwarding. | [reference](../components/processors/batch) |
+| processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
+| processor | `protobuf_to_arrow` | Decodes Protobuf wire-format bytes into Arrow RecordBatches. | [reference](../components/processors/protobuf) |
+| processor | `python` | Runs a user-defined Python function (with PyArrow) against each batch. | [reference](../components/processors/python) |
+| processor | `sql` | Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables. | [reference](../components/processors/sql) |
+| processor | `vrl` | Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment. | [reference](../components/processors/vrl) |
+| temporary | `redis` | Redis-backed temporary lookup store (single node or cluster) read through a codec. | [reference](../components/temporary/redis) |
 
 <!-- COMPONENT_INVENTORY_END -->
 

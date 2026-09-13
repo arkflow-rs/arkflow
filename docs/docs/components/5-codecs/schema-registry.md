@@ -1,4 +1,5 @@
 ---
+components: [schema_registry]
 sidebar_label: Schema Registry
 ---
 

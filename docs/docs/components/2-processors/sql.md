@@ -1,4 +1,5 @@
 ---
+components: [processor/sql]
 description: ArkFlow documentation page.
 ---
 

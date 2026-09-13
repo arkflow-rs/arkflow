@@ -1,4 +1,5 @@
 ---
+components: [mongodb]
 description: ArkFlow MongoDB output component.
 ---
 

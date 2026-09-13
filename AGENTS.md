@@ -24,11 +24,18 @@ cargo test --workspace --all-targets        # what CI runs
 cargo test -p arkflow-plugin <test_name>    # focused test
 cargo clippy --workspace --all-targets      # lint before finishing
 ./target/release/arkflow --config <file> --validate   # validate a YAML config (deep-validates streams and jobs)
-./target/release/arkflow components list    # discover registered components
+./target/release/arkflow components list    # discover registered components (--format json for machine-readable)
 ./target/release/arkflow schema             # emit JSON Schema of the config
 ```
 
 CI requires the protobuf compiler (`protoc` on PATH). Rust 1.97+ (`rust-version`). Note the README still advertises 1.88 in places — `Cargo.toml` is authoritative.
+
+## Documentation workflow
+
+- `docs/reference/component-inventory.json` and `docs/static/config-schema.json` are **generated** from the component registry; never edit them by hand. When you change registrations or schemas, regenerate with `ARKFLOW_REGENERATE_DOCS=1 cargo test -p arkflow-plugin --test docs_inventory_snapshot` — the snapshot test fails in CI otherwise.
+- Every page under `docs/docs/components/` declares `components: [names]` front matter (use `kind/name` to disambiguate); `pnpm docs:check` validates ownership against the generated inventory bidirectionally.
+- Example YAMLs registered in `docs/reference/example-manifest.json` are deep-validated by a workspace test (`crates/arkflow/tests/examples_validate.rs`); an example that cannot validate offline needs explicit `"validate": false` plus a reason in the manifest.
+- README.md / README_zh.md component lists must use exact registry type-names and stay in parity (see the `documentation-accuracy` spec).
 
 ## Architecture rules
 

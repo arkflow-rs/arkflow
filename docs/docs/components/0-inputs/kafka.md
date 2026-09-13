@@ -1,4 +1,5 @@
 ---
+components: [input/kafka]
 sidebar_label: Kafka
 ---
 

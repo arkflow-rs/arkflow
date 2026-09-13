@@ -1,4 +1,5 @@
 ---
+components: [output/http]
 description: ArkFlow documentation page.
 ---
 

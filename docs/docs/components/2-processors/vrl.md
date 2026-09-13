@@ -1,4 +1,5 @@
 ---
+components: [vrl]
 description: ArkFlow documentation page.
 ---
 

@@ -1,4 +1,5 @@
 ---
+components: [input/nats]
 sidebar_label: NATS
 ---
 

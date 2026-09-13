@@ -170,3 +170,7 @@ completion:
 ```bash
 ./target/release/arkflow schema > arkflow.schema.json
 ```
+
+A pre-generated schema ships with the documentation at
+[`/config-schema.json`](/config-schema.json); see
+[IDE auto-completion](2-ide-schema.md) for editor setup.

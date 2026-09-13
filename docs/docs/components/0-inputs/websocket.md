@@ -1,4 +1,5 @@
 ---
+components: [websocket]
 sidebar_label: WebSocket
 ---
 
