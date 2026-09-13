@@ -47,7 +47,7 @@ operation snapshots, bounded events, and metrics.
 
 ### Requirement: Command polling and execution
 
-The Agent SHALL poll for commands addressed to its node, validate expiry and idempotency, acknowledge receipt, execute supported local ControlPlane actions, and report terminal results with correlation metadata. The Agent SHALL present its session credential in the `Authorization: Bearer` header and SHALL also present it in the legacy query parameter while the transition window is open, so an Agent deployed against a Hub that still requires the query credential keeps polling. The Hub SHALL accept the credential from either transport and SHALL prefer the header when both are present.
+The Agent SHALL poll for commands addressed to its node, validate expiry and idempotency, acknowledge receipt, execute supported local ControlPlane actions, and report terminal results with correlation metadata. The Agent SHALL present its session credential only in the `Authorization: Bearer` header and MUST NOT place the session credential in the request URL. The Hub SHALL continue to accept the credential from the legacy query parameter for Agents predating this change and SHALL prefer the header when both are present, recording a deprecation warning for query-parameter authentication.
 
 #### Scenario: Execute a start command
 
@@ -59,10 +59,10 @@ The Agent SHALL poll for commands addressed to its node, validate expiry and ide
 - **WHEN** a command's expiry time has passed before execution
 - **THEN** the Agent rejects it without changing the Stream and reports an explicit expired outcome
 
-#### Scenario: Agent upgraded before the Hub
+#### Scenario: Upgraded Agent requires an upgraded Hub
 
-- **WHEN** an Agent that presents its credential in both transports polls a Hub that still requires the query parameter
-- **THEN** the Hub authenticates the session and the Agent receives and reports commands without a session rebuild
+- **WHEN** an Agent from this release polls a Hub from an earlier release that requires the query credential
+- **THEN** the poll fails and the Agent retries through its normal reconnect loop, and mixed-fleet deployments upgrade the Hub before upgrading Agents
 
 #### Scenario: Hub upgraded before the Agent
 
@@ -71,20 +71,27 @@ The Agent SHALL poll for commands addressed to its node, validate expiry and ide
 
 ### Requirement: Reconnect and graceful shutdown
 
-The Agent SHALL re-register after session loss and SHALL stop its polling loops
-gracefully without interrupting WAL shutdown semantics.
+The Agent SHALL re-register after session loss and SHALL stop its polling loops gracefully without interrupting WAL shutdown semantics. Reconnection backoff SHALL incorporate random jitter so simultaneous session loss across the fleet does not produce synchronized re-registration bursts at the Hub.
 
 #### Scenario: Reconnect after Hub restart
 
 - **WHEN** the Hub restarts and the Agent reconnects
-- **THEN** the Agent re-authenticates, sends a full report, and allows the Hub to
-  reconstruct current node resources
+- **THEN** the Agent re-authenticates, sends a full report, and allows the Hub to reconstruct current node resources
 
 #### Scenario: Process shutdown
 
 - **WHEN** the compute process receives a termination signal
-- **THEN** it stops accepting new commands, reports draining when possible, and
-  shuts down local Streams using the existing WAL-safe lifecycle
+- **THEN** it stops accepting new commands, reports draining when possible, and shuts down local Streams using the existing WAL-safe lifecycle
+
+#### Scenario: Session expiry behaves as session loss
+
+- **WHEN** the Hub rejects an Agent request because the session credential has expired
+- **THEN** the Agent treats the rejection as session loss, re-registers with its stable boot identity, resumes its loops, and redelivers cached terminal results through the existing command replay path
+
+#### Scenario: Fleet-wide session loss does not stampede the Hub
+
+- **WHEN** many Agents lose their sessions at the same moment, for example after a Hub restart
+- **THEN** each Agent's retry delay is randomized within the bounded backoff window, desynchronizing re-registration attempts
 
 ### Requirement: Agent liveness is independent of command execution
 
