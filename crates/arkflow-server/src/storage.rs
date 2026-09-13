@@ -480,6 +480,16 @@ enum StorageCommand {
         max_retained: i64,
         response: oneshot::Sender<Result<usize, StorageError>>,
     },
+    PruneProcessedOutbox {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneTerminalAttempts {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
     ClaimAttempt {
         intent_id: String,
         response: oneshot::Sender<Result<Option<AttemptRecord>, StorageError>>,
@@ -735,10 +745,8 @@ impl StorageActor {
                         max_retained,
                         response,
                     } => {
-                        let _ = response.send(store.prune_operation_history(
-                            older_than_ms,
-                            max_retained,
-                        ));
+                        let _ = response
+                            .send(store.prune_operation_history(older_than_ms, max_retained));
                     }
                     StorageCommand::PruneJobCheckpointRecords {
                         older_than_ms,
@@ -751,8 +759,24 @@ impl StorageActor {
                         max_retained,
                         response,
                     } => {
+                        let _ =
+                            response.send(store.prune_audit_events(older_than_ms, max_retained));
+                    }
+                    StorageCommand::PruneProcessedOutbox {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
                         let _ = response
-                            .send(store.prune_audit_events(older_than_ms, max_retained));
+                            .send(store.prune_processed_outbox(older_than_ms, max_retained));
+                    }
+                    StorageCommand::PruneTerminalAttempts {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_terminal_attempts(older_than_ms, max_retained));
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
@@ -1294,6 +1318,46 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::PruneAuditEvents {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim processed reconciliation outbox rows by age and count bound.
+    /// Unprocessed rows — pending or claimed — are the outstanding work queue
+    /// and are never touched.
+    pub async fn prune_processed_outbox(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneProcessedOutbox {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim terminal Attempt records by age and count bound. Active
+    /// attempts (queued/dispatched/acknowledged/running) are never touched;
+    /// the `cp_one_active_attempt` unique index relies on their presence.
+    pub async fn prune_terminal_attempts(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneTerminalAttempts {
                 older_than_ms,
                 max_retained,
                 response,
@@ -2186,6 +2250,47 @@ impl ControlPlaneStore {
             )?;
             deleted += transaction.execute(
                 "DELETE FROM cp_audit_events WHERE event_id NOT IN (SELECT event_id FROM cp_audit_events ORDER BY event_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim processed outbox rows by age and count bound. Rows still
+    /// awaiting processing (pending or claimed) are never reclaimed.
+    pub fn prune_processed_outbox(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND processed_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND outbox_id NOT IN (SELECT outbox_id FROM cp_outbox WHERE processed_at_ms IS NOT NULL ORDER BY processed_at_ms DESC, outbox_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim terminal Attempt records by age and count bound. Active
+    /// attempts are protected by both the state predicate and the
+    /// `cp_one_active_attempt` unique index.
+    pub fn prune_terminal_attempts(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND COALESCE(finished_at_ms, created_at_ms) < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND attempt_id NOT IN (SELECT attempt_id FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY COALESCE(finished_at_ms, created_at_ms) DESC, attempt_id DESC LIMIT ?1)",
                 [max_retained],
             )?;
             Ok(deleted)
@@ -3333,12 +3438,6 @@ impl ControlPlaneStore {
                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (job_id, checkpoint_id)
             );
-            CREATE TABLE IF NOT EXISTS cp_job_observations (
-                job_id TEXT NOT NULL, node_id TEXT NOT NULL, boot_id TEXT,
-                report_seq INTEGER NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL,
-                convergence TEXT NOT NULL, checkpoint_id TEXT, snapshot_json TEXT NOT NULL,
-                observed_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, node_id)
-            );
 
             CREATE TABLE IF NOT EXISTS cp_stream_desired (
                 node_id TEXT NOT NULL,
@@ -4133,6 +4232,115 @@ mod tests {
             .mark_outbox_processed(first.outbox_id, 30_012)
             .unwrap();
         assert!(store.claim_outbox("worker-c", 30_013).unwrap().is_none());
+    }
+
+    /// The outbox retention reclaims only processed rows: the unprocessed
+    /// work queue (pending or claimed) survives every sweep, and the status
+    /// counters — which only look at unprocessed rows — are unaffected.
+    #[test]
+    fn prune_processed_outbox_reclaims_only_processed_rows() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let insert = |event_key: &str, processed_at_ms: Option<i64>, claimed: bool| {
+            store
+                .immediate_transaction(|transaction| -> Result<(), StorageError> {
+                    transaction.execute(
+                        "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms, claimed_at_ms, processed_at_ms) VALUES (?1, 'reconcile_intent', 'node-a', 1, 1, ?2, ?3)",
+                        rusqlite::params![
+                            event_key,
+                            if claimed { Some(5) } else { None },
+                            processed_at_ms
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        insert("old-processed", Some(100), false);
+        insert("recent-processed", Some(9_000), false);
+        insert("claimed-pending", None, true);
+
+        let aggregates_before = store.operational_aggregates(10_000).unwrap();
+        // The age window reclaims only the processed row past the cutoff.
+        assert_eq!(store.prune_processed_outbox(1_000, 4096).unwrap(), 1);
+        // The count bound keeps the newest processed rows when history
+        // accumulates faster than the age window reclaims it.
+        for index in 0..6 {
+            insert(&format!("bulk-{index}"), Some(2_000 + index), false);
+        }
+        assert_eq!(store.prune_processed_outbox(1_000, 2).unwrap(), 5);
+        let remaining = store
+            .immediate_transaction(|transaction| {
+                let mut statement =
+                    transaction.prepare("SELECT event_key FROM cp_outbox ORDER BY outbox_id")?;
+                let keys = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(keys)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["recent-processed", "claimed-pending", "bulk-5"]
+        );
+        let aggregates_after = store.operational_aggregates(10_000).unwrap();
+        assert_eq!(
+            aggregates_before.outbox_pending,
+            aggregates_after.outbox_pending
+        );
+        assert_eq!(
+            aggregates_before.outbox_claimed,
+            aggregates_after.outbox_claimed
+        );
+    }
+
+    /// Attempt retention reclaims terminal rows only; the active attempt —
+    /// guarded by both the state predicate and the `cp_one_active_attempt`
+    /// unique index — is preserved unchanged.
+    #[test]
+    fn prune_terminal_attempts_reclaims_only_terminal_rows() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .immediate_transaction(|transaction| -> Result<(), StorageError> {
+                transaction.execute(
+                    "INSERT INTO cp_intents (intent_id, node_id, stream_id, generation, intent_type, state, convergence_state, created_at_ms, updated_at_ms) VALUES ('intent-1', 'node-a', 'orders', 1, 'stream_lifecycle', 'converged', 'converged', 1, 1)",
+                    [],
+                )?;
+                let insert_attempt = |attempt_id: &str,
+                                      state: &str,
+                                      finished_at_ms: Option<i64>|
+                 -> Result<(), StorageError> {
+                    transaction.execute(
+                        "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, finished_at_ms, created_at_ms) VALUES (?1, 'intent-1', ?1, 'node-a', 'orders', 1, 'apply_configuration', ?2, ?3, 1)",
+                        rusqlite::params![attempt_id, state, finished_at_ms],
+                    )?;
+                    Ok(())
+                };
+                insert_attempt("old-terminal", "succeeded", Some(100))?;
+                insert_attempt("recent-terminal", "failed", Some(9_000))?;
+                insert_attempt("active-attempt", "running", None)?;
+                Ok(())
+            })
+            .unwrap();
+        // The age window reclaims only the terminal row past the cutoff.
+        assert_eq!(store.prune_terminal_attempts(1_000, 4096).unwrap(), 1);
+        // The count bound trims terminal history down to the newest rows.
+        assert_eq!(store.prune_terminal_attempts(1_000, 0).unwrap(), 1);
+        let remaining = store
+            .immediate_transaction(|transaction| {
+                let mut statement =
+                    transaction.prepare("SELECT attempt_id, state FROM cp_attempts")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![("active-attempt".to_string(), "running".to_string())]
+        );
     }
 
     #[tokio::test]

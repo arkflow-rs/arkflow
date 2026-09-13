@@ -1686,6 +1686,37 @@ impl Hub {
         Ok(())
     }
 
+    /// Reclaim processed reconciliation outbox rows so the durable outbox
+    /// stays bounded under steady reconcile churn. Unprocessed rows — the
+    /// outstanding work queue — are never reclaimed, and the
+    /// `outbox_pending`/`outbox_claimed` status counters are unaffected.
+    pub async fn prune_outbox_history(&self) -> Result<(), HubError> {
+        const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+        const RETENTION_MAX: i64 = 4096;
+        if let Some(storage) = &self.storage {
+            storage
+                .prune_processed_outbox(now_ms() as i64 - RETENTION_MS, RETENTION_MAX)
+                .await
+                .map_err(HubError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Reclaim terminal Attempt records so the durable attempt store stays
+    /// bounded under steady dispatch churn. Active attempts are never
+    /// reclaimed.
+    pub async fn prune_attempt_history(&self) -> Result<(), HubError> {
+        const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+        const RETENTION_MAX: i64 = 4096;
+        if let Some(storage) = &self.storage {
+            storage
+                .prune_terminal_attempts(now_ms() as i64 - RETENTION_MS, RETENTION_MAX)
+                .await
+                .map_err(HubError::from)?;
+        }
+        Ok(())
+    }
+
     /// Reclaim pending/failed checkpoint attempt records older than the
     /// retention window. Completed records are governed by the per-Job
     /// checkpoint retention policy; pending/failed rows used to accumulate
@@ -8321,6 +8352,63 @@ mod session_report_tests {
         // outcome exists per operation record.
         let original = hub.operation(&operation.id).await.unwrap();
         assert_eq!(original.state, HubOperationState::TimedOut);
+    }
+
+    /// The outbox and attempt retention wrappers converge their tables
+    /// through the storage actor while unprocessed outbox rows and active
+    /// attempts survive, and the status counters stay meaningful.
+    #[tokio::test]
+    async fn outbox_and_attempt_history_prunes_converge_through_the_hub() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let now = now_ms() as i64;
+        store
+            .immediate_transaction(|transaction| -> Result<(), crate::storage::StorageError> {
+                transaction.execute(
+                    "INSERT INTO cp_intents (intent_id, node_id, stream_id, generation, intent_type, state, convergence_state, created_at_ms, updated_at_ms) VALUES ('intent-1', 'n1', 'orders', 1, 'stream_lifecycle', 'converged', 'converged', 1, 1)",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms, processed_at_ms) VALUES ('stale-processed', 'reconcile_intent', 'n1', 1, 1, 100)",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms, processed_at_ms) VALUES ('fresh-processed', 'reconcile_intent', 'n1', 1, 1, ?1)",
+                    [now],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, finished_at_ms, created_at_ms) VALUES ('old-terminal', 'intent-1', 'cmd-old', 'n1', 'orders', 1, 'apply_configuration', 'succeeded', 100, 1)",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, finished_at_ms, created_at_ms) VALUES ('live-active', 'intent-1', 'cmd-live', 'n1', 'orders', 1, 'apply_configuration', 'running', NULL, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        hub.prune_outbox_history().await.unwrap();
+        hub.prune_attempt_history().await.unwrap();
+        let counts = store
+            .immediate_transaction(|transaction| {
+                let outbox = transaction.query_row(
+                    "SELECT COUNT(*) FROM cp_outbox WHERE event_key IN ('stale-processed', 'fresh-processed')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let attempts = transaction.query_row(
+                    "SELECT COUNT(*) FROM cp_attempts WHERE attempt_id IN ('old-terminal', 'live-active')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok((outbox, attempts))
+            })
+            .unwrap();
+        assert_eq!(
+            counts,
+            (1, 1),
+            "stale processed outbox and terminal attempt rows are reclaimed; fresh and active rows are kept"
+        );
     }
 
     /// Task 7.3: a delayed report from an older session arrives after the new

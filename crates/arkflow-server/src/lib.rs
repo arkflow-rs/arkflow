@@ -420,13 +420,32 @@ pub async fn serve_hub(
                     reconcile_hub.record_reconcile_result(started, &result).await;
                     let _ = reconcile_hub.reconcile_jobs().await;
                     let _ = reconcile_hub.reconcile_rollouts().await;
-                    let _ = reconcile_hub.prune_events(2048).await;
                     let _ = reconcile_hub.expire_stale_job_operations().await;
-                    let _ = reconcile_hub.prune_operation_history().await;
-                    let _ = reconcile_hub.prune_stale_checkpoint_records().await;
-                    let _ = reconcile_hub.prune_audit_history().await;
                 }
                 _ = reconcile_cancel.cancelled() => break,
+            }
+        }
+    });
+    // Retention sweeps run on their own slow cadence: their cost grows with
+    // the retained history and must not steal the single-writer SQLite
+    // budget from the per-second reconciliation tick. The first tick fires
+    // immediately, so an upgraded Hub reclaims history that accumulated
+    // before the bounds existed as soon as it starts serving.
+    let maintenance_hub = hub.clone();
+    let maintenance_cancel = cancellation.clone();
+    let maintenance_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let _ = maintenance_hub.prune_events(2048).await;
+                    let _ = maintenance_hub.prune_operation_history().await;
+                    let _ = maintenance_hub.prune_stale_checkpoint_records().await;
+                    let _ = maintenance_hub.prune_audit_history().await;
+                    let _ = maintenance_hub.prune_outbox_history().await;
+                    let _ = maintenance_hub.prune_attempt_history().await;
+                }
+                _ = maintenance_cancel.cancelled() => break,
             }
         }
     });
@@ -435,6 +454,7 @@ pub async fn serve_hub(
         .await;
     sweep_task.abort();
     reconcile_task.abort();
+    maintenance_task.abort();
     result?;
     Ok(())
 }
