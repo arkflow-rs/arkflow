@@ -48,7 +48,6 @@ pub mod processor;
 pub mod runtime;
 pub mod state;
 pub mod stream;
-pub mod streaming_sql;
 pub mod temporary;
 pub mod wal;
 

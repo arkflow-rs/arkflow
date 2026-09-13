@@ -749,23 +749,6 @@ impl KafkaAck {
             .unwrap_or(false)
     }
 
-    /// Wait until the consumer owns the partition again (or the delivery is
-    /// shut down, or the wait expires). A reconnect or a rebalance can leave
-    /// an in-flight acknowledgement racing the (re)assignment: `store_offset`
-    /// on an unassigned partition fails, and an acknowledgement error fails
-    /// the whole stream — so the wait replaces the failure.
-    async fn wait_for_assignment(&self, consumer: &StreamConsumer) -> bool {
-        let deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
-        loop {
-            if Self::partition_assigned(consumer, &self.topic, self.partition) {
-                return true;
-            }
-            if self.close.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
 }
 
 #[async_trait]
@@ -791,22 +774,34 @@ impl Ack for KafkaAck {
             // installs the consumer whose assignment this wait is watching for.
             // Holding either one across the wait wedges unrelated partitions
             // (and the checkpoint drain behind them) until it expires.
-            let assigned = {
-                let consumer_guard = self.consumer.read().await;
-                match consumer_guard.as_ref() {
-                    Some(consumer) if Self::partition_assigned(
-                        consumer,
-                        &self.topic,
-                        self.partition,
-                    ) =>
-                    {
-                        true
+            // Poll the assignment with SHORT read-lock acquisitions instead of
+            // waiting while holding the guard: waiting under the read lock (up
+            // to the 60s bound) would block the `connect()` write lock that
+            // installs the very consumer whose assignment this wait is
+            // watching for, and wedge unrelated partitions behind the consumer
+            // lock. Each iteration releases the lock, so a reconnect
+            // interleaves immediately and the wait follows the CURRENT
+            // consumer.
+            let wait_deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
+            let assigned = loop {
+                let assigned_now = {
+                    let consumer_guard = self.consumer.read().await;
+                    match consumer_guard.as_ref() {
+                        Some(consumer) => {
+                            Self::partition_assigned(consumer, &self.topic, self.partition)
+                        }
+                        // No consumer at all: the acknowledgement retries
+                        // below with an explicit error instead of waiting.
+                        None => true,
                     }
-                    // No consumer at all: the acknowledgement retries below
-                    // with an explicit error instead of waiting.
-                    None => true,
-                    Some(consumer) => self.wait_for_assignment(consumer).await,
+                };
+                if assigned_now {
+                    break true;
                 }
+                if self.close.is_cancelled() || tokio::time::Instant::now() >= wait_deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             };
             if !assigned {
                 tracing::warn!(
@@ -1032,22 +1027,52 @@ mod tests {
     /// acknowledgement lock and its consumer read guard, so one partition
     /// waiting out a rebalance blocked every sibling acknowledgement — and the
     /// consumer read guard blocked the `connect` that installs the
-    /// reassignment it was waiting for. The wait must start before the lock
-    /// scope, so the critical section never spans it.
+    /// reassignment it was waiting for. The wait must poll with SHORT guard
+    /// acquisitions (guard dropped before sleeping) and stay outside the
+    /// acknowledgement lock scope.
     #[test]
     fn assignment_wait_starts_before_the_acknowledgement_lock() {
         let source = include_str!("kafka.rs");
         let ack_start = source
             .find("impl Ack for KafkaAck")
             .expect("the Kafka acknowledgement exists");
-        let wait_at = ack_start
-            + source[ack_start..]
-                .find("self.wait_for_assignment(consumer)")
-                .expect("the assignment wait exists");
-        let lock_at = ack_start
-            + source[ack_start..]
-                .find("let _ack_guard = self.ack_lock.lock().await;")
-                .expect("the acknowledgement lock exists");
+        // Bound the scanned body at the test module: the assertion literals
+        // below would otherwise match their own text embedded by
+        // `include_str!`.
+        let tests_start = source
+            .find("#[cfg(test)]")
+            .expect("the test module exists");
+        let ack_body = &source[ack_start..tests_start];
+        // The old held-guard wait is gone from the acknowledgement path.
+        assert!(
+            !ack_body.contains("Some(consumer) => self.wait_for_assignment(consumer).await"),
+            "the assignment wait must not run while holding the consumer read guard"
+        );
+        let wait_at = ack_body
+            .find("let wait_deadline")
+            .expect("the assignment wait loop exists");
+        // The read guard is scoped inside one polling iteration.
+        let guard_at = ack_body[wait_at..]
+            .find("let consumer_guard = self.consumer.read().await")
+            .expect("the polling loop takes the consumer read guard");
+        let iteration_scope_end = ack_body[wait_at..]
+            .find("if assigned_now {")
+            .expect("the polling iteration closes before using the verdict");
+        assert!(
+            guard_at < iteration_scope_end,
+            "the read guard must be released before the assignment verdict is used"
+        );
+        let sleep_at = ack_body[wait_at..]
+            .find("tokio::time::sleep")
+            .expect("the polling loop sleeps between iterations");
+        assert!(
+            iteration_scope_end < sleep_at,
+            "the consumer read guard must be dropped before the wait sleeps"
+        );
+        // The whole wait still precedes the acknowledgement lock scope.
+        let lock_at = ack_body
+            .find("let _ack_guard = self.ack_lock.lock().await;")
+            .expect("the acknowledgement lock exists");
         assert!(
             wait_at < lock_at,
             "the assignment wait must be outside the acknowledgement lock scope"

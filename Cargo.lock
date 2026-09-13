@@ -220,6 +220,7 @@ dependencies = [
  "arkflow-core",
  "arkflow-plugin",
  "arkflow-server",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]
@@ -236,6 +237,7 @@ dependencies = [
  "datafusion",
  "flume",
  "futures",
+ "humantime",
  "lazy_static",
  "num_cpus",
  "redb",

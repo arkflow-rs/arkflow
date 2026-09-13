@@ -45,7 +45,7 @@ The Hub SHALL increment a resource generation for every desired-state mutation, 
 - **THEN** reconciliation sends a stop for the prior-generation placement on node A and a start for the current generation on node B
 
 ### Requirement: Reconciliation triggers and recovery
-The Hub SHALL trigger reconciliation after desired-state changes, rollout batch changes, Job deployment or recovery changes, node registration, valid reports, lease recovery, checkpoint completion or failure, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism. Recovery SHALL restore unfinished Operations, Rollouts, and Job deployments from durable state before reporting readiness.
+The Hub SHALL trigger reconciliation after desired-state changes, rollout batch changes, Job deployment or recovery changes, node registration, valid reports, lease recovery, checkpoint completion or failure, and expired Attempts, and SHALL provide a periodic bounded scan as a recovery mechanism. Recovery SHALL restore unfinished Operations, Rollouts, and Job deployments from durable state before reporting readiness. A lifecycle operation whose terminal result already satisfies the desired state at the current generation SHALL be remembered as a dispatch skip condition: the periodic scan SHALL NOT re-enqueue that operation while the desired state, generation, and operation are unchanged. A failure to enqueue commands for one Job (node unavailable, queue capacity, or a lost race with node expiry) SHALL be recorded and SHALL skip only that Job for the tick instead of aborting reconciliation of the remaining Jobs. Operation records and checkpoint attempt records SHALL be retained under a bounded retention policy that also reclaims non-completed records, so the durable operation and checkpoint stores cannot grow without bound.
 
 #### Scenario: Agent reconnects with stale observed state
 - **WHEN** a node reconnects and its full report does not match the persisted desired Stream or Job state
@@ -67,6 +67,18 @@ The Hub SHALL trigger reconciliation after desired-state changes, rollout batch 
 - **WHEN** a Job task cannot restore from the selected checkpoint
 - **THEN** the Hub records a bounded recovery failure, preserves the last valid checkpoint, and does not report the Job as healthy
 
+#### Scenario: A stopped Job is not re-commanded every tick
+- **WHEN** a Job's desired state is stopped and the current generation already has a succeeded stop operation for every target node, and neither the desired state nor the generation changed
+- **THEN** subsequent reconcile ticks dispatch no new stop commands and create no new operation records for that Job
+
+#### Scenario: One Job's dispatch failure does not stall the scan
+- **WHEN** enqueueing commands for one Job fails because the target node expired between the pre-check and the enqueue or the command queue is at capacity
+- **THEN** the Hub records the failure for that Job and continues reconciling the remaining Jobs in the same scan
+
+#### Scenario: Non-completed checkpoint records are reclaimed
+- **WHEN** checkpoint attempt records remain pending or failed beyond the retention bound
+- **THEN** the retention sweep reclaims them and the durable checkpoint store does not grow without bound
+
 ### Requirement: Failure classification and retry
 The Hub SHALL distinguish rejected requests, transient failures, unavailable nodes, permanent execution failures, ambiguous results, and superseded commands, and SHALL apply bounded retry with recorded attempt count and next retry time to retryable failures. An expired command lease is a retryable or ambiguous attempt, not a silently discarded operation. A retryable failure SHALL always converge to a fresh queued command after its backoff expires, even when the prior operation record for the intent is terminal.
 
@@ -84,7 +96,7 @@ The Hub SHALL distinguish rejected requests, transient failures, unavailable nod
 
 ### Requirement: Idempotent one-shot actions
 
-The Agent and Hub SHALL support idempotent lifecycle commands and SHALL identify non-stable actions such as restart with a unique action ID that is reported after completion.
+The Agent and Hub SHALL support idempotent lifecycle commands and SHALL identify non-stable actions such as restart with a unique action ID that is reported after completion. The Agent's completed-command dedup cache SHALL evict entries one at a time when the cache is full and SHALL NOT clear the cache wholesale, so recently completed commands remain deduplicated across Hub redelivery.
 
 #### Scenario: Duplicate lifecycle delivery
 - **WHEN** an Agent receives the same command ID more than once
@@ -93,6 +105,10 @@ The Agent and Hub SHALL support idempotent lifecycle commands and SHALL identify
 #### Scenario: Restart is confirmed
 - **WHEN** a restart action completes and the Agent reports its action ID with the Stream observed as running
 - **THEN** the Hub marks the restart Intent converged even though desired and observed stable state are both running
+
+#### Scenario: A full dedup cache does not forget recent completions wholesale
+- **WHEN** the Agent's completed-command cache reaches its bound and a new command completes
+- **THEN** only the oldest entry is evicted, a redelivered recently completed command still returns its existing result, and no running Job is restarted by a re-executed lifecycle command
 
 ### Requirement: Configuration convergence
 

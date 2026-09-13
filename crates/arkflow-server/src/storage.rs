@@ -466,6 +466,15 @@ enum StorageCommand {
         retain: usize,
         response: oneshot::Sender<Result<usize, StorageError>>,
     },
+    PruneOperationHistory {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneJobCheckpointRecords {
+        older_than_ms: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
     ClaimAttempt {
         intent_id: String,
         response: oneshot::Sender<Result<Option<AttemptRecord>, StorageError>>,
@@ -715,6 +724,22 @@ impl StorageActor {
                     }
                     StorageCommand::PruneEvents { retain, response } => {
                         let _ = response.send(store.prune_events(retain));
+                    }
+                    StorageCommand::PruneOperationHistory {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response.send(store.prune_operation_history(
+                            older_than_ms,
+                            max_retained,
+                        ));
+                    }
+                    StorageCommand::PruneJobCheckpointRecords {
+                        older_than_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.prune_job_checkpoint_records(older_than_ms));
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
@@ -1204,6 +1229,45 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::PruneEvents { retain, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Bounded retention for the durable operation history: terminal
+    /// operation rows older than `older_than_ms` are deleted, and beyond
+    /// `max_retained` the oldest terminal rows are dropped. Active rows are
+    /// never touched.
+    pub async fn prune_operation_history(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneOperationHistory {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim pending/failed checkpoint attempt records older than
+    /// `older_than_ms`; completed records are managed by the checkpoint
+    /// retention policy instead.
+    pub async fn prune_job_checkpoint_records(
+        &self,
+        older_than_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneJobCheckpointRecords {
+                older_than_ms,
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -2042,6 +2106,37 @@ impl ControlPlaneStore {
             let deleted = transaction.execute(
                 "DELETE FROM cp_events WHERE event_id NOT IN (SELECT event_id FROM cp_events ORDER BY event_id DESC LIMIT ?1)",
                 [retain as i64],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    pub fn prune_operation_history(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND updated_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            // Count bound: keep the newest `max_retained` terminal rows when
+            // long-lived deployments accumulate faster than the age window
+            // reclaims them.
+            deleted += transaction.execute(
+                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND operation_id NOT IN (SELECT operation_id FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    pub fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let deleted = transaction.execute(
+                "DELETE FROM cp_job_checkpoints WHERE status IN ('pending', 'failed') AND updated_at_ms < ?1",
+                [older_than_ms],
             )?;
             Ok(deleted)
         })

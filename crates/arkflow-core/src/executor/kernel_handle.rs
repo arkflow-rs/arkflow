@@ -264,6 +264,18 @@ impl KernelJobHandle {
                                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             }
                         }
+                        // A chain that exits without a report for THIS round
+                        // — an error exit in particular never reports — must
+                        // not be exempted: exempting it would seal a manifest
+                        // that is missing a participant while validation
+                        // still passes. Fail the round instead; the next one
+                        // exempts the ended chain up front.
+                        if !snapshots.contains_key(&task_id) {
+                            return Err(Error::Process(format!(
+                                "chain '{}' ended during the checkpoint round without reporting a snapshot",
+                                task_id
+                            )));
+                        }
                         remaining.remove(&task_id);
                         continue;
                     }
@@ -301,6 +313,16 @@ impl KernelJobHandle {
                 return Err(Error::Process("duplicate chain checkpoint report".into()));
             }
             remaining.remove(&reported_task_id);
+        }
+
+        // Every report arrived, but the select above may never have visited a
+        // ready error branch: a snapshot error queued alongside the reports
+        // would otherwise be bypassed and the round would persist as
+        // successful. Drain the queue before declaring the cut consistent —
+        // the chain loop sends at most one error instead of its report, so an
+        // error queued for this round invalidates it.
+        if let Ok(error) = self.checkpoint_errors.lock().await.try_recv() {
+            return Err(error);
         }
 
         // The checkpoint's state format is the CONFIGURED Job/backend

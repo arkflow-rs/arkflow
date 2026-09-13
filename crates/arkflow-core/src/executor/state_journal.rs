@@ -166,6 +166,12 @@ struct JournalInner {
     /// a later committed transaction owns — the staged snapshot is stale and
     /// the replay re-accumulates the same rows into the newer value.
     apply_fences: BTreeMap<u64, Vec<Option<u64>>>,
+    /// Mutation indices whose effect is already embedded in a later
+    /// transaction's committed value: their compensation was skipped by the
+    /// ownership check, so a retried apply must NOT execute them again
+    /// (replaying a relative `Increment` would count its delta twice).
+    /// Cleared when the transaction completes or is discarded.
+    replay_applied: BTreeMap<u64, std::collections::BTreeSet<usize>>,
 }
 
 impl JournalInner {
@@ -274,15 +280,29 @@ impl StateJournal {
 
     /// Restore a completed transaction's bytes conditionally.  Version
     /// fencing in `restore_previous` prevents an older compensation from
-    /// erasing a newer commit on the same key.
+    /// erasing a newer commit on the same key. A restore skipped by that
+    /// ownership check marks the mutation's effect as embedded in the newer
+    /// commit, so a retried apply of the re-staged transaction must not
+    /// execute it again.
     fn undo_snapshot(&self, snapshot: &StateRollback) -> Result<(), Error> {
         let _commit_guard = self.commit_lock.lock().unwrap();
-        self.restore_previous(
+        let ownership_skipped = self.restore_previous(
             &snapshot.mutations,
             &snapshot.previous,
             &snapshot.previous_versions,
             &snapshot.applied_versions,
-        )
+        )?;
+        if !ownership_skipped.is_empty() {
+            let mut inner = self.inner.lock().unwrap();
+            let skips = inner.replay_applied.entry(snapshot.txn.id).or_default();
+            for index in ownership_skipped {
+                if matches!(snapshot.mutations.get(index), Some(StagedMutation::Increment { .. }))
+                {
+                    skips.insert(index);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Re-stage a completed transaction after a compensating undo.  A
@@ -379,16 +399,23 @@ impl StateJournal {
     }
 
     /// Overlay value for one key across staged (unapplied) transactions, or
-    /// `None` when no staged mutation touches it.
+    /// `None` when no staged mutation touches it. Mutations marked
+    /// replay-applied (their compensation was skipped because a later commit
+    /// owns the key) are already embedded in the backend value and are
+    /// excluded, so the overlay does not count them twice either.
     fn overlay_value(&self, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Error> {
         let inner = self.inner.lock().unwrap();
         let mut value = self.backend.get(namespace, key)?;
         let mut touched = false;
-        for state in inner.txns.values() {
+        for (txn_id, state) in inner.txns.iter() {
             let TxnState::Staged(mutations) = state else {
                 continue;
             };
-            for mutation in mutations {
+            let skips = inner.replay_applied.get(txn_id);
+            for (index, mutation) in mutations.iter().enumerate() {
+                if skips.is_some_and(|set| set.contains(&index)) {
+                    continue;
+                }
                 let (mutation_namespace, mutation_key) = mutation.storage();
                 if mutation_namespace == namespace && mutation_key == key {
                     touched = true;
@@ -590,7 +617,7 @@ impl StateJournal {
     /// returns the transaction to the staged state so the caller may retry.
     pub fn apply(&self, txn: StateTxn) -> Result<(), Error> {
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let (mutations, staged_versions) = {
+        let (mutations, staged_versions, replay_applied) = {
             let inner = self.inner.lock().unwrap();
             match inner.txns.get(&txn.id) {
                 Some(TxnState::Staged(mutations)) => {
@@ -614,7 +641,11 @@ impl StateJournal {
                             })
                             .collect::<Vec<_>>(),
                     };
-                    (mutations.clone(), staged_versions)
+                    // Mutations whose compensation was skipped by the
+                    // ownership check are already embedded in a later
+                    // committed value; a retried apply must not execute them.
+                    let replay_applied = inner.replay_applied.get(&txn.id).cloned();
+                    (mutations.clone(), staged_versions, replay_applied)
                 }
                 Some(TxnState::Applied { .. }) | None => return Ok(()),
             }
@@ -640,6 +671,16 @@ impl StateJournal {
         for (index, mutation) in mutations.iter().enumerate() {
             let (namespace, key) = mutation.storage();
             let version_key = (namespace.to_owned(), key.to_vec());
+            // A mutation whose compensation was skipped (a later committed
+            // transaction owns the key) is already in effect; re-executing
+            // it would double-apply. Treat it as applied-but-unowned: no
+            // backend call, no version, and nothing to compensate later.
+            if replay_applied
+                .as_ref()
+                .is_some_and(|skips| skips.contains(&index))
+            {
+                continue;
+            }
             let current = {
                 let inner = self.inner.lock().unwrap();
                 local_versions
@@ -743,12 +784,13 @@ impl StateJournal {
                     // keep a partial transaction a retry would double-apply.
                     // Fenced (skipped) mutations own nothing and are excluded
                     // by the None entries.
-                    if let Err(rollback_error) = self.restore_previous(
+                    let ownership_skipped = self.restore_previous(
                         &mutations,
                         &previous,
                         &previous_versions,
                         &applied_versions,
-                    ) {
+                    );
+                    if let Err(rollback_error) = ownership_skipped {
                         return Err(Error::Process(format!(
                             "state journal apply failed ({error}); rollback also failed ({rollback_error})"
                         )));
@@ -777,6 +819,7 @@ impl StateJournal {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
         inner.apply_fences.remove(&txn.id);
+        inner.replay_applied.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
             match state {
                 TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
@@ -810,8 +853,21 @@ impl StateJournal {
                 _ => return Ok(()),
             }
         };
-        self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
+        let ownership_skipped = self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
         let mut inner = self.inner.lock().unwrap();
+        // A skipped restore means the mutation's effect is embedded in a
+        // later committed value. Mark relative mutations (Increment) so the
+        // retried apply does not execute them again — that would count the
+        // delta a second time. Absolute writes are self-healing: their
+        // version fence refuses the stale snapshot on replay.
+        if !ownership_skipped.is_empty() {
+            let skips = inner.replay_applied.entry(txn.id).or_default();
+            for index in ownership_skipped {
+                if matches!(applied.0.get(index), Some(StagedMutation::Increment { .. })) {
+                    skips.insert(index);
+                }
+            }
+        }
         if let Some(TxnState::Applied { mutations, .. }) = inner.txns.remove(&txn.id) {
             inner.txns.insert(txn.id, TxnState::Staged(mutations));
         }
@@ -835,19 +891,26 @@ impl StateJournal {
     /// the same key more than once). `applied_versions` is aligned with
     /// `mutations`; `None` entries were skipped by the version fence and own
     /// nothing, so restoring them would erase a newer committed value.
+    /// Returns the indices whose restore was skipped because a later
+    /// committed transaction owns the key — the mutation's effect lives
+    /// inside that newer value.
     fn restore_previous(
         &self,
         mutations: &[StagedMutation],
         previous: &[Option<StateEntry>],
         previous_versions: &[Option<u64>],
         applied_versions: &[Option<u64>],
-    ) -> Result<(), Error> {
-        for (((mutation, value), previous_version), applied_version) in mutations
+    ) -> Result<Vec<usize>, Error> {
+        let entries = mutations
             .iter()
             .zip(previous)
             .zip(previous_versions)
             .zip(applied_versions)
-            .rev()
+            .enumerate()
+            .collect::<Vec<_>>();
+        let mut ownership_skipped = Vec::new();
+        for (index, (((mutation, value), previous_version), applied_version)) in
+            entries.into_iter().rev()
         {
             let Some(applied_version) = applied_version else {
                 continue;
@@ -866,6 +929,7 @@ impl StateJournal {
             if !owns_current_value {
                 // A later committed transaction owns this key. Restoring the
                 // older bytes would erase that valid commit.
+                ownership_skipped.push(index);
                 continue;
             }
             self.backend.restore_entry(namespace, key, value.as_ref())?;
@@ -881,7 +945,7 @@ impl StateJournal {
                 }
             }
         }
-        Ok(())
+        Ok(ownership_skipped)
     }
 }
 
@@ -984,16 +1048,19 @@ impl Ack for CommitGroupOnAck {
     async fn undo(&self) -> Result<(), Error> {
         self.journal
             .with_finalize_scope(async {
-                // Source compensation and state compensation are independent
-                // recovery steps.  Even if the source cannot currently undo,
-                // still restore the state snapshot; otherwise a retry can
-                // observe a durable state mutation with an uncommitted source
-                // position and apply it twice.
-                let mut first_error = self.inner.undo().await.err();
+                // Compensate the journal state BEFORE rewinding the source/WAL
+                // cursor: the rewind is the last durable step, mirroring the
+                // forward path where the cursor advances only after state
+                // commits. A crash between the two steps leaves the delivery
+                // replayable instead of a cursor rewound over an
+                // uncompensated mutation. If the state compensation itself
+                // fails, the cursor is NOT rewound — the transaction stays
+                // retryable.
+                let mut state_error = None;
                 for txn in &self.txns {
                     if self.journal.transaction_is_registered(*txn) {
                         if let Err(error) = self.journal.undo(*txn) {
-                            first_error.get_or_insert(error);
+                            state_error.get_or_insert(error);
                         }
                     }
                 }
@@ -1001,17 +1068,20 @@ impl Ack for CommitGroupOnAck {
                 if let Some(rollbacks) = completed_rollbacks {
                     for rollback in rollbacks.iter().rev() {
                         if let Err(error) = self.journal.undo_snapshot(rollback) {
-                            first_error.get_or_insert(error);
+                            state_error.get_or_insert(error);
                         }
                     }
                     for rollback in &rollbacks {
                         if let Err(error) = self.journal.restage_snapshot(rollback) {
-                            first_error.get_or_insert(error);
+                            state_error.get_or_insert(error);
                         }
                     }
                     *self.completed_rollbacks.lock().unwrap() = Some(rollbacks);
                 }
-                first_error.map_or(Ok(()), Err)
+                if let Some(error) = state_error {
+                    return Err(error);
+                }
+                self.inner.undo().await.err().map_or(Ok(()), Err)
             })
             .await
     }
@@ -1093,28 +1163,30 @@ impl Ack for CommitOnAck {
     async fn undo(&self) -> Result<(), Error> {
         self.journal
             .with_finalize_scope(async {
-                // Do not let a source-side compensation error bypass the
-                // journal rollback.  The source remains retryable, while the
-                // in-memory/backend state must not retain an unacknowledged
-                // mutation.
-                let mut first_error = self.inner.undo().await.err();
-                if self.journal.transaction_is_registered(self.txn) {
-                    if let Err(error) = self.journal.undo(self.txn) {
-                        first_error.get_or_insert(error);
-                    }
+                // Compensate the journal state BEFORE rewinding the source/WAL
+                // cursor: the rewind is the last durable step, mirroring the
+                // forward path where the cursor advances only after state
+                // commits. If the state compensation itself fails, the cursor
+                // is NOT rewound — the transaction stays retryable.
+                let state_result = if self.journal.transaction_is_registered(self.txn) {
+                    self.journal.undo(self.txn)
                 } else {
                     let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
                     if let Some(rollback) = completed_rollback {
-                        if let Err(error) = self.journal.undo_snapshot(&rollback) {
-                            first_error.get_or_insert(error);
-                        }
-                        if let Err(error) = self.journal.restage_snapshot(&rollback) {
-                            first_error.get_or_insert(error);
-                        }
+                        let result = self
+                            .journal
+                            .undo_snapshot(&rollback)
+                            .and_then(|()| self.journal.restage_snapshot(&rollback));
                         *self.completed_rollback.lock().unwrap() = Some(rollback);
+                        result
+                    } else {
+                        Ok(())
                     }
+                };
+                if let Err(error) = state_result {
+                    return Err(error);
                 }
-                first_error.map_or(Ok(()), Err)
+                self.inner.undo().await.err().map_or(Ok(()), Err)
             })
             .await
     }
@@ -1452,6 +1524,65 @@ mod tests {
     }
 
     #[test]
+    fn skipped_increment_compensation_does_not_double_count_on_retry() {
+        let journal = StateJournal::new(backend());
+        // A applies +1.
+        let a = journal.begin().unwrap();
+        journal.update_i64(a, "ns", b"k", 1, None).unwrap();
+        journal.apply(a).unwrap();
+        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"1".to_vec()));
+        // B commits +1 while A is applied: the committed value now embeds
+        // A's delta.
+        let b = journal.begin().unwrap();
+        journal.update_i64(b, "ns", b"k", 1, None).unwrap();
+        journal.apply(b).unwrap();
+        journal.complete(b);
+        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"2".to_vec()));
+        // A's wrapped acknowledgement fails: the compensation is skipped
+        // because B's commit owns the key.
+        journal.undo(a).unwrap();
+        // The overlay must not count A's staged delta either: the value is
+        // B's committed 2, not 3.
+        assert_eq!(
+            journal.get("ns", b"k").unwrap(),
+            Some(b"2".to_vec()),
+            "the overlay excludes a replay-applied increment whose compensation was skipped"
+        );
+        // A retries and must NOT apply its delta again: the correct final
+        // value stays B's 2.
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec()),
+            "a retried increment whose compensation was skipped must not double-count"
+        );
+    }
+
+    #[test]
+    fn undo_skipped_compensation_still_restores_when_the_key_is_owned() {
+        // Control: an increment whose compensation is NOT skipped keeps the
+        // old retry semantics — undo restores, retry re-applies exactly once.
+        let journal = StateJournal::new(backend());
+        let a = journal.begin().unwrap();
+        journal.update_i64(a, "ns", b"k", 1, None).unwrap();
+        journal.apply(a).unwrap();
+        journal.undo(a).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            None,
+            "an owned compensation still restores the pre-apply value"
+        );
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec()),
+            "the retried increment applies exactly once when the key was never taken over"
+        );
+    }
+
+    #[test]
     fn staging_bounds_are_enforced() {
         let journal = StateJournal::with_limits(
             backend(),
@@ -1554,6 +1685,62 @@ mod tests {
             *self.acked.lock().unwrap() = true;
             Ok(())
         }
+    }
+
+    struct UndoOrderSpy {
+        journal: Arc<StateJournal>,
+        called: std::sync::atomic::AtomicBool,
+        state_at_source_undo: Mutex<Option<Option<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl Ack for UndoOrderSpy {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn undo(&self) -> Result<(), Error> {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            *self.state_at_source_undo.lock().unwrap() =
+                Some(self.journal.backend().get("ns", b"k").unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_compensates_state_before_rewinding_the_source_cursor() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"1".to_vec(), None)
+            .unwrap();
+        journal.apply(txn).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        let spy = Arc::new(UndoOrderSpy {
+            journal: journal.clone(),
+            called: std::sync::atomic::AtomicBool::new(false),
+            state_at_source_undo: Mutex::new(None),
+        });
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            spy.clone() as Arc<dyn Ack>,
+        ));
+        ack.undo().await.unwrap();
+        assert!(
+            spy.called.load(std::sync::atomic::Ordering::Acquire),
+            "the source cursor rewind must still run after state compensation"
+        );
+        let seen = spy.state_at_source_undo.lock().unwrap().take();
+        assert_eq!(
+            seen,
+            Some(None),
+            "the journal state must already be compensated when the source cursor is rewound"
+        );
     }
 
     #[tokio::test]

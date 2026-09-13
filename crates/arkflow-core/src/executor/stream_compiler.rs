@@ -320,7 +320,7 @@ fn window_config(
             })?;
         parse_duration_ms(value).ok_or_else(|| {
             Error::Config(format!(
-                "buffer '{buffer_type}' field '{field}' has an unsupported duration '{value}'"
+                "buffer '{buffer_type}' field '{field}' has an unsupported duration '{value}': use a duration like '500ms', '1s', '2m', '1h', '500us', or a compound '1h30m'"
             ))
         })
     };
@@ -401,9 +401,19 @@ fn window_config(
     Ok(window)
 }
 
-/// Parse a human duration string ("500ms", "1s", "2m", "1h") to milliseconds.
+/// Parse a human duration string to milliseconds. Accepts the legacy
+/// `humantime` grammar the retired Stream runtime used — compound forms such
+/// as `1h30m` and sub-millisecond units such as `500us`/`100ns` — in addition
+/// to the plain `500ms`/`1s`/`2m`/`1h` forms, so migrated configs keep
+/// compiling with identical values.
 fn parse_duration_ms(raw: &str) -> Option<i64> {
     let raw = raw.trim();
+    if let Ok(duration) = humantime::parse_duration(raw) {
+        // Sub-millisecond durations truncate toward zero, matching the
+        // legacy runtime's millisecond resolution.
+        let millis = i64::try_from(duration.as_millis()).ok()?;
+        return Some(millis);
+    }
     let (value, unit) =
         raw.split_at(raw.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')?);
     let value: f64 = value.parse().ok()?;
@@ -551,6 +561,11 @@ mod tests {
         assert_eq!(parse_duration_ms("1s"), Some(1_000));
         assert_eq!(parse_duration_ms("2m"), Some(120_000));
         assert_eq!(parse_duration_ms("1h"), Some(3_600_000));
+        // The legacy `humantime` grammar keeps migrated configs compiling.
+        assert_eq!(parse_duration_ms("500us"), Some(0));
+        assert_eq!(parse_duration_ms("1500us"), Some(1));
+        assert_eq!(parse_duration_ms("1h30m"), Some(5_400_000));
+        assert_eq!(parse_duration_ms("1m30s"), Some(90_000));
         assert_eq!(parse_duration_ms("bogus"), None);
     }
 }

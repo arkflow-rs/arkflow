@@ -478,6 +478,7 @@ impl EventTimeGate {
                         expired,
                         late_policy,
                         allowed_lateness_ms,
+                        false,
                     )
                 })
                 .collect();
@@ -503,6 +504,7 @@ impl EventTimeGate {
                         &[],
                         late_policy,
                         allowed_lateness_ms,
+                        false,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -544,6 +546,7 @@ impl EventTimeGate {
                         expired,
                         late_policy,
                         allowed_lateness_ms,
+                        false,
                     )
                 })
                 .collect();
@@ -570,18 +573,21 @@ impl EventTimeGate {
                 .iter()
                 .zip(pending.expired_window_ends.iter())
                 .map(|(event_time_ms, expired)| {
-                    // Treat EOS as a watermark beyond every containing
-                    // window, but still classify memberships that already
-                    // closed while the row was held according to the late
-                    // policy. The latest membership is the only one that is
-                    // released as an on-time row.
+                    // End-of-stream release against the LAST OBSERVED
+                    // watermark: memberships that closed classify by their
+                    // real lateness deadline (Update/Route policy still
+                    // applies within it), memberships still open stay
+                    // on-time. A sentinel watermark here would push every
+                    // closed membership past its deadline and permanently
+                    // truncate sliding-window updates.
                     self.classify_row(
                         *event_time_ms,
-                        Some(i64::MAX),
+                        self.watermark(),
                         true,
                         expired,
                         late_policy,
                         allowed_lateness_ms,
+                        true,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -768,6 +774,7 @@ impl EventTimeGate {
         previously_expired: &[i64],
         late_policy: LateEventPolicy,
         allowed_lateness_ms: u64,
+        eos_release: bool,
     ) -> RowDecision {
         let Some(event_time_ms) = event_time_ms else {
             // A null (invalid) timestamp can never compute a window end, so
@@ -810,7 +817,26 @@ impl EventTimeGate {
                     expired.push(*end);
                 }
             }
-            if window_ends.iter().any(|end| *end > watermark) {
+            // End-of-stream release: there is no future watermark, so the
+            // row must be released even though some memberships are still
+            // open. Closed memberships are classified against their REAL
+            // lateness deadlines (the observed watermark), not a sentinel —
+            // a membership within its deadline follows the same
+            // Update/Route/Drop policy as mid-stream and is never
+            // permanently truncated just because the source ended. Open
+            // memberships stay on-time in the main copy.
+            if eos_release {
+                if closed.is_empty() {
+                    return RowDecision {
+                        action: WindowAction::Emit,
+                        invalid_timestamp: false,
+                        excluded_window_ends: Vec::new(),
+                        route_late: false,
+                        update_window_ends: Vec::new(),
+                        expired_window_ends: Vec::new(),
+                    };
+                }
+            } else if window_ends.iter().any(|end| *end > watermark) {
                 return RowDecision {
                     action: WindowAction::Hold,
                     invalid_timestamp: false,
@@ -1484,6 +1510,50 @@ mod tests {
             .unwrap();
         assert_eq!(updates.value(0), "5,7");
         assert!(decision.ready[0]
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_classifies_held_memberships_against_real_deadlines() {
+        let mut spec = time_spec(LateEventPolicy::Update);
+        spec.allowed_lateness_ms = 1_000;
+        let mut gate = EventTimeGate::new(
+            &spec,
+            vec![WindowTiming::Sliding {
+                size_ms: 5,
+                slide_ms: 2,
+            }],
+        )
+        .unwrap();
+        gate.observe(0, batch(vec![4])).unwrap();
+        // Watermark 6 closes only the [0,5) membership; [2,7) and [4,9) are
+        // still open, so the row stays held.
+        gate.observe(0, batch(vec![6])).unwrap();
+        assert!(gate.has_held());
+
+        // End-of-stream: the closed [0,5) membership is WITHIN its
+        // lateness deadline (5 + 1000 >= 6), so it must be released as an
+        // Update. Classifying against a sentinel end-of-time watermark
+        // would drop it and permanently truncate the already-emitted
+        // [0,5) aggregate. The observe(6) row is also released (all its
+        // memberships are still open → on-time Emit).
+        let decision = gate.finish().await.unwrap();
+        let update_index = decision
+            .ready
+            .iter()
+            .position(|(_, action)| *action == WindowAction::Update)
+            .expect("a membership within its deadline must keep the Update policy at EOS");
+        let updates = decision.ready[update_index]
+            .0
+            .record_batch()
+            .column_by_name("__arkflow_late_window_updates")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(updates.value(0), "5");
+        assert!(decision.ready[update_index]
             .0
             .record_batch()
             .column_by_name("__arkflow_late_window_ends")

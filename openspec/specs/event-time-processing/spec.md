@@ -53,7 +53,7 @@ The runtime SHALL track watermark progress by the complete physical input identi
 - **THEN** the watermark is installed for partition 3 and no synthetic partition 0 participates in the calculation
 
 ### Requirement: Windows SHALL define lateness behavior
-Event-time windows SHALL define closure, allowed lateness, late-event handling, and emitted result behavior. A late Update within the allowed-lateness deadline SHALL modify the already emitted window result rather than create an unrelated partial window. For sliding windows, each row SHALL be classified against every containing window membership rather than a single latest window end. Runtime metrics SHALL count each late or invalid row regardless of whether the policy drops, routes, or updates it. Session windows SHALL retain and merge dynamic per-key session boundaries; a late row that bridges an emitted session SHALL produce an update rather than a new initial result.
+Event-time windows SHALL define closure, allowed lateness, late-event handling, and emitted result behavior. A late Update within the allowed-lateness deadline SHALL modify the already emitted window result rather than create an unrelated partial window. For sliding windows, each row SHALL be classified against every containing window membership rather than a single latest window end. Runtime metrics SHALL count each late or invalid row regardless of whether the policy drops, routes, or updates it. Session windows SHALL retain and merge dynamic per-key session boundaries; a late row that bridges an emitted session SHALL produce an update rather than a new initial result. Expired-window cleanup SHALL NOT reclaim an emitted buffer that still owes an unemitted correction, including at end-of-stream; the correction SHALL be emitted before the buffer's state is reclaimed.
 
 #### Scenario: A late event arrives within allowed lateness
 - **WHEN** an event arrives after the window watermark but before the allowed-lateness deadline
@@ -75,6 +75,11 @@ Event-time windows SHALL define closure, allowed lateness, late-event handling, 
 - **WHEN** a batch contains multiple late rows and the policy drops them, including rows with invalid timestamps
 - **THEN** the late-event metric increases by the number of affected rows, not by one per action group
 
+#### Scenario: End-of-stream emits pending corrections before reclaim
+
+- **WHEN** a session window's emitted buffer was merged or extended by a late update and the source reaches end-of-stream before the watermark advances past the merged end
+- **THEN** the pending correction is emitted before the expired-buffer cleanup reclaims the buffer, and neither the corrected rows nor the new rows are lost
+
 ### Requirement: Event timestamps SHALL accept supported Arrow units
 An event-time source SHALL accept Int64 timestamps and Arrow timestamp columns in seconds, milliseconds, microseconds, or nanoseconds, normalize them to checked millisecond values, and reject overflow or unsupported types before processing.
 
@@ -87,11 +92,15 @@ An event-time source SHALL accept Int64 timestamps and Arrow timestamp columns i
 - **THEN** event-time processing fails with an actionable field/type error and does not silently wrap the value
 
 ### Requirement: Event-time gates SHALL classify current rows consistently
-The gate SHALL evaluate current rows against a watermark that is consistent with the batch's recorded progress. Rows that become late because the batch advances the watermark SHALL receive the configured Drop, Route, or Update action, while future rows MAY remain held.
+The gate SHALL evaluate current rows against a watermark that is consistent with the batch's recorded progress. Rows that become late because the batch advances the watermark SHALL receive the configured Drop, Route, or Update action, while future rows MAY remain held. At end-of-stream the gate SHALL classify each held row per window membership against that window's real lateness deadline derived from the last observed watermark; a sentinel end-of-stream watermark SHALL NOT by itself exclude memberships that are still within their deadline.
 
 #### Scenario: A batch contains a future row and an old row
 - **WHEN** a first batch contains event times `[2100, 100]` for a `[0,1000)` window and the batch advances the watermark beyond that window
 - **THEN** the old row is classified by the configured late-event policy and only the future row remains held for a later window
+
+#### Scenario: End-of-stream does not truncate live sliding memberships
+- **WHEN** the source ends while a held sliding row has one membership past its deadline and one membership still within its deadline
+- **THEN** the still-live membership receives the row under the same Update/Drop/Route policy as mid-stream, and the emitted aggregates are not permanently truncated by the end-of-stream classification
 
 ### Requirement: Invalid event timestamps SHALL not be held indefinitely
 A null or otherwise invalid event timestamp SHALL NOT be retained as an ordinary held event because it cannot produce a window end. The runtime SHALL route it to the configured invalid/late side output when one exists, otherwise drop and acknowledge it.
@@ -122,12 +131,17 @@ When a held row belongs to multiple sliding windows that close on different wate
 
 ### Requirement: Window state and source acknowledgement share rollback semantics
 
-For a fired window backed by staged state, state finalization and source/WAL acknowledgement SHALL form one retryable processing unit. If any source acknowledgement fails, the runtime SHALL conditionally compensate or retain the state transaction so replay cannot double-count or lose the window update.
+For a fired window backed by staged state, state finalization and source/WAL acknowledgement SHALL form one retryable processing unit. If any source acknowledgement fails, the runtime SHALL conditionally compensate or retain the state transaction so replay cannot double-count or lose the window update. Every window operator construction path SHALL register its fired-buffer writes with that retryable unit: a path that writes the backend before the output acknowledgement SHALL roll back the backend state, not only its in-memory buffers, when the acknowledgement fails.
 
 #### Scenario: Replay after a failed fired-window acknowledgement
 
 - **WHEN** a fired window is emitted successfully but its source acknowledgement fails before the durable cut completes
 - **THEN** replaying the source row restores the pre-commit state or resumes the same staged transaction rather than applying a second aggregate
+
+#### Scenario: A direct-construction path rolls back its backend writes
+
+- **WHEN** a window operator built without the state journal emits a fired buffer, its acknowledgement fails, and the process replays the source rows before the next emission
+- **THEN** the replay does not double-count into the emitted aggregate because the backend's emitted state was rolled back together with the in-memory buffers
 
 ### Requirement: Event-time compatibility markers remain row-local
 
@@ -137,4 +151,18 @@ Sliding-window late-membership metadata SHALL be attached and merged per input r
 
 - **WHEN** a late row belongs to one closed sliding window and one still-open sliding window
 - **THEN** the closed membership is excluded or routed according to policy while the open membership receives the row exactly once
+
+### Requirement: Timestamped rows with a NULL key SHALL follow an explicit policy
+
+A row with a convertible event timestamp but a NULL key SHALL NOT be silently skipped by keyed window aggregation. The runtime SHALL count it in the invalid/late metrics, SHALL route it to the late/invalid side output when one is configured, and SHALL otherwise drop it and complete its acknowledgement — mirroring the invalid-timestamp policy. The row's delivery SHALL NOT be acknowledged while it is silently unaccounted.
+
+#### Scenario: NULL key with a side output configured
+
+- **WHEN** a windowed Job receives a row whose timestamp converts but whose key column is NULL and a late/invalid side output is configured
+- **THEN** the row is routed to that side output with an invalid marker, counted in the metrics, and acknowledged only after the route write
+
+#### Scenario: NULL key without a side output
+
+- **WHEN** a windowed Job receives a row whose key column is NULL and no side output is configured
+- **THEN** the row is dropped, the invalid/late metric is incremented, and the acknowledgement completes without the row being counted into any aggregate
 

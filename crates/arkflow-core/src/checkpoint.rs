@@ -160,8 +160,42 @@ impl CheckpointStore for FileCheckpointStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::Process(format!("create checkpoint prefix: {error}")))?;
         }
-        std::fs::write(path, bytes)
-            .map_err(|error| Error::Process(format!("write checkpoint object: {error}")))
+        // Crash-atomic write: a crash mid-`fs::write` would leave a torn or
+        // empty manifest as the ONLY recoverable point once retention removed
+        // the predecessor. Write to a sibling temp file, flush it to disk,
+        // atomically rename it over the final path, and fsync the parent
+        // directory so the rename itself survives power loss.
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Config("invalid checkpoint store key".into()))?;
+        let temp_path = path.with_file_name(format!(
+            ".{file_name}.tmp-{}",
+            std::process::id()
+        ));
+        let write_atomic = || -> Result<(), Error> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp_path)
+                .map_err(|error| Error::Process(format!("create checkpoint temp file: {error}")))?;
+            file.write_all(bytes)
+                .map_err(|error| Error::Process(format!("write checkpoint object: {error}")))?;
+            file.sync_all()
+                .map_err(|error| Error::Process(format!("sync checkpoint object: {error}")))?;
+            drop(file);
+            std::fs::rename(&temp_path, &path)
+                .map_err(|error| Error::Process(format!("publish checkpoint object: {error}")))?;
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            Ok(())
+        };
+        if let Err(error) = write_atomic() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -1245,5 +1279,48 @@ mod compatibility_tests {
             .write_checkpoint_with_plan(&manifest, &planned)
             .expect_err("an incomplete checkpoint must not be sealed");
         assert!(error.to_string().contains("incomplete"), "{error}");
+    }
+
+    #[test]
+    fn file_store_put_is_atomic_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::new(dir.path()).unwrap();
+        store.put("cp/a/manifest.json", b"v1").unwrap();
+        assert_eq!(store.get("cp/a/manifest.json").unwrap().as_deref(), Some(b"v1".as_slice()));
+        // A replacement fully replaces the object; a torn partial write can
+        // never appear under the final key because publication happens
+        // through an atomic rename after fsync.
+        store
+            .put("cp/a/manifest.json", b"v2-with-a-longer-payload")
+            .unwrap();
+        assert_eq!(
+            store.get("cp/a/manifest.json").unwrap().as_deref(),
+            Some(b"v2-with-a-longer-payload".as_slice())
+        );
+        // No temp files remain in any prefix.
+        fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_files(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        collect_files(dir.path(), &mut files);
+        let leftovers: Vec<_> = files
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp checkpoint files leaked: {leftovers:?}"
+        );
     }
 }

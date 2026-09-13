@@ -414,6 +414,8 @@ pub async fn serve_hub(
                     let _ = reconcile_hub.reconcile_jobs().await;
                     let _ = reconcile_hub.reconcile_rollouts().await;
                     let _ = reconcile_hub.prune_events(2048).await;
+                    let _ = reconcile_hub.prune_operation_history().await;
+                    let _ = reconcile_hub.prune_stale_checkpoint_records().await;
                 }
                 _ = reconcile_cancel.cancelled() => break,
             }

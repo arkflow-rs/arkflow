@@ -2255,6 +2255,195 @@ async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn checkpoint_round_fails_when_source_positions_error() {
+    struct FailingPositionsInput {
+        reads: AtomicUsize,
+        position_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for FailingPositionsInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.position_calls.load(Ordering::SeqCst) >= 2 {
+                return Err(Error::EOF);
+            }
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                    offset as i64,
+                    "a".into(),
+                )]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            let call = self.position_calls.fetch_add(1, Ordering::SeqCst);
+            if call >= 1 {
+                return Err(Error::Process("position snapshot failed".into()));
+            }
+            Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+                0,
+                self.reads.load(Ordering::SeqCst) as u64,
+            )])
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(FailingPositionsInput {
+        reads: AtomicUsize::new(0),
+        position_calls: AtomicUsize::new(0),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input.clone()],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // First round captures positions; the swap arms the failure, so the next
+    // round must fail closed instead of sealing empty/stale positions.
+    let first = tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot())
+        .await
+        .expect("first checkpoint timed out");
+    assert!(
+        first.is_ok(),
+        "first checkpoint round should succeed, got {:?}",
+        first.err()
+    );
+
+    let second = tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot())
+        .await
+        .expect("second checkpoint must resolve, not time out");
+    assert!(
+        second.is_err(),
+        "checkpoint round with a failing position snapshot must fail, got {:?}",
+        second.ok()
+    );
+
+    cancellation.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.watcher()).await;
+}
+
+#[tokio::test]
+async fn checkpoint_round_fails_when_chain_ends_without_reporting() {
+    struct ErrorExitInput {
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for ErrorExitInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            match self.reads.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok((
+                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                        0,
+                        "a".into(),
+                    )]))),
+                    Arc::new(crate::input::NoopAck),
+                )),
+                // Fail mid-flight (NOT a clean EOF): the chain exits with an
+                // error, which never reports a snapshot for the round the
+                // caller injects while this read is blocked.
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Err(Error::Process("source exploded mid-flight".into()))
+                }
+                _ => Err(Error::EOF),
+            }
+        }
+
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+                0,
+                self.reads.load(Ordering::SeqCst) as u64,
+            )])
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(ErrorExitInput {
+        reads: AtomicUsize::new(0),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input.clone()],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+    // The chain is now blocked in its second read (150ms): inject the round
+    // into that window so the error exit happens mid-round.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The chain exits with an error while this round is in flight and never
+    // reports a snapshot for it: the round must fail instead of sealing a
+    // manifest that is missing a participant.
+    let round = tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot()).await;
+    assert!(
+        round.is_err() || round.unwrap().is_err(),
+        "checkpoint round with a chain that ends without reporting must fail"
+    );
+
+    cancellation.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.watcher()).await;
+}
+
 // ---------- stateful operator wiring tests ----------
 
 #[test]

@@ -469,10 +469,17 @@ async fn run_source_chain(
                 let positions = match source.current_positions().await {
                     Ok(positions) => positions,
                     Err(error) => {
+                        // Fail the round closed: seeding the frontier with an
+                        // empty vec would seal stale (or first-round empty)
+                        // positions while the reported error races the report
+                        // drain and can be lost. The barrier is consumed but
+                        // not sealed and not forwarded, like the drain
+                        // timeout, so no cut can persist positions this chain
+                        // cannot vouch for.
                         if let Some(reporter) = &hook.failure_reporter {
                             let _ = reporter.send(error);
                         }
-                        Vec::new()
+                        continue;
                     }
                 };
                 let (watermark_ms, watermark_partitions) = hook
@@ -1837,9 +1844,12 @@ impl ProcessorWorkerPool {
         // may itself be blocked (a full channel whose consumer already
         // stopped), which would park this join forever on the failure path
         // where the cancellation token is not set. Bound the join: exceeding
-        // it leaves the collector to finish on its own and reports the
-        // condition instead of wedging the chain's shutdown.
-        match tokio::time::timeout(COLLECTOR_DRAIN_TIMEOUT, collector).await {
+        // it fails the chain — the drain never completed, so outputs may be
+        // missing — and stops the collector before the caller closes the
+        // sink, so a retired collector can neither write into a closed sink
+        // nor publish deliveries past EOS.
+        let mut collector = collector;
+        match tokio::time::timeout(COLLECTOR_DRAIN_TIMEOUT, &mut collector).await {
             Ok(Ok(())) => {}
             // The collector panicked: its buffered deliveries were never
             // published and their acknowledgements were never settled, which
@@ -1852,8 +1862,16 @@ impl ProcessorWorkerPool {
             Err(_elapsed) => {
                 tracing::warn!(
                     timeout_secs = COLLECTOR_DRAIN_TIMEOUT.as_secs(),
-                    "processor result collector did not finish draining; abandoning the join"
+                    "processor result collector did not finish draining; aborting the join"
                 );
+                collector.abort();
+                let _ = collector.await;
+                join_error.get_or_insert_with(|| {
+                    Error::Process(format!(
+                        "processor result collector did not finish draining within {}s",
+                        COLLECTOR_DRAIN_TIMEOUT.as_secs()
+                    ))
+                });
             }
         }
         if let Some(error) = join_error {

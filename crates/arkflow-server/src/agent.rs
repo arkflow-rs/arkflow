@@ -458,80 +458,162 @@ impl JobRuntime {
                 .map_err(|error| error.to_string())?,
         );
         let recovery = if let Some(checkpoint_id) = recovery_id {
-            let repository = checkpoint_repository(&plan)?;
-            let artifact = recovery_artifact(&plan, &checkpoint_id, recovery_savepoint)?;
-            let manifest = repository
-                .read_manifest(&artifact)
-                .map_err(|error| error.to_string())?;
-            validate_recovery_manifest(&plan, &checkpoint_id, state_format_version, &manifest)?;
-            let assigned_task_ids = assignments
-                .iter()
-                .map(|assignment| assignment.task_id.as_str())
-                .collect::<BTreeSet<_>>();
-            let mut snapshots = manifest
-                .state_snapshots
-                .iter()
-                .filter(|snapshot_ref| assigned_task_ids.contains(snapshot_ref.task_id.as_str()))
-                .map(|snapshot_ref| {
-                    repository
-                        .read_state_snapshot(snapshot_ref)
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if snapshots.len() > 1 {
-                let entries = snapshots
-                    .drain(..)
-                    .flat_map(|snapshot| snapshot.entries)
-                    .collect();
-                let snapshot =
-                    arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
-                state
-                    .restore(&snapshot)
-                    .map_err(|error| error.to_string())?;
-            } else if let Some(snapshot) = snapshots.pop() {
-                state
-                    .restore(&snapshot)
-                    .map_err(|error| error.to_string())?;
-            }
-            let recovery =
-                RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())?;
-            Some(recovery)
+            // Manifest/snapshot reads are object-store round trips (the
+            // CheckpointStore trait is synchronous): run them on the blocking
+            // pool so a slow S3 read cannot stall the async runtime's worker
+            // threads and delay heartbeats and other commands.
+            let plan_for_recovery = plan.clone();
+            let assignments_for_recovery = assignments.clone();
+            let state_for_restore = state.clone();
+            let recovered = tokio::task::spawn_blocking(
+                move || -> Result<RecoveryPlan, String> {
+                    let repository = checkpoint_repository(&plan_for_recovery)?;
+                    let artifact =
+                        recovery_artifact(&plan_for_recovery, &checkpoint_id, recovery_savepoint)?;
+                    let manifest = repository
+                        .read_manifest(&artifact)
+                        .map_err(|error| error.to_string())?;
+                    validate_recovery_manifest(
+                        &plan_for_recovery,
+                        &checkpoint_id,
+                        state_for_restore.format_version(),
+                        &manifest,
+                    )?;
+                    let assigned_task_ids = assignments_for_recovery
+                        .iter()
+                        .map(|assignment| assignment.task_id.as_str())
+                        .collect::<BTreeSet<_>>();
+                    let mut snapshots = manifest
+                        .state_snapshots
+                        .iter()
+                        .filter(|snapshot_ref| {
+                            assigned_task_ids.contains(snapshot_ref.task_id.as_str())
+                        })
+                        .map(|snapshot_ref| {
+                            repository
+                                .read_state_snapshot(snapshot_ref)
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if snapshots.len() > 1 {
+                        let entries = snapshots
+                            .drain(..)
+                            .flat_map(|snapshot| snapshot.entries)
+                            .collect();
+                        let snapshot = arkflow_core::state::StateSnapshot::new(
+                            state_for_restore.format_version(),
+                            entries,
+                        );
+                        state_for_restore
+                            .restore(&snapshot)
+                            .map_err(|error| error.to_string())?;
+                    } else if let Some(snapshot) = snapshots.pop() {
+                        state_for_restore
+                            .restore(&snapshot)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())
+                },
+            )
+            .await
+            .map_err(|error| format!("recovery read task failed: {error}"))??;
+            Some(recovered)
         } else {
             None
         };
         let cancellation = CancellationToken::new();
-        // Spawn the Job on the unified kernel: the same plan, adapter and
-        // state backend drive pipelined chain execution, and the handle backs
-        // command-driven checkpoints. The legacy runner stays attached only
-        // until its review-fix tests migrate (kernel snapshots take priority).
-        let kernel = Arc::new(
-            spawn_kernel_job(
-                &plan,
-                &task_ids,
-                state.clone(),
-                recovery.as_ref(),
-                cancellation.clone(),
-            )
-            .await?,
-        );
-        let handle = kernel.watcher();
+        // Register the Job BEFORE spawning the kernel: an abort of this
+        // command task during the spawn window (session teardown, another
+        // command's failed result) must not orphan a running kernel that no
+        // report, stop, or stop-all can reach. The registered cancellation
+        // token lets stop paths cancel the in-flight start, and the
+        // placeholder join handle gives stop something to await. The entry is
+        // swapped to the real kernel handle once the spawn completes; on spawn
+        // failure the entry is removed and the token cancelled.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let placeholder_cancellation = cancellation.clone();
+        let placeholder_handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = placeholder_cancellation.cancelled() => {}
+                _ = started_rx => {}
+            }
+            Ok(())
+        });
         self.tasks.lock().await.insert(
-            job_id,
+            job_id.clone(),
             JobTask {
                 generation,
                 cancellation: cancellation.clone(),
-                assignments,
-                watermark_partitions,
-                state,
+                assignments: assignments.clone(),
+                watermark_partitions: watermark_partitions.clone(),
+                state: state.clone(),
                 checkpoint_store_uri: plan
                     .spec
                     .checkpoint
                     .as_ref()
                     .map(|checkpoint| checkpoint.object_store_uri.clone()),
-                kernel: Some(kernel),
-                handle,
+                kernel: None,
+                handle: placeholder_handle,
             },
         );
+        // Spawn the Job on the unified kernel: the same plan, adapter and
+        // state backend drive pipelined chain execution, and the handle backs
+        // command-driven checkpoints.
+        let spawn_result = spawn_kernel_job(
+            &plan,
+            &task_ids,
+            state.clone(),
+            recovery.as_ref(),
+            cancellation.clone(),
+        )
+        .await;
+        let kernel = match spawn_result {
+            Ok(handle) => {
+                // Release the placeholder: the swap below resolves it.
+                drop(started_tx);
+                Arc::new(handle)
+            }
+            Err(error) => {
+                drop(started_tx);
+                let placeholder = self.tasks.lock().await.remove(&job_id);
+                if let Some(task) = placeholder {
+                    task.cancellation.cancel();
+                    let _ = task.handle.await;
+                }
+                let _ = state.close();
+                return Err(error);
+            }
+        };
+        let handle = kernel.watcher();
+        {
+            let mut tasks = self.tasks.lock().await;
+            // Swap in the real kernel only if our placeholder still owns the
+            // entry: a stop during the spawn removed it (the token is
+            // cancelled and the runner winds down on its own), and a stale
+            // generation must not overwrite a newer registration.
+            let still_ours = tasks
+                .get(&job_id)
+                .is_some_and(|task| task.generation == generation && task.kernel.is_none());
+            if still_ours {
+                tasks.insert(
+                    job_id,
+                    JobTask {
+                        generation,
+                        cancellation: cancellation.clone(),
+                        assignments,
+                        watermark_partitions,
+                        state,
+                        checkpoint_store_uri: plan
+                            .spec
+                            .checkpoint
+                            .as_ref()
+                            .map(|checkpoint| checkpoint.object_store_uri.clone()),
+                        kernel: Some(kernel),
+                        handle,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -543,22 +625,34 @@ impl JobRuntime {
         savepoint: bool,
         node_id: &str,
     ) -> Result<String, String> {
-        let tasks = self.tasks.lock().await;
-        let task = tasks
-            .get(job_id)
-            .ok_or_else(|| "Job is not running on this Agent".to_string())?;
-        if task.generation != generation {
-            return Err("checkpoint generation does not match running Job".into());
-        }
-        let (snapshot, source_positions, task_watermarks, watermark_partitions) = task
-            .kernel
-            .as_ref()
-            .ok_or_else(|| "Job kernel handle is missing".to_string())?
+        // Copy what the checkpoint needs and release the tasks lock: the
+        // barrier wait and the object-store writes below take seconds on slow
+        // storage, and holding the lock across them would block stop/stop-all
+        // and new starts for the whole duration.
+        let (kernel, assignments, task_watermark_partitions, checkpoint_store_uri) = {
+            let tasks = self.tasks.lock().await;
+            let task = tasks
+                .get(job_id)
+                .ok_or_else(|| "Job is not running on this Agent".to_string())?;
+            if task.generation != generation {
+                return Err("checkpoint generation does not match running Job".into());
+            }
+            let kernel = task
+                .kernel
+                .clone()
+                .ok_or_else(|| "Job kernel handle is missing".to_string())?;
+            (
+                kernel,
+                task.assignments.clone(),
+                task.watermark_partitions.clone(),
+                task.checkpoint_store_uri.clone(),
+            )
+        };
+        let (snapshot, source_positions, task_watermarks, watermark_partitions) = kernel
             .checkpoint_barrier_with_details(checkpoint_id, generation)
             .await
             .map_err(|error| error.to_string())?;
-        let store_uri = task
-            .checkpoint_store_uri
+        let store_uri = checkpoint_store_uri
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
         let store_uri_owned = store_uri.to_owned();
@@ -576,8 +670,7 @@ impl JobRuntime {
         })
         .await
         .map_err(|error| format!("checkpoint state write task failed: {error}"))??;
-        let state_refs = task
-            .assignments
+        let state_refs = assignments
             .iter()
             .map(|assignment| StateSnapshotRef {
                 task_id: assignment.task_id.clone(),
@@ -586,24 +679,23 @@ impl JobRuntime {
             })
             .collect::<Vec<_>>();
         let mut coordinator = CheckpointCoordinator::new(
-            task.assignments[0].job_id.clone(),
-            task.assignments[0].job_version,
+            assignments[0].job_id.clone(),
+            assignments[0].job_version,
             generation,
             snapshot.format_version,
-            task.assignments
+            assignments
                 .iter()
                 .map(|assignment| assignment.task_id.clone()),
         );
         let barrier = coordinator
             .start(checkpoint_id)
             .map_err(|error| error.to_string())?;
-        for (index, assignment) in task.assignments.iter().enumerate() {
+        for (index, assignment) in assignments.iter().enumerate() {
             coordinator
                 .acknowledge(TaskCheckpointAck {
                     task_id: assignment.task_id.clone(),
                     attempt_id: assignment.id.clone(),
-                    partition: task
-                        .watermark_partitions
+                    partition: task_watermark_partitions
                         .get(&assignment.task_id)
                         .copied()
                         .unwrap_or_default(),
@@ -623,8 +715,7 @@ impl JobRuntime {
                 })
                 .map_err(|error| error.to_string())?;
         }
-        let attempts = task
-            .assignments
+        let attempts = assignments
             .iter()
             .map(|assignment| TaskAttemptSnapshot {
                 task_id: assignment.task_id.clone(),
@@ -679,15 +770,24 @@ impl JobRuntime {
         manifest_nodes: &[String],
         planned_task_ids: &[String],
     ) -> Result<String, String> {
-        let tasks = self.tasks.lock().await;
-        let task = tasks
-            .get(job_id)
-            .ok_or_else(|| "Job is not running on this Agent".to_string())?;
-        if task.generation != generation {
-            return Err("checkpoint generation does not match running Job".into());
-        }
-        let store_uri = task
-            .checkpoint_store_uri
+        // Copy what the aggregate needs and release the tasks lock: the
+        // manifest reads and the object-store write below are slow I/O that
+        // must not block stop/stop-all and new starts.
+        let (store_uri_owned, job_version, format_version) = {
+            let tasks = self.tasks.lock().await;
+            let task = tasks
+                .get(job_id)
+                .ok_or_else(|| "Job is not running on this Agent".to_string())?;
+            if task.generation != generation {
+                return Err("checkpoint generation does not match running Job".into());
+            }
+            (
+                task.checkpoint_store_uri.clone(),
+                task.assignments[0].job_version,
+                task.state.format_version(),
+            )
+        };
+        let store_uri = store_uri_owned
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
         let kind = if savepoint {
@@ -702,8 +802,6 @@ impl JobRuntime {
         };
         let mut aggregate: Option<arkflow_core::checkpoint::CheckpointManifest> = None;
         let mut task_ids = std::collections::BTreeSet::new();
-        let job_version = task.assignments[0].job_version;
-        let format_version = task.state.format_version();
         for node_id in manifest_nodes {
             let key = format!(
                 "{prefix}/{checkpoint_id}/manifests/{}.json",
@@ -1234,7 +1332,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let mut backoff = Duration::from_millis(250);
-    let mut completed_commands = HashMap::<String, CommandResult>::new();
+    let mut completed_commands = CompletedCommandCache::new(1024);
     let job_runtime = JobRuntime::default();
     loop {
         if cancellation.is_cancelled() {
@@ -1310,7 +1408,7 @@ async fn run_session(
     config: &NodeAgentConfig,
     session: RegisterResponse,
     cancellation: CancellationToken,
-    completed_commands: &mut HashMap<String, CommandResult>,
+    completed_commands: &mut CompletedCommandCache,
     job_runtime: JobRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
@@ -1939,22 +2037,50 @@ async fn deliver_result(
     Ok(result)
 }
 
-fn replay_cached_command(
-    cache: &HashMap<String, CommandResult>,
-    command_id: &str,
-) -> Option<CommandResult> {
-    cache.get(command_id).cloned()
+/// Bounded, insertion-ordered cache of completed command results. When the
+/// bound is reached the OLDEST entry is evicted one at a time: clearing the
+/// cache wholesale made the Hub's redeliveries of still-active lifecycle
+/// commands re-execute (a redelivered job_start would cancel and restart a
+/// running Job), breaking the at-most-once lifecycle guarantee.
+#[derive(Default)]
+struct CompletedCommandCache {
+    entries: HashMap<String, CommandResult>,
+    order: std::collections::VecDeque<String>,
+    capacity: usize,
 }
 
-fn remember_completed_command(
-    cache: &mut HashMap<String, CommandResult>,
-    command_id: String,
-    result: CommandResult,
-) {
-    if cache.len() >= 1024 {
-        cache.clear();
+impl CompletedCommandCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+        }
     }
-    cache.insert(command_id, result);
+
+    fn replay(&self, command_id: &str) -> Option<CommandResult> {
+        self.entries.get(command_id).cloned()
+    }
+
+    fn remember(&mut self, command_id: String, result: CommandResult) {
+        if !self.entries.contains_key(&command_id) {
+            while self.entries.len() >= self.capacity {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+            self.order.push_back(command_id.clone());
+        }
+        self.entries.insert(command_id, result);
+    }
+}
+
+fn replay_cached_command(cache: &CompletedCommandCache, command_id: &str) -> Option<CommandResult> {
+    cache.replay(command_id)
+}
+
+fn remember_completed_command(cache: &mut CompletedCommandCache, command_id: String, result: CommandResult) {
+    cache.remember(command_id, result);
 }
 
 async fn send_result(
@@ -2066,6 +2192,103 @@ mod tests {
     /// session rebuild: the task is already gone from the runtime map, so
     /// dropping the observation would leave the Hub reporting the job as
     /// running forever.
+    /// An aborted `job_start` (session teardown aborts command tasks) must
+    /// never orphan a RUNNING kernel: the job must be registered in the task
+    /// map before the kernel spawn begins, so a later stop can always reach
+    /// and cancel it.
+    #[tokio::test]
+    async fn aborted_start_leaves_no_unregistered_running_kernel() {
+        let _ = arkflow_plugin::initialize();
+        let runtime = std::sync::Arc::new(JobRuntime::default());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        let plan = arkflow_core::job::JobPlan::compile(spec).unwrap();
+        let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+        assert!(!assignments.is_empty());
+        let spawn_runtime = runtime.clone();
+        let start_task = tokio::spawn(async move {
+            spawn_runtime
+                .start(plan, assignments, 1, None, false, "node-a")
+                .await
+        });
+        // Registration-first: observe the entry as early as possible.
+        let mut registered = false;
+        for _ in 0..2000 {
+            if runtime.tasks.lock().await.contains_key("orders") {
+                registered = true;
+                break;
+            }
+            if start_task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        if registered {
+            // Abort while the start may still be mid-spawn: this mirrors
+            // `command_tasks.abort_all()` during session teardown.
+            start_task.abort();
+        }
+        let _ = start_task.await;
+        // Whatever stage the start reached, stop must reach the Job and the
+        // runtime must end up with no surviving kernel entry.
+        runtime.stop("orders", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(
+            runtime.tasks.lock().await.is_empty(),
+            "no kernel may survive an aborted start without a registered, cancellable entry"
+        );
+        // A follow-up start for the same Job must not be wedged by the
+        // aborted one (the placeholder or kernel must not hold resources).
+        let spawn_runtime = runtime.clone();
+        let restart = tokio::spawn(async move {
+            let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+                "id": "orders",
+                "version": 1,
+                "operators": [
+                    {"id": "source", "kind": "source"},
+                    {"id": "sink", "kind": "sink"}
+                ],
+                "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+                "sources": [{
+                    "operator_id": "source",
+                    "input_type": "generate",
+                    "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                    "time": {"mode": "processing_time"}
+                }],
+                "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+            }))
+            .unwrap();
+            let plan = arkflow_core::job::JobPlan::compile(spec).unwrap();
+            let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+            spawn_runtime
+                .start(plan, assignments, 2, None, false, "node-a")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), restart)
+            .await
+            .expect("a start after an aborted start must not be wedged")
+            .unwrap()
+            .unwrap();
+        runtime.stop("orders", 2).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn parked_job_observations_are_redelivered_by_the_next_session() {
         let runtime = JobRuntime::default();
@@ -2120,7 +2343,7 @@ mod tests {
 
     #[test]
     fn duplicate_command_replays_the_terminal_result() {
-        let mut cache = HashMap::new();
+        let mut cache = CompletedCommandCache::new(1024);
         let result = CommandResult {
             command_id: "cmd-1".into(),
             operation_id: "op-1".into(),

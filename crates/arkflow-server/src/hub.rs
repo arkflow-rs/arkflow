@@ -551,10 +551,16 @@ impl Hub {
         for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
             match self.reconcile_job(&job).await {
                 Ok(count) => dispatched += count,
-                // One Job whose target is at capacity (or whose persisted
-                // spec no longer compiles) must not stall the tick for every
-                // other Job; the same ordering failure would repeat each tick.
-                Err(error @ (HubError::Capacity | HubError::Invalid(_))) => {
+                // One Job whose target is at capacity, whose node expired
+                // between the online pre-check and the enqueue, or whose
+                // persisted spec no longer compiles must not stall the tick
+                // for every other Job; the same ordering failure would repeat
+                // each tick.
+                Err(
+                    error @ (HubError::Capacity
+                    | HubError::Invalid(_)
+                    | HubError::NodeUnavailable),
+                ) => {
                     tracing::warn!(
                         job_id = %job.job_id,
                         error = %error,
@@ -709,13 +715,24 @@ impl Hub {
                     .collect()
             };
             if !abandoned.is_empty() {
-                let mut operations = self.operations.write().await;
-                for mut record in abandoned {
-                    record.state = HubOperationState::Superseded;
-                    record.superseded_generation = Some(job.generation);
-                    operations.insert(record.id.clone(), record.clone());
-                    if let Some(storage) = self.storage.as_ref() {
-                        persist_operation(storage, &record)
+                // Apply the in-memory transition under the write lock, then
+                // persist OUTSIDE it: the storage round-trips are async and
+                // holding the operations write lock across them would block
+                // every agent poll, report, and command result for the
+                // duration of the I/O.
+                let mut superseded = Vec::with_capacity(abandoned.len());
+                {
+                    let mut operations = self.operations.write().await;
+                    for mut record in abandoned {
+                        record.state = HubOperationState::Superseded;
+                        record.superseded_generation = Some(job.generation);
+                        operations.insert(record.id.clone(), record.clone());
+                        superseded.push(record);
+                    }
+                }
+                if let Some(storage) = self.storage.as_ref() {
+                    for record in &superseded {
+                        persist_operation(storage, record)
                             .await
                             .map_err(HubError::from)?;
                     }
@@ -727,6 +744,25 @@ impl Hub {
             // recorded under an older generation.
             let nodes_to_stop = historical_nodes.difference(&target_ids).collect::<Vec<_>>();
             for node_id in nodes_to_stop {
+                // The same terminal-state memory as the dispatch loop: a
+                // Succeeded stop for this (node, job, generation) already
+                // fenced the abandoned placement; re-enqueuing it every tick
+                // would churn persistent operation rows.
+                let stop_settled = self
+                    .operations
+                    .read()
+                    .await
+                    .values()
+                    .any(|operation_record| {
+                        operation_record.node_id == *node_id
+                            && operation_record.resource_id == job.job_id
+                            && operation_record.operation == "job_stop"
+                            && operation_record.generation == job.generation
+                            && operation_record.state == HubOperationState::Succeeded
+                    });
+                if stop_settled {
+                    continue;
+                }
                 let is_online = self.nodes.read().await.get(node_id).is_some_and(|node| {
                     node.resource.state == NodeConnectionState::Online
                         && node.resource.lease_expires_at_ms > now_ms()
@@ -787,20 +823,26 @@ impl Hub {
             });
         let mut dispatched = 0;
         for node_id in targets {
-            if operation == "job_start"
-                && self
-                    .operations
-                    .read()
-                    .await
-                    .values()
-                    .any(|operation_record| {
-                        operation_record.node_id == node_id
-                            && operation_record.resource_id == job.job_id
-                            && operation_record.operation == "job_start"
-                            && operation_record.generation == job.generation
-                            && operation_record.state == HubOperationState::Succeeded
-                    })
-            {
+            // Terminal-state memory: a Succeeded lifecycle operation for THIS
+            // (node, job, generation) already satisfies the desired state.
+            // Without this skip, every reconcile tick re-enqueued the command
+            // and a fresh persistent operation row — an unbounded churn loop
+            // for stopped Jobs (and for fenced placements) with no retention
+            // able to keep up. A generation bump or desired-state change
+            // re-dispatches naturally.
+            let already_terminal = self
+                .operations
+                .read()
+                .await
+                .values()
+                .any(|operation_record| {
+                    operation_record.node_id == node_id
+                        && operation_record.resource_id == job.job_id
+                        && operation_record.operation == operation
+                        && operation_record.generation == job.generation
+                        && operation_record.state == HubOperationState::Succeeded
+                });
+            if already_terminal {
                 continue;
             }
             let node_assignments = assignments
@@ -1330,6 +1372,105 @@ impl Hub {
             scheduled += 1;
         }
         Ok(scheduled)
+    }
+
+    /// Bounded retention for the operation history. The reconciler's
+    /// terminal-state memory reads Succeeded/terminal rows, so records are
+    /// kept for a grace window and a count bound instead of living forever:
+    /// without this, every reconcile tick of a stopped Job (or a fenced
+    /// placement) appended a fresh persistent row with no reclaim. Pruning a
+    /// terminal record past the window can cause one idempotent
+    /// re-dispatch, which is bounded and safe.
+    pub async fn prune_operation_history(&self) -> Result<(), HubError> {
+        const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+        const RETENTION_MAX: i64 = 4096;
+        let cutoff = now_ms() as i64 - RETENTION_MS;
+        if let Some(storage) = &self.storage {
+            storage
+                .prune_operation_history(cutoff, RETENTION_MAX)
+                .await
+                .map_err(HubError::from)?;
+        }
+        let mut operations = self.operations.write().await;
+        let terminal = |state: &HubOperationState| {
+            matches!(
+                state,
+                HubOperationState::Succeeded
+                    | HubOperationState::Failed
+                    | HubOperationState::TimedOut
+                    | HubOperationState::NodeUnavailable
+                    | HubOperationState::Cancelled
+                    | HubOperationState::Superseded
+            )
+        };
+        let stale: Vec<String> = operations
+            .iter()
+            .filter(|(_, record)| {
+                terminal(&record.state)
+                    && ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64) < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            operations.remove(&id);
+        }
+        let mut terminal_ids: Vec<(i64, String)> = operations
+            .iter()
+            .filter(|(_, record)| terminal(&record.state))
+            .map(|(id, record)| {
+                ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64, id.clone())
+            })
+            .collect();
+        terminal_ids.sort();
+        let excess = terminal_ids.len().saturating_sub(RETENTION_MAX as usize);
+        for (_, id) in terminal_ids.into_iter().take(excess) {
+            operations.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// Reclaim pending/failed checkpoint attempt records older than the
+    /// retention window. Completed records are governed by the per-Job
+    /// checkpoint retention policy; pending/failed rows used to accumulate
+    /// forever whenever an Agent could not finish a round.
+    pub async fn prune_stale_checkpoint_records(&self) -> Result<(), HubError> {
+        const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+        let cutoff = now_ms() as i64 - RETENTION_MS;
+        if let Some(storage) = &self.storage {
+            storage
+                .prune_job_checkpoint_records(cutoff)
+                .await
+                .map_err(HubError::from)?;
+        }
+        let stale: Vec<(String, String)> = self
+            .job_checkpoints
+            .read()
+            .await
+            .iter()
+            .flat_map(|(job_id, records)| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        (record.updated_at_ms as i64) < cutoff
+                            && matches!(
+                                record.status.as_str(),
+                                "pending" | "failed"
+                            )
+                    })
+                    .map(|record| (job_id.clone(), record.checkpoint_id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let mut checkpoints = self.job_checkpoints.write().await;
+        for (job_id, checkpoint_id) in stale {
+            if let Some(records) = checkpoints.get_mut(&job_id) {
+                records.retain(|record| record.checkpoint_id != checkpoint_id);
+            }
+        }
+        Ok(())
     }
 
     async fn enforce_checkpoint_retention(
@@ -4402,6 +4543,287 @@ mod tests {
         assert!(
             !commands.is_empty(),
             "a retried intent must produce a fresh command"
+        );
+    }
+
+    fn job_spec_json(id: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        })
+        .to_string()
+    }
+
+    /// A stopped Job whose stop command already succeeded must not receive a
+    /// fresh stop command (and a fresh persistent operation row) on every
+    /// reconcile tick: that churn loop grew the durable operation store
+    /// without bound.
+    #[tokio::test]
+    async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage);
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: job_spec_json("orders"),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session.session_token.clone(),
+        };
+        let job = hub.jobs().await.unwrap().remove(0);
+        let first = hub.reconcile_job(&job).await.unwrap();
+        assert_eq!(first, 1, "the first tick dispatches the stop");
+        let polled = hub.commands(auth.clone()).await.unwrap();
+        assert_eq!(polled.len(), 1);
+        hub.command_result(
+            auth.clone(),
+            CommandResult {
+                command_id: polled[0].id.clone(),
+                operation_id: polled[0].operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: None,
+                generation: job.generation,
+                observed_generation: None,
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The node's command queue is drained; later ticks must NOT enqueue
+        // another stop for the settled (job, generation, node).
+        for _ in 0..3 {
+            let dispatched = hub.reconcile_job(&job).await.unwrap();
+            assert_eq!(
+                dispatched, 0,
+                "a settled stop must not be re-dispatched by later ticks"
+            );
+        }
+        let operations = hub.operations.read().await;
+        let stops = operations
+            .values()
+            .filter(|record| {
+                record.resource_id == "orders"
+                    && record.operation == "job_stop"
+                    && record.node_id == "node-a"
+            })
+            .count();
+        assert_eq!(
+            stops, 1,
+            "exactly one stop operation record must exist for the settled generation"
+        );
+    }
+
+    /// One Job whose dispatch fails (here: its node's command queue is at
+    /// capacity) must not stall the reconcile tick for every other Job —
+    /// the failure is recorded and only that Job is skipped.
+    #[tokio::test]
+    async fn one_jobs_dispatch_failure_does_not_stall_the_scan() {
+        let hub = Hub::new(config());
+        for node_id in ["node-a", "node-b"] {
+            hub.register(RegisterRequest {
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![
+                    "stream_lifecycle".into(),
+                    "job_runtime".into(),
+                    "state_backend".into(),
+                ],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let job = |job_id: &str, node_id: &str| JobRecord {
+            job_id: job_id.into(),
+            version: 1,
+            spec_json: job_spec_json(job_id),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 1,
+            node_ids: vec![node_id.into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        };
+        hub.upsert_job(job("job-blocked", "node-a")).await.unwrap();
+        hub.upsert_job(job("job-healthy", "node-b")).await.unwrap();
+        // Fill node-a's command queue to the dispatch bound.
+        for index in 0..MAX_COMMANDS_PER_NODE {
+            hub.enqueue_with_metadata(
+                "node-a".into(),
+                "start".into(),
+                format!("fill-{index}"),
+                None,
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Arm both Jobs for dispatch without going through upsert's eager
+        // reconcile (the blocked one would fail the upsert itself).
+        {
+            let mut jobs = hub.jobs.write().await;
+            for job_id in ["job-blocked", "job-healthy"] {
+                if let Some(record) = jobs.get_mut(job_id) {
+                    record.desired_state = "running".into();
+                }
+            }
+        }
+        // The scan must succeed overall: the blocked Job is skipped, the
+        // healthy Job still dispatches its start.
+        let dispatched = hub.reconcile_jobs().await.unwrap();
+        assert!(dispatched >= 1, "the healthy Job must still dispatch");
+        let operations = hub.operations.read().await;
+        assert!(
+            operations
+                .values()
+                .any(|record| record.resource_id == "job-healthy"
+                    && record.operation == "job_start"),
+            "the healthy Job's start must be enqueued"
+        );
+        assert!(
+            !operations.values().any(|record| record.resource_id == "job-blocked"
+                && record.operation == "job_start"),
+            "the blocked Job's start must be skipped, not enqueued"
+        );
+    }
+
+    /// Operation and checkpoint records must be reclaimed by a bounded
+    /// retention: pending/failed checkpoint attempt rows and old terminal
+    /// operation rows used to accumulate forever.
+    #[tokio::test]
+    async fn stale_operation_and_checkpoint_records_are_reclaimed() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = StorageActor::start(store, 8);
+        let hub = Hub::with_storage(config(), storage);
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "running".into(),
+            convergence: "in_sync".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        hub.record_job_checkpoint(JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 1,
+            checkpoint_id: "checkpoint-stale-pending".into(),
+            kind: "checkpoint".into(),
+            status: "pending".into(),
+            manifest_uri: None,
+            format_version: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+        hub.record_job_checkpoint(JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 1,
+            checkpoint_id: "checkpoint-stale-failed".into(),
+            kind: "checkpoint".into(),
+            status: "failed".into(),
+            manifest_uri: None,
+            format_version: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+        let stale_op = HubOperation {
+            id: "op-stale".into(),
+            intent_id: None,
+            command_id: "command-stale".into(),
+            node_id: "node-a".into(),
+            operation: "job_stop".into(),
+            resource_id: "orders".into(),
+            checkpoint_id: None,
+            generation: 1,
+            attempt_id: None,
+            config_version_id: None,
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            created_at_ms: 1,
+            dispatched_at_ms: None,
+            acknowledged_at_ms: None,
+            finished_at_ms: Some(1),
+            correlation_id: None,
+            error: None,
+            failure_class: None,
+            intent_state: None,
+            convergence_state: None,
+            retry_count: 0,
+            next_retry_at_ms: None,
+            superseded_by_intent_id: None,
+            superseded_generation: None,
+            observed_generation: None,
+            observed_state: None,
+        };
+        hub.operations
+            .write()
+            .await
+            .insert(stale_op.id.clone(), stale_op.clone());
+        hub.prune_stale_checkpoint_records().await.unwrap();
+        hub.prune_operation_history().await.unwrap();
+        let records = hub.job_checkpoints("orders").await.unwrap();
+        assert!(
+            records.is_empty(),
+            "stale pending/failed checkpoint records must be reclaimed"
+        );
+        assert!(
+            !hub.operations.read().await.contains_key("op-stale"),
+            "old terminal operation records must be reclaimed"
         );
     }
 

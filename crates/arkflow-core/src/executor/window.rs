@@ -498,12 +498,21 @@ pub struct ColumnarWindowOperator {
     last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
     loaded: Arc<Mutex<bool>>,
+    /// Non-journal persistence only: raw state keys -> prior backend bytes
+    /// (None = key absent) captured before the direct backend writes, so a
+    /// failed fired acknowledgement can rewind them. Journal-backed operators
+    /// compensate through their transactions instead.
+    persist_undo: Arc<Mutex<PersistUndoImage>>,
     /// Serialize a window operation through the output acknowledgement. A
     /// fired result changes both the in-memory buffer and the journal; a
     /// second input must not mutate the same window until the first result's
     /// source acknowledgement has either committed or been compensated.
     operation_lock: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// Raw state key -> prior backend bytes (None = key absent): the undo image
+/// one non-journal persistence captures for a failed fired acknowledgement.
+type PersistUndoImage = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 #[derive(Clone)]
 struct WindowRuntimeSnapshot {
@@ -519,6 +528,11 @@ struct WindowRollback {
     last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
     operation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Non-journal construction only: backend, namespace, and the pre-persist
+    /// backend image `persist_buffers_for_fired` captured before writing the
+    /// fired buffers. Journal-backed operators compensate through their
+    /// transactions and leave this as `None`.
+    backend: Option<(Arc<dyn StateBackend>, String, Mutex<PersistUndoImage>)>,
     before: WindowRuntimeSnapshot,
     after: WindowRuntimeSnapshot,
 }
@@ -529,6 +543,39 @@ impl WindowRollback {
         *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
         *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;
         *self.last_processing_activity_ms.lock().unwrap() = snapshot.last_processing_activity_ms;
+    }
+
+    /// Rewind the backend entries the last non-journal persistence wrote
+    /// back to their pre-persist bytes. Non-journal persistence commits
+    /// fired buffers before the source acknowledgement, so a failed
+    /// acknowledgement must also undo those bytes — a memory-only rollback
+    /// would leave `emitted` aggregates in the backend and a replay would
+    /// merge rows into them a second time. Best-effort: a failed rewind
+    /// surfaces through the retryable acknowledgement error the caller is
+    /// already handling.
+    fn restore_persist_undo(&self) {
+        let Some((backend, namespace, undo)) = &self.backend else {
+            return;
+        };
+        let undo = { std::mem::take(&mut *undo.lock().unwrap()) };
+        for (raw, prior) in undo {
+            match prior {
+                Some(bytes) => {
+                    let _ = backend.put(namespace, &raw, &bytes);
+                }
+                None => {
+                    let _ = backend.delete(namespace, &raw);
+                }
+            }
+        }
+    }
+
+    /// The fired output acknowledgement succeeded: its backend writes stand,
+    /// so drop the stale undo image.
+    fn clear_persist_undo(&self) {
+        if let Some((_, _, undo)) = &self.backend {
+            undo.lock().unwrap().clear();
+        }
     }
 }
 
@@ -565,11 +612,13 @@ impl Ack for WindowFiredAck {
         match self.inner.ack().await {
             Ok(()) => {
                 self.rollback.restore(&self.rollback.after);
+                self.rollback.clear_persist_undo();
                 drop(guard);
                 Ok(())
             }
             Err(error) => {
                 self.rollback.restore(&self.rollback.before);
+                self.rollback.restore_persist_undo();
                 self.retain_guard(guard);
                 Err(error)
             }
@@ -586,6 +635,7 @@ impl Ack for WindowFiredAck {
         // in-memory window must follow the same rollback boundary regardless
         // of which error is returned.
         self.rollback.restore(&self.rollback.before);
+        self.rollback.restore_persist_undo();
         drop(guard);
         result
     }
@@ -595,6 +645,7 @@ impl Ack for WindowFiredAck {
         let guard = self.take_guard().await;
         let result = self.inner.abort().await;
         self.rollback.restore(&self.rollback.before);
+        self.rollback.restore_persist_undo();
         drop(guard);
         result
     }
@@ -635,12 +686,24 @@ impl ColumnarWindowOperator {
         before: WindowRuntimeSnapshot,
         after: WindowRuntimeSnapshot,
     ) -> Arc<WindowRollback> {
+        // Only non-journal operators persist before the acknowledgement; the
+        // pre-persist image captured by the last persistence call is the
+        // backend undo this rollback owns. Journal-backed compensation runs
+        // through the transactions instead.
+        let persist_undo = std::mem::take(&mut *self.persist_undo.lock().unwrap());
         Arc::new(WindowRollback {
             buffers: self.buffers.clone(),
             watermark_ms: self.watermark_ms.clone(),
             last_processing_trigger_ms: self.last_processing_trigger_ms.clone(),
             last_processing_activity_ms: self.last_processing_activity_ms.clone(),
             operation_lock: self.operation_lock.clone(),
+            backend: self.journal.is_none().then(|| {
+                (
+                    self.backend.clone(),
+                    self.namespace.clone(),
+                    Mutex::new(persist_undo),
+                )
+            }),
             before,
             after,
         })
@@ -704,6 +767,7 @@ impl ColumnarWindowOperator {
             last_processing_trigger_ms: Arc::new(Mutex::new(None)),
             last_processing_activity_ms: Arc::new(Mutex::new(None)),
             loaded: Arc::new(Mutex::new(false)),
+            persist_undo: Arc::new(Mutex::new(BTreeMap::new())),
             operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -1073,6 +1137,20 @@ impl ColumnarWindowOperator {
         Ok((keep, late, invalid))
     }
 
+    /// Rows with a convertible event timestamp but a NULL key: they can
+    /// never join a keyed aggregate and must follow the explicit
+    /// late/invalid policy (count, route, or drop+ack) instead of being
+    /// silently skipped.
+    fn null_key_mask(&self, batch: &crate::MessageBatchRef) -> Result<Vec<bool>, Error> {
+        let timestamps = self.extract_timestamps(batch)?;
+        let keys = self.extract_keys(batch)?;
+        Ok(timestamps
+            .iter()
+            .zip(keys.iter())
+            .map(|(event_time, key)| event_time.is_some() && key.is_none())
+            .collect())
+    }
+
     /// Merge one batch into the aggregate buffers (vectorized assignment).
     fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<Vec<(i64, String)>, Error> {
         let timestamps = self.extract_timestamps(batch)?;
@@ -1380,12 +1458,17 @@ impl ColumnarWindowOperator {
         // so a late Update modifies the same `(operator, key, window)`
         // aggregate; only past-deadline buffers are cleaned up. A window
         // that never fired always fires first — cleanup never drops an
-        // unemitted aggregate.
+        // unemitted aggregate. A buffer that still owes an unemitted
+        // correction (`updated_since_emit`) is not reclaimable either,
+        // including at end-of-stream (threshold = i64::MAX): the correction
+        // fires through the ready path below before any reclaim.
         let expired = buffers
             .iter()
             .filter(|((start, _), buffer)| {
                 let end = end_of(*start, buffer);
-                buffer.emitted && threshold.saturating_sub(end) > lateness
+                buffer.emitted
+                    && !buffer.updated_since_emit
+                    && threshold.saturating_sub(end) > lateness
             })
             .map(|((start, key), _)| (*start, key.clone()))
             .collect::<Vec<_>>();
@@ -1929,7 +2012,22 @@ impl ColumnarWindowOperator {
         // partial aggregate. Accepted rows and a configured late route share
         // the source acknowledgement; dropped rows consume a third child so
         // the parent is not committed until every outcome is settled.
-        let (keep, late, invalid_timestamps) = self.session_late_masks(&batch)?;
+        let (mut keep, mut late, invalid_timestamps) = self.session_late_masks(&batch)?;
+        // A row with a convertible timestamp but a NULL key can never join a
+        // keyed aggregate. Like an invalid timestamp it follows an explicit
+        // policy instead of being silently skipped (and silently
+        // acknowledged): it is counted in the late/invalid metrics, routed to
+        // the configured side output, or dropped with its acknowledgement
+        // settled.
+        let null_key_late = self.null_key_mask(&batch)?;
+        for ((keep_row, late_row), null_key) in
+            keep.iter_mut().zip(late.iter_mut()).zip(null_key_late.iter())
+        {
+            if *null_key {
+                *keep_row = false;
+                *late_row = true;
+            }
+        }
         let late_count = late.iter().filter(|is_late| **is_late).count();
         if late_count > 0 {
             // The gate cannot classify session lateness; these rows would
@@ -2549,6 +2647,22 @@ impl ColumnarWindowOperator {
             return Ok(());
         }
         let existing = self.backend.scan(&self.namespace)?;
+        // Capture the pre-persist backend image so a failed fired
+        // acknowledgement can rewind these direct writes. Deleted stale keys
+        // are recorded too (their prior bytes) and replacements in `current`
+        // overwrite the deletion entry.
+        let mut prior_image = PersistUndoImage::new();
+        for entry in &existing {
+            let key = Self::decode_state_key(&entry.key)?;
+            if !current.contains_key(&key) {
+                prior_image.insert(entry.key.clone(), Some(entry.value.clone()));
+            }
+        }
+        for (window_start, key) in current.keys() {
+            let raw = Self::state_key(*window_start, key);
+            let prior = self.backend.get(&self.namespace, &raw).ok().flatten();
+            prior_image.insert(raw, prior);
+        }
         for entry in existing {
             let key = Self::decode_state_key(&entry.key)?;
             if !current.contains_key(&key) {
@@ -2565,6 +2679,7 @@ impl ColumnarWindowOperator {
                 crate::state::now_ms(),
             )?;
         }
+        *self.persist_undo.lock().unwrap() = prior_image;
         Ok(())
     }
 
@@ -3223,6 +3338,223 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(counts.values(), &[3]);
+    }
+
+    #[tokio::test]
+    async fn finish_emits_pending_session_corrections_before_cleanup() {
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            WindowOperatorConfig {
+                kind: WindowKind::Session { gap_ms: 1_000 },
+                timestamp_field: "ts".into(),
+                key_field: "key".into(),
+                value_fields: vec!["value".into()],
+                trigger: WindowTrigger::Watermark,
+                trigger_interval_ms: 1_000,
+                watermark_field: "__watermark_ms".into(),
+                allowed_lateness_ms: 10_000,
+                legacy_payload: false,
+            },
+            backend,
+            "session-eos-correction-test",
+            LateEventPolicy::Update,
+            false,
+        );
+
+        // Two separate sessions fire at watermark 3_500 and stay retained.
+        op.process(batch(vec![(1_000, "a", 1), (2_500, "a", 2)], None))
+            .await
+            .unwrap();
+        let first = op.on_watermark(3_500).await.unwrap();
+        let ProcessResult::SingleWithAck(_, first_ack) = first else {
+            panic!("the initial sessions should fire");
+        };
+        first_ack.ack().await.unwrap();
+
+        // A late row at 3_400 extends the second session's end to 4_400,
+        // past the current watermark: the merged buffer owes a correction
+        // that no watermark has released yet.
+        let mid = op.process(batch(vec![(3_400, "a", 3)], None)).await.unwrap();
+        assert!(matches!(mid, ProcessResult::None));
+        assert!(op
+            .buffers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|buffer| buffer.updated_since_emit));
+
+        // End-of-stream must emit the pending correction BEFORE the expired
+        // cleanup can reclaim the buffer. Before the fix the buffer was
+        // deleted unemitted and the correction was lost.
+        let finished = op.finish().await.unwrap();
+        let (ProcessResult::Single(finished) | ProcessResult::SingleWithAck(finished, _)) =
+            finished
+        else {
+            panic!("end-of-stream must emit the pending session correction");
+        };
+        let updates = finished
+            .record_batch()
+            .column_by_name("__arkflow_window_update")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(updates.value(0), "the EOS emission is a correction");
+        let counts = finished
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(counts.values(), &[2], "merged aggregate rows 2500 and 3400");
+    }
+
+    #[tokio::test]
+    async fn null_key_rows_follow_the_invalid_policy_instead_of_silent_skip() {
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = operator(WindowTrigger::Watermark, backend.clone());
+        let fields = vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(I64::from(vec![1_000, 2_000])),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+            Arc::new(I64::from(vec![1, 5])),
+        ];
+        let mixed = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+        ));
+        op.process(mixed).await.unwrap();
+        // The NULL-key row is counted (late/invalid metric), not silently
+        // skipped.
+        assert_eq!(
+            op.late_event_row_counter().load(Ordering::Relaxed),
+            1,
+            "the NULL-key row must be counted in the late/invalid metric"
+        );
+        // Only the keyed row aggregates: firing window [0,10000) yields one
+        // row for key "a" with count 1.
+        let fired = op
+            .process(batch(vec![(11_000, "z", 0)], Some(10_000)))
+            .await
+            .unwrap();
+        let ProcessResult::Single(fired) = fired else {
+            panic!("window should fire");
+        };
+        let keys = fired
+            .record_batch()
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let a_index = (0..keys.len())
+            .find(|index| keys.value(*index) == "a")
+            .expect("keyed row must aggregate");
+        assert_eq!(counts.value(a_index), 1, "the NULL-key row must not aggregate");
+    }
+
+    #[tokio::test]
+    async fn non_journal_fired_ack_failure_rolls_back_backend_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let op = operator(WindowTrigger::Watermark, backend.clone());
+        // Batch 1 accumulates the row; its delivery ack is held under the
+        // window key. Batch 2 (with its own ack, so the fired composite is
+        // returned to the caller) advances the watermark and fires window
+        // [0,10000). The non-journal path persisted the fired buffer BEFORE
+        // that composite acknowledgement.
+        let ack: Arc<dyn Ack> = Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        });
+        op.process_with_ack(batch(vec![(1_000, "a", 1)], None), ack)
+            .await
+            .unwrap();
+        let fired = op
+            .process_with_ack(
+                batch(vec![(11_000, "z", 1)], Some(10_000)),
+                Arc::new(CountingAck {
+                    acked: AtomicUsize::new(0),
+                }),
+            )
+            .await
+            .unwrap();
+        let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+            panic!("window should fire");
+        };
+        assert!(fired_ack.ack().await.is_err(), "the source acknowledgement fails");
+        // The kernel's failure path undoes the fired acknowledgement: this
+        // releases the retained operation lock and finalizes the rollback
+        // for the replay.
+        fired_ack.undo().await.unwrap();
+        // The backend must NOT retain the fired aggregate: a replay merging
+        // into the emitted buffer would double-count.
+        let stored = backend.scan("window-test").unwrap();
+        // The fired aggregate must be gone from the backend: a replay that
+        // merges into an emitted buffer would double-count. What legitimately
+        // remains is the pre-fire working state (unemitted), persisted by the
+        // earlier non-firing batch.
+        for entry in &stored {
+            let state: serde_json::Value = serde_json::from_slice(&entry.value)
+                .expect("window state is JSON");
+            assert_eq!(
+                state["emitted"],
+                serde_json::json!(false),
+                "a failed fired acknowledgement must roll back the emitted window state"
+            );
+        }
+        assert!(
+            !stored
+                .iter()
+                .any(|entry| entry.key == ColumnarWindowOperator::state_key(10_000, "z")),
+            "the trigger batch's own state must be rolled back too"
+        );
+        // The in-memory buffer is restored to the unemitted pre-fire state.
+        let (restored_emitted, restored_count) = {
+            let buffers = op.buffers.lock().unwrap();
+            let buffer = buffers.get(&(0, "a".to_string())).unwrap();
+            (buffer.emitted, buffer.count)
+        };
+        assert!(!restored_emitted);
+        assert_eq!(restored_count, 1);
+        // Re-firing re-emits the retained aggregate exactly once. The replay
+        // batch re-establishes the watermark (the failed acknowledgement
+        // rolled it back) and its late row is dropped by the operator, so no
+        // new aggregate is manufactured.
+        let retried = op
+            .process(batch(vec![(1_000, "a", 1)], Some(10_000)))
+            .await
+            .unwrap();
+        let (ProcessResult::Single(fired) | ProcessResult::SingleWithAck(fired, _)) = retried
+        else {
+            panic!("the retry should re-fire the window");
+        };
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        // The re-emitted aggregate reflects each DELIVERY exactly once: the
+        // original unsettled delivery (restored to the unemitted working
+        // buffer) plus the replayed one = 2, never a merge into the emitted
+        // backend state (which would fabricate a third contribution across
+        // restart/re-emit).
+        assert_eq!(counts.value(0), 2);
     }
 
     #[tokio::test]
