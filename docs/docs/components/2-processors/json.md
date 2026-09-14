@@ -1,4 +1,5 @@
 ---
+components: [arrow_to_json, json_to_arrow]
 description: ArkFlow documentation page.
 ---
 

@@ -1,4 +1,5 @@
 ---
+components: [output/redis]
 description: ArkFlow documentation page.
 ---
 

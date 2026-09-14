@@ -1,8 +1,8 @@
-# Purpose
+## Purpose
 
 Define immutable configuration rollouts, bounded batch scheduling, health gates, and durable rollout actions.
 
-# Requirements
+## Requirements
 
 ### Requirement: Create an immutable configuration rollout
 

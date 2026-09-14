@@ -14,8 +14,8 @@
 
 //! Component metadata registry
 //!
-//! Each component (input / output / processor / buffer / codec) can be
-//! registered with a `ComponentMetadata` entry that describes it. The
+//! Each component (input / output / processor / buffer / codec / temporary)
+//! can be registered with a `ComponentMetadata` entry that describes it. The
 //! metadata powers three capabilities:
 //!
 //! 1. **Discovery** — `list_components()` lets callers enumerate every
@@ -41,6 +41,7 @@ pub enum ComponentKind {
     Processor,
     Buffer,
     Codec,
+    Temporary,
 }
 
 impl ComponentKind {
@@ -52,17 +53,19 @@ impl ComponentKind {
             ComponentKind::Processor => "processor",
             ComponentKind::Buffer => "buffer",
             ComponentKind::Codec => "codec",
+            ComponentKind::Temporary => "temporary",
         }
     }
 
     /// All kinds, in the canonical order used by listings and the schema.
-    pub const fn all() -> [ComponentKind; 5] {
+    pub const fn all() -> [ComponentKind; 6] {
         [
             ComponentKind::Input,
             ComponentKind::Output,
             ComponentKind::Processor,
             ComponentKind::Buffer,
             ComponentKind::Codec,
+            ComponentKind::Temporary,
         ]
     }
 }
@@ -83,8 +86,9 @@ impl std::str::FromStr for ComponentKind {
             "processor" => Ok(ComponentKind::Processor),
             "buffer" => Ok(ComponentKind::Buffer),
             "codec" => Ok(ComponentKind::Codec),
+            "temporary" => Ok(ComponentKind::Temporary),
             other => Err(Error::Config(format!(
-                "Unknown component kind: {} (expected one of: input, output, processor, buffer, codec)",
+                "Unknown component kind: {} (expected one of: input, output, processor, buffer, codec, temporary)",
                 other
             ))),
         }
@@ -164,6 +168,8 @@ lazy_static::lazy_static! {
         RwLock::new(BTreeMap::new());
     static ref CODEC_METADATA: RwLock<BTreeMap<String, Arc<ComponentMetadata>>> =
         RwLock::new(BTreeMap::new());
+    static ref TEMPORARY_METADATA: RwLock<BTreeMap<String, Arc<ComponentMetadata>>> =
+        RwLock::new(BTreeMap::new());
 }
 
 macro_rules! register_metadata {
@@ -210,6 +216,11 @@ register_metadata!(
     CODEC_METADATA,
     ComponentKind::Codec
 );
+register_metadata!(
+    register_temporary_metadata,
+    TEMPORARY_METADATA,
+    ComponentKind::Temporary
+);
 
 macro_rules! list_metadata {
     ($fn_name:ident, $registry:ident) => {
@@ -226,6 +237,7 @@ list_metadata!(list_output_components, OUTPUT_METADATA);
 list_metadata!(list_processor_components, PROCESSOR_METADATA);
 list_metadata!(list_buffer_components, BUFFER_METADATA);
 list_metadata!(list_codec_components, CODEC_METADATA);
+list_metadata!(list_temporary_components, TEMPORARY_METADATA);
 
 /// Look up the metadata registry for a given kind.
 fn registry_for(kind: ComponentKind) -> &'static RwLock<BTreeMap<String, Arc<ComponentMetadata>>> {
@@ -235,6 +247,7 @@ fn registry_for(kind: ComponentKind) -> &'static RwLock<BTreeMap<String, Arc<Com
         ComponentKind::Processor => &PROCESSOR_METADATA,
         ComponentKind::Buffer => &BUFFER_METADATA,
         ComponentKind::Codec => &CODEC_METADATA,
+        ComponentKind::Temporary => &TEMPORARY_METADATA,
     }
 }
 
@@ -250,6 +263,7 @@ pub fn register_component_metadata(
         ComponentKind::Processor => register_processor_metadata(metadata),
         ComponentKind::Buffer => register_buffer_metadata(metadata),
         ComponentKind::Codec => register_codec_metadata(metadata),
+        ComponentKind::Temporary => register_temporary_metadata(metadata),
     }
 }
 
@@ -280,6 +294,44 @@ pub fn list_components() -> Vec<(ComponentKind, Arc<ComponentMetadata>)> {
                 .map(move |m| (kind, m))
         })
         .collect()
+}
+
+/// One component in the machine-readable registry export.
+#[derive(Serialize)]
+struct ComponentExportEntry {
+    kind: ComponentKind,
+    name: String,
+    description: String,
+    config_optional: bool,
+    config_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_example: Option<serde_json::Value>,
+}
+
+/// Serialize the full component registry as a deterministic JSON document:
+/// format `version` 2 with one entry per registered component carrying its
+/// kind, name, description, configuration schema, and example.
+///
+/// The output backs `components list --format json`, the committed
+/// documentation inventory, and its snapshot test, so all three consumers
+/// share one serializer and cannot diverge. Ordering is canonical kind order
+/// then name (the registries are `BTreeMap`s).
+pub fn export_registry() -> serde_json::Value {
+    let components: Vec<ComponentExportEntry> = list_components()
+        .into_iter()
+        .map(|(kind, m)| ComponentExportEntry {
+            kind,
+            name: m.name.clone(),
+            description: m.description.clone(),
+            config_optional: m.config_optional,
+            config_schema: m.config_schema.clone(),
+            config_example: m.config_example.clone(),
+        })
+        .collect();
+    serde_json::json!({
+        "version": 2,
+        "components": components
+    })
 }
 
 /// Build a JSON Schema describing the top-level engine configuration.
@@ -345,9 +397,19 @@ pub fn build_config_schema() -> serde_json::Value {
                 "type": "array",
                 "description": "List of stream processing pipelines.",
                 "items": {"$ref": "#/$defs/stream"}
+            },
+            "jobs": {
+                "type": "array",
+                "description": "Local Jobs declared directly in the configuration; they execute on the unified kernel without a Hub.",
+                "items": {"$ref": "#/$defs/job"}
             }
         },
-        "required": ["streams"]
+        // Streams and jobs are both optional individually (serde defaults),
+        // but a configuration carries at least one of them.
+        "anyOf": [
+            {"required": ["streams"]},
+            {"required": ["jobs"]}
+        ]
     });
 
     let defs = root.as_object_mut().unwrap();
@@ -359,6 +421,7 @@ pub fn build_config_schema() -> serde_json::Value {
     let processor_variants = variant_schemas(ComponentKind::Processor);
     let buffer_variants = variant_schemas(ComponentKind::Buffer);
     let codec_variants = variant_schemas(ComponentKind::Codec);
+    let temporary_variants = variant_schemas(ComponentKind::Temporary);
 
     let component_union =
         |variants: &serde_json::Value, kind: ComponentKind| -> serde_json::Value {
@@ -412,6 +475,13 @@ pub fn build_config_schema() -> serde_json::Value {
         component_union(&codec_variants, ComponentKind::Codec),
     );
     defs.insert(
+        "temporary".to_string(),
+        component_union(&temporary_variants, ComponentKind::Temporary),
+    );
+    defs.insert("job".to_string(), job_schema());
+    defs.insert("job_operator".to_string(), job_operator_schema_fragment());
+    defs.insert("job_source".to_string(), job_source_schema_fragment());
+    defs.insert(
         "stream".to_string(),
         serde_json::json!({
             "type": "object",
@@ -453,12 +523,210 @@ pub fn build_config_schema() -> serde_json::Value {
                         }
                     }
                 },
-                "buffer": {"$ref": "#/$defs/buffer"}
+                "buffer": {"$ref": "#/$defs/buffer"},
+                "temporary": {
+                    "type": "array",
+                    "description": "Optional temporary (lookup) components shared by the pipeline.",
+                    "items": {"$ref": "#/$defs/temporary"}
+                }
             }
         }),
     );
 
     root
+}
+
+/// Schema for one local Job (the `jobs` entry): the same JobSpec structure
+/// deserialization and deep validation accept, with strict
+/// additional-property checks.
+fn job_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "A local Job executed by the unified streaming kernel.",
+        "additionalProperties": false,
+        "required": ["id", "version", "operators", "edges", "sources", "sinks"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "description": "Job identity."
+            },
+            "version": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Monotonic Job version; upgrades restore compatible savepoints."
+            },
+            "max_parallelism": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Upper bound on physical task parallelism."
+            },
+            "parallelism": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Requested task parallelism."
+            },
+            "operators": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/job_operator"}
+            },
+            "edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "from", "to"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "partitioned": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Route by key hash instead of broadcasting."
+                        }
+                    }
+                }
+            },
+            "sources": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/job_source"}
+            },
+            "sinks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["operator_id", "output_type"],
+                    "properties": {
+                        "operator_id": {"type": "string"},
+                        "output_type": {"type": "string"},
+                        "config": {"type": "object"}
+                    }
+                }
+            },
+            "state": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["backend"],
+                "properties": {
+                    "backend": {
+                        "type": "string",
+                        "enum": ["embedded_kv", "redb"],
+                        "description": "Keyed-state backend (local execution)."
+                    },
+                    "namespace": {"type": "string"},
+                    "ttl_ms": {"type": "integer", "minimum": 0},
+                    "format_version": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1,
+                        "description": "State format contract; savepoint compatibility keys on it."
+                    },
+                    "max_pending_transactions": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum simultaneously staged state-journal transactions (one per open window group or unacknowledged output). Raise it with realistic capacity planning when a window sees very high per-window key cardinality."
+                    }
+                }
+            },
+            "checkpoint": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "interval_ms": {"type": "integer", "minimum": 1},
+                    "object_store_uri": {"type": "string"},
+                    "retention": {"type": "integer", "minimum": 1}
+                }
+            },
+            "recovery": {
+                "type": "string",
+                "enum": ["fail", "latest_checkpoint", "latest_savepoint"],
+                "default": "fail",
+                "description": "Recovery policy on restart."
+            }
+        }
+    })
+}
+
+/// Schema for one Job source entry.
+fn job_source_schema_fragment() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operator_id", "input_type", "time"],
+        "properties": {
+            "operator_id": {"type": "string"},
+            "input_type": {"type": "string"},
+            "config": {"type": "object"},
+            "time": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode"],
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["processing_time", "event_time"],
+                        "description": "Time semantics for this source."
+                    },
+                    "timestamp_field": {
+                        "type": "string",
+                        "description": "Event-time field (Int64 ms or an Arrow timestamp column)."
+                    },
+                    "watermark": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "strategy": {
+                                "type": "string",
+                                "enum": ["monotonous", "bounded_out_of_orderness"]
+                            },
+                            "out_of_orderness_ms": {"type": "integer", "minimum": 0},
+                            "idle_timeout_ms": {"type": "integer", "minimum": 0}
+                        }
+                    },
+                    "allowed_lateness_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Fired windows stay correctable (late Update) until end + lateness."
+                    },
+                    "late_event_policy": {
+                        "type": "string",
+                        "enum": ["drop", "update", "route"],
+                        "default": "drop"
+                    },
+                    "late_event_route": {
+                        "type": "string",
+                        "description": "Operator receiving routed late/invalid-timestamp rows."
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Schema for one Job operator entry.
+fn job_operator_schema_fragment() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind"],
+        "properties": {
+            "id": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "source", "map", "aggregate", "window", "join", "sink"
+                ]
+            },
+            "stateful": {"type": "boolean", "default": false},
+            "key_field": {"type": "string"},
+            "config": {"type": "object"}
+        }
+    })
 }
 
 /// Build the `oneOf` variant array for a given component kind. Each
@@ -619,10 +887,22 @@ mod tests {
         register_buffer_metadata(ComponentMetadata::unit(name, "Listing test.")).unwrap();
 
         let list = list_components();
-        let kinds: Vec<ComponentKind> = list.iter().map(|(k, _)| *k).collect();
-        let mut sorted = kinds.clone();
-        sorted.dedup();
-        assert_eq!(kinds, sorted, "kinds should appear in canonical order");
+        let canonical = ComponentKind::all();
+        let ranks: Vec<usize> = list
+            .iter()
+            .map(|(k, _)| {
+                canonical
+                    .iter()
+                    .position(|candidate| candidate == k)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        // Kinds must be grouped in canonical order. Other tests in this
+        // process share the global registry and may have left several
+        // entries for one kind, so allow repeats within a kind group.
+        let mut sorted_ranks = ranks.clone();
+        sorted_ranks.sort_unstable();
+        assert_eq!(ranks, sorted_ranks, "kinds should appear in canonical order");
 
         let found = list
             .iter()
@@ -648,5 +928,168 @@ mod tests {
             ),
             "registered component should appear in output schema variants"
         );
+    }
+
+    #[test]
+    fn export_registry_is_deterministic_and_typed() {
+        let _guard = REGISTER_LOCK.lock().unwrap();
+        register_temporary_metadata(ComponentMetadata::unit(
+            "test_export_temp",
+            "Export test.",
+        ))
+        .unwrap();
+        register_processor_metadata(
+            ComponentMetadata::with_schema(
+                "test_export_proc",
+                "Export processor.",
+                serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}}),
+            )
+            .with_example(serde_json::json!({"x": 1})),
+        )
+        .unwrap();
+
+        let first = export_registry();
+        let second = export_registry();
+        assert_eq!(first, second, "export must be deterministic");
+
+        assert_eq!(first["version"], 2);
+        let components = first["components"].as_array().unwrap();
+
+        // Entries appear in canonical kind order (input .. temporary) and
+        // name order within a kind.
+        let kind_rank = |k: &str| {
+            ComponentKind::all()
+                .iter()
+                .position(|kind| kind.as_str() == k)
+                .unwrap()
+        };
+        let ranks: Vec<usize> = components
+            .iter()
+            .map(|c| kind_rank(c["kind"].as_str().unwrap()))
+            .collect();
+        let mut sorted = ranks.clone();
+        sorted.sort();
+        assert_eq!(
+            ranks, sorted,
+            "entries must follow canonical kind order; saw {ranks:?}"
+        );
+
+        let temp = components
+            .iter()
+            .find(|c| c["name"] == "test_export_temp")
+            .expect("temporary component exported");
+        assert_eq!(temp["kind"], "temporary");
+        assert!(temp.get("config_example").is_none());
+
+        let proc = components
+            .iter()
+            .find(|c| c["name"] == "test_export_proc")
+            .expect("processor exported");
+        assert_eq!(proc["kind"], "processor");
+        assert_eq!(proc["config_example"]["x"], 1);
+        assert!(proc["config_schema"]["properties"]["x"].is_object());
+    }
+
+    #[test]
+    fn build_config_schema_exposes_temporary_kind() {
+        let _guard = REGISTER_LOCK.lock().unwrap();
+        let name = "test_schema_temporary";
+        register_temporary_metadata(ComponentMetadata::unit(name, "Schema temp.")).unwrap();
+
+        let schema = build_config_schema();
+        let temporary = schema
+            .pointer("/$defs/stream/properties/temporary")
+            .expect("stream schema exposes the temporary property");
+        assert_eq!(temporary["type"], "array");
+        let variants = schema
+            .pointer("/$defs/temporary/oneOf")
+            .expect("temporary variants present in $defs");
+        let variants = variants.as_array().unwrap();
+        assert!(
+            variants.iter().any(
+                |v| v.pointer("/properties/type/const").and_then(|c| c.as_str()) == Some(name)
+            ),
+            "registered temporary component should appear in schema variants"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    /// Task 6.3: the generated engine schema exposes the `jobs` property
+    /// and the JobSpec structure with strict additional-property checks.
+    #[test]
+    fn engine_schema_describes_local_jobs() {
+        let schema = build_config_schema();
+        let jobs = &schema["properties"]["jobs"];
+        assert_eq!(jobs["type"], "array", "the jobs property is exposed");
+        let defs = schema["$defs"].as_object().unwrap();
+        for definition in ["job", "job_operator", "job_source"] {
+            let job = defs.get(definition).expect(definition);
+            assert_eq!(job["type"], "object");
+            assert_eq!(
+                job["additionalProperties"], false,
+                "{definition} keeps strict additional-property checks"
+            );
+        }
+        let job = &defs["job"];
+        for field in [
+            "id",
+            "version",
+            "operators",
+            "edges",
+            "sources",
+            "sinks",
+            "state",
+            "checkpoint",
+            "recovery",
+        ] {
+            assert!(
+                job["properties"].get(field).is_some(),
+                "job schema exposes '{field}'"
+            );
+        }
+        // A jobs-only configuration is representable: neither `streams` nor
+        // `jobs` is in `required`, and `anyOf` demands at least one.
+        assert!(
+            schema.get("required").is_none(),
+            "streams and jobs are individually optional"
+        );
+        let any_of = schema["anyOf"].as_array().expect("at-least-one-of gate");
+        let requires_jobs = any_of.iter().any(|variant| {
+            variant["required"]
+                .as_array()
+                .map(|required| required.contains(&serde_json::json!("jobs")))
+                .unwrap_or(false)
+        });
+        let requires_streams = any_of.iter().any(|variant| {
+            variant["required"]
+                .as_array()
+                .map(|required| required.contains(&serde_json::json!("streams")))
+                .unwrap_or(false)
+        });
+        assert!(
+            requires_jobs,
+            "a jobs-only configuration satisfies the schema"
+        );
+        assert!(
+            requires_streams,
+            "a streams-only configuration satisfies it too"
+        );
+        // Deserialization agrees: a jobs-only config parses.
+        let jobs_only = serde_json::json!({
+            "jobs": [{
+                "id": "orders",
+                "version": 1,
+                "operators": [],
+                "edges": [],
+                "sources": [],
+                "sinks": []
+            }]
+        });
+        let parsed: Result<crate::config::EngineConfig, _> = serde_json::from_value(jobs_only);
+        assert!(parsed.is_ok(), "jobs-only deserializes: {parsed:?}");
     }
 }

@@ -84,6 +84,20 @@ pub struct StreamMetricsSnapshot {
     pub input_reconnects: u64,
     pub output_errors: u64,
     pub restarts: u64,
+    #[serde(default)]
+    pub kernel_chains: BTreeMap<String, crate::executor::metrics::ChainMetricsSnapshot>,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub mean_latency_us: u64,
+    #[serde(default)]
+    pub checkpoint_duration_ms: u64,
+    #[serde(default)]
+    pub checkpoint_failures: u64,
+    #[serde(default)]
+    pub watermark_lag_ms: u64,
+    #[serde(default)]
+    pub late_events: u64,
 }
 
 /// Public snapshot for one Stream.

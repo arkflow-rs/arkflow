@@ -141,6 +141,32 @@ pub trait WalStore: Send + Sync + 'static {
     /// should no-op when `seq <= current_cursor`.
     fn advance_cursor(&self, seq: u64) -> Result<(), Error>;
 
+    /// Move the committed cursor backwards to `seq` for acknowledgement
+    /// compensation. Backends that cannot durably rewind expose an error so a
+    /// caller never treats an un-compensated source commit as successful.
+    fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+        if seq >= self.cursor() {
+            return Ok(());
+        }
+        Err(Error::Process(
+            "WAL backend does not support cursor compensation".into(),
+        ))
+    }
+
+    /// Reclaim entries whose wrapped source commit has succeeded. `seq` is the
+    /// highest fully acknowledged sequence; every entry strictly below it is
+    /// past both the cursor and the source commit.
+    ///
+    /// Entries must NOT be reclaimed when the cursor merely advances: the
+    /// acknowledgement path advances the cursor before the wrapped source
+    /// commit and compensates with [`Self::rewind_cursor`], so an entry above
+    /// the reclaim floor is what makes that compensation replayable. Backends
+    /// that reclaim on their own committed boundary (for example the
+    /// object-store segment writer) leave this as a no-op.
+    fn mark_committed(&self, _seq: u64) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error>;
@@ -328,6 +354,59 @@ impl WalStore for RedbStore {
         Ok(())
     }
 
+    fn mark_committed(&self, seq: u64) -> Result<(), Error> {
+        // Only the source's own commit may reclaim: the caller advances the
+        // cursor before it invokes the wrapped source acknowledgement, so an
+        // entry the cursor has passed is still replayable through
+        // `rewind_cursor` until this call. Deleting below `seq` — never `seq`
+        // itself, which a rewind to `seq - 1` must still be able to replay —
+        // is what keeps the local store from growing with total throughput.
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
+        let floor = seq.saturating_sub(1);
+        if floor > 0 {
+            let mut entries = tx
+                .open_table(ENTRIES)
+                .map_err(|e| Error::Process(format!("WAL entries open failed: {}", e)))?;
+            let mut reclaimed = Vec::new();
+            for item in entries
+                .range(..=floor)
+                .map_err(|e| Error::Process(format!("WAL reclaim scan failed: {}", e)))?
+            {
+                let (key, _) =
+                    item.map_err(|e| Error::Process(format!("WAL reclaim scan failed: {}", e)))?;
+                reclaimed.push(key.value());
+            }
+            for key in reclaimed {
+                entries
+                    .remove(key)
+                    .map_err(|e| Error::Process(format!("WAL reclaim failed: {}", e)))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Process(format!("WAL write failed: {}", e)))?;
+        {
+            let mut meta = tx
+                .open_table(META)
+                .map_err(|e| Error::Process(format!("WAL meta open failed: {}", e)))?;
+            meta.insert(CURSOR_KEY, seq)
+                .map_err(|e| Error::Process(format!("WAL meta write failed: {}", e)))?;
+        }
+        tx.commit()
+            .map_err(|e| Error::Process(format!("WAL commit failed: {}", e)))?;
+        Ok(())
+    }
+
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
         let tx = self
             .db
@@ -370,11 +449,10 @@ impl WalStore for RedbStore {
     }
 
     fn next_seq_hint(&self) -> u64 {
-        // For local redb we know the exact max seq. Anything simpler would
-        // under-count after a restart where the cursor advanced past the
-        // tail of the table.
+        // Reclaim removes acked entries, so the max KEY can lag the cursor:
+        // the next sequence must never reuse or fall below an acked one.
         self.max_seq()
-            .map(|m| m.saturating_add(1))
+            .map(|m| m.max(self.cursor()).saturating_add(1))
             .unwrap_or(1)
             .max(1)
     }
@@ -497,5 +575,140 @@ mod tests {
 
         // Close is a no-op for redb (drops on last `Arc`).
         store.close().unwrap();
+    }
+
+    fn local_store(label: &str) -> (Arc<dyn WalStore>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "arkflow-wal-{label}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        (LocalStoreBuilder.build(&cfg).unwrap(), dir)
+    }
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    /// Regression: the acknowledgement path advances the cursor BEFORE the
+    /// wrapped source commit and compensates with `rewind_cursor`. Reclaiming
+    /// at `advance_cursor` deleted the very entry that compensation has to
+    /// replay, so a source that cannot re-deliver lost the record silently.
+    #[test]
+    fn rewind_after_advance_keeps_the_unwound_entry_replayable() {
+        let (store, dir) = local_store("rewind");
+        let payload = serialize(&sample_batch(Some("kafka"))).unwrap();
+        store
+            .append_batch(vec![
+                (1, payload.clone()),
+                (2, payload.clone()),
+                (3, payload.clone()),
+            ])
+            .unwrap();
+
+        // Ack 1 → cursor 1, nothing reclaimed (no source commit yet).
+        store.advance_cursor(1).unwrap();
+        // Ack 2's source commit fails: the cursor is compensated to 1.
+        store.advance_cursor(2).unwrap();
+        store.rewind_cursor(1).unwrap();
+
+        // Sequence 2 must still be replayable: its acknowledgement never
+        // completed at the source.
+        let replayed = store.read_after_cursor().unwrap();
+        assert_eq!(
+            replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "the unwound entry must survive the cursor compensation"
+        );
+
+        // Only a successful source commit reclaims: seq 2's own commit removes
+        // seq 1 (strictly below), and seq 2 stays replayable until its own.
+        store.mark_committed(2).unwrap();
+        let replayed = store.read_after_cursor().unwrap();
+        assert_eq!(
+            replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        // After seq 3 commits, only 3 remains and the next sequence clears the
+        // persisted cursor.
+        store.mark_committed(3).unwrap();
+        assert_eq!(
+            store
+                .read_after_cursor()
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        let hint = store.next_seq_hint();
+        assert!(
+            hint > store.cursor(),
+            "next sequence {hint} must be greater than the persisted cursor {}",
+            store.cursor()
+        );
+
+        // A reopened store keeps the same guarantee.
+        store.close().unwrap();
+        drop(store);
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let reopened = LocalStoreBuilder.build(&cfg).unwrap();
+        assert_eq!(reopened.next_seq_hint(), hint);
+        let replayed = reopened.read_after_cursor().unwrap();
+        assert_eq!(
+            replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    /// A successful source commit reclaims what it covers and nothing above
+    /// it, so the store does not grow with total throughput.
+    #[test]
+    fn committed_floor_reclaims_below_and_keeps_the_floor_entry() {
+        let (store, _dir) = local_store("reclaim");
+        let payload = serialize(&sample_batch(None)).unwrap();
+        store
+            .append_batch(
+                (1..=5)
+                    .map(|seq| (seq, payload.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        store.advance_cursor(4).unwrap();
+        store.mark_committed(4).unwrap();
+        assert_eq!(
+            store
+                .read_after_cursor()
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![5],
+            "entries below the committed floor are reclaimed"
+        );
+
+        // The floor entry itself survives: a compensation that rewinds the
+        // cursor back onto it must still be able to replay it.
+        store.rewind_cursor(3).unwrap();
+        assert_eq!(
+            store
+                .read_after_cursor()
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5],
+            "the floor entry stays replayable for a cursor compensation"
+        );
     }
 }

@@ -26,3 +26,28 @@ pub mod temporary;
 pub mod time;
 pub mod udf;
 pub mod wal;
+
+use arkflow_core::Error;
+use std::sync::OnceLock;
+
+static INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Register the built-in component catalogue once per process.
+///
+/// Both the local Engine and the standalone Hub expose this metadata to
+/// operators, so their startup paths must share one idempotent initializer.
+pub fn initialize() -> Result<(), Error> {
+    match INITIALIZATION.get_or_init(|| {
+        input::init()
+            .and_then(|_| output::init())
+            .and_then(|_| processor::init())
+            .and_then(|_| buffer::init())
+            .and_then(|_| temporary::init())
+            .and_then(|_| codec::init())
+            .and_then(|_| wal::init())
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Error::Config(error.clone())),
+    }
+}

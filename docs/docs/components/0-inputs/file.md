@@ -1,4 +1,5 @@
 ---
+components: [file]
 sidebar_label: File
 ---
 

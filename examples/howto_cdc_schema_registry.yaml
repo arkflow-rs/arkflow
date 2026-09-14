@@ -1,0 +1,46 @@
+# How-to: CDC via Debezium with Confluent Schema Registry.
+#
+# Same pipeline as examples/cdc_debezium.yaml, but the Kafka records carry
+# Confluent wire-format Protobuf instead of JSON: the `schema_registry`
+# codec resolves the schema id from the registry and decodes the envelope
+# payload. Envelope fields land on the batch exactly as with `debezium_json`
+# (op, ts_ms, source_db, source_table, before, source).
+#
+# Validate offline:
+#   ./target/release/arkflow --config examples/howto_cdc_schema_registry.yaml --validate
+
+logging:
+  level: info
+
+streams:
+  - id: cdc-schema-registry
+    input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - shop.users
+      consumer_group: arkflow-cdc-sr
+      client_id: arkflow-cdc-sr
+      start_from_latest: true
+      codec:
+        type: schema_registry
+        registry_url: "http://localhost:8081"
+        message_type: "shop.Users"
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: sql
+          query: |
+            SELECT
+              op,
+              id,
+              name,
+              source_db,
+              source_table,
+              ts_ms
+            FROM flow
+
+    output:
+      type: stdout

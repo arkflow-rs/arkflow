@@ -1,4 +1,5 @@
 ---
+components: [protobuf]
 sidebar_label: Protobuf
 ---
 

@@ -5,8 +5,9 @@ sidebar_position: 1
 # Top-level configuration
 
 An ArkFlow configuration describes the engine: logging, the health-check /
-control-plane server, and the list of streams to run. The file format is
-selected by extension — `.yaml`/`.yml`, `.json`, or `.toml` are all accepted.
+control-plane server, the list of streams to run, and optional streaming
+`jobs` executed by the unified kernel. The file format is selected by
+extension — `.yaml`/`.yml`, `.json`, or `.toml` are all accepted.
 
 ```yaml
 logging:
@@ -21,15 +22,20 @@ streams:
     input:    { ... }
     pipeline: { ... }
     output:   { ... }
+
+jobs: []      # optional declarative streaming jobs, see "job" below
 ```
 
 ## Top-level fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `streams` | array&lt;[stream](#stream)&gt; | yes | — | Streams to run. |
+| `streams` | array&lt;[stream](#stream)&gt; | yes* | — | Streams to run. |
+| `jobs` | array&lt;[job](#job)&gt; | no | `[]` | Declarative streaming jobs (DAG + time + state + checkpoint) run by the unified kernel. |
 | `logging` | object | no | see below | Logging configuration. |
 | `health_check` | object | no | see below | Health-check and control-plane server. |
+
+\* Both `streams` and `jobs` default to empty lists; a jobs-only configuration is valid (declare `streams: []` or omit it).
 
 ## `logging`
 
@@ -60,6 +66,7 @@ API and the Hub agent when `hub_url` is set (see
 | `node_id` | string | no | — | Stable identity this process reports to its Hub. |
 | `node_token` | string | no | — | Shared node registration credential. Never included in reports. |
 | `agent_lease_ttl_ms` | integer | no | `15000` | Lease duration (ms) a compute node advertises to its Hub. |
+| `agent_session_ttl_ms` | integer | no | `3600000` | Hard lifetime (ms) of a Hub-issued agent session credential; the Agent re-registers transparently when it elapses. |
 
 ## stream
 
@@ -85,6 +92,71 @@ the shape is:
 | `thread_num` | integer | no | `1` | Number of processor worker tasks. |
 | `processors` | array&lt;object&gt; | yes | — | Ordered list of processor components. |
 
+## job
+
+Each entry in `jobs` is a declarative streaming job: an operator DAG with
+explicit event-time, state, checkpoint, and recovery settings. Jobs run
+locally through the same unified kernel as streams, and the same job shape is
+what the Hub distributes to compute nodes (see
+[Distributed jobs](../concepts/7-distributed-jobs.md)).
+
+```yaml
+jobs:
+  - id: local-job
+    version: 1
+    parallelism: 1
+    max_parallelism: 128
+    operators:
+      - { id: source, kind: source }
+      - { id: sink, kind: sink }
+    edges:
+      - { id: e1, from: source, to: sink, partitioned: true }
+    sources:
+      - operator_id: source
+        input_type: generate
+        config: { type: generate, context: '{"value": 1}', interval: 1s, batch_size: 10 }
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+    recovery: latest_checkpoint
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | yes | — | Stable job identifier; must be unique across `jobs`. |
+| `version` | integer | yes | — | Job version; state-format compatibility on recovery is evaluated against it. |
+| `parallelism` | integer | no | `1` | Default task parallelism. |
+| `max_parallelism` | integer | no | `128` | Upper bound used for key-group partitioning. |
+| `operators` | array&lt;object&gt; | yes | — | DAG nodes: `id`, `kind` (`source`, `map`, `filter`, `aggregate`, `window`, `join`, `sink`, `udf`), `stateful`, `key_field`, `config`. |
+| `edges` | array&lt;object&gt; | no | `[]` | DAG edges: `id`, `from`, `to`, `partitioned` (key-group routing instead of same-subtask). |
+| `sources` | array&lt;object&gt; | no | `[]` | Attach a component input to a `source` operator: `operator_id`, `input_type`, `config`, `time`. |
+| `sinks` | array&lt;object&gt; | no | `[]` | Attach a component output to a `sink` operator: `operator_id`, `output_type`, `config`. |
+| `state` | object | no | — | `backend` (e.g. `embedded_kv`), `namespace`, `ttl_ms`, `format_version`, `max_pending_transactions` (positive; default 4096; raise it when a window sees very high per-window key cardinality, since one transaction is held per open window group or unacknowledged output). Required by stateful operators. |
+| `checkpoint` | object | no | — | `interval_ms`, `retention`, `object_store_uri` (e.g. `file://...` or `s3://...`). |
+| `recovery` | string | no | `latest_checkpoint` | `latest_checkpoint`, `latest_savepoint`, or `fail`. |
+
+### `time` (source event-time declaration)
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `mode` | string | yes | — | `event_time` or `processing_time`. |
+| `timestamp_field` | string | no | — | Field read as the event timestamp when `mode: event_time`. |
+| `watermark` | object | no | — | `strategy` (`bounded_out_of_orderness` (default) or `monotonous`), `out_of_orderness_ms`, `idle_timeout_ms`. |
+| `allowed_lateness_ms` | integer | no | `0` | How far past the watermark late events are still accepted. |
+| `late_event_policy` | string | no | `drop` | What happens to late events: `drop`, `route`, or `update`. |
+| `late_event_route` | string | no | — | Operator receiving routed late events when the policy is `route`. |
+
+:::note
+Intermediate operator kinds (`map`, `filter`, `aggregate`, `window`, `join`,
+`udf`) are primarily produced by the streaming SQL compiler and the console
+DAG orchestrator today. Always run `--validate` before deploying: it performs
+the same deep build checks as startup and rejects unsupported operators or
+state backends explicitly. `./target/release/arkflow schema` emits the
+authoritative JSON Schema, including the `jobs` fields, for editor completion.
+:::
+
 ## Validate before running
 
 Always validate a config first:
@@ -99,3 +171,7 @@ completion:
 ```bash
 ./target/release/arkflow schema > arkflow.schema.json
 ```
+
+A pre-generated schema ships with the documentation at
+[`/config-schema.json`](/config-schema.json); see
+[IDE auto-completion](2-ide-schema.md) for editor setup.

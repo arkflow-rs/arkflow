@@ -181,11 +181,61 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
             message: error.to_string(),
         });
     }
+    // Keep the standalone validation entry point equivalent to Engine startup
+    // and the configuration control plane: Job identity/spec validation must
+    // happen even when this function is called directly, without the caller
+    // first invoking `EngineConfig::job_specs()`.
+    if let Err(error) = config.job_specs() {
+        errors.push(ConfigIssue {
+            path: "jobs".to_string(),
+            message: error.to_string(),
+        });
+    }
 
     for (index, stream) in config.streams.iter().enumerate() {
-        if let Err(error) = stream.build() {
+        // Kernel-equivalent validation: compile to a JobSpec, then dry-run
+        // component construction and graph building (unknown inputs,
+        // processors, temporaries, and broken graphs all surface here). The
+        // validation adapter never opens the durable WAL — validation must
+        // not hold the redb exclusive lock the real startup needs; the WAL
+        // configuration itself is validated synchronously.
+        if let Err(error) = (|| -> Result<(), crate::Error> {
+            if let Some(durability) = stream.durability.as_ref() {
+                durability.validate()?;
+            }
+            let spec = crate::executor::stream_compiler::compile_stream(stream, index)?;
+            // Do not open the stream WAL in the synchronous configuration
+            // validator. The durability contract is checked above, while the
+            // real start path owns the async open/close lifecycle; opening a
+            // group-commit WAL here would leave its flusher task outside this
+            // synchronous function and can retain the redb lock.
+            let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                None,
+                stream.temporary.clone(),
+            )?;
+            let mut resource = adapter.build_resource()?;
+            let plan = crate::job::JobPlan::compile(spec)?;
+            crate::executor::graph::ExecutionGraphBuilder::default().build(
+                &plan,
+                &adapter,
+                &mut resource,
+            )?;
+            Ok(())
+        })() {
             errors.push(ConfigIssue {
                 path: format!("streams[{index}]"),
+                message: error.to_string(),
+            });
+        }
+    }
+    for (index, job) in config.jobs.iter().enumerate() {
+        // The SAME side-effect-free deep build the real startup uses:
+        // unknown components, unsupported backends, and invalid graph edges
+        // surface here instead of at runtime. Constructed state backends
+        // drop with the build (releasing their locks) before returning.
+        if let Err(error) = crate::executor::job_runner_adapter::validate_local_job(job) {
+            errors.push(ConfigIssue {
+                path: format!("jobs[{index}]"),
                 message: error.to_string(),
             });
         }

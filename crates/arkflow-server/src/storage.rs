@@ -4,8 +4,8 @@
 //! repository schema is deliberately independent from HTTP and Hub types so
 //! the state machine can later move to a server database.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -210,6 +210,87 @@ pub struct PersistedOperation {
     pub operation_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub job_id: String,
+    pub version: u64,
+    pub spec_json: String,
+    pub desired_state: String,
+    pub observed_state: String,
+    pub convergence: String,
+    pub generation: u64,
+    pub node_ids: Vec<String>,
+    pub checkpoint_id: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobVersionRecord {
+    pub job_id: String,
+    pub version: u64,
+    pub spec_json: String,
+    pub plan_json: String,
+    pub created_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAssignmentRecord {
+    pub job_id: String,
+    pub generation: u64,
+    pub task_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub updated_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCheckpointRecord {
+    pub job_id: String,
+    /// Job version that produced this artifact. Recovery must never reuse a
+    /// checkpoint from a prior deployment of the same logical Job id.
+    pub job_version: u64,
+    pub checkpoint_id: String,
+    pub kind: String,
+    pub status: String,
+    pub manifest_uri: Option<String>,
+    pub format_version: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobObservationRecord {
+    pub job_id: String,
+    pub node_id: String,
+    pub boot_id: Option<String>,
+    pub report_seq: u64,
+    pub generation: u64,
+    pub state: String,
+    pub convergence: String,
+    pub checkpoint_id: Option<String>,
+    pub snapshot_json: String,
+    pub observed_at_ms: u64,
+}
+
+fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
+    let node_ids_json: String = row.get(7)?;
+    let node_ids = serde_json::from_str(&node_ids_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(JobRecord {
+        job_id: row.get(0)?,
+        version: row.get(1)?,
+        spec_json: row.get(2)?,
+        desired_state: row.get(3)?,
+        observed_state: row.get(4)?,
+        convergence: row.get(5)?,
+        generation: row.get(6)?,
+        node_ids,
+        checkpoint_id: row.get(8)?,
+        last_error: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RolloutTargetUpdate {
     pub rollout_id: String,
@@ -280,8 +361,75 @@ pub struct ControlPlaneStore {
 }
 
 enum StorageCommand {
+    UpsertJob {
+        job: JobRecord,
+        response: oneshot::Sender<Result<JobRecord, StorageError>>,
+    },
+    UpdateJobWithExpectedGeneration {
+        job: JobRecord,
+        expected_generation: u64,
+        response: oneshot::Sender<Result<JobRecord, StorageError>>,
+    },
+    GetJob {
+        job_id: String,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    ListJobs {
+        response: oneshot::Sender<Result<Vec<JobRecord>, StorageError>>,
+    },
+    UpsertJobVersion {
+        record: JobVersionRecord,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ListJobVersions {
+        job_id: String,
+        response: oneshot::Sender<Result<Vec<JobVersionRecord>, StorageError>>,
+    },
+    UpdateJob {
+        job_id: String,
+        desired_state: Option<String>,
+        observed_state: Option<String>,
+        convergence: Option<String>,
+        generation: Option<u64>,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    UpdateJobObservation {
+        job_id: String,
+        observed_state: String,
+        convergence: String,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    UpdateJobDesiredState {
+        job_id: String,
+        desired_state: String,
+        expected_generation: u64,
+        response: oneshot::Sender<Result<Option<JobRecord>, StorageError>>,
+    },
+    UpsertJobCheckpoint {
+        record: JobCheckpointRecord,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ListJobCheckpoints {
+        job_id: String,
+        response: oneshot::Sender<Result<Vec<JobCheckpointRecord>, StorageError>>,
+    },
+    DeleteJobCheckpoint {
+        job_id: String,
+        checkpoint_id: String,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
     UpsertNode {
         mutation: NodeMutation,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ResetObservedCursors {
+        node_id: String,
         response: oneshot::Sender<Result<(), StorageError>>,
     },
     SetDesired {
@@ -316,6 +464,30 @@ enum StorageCommand {
     },
     PruneEvents {
         retain: usize,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneOperationHistory {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneJobCheckpointRecords {
+        older_than_ms: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneAuditEvents {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneProcessedOutbox {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    PruneTerminalAttempts {
+        older_than_ms: i64,
+        max_retained: i64,
         response: oneshot::Sender<Result<usize, StorageError>>,
     },
     ClaimAttempt {
@@ -438,8 +610,100 @@ impl StorageActor {
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 match command {
+                    StorageCommand::UpsertJob { job, response } => {
+                        let _ = response.send(store.upsert_job(job));
+                    }
+                    StorageCommand::UpdateJobWithExpectedGeneration {
+                        job,
+                        expected_generation,
+                        response,
+                    } => {
+                        let _ = response.send(
+                            store.update_job_with_expected_generation(job, expected_generation),
+                        );
+                    }
+                    StorageCommand::GetJob { job_id, response } => {
+                        let _ = response.send(store.get_job(&job_id));
+                    }
+                    StorageCommand::ListJobs { response } => {
+                        let _ = response.send(store.list_jobs());
+                    }
+                    StorageCommand::UpsertJobVersion { record, response } => {
+                        let _ = response.send(store.upsert_job_version(record));
+                    }
+                    StorageCommand::ListJobVersions { job_id, response } => {
+                        let _ = response.send(store.list_job_versions(&job_id));
+                    }
+                    StorageCommand::UpdateJob {
+                        job_id,
+                        desired_state,
+                        observed_state,
+                        convergence,
+                        generation,
+                        checkpoint_id,
+                        last_error,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job(
+                            &job_id,
+                            desired_state.as_deref(),
+                            observed_state.as_deref(),
+                            convergence.as_deref(),
+                            generation,
+                            checkpoint_id.as_deref(),
+                            last_error.as_deref(),
+                        ));
+                    }
+                    StorageCommand::UpdateJobObservation {
+                        job_id,
+                        observed_state,
+                        convergence,
+                        generation,
+                        expected_generation,
+                        checkpoint_id,
+                        last_error,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job_observation(
+                            &job_id,
+                            &observed_state,
+                            &convergence,
+                            generation,
+                            expected_generation,
+                            checkpoint_id.as_deref(),
+                            last_error.as_deref(),
+                        ));
+                    }
+                    StorageCommand::UpdateJobDesiredState {
+                        job_id,
+                        desired_state,
+                        expected_generation,
+                        response,
+                    } => {
+                        let _ = response.send(store.update_job_desired_state(
+                            &job_id,
+                            &desired_state,
+                            expected_generation,
+                        ));
+                    }
+                    StorageCommand::UpsertJobCheckpoint { record, response } => {
+                        let _ = response.send(store.upsert_job_checkpoint(record));
+                    }
+                    StorageCommand::ListJobCheckpoints { job_id, response } => {
+                        let _ = response.send(store.list_job_checkpoints(&job_id));
+                    }
+                    StorageCommand::DeleteJobCheckpoint {
+                        job_id,
+                        checkpoint_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id));
+                    }
                     StorageCommand::UpsertNode { mutation, response } => {
                         let _ = response.send(store.upsert_node(mutation));
+                    }
+                    StorageCommand::ResetObservedCursors { node_id, response } => {
+                        let _ = response.send(store.reset_observed_cursors(&node_id));
                     }
                     StorageCommand::SetDesired { mutation, response } => {
                         let _ = response.send(store.set_desired(mutation));
@@ -475,6 +739,44 @@ impl StorageActor {
                     }
                     StorageCommand::PruneEvents { retain, response } => {
                         let _ = response.send(store.prune_events(retain));
+                    }
+                    StorageCommand::PruneOperationHistory {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_operation_history(older_than_ms, max_retained));
+                    }
+                    StorageCommand::PruneJobCheckpointRecords {
+                        older_than_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.prune_job_checkpoint_records(older_than_ms));
+                    }
+                    StorageCommand::PruneAuditEvents {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ =
+                            response.send(store.prune_audit_events(older_than_ms, max_retained));
+                    }
+                    StorageCommand::PruneProcessedOutbox {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_processed_outbox(older_than_ms, max_retained));
+                    }
+                    StorageCommand::PruneTerminalAttempts {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_terminal_attempts(older_than_ms, max_retained));
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
@@ -627,6 +929,198 @@ impl StorageActor {
         Self { sender }
     }
 
+    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJob { job, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_with_expected_generation(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobWithExpectedGeneration {
+                job,
+                expected_generation,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_job(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetJob {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobs { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJobVersion { record, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_job_versions(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Vec<JobVersionRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobVersions {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_job(
+        &self,
+        job_id: impl Into<String>,
+        desired_state: Option<String>,
+        observed_state: Option<String>,
+        convergence: Option<String>,
+        generation: Option<u64>,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJob {
+                job_id: job_id.into(),
+                desired_state,
+                observed_state,
+                convergence,
+                generation,
+                checkpoint_id,
+                last_error,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_observation(
+        &self,
+        job_id: impl Into<String>,
+        observed_state: impl Into<String>,
+        convergence: impl Into<String>,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<String>,
+        last_error: Option<String>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobObservation {
+                job_id: job_id.into(),
+                observed_state: observed_state.into(),
+                convergence: convergence.into(),
+                generation,
+                expected_generation,
+                checkpoint_id,
+                last_error,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn update_job_desired_state(
+        &self,
+        job_id: impl Into<String>,
+        desired_state: impl Into<String>,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpdateJobDesiredState {
+                job_id: job_id.into(),
+                desired_state: desired_state.into(),
+                expected_generation,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn upsert_job_checkpoint(
+        &self,
+        record: JobCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJobCheckpoint { record, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_job_checkpoints(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobCheckpoints {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn delete_job_checkpoint(
+        &self,
+        job_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::DeleteJobCheckpoint {
+                job_id: job_id.into(),
+                checkpoint_id: checkpoint_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
     pub async fn set_desired(
         &self,
         mutation: DesiredMutation,
@@ -643,6 +1137,21 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::UpsertNode { mutation, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn reset_observed_cursors(
+        &self,
+        node_id: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ResetObservedCursors {
+                node_id: node_id.into(),
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -757,6 +1266,102 @@ impl StorageActor {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(StorageCommand::PruneEvents { retain, response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Bounded retention for the durable operation history: terminal
+    /// operation rows older than `older_than_ms` are deleted, and beyond
+    /// `max_retained` the oldest terminal rows are dropped. Active rows are
+    /// never touched.
+    pub async fn prune_operation_history(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneOperationHistory {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim pending/failed checkpoint attempt records older than
+    /// `older_than_ms`; completed records are managed by the checkpoint
+    /// retention policy instead.
+    pub async fn prune_job_checkpoint_records(
+        &self,
+        older_than_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneJobCheckpointRecords {
+                older_than_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn prune_audit_events(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneAuditEvents {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim processed reconciliation outbox rows by age and count bound.
+    /// Unprocessed rows — pending or claimed — are the outstanding work queue
+    /// and are never touched.
+    pub async fn prune_processed_outbox(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneProcessedOutbox {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Reclaim terminal Attempt records by age and count bound. Active
+    /// attempts (queued/dispatched/acknowledged/running) are never touched;
+    /// the `cp_one_active_attempt` unique index relies on their presence.
+    pub async fn prune_terminal_attempts(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneTerminalAttempts {
+                older_than_ms,
+                max_retained,
+                response,
+            })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1324,6 +1929,22 @@ impl ControlPlaneStore {
         })
     }
 
+    /// Reset every per-stream report cursor for a node. The Agent restarts
+    /// `report_seq` from 1 on each session rebuild (register), so a cursor
+    /// left at the previous session's high-water mark would silently drop
+    /// every new report until the node caught up to it — blinding stream
+    /// convergence, configuration rollout, and reconcile for the whole
+    /// previous session's duration.
+    pub fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE cp_stream_observed SET report_seq = 0 WHERE node_id = ?1",
+                rusqlite::params![node_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn set_node_maintenance(
         &self,
         mutation: NodeMaintenanceMutation,
@@ -1584,6 +2205,98 @@ impl ControlPlaneStore {
         })
     }
 
+    pub fn prune_operation_history(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND updated_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            // Count bound: keep the newest `max_retained` terminal rows when
+            // long-lived deployments accumulate faster than the age window
+            // reclaims them.
+            deleted += transaction.execute(
+                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND operation_id NOT IN (SELECT operation_id FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    pub fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let deleted = transaction.execute(
+                "DELETE FROM cp_job_checkpoints WHERE status IN ('pending', 'failed') AND updated_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim audit history by age and count bound. Recent records within
+    /// both bounds always survive; the trail stays queryable but bounded.
+    pub fn prune_audit_events(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_audit_events WHERE occurred_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_audit_events WHERE event_id NOT IN (SELECT event_id FROM cp_audit_events ORDER BY event_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim processed outbox rows by age and count bound. Rows still
+    /// awaiting processing (pending or claimed) are never reclaimed.
+    pub fn prune_processed_outbox(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND processed_at_ms < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND outbox_id NOT IN (SELECT outbox_id FROM cp_outbox WHERE processed_at_ms IS NOT NULL ORDER BY processed_at_ms DESC, outbox_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    /// Reclaim terminal Attempt records by age and count bound. Active
+    /// attempts are protected by both the state predicate and the
+    /// `cp_one_active_attempt` unique index.
+    pub fn prune_terminal_attempts(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut deleted = transaction.execute(
+                "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND COALESCE(finished_at_ms, created_at_ms) < ?1",
+                [older_than_ms],
+            )?;
+            deleted += transaction.execute(
+                "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND attempt_id NOT IN (SELECT attempt_id FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY COALESCE(finished_at_ms, created_at_ms) DESC, attempt_id DESC LIMIT ?1)",
+                [max_retained],
+            )?;
+            Ok(deleted)
+        })
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
         self.immediate_transaction(|transaction| {
@@ -1836,10 +2549,24 @@ impl ControlPlaneStore {
                 )
                 .optional()?;
             if let Some((boot_id, report_seq)) = current {
-                if boot_id.as_deref() == mutation.boot_id.as_deref()
-                    && mutation.report_seq <= report_seq
-                {
-                    return Ok(());
+                match (boot_id.as_deref(), mutation.boot_id.as_deref()) {
+                    // Same fencible session: the sequence cursor rejects
+                    // replays (every report of a session carries a strictly
+                    // increasing seq).
+                    (Some(stored), Some(incoming)) if stored == incoming => {
+                        if mutation.report_seq <= report_seq {
+                            return Ok(());
+                        }
+                    }
+                    // No fencible identity on either side: boot-less agents
+                    // report seq 0 forever, so a seq gate here would freeze
+                    // the observed state at the first report. Accept the
+                    // report; convergence runs on its content.
+                    (None, None) => {}
+                    // The session identity changed (an agent re-registered
+                    // with or without a boot id): the incoming report
+                    // supersedes the stored session.
+                    _ => {}
                 }
             }
             let now = now_ms();
@@ -2308,6 +3035,354 @@ impl ControlPlaneStore {
         })
     }
 
+    pub fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            let current_generation = connection
+                .query_row(
+                    "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                    [&job.job_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?;
+            job.generation = current_generation
+                .map(|generation| generation.saturating_add(1))
+                .unwrap_or_else(|| job.generation.max(1));
+            let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
+                StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
+            connection.execute(
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    job.job_id,
+                    job.version,
+                    job.spec_json,
+                    job.desired_state,
+                    job.observed_state,
+                    job.convergence,
+                    job.generation,
+                    node_ids,
+                    job.checkpoint_id,
+                    job.last_error,
+                    job.updated_at_ms,
+                ],
+            )?;
+            Ok(job)
+        })
+    }
+
+    /// Replace a Job record only when its stored generation still matches
+    /// `expected_generation`, bumping the generation on success. The
+    /// upgrade/rollback handlers read the Job, await several round trips and
+    /// then write: without this CAS a concurrent desired-state change that
+    /// bumps the generation can be silently overwritten by the older read.
+    ///
+    /// The recovery pointer is not written: it belongs to the checkpoint path,
+    /// which moves it without bumping the generation, so a rollback copying its
+    /// earlier read back would regress recovery to a checkpoint retention may
+    /// already have deleted.
+    pub fn update_job_with_expected_generation(
+        &self,
+        mut job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            job.generation = expected_generation.saturating_add(1);
+            let node_ids = serde_json::to_string(&job.node_ids).map_err(|error| {
+                StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
+            // The recovery pointer is fenced by PRESERVATION: a checkpoint
+            // that lands between the caller's read and this write updated the
+            // `checkpoint_id` is deliberately NOT in the SET list: the
+            // recovery pointer is owned by the checkpoint path, which updates
+            // it without bumping the generation (see `update_job`). A
+            // conditional write that copied the caller's older read back would
+            // regress recovery to a pointer retention may already have deleted.
+            // The version/spec change from a rollback does not need to re-point
+            // recovery: selection filters artifacts by job version and state
+            // format, so preserving the newest pointer is both safe and the
+            // only choice that cannot regress.
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=? WHERE job_id=? AND generation=?",
+                rusqlite::params![
+                    job.version,
+                    job.spec_json,
+                    job.desired_state,
+                    job.observed_state,
+                    job.convergence,
+                    job.generation,
+                    node_ids,
+                    job.last_error,
+                    job.updated_at_ms,
+                    job.job_id,
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [&job.job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return Err(StorageError::GenerationConflict {
+                    expected: expected_generation,
+                    current: current.unwrap_or(0),
+                });
+            }
+            // Report the row as stored: the recovery pointer may have been
+            // preserved from a concurrent checkpoint rather than taken from the
+            // request, and the caller caches this record.
+            let stored = connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [&job.job_id],
+                    row_to_job,
+                )
+                .optional()?;
+            Ok(stored.unwrap_or(job))
+        })
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()
+        })
+    }
+
+    pub fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_job_versions (job_id, version, spec_json, plan_json, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(job_id, version) DO UPDATE SET spec_json=excluded.spec_json, plan_json=excluded.plan_json",
+                rusqlite::params![
+                    record.job_id,
+                    record.version,
+                    record.spec_json,
+                    record.plan_json,
+                    record.created_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, version, spec_json, plan_json, created_at_ms FROM cp_job_versions WHERE job_id = ?1 ORDER BY version DESC",
+            )?;
+            let rows = statement.query_map([job_id], |row| {
+                Ok(JobVersionRecord {
+                    job_id: row.get(0)?,
+                    version: row.get(1)?,
+                    spec_json: row.get(2)?,
+                    plan_json: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
+            )?;
+            let rows = statement.query_map([], row_to_job)?;
+            rows.collect()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_job(
+        &self,
+        job_id: &str,
+        desired_state: Option<&str>,
+        observed_state: Option<&str>,
+        convergence: Option<&str>,
+        generation: Option<u64>,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE cp_jobs SET desired_state=COALESCE(?2, desired_state), observed_state=COALESCE(?3, observed_state), convergence=COALESCE(?4, convergence), generation=COALESCE(?5, generation), checkpoint_id=COALESCE(?6, checkpoint_id), last_error=COALESCE(?7, last_error), updated_at_ms=?8 WHERE job_id=?1",
+                rusqlite::params![job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error, now_ms()],
+            )?;
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()
+        })
+    }
+
+    /// CAS observation update: applies the observed state only while the
+    /// Job's generation still equals `expected_generation`. A concurrent
+    /// desired-state change or placement move must never be rolled back by a
+    /// stale report — that would fence every newer observation and pin the
+    /// Job in a reconciling loop.
+    pub fn update_job_observation(
+        &self,
+        job_id: &str,
+        observed_state: &str,
+        convergence: &str,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET observed_state=?2, convergence=?3, generation=?4, checkpoint_id=COALESCE(?5, checkpoint_id), last_error=?6, updated_at_ms=?7 WHERE job_id=?1 AND generation=?8",
+                rusqlite::params![
+                    job_id,
+                    observed_state,
+                    convergence,
+                    generation,
+                    checkpoint_id,
+                    last_error,
+                    now_ms(),
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return match current {
+                    Some(current) => Err(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current,
+                    }),
+                    None => Ok(None),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn update_job_desired_state(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                rusqlite::params![
+                    job_id,
+                    desired_state,
+                    expected_generation.saturating_add(1),
+                    now_ms(),
+                    expected_generation,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                return match current {
+                    Some(current) => Err(StorageError::GenerationConflict {
+                        expected: expected_generation,
+                        current,
+                    }),
+                    None => Ok(None),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_job_checkpoints (job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(job_id, checkpoint_id) DO UPDATE SET job_version=excluded.job_version, status=excluded.status, manifest_uri=excluded.manifest_uri, format_version=excluded.format_version, updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    record.job_id,
+                    record.job_version,
+                    record.checkpoint_id,
+                    record.kind,
+                    record.status,
+                    record.manifest_uri,
+                    record.format_version,
+                    record.created_at_ms,
+                    record.updated_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_job_checkpoints(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms FROM cp_job_checkpoints WHERE job_id = ?1 ORDER BY created_at_ms DESC, checkpoint_id DESC",
+            )?;
+            let rows = statement.query_map([job_id], |row| {
+                Ok(JobCheckpointRecord {
+                    job_id: row.get(0)?,
+                    job_version: row.get(1)?,
+                    checkpoint_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    status: row.get(4)?,
+                    manifest_uri: row.get(5)?,
+                    format_version: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn delete_job_checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM cp_job_checkpoints WHERE job_id = ?1 AND checkpoint_id = ?2",
+                rusqlite::params![job_id, checkpoint_id],
+            )?;
+            Ok(())
+        })
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute_batch(
@@ -2327,6 +3402,41 @@ impl ControlPlaneStore {
                 maintenance_updated_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_jobs (
+                job_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                spec_json TEXT NOT NULL,
+                desired_state TEXT NOT NULL DEFAULT 'stopped',
+                observed_state TEXT NOT NULL DEFAULT 'draft',
+                convergence TEXT NOT NULL DEFAULT 'unknown',
+                generation INTEGER NOT NULL DEFAULT 0,
+                node_ids_json TEXT NOT NULL DEFAULT '[]',
+                checkpoint_id TEXT,
+                last_error TEXT,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS cp_jobs_updated
+                ON cp_jobs(updated_at_ms DESC, job_id);
+
+            CREATE TABLE IF NOT EXISTS cp_job_versions (
+                job_id TEXT NOT NULL, version INTEGER NOT NULL, spec_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS cp_job_tasks (
+                job_id TEXT NOT NULL, generation INTEGER NOT NULL, task_id TEXT NOT NULL,
+                node_id TEXT NOT NULL, attempt_id TEXT NOT NULL, state TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, generation, task_id)
+            );
+            CREATE TABLE IF NOT EXISTS cp_job_checkpoints (
+                job_id TEXT NOT NULL, job_version INTEGER NOT NULL DEFAULT 0,
+                checkpoint_id TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, manifest_uri TEXT, format_version INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, checkpoint_id)
             );
 
             CREATE TABLE IF NOT EXISTS cp_stream_desired (
@@ -2583,6 +3693,18 @@ impl ControlPlaneStore {
             .collect::<Result<Vec<_>, _>>()?;
         if !event_columns.iter().any(|name| name == "actor") {
             connection.execute("ALTER TABLE cp_events ADD COLUMN actor TEXT", [])?;
+        }
+        let checkpoint_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_job_checkpoints)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !checkpoint_columns.iter().any(|name| name == "job_version") {
+            // Existing checkpoints have no durable producer version. Mark them
+            // incompatible (0) so they are never auto-selected for recovery.
+            connection.execute(
+                "ALTER TABLE cp_job_checkpoints ADD COLUMN job_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
@@ -3005,6 +4127,84 @@ mod tests {
         ));
     }
 
+    /// Regression: a checkpoint that lands between a rollback handler's read
+    /// and its conditional write updates `checkpoint_id` WITHOUT bumping the
+    /// generation (the checkpoint path deliberately leaves the generation
+    /// alone). The write must therefore preserve the stored pointer instead of
+    /// writing the caller's older one back — a regressed pointer can reference
+    /// a checkpoint retention has already deleted, degrading the next start to
+    /// a stateless one.
+    #[test]
+    fn conditional_job_write_preserves_a_newer_recovery_pointer() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let job = |checkpoint_id: Option<&str>| JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: "{}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: checkpoint_id.map(str::to_owned),
+            last_error: None,
+            updated_at_ms: 0,
+        };
+        store.upsert_job(job(Some("ckpt-old"))).unwrap();
+
+        // A concurrent checkpoint observation moves the pointer without
+        // touching the generation.
+        let concurrent = store
+            .update_job("orders", None, None, None, None, Some("ckpt-new".into()), None)
+            .unwrap();
+        assert_eq!(
+            concurrent.as_ref().and_then(|job| job.checkpoint_id.clone()),
+            Some("ckpt-new".to_string())
+        );
+
+        // The rollback handler writes the record it read (the older pointer).
+        let written = store
+            .update_job_with_expected_generation(job(Some("ckpt-old")), 1)
+            .unwrap();
+        assert_eq!(
+            written.checkpoint_id.as_deref(),
+            Some("ckpt-new"),
+            "the returned record reports the pointer the row actually holds"
+        );
+        let stored = store.get_job("orders").unwrap().unwrap();
+        assert_eq!(
+            stored.checkpoint_id.as_deref(),
+            Some("ckpt-new"),
+            "a concurrent checkpoint must not be regressed by the rollback write"
+        );
+
+        // The conditional write never moves the pointer in either direction,
+        // so a NULL pointer stays NULL and the version/spec change lands.
+        store
+            .immediate_transaction(|connection| -> Result<(), StorageError> {
+                connection.execute(
+                    "UPDATE cp_jobs SET checkpoint_id = NULL WHERE job_id = 'orders'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let written = store
+            .update_job_with_expected_generation(job(Some("ckpt-fresh")), 2)
+            .unwrap();
+        assert_eq!(
+            written.checkpoint_id, None,
+            "the rollback write must not invent a recovery pointer"
+        );
+        assert_eq!(written.version, 2);
+
+        // A stale generation still conflicts.
+        assert!(matches!(
+            store.update_job_with_expected_generation(job(None), 1),
+            Err(StorageError::GenerationConflict { .. })
+        ));
+    }
+
     #[test]
     fn outbox_claim_is_idempotent_and_reclaimable_after_lease() {
         let store = ControlPlaneStore::in_memory().unwrap();
@@ -3032,6 +4232,115 @@ mod tests {
             .mark_outbox_processed(first.outbox_id, 30_012)
             .unwrap();
         assert!(store.claim_outbox("worker-c", 30_013).unwrap().is_none());
+    }
+
+    /// The outbox retention reclaims only processed rows: the unprocessed
+    /// work queue (pending or claimed) survives every sweep, and the status
+    /// counters — which only look at unprocessed rows — are unaffected.
+    #[test]
+    fn prune_processed_outbox_reclaims_only_processed_rows() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let insert = |event_key: &str, processed_at_ms: Option<i64>, claimed: bool| {
+            store
+                .immediate_transaction(|transaction| -> Result<(), StorageError> {
+                    transaction.execute(
+                        "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms, claimed_at_ms, processed_at_ms) VALUES (?1, 'reconcile_intent', 'node-a', 1, 1, ?2, ?3)",
+                        rusqlite::params![
+                            event_key,
+                            if claimed { Some(5) } else { None },
+                            processed_at_ms
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        insert("old-processed", Some(100), false);
+        insert("recent-processed", Some(9_000), false);
+        insert("claimed-pending", None, true);
+
+        let aggregates_before = store.operational_aggregates(10_000).unwrap();
+        // The age window reclaims only the processed row past the cutoff.
+        assert_eq!(store.prune_processed_outbox(1_000, 4096).unwrap(), 1);
+        // The count bound keeps the newest processed rows when history
+        // accumulates faster than the age window reclaims it.
+        for index in 0..6 {
+            insert(&format!("bulk-{index}"), Some(2_000 + index), false);
+        }
+        assert_eq!(store.prune_processed_outbox(1_000, 2).unwrap(), 5);
+        let remaining = store
+            .immediate_transaction(|transaction| {
+                let mut statement =
+                    transaction.prepare("SELECT event_key FROM cp_outbox ORDER BY outbox_id")?;
+                let keys = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(keys)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["recent-processed", "claimed-pending", "bulk-5"]
+        );
+        let aggregates_after = store.operational_aggregates(10_000).unwrap();
+        assert_eq!(
+            aggregates_before.outbox_pending,
+            aggregates_after.outbox_pending
+        );
+        assert_eq!(
+            aggregates_before.outbox_claimed,
+            aggregates_after.outbox_claimed
+        );
+    }
+
+    /// Attempt retention reclaims terminal rows only; the active attempt —
+    /// guarded by both the state predicate and the `cp_one_active_attempt`
+    /// unique index — is preserved unchanged.
+    #[test]
+    fn prune_terminal_attempts_reclaims_only_terminal_rows() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .immediate_transaction(|transaction| -> Result<(), StorageError> {
+                transaction.execute(
+                    "INSERT INTO cp_intents (intent_id, node_id, stream_id, generation, intent_type, state, convergence_state, created_at_ms, updated_at_ms) VALUES ('intent-1', 'node-a', 'orders', 1, 'stream_lifecycle', 'converged', 'converged', 1, 1)",
+                    [],
+                )?;
+                let insert_attempt = |attempt_id: &str,
+                                      state: &str,
+                                      finished_at_ms: Option<i64>|
+                 -> Result<(), StorageError> {
+                    transaction.execute(
+                        "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, finished_at_ms, created_at_ms) VALUES (?1, 'intent-1', ?1, 'node-a', 'orders', 1, 'apply_configuration', ?2, ?3, 1)",
+                        rusqlite::params![attempt_id, state, finished_at_ms],
+                    )?;
+                    Ok(())
+                };
+                insert_attempt("old-terminal", "succeeded", Some(100))?;
+                insert_attempt("recent-terminal", "failed", Some(9_000))?;
+                insert_attempt("active-attempt", "running", None)?;
+                Ok(())
+            })
+            .unwrap();
+        // The age window reclaims only the terminal row past the cutoff.
+        assert_eq!(store.prune_terminal_attempts(1_000, 4096).unwrap(), 1);
+        // The count bound trims terminal history down to the newest rows.
+        assert_eq!(store.prune_terminal_attempts(1_000, 0).unwrap(), 1);
+        let remaining = store
+            .immediate_transaction(|transaction| {
+                let mut statement =
+                    transaction.prepare("SELECT attempt_id, state FROM cp_attempts")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![("active-attempt".to_string(), "running".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -3145,6 +4454,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(observed, "running");
+    }
+
+    /// A session rebuild (re-register with the same stable boot identity)
+    /// restarts the Agent's report_seq at 1. The Hub resets the per-stream
+    /// cursors at register; without that reset every new observation is
+    /// silently dropped until the node re-reaches the previous session's
+    /// high-water mark, blinding convergence for the whole rebuild gap.
+    #[test]
+    fn stable_boot_session_rebuild_resets_the_observation_cursor() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let observed = |seq: u64, state: &str| ObservedMutation {
+            node_id: "node-a".into(),
+            stream_id: "orders".into(),
+            boot_id: Some("boot-stable".into()),
+            report_seq: seq,
+            observed_generation: Some(1),
+            observed_state: state.into(),
+            config_version_id: None,
+            action_id: None,
+            snapshot_json: "{}".into(),
+            last_error_code: None,
+            last_error_message: None,
+        };
+        store.record_observed(observed(7, "running")).unwrap();
+        // Re-register resets the stored cursors for this node.
+        store.reset_observed_cursors("node-a").unwrap();
+        // Sequence 1 of the rebuilt session must be accepted, not dropped
+        // as stale under the previous session's cursor of 7.
+        store.record_observed(observed(1, "failed")).unwrap();
+        let (state, seq): (String, u64) = store
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT observed_state, report_seq FROM cp_stream_observed WHERE node_id = 'node-a' AND stream_id = 'orders'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((state.as_str(), seq), ("failed", 1));
     }
 
     #[test]
@@ -3643,4 +4991,111 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod job_storage_tests {
+    use super::*;
+
+    #[test]
+    fn job_records_survive_store_reopen() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let job = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "draft".into(),
+            convergence: "unknown".into(),
+            generation: 0,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let stored = store.upsert_job(job.clone()).unwrap();
+        assert_eq!(stored.generation, 1);
+        assert_eq!(store.get_job("orders").unwrap(), Some(stored));
+        let updated = store
+            .update_job(
+                "orders",
+                Some("running"),
+                Some("running"),
+                Some("in_sync"),
+                Some(1),
+                Some("cp-1"),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.desired_state, "running");
+        assert_eq!(updated.checkpoint_id.as_deref(), Some("cp-1"));
+        assert_eq!(store.list_jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_job_advances_its_generation() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let original = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{\"version\":1}".into(),
+            desired_state: "stopped".into(),
+            observed_state: "stopped".into(),
+            convergence: "converged".into(),
+            generation: 4,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        assert_eq!(store.upsert_job(original).unwrap().generation, 4);
+
+        let replacement = store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 2,
+                spec_json: "{\"version\":2}".into(),
+                desired_state: "running".into(),
+                observed_state: "validated".into(),
+                convergence: "pending".into(),
+                generation: 1,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        assert_eq!(replacement.generation, 5);
+        assert_eq!(replacement.version, 2);
+        assert_eq!(store.get_job("orders").unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn desired_state_update_marks_job_as_reconciling() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "stopped".into(),
+                convergence: "converged".into(),
+                generation: 3,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+
+        let updated = store
+            .update_job_desired_state("orders", "running", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.generation, 4);
+        assert_eq!(updated.convergence, "reconciling");
+    }
 }

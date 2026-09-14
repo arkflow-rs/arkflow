@@ -10,6 +10,8 @@ This section is for pipeline authors. Start with the [quickstart](getting-starte
 ## Common workflows
 
 - [Configure a stream](configuration/1-top-level.md)
+- [Write and run streaming jobs](streaming-jobs.md)
+- [Run jobs on the control plane](streaming-jobs.md#distribute-a-job-across-nodes)
 - [Transform JSON](components/2-processors/json.md)
 - [Process with SQL](components/2-processors/sql.md)
 - [Use VRL](components/2-processors/vrl.md)

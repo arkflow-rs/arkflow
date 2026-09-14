@@ -14,19 +14,13 @@
 
 use arkflow_core::cli::Cli;
 use arkflow_core::engine::Engine;
-use arkflow_plugin::{buffer, codec, input, output, processor, temporary, wal};
+use arkflow_plugin::initialize;
 use arkflow_server::{agent, serve, ServerConfig};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    input::init()?;
-    output::init()?;
-    processor::init()?;
-    buffer::init()?;
-    temporary::init()?;
-    codec::init()?;
-    wal::init()?;
+    initialize()?;
     let mut cli = Cli::default();
     cli.parse()?;
     let Some(config) = cli.config() else {

@@ -1,4 +1,5 @@
 ---
+components: [buffer/memory]
 description: ArkFlow documentation page.
 ---
 

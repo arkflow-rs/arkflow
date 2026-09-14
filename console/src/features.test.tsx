@@ -1,7 +1,12 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
-import { Configuration, convertConfiguration } from './features'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Components, Configuration, convertConfiguration } from './features'
+import { Jobs } from './features/jobs'
+import { JobEditor } from './features/job-editor'
+import type { Job, JobCheckpoint } from './api'
 import { Rollouts } from './features/rollouts'
+
+afterEach(() => cleanup())
 
 describe('configuration workflow', () => {
   it('converts YAML to JSON and preserves equivalent values', () => {
@@ -71,5 +76,158 @@ describe('rollout workflow', () => {
     expect(await screen.findByText('paused')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/rollouts/r-1/actions'), expect.objectContaining({ method: 'POST' }))
+  })
+})
+
+describe('distributed Job workbench', () => {
+  it('validates a Job plan before creating it in stopped state', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: { tasks: [] }, required_capabilities: [], nodes: [], warnings: [] }) })
+      if (url.endsWith('/jobs') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ job_id: 'new-job', version: 1, desired_state: 'stopped', observed_state: 'validated', convergence: 'pending', generation: 1, node_ids: [], updated_at_ms: 1 }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const refresh = vi.fn()
+    render(<Jobs jobs={[]} nodes={[]} onRefresh={refresh} onError={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Create Job' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    expect(await screen.findByText('Plan is valid')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Create stopped' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/jobs'), expect.objectContaining({ method: 'POST' })))
+    expect(refresh).toHaveBeenCalled()
+  })
+
+  it('requires a fresh validation after Job settings change', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    fireEvent.click(local.getByRole('button', { name: 'Validate Plan' }))
+    await waitFor(() => expect(local.getByRole('button', { name: 'Create stopped' })).not.toBeDisabled())
+    fireEvent.change(local.getByLabelText('Job ID'), { target: { value: 'changed-job' } })
+    expect(local.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+  })
+
+  it('shows a retryable component-catalogue failure in the Job palette', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/components')) return Promise.resolve({ ok: false, status: 503, json: async () => ({ message: 'catalogue unavailable' }), headers: new Headers() })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    expect(await local.findByText('Component catalogue could not be loaded.')).toBeInTheDocument()
+    expect(local.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  it('filters the Job palette by component kind and search term', async () => {
+    const components = [{ kind: 'input', name: 'generate', description: 'Generate records' }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON' }, { kind: 'output', name: 'stdout', description: 'Write output' }]
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, json: async () => components })) as unknown as typeof fetch
+    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const local = within(view.container)
+    fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
+    expect(await local.findByText('generate')).toBeInTheDocument()
+    expect(local.queryByText('stdout')).not.toBeInTheDocument()
+    fireEvent.click(local.getByRole('tab', { name: 'processor' }))
+    expect(await local.findByText('json_to_arrow')).toBeInTheDocument()
+    fireEvent.change(local.getByLabelText('Component search'), { target: { value: 'missing' } })
+    expect(local.getByText('No matching components.')).toBeInTheDocument()
+  })
+})
+
+describe('component catalogue', () => {
+  it('filters entries and shows details only for the selected component', async () => {
+    const components = [{ kind: 'input', name: 'generate', description: 'Generate records', schema: { type: 'object' }, example: { batch_size: 1 } }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON', schema: { type: 'object' } }]
+    globalThis.fetch = vi.fn((url: string) => Promise.resolve({ ok: true, json: async () => url.endsWith('/components') ? components : {} })) as unknown as typeof fetch
+    const view = render(<Components onError={vi.fn()} />)
+    const local = within(view.container)
+    expect(await local.findByText('generate')).toBeInTheDocument()
+    expect(local.getAllByText('Generate records')).toHaveLength(2)
+    fireEvent.click(local.getByRole('tab', { name: 'processor' }))
+    expect(local.getAllByText('json_to_arrow')).toHaveLength(2)
+    expect(local.queryByText('Generate records')).not.toBeInTheDocument()
+  })
+})
+
+describe('job editor determinism', () => {
+  const componentCatalogue = [
+    { kind: 'input', name: 'generate', description: 'Generate', schema: null, example: {} },
+    { kind: 'output', name: 'drop', description: 'Drop', schema: null, example: {} },
+  ]
+  const editorFetchMock = () => vi.fn((url: string) => {
+    if (url.endsWith('/components')) return Promise.resolve({ ok: true, json: async () => componentCatalogue })
+    if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, warnings: [], plan: undefined, required_capabilities: [], nodes: [] }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  })
+
+  const upgradeJob = {
+    job_id: 'orders', version: 3, generation: 7, desired_state: 'stopped', state: 'stopped',
+    node_ids: [], spec: { id: 'orders', version: 3, operators: [{ id: 'kept-source', kind: 'source', component: 'generate', config: {} }], sources: [{ operator_id: 'kept-source', input_type: 'generate' }], sinks: [], edges: [] },
+  }
+
+  it('resets the draft when the editor target switches from create to upgrade', async () => {
+    globalThis.fetch = editorFetchMock() as unknown as typeof fetch
+    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    await screen.findByText('generate')
+    fireEvent.click(view.getByRole('button', { name: /generate/ }))
+    await view.findAllByText('generate-1')
+    // Switch the same mounted editor to an upgrade target.
+    view.rerender(<JobEditor mode="upgrade" job={upgradeJob as unknown as Job} savepoint={{ checkpoint_id: 'sp-1', kind: 'savepoint', status: 'completed', job_version: 3, format_version: 1, created_at_ms: 1 } as unknown as JobCheckpoint} nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    // The create draft is gone: the editor shows the target Job's id.
+    await view.findByDisplayValue('orders')
+    expect(view.queryByText('generate-1')).toBeNull()
+    expect(view.getByText(/Recovery: sp-1/)).toBeTruthy()
+  })
+
+  it('generates collision-free node ids across add/delete/add', async () => {
+    const fetchMock = editorFetchMock()
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    await screen.findAllByRole('button', { name: /generate/ })
+    fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
+    await view.findByRole('button', { name: 'Delete node' })
+    // Delete the only node, then add another: with `length + 1` ids the new
+    // node would collide with the deleted `generate-1`.
+    fireEvent.click(view.getByRole('button', { name: 'Delete node' }))
+    fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
+    await view.findByRole('button', { name: 'Delete node' })
+    fireEvent.click(view.getByRole('button', { name: 'Validate Plan' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/jobs/validate'))).toBe(true))
+    const validateCall = fetchMock.mock.calls.find(call => call[0].endsWith('/jobs/validate'))
+    const body = JSON.parse((validateCall?.at(1) as RequestInit | undefined)?.body as string)
+    const operatorIds = body.spec.operators.map((operator: { id: string }) => operator.id)
+    expect(new Set(operatorIds).size).toBe(operatorIds.length)
+    expect(operatorIds).toContain('generate-2')
+    expect(operatorIds).not.toContain('generate-1')
+    view.unmount()
+  })
+
+  it('does not unlock submission for a graph edited while validating', async () => {
+    let releaseValidation: (() => void) | undefined
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/components')) return Promise.resolve({ ok: true, json: async () => componentCatalogue })
+      if (url.endsWith('/jobs/validate')) return new Promise(resolve => { releaseValidation = () => resolve({ ok: true, json: async () => ({ valid: true, warnings: [], required_capabilities: [], nodes: [] }) }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    await screen.findAllByRole('button', { name: /generate/ })
+    fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
+    await view.findByRole('button', { name: 'Delete node' })
+    fireEvent.click(view.getByRole('button', { name: 'Validate Plan' }))
+    // Edit the graph while the validation request is in flight (a second
+    // generate node changes the derived spec)...
+    fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
+    await view.findByRole('button', { name: 'Delete node' })
+    // ...then let the stale response arrive.
+    releaseValidation?.()
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/jobs/validate')).length).toBe(1))
+    expect(view.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
   })
 })

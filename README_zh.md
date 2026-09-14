@@ -143,9 +143,9 @@ input:
 
 ArkFlow提供多种数据处理器：
 
-- **JSON**：JSON数据处理和转换
+- **JSON**：JSON数据处理和转换（`json_to_arrow` / `arrow_to_json`）
 - **SQL**：使用SQL查询处理数据
-- **Protobuf**：Protobuf编解码
+- **Protobuf**：Protobuf编解码（`arrow_to_protobuf` / `protobuf_to_arrow`）
 - **批处理**：将消息批量处理
 - **VRL**：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
 - **Python**：对每个批次运行用户自定义的 Python 函数
@@ -169,6 +169,7 @@ ArkFlow支持多种输出目标：
 - **MQTT**：将消息发布到MQTT主题
 - **HTTP**：通过HTTP发送数据
 - **InfluxDB**：将时序数据写入 InfluxDB 2.x
+- **MongoDB**：将文档写入 MongoDB 集合
 - **NATS**：将消息发布到 NATS 主题
 - **Pulsar**：将消息发布到 Pulsar 主题
 - **Redis**：写入 Redis 流、列表或发布/订阅频道
@@ -210,18 +211,17 @@ error_output:
 
 ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:
 
-- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合。
-- **会话窗口 (Session Window)**：会话窗口缓冲组件提供了一种基于会话的消息分组机制，其中消息根据活动间隙进行分组。它实现了一个会话窗口，在可配置的非活动期后关闭。
-- **滑动窗口 (Sliding Window)**：滑动窗口缓冲组件提供了一种基于时间的分批处理消息的窗口机制。它实现了一种滑动窗口算法，具有可配置的窗口大小、滑动间隔和滑动大小。
-- **滚动窗口 (Tumbling Window)**：滚动窗口缓冲组件提供了一种固定大小、不重叠的批处理消息的窗口机制。它实现了一种滚动窗口算法，具有可配置的间隔设置。
+- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合。编译后的 Stream 中它退化为直通，`capacity`/`timeout` 选项被忽略。
+- **会话窗口 (Session Window)**：会话窗口缓冲组件提供了一种基于会话的消息分组机制，其中消息根据活动间隙进行分组。它实现了一个会话窗口，在可配置的非活动期后关闭。编译为处理时间窗口算子。
+- **滑动窗口 (Sliding Window，已弃用)**：已弃用且在 Stream 配置中不可达——流编译器会拒绝滑动窗口缓冲。请改用 Job DAG 中的事件时间滑动窗口算子。
+- **滚动窗口 (Tumbling Window)**：滚动窗口缓冲组件提供了一种固定大小、不重叠的批处理消息的窗口机制。它实现了一种滚动窗口算法，具有可配置的间隔设置。编译为处理时间窗口算子。
+- **Join（已弃用）**：已弃用且在 Stream 配置中不可达——流编译器会拒绝 join 缓冲，并给出指向 Job DAG 配置的迁移提示。
 
 示例：
 
 ```yaml
 buffer:
   type: memory
-  capacity: 10000  # Maximum number of messages to buffer
-  timeout: 10s  # Maximum time to buffer messages
 ```
 
 ## 示例

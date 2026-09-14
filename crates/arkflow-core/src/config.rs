@@ -90,13 +90,21 @@ pub struct HealthCheckConfig {
     /// Lease duration advertised by a compute node to its Hub.
     #[serde(default = "default_agent_lease_ttl_ms")]
     pub agent_lease_ttl_ms: u64,
+    /// Lifetime of a Hub-issued agent session credential.
+    #[serde(default = "default_agent_session_ttl_ms")]
+    pub agent_session_ttl_ms: u64,
 }
 
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     /// Streams configuration
+    #[serde(default)]
     pub streams: Vec<StreamConfig>,
+    /// Local Jobs declared directly in config (executed by the unified
+    /// kernel without a Hub).
+    #[serde(default)]
+    pub jobs: Vec<crate::job::JobSpec>,
     /// Logging configuration (optional)
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -125,6 +133,18 @@ impl EngineConfig {
         }
 
         Ok(resolved)
+    }
+
+    /// Validate declared Jobs (spec-level validation incl. graph checks).
+    pub fn job_specs(&self) -> Result<Vec<&crate::job::JobSpec>, Error> {
+        let mut job_ids = std::collections::HashSet::with_capacity(self.jobs.len());
+        for job in &self.jobs {
+            job.validate()?;
+            if !job_ids.insert(job.id.as_str().to_owned()) {
+                return Err(Error::Config(format!("Duplicate job id '{}'", job.id)));
+            }
+        }
+        Ok(self.jobs.iter().collect())
     }
 
     /// Load configuration from file
@@ -195,6 +215,10 @@ fn default_agent_lease_ttl_ms() -> u64 {
     15_000
 }
 
+fn default_agent_session_ttl_ms() -> u64 {
+    3_600_000
+}
+
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
@@ -210,6 +234,7 @@ impl Default for HealthCheckConfig {
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
+            agent_session_ttl_ms: default_agent_session_ttl_ms(),
         }
     }
 }
@@ -347,6 +372,7 @@ mod tests {
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
+            agent_session_ttl_ms: default_agent_session_ttl_ms(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -579,6 +605,7 @@ type = "stdout"
     fn test_engine_config_serialization_with_defaults() {
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -622,6 +649,7 @@ type = "stdout"
     fn test_stream_ids_assign_legacy_ids() {
         let config = EngineConfig {
             streams: vec![test_stream(None), test_stream(None)],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -633,6 +661,7 @@ type = "stdout"
     fn test_stream_ids_reject_invalid_and_duplicate_ids() {
         let invalid = EngineConfig {
             streams: vec![test_stream(Some("bad id"))],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -640,6 +669,7 @@ type = "stdout"
 
         let duplicate = EngineConfig {
             streams: vec![test_stream(Some("orders")), test_stream(Some("orders"))],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };

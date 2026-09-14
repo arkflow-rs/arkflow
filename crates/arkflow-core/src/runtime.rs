@@ -211,11 +211,24 @@ pub struct RuntimeMetrics {
     pub input_reconnects: AtomicU64,
     pub output_errors: AtomicU64,
     pub restarts: AtomicU64,
+    pub kernel: Arc<crate::executor::metrics::KernelMetrics>,
 }
 
 impl RuntimeMetrics {
     pub fn snapshot(&self) -> StreamMetricsSnapshot {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let kernel = self.kernel.snapshot();
+        let in_flight = kernel
+            .chains
+            .values()
+            .map(|metrics| metrics.in_flight)
+            .sum();
+        let mean_latency_us = kernel
+            .chains
+            .values()
+            .map(|metrics| metrics.mean_latency_us)
+            .max()
+            .unwrap_or_default();
         StreamMetricsSnapshot {
             input_batches: load(&self.input_batches),
             input_messages: load(&self.input_messages),
@@ -226,6 +239,13 @@ impl RuntimeMetrics {
             input_reconnects: load(&self.input_reconnects),
             output_errors: load(&self.output_errors),
             restarts: load(&self.restarts),
+            kernel_chains: kernel.chains,
+            in_flight,
+            mean_latency_us,
+            checkpoint_duration_ms: kernel.checkpoint_duration_ms,
+            checkpoint_failures: kernel.checkpoint_failures,
+            watermark_lag_ms: kernel.watermark_lag_ms,
+            late_events: kernel.late_events,
         }
     }
 }
@@ -242,6 +262,7 @@ impl Default for RuntimeMetrics {
             input_reconnects: AtomicU64::new(0),
             output_errors: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            kernel: Arc::new(crate::executor::metrics::KernelMetrics::default()),
         }
     }
 }
@@ -250,6 +271,8 @@ impl Default for RuntimeMetrics {
 pub struct RuntimeEntry {
     pub id: String,
     pub config: StreamConfig,
+    /// Registration index (for deterministic legacy stream-id derivation).
+    pub index: usize,
     pub state: StreamState,
     pub cancellation: CancellationToken,
     pub handle: Option<JoinHandle<Result<(), Error>>>,
@@ -272,10 +295,11 @@ pub struct RuntimeEntry {
 }
 
 impl RuntimeEntry {
-    pub fn new(id: String, config: StreamConfig) -> Self {
+    pub fn new(id: String, config: StreamConfig, index: usize) -> Self {
         Self {
             id,
             config,
+            index,
             state: StreamState::Created,
             cancellation: CancellationToken::new(),
             handle: None,
@@ -355,9 +379,10 @@ impl RuntimeManager {
                 "Stream runtime already registered: {id}"
             )));
         }
+        let index = entries.len();
         entries.insert(
             id.clone(),
-            Arc::new(Mutex::new(RuntimeEntry::new(id, config))),
+            Arc::new(Mutex::new(RuntimeEntry::new(id, config, index))),
         );
         Ok(())
     }
@@ -464,12 +489,17 @@ impl RuntimeManager {
         };
 
         if let Some(handle) = stale_handle {
-            await_task(handle).await?;
+            let wait_result = await_task(handle).await;
+            settle_detached_task(&entry, &wait_result, "stale-startup-task").await;
+            wait_result?;
         }
 
         let metrics = entry.lock().await.metrics.clone();
-        let mut stream = match config.build() {
-            Ok(stream) => stream.with_metrics(metrics),
+        let index = entry.lock().await.index;
+        // Unified kernel: the StreamConfig compiles to a JobSpec and runs
+        // through the same executor as declared Jobs and Agent subgraphs.
+        let spec = match crate::executor::stream_compiler::compile_stream(&config, index) {
+            Ok(spec) => spec,
             Err(error) => {
                 let mut runtime = entry.lock().await;
                 runtime.state = StreamState::Failed;
@@ -485,18 +515,197 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
+        let stream_id = id.to_string();
 
-        let handle =
-            self.spawn_supervised(entry.clone(), async move { stream.run(cancellation).await });
-
-        let mut runtime = entry.lock().await;
-        runtime.state = StreamState::Running;
-        runtime.started_at_ms = Some(now_ms());
-        runtime.handle = Some(handle);
-        drop(runtime);
-        self.record_event("stream_start", Some(id.to_string()), "succeeded", None)
+        // Dry-run: compile + component construction + graph build so config
+        // errors (unknown inputs/processors, broken graphs) surface in `start`
+        // synchronously — reconciliation relies on that. The validation WAL
+        // (durability-enabled streams) is closed on every path — including
+        // build failures — so the real runtime can reopen the same redb path
+        // without an exclusive-lock failure. The discarded graph is rebuilt
+        // by the spawned run.
+        {
+            let adapter = match crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                config.durability.as_ref(),
+                config.temporary.clone(),
+            ) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("build", error.to_string());
+                    drop(runtime);
+                    self.record_event(
+                        "stream_start",
+                        Some(id.to_string()),
+                        "failed",
+                        Some(error.to_string()),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            let build_result = async {
+                let mut resource = adapter.build_resource()?;
+                let plan = crate::job::JobPlan::compile(spec.clone())?;
+                crate::executor::graph::ExecutionGraphBuilder::default().build(
+                    &plan,
+                    &adapter,
+                    &mut resource,
+                )?;
+                Ok::<(), Error>(())
+            }
             .await;
-        Ok(())
+            let close_result = adapter.close().await;
+            match (build_result, close_result) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), _) => {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("build", error.to_string());
+                    drop(runtime);
+                    self.record_event(
+                        "stream_start",
+                        Some(id.to_string()),
+                        "failed",
+                        Some(error.to_string()),
+                    )
+                    .await;
+                    return Err(error);
+                }
+                (Ok(()), Err(error)) => {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("close", error.to_string());
+                    drop(runtime);
+                    self.record_event(
+                        "stream_start",
+                        Some(id.to_string()),
+                        "failed",
+                        Some(error.to_string()),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        }
+
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let handle = self.spawn_supervised(entry.clone(), async move {
+            let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                config.durability.as_ref(),
+                config.temporary.clone(),
+            )?;
+            // The adapter owns the WAL flusher. Close it even when resource
+            // construction or graph startup fails before the graph takes
+            // ownership of the source.
+            let run_result = async {
+                let mut resource = adapter.build_resource()?;
+                crate::executor::run_job_with_metrics_started(
+                    &spec,
+                    &adapter,
+                    &mut resource,
+                    cancellation,
+                    Some(metrics),
+                    Some(startup_tx),
+                )
+                .await
+            }
+            .await;
+            let close_result = adapter.close().await;
+            match (run_result, close_result) {
+                (Err(error), _) => {
+                    tracing::warn!(stream_id = %stream_id, %error, "kernel stream run failed");
+                    Err(error)
+                }
+                (Ok(()), Err(error)) => {
+                    tracing::warn!(stream_id = %stream_id, %error, "kernel stream adapter close failed");
+                    Err(error)
+                }
+                (Ok(()), Ok(())) => Ok(()),
+            }
+        });
+
+        {
+            // Make the task joinable from spawn time, not only after the
+            // startup handshake: the spawned adapter already opened the WAL,
+            // so a stop() during `Starting` must await THIS task before
+            // reporting `Stopped` (an immediate start() would otherwise race
+            // the old adapter for the exclusive WAL lock).
+            entry.lock().await.handle = Some(handle);
+        }
+
+        match startup_rx.await {
+            Ok(Ok(())) => {
+                let mut runtime = entry.lock().await;
+                if runtime.state != StreamState::Starting {
+                    let state = runtime.state;
+                    let task_handle = runtime.handle.take();
+                    drop(runtime);
+                    let result = match task_handle {
+                        Some(task_handle) => await_task(task_handle).await,
+                        // A concurrent stop()/restart() already joined the task.
+                        None => Ok(()),
+                    };
+                    return match result {
+                        Ok(()) if matches!(state, StreamState::Stopped) => Ok(()),
+                        Ok(()) => Err(Error::Process(format!(
+                            "stream '{}' left startup in unexpected state {:?}",
+                            id, state
+                        ))),
+                        Err(error) => Err(error),
+                    };
+                }
+                runtime.state = StreamState::Running;
+                runtime.started_at_ms = Some(now_ms());
+                drop(runtime);
+                self.record_event("stream_start", Some(id.to_string()), "succeeded", None)
+                    .await;
+                Ok(())
+            }
+            Ok(Err(message)) => {
+                let startup_error = Error::Process(format!(
+                    "stream '{}' resource startup failed: {message}",
+                    id
+                ));
+                let task_handle = entry.lock().await.handle.take();
+                let wait_result = match task_handle {
+                    Some(task_handle) => await_task(task_handle).await,
+                    // A concurrent stop() joined the task and settled the state.
+                    None => Ok(()),
+                };
+                settle_detached_task(&entry, &wait_result, "startup").await;
+                if wait_result.is_ok() {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("startup", startup_error.to_string());
+                    Err(startup_error)
+                } else {
+                    Err(wait_result.expect_err("startup task result was checked"))
+                }
+            }
+            Err(_) => {
+                let startup_error = Error::Process(format!(
+                    "stream '{}' stopped before reporting startup readiness",
+                    id
+                ));
+                let task_handle = entry.lock().await.handle.take();
+                let wait_result = match task_handle {
+                    Some(task_handle) => await_task(task_handle).await,
+                    // A concurrent stop() joined the task and settled the state.
+                    None => Ok(()),
+                };
+                settle_detached_task(&entry, &wait_result, "startup").await;
+                if wait_result.is_ok() {
+                    let mut runtime = entry.lock().await;
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("startup", startup_error.to_string());
+                    Err(startup_error)
+                } else {
+                    Err(wait_result.expect_err("startup task result was checked"))
+                }
+            }
+        }
     }
 
     fn spawn_supervised<F>(
@@ -655,13 +864,20 @@ impl RuntimeManager {
             runtime.handle.take()
         };
 
-        if let Some(handle) = handle {
-            await_task(handle).await?;
-        }
-
+        let wait_result = match handle {
+            Some(handle) => await_task(handle).await,
+            None => Ok(()),
+        };
         let mut runtime = entry.lock().await;
-        runtime.state = StreamState::Stopped;
+        match &wait_result {
+            Ok(()) => runtime.state = StreamState::Stopped,
+            Err(error) => {
+                runtime.state = StreamState::Failed;
+                runtime.record_error("shutdown", error.to_string());
+            }
+        }
         drop(runtime);
+        wait_result?;
         self.record_event("stream_stop", Some(id.to_string()), "succeeded", None)
             .await;
         Ok(())
@@ -707,14 +923,22 @@ impl RuntimeManager {
             let mut runtime = entry.lock().await;
             runtime.handle.take()
         };
-        if let Some(handle) = handle {
-            await_task(handle).await?;
-        }
+        let wait_result = match handle {
+            Some(handle) => await_task(handle).await,
+            None => Ok(()),
+        };
         {
             let mut runtime = entry.lock().await;
-            runtime.state = StreamState::Stopped;
+            match &wait_result {
+                Ok(()) => runtime.state = StreamState::Stopped,
+                Err(error) => {
+                    runtime.state = StreamState::Failed;
+                    runtime.record_error("restart", error.to_string());
+                }
+            }
             runtime.metrics.restarts.fetch_add(1, Ordering::Relaxed);
         }
+        wait_result?;
         self.record_event("stream_restart", Some(id.to_string()), "requested", None)
             .await;
         self.start(id).await
@@ -728,10 +952,42 @@ impl RuntimeManager {
         for entry in entries {
             let handle = entry.lock().await.handle.take();
             if let Some(handle) = handle {
-                await_task(handle).await?;
+                let wait_result = await_task(handle).await;
+                settle_detached_task(&entry, &wait_result, "wait-all").await;
+                wait_result?;
             }
         }
         Ok(())
+    }
+}
+
+/// A task handle is removed from its registry before it is awaited.  If the
+/// bounded wait expires, the task is aborted and no supervisor continuation is
+/// left to move the entry out of `Stopping`, `Restarting`, or `Running`.  Keep
+/// the registry truthful for every caller that owns a detached handle,
+/// including startup and `wait_all` paths.
+async fn settle_detached_task(
+    entry: &Arc<Mutex<RuntimeEntry>>,
+    result: &Result<(), Error>,
+    phase: &str,
+) {
+    let mut runtime = entry.lock().await;
+    match result {
+        Ok(()) => {
+            if matches!(
+                runtime.state,
+                StreamState::Starting
+                    | StreamState::Running
+                    | StreamState::Stopping
+                    | StreamState::Restarting
+            ) {
+                runtime.state = StreamState::Stopped;
+            }
+        }
+        Err(error) => {
+            runtime.state = StreamState::Failed;
+            runtime.record_error(phase, error.to_string());
+        }
     }
 }
 
@@ -742,6 +998,13 @@ async fn await_task(mut handle: JoinHandle<Result<(), Error>>) -> Result<(), Err
         }
         Err(_) => {
             handle.abort();
+            // Await the cancellation briefly so resource guards (WAL
+            // flushers, temporary stores, and source connections) are
+            // dropped before the caller is allowed to restart the stream.
+            // A task stuck in a non-cooperative blocking call must not make
+            // shutdown wait forever, so the original timeout remains the
+            // reported lifecycle error.
+            let _ = timeout(Duration::from_secs(1), handle).await;
             Err(Error::Timeout)
         }
     }
@@ -771,8 +1034,7 @@ mod tests {
     use crate::input::InputConfig;
     use crate::output::OutputConfig;
     use crate::pipeline::PipelineConfig;
-
-    fn stream_config() -> StreamConfig {
+    pub(super) fn stream_config() -> StreamConfig {
         StreamConfig {
             id: Some("orders".into()),
             input: InputConfig {
@@ -1039,6 +1301,7 @@ mod tests {
         let manager = RuntimeManager::new();
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: crate::config::LoggingConfig::default(),
             health_check: crate::config::HealthCheckConfig::default(),
         };
@@ -1055,6 +1318,7 @@ mod tests {
             .unwrap();
         let config = EngineConfig {
             streams: vec![],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1076,6 +1340,7 @@ mod tests {
         invalid.input.input_type = "missing-input".into();
         let config = EngineConfig {
             streams: vec![invalid],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1088,6 +1353,7 @@ mod tests {
     fn runtime_types_are_usable_in_engine_configs() {
         let config = EngineConfig {
             streams: vec![stream_config()],
+            jobs: Vec::new(),
             logging: LoggingConfig::default(),
             health_check: HealthCheckConfig::default(),
         };
@@ -1103,7 +1369,7 @@ mod tests {
         assert_eq!(snapshot.input_batches, 2);
         assert_eq!(snapshot.output_messages, 5);
 
-        let mut entry = RuntimeEntry::new("orders".into(), stream_config());
+        let mut entry = RuntimeEntry::new("orders".into(), stream_config(), 0);
         for index in 0..(MAX_RECENT_ERRORS + 1) {
             entry.record_error("test", index.to_string());
         }
@@ -1112,5 +1378,382 @@ mod tests {
             entry.snapshot().last_error.unwrap().message,
             MAX_RECENT_ERRORS.to_string()
         );
+    }
+}
+
+// ---------- durability / WAL lifecycle tests (task 2.4) ----------
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::input::{Input, InputBuilder};
+    use crate::output::{Output, OutputBuilder};
+    use crate::Error;
+    use std::sync::Arc;
+
+    struct EofInput;
+
+    #[async_trait::async_trait]
+    impl Input for EofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct EofInputBuilder;
+
+    impl InputBuilder for EofInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(EofInput))
+        }
+    }
+
+    struct DevNullOutput;
+
+    #[async_trait::async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutputBuilder;
+
+    impl OutputBuilder for DevNullOutputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNullOutput))
+        }
+    }
+
+    /// Task 2.4: a durability-enabled stream's dry-run validation opens the
+    /// WAL; the real runtime then rebuilds the adapter and reopens the same
+    /// redb path. Validation must have flushed and closed its WAL — on every
+    /// path — or the real start (and every restart) fails with an
+    /// exclusive-lock error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_enabled_start_reopens_the_same_wal_path() {
+        let _ = crate::input::register_input_builder(
+            "runtime-test-eof-input",
+            Arc::new(EofInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-test-devnull-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = super::tests::stream_config();
+        config.input.input_type = "runtime-test-eof-input".into();
+        config.output.output_type = "runtime-test-devnull-output".into();
+        config.durability = Some(crate::wal::WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::GroupCommit,
+        ));
+
+        let manager = RuntimeManager::new();
+        manager.register("orders".into(), config).await.unwrap();
+        manager.start("orders").await.unwrap();
+        manager.wait_all().await.unwrap();
+        manager.stop("orders").await.unwrap();
+
+        // Restart: the dry-run and the real runtime must both reopen the WAL
+        // path the first start already used.
+        manager.start("orders").await.unwrap();
+        manager.wait_all().await.unwrap();
+        manager.stop("orders").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+    use crate::input::{Input, InputBuilder, InputConfig};
+    use crate::output::{Output, OutputBuilder, OutputConfig};
+    use crate::pipeline::PipelineConfig;
+    use std::sync::Arc;
+
+    struct ConnectFailureInput;
+
+    #[async_trait::async_trait]
+    impl Input for ConnectFailureInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Connection(
+                "injected asynchronous input failure".into(),
+            ))
+        }
+
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            Err(Error::EOF)
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct ConnectFailureInputBuilder;
+
+    impl InputBuilder for ConnectFailureInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(ConnectFailureInput))
+        }
+    }
+
+    struct ConnectFailureOutput;
+
+    #[async_trait::async_trait]
+    impl Output for ConnectFailureOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct ConnectFailureOutputBuilder;
+
+    impl OutputBuilder for ConnectFailureOutputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(ConnectFailureOutput))
+        }
+    }
+
+    /// Task 2.5: a dry-run (compile/build) failure during `start` transitions
+    /// the runtime from `Starting` to `Failed` before the error is returned,
+    /// so a later start is not rejected because the old state lingers.
+    #[tokio::test]
+    async fn dry_run_failure_marks_runtime_failed() {
+        let manager = RuntimeManager::new();
+        let mut config = super::tests::stream_config();
+        config.input = InputConfig {
+            input_type: "definitely-missing-input".into(),
+            name: None,
+            codec: None,
+            config: None,
+        };
+        config.output = OutputConfig {
+            output_type: "definitely-missing-output".into(),
+            name: None,
+            codec: None,
+            config: None,
+        };
+        config.pipeline = PipelineConfig {
+            thread_num: 1,
+            processors: vec![],
+        };
+        manager.register("broken".into(), config).await.unwrap();
+        assert!(manager.start("broken").await.is_err());
+        let entry = manager.get("broken").await.unwrap();
+        let runtime = entry.lock().await;
+        assert_eq!(runtime.state, StreamState::Failed);
+        assert!(runtime.snapshot().last_error.is_some());
+        // A later start attempts a fresh build rather than being rejected as
+        // "already transitioning".
+        drop(runtime);
+        assert!(manager.start("broken").await.is_err());
+    }
+
+    /// Resource connection happens after the synchronous dry-run. The startup
+    /// handshake must keep the runtime out of `Running` when that asynchronous
+    /// phase fails, and a subsequent start must be allowed to retry.
+    #[tokio::test]
+    async fn async_resource_failure_marks_runtime_failed() {
+        let _ = crate::input::register_input_builder(
+            "runtime-test-connect-failure-input",
+            Arc::new(ConnectFailureInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-test-connect-failure-output",
+            Arc::new(ConnectFailureOutputBuilder),
+        );
+        let mut config = super::tests::stream_config();
+        config.input = InputConfig {
+            input_type: "runtime-test-connect-failure-input".into(),
+            name: None,
+            codec: None,
+            config: None,
+        };
+        config.output = OutputConfig {
+            output_type: "runtime-test-connect-failure-output".into(),
+            name: None,
+            codec: None,
+            config: None,
+        };
+        config.pipeline = PipelineConfig {
+            thread_num: 1,
+            processors: vec![],
+        };
+
+        let manager = RuntimeManager::new();
+        manager
+            .register("connect-broken".into(), config)
+            .await
+            .unwrap();
+        let error = manager.start("connect-broken").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected asynchronous input failure"),
+            "unexpected startup error: {error}"
+        );
+        let entry = manager.get("connect-broken").await.unwrap();
+        let runtime = entry.lock().await;
+        assert_eq!(runtime.state, StreamState::Failed);
+        assert!(runtime.handle.is_none());
+    }
+}
+
+#[cfg(test)]
+mod validation_lifecycle_tests {
+    use super::*;
+    use crate::input::{Input, InputBuilder};
+    use crate::output::{Output, OutputBuilder};
+    use crate::Error;
+    use std::sync::Arc;
+
+    struct EofInput2;
+
+    #[async_trait::async_trait]
+    impl Input for EofInput2 {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct EofInputBuilder2;
+
+    impl InputBuilder for EofInputBuilder2 {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(EofInput2))
+        }
+    }
+
+    struct DevNull2;
+
+    #[async_trait::async_trait]
+    impl Output for DevNull2 {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullBuilder2;
+
+    impl OutputBuilder for DevNullBuilder2 {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNull2))
+        }
+    }
+
+    /// Task 6.4: validating a durability-enabled candidate never opens (or
+    /// leaves open) the WAL or a state backend the real startup needs: after
+    /// validation, the same stream starts on the same redb path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validation_releases_resources_before_real_startup() {
+        let _ = crate::input::register_input_builder(
+            "runtime-test-eof-input",
+            Arc::new(EofInputBuilder2),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-test-devnull-output",
+            Arc::new(DevNullBuilder2),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = super::tests::stream_config();
+        config.input.input_type = "runtime-test-eof-input".into();
+        config.output.output_type = "runtime-test-devnull-output".into();
+        config.durability = Some(crate::wal::WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::GroupCommit,
+        ));
+
+        let report = crate::configuration::validate_config(&crate::config::EngineConfig {
+            streams: vec![config.clone()],
+            jobs: Vec::new(),
+            logging: crate::config::LoggingConfig::default(),
+            health_check: crate::config::HealthCheckConfig::default(),
+        });
+        assert!(report.valid, "{report:?}");
+
+        // The real startup reopens the validated WAL path without an
+        // exclusive-lock failure caused by the validator.
+        let manager = RuntimeManager::new();
+        manager.register("orders".into(), config).await.unwrap();
+        manager.start("orders").await.unwrap();
+        manager.wait_all().await.unwrap();
+        manager.stop("orders").await.unwrap();
     }
 }

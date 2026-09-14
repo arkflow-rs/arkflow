@@ -1,4 +1,5 @@
 ---
+components: [json]
 sidebar_label: JSON
 ---
 

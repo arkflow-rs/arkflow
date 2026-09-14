@@ -145,9 +145,9 @@ input:
 
 ArkFlow provides multiple data processors:
 
-- **JSON**: JSON data processing and transformation
+- **JSON**: JSON data processing and transformation (`json_to_arrow` / `arrow_to_json`)
 - **SQL**: Process data using SQL queries
-- **Protobuf**: Protobuf encoding/decoding
+- **Protobuf**: Protobuf encoding/decoding (`arrow_to_protobuf` / `protobuf_to_arrow`)
 - **Batch Processing**: Process messages in batches
 - **VRL**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
 - **Python**: Run Python user-defined functions over the batch
@@ -171,6 +171,7 @@ ArkFlow supports multiple output targets:
 - **MQTT**: Publish messages to MQTT topics
 - **HTTP**: Send data via HTTP
 - **InfluxDB**: Write time-series data to InfluxDB 2.x
+- **MongoDB**: Write documents to a MongoDB collection
 - **NATS**: Publish messages to NATS topics
 - **Pulsar**: Publish messages to Pulsar topics
 - **Redis**: Write to Redis streams, lists, or pub/sub channels
@@ -216,23 +217,24 @@ error_output:
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation.
+- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation. Compiled Streams treat it
+  as a no-op pass-through; its `capacity`/`timeout` options are ignored.
 - **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where
   messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of
-  inactivity.
-- **Sliding Window**: The Sliding Window buffer component provides a time-based windowing mechanism for processing
-  message batches. It implements a sliding window algorithm with configurable window size, slide interval and slide
-  size.
+  inactivity. Compiled into a processing-time window operator.
+- **Sliding Window (deprecated)**: Deprecated and unreachable in Stream configs — the stream compiler rejects the
+  sliding window buffer. Use an event-time sliding window operator in a Job DAG instead.
 - **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism
   for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
+  Compiled into a processing-time window operator.
+- **Join (deprecated)**: Deprecated and unreachable in Stream configs — the stream compiler rejects the join buffer
+  with a migration message pointing to Job DAG configuration.
 
 Example:
 
 ```yaml
 buffer:
   type: memory
-  capacity: 10000  # Maximum number of messages to buffer
-  timeout: 10s  # Maximum time to buffer messages
 ```
 
 ## Examples

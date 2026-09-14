@@ -174,5 +174,49 @@ impl TemporaryBuilder for RedisTemporaryBuilder {
 }
 
 pub fn init() -> Result<(), Error> {
-    temporary::register_temporary_builder("redis", Arc::new(RedisTemporaryBuilder))
+    temporary::register_temporary_builder("redis", Arc::new(RedisTemporaryBuilder))?;
+    arkflow_core::component::register_temporary_metadata(
+        arkflow_core::component::ComponentMetadata::with_schema(
+            "redis",
+            "Redis-backed temporary lookup store (single node or cluster) read through a codec.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "mode": {
+                        "description": "Redis connection mode.",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "title": "single",
+                                "properties": {
+                                    "type": {"const": "single"},
+                                    "url": {"type": "string", "description": "Redis URL, e.g. redis://127.0.0.1:6379."}
+                                },
+                                "required": ["type", "url"]
+                            },
+                            {
+                                "type": "object",
+                                "title": "cluster",
+                                "properties": {
+                                    "type": {"const": "cluster"},
+                                    "urls": {"type": "array", "items": {"type": "string"}, "description": "Redis cluster node URLs."}
+                                },
+                                "required": ["type", "urls"]
+                            }
+                        ]
+                    },
+                    "redis_type": {
+                        "description": "Redis structure holding the values.",
+                        "oneOf": [
+                            {"type": "object", "title": "list", "properties": {"type": {"const": "list"}}, "required": ["type"]},
+                            {"type": "object", "title": "string", "properties": {"type": {"const": "string"}}, "required": ["type"]}
+                        ]
+                    },
+                    "codec": {"type": "object", "description": "Codec used to decode stored values."}
+                },
+                "required": ["mode", "redis_type", "codec"]
+            }),
+        ),
+    )
 }

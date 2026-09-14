@@ -1,4 +1,5 @@
 ---
+components: [batch]
 description: ArkFlow documentation page.
 ---
 

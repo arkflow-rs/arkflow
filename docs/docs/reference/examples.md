@@ -15,6 +15,7 @@ These examples are maintained with the repository and checked by `pnpm docs:chec
 | S3 durability | [`durability_example_s3.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/durability_example_s3.yaml) | Object-storage-backed recovery |
 | Control plane | [`control_plane_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_example.yaml) | Hub and compute-node operation |
 | Control plane hub | [`control_plane_hub.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_hub.yaml) | Fleet-level configuration |
+| Local streaming job | [`jobs_local.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/jobs_local.yaml) | Declarative `jobs` DAG with event time, state, and checkpoint |
 | Debezium CDC | [`cdc_debezium.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/cdc_debezium.yaml) | CDC envelope decoding |
 
 For each service-backed example, validate credentials and endpoints before running it in a shared environment.

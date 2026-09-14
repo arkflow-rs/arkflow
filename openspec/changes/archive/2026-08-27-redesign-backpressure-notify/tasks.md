@@ -37,4 +37,4 @@
 ## 6. OpenSpec 校验与归档
 
 - [x] 6.1 `openspec status`：4/4 artifact done；`openspec validate redesign-backpressure-notify --strict` 通过。
-- [ ] 6.2 待用户决定：合入后走 `/opsx:archive` 归档，将 `specs/stream-backpressure/spec.md` 同步进 `openspec/specs/stream-backpressure/`。
+- [x] 6.2 已归档（2026-08-27）：`specs/stream-backpressure/spec.md` 已同步进 `openspec/specs/stream-backpressure/`。

@@ -64,6 +64,45 @@ export PROTOC=$(which protoc)
 
 ArkFlow is a high-performance Rust stream processing engine built on Tokio with a plugin-based architecture.
 
+### Unified Execution Kernel (the only runtime; `rebuild-unified-streaming-engine`)
+
+A single execution model for local streams and distributed Jobs lives in
+`crates/arkflow-core/src/executor/`:
+
+- `envelope.rs` — `Envelope` (Data/Barrier/Watermark/EOS) control+data
+  elements that flow FIFO through execution edges.
+- `graph.rs` — `ExecutionGraphBuilder` compiles a `JobPlan` into chains of
+  operators joined by bounded flume channels; consecutive pass-through
+  operators fuse into one chain (zero channel hops); source/sink/stateful
+  operators always break chains.
+- `task.rs` — per-chain event loops (`run_graph`); chains run concurrently so
+  stages pipeline; bounded edges propagate backpressure; source chains handle
+  EOF/reconnect; sink chains ack after successful writes.
+- `barrier.rs` — async checkpoint barriers: `Aligner` (multi-input barrier
+  alignment with a bounded buffer), `BarrierCoordinator` (injects barriers,
+  completes checkpoints once every chain reports).
+- `window.rs` — `ColumnarWindowOperator`: vectorized tumbling window
+  assignment (Arrow column ops, no per-row batch copies), keyed aggregate
+  state in the `StateBackend`, watermark + processing-time triggers.
+- `stream_compiler.rs` — deterministic `StreamConfig → JobSpec` compilation
+  (input→source, processors→Map chain, window buffers→processing-time window
+  operators, `join` buffers→compile error, error_output→side sink edge).
+- `stream_adapter.rs` — `StreamJobAdapter`: rebuilds compiled-stream
+  components (codec/name passthrough) and wraps inputs with the stream WAL.
+- `job_runner_adapter.rs` — `run_job`/`run_job_tasks` entry points (local
+  full-graph and Agent subgraph modes share one code path).
+
+`EngineConfig` accepts a `jobs:` list (default empty) executed by the kernel
+locally; `--validate` deep-validates both streams and jobs (graph checks).
+The legacy executors are REMOVED: `SingleComputeJobRunner` (job_runner.rs)
+and the linear Stream executor are deleted. Streams compile through
+`stream_compiler` + `StreamJobAdapter` (WAL replay included in `WalInput`);
+Agent Jobs run through `kernel_handle::KernelJobRunner` with command-driven
+snapshots; `RuntimeManager::start` bumps the shared `RuntimeMetrics` via
+`run_job_with_metrics`. Window operators support tumbling/sliding/session
+(`WindowKind`), and window buffers compile by their legacy field names
+(`interval`/`gap`).
+
 ### Workspace Dependency Management
 
 The project uses Cargo workspace with centralized dependency management in the root `Cargo.toml`. All workspace members share versions through `[workspace.package]` and dependencies through `[workspace.dependencies]`. When adding dependencies, add them to the workspace section and reference with `workspace = true` in crate `Cargo.toml` files.
@@ -76,8 +115,8 @@ This is a Cargo workspace with three crates:
 
 - **`arkflow-core`** (`crates/arkflow-core/`) - Core engine abstractions and interfaces
   - `Engine`: Main orchestrator managing streams and health checks
-  - `Stream`: Complete data processing unit (input → pipeline → output)
-  - `Pipeline`: Ordered collection of processors
+  - `executor`: The unified execution kernel (chains, channels, barriers, windows)
+  - `StreamConfig`: Legacy stream schema, compiled to JobSpecs
   - `MessageBatch`: Columnar data using Apache Arrow `RecordBatch`
   - Abstract traits for `Input`, `Output`, `Processor`, `Buffer`, `Codec`
 
@@ -101,16 +140,16 @@ When adding a new plugin:
 3. Call the plugin's `init()` from the module's `init()` function
 
 #### Stream Processing Flow
-Each `Stream` runs concurrently with:
-- **Input worker**: Reads data from source
-- **Processor workers**: Multiple threads (configurable via `thread_num`) process batches
-- **Output worker**: Writes to sink with ordered delivery using sequence numbers
-- **Buffer layer**: Handles backpressure (threshold: 1024 messages in channel)
+Streams compile to JobSpecs and run on the unified kernel:
+- **Source chains**: read batches, apply event-time gating when configured, push Data/Barrier/Watermark envelopes downstream
+- **Chains** (fused operator runs): process batches in their own event loops; multiple chains pipeline concurrently
+- **Sink chains**: write batches (`write_batch`) then ack
+- **Edges**: bounded flume channels (default capacity 1024) — a full edge backpressures the producer
 
-Data flow: `Input → Buffer → [Processor1 → Processor2 → ...] → Output`
-Errors are routed to `error_output` if configured.
+Data flow: `Source chain → [chained processors] → channel → [chained processors] → Sink chain`
+Errors surface as processing-error metrics; `error_output` compiles to a side sink.
 
-**Backpressure Mechanism**: When the channel between input and processor contains 1024+ messages, the input worker blocks until space is available, preventing memory overflow from fast inputs/slow processors.
+**Backpressure Mechanism**: bounded inter-chain channels (default 1024 envelopes); producers await send when full, propagating backpressure to the source.
 
 #### Data Model
 Uses Apache Arrow's `RecordBatch` for efficient columnar storage. The `MessageBatch` wrapper includes:
@@ -143,6 +182,31 @@ The output worker ensures ordered delivery using:
 - **Sequence numbers**: Each message batch gets an incrementing sequence number
 - **Blocking queue**: Output worker waits for out-of-order batches before writing
 - Atomic counters track the next expected sequence, preventing out-of-order writes to sinks
+
+#### Durability and Recovery Invariants
+
+The unified runtime treats acknowledgement, state, event time, and recovery as
+one consistency boundary:
+
+- WAL and Kafka acknowledgements advance only through the highest contiguous
+  acknowledged sequence/offset. A later fan-out child must wait for an earlier
+  gap, and restored cursors seed the same in-memory frontier.
+- Stateful mutations remain staged until the processing acknowledgement commits.
+  Compensation restores the complete previous state entry, including TTL, and
+  cannot overwrite a newer per-key commit.
+- A fired window commits its state journal before acknowledging source input.
+  Window watermarks use the minimum progress of all active physical input
+  partitions; a multiplexed source must carry each delivery's physical
+  partition into the gate.
+- Sliding-window lateness is evaluated independently for every containing
+  window. Null or invalid event timestamps are never held indefinitely and are
+  explicitly marked when routed.
+- A local checkpoint manifest contains every planned task, even when stateless
+  operators are fused into fewer execution chains, and preserves the configured
+  state format when no stateful task has entries.
+- An Agent report identifies the process boot, not its short-lived session
+  token. A new boot invalidates stale start operations so desired-running Jobs
+  are reconciled into the fresh local runtime.
 
 ### Configuration System
 

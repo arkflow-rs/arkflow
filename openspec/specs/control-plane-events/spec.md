@@ -1,8 +1,8 @@
-# Purpose
+## Purpose
 
 Define authenticated, durable, bounded control-plane event delivery and replay.
 
-# Requirements
+## Requirements
 
 ### Requirement: Authenticated SSE event stream
 

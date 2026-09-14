@@ -15,3 +15,5 @@ examples/output.txt
 node_modules/
 console/dist/
 *.tsbuildinfo
+data/
+.zcode/

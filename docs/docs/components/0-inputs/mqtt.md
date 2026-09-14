@@ -1,4 +1,5 @@
 ---
+components: [input/mqtt]
 sidebar_label: MQTT
 ---
 

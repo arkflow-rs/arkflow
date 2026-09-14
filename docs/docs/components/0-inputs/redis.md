@@ -1,4 +1,5 @@
 ---
+components: [input/redis]
 sidebar_label: Redis
 ---
 

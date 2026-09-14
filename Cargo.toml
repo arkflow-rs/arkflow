@@ -51,6 +51,7 @@ clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
 flume = "=0.11"
 subtle = "2.6"
+rand = "0.9"
 governor = "0.6"
 dashmap = "6.1"
 mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
@@ -62,6 +63,8 @@ rusqlite = "0.37"
 tempfile = "3.24.0"
 mockall = "0.14"
 redb = "2"
+object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
+bytes = "1"
 arkflow-core = { path = "crates/arkflow-core" }
 arkflow-plugin = { path = "crates/arkflow-plugin" }
 arkflow-server = { path = "crates/arkflow-server" }

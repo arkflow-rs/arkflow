@@ -1,4 +1,5 @@
 ---
+components: [output/sql]
 description: ArkFlow documentation page.
 ---
 

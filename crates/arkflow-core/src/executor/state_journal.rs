@@ -1,0 +1,1967 @@
+//! Execution-local state mutation journal for stateful and window operators.
+//!
+//! The [`StateBackend`] trait has no cross-component transaction, so a stateful
+//! operator cannot ask the backend to "commit with the output". Instead, the
+//! mutations of one processing unit are staged in an execution-local journal:
+//!
+//! * writes go to the pending overlay (bounded by count and bytes);
+//! * reads see committed state plus the overlay, so later batches in the same
+//!   chain observe staged-but-unacknowledged mutations;
+//! * the backend itself only ever contains applied state, which is exactly
+//!   what a checkpoint barrier snapshots (the committed epoch);
+//! * [`CommitOnAck`] ties the apply to the final output acknowledgement —
+//!   staged mutations reach the backend only after the downstream write is
+//!   confirmed, and if the wrapped (source-side) acknowledgement then fails,
+//!   the applied prefix is compensated so an at-least-once replay cannot
+//!   double-apply it.
+
+use crate::input::Ack;
+use crate::state::{StateBackend, StateEntry};
+use crate::Error;
+use async_trait::async_trait;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+
+// A stateful processor and a window can be nested in the same acknowledgement
+// chain. Both use this journal, so a non-reentrant Tokio mutex would deadlock
+// when the outer window finalization invokes the inner processor's
+// `CommitOnAck`. The scope is task-local: top-level acknowledgements still
+// serialize the complete apply -> wrapped ack -> complete/undo interval, while
+// nested acknowledgements in that same interval reuse the held lock.
+tokio::task_local! {
+    static ACTIVE_FINALIZATION_JOURNALS: std::cell::RefCell<Vec<usize>>;
+}
+
+/// Bounds on staged (uncommitted) state. Exceeding either bound fails the
+/// staging call so the affected chain surfaces the error instead of growing
+/// memory without limit.
+#[derive(Debug, Clone, Copy)]
+pub struct JournalLimits {
+    /// Maximum number of simultaneously registered transactions (one per
+    /// unacknowledged output / open window group).
+    pub max_pending_transactions: usize,
+    /// Maximum total staged payload bytes across all transactions.
+    pub max_staged_bytes: usize,
+}
+
+impl Default for JournalLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_transactions: 4_096,
+            max_staged_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// One staged mutation, in apply order within its transaction.
+#[derive(Debug, Clone)]
+enum StagedMutation {
+    Put {
+        namespace: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    },
+    Delete {
+        namespace: String,
+        key: Vec<u8>,
+    },
+    /// Counter delta — order-independent across transactions, so two
+    /// transactions touching the same key may apply in any order.
+    Increment {
+        namespace: String,
+        key: Vec<u8>,
+        delta: i64,
+        ttl_ms: Option<u64>,
+    },
+}
+
+impl StagedMutation {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Put { key, value, .. } => key.len() + value.len(),
+            Self::Delete { key, .. } | Self::Increment { key, .. } => key.len(),
+        }
+    }
+
+    fn storage(&self) -> (&str, &[u8]) {
+        match self {
+            Self::Put { namespace, key, .. }
+            | Self::Delete { namespace, key }
+            | Self::Increment { namespace, key, .. } => (namespace, key),
+        }
+    }
+
+    fn apply_to(&self, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        match self {
+            Self::Put { value: staged, .. } => Some(staged.clone()),
+            Self::Delete { .. } => None,
+            Self::Increment { delta, .. } => {
+                let current = value
+                    .map(|raw| serde_json::from_slice::<i64>(&raw).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                Some(
+                    serde_json::to_vec(&current.saturating_add(*delta))
+                        .expect("i64 serialization cannot fail"),
+                )
+            }
+        }
+    }
+}
+
+/// Handle for one staging group. `Copy` by design: the journal tracks the
+/// group's lifecycle, making `apply`/`complete`/`undo`/`rollback` idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StateTxn {
+    id: u64,
+}
+
+/// Lifecycle of a registered transaction.
+#[derive(Debug)]
+enum TxnState {
+    /// Mutations not yet applied to the backend.
+    Staged(Vec<StagedMutation>),
+    /// Applied to the backend; `previous` holds the pre-apply value of every
+    /// mutation (in apply order) so `undo` can compensate. `applied_versions`
+    /// is aligned with `mutations`; `None` marks a mutation skipped by the
+    /// version fence (it owns nothing and is never restored).
+    Applied {
+        mutations: Vec<StagedMutation>,
+        previous: Vec<Option<StateEntry>>,
+        previous_versions: Vec<Option<u64>>,
+        applied_versions: Vec<Option<u64>>,
+    },
+}
+
+/// Durable compensation data retained by an acknowledgement after a journal
+/// transaction has been completed.  A later sibling acknowledgement may
+/// still need to undo that already-completed state change; dropping the
+/// pre-apply values at `complete` would make that impossible.
+#[derive(Debug, Clone)]
+pub struct StateRollback {
+    txn: StateTxn,
+    mutations: Vec<StagedMutation>,
+    previous: Vec<Option<StateEntry>>,
+    /// Versions the mutations replaced at apply time (what a compensation
+    /// restores). `None` for a mutation the version fence skipped.
+    previous_versions: Vec<Option<u64>>,
+    applied_versions: Vec<Option<u64>>,
+    /// Versions the mutations were staged at, kept so a restage can re-arm the
+    /// fence with the staged version for a mutation the fence skipped.
+    staged_versions: Vec<Option<u64>>,
+}
+
+#[derive(Debug, Default)]
+struct JournalInner {
+    next_id: u64,
+    next_version: u64,
+    txns: BTreeMap<u64, TxnState>,
+    staged_bytes: usize,
+    key_versions: BTreeMap<(String, Vec<u8>), u64>,
+    /// Version fence, per transaction and aligned with its staged mutations:
+    /// the version each key held when the mutation was staged. A retried
+    /// apply (after an undo or a delayed attempt) must not overwrite a value
+    /// a later committed transaction owns — the staged snapshot is stale and
+    /// the replay re-accumulates the same rows into the newer value.
+    apply_fences: BTreeMap<u64, Vec<Option<u64>>>,
+    /// Mutation indices whose effect is already embedded in a later
+    /// transaction's committed value: their compensation was skipped by the
+    /// ownership check, so a retried apply must NOT execute them again
+    /// (replaying a relative `Increment` would count its delta twice).
+    /// Cleared when the transaction completes or is discarded.
+    replay_applied: BTreeMap<u64, std::collections::BTreeSet<usize>>,
+}
+
+impl JournalInner {
+    fn release_bytes(&mut self, mutations: &[StagedMutation]) {
+        self.staged_bytes = self
+            .staged_bytes
+            .saturating_sub(mutations.iter().map(StagedMutation::bytes).sum::<usize>());
+    }
+}
+
+/// The execution-local mutation journal over one state backend.
+pub struct StateJournal {
+    backend: Arc<dyn StateBackend>,
+    inner: Mutex<JournalInner>,
+    /// Serialize backend mutations and their journal version transitions.
+    commit_lock: Mutex<()>,
+    /// Serialize acknowledgement finalization for this journal across the
+    /// whole `apply -> wrapped ack -> complete/undo` interval. Without a
+    /// lock spanning that interval, transaction A could be applied, B could
+    /// commit the same key, and A could then be retried after undoing over B.
+    /// Journals are scoped to one stateful operator task, so this conservative
+    /// per-journal lock preserves correctness without a process-wide mutex.
+    finalize_lock: tokio::sync::Mutex<()>,
+    limits: JournalLimits,
+}
+
+impl StateJournal {
+    pub fn new(backend: Arc<dyn StateBackend>) -> Self {
+        Self::with_limits(backend, JournalLimits::default())
+    }
+
+    pub fn with_limits(backend: Arc<dyn StateBackend>, limits: JournalLimits) -> Self {
+        Self {
+            backend,
+            inner: Mutex::new(JournalInner::default()),
+            commit_lock: Mutex::new(()),
+            finalize_lock: tokio::sync::Mutex::new(()),
+            limits,
+        }
+    }
+
+    async fn with_finalize_scope<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T> + Send,
+        T: Send,
+    {
+        let journal_key = self as *const Self as usize;
+        let active = ACTIVE_FINALIZATION_JOURNALS
+            .try_with(|journals| journals.borrow().contains(&journal_key))
+            .unwrap_or(false);
+        if active {
+            return future.await;
+        }
+
+        let mut journals = ACTIVE_FINALIZATION_JOURNALS
+            .try_with(|journals| journals.borrow().clone())
+            .unwrap_or_default();
+        journals.push(journal_key);
+        let _finalize_guard = self.finalize_lock.lock().await;
+        ACTIVE_FINALIZATION_JOURNALS
+            .scope(std::cell::RefCell::new(journals), future)
+            .await
+    }
+
+    /// The committed-only backend. Barrier snapshots read through this handle
+    /// so a checkpoint captures the applied epoch, never the pending overlay.
+    pub fn backend(&self) -> &Arc<dyn StateBackend> {
+        &self.backend
+    }
+
+    pub fn pending_transactions(&self) -> usize {
+        self.inner.lock().unwrap().txns.len()
+    }
+
+    fn transaction_is_registered(&self, txn: StateTxn) -> bool {
+        self.inner.lock().unwrap().txns.contains_key(&txn.id)
+    }
+
+    /// Capture the pre-apply values for a transaction that is about to be
+    /// completed.  The returned token is bounded by the transaction itself
+    /// and lets a composite acknowledgement compensate a successful state
+    /// child if a later sibling fails.
+    fn capture_applied(&self, txn: StateTxn) -> Option<StateRollback> {
+        let inner = self.inner.lock().unwrap();
+        match inner.txns.get(&txn.id) {
+            Some(TxnState::Applied {
+                mutations,
+                previous,
+                previous_versions,
+                applied_versions,
+            }) => Some(StateRollback {
+                txn,
+                mutations: mutations.clone(),
+                previous: previous.clone(),
+                previous_versions: previous_versions.clone(),
+                applied_versions: applied_versions.clone(),
+                staged_versions: inner
+                    .apply_fences
+                    .get(&txn.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Restore a completed transaction's bytes conditionally.  Version
+    /// fencing in `restore_previous` prevents an older compensation from
+    /// erasing a newer commit on the same key. A restore skipped by that
+    /// ownership check marks the mutation's effect as embedded in the newer
+    /// commit, so a retried apply of the re-staged transaction must not
+    /// execute it again.
+    fn undo_snapshot(&self, snapshot: &StateRollback) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let ownership_skipped = self.restore_previous(
+            &snapshot.mutations,
+            &snapshot.previous,
+            &snapshot.previous_versions,
+            &snapshot.applied_versions,
+        )?;
+        if !ownership_skipped.is_empty() {
+            let mut inner = self.inner.lock().unwrap();
+            let skips = inner.replay_applied.entry(snapshot.txn.id).or_default();
+            for index in ownership_skipped {
+                if matches!(snapshot.mutations.get(index), Some(StagedMutation::Increment { .. }))
+                {
+                    skips.insert(index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-stage a completed transaction after a compensating undo.  A
+    /// composite acknowledgement can finish its state child before a
+    /// sibling source acknowledgement fails; if the composite is retried,
+    /// the same transaction id must contain the original mutations again or
+    /// the retry would acknowledge the source without reapplying state.
+    fn restage_snapshot(&self, snapshot: &StateRollback) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.txns.contains_key(&snapshot.txn.id) {
+            return Ok(());
+        }
+        let bytes = snapshot
+            .mutations
+            .iter()
+            .map(StagedMutation::bytes)
+            .sum::<usize>();
+        if inner.txns.len() >= self.limits.max_pending_transactions {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-transaction pending bound",
+                self.limits.max_pending_transactions
+            )));
+        }
+        if inner.staged_bytes.saturating_add(bytes) > self.limits.max_staged_bytes {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-byte staging bound",
+                self.limits.max_staged_bytes
+            )));
+        }
+        inner.staged_bytes = inner.staged_bytes.saturating_add(bytes);
+        inner.txns.insert(
+            snapshot.txn.id,
+            TxnState::Staged(snapshot.mutations.clone()),
+        );
+        // Re-arm the version fence so a retried composite acknowledgement
+        // cannot overwrite a value a later committed transaction owns.
+        //
+        // A mutation that actually applied keeps the version it replaced (the
+        // value a compensation writes back). A mutation the fence SKIPPED must
+        // keep the version it was STAGED at: its `previous_versions` entry
+        // records the newer version it observed while being skipped, and
+        // re-arming with that value would make the retry compare equal and
+        // write the stale snapshot the skip existed to prevent.
+        let fence = snapshot
+            .previous_versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| match snapshot.applied_versions.get(index) {
+                Some(Some(_)) => *version,
+                _ => snapshot.staged_versions.get(index).copied().flatten(),
+            })
+            .collect::<Vec<_>>();
+        inner.apply_fences.insert(snapshot.txn.id, fence);
+        Ok(())
+    }
+
+    /// The version fence a transaction currently carries (test observability).
+    #[cfg(test)]
+    fn fence_for_test(&self, txn: StateTxn) -> Option<Vec<Option<u64>>> {
+        self.inner.lock().unwrap().apply_fences.get(&txn.id).cloned()
+    }
+
+    pub fn staged_bytes(&self) -> usize {
+        self.inner.lock().unwrap().staged_bytes
+    }
+
+    /// Begin a new staging group.
+    pub fn begin(&self) -> Result<StateTxn, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.txns.len() >= self.limits.max_pending_transactions {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-transaction pending bound: one transaction is \
+                 held per open window group (window key) or unacknowledged output, so very \
+                 high per-window key cardinality can exhaust the bound — raise \
+                 state.max_pending_transactions or reduce the live key set",
+                self.limits.max_pending_transactions
+            )));
+        }
+        inner.next_id = inner.next_id.saturating_add(1);
+        let id = inner.next_id;
+        inner.txns.insert(id, TxnState::Staged(Vec::new()));
+        Ok(StateTxn { id })
+    }
+
+    /// Read through the overlay: the applied backend value with every staged
+    /// transaction's mutations applied in begin order.
+    pub fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let staged = self.overlay_value(namespace, key)?;
+        if let Some(value) = staged {
+            return Ok(value);
+        }
+        self.backend.get(namespace, key)
+    }
+
+    /// Overlay value for one key across staged (unapplied) transactions, or
+    /// `None` when no staged mutation touches it. Mutations marked
+    /// replay-applied (their compensation was skipped because a later commit
+    /// owns the key) are already embedded in the backend value and are
+    /// excluded, so the overlay does not count them twice either.
+    fn overlay_value(&self, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Error> {
+        let inner = self.inner.lock().unwrap();
+        let mut value = self.backend.get(namespace, key)?;
+        let mut touched = false;
+        for (txn_id, state) in inner.txns.iter() {
+            let TxnState::Staged(mutations) = state else {
+                continue;
+            };
+            let skips = inner.replay_applied.get(txn_id);
+            for (index, mutation) in mutations.iter().enumerate() {
+                if skips.is_some_and(|set| set.contains(&index)) {
+                    continue;
+                }
+                let (mutation_namespace, mutation_key) = mutation.storage();
+                if mutation_namespace == namespace && mutation_key == key {
+                    touched = true;
+                    value = mutation.apply_to(value);
+                }
+            }
+        }
+        Ok(touched.then_some(value))
+    }
+
+    /// Stage a raw put.
+    pub fn put(
+        &self,
+        txn: StateTxn,
+        namespace: &str,
+        key: &[u8],
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        self.stage(
+            txn,
+            StagedMutation::Put {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                value,
+                ttl_ms,
+            },
+        )
+    }
+
+    /// Replace the snapshot for one key inside a staged transaction.
+    ///
+    /// Window buffers are serialized as complete values. Appending another
+    /// `Put` for the same open window on every input batch would make the
+    /// journal's byte bound grow with traffic even though only the latest
+    /// snapshot is live. This operation removes older mutations for the key
+    /// before staging the replacement while preserving the transaction's
+    /// overlay semantics.
+    pub fn put_compact(
+        &self,
+        txn: StateTxn,
+        namespace: &str,
+        key: &[u8],
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        let mutation = StagedMutation::Put {
+            namespace: namespace.to_owned(),
+            key: key.to_vec(),
+            value,
+            ttl_ms,
+        };
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let removed_bytes = {
+            let Some(TxnState::Staged(mutations)) = inner.txns.get(&txn.id) else {
+                return Err(Error::Process(
+                    "state journal transaction is no longer staged".into(),
+                ));
+            };
+            mutations
+                .iter()
+                .filter(|existing| existing.storage() == mutation.storage())
+                .map(StagedMutation::bytes)
+                .sum::<usize>()
+        };
+        let next_bytes = inner
+            .staged_bytes
+            .saturating_sub(removed_bytes)
+            .saturating_add(mutation.bytes());
+        if next_bytes > self.limits.max_staged_bytes {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-byte staging bound",
+                self.limits.max_staged_bytes
+            )));
+        }
+        inner.staged_bytes = next_bytes;
+        // Rebuild the transaction's mutation list and its version fence
+        // together so the two stay aligned while compacting away replaced
+        // entries. The journal inner is behind a mutex guard, so the reads
+        // are collected as owned data before anything is written back.
+        let storage = mutation.storage();
+        let storage = (storage.0.to_owned(), storage.1.to_vec());
+        let removed_fence = inner.apply_fences.remove(&txn.id);
+        let (mut kept_mutations, mut kept_fence) = {
+            let Some(TxnState::Staged(mutations)) = inner.txns.get(&txn.id) else {
+                return Ok(());
+            };
+            let mut kept_mutations = Vec::with_capacity(mutations.len());
+            let mut kept_fence = Vec::with_capacity(mutations.len());
+            let mut fence = removed_fence.unwrap_or_default().into_iter();
+            for existing in mutations.iter() {
+                let version = fence.next().flatten();
+                let existing_storage = existing.storage();
+                if existing_storage.0 != storage.0 || existing_storage.1 != storage.1.as_slice() {
+                    kept_mutations.push(existing.clone());
+                    kept_fence.push(version);
+                }
+            }
+            (kept_mutations, kept_fence)
+        };
+        kept_mutations.push(mutation);
+        let (namespace, key) = kept_mutations
+            .last()
+            .map(StagedMutation::storage)
+            .expect("a compacted transaction always retains one mutation");
+        kept_fence.push(
+            inner
+                .key_versions
+                .get(&(namespace.to_owned(), key.to_vec()))
+                .copied(),
+        );
+        kept_fence.resize(kept_mutations.len(), None);
+        if let Some(TxnState::Staged(mutations)) = inner.txns.get_mut(&txn.id) {
+            *mutations = kept_mutations;
+        }
+        inner.apply_fences.insert(txn.id, kept_fence);
+        Ok(())
+    }
+
+    /// Stage a delete.
+    pub fn delete(&self, txn: StateTxn, namespace: &str, key: &[u8]) -> Result<(), Error> {
+        self.stage(
+            txn,
+            StagedMutation::Delete {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+            },
+        )
+    }
+
+    /// Stage a counter delta. Returns the next effective value computed from
+    /// the applied backend state plus the staged overlay.
+    pub fn update_i64(
+        &self,
+        txn: StateTxn,
+        namespace: &str,
+        key: &[u8],
+        delta: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, Error> {
+        let current = self
+            .get(namespace, key)?
+            .map(|value| serde_json::from_slice::<i64>(&value))
+            .transpose()
+            .map_err(Error::Serialization)?
+            .unwrap_or_default();
+        let next = current.saturating_add(delta);
+        self.stage(
+            txn,
+            StagedMutation::Increment {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                delta,
+                ttl_ms,
+            },
+        )?;
+        Ok(next)
+    }
+
+    fn stage(&self, txn: StateTxn, mutation: StagedMutation) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let byte_len = mutation.bytes();
+        if !matches!(inner.txns.get(&txn.id), Some(TxnState::Staged(_))) {
+            return Err(Error::Process(
+                "state journal transaction is no longer staged".into(),
+            ));
+        }
+        if inner.staged_bytes + byte_len > self.limits.max_staged_bytes {
+            return Err(Error::Process(format!(
+                "state journal exceeds the {}-byte staging bound",
+                self.limits.max_staged_bytes
+            )));
+        }
+        inner.staged_bytes += byte_len;
+        let fence_version = {
+            let (namespace, key) = mutation.storage();
+            inner
+                .key_versions
+                .get(&(namespace.to_owned(), key.to_vec()))
+                .copied()
+        };
+        if let Some(TxnState::Staged(mutations)) = inner.txns.get_mut(&txn.id) {
+            mutations.push(mutation);
+        }
+        inner
+            .apply_fences
+            .entry(txn.id)
+            .or_default()
+            .push(fence_version);
+        Ok(())
+    }
+
+    /// Apply a staged transaction to the backend. The transaction stays
+    /// registered (as applied) until [`StateJournal::complete`], so a
+    /// wrapped-acknowledgement failure can still [`StateJournal::undo`] it.
+    /// A backend failure during apply compensates the applied prefix and
+    /// returns the transaction to the staged state so the caller may retry.
+    pub fn apply(&self, txn: StateTxn) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let (mutations, staged_versions, replay_applied) = {
+            let inner = self.inner.lock().unwrap();
+            match inner.txns.get(&txn.id) {
+                Some(TxnState::Staged(mutations)) => {
+                    // The fence records the key version each mutation observed
+                    // when it was staged (falling back to the current version
+                    // for transactions staged before a fence existed). A
+                    // retried apply must not overwrite a value a later
+                    // committed transaction owns: the staged snapshot is
+                    // stale, and the replay re-accumulates the same rows into
+                    // the newer value.
+                    let staged_versions = match inner.apply_fences.get(&txn.id) {
+                        Some(fence) => fence.clone(),
+                        None => mutations
+                            .iter()
+                            .map(|mutation| {
+                                let (namespace, key) = mutation.storage();
+                                inner
+                                    .key_versions
+                                    .get(&(namespace.to_owned(), key.to_vec()))
+                                    .copied()
+                            })
+                            .collect::<Vec<_>>(),
+                    };
+                    // Mutations whose compensation was skipped by the
+                    // ownership check are already embedded in a later
+                    // committed value; a retried apply must not execute them.
+                    let replay_applied = inner.replay_applied.get(&txn.id).cloned();
+                    (mutations.clone(), staged_versions, replay_applied)
+                }
+                Some(TxnState::Applied { .. }) | None => return Ok(()),
+            }
+        };
+        // Capture the pre-apply value of each mutation so `undo` and the
+        // failure compensation can restore exactly what changed.
+        let mut previous = Vec::with_capacity(mutations.len());
+        for mutation in &mutations {
+            let (namespace, key) = mutation.storage();
+            previous.push(self.backend.get_entry(namespace, key)?);
+        }
+        let mut applied_versions: Vec<Option<u64>> = vec![None; mutations.len()];
+        // The version each mutation actually REPLACED, captured at apply time.
+        // `restore_previous` writes this back into the version map, so recording
+        // the version observed when the mutation was STAGED would write back a
+        // value older than a concurrent commit and silently disable the
+        // ownership check for the transaction that owns it.
+        let mut previous_versions: Vec<Option<u64>> = vec![None; mutations.len()];
+        // Versions written by THIS apply pass: a later mutation of the same
+        // transaction on the same key legitimately builds on them instead of
+        // being fenced out.
+        let mut local_versions = std::collections::BTreeMap::<(String, Vec<u8>), u64>::new();
+        for (index, mutation) in mutations.iter().enumerate() {
+            let (namespace, key) = mutation.storage();
+            let version_key = (namespace.to_owned(), key.to_vec());
+            // A mutation whose compensation was skipped (a later committed
+            // transaction owns the key) is already in effect; re-executing
+            // it would double-apply. Treat it as applied-but-unowned: no
+            // backend call, no version, and nothing to compensate later.
+            if replay_applied
+                .as_ref()
+                .is_some_and(|skips| skips.contains(&index))
+            {
+                continue;
+            }
+            let current = {
+                let inner = self.inner.lock().unwrap();
+                local_versions
+                    .get(&version_key)
+                    .copied()
+                    .or_else(|| inner.key_versions.get(&version_key).copied())
+            };
+            previous_versions[index] = current;
+            let owned_by_this_pass = local_versions.contains_key(&version_key);
+            // A mutation is stale when the key's version moved since the
+            // mutation was staged, because its staged snapshot then predates a
+            // newer committed value.
+            //
+            // `Increment` is exempt: its mutation is a relative delta that the
+            // backend applies to whatever value is current, so it composes
+            // across transactions in any order and a version move does not make
+            // it wrong. `Delete` is destructive and therefore fenced, and it
+            // cannot be partially skipped without leaving the transaction's
+            // post-conditions inconsistent, so a stale delete fails the whole
+            // apply and the caller compensates and retries.
+            let destructive = !matches!(mutation, StagedMutation::Increment { .. });
+            let stale = destructive && !owned_by_this_pass && current != staged_versions[index];
+            if stale {
+                match mutation {
+                    StagedMutation::Put { .. } => {
+                        tracing::debug!(
+                            namespace = %namespace,
+                            key = %String::from_utf8_lossy(key),
+                            "skipping stale journal mutation fenced by a newer committed value"
+                        );
+                        continue;
+                    }
+                    StagedMutation::Delete { .. } | StagedMutation::Increment { .. } => {
+                        if let Err(rollback_error) = self.restore_previous(
+                            &mutations,
+                            &previous,
+                            &previous_versions,
+                            &applied_versions,
+                        ) {
+                            return Err(Error::Process(format!(
+                                "state journal apply refused a stale mutation; rollback also \
+                                 failed ({rollback_error})"
+                            )));
+                        }
+                        return Err(Error::Process(format!(
+                            "state journal refused a stale {} for key '{}': the staged snapshot \
+                             predates a newer committed value",
+                            if matches!(mutation, StagedMutation::Delete { .. }) {
+                                "delete"
+                            } else {
+                                "increment"
+                            },
+                            String::from_utf8_lossy(key)
+                        )));
+                    }
+                }
+            }
+            let result = match mutation {
+                StagedMutation::Put {
+                    namespace,
+                    key,
+                    value,
+                    ttl_ms,
+                } => self.backend.put_with_ttl(
+                    namespace,
+                    key,
+                    value,
+                    *ttl_ms,
+                    crate::state::now_ms(),
+                ),
+                StagedMutation::Delete { namespace, key } => {
+                    self.backend.delete(namespace, key).map(|_| ())
+                }
+                StagedMutation::Increment {
+                    namespace,
+                    key,
+                    delta,
+                    ttl_ms,
+                } => self
+                    .backend
+                    .update_i64_with_ttl(namespace, key, *delta, *ttl_ms)
+                    .map(|_| ()),
+            };
+            match result {
+                Ok(_) => {
+                    let version = {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.next_version = inner.next_version.saturating_add(1);
+                        let version = inner.next_version;
+                        let (namespace, key) = mutation.storage();
+                        inner
+                            .key_versions
+                            .insert((namespace.to_owned(), key.to_vec()), version);
+                        version
+                    };
+                    applied_versions[index] = Some(version);
+                    local_versions.insert(version_key, version);
+                }
+                Err(error) => {
+                    // Compensate the applied mutations so the backend does not
+                    // keep a partial transaction a retry would double-apply.
+                    // Fenced (skipped) mutations own nothing and are excluded
+                    // by the None entries.
+                    let ownership_skipped = self.restore_previous(
+                        &mutations,
+                        &previous,
+                        &previous_versions,
+                        &applied_versions,
+                    );
+                    if let Err(rollback_error) = ownership_skipped {
+                        return Err(Error::Process(format!(
+                            "state journal apply failed ({error}); rollback also failed ({rollback_error})"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.txns.get_mut(&txn.id) {
+            if matches!(state, TxnState::Staged(_)) {
+                *state = TxnState::Applied {
+                    mutations,
+                    previous,
+                    previous_versions,
+                    applied_versions,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete an applied transaction: its wrapped acknowledgement
+    /// succeeded, so the applied state becomes final. No-op otherwise.
+    pub fn complete(&self, txn: StateTxn) {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.apply_fences.remove(&txn.id);
+        inner.replay_applied.remove(&txn.id);
+        if let Some(state) = inner.txns.remove(&txn.id) {
+            match state {
+                TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
+                    inner.release_bytes(&mutations);
+                }
+            }
+        }
+    }
+
+    /// Compensating rollback of an applied transaction: restore the
+    /// pre-apply value of every mutation so an at-least-once replay cannot
+    /// double-apply it. A successful undo returns the transaction to
+    /// `Staged`, because a transient wrapped-ack failure retries this same
+    /// acknowledgement and must apply the mutation again.
+    pub fn undo(&self, txn: StateTxn) -> Result<(), Error> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let applied = {
+            let inner = self.inner.lock().unwrap();
+            match inner.txns.get(&txn.id) {
+                Some(TxnState::Applied {
+                    mutations,
+                    previous,
+                    previous_versions,
+                    applied_versions,
+                }) => (
+                    mutations.clone(),
+                    previous.clone(),
+                    previous_versions.clone(),
+                    applied_versions.clone(),
+                ),
+                _ => return Ok(()),
+            }
+        };
+        let ownership_skipped = self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
+        let mut inner = self.inner.lock().unwrap();
+        // A skipped restore means the mutation's effect is embedded in a
+        // later committed value. Mark relative mutations (Increment) so the
+        // retried apply does not execute them again — that would count the
+        // delta a second time. Absolute writes are self-healing: their
+        // version fence refuses the stale snapshot on replay.
+        if !ownership_skipped.is_empty() {
+            let skips = inner.replay_applied.entry(txn.id).or_default();
+            for index in ownership_skipped {
+                if matches!(applied.0.get(index), Some(StagedMutation::Increment { .. })) {
+                    skips.insert(index);
+                }
+            }
+        }
+        if let Some(TxnState::Applied { mutations, .. }) = inner.txns.remove(&txn.id) {
+            inner.txns.insert(txn.id, TxnState::Staged(mutations));
+        }
+        Ok(())
+    }
+
+    /// Apply and complete in one step, for callers that gate the commit on a
+    /// condition they already know succeeded (no wrapped acknowledgement).
+    pub fn commit(&self, txn: StateTxn) -> Result<(), Error> {
+        self.apply(txn)?;
+        self.complete(txn);
+        Ok(())
+    }
+
+    /// Discard a staged (unapplied) transaction without applying it.
+    pub fn rollback(&self, txn: StateTxn) {
+        self.complete(txn);
+    }
+
+    /// Restore pre-apply values in reverse order (a transaction may mutate
+    /// the same key more than once). `applied_versions` is aligned with
+    /// `mutations`; `None` entries were skipped by the version fence and own
+    /// nothing, so restoring them would erase a newer committed value.
+    /// Returns the indices whose restore was skipped because a later
+    /// committed transaction owns the key — the mutation's effect lives
+    /// inside that newer value.
+    fn restore_previous(
+        &self,
+        mutations: &[StagedMutation],
+        previous: &[Option<StateEntry>],
+        previous_versions: &[Option<u64>],
+        applied_versions: &[Option<u64>],
+    ) -> Result<Vec<usize>, Error> {
+        let entries = mutations
+            .iter()
+            .zip(previous)
+            .zip(previous_versions)
+            .zip(applied_versions)
+            .enumerate()
+            .collect::<Vec<_>>();
+        let mut ownership_skipped = Vec::new();
+        for (index, (((mutation, value), previous_version), applied_version)) in
+            entries.into_iter().rev()
+        {
+            let Some(applied_version) = applied_version else {
+                continue;
+            };
+            let applied_version = *applied_version;
+            let (namespace, key) = mutation.storage();
+            let version_key = (namespace.to_owned(), key.to_vec());
+            let owns_current_value = self
+                .inner
+                .lock()
+                .unwrap()
+                .key_versions
+                .get(&version_key)
+                .copied()
+                == Some(applied_version);
+            if !owns_current_value {
+                // A later committed transaction owns this key. Restoring the
+                // older bytes would erase that valid commit.
+                ownership_skipped.push(index);
+                continue;
+            }
+            self.backend.restore_entry(namespace, key, value.as_ref())?;
+            let mut inner = self.inner.lock().unwrap();
+            if inner.key_versions.get(&version_key).copied() == Some(applied_version) {
+                match previous_version {
+                    Some(version) => {
+                        inner.key_versions.insert(version_key, *version);
+                    }
+                    None => {
+                        inner.key_versions.remove(&version_key);
+                    }
+                }
+            }
+        }
+        Ok(ownership_skipped)
+    }
+}
+
+/// Acknowledgement that applies a journal transaction before delegating, so
+/// state finalization is ordered after the downstream output confirms its
+/// write (and before the WAL cursor / source commit of the wrapped ack).
+///
+/// If the wrapped acknowledgement fails after the apply, the transaction is
+/// undone: the source position stays uncommitted, the record replays, and the
+/// replayed mutation applies exactly once.
+pub struct CommitOnAck {
+    journal: Arc<StateJournal>,
+    txn: StateTxn,
+    inner: Arc<dyn Ack>,
+    completed_rollback: Mutex<Option<StateRollback>>,
+}
+
+/// Acknowledgement that atomically finalizes several journal transactions with
+/// one wrapped acknowledgement. Window firing can touch multiple groups in a
+/// single output; keeping the source acknowledgement inside this composite is
+/// what lets a source failure undo every group instead of leaving finalized
+/// window state behind.
+pub struct CommitGroupOnAck {
+    journal: Arc<StateJournal>,
+    txns: Vec<StateTxn>,
+    inner: Arc<dyn Ack>,
+    completed_rollbacks: Mutex<Option<Vec<StateRollback>>>,
+}
+
+impl CommitGroupOnAck {
+    pub fn new(journal: Arc<StateJournal>, txns: Vec<StateTxn>, inner: Arc<dyn Ack>) -> Self {
+        Self {
+            journal,
+            txns,
+            inner,
+            completed_rollbacks: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Ack for CommitGroupOnAck {
+    async fn ack(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                let mut applied = Vec::with_capacity(self.txns.len());
+                for txn in &self.txns {
+                    if let Err(error) = self.journal.apply(*txn) {
+                        for applied_txn in applied.iter().rev() {
+                            let _ = self.journal.undo(*applied_txn);
+                        }
+                        return Err(error);
+                    }
+                    applied.push(*txn);
+                }
+                match self.inner.ack().await {
+                    Ok(()) => {
+                        let rollbacks = self
+                            .txns
+                            .iter()
+                            .filter_map(|txn| self.journal.capture_applied(*txn))
+                            .collect::<Vec<_>>();
+                        for txn in &self.txns {
+                            self.journal.complete(*txn);
+                        }
+                        let should_store = !rollbacks.is_empty()
+                            || self.completed_rollbacks.lock().unwrap().is_none();
+                        if should_store {
+                            *self.completed_rollbacks.lock().unwrap() = Some(rollbacks);
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let mut rollback_error = None;
+                        for txn in applied.iter().rev() {
+                            if let Err(undo_error) = self.journal.undo(*txn) {
+                                rollback_error.get_or_insert(undo_error);
+                            }
+                        }
+                        match rollback_error {
+                            Some(undo_error) => Err(Error::Process(format!(
+                                "source acknowledgement failed ({error}); state rollback also failed ({undo_error})"
+                            ))),
+                            None => Err(error),
+                        }
+                    }
+                }
+            })
+            .await
+    }
+
+    fn mark_held(&self) {
+        self.inner.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.inner.release_held();
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                // Compensate the journal state BEFORE rewinding the source/WAL
+                // cursor: the rewind is the last durable step, mirroring the
+                // forward path where the cursor advances only after state
+                // commits. A crash between the two steps leaves the delivery
+                // replayable instead of a cursor rewound over an
+                // uncompensated mutation. If the state compensation itself
+                // fails, the cursor is NOT rewound — the transaction stays
+                // retryable.
+                let mut state_error = None;
+                for txn in &self.txns {
+                    if self.journal.transaction_is_registered(*txn) {
+                        if let Err(error) = self.journal.undo(*txn) {
+                            state_error.get_or_insert(error);
+                        }
+                    }
+                }
+                let completed_rollbacks = { self.completed_rollbacks.lock().unwrap().take() };
+                if let Some(rollbacks) = completed_rollbacks {
+                    for rollback in rollbacks.iter().rev() {
+                        if let Err(error) = self.journal.undo_snapshot(rollback) {
+                            state_error.get_or_insert(error);
+                        }
+                    }
+                    for rollback in &rollbacks {
+                        if let Err(error) = self.journal.restage_snapshot(rollback) {
+                            state_error.get_or_insert(error);
+                        }
+                    }
+                    *self.completed_rollbacks.lock().unwrap() = Some(rollbacks);
+                }
+                if let Some(error) = state_error {
+                    return Err(error);
+                }
+                self.inner.undo().await.err().map_or(Ok(()), Err)
+            })
+            .await
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        // The output may fail before this acknowledgement is ever called.
+        // `fired_ack` has already removed the transactions from the window's
+        // lookup map, so explicitly discard their staged mutations here;
+        // otherwise a one-target send failure leaks a transaction forever and
+        // can eventually exhaust the journal bound.
+        self.journal
+            .with_finalize_scope(async {
+                let inner_result = self.inner.abort().await;
+                for txn in &self.txns {
+                    if self.journal.transaction_is_registered(*txn) {
+                        let _ = self.journal.undo(*txn);
+                        self.journal.rollback(*txn);
+                    }
+                }
+                if let Some(rollbacks) = self.completed_rollbacks.lock().unwrap().take() {
+                    for rollback in rollbacks.iter().rev() {
+                        let _ = self.journal.undo_snapshot(rollback);
+                    }
+                }
+                inner_result
+            })
+            .await
+    }
+}
+
+impl CommitOnAck {
+    pub fn new(journal: Arc<StateJournal>, txn: StateTxn, inner: Arc<dyn Ack>) -> Self {
+        Self {
+            journal,
+            txn,
+            inner,
+            completed_rollback: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Ack for CommitOnAck {
+    async fn ack(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                // Idempotent at the journal level: a retry after a transient
+                // backend failure re-applies only the unapplied transaction.
+                self.journal.apply(self.txn)?;
+                match self.inner.ack().await {
+                    Ok(()) => {
+                        if let Some(rollback) = self.journal.capture_applied(self.txn) {
+                            *self.completed_rollback.lock().unwrap() = Some(rollback);
+                        }
+                        self.journal.complete(self.txn);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if let Err(undo_error) = self.journal.undo(self.txn) {
+                            return Err(Error::Process(format!(
+                                "source acknowledgement failed ({error}); state rollback also failed ({undo_error})"
+                            )));
+                        }
+                        Err(error)
+                    }
+                }
+            })
+            .await
+    }
+
+    fn mark_held(&self) {
+        self.inner.mark_held();
+    }
+
+    fn release_held(&self) {
+        self.inner.release_held();
+    }
+
+    async fn undo(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                // Compensate the journal state BEFORE rewinding the source/WAL
+                // cursor: the rewind is the last durable step, mirroring the
+                // forward path where the cursor advances only after state
+                // commits. If the state compensation itself fails, the cursor
+                // is NOT rewound — the transaction stays retryable.
+                let state_result = if self.journal.transaction_is_registered(self.txn) {
+                    self.journal.undo(self.txn)
+                } else {
+                    let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
+                    if let Some(rollback) = completed_rollback {
+                        let result = self
+                            .journal
+                            .undo_snapshot(&rollback)
+                            .and_then(|()| self.journal.restage_snapshot(&rollback));
+                        *self.completed_rollback.lock().unwrap() = Some(rollback);
+                        result
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(error) = state_result {
+                    return Err(error);
+                }
+                self.inner.undo().await.err().map_or(Ok(()), Err)
+            })
+            .await
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        self.journal
+            .with_finalize_scope(async {
+                let inner_result = self.inner.abort().await;
+                if self.journal.transaction_is_registered(self.txn) {
+                    let _ = self.journal.undo(self.txn);
+                    self.journal.rollback(self.txn);
+                } else {
+                    let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
+                    if let Some(rollback) = completed_rollback {
+                        let _ = self.journal.undo_snapshot(&rollback);
+                    }
+                }
+                inner_result
+            })
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::RedbStateBackend;
+
+    fn backend() -> Arc<dyn StateBackend> {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(RedbStateBackend::open(dir.path(), 1).unwrap());
+        // Keep the tempdir alive for the test's duration; the OS reclaims it
+        // after the test process exits.
+        std::mem::forget(dir);
+        backend
+    }
+
+    #[test]
+    fn reads_see_applied_plus_staged_overlay() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"1").unwrap();
+        let txn = journal.begin().unwrap();
+        assert_eq!(journal.update_i64(txn, "ns", b"k", 2, None).unwrap(), 3);
+        // Overlay visible to readers, invisible to the backend.
+        assert_eq!(journal.get("ns", b"k").unwrap(), Some(b"3".to_vec()));
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        journal.commit(txn).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"3".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[test]
+    fn staged_increments_compose_across_pending_transactions_in_any_order() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        let second = journal.begin().unwrap();
+        // The second batch sees the first batch's staged increment.
+        assert_eq!(journal.update_i64(second, "ns", b"k", 1, None).unwrap(), 2);
+        // Commits fire in acknowledgement order, not begin order.
+        journal.commit(second).unwrap();
+        journal.commit(first).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec())
+        );
+    }
+
+    #[test]
+    fn rollback_discards_staged_mutations() {
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 5, None).unwrap();
+        journal.rollback(txn);
+        journal.rollback(txn); // idempotent
+        assert!(journal.get("ns", b"k").unwrap().is_none());
+        assert_eq!(journal.staged_bytes(), 0);
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[test]
+    fn retried_apply_does_not_overwrite_a_newer_committed_value() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal
+            .put(first, "ns", b"k", b"stale".to_vec(), None)
+            .unwrap();
+        journal.apply(first).unwrap();
+        // The wrapped acknowledgement failed: undo returns the transaction to
+        // the staged state so the caller retries it.
+        journal.undo(first).unwrap();
+        // Meanwhile a later transaction commits the same key.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+        // The retry must be fenced: applying the stale snapshot over the
+        // newer commit would erase a valid value (the replay re-accumulates
+        // the same rows into the newer transaction instead).
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+    }
+
+    /// Regression: the fence exempted `Delete`, so a compensated transaction
+    /// that was retried replayed its stale delete over a value a later
+    /// transaction had committed — and the replay that should have restored the
+    /// window's rows had already been acknowledged.
+    #[test]
+    fn retried_delete_does_not_erase_a_newer_committed_value() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal.delete(first, "ns", b"k").unwrap();
+        journal.apply(first).unwrap();
+        // The wrapped acknowledgement failed: undo returns the transaction to
+        // the staged state so the caller retries it.
+        journal.undo(first).unwrap();
+        // Meanwhile a later transaction commits a value for the same key.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+        // The retry must not erase the newer commit; it reports the stale
+        // mutation so the caller can compensate rather than silently corrupt.
+        let error = journal.apply(first).unwrap_err().to_string();
+        assert!(error.contains("stale delete"), "{error}");
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+    }
+
+    /// A stale `Increment` still applies: its delta composes with whatever the
+    /// key holds now, which is the documented counter contract. Only the
+    /// destructive kinds are fenced.
+    #[test]
+    fn increments_stay_exempt_from_the_version_fence() {
+        let journal = StateJournal::new(backend());
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        journal.apply(first).unwrap();
+        journal.undo(first).unwrap();
+        // A later transaction replaces the value outright.
+        let second = journal.begin().unwrap();
+        journal.put(second, "ns", b"k", b"5".to_vec(), None).unwrap();
+        journal.commit(second).unwrap();
+        // The retry of the relative mutation still lands on the newer value.
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"6".to_vec())
+        );
+    }
+
+    /// Regression: `undo` must write back the version it actually replaced. A
+    /// compensation that stored the STAGE-time version wrote an older version
+    /// into the map, so the transaction owning the newer value no longer
+    /// recognized its own key and skipped its rollback — the mutation stayed
+    /// applied while its source position was uncommitted, and the replay
+    /// applied it twice.
+    /// Regression: a mutation the fence SKIPPED records the newer version it
+    /// observed while being skipped. Re-arming the fence with that value made
+    /// the retry compare equal, so the stale snapshot the skip existed to
+    /// prevent was written after all.
+    #[test]
+    fn a_restaged_transaction_keeps_skipping_the_mutation_it_was_fenced_on() {
+        let journal = StateJournal::new(backend());
+        // Transaction A stages a snapshot write for a key that does not exist.
+        let first = journal.begin().unwrap();
+        journal
+            .put(first, "ns", b"k", b"old".to_vec(), None)
+            .unwrap();
+        // A later transaction commits a newer value for the same key first.
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"k", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(second).unwrap();
+
+        // A sibling failure restages A before it ever applies: the transaction
+        // returns to staged with the fence it staged at.
+        // A's attempt is skipped by the fence.
+        journal.apply(first).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+        let rollback = journal
+            .capture_applied(first)
+            .expect("the skipped transaction still carries compensation data");
+        assert_eq!(
+            rollback.applied_versions,
+            vec![None],
+            "the mutation was skipped, not applied"
+        );
+
+        // The acknowledgement succeeded, so the transaction is completed; a
+        // later sibling failure restages it from the retained rollback data.
+        journal.complete(first);
+        journal.restage_snapshot(&rollback).unwrap();
+        assert_eq!(
+            journal
+                .fence_for_test(first)
+                .expect("the restaged transaction is fenced"),
+            vec![None],
+            "the fence must keep the staged version, not the version seen while skipped"
+        );
+
+        // The retry must still be fenced: the skip was not a one-off.
+        journal.apply(first).unwrap();
+        journal.complete(first);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"fresh".to_vec()),
+            "the restaged transaction must not write its stale snapshot over the newer commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_restores_the_version_it_replaced_so_the_owner_still_recognizes_it() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let failing = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let succeeding = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        // Both transactions stage their increment before either applies.
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        let second = journal.begin().unwrap();
+        journal.update_i64(second, "ns", b"k", 1, None).unwrap();
+
+        // The second transaction commits first, and its acknowledgement keeps
+        // the compensation data for a later sibling failure.
+        let second_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            second,
+            succeeding.clone() as Arc<dyn Ack>,
+        ));
+        second_ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+
+        // The first transaction applies over the newer value and then its
+        // acknowledgement fails, so the journal compensates it.
+        let first_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            first,
+            failing.clone() as Arc<dyn Ack>,
+        ));
+        assert!(first_ack.ack().await.is_err());
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec()),
+            "the compensation restores the value the first transaction replaced"
+        );
+
+        // A sibling failure now compensates the already-completed second
+        // transaction. It must still recognize the key as its own: before the
+        // fix the version written back by the first compensation was the one
+        // observed at STAGE time, so the ownership check failed and the
+        // increment survived.
+        second_ack.undo().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            None,
+            "the owning transaction's rollback must still recognize its version"
+        );
+    }
+
+    #[test]
+    fn commit_is_idempotent() {
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
+        journal.commit(txn).unwrap();
+        journal.commit(txn).unwrap(); // second commit is a no-op
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn undo_restores_the_pre_apply_state() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"pre", b"old").unwrap();
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"pre", b"new".to_vec(), None)
+            .unwrap();
+        journal
+            .put(txn, "ns", b"fresh", b"1".to_vec(), None)
+            .unwrap();
+        journal.update_i64(txn, "ns", b"counter", 7, None).unwrap();
+        journal.apply(txn).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"counter").unwrap(),
+            Some(b"7".to_vec())
+        );
+        journal.undo(txn).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"pre").unwrap(),
+            Some(b"old".to_vec())
+        );
+        assert!(journal.backend().get("ns", b"fresh").unwrap().is_none());
+        assert!(journal.backend().get("ns", b"counter").unwrap().is_none());
+        // Undo keeps the transaction staged so the same acknowledgement can
+        // retry after a transient wrapped-ack failure.
+        assert_eq!(journal.pending_transactions(), 1);
+    }
+
+    #[test]
+    fn skipped_increment_compensation_does_not_double_count_on_retry() {
+        let journal = StateJournal::new(backend());
+        // A applies +1.
+        let a = journal.begin().unwrap();
+        journal.update_i64(a, "ns", b"k", 1, None).unwrap();
+        journal.apply(a).unwrap();
+        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"1".to_vec()));
+        // B commits +1 while A is applied: the committed value now embeds
+        // A's delta.
+        let b = journal.begin().unwrap();
+        journal.update_i64(b, "ns", b"k", 1, None).unwrap();
+        journal.apply(b).unwrap();
+        journal.complete(b);
+        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"2".to_vec()));
+        // A's wrapped acknowledgement fails: the compensation is skipped
+        // because B's commit owns the key.
+        journal.undo(a).unwrap();
+        // The overlay must not count A's staged delta either: the value is
+        // B's committed 2, not 3.
+        assert_eq!(
+            journal.get("ns", b"k").unwrap(),
+            Some(b"2".to_vec()),
+            "the overlay excludes a replay-applied increment whose compensation was skipped"
+        );
+        // A retries and must NOT apply its delta again: the correct final
+        // value stays B's 2.
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec()),
+            "a retried increment whose compensation was skipped must not double-count"
+        );
+    }
+
+    #[test]
+    fn undo_skipped_compensation_still_restores_when_the_key_is_owned() {
+        // Control: an increment whose compensation is NOT skipped keeps the
+        // old retry semantics — undo restores, retry re-applies exactly once.
+        let journal = StateJournal::new(backend());
+        let a = journal.begin().unwrap();
+        journal.update_i64(a, "ns", b"k", 1, None).unwrap();
+        journal.apply(a).unwrap();
+        journal.undo(a).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            None,
+            "an owned compensation still restores the pre-apply value"
+        );
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec()),
+            "the retried increment applies exactly once when the key was never taken over"
+        );
+    }
+
+    #[test]
+    fn staging_bounds_are_enforced() {
+        let journal = StateJournal::with_limits(
+            backend(),
+            JournalLimits {
+                max_pending_transactions: 1,
+                max_staged_bytes: 4,
+            },
+        );
+        let txn = journal.begin().unwrap();
+        assert!(journal.begin().is_err());
+        assert!(journal.put(txn, "ns", b"k", vec![0; 8], None).is_err());
+    }
+
+    struct FailingBackend {
+        inner: Arc<dyn StateBackend>,
+        fail_next: Mutex<bool>,
+    }
+
+    impl StateBackend for FailingBackend {
+        fn format_version(&self) -> u32 {
+            self.inner.format_version()
+        }
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            self.inner.get(namespace, key)
+        }
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            ttl_ms: Option<u64>,
+            now_ms: u64,
+        ) -> Result<(), Error> {
+            if *self.fail_next.lock().unwrap() {
+                return Err(Error::Process("injected put failure".into()));
+            }
+            self.inner
+                .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        }
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            self.inner.update_i64(namespace, key, delta)
+        }
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            self.inner.delete(namespace, key)
+        }
+        fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+            self.inner.purge_expired(now_ms)
+        }
+        fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            self.inner.scan(namespace)
+        }
+        fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+            self.inner.snapshot_at(now_ms)
+        }
+        fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            self.inner.restore(snapshot)
+        }
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            self.inner.metrics()
+        }
+        fn close(&self) -> Result<(), Error> {
+            self.inner.close()
+        }
+    }
+
+    #[test]
+    fn failed_apply_compensates_and_stays_staged() {
+        let inner = backend();
+        let failing = Arc::new(FailingBackend {
+            inner: inner.clone(),
+            fail_next: Mutex::new(true),
+        });
+        let journal = StateJournal::new(failing.clone() as Arc<dyn StateBackend>);
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"a", b"1".to_vec(), None).unwrap();
+        journal.put(txn, "ns", b"b", b"2".to_vec(), None).unwrap();
+        assert!(journal.commit(txn).is_err());
+        // Nothing from the failed transaction reached the backend.
+        assert!(inner.get("ns", b"a").unwrap().is_none());
+        assert!(inner.get("ns", b"b").unwrap().is_none());
+        // The transaction stays staged: a retry after the transient failure
+        // applies it exactly once.
+        *failing.fail_next.lock().unwrap() = false;
+        journal.commit(txn).unwrap();
+        assert_eq!(inner.get("ns", b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(inner.get("ns", b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    struct RecordingAck {
+        acked: Mutex<bool>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::Process("downstream ack failed".into()));
+            }
+            *self.acked.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    struct UndoOrderSpy {
+        journal: Arc<StateJournal>,
+        called: std::sync::atomic::AtomicBool,
+        state_at_source_undo: Mutex<Option<Option<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl Ack for UndoOrderSpy {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn undo(&self) -> Result<(), Error> {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            *self.state_at_source_undo.lock().unwrap() =
+                Some(self.journal.backend().get("ns", b"k").unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_compensates_state_before_rewinding_the_source_cursor() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"1".to_vec(), None)
+            .unwrap();
+        journal.apply(txn).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        let spy = Arc::new(UndoOrderSpy {
+            journal: journal.clone(),
+            called: std::sync::atomic::AtomicBool::new(false),
+            state_at_source_undo: Mutex::new(None),
+        });
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            spy.clone() as Arc<dyn Ack>,
+        ));
+        ack.undo().await.unwrap();
+        assert!(
+            spy.called.load(std::sync::atomic::Ordering::Acquire),
+            "the source cursor rewind must still run after state compensation"
+        );
+        let seen = spy.state_at_source_undo.lock().unwrap().take();
+        assert_eq!(
+            seen,
+            Some(None),
+            "the journal state must already be compensated when the source cursor is rewound"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_on_ack_applies_before_the_wrapped_ack() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            inner.clone() as Arc<dyn Ack>,
+        ));
+        ack.ack().await.unwrap();
+        assert!(*inner.acked.lock().unwrap());
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_on_ack_wrapped_failure_undoes_the_apply() {
+        // Output succeeded but the source-side commit failed: the applied
+        // state must be compensated so the at-least-once replay of the same
+        // record applies the mutation exactly once.
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            inner.clone() as Arc<dyn Ack>,
+        ));
+        assert!(ack.ack().await.is_err());
+        assert_eq!(journal.pending_transactions(), 1);
+        assert!(journal.backend().get("ns", b"k").unwrap().is_none());
+        // The fan-out/ack retry reuses the same CommitOnAck and therefore the
+        // same staged transaction. It must apply the mutation once, rather
+        // than observing a removed transaction and acknowledging the source
+        // without restoring state.
+        inner
+            .fail
+            .store(false, std::sync::atomic::Ordering::Release);
+        ack.ack().await.unwrap();
+        assert_eq!(journal.pending_transactions(), 0);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_group_on_ack_rolls_back_all_transactions_and_retries() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"first", 1, None).unwrap();
+        let second = journal.begin().unwrap();
+        journal
+            .update_i64(second, "ns", b"second", 2, None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![first, second],
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        // A source-side failure must undo every applied window transaction,
+        // rather than leaving a partially finalized aggregate behind.
+        assert!(ack.ack().await.is_err());
+        assert!(journal.backend().get("ns", b"first").unwrap().is_none());
+        assert!(journal.backend().get("ns", b"second").unwrap().is_none());
+        assert_eq!(journal.pending_transactions(), 2);
+
+        // Retrying the same composite re-stages/applies both transactions and
+        // completes them exactly once after the wrapped source ack succeeds.
+        inner
+            .fail
+            .store(false, std::sync::atomic::Ordering::Release);
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"first").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            journal.backend().get("ns", b"second").unwrap(),
+            Some(b"2".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_state_can_be_compensated_and_retried() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+
+        // A sibling acknowledgement failure may compensate a state child
+        // after its transaction has already completed. The next retry must
+        // re-stage the mutation, not merely re-ack the source.
+        ack.undo().await.unwrap();
+        assert!(journal.backend().get("ns", b"k").unwrap().is_none());
+        assert_eq!(journal.pending_transactions(), 1);
+
+        ack.ack().await.unwrap();
+        assert_eq!(journal.pending_transactions(), 0);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_same_journal_ack_does_not_deadlock() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let source = Arc::new(RecordingAck {
+            acked: Mutex::new(false),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let window_txn = journal.begin().unwrap();
+        journal
+            .update_i64(window_txn, "window", b"k", 1, None)
+            .unwrap();
+        let processor_txn = journal.begin().unwrap();
+        journal
+            .update_i64(processor_txn, "processor", b"k", 1, None)
+            .unwrap();
+        let processor_ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            processor_txn,
+            source.clone() as Arc<dyn Ack>,
+        ));
+        let group: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![window_txn],
+            processor_ack,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), group.ack())
+            .await
+            .expect("nested journal acknowledgements must not deadlock")
+            .unwrap();
+        assert_eq!(
+            journal.backend().get("window", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            journal.backend().get("processor", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[test]
+    fn undo_preserves_ttl_metadata() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let backend_dyn: Arc<dyn StateBackend> = backend.clone();
+        let now = crate::state::now_ms();
+        backend_dyn
+            .put_with_ttl("ns", b"k", b"old", Some(60_000), now)
+            .unwrap();
+        let before = backend_dyn.get_entry("ns", b"k").unwrap().unwrap();
+
+        let journal = StateJournal::new(backend_dyn.clone());
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"k", b"new".to_vec(), None).unwrap();
+        journal.apply(txn).unwrap();
+        journal.undo(txn).unwrap();
+
+        let after = backend_dyn.get_entry("ns", b"k").unwrap().unwrap();
+        assert_eq!(after.value, before.value);
+        assert_eq!(after.expires_at_ms, before.expires_at_ms);
+    }
+
+    #[test]
+    fn older_undo_does_not_restore_over_a_later_commit() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"0").unwrap();
+
+        let first = journal.begin().unwrap();
+        journal.update_i64(first, "ns", b"k", 1, None).unwrap();
+        journal.apply(first).unwrap();
+
+        let second = journal.begin().unwrap();
+        journal.update_i64(second, "ns", b"k", 1, None).unwrap();
+        journal.apply(second).unwrap();
+        journal.complete(second);
+
+        // The first transaction's compensation must not erase the second
+        // transaction's already committed increment.
+        journal.undo(first).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec())
+        );
+    }
+}

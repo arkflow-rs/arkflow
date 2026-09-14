@@ -1,0 +1,50 @@
+# Case: durable webhook collection forwarded to Kafka.
+#
+# Third-party webhooks POST JSON to ArkFlow's HTTP input. Every accepted
+# message is persisted to a write-ahead log BEFORE processing, and the source
+# only acknowledges after Kafka confirms the produce — so a crash between
+# receive and produce loses nothing: unacknowledged webhooks are replayed
+# from the WAL on restart. Messages that fail processing go to the error
+# output instead of blocking the stream.
+#
+# Semantics: at-least-once (the HTTP caller may retry, and WAL replay can
+# redeliver; deduplicate downstream by webhook id if needed).
+#
+# Validate offline:
+#   ./target/release/arkflow --config examples/case_webhook_durable.yaml --validate
+
+logging:
+  level: info
+
+streams:
+  - id: webhooks-to-kafka
+    input:
+      type: http
+      address: "0.0.0.0:8080"
+      path: "/webhooks"
+
+    # Durable ingest: persist every webhook to ./data/wal before processing.
+    durability:
+      enabled: true
+      path: "./data/wal"
+      sync: "group_commit"   # per_entry | group_commit | periodic
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: "SELECT * FROM flow"
+        - type: arrow_to_json
+
+    output:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topic:
+        type: value
+        value: webhooks.raw
+      client_id: arkflow-webhooks
+
+    error_output:
+      type: stdout

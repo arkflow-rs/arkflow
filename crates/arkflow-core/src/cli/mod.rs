@@ -32,7 +32,7 @@ impl Cli {
 
     pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let matches = Command::new("arkflow")
-            .version("0.4.0-rc1")
+            .version(env!("CARGO_PKG_VERSION"))
             .author("chenquan")
             .about("High-performance Rust stream processing engine, providing powerful data stream processing capabilities, supporting multiple input/output sources and processors.")
             .subcommand(
@@ -46,7 +46,15 @@ impl Cli {
                                     .long("kind")
                                     .short('k')
                                     .value_name("KIND")
-                                    .help("Filter by component kind: input, output, processor, buffer, codec."),
+                                    .help("Filter by component kind: input, output, processor, buffer, codec, temporary."),
+                            )
+                            .arg(
+                                Arg::new("format")
+                                    .long("format")
+                                    .short('f')
+                                    .value_name("FORMAT")
+                                    .default_value("text")
+                                    .help("Output format: text or json."),
                             ),
                     )
                     .subcommand(
@@ -56,7 +64,7 @@ impl Cli {
                                 Arg::new("kind")
                                     .value_name("KIND")
                                     .required(true)
-                                    .help("Component kind: input, output, processor, buffer, codec."),
+                                    .help("Component kind: input, output, processor, buffer, codec, temporary."),
                             )
                             .arg(
                                 Arg::new("name")
@@ -125,6 +133,28 @@ impl Cli {
             }
         };
 
+        // Deep validation: stream ids and declared Job specs (graph checks,
+        // duplicate ids, operator references) beyond deserialization.
+        if let Err(e) = config.stream_ids() {
+            println!("Invalid configuration: {}", e);
+            process::exit(1);
+        }
+        if let Err(e) = config.job_specs() {
+            println!("Invalid configuration: {}", e);
+            process::exit(1);
+        }
+        let validation = crate::configuration::validate_config(&config);
+        if !validation.valid {
+            let details = validation
+                .errors
+                .iter()
+                .map(|issue| format!("{}: {}", issue.path, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            println!("Invalid configuration: {details}");
+            process::exit(1);
+        }
+
         // If you just verify the configuration, exit it
         if matches.get_flag("validate") {
             info!("The config is validated.");
@@ -154,7 +184,15 @@ fn handle_components_subcommand(matches: &ArgMatches) -> Result<(), Box<dyn std:
                 .get_one::<String>("kind")
                 .map(|k| k.parse())
                 .transpose()?;
-            print_component_list(filter);
+            let format = sub
+                .get_one::<String>("format")
+                .map(|s| s.as_str())
+                .unwrap_or("text");
+            if format == "json" {
+                print_component_list_json(filter)?;
+            } else {
+                print_component_list(filter);
+            }
             Ok(())
         }
         Some(("show", sub)) => {
@@ -212,6 +250,19 @@ fn print_component_list(filter: Option<ComponentKind>) {
             width = name_width
         );
     }
+}
+
+fn print_component_list_json(
+    filter: Option<ComponentKind>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = component::export_registry();
+    if let Some(kind) = filter {
+        if let Some(components) = payload.get_mut("components").and_then(|c| c.as_array_mut()) {
+            components.retain(|c| c["kind"].as_str() == Some(kind.as_str()));
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
 }
 
 fn print_component_details(

@@ -1,4 +1,5 @@
 ---
+components: [multiple_inputs]
 sidebar_label: Multiple Inputs
 ---
 

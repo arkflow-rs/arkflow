@@ -1,4 +1,5 @@
 ---
+components: [output/nats]
 description: ArkFlow documentation page.
 ---
 

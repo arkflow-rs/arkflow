@@ -12,6 +12,7 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true}
 tokio-util = { workspace = true }
+serde_json = { workspace = true }
 
 # arkflow
 arkflow-core = { workspace = true }

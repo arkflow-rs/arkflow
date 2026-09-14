@@ -1,0 +1,45 @@
+# Case: order stream ingestion into MySQL.
+#
+# Shop order events arrive as JSON on a Kafka topic. ArkFlow decodes each
+# message into a columnar Arrow batch, filters out test records, and appends
+# the orders into a MySQL table. Malformed messages never block the stream:
+# they are routed to the error output instead.
+#
+# Validate offline:
+#   ./target/release/arkflow --config examples/case_order_stream_sql.yaml --validate
+
+logging:
+  level: info
+
+streams:
+  - id: orders-to-mysql
+    input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - shop.orders
+      consumer_group: arkflow-orders
+      client_id: arkflow-orders
+      start_from_latest: true
+
+    pipeline:
+      thread_num: 4
+      processors:
+        # Decode the JSON payload into a columnar Arrow batch.
+        - type: json_to_arrow
+        # Keep paying orders only.
+        - type: sql
+          query: "SELECT * FROM flow WHERE status = 'PAID'"
+        # Re-encode to JSON rows for the sink.
+        - type: arrow_to_json
+
+    output:
+      type: sql
+      output_type:
+        type: "mysql"
+        uri: "mysql://root:1234@localhost:3306/arkflow"
+      table_name: "orders"
+
+    error_output:
+      type: stdout

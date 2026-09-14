@@ -1,13 +1,70 @@
 {
   "version": 1,
   "examples": [
-    {"name": "quickstart", "path": "../examples/generate_example.yaml", "kind": "yaml"},
-    {"name": "kafka-input", "path": "../examples/kafka_example.yaml", "kind": "yaml"},
-    {"name": "sql-output", "path": "../examples/sql_output_example.yaml", "kind": "yaml"},
-    {"name": "durability", "path": "../examples/durability_example.yaml", "kind": "yaml"},
-    {"name": "durability-s3", "path": "../examples/durability_example_s3.yaml", "kind": "yaml"},
-    {"name": "control-plane", "path": "../examples/control_plane_example.yaml", "kind": "yaml"},
-    {"name": "control-plane-hub", "path": "../examples/control_plane_hub.yaml", "kind": "yaml"},
-    {"name": "cdc-debezium", "path": "../examples/cdc_debezium.yaml", "kind": "yaml"}
+    {
+      "name": "quickstart",
+      "path": "../examples/generate_example.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "kafka-input",
+      "path": "../examples/kafka_example.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "sql-output",
+      "path": "../examples/sql_output_example.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "durability",
+      "path": "../examples/durability_example.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "durability-s3",
+      "path": "../examples/durability_example_s3.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "control-plane",
+      "path": "../examples/control_plane_example.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "control-plane-hub",
+      "path": "../examples/control_plane_hub.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "jobs-local",
+      "path": "../examples/jobs_local.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "cdc-debezium",
+      "path": "../examples/cdc_debezium.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "case-order-stream-sql",
+      "path": "../examples/case_order_stream_sql.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "case-telemetry-windows",
+      "path": "../examples/case_telemetry_windows.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "case-webhook-durable",
+      "path": "../examples/case_webhook_durable.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "howto-cdc-schema-registry",
+      "path": "../examples/howto_cdc_schema_registry.yaml",
+      "kind": "yaml"
+    }
   ]
 }

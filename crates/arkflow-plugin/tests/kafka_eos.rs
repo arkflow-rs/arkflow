@@ -55,11 +55,71 @@ const CLUSTER_ID: &str = "1RlfgIc1TZWvdfLySKufPw";
 const KAFKA_HOST_PORT: u16 = 9092;
 
 /// Shared broker — started once, reused by every (serial) test to avoid the
-/// fixed-port release race between back-to-back containers.
-static BROKER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+/// fixed-port release race between back-to-back containers. `None` marks a
+/// probe-detected Docker-less environment: every test then skips instead of
+/// panicking on the missing container engine.
+static BROKER: OnceCell<Option<ContainerAsync<GenericImage>>> = OnceCell::const_new();
 
-async fn broker() {
-    BROKER.get_or_init(start_broker).await;
+async fn broker() -> bool {
+    let container = BROKER
+        .get_or_init(|| async {
+            if !docker_available() {
+                eprintln!(
+                    "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
+                );
+                return None;
+            }
+            Some(start_broker().await)
+        })
+        .await;
+    container.is_some()
+}
+
+/// Skip one case loudly. A green run of this suite must never mean "zero
+/// assertions ran": when `ARKFLOW_REQUIRE_DOCKER` is set (CI), an unavailable
+/// engine fails the case instead of passing it silently.
+fn skip_without_docker(case: &str) {
+    if std::env::var_os("ARKFLOW_REQUIRE_DOCKER").is_some() {
+        panic!(
+            "{case}: Docker is required (ARKFLOW_REQUIRE_DOCKER is set) but no daemon is reachable"
+        );
+    }
+    eprintln!("--- SKIPPED {case}: Docker is unavailable ---");
+}
+
+/// Probe for a usable container engine: the default Unix socket or an
+/// explicitly configured non-unix DOCKER_HOST.
+fn docker_available() -> bool {
+    if let Ok(host) = std::env::var("DOCKER_HOST") {
+        // A non-unix endpoint names a reachable daemon; a unix:// endpoint
+        // names the socket to probe below.
+        if host.starts_with("tcp://") || host.starts_with("http://") {
+            return true;
+        }
+        if let Some(path) = host.strip_prefix("unix://") {
+            return std::path::Path::new(path).exists();
+        }
+    }
+    // The default socket plus the paths Docker Desktop, Colima, Rancher, and
+    // podman publish. A probe that only knew /var/run/docker.sock reported a
+    // running daemon as absent and silently skipped every case.
+    [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+    ]
+    .iter()
+    .any(|path| std::path::Path::new(path).exists())
+        || std::env::var_os("HOME").is_some_and(|home| {
+            let home = std::path::PathBuf::from(home);
+            [
+                ".docker/run/docker.sock",
+                ".colima/default/docker.sock",
+                ".rd/docker.sock",
+                ".local/share/containers/podman/machine/podman.sock",
+            ]
+            .iter()
+            .any(|relative| home.join(relative).exists())
+        })
 }
 
 /// Register all output builders exactly once.
@@ -254,7 +314,10 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn smoke_broker_and_roundtrip() {
-    broker().await;
+    if !broker().await {
+        skip_without_docker("smoke_broker_and_roundtrip");
+        return;
+    }
     let topic = format!("eos-smoke-{}", std::process::id());
     let output = build_output(&topic, false, None).await;
     output
@@ -276,7 +339,10 @@ async fn smoke_broker_and_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn atomic_commit_observes_whole_batch() {
-    broker().await;
+    if !broker().await {
+        skip_without_docker("atomic_commit_observes_whole_batch");
+        return;
+    }
     let topic = format!("eos-atomic-{}", std::process::id());
     let tx_id = format!("atomic-tx-{}", std::process::id());
 
@@ -305,7 +371,10 @@ async fn atomic_commit_observes_whole_batch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn zombie_fenced_across_restart() {
-    broker().await;
+    if !broker().await {
+        skip_without_docker("zombie_fenced_across_restart");
+        return;
+    }
     let topic = format!("eos-fence-{}", std::process::id());
     let tx_id = format!("fence-tx-{}", std::process::id());
 
@@ -341,7 +410,10 @@ async fn zombie_fenced_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn post_commit_crash_duplicates() {
-    broker().await;
+    if !broker().await {
+        skip_without_docker("post_commit_crash_duplicates");
+        return;
+    }
     let topic = format!("eos-dup-{}", std::process::id());
     let tx_id = format!("dup-tx-{}", std::process::id());
 

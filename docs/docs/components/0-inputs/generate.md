@@ -1,4 +1,5 @@
 ---
+components: [generate]
 sidebar_label: Generate
 ---
 

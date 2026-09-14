@@ -1,4 +1,5 @@
 ---
+components: [tumbling_window]
 description: ArkFlow documentation page.
 ---
 

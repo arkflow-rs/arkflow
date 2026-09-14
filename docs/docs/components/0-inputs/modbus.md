@@ -1,4 +1,5 @@
 ---
+components: [modbus]
 sidebar_label: Modbus
 ---
 

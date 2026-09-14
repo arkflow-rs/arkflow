@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -27,9 +27,9 @@
    - `git log` 全量搜索 ai/inference/onnx/tensor/anomaly **零命中**（历史从未实现）
    - processor 仅 6 种：`batch/json/protobuf/python/sql/vrl`，无原生 AI processor
    - → **宣传与实现脱节最严重处 = 最大差异化机会**
-2. **单节点、无分布式**。无 cluster/consensus/raft 依赖；`crates/arkflow-core/test_distributed_wal/` 是 2025-09 建的**空目录**——曾起念但未做。Engine/Stream 各为单文件（`engine/mod.rs`、`stream/mod.rs`）。
-3. **无有状态计算**。仅内存 window 状态（`buffer/{session,sliding,tumbling}_window.rs`），无 state backend、无 checkpoint/savepoint、无端到端 exactly-once（当前仅 at-least-once，见 `input-durability` spec「At-least-once delivery」）。
-4. **无 CDC**。无 Debezium/binlog/PG WAL input。社区 issue #430（NoSQL output）、#274（S3 & SQL output）侧面反映企业集成诉求。
+2. ~~**单节点、无分布式**~~ → 已突破：v1 分支落地分布式 Job 运行时（Hub–Agent 多 Compute Node，见第四节）。YAML Stream 仍为单节点形态。
+3. ~~**无有状态计算**~~ → 已突破（v1）：keyed state、checkpoint/savepoint、事件时间/watermark 已落地 `arkflow-core/src/{state,checkpoint,event_time,job,job_runner}.rs`；端到端 exactly-once（Kafka L2 事务）已合入 main。
+4. ~~**无 CDC**~~ → 已闭环：`debezium_json` codec（MySQL/PostgreSQL/MongoDB/SQLServer），2026-07-31 归档。
 5. **可运维性弱**。有 `prometheus` 依赖但缺完整 metrics 导出方案；无 trace；无动态配置/管理面。
 6. **processor 工具箱偏薄**。缺数据处理常用的 filter/mask/encrypt/http-lookup/schema-registry 等。
 7. **文档落后于实现**。README 的 input/output 清单不全（漏 memory/multiple_inputs/pulsar、redis/sql/influxdb/pulsar output 等）。
@@ -172,7 +172,7 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 
 ---
 
-## 四、进度与状态（2026-07-31）
+## 四、进度与状态（2026-08-27 对齐 v1 实际进展）
 
 ### 方向② 推进进度
 
@@ -181,43 +181,99 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 | **1 CDC** | ✅ 全流程闭环 | `changes/archive/2026-07-31-add-cdc-debezium`；spec `debezium-cdc-parsing` 已合并 `openspec/specs/` | `debezium_json` codec，复用 Kafka input + ack-gated offset |
 | **前置 refactor** | ✅ 全流程闭环 | `changes/archive/2026-07-31-refactor-codec-async`；spec `async-codec-contract` 已合并 | Codec trait async 化，**纯重构无行为变更**；为 schema_registry 解锁 reqwest async |
 | **2 Schema Registry** | ✅ 全流程闭环 | `changes/archive/2026-07-31-add-schema-registry`；spec `schema-registry-integration` 已合并 | reqwest async + `SchemaResolver` trait；认证 HTTP mock 测试（wiremock） |
-| **3 端到端 EOS** | 🚧 实现 done，待 verify/archive | `changes/add-end-to-end-exactly-once` | Phase 1（write_batch 地基）✅ + Phase 2（Kafka 事务 producer）✅ + Phase 3（cp-kafka testcontainers 集成测试：smoke/atomic/fencing/dup，4 项本地通过）✅ + Phase 4（example/CLAUDE.md）✅ |
-| **4 状态 checkpoint** | ⏳ 待 propose | — | 最重、推最后；守单节点 |
+| **3 端到端 EOS** | ✅ 全流程闭环 | `changes/archive/2026-08-01-add-end-to-end-exactly-once`；spec `exactly-once-output` 已合并 | Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`）；PR #1195 已合入 main |
+| **4 状态 checkpoint** | ✅ 以超集形态落地 | `changes/add-distributed-stateful-streaming-runtime`（v1 分支，118/118 全 done） | 见下方「战略边界修订」——**未按原「单节点 Change 4」方案做，而是走了分布式 Job 运行时** |
+
+### 战略边界修订（2026-08-27 记录）
+
+原 Change 4 设想为「单节点 stateful processor + checkpoint」，严守「不引入分布式」。实际落地为 **`add-distributed-stateful-streaming-runtime`**（v1 分支，26 个提交，~10000 行）：
+
+- 新增 `arkflow-core` 模块：`job.rs`（JobSpec/DAG/代际）、`job_runner.rs`（任务分发/locality）、`checkpoint.rs`（分布式屏障/保存/恢复）、`state.rs`（keyed state，embedded_kv）、`event_time.rs`（watermark）、`streaming_sql.rs`。
+- 扩展 Hub–Agent 控制面管理 Job/Task/Checkpoint/恢复；Console Job workbench + 可视化 DAG 编排器（`add-visual-job-dag-orchestrator`）。
+- 7 个 capability spec：`streaming-job-api`、`distributed-job-runtime`、`keyed-state-backend`、`checkpoint-recovery`、`event-time-processing`、`control-plane-fleet`/`control-plane-reconciliation`（扩展）。
+- **突破了 3.1 节「保持单节点」的边界**：任务可分布在多 Compute Node 上。这是有意为之的路线调整（数据平台团队诉求），但与 1.3 节「不在分布式有状态领域与 RisingWave/Arroyo 正面竞争」的原始定位存在张力——定位叙事需要重新审视：ArkFlow 的差异点应表述为「轻量 Hub–Agent 编排 + 列式 Arrow + 声明式 Job」，而非重型流数据库。
+- 现有 YAML 本地 Stream 运行时保持兼容，不自动转换为 Job。
+- v1 分支尚未合入 main；PR #1219（`fix/distributed-job-review-remediation`，含其中 25 个提交）评审中。
 
 ### 已确认决策
 - 方向② = 生产级端到端可靠性（对标 Benthos 软肋、延续 WAL 势能；详见 1.3 节）。
-- 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。
-- 状态 checkpoint（Change 4）保留完整内容、推最后；守「单节点、不引入分布式」。
+- 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。（前三项已全部闭环）
+- ~~状态 checkpoint（Change 4）守「单节点、不引入分布式」~~ → 已修订为分布式 Job 运行时（见上节）。
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
 - Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 复用现有 upsert（零代码）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future。
 
-### 下一步
-Change 3 EOS：实现完成（Phase 1-4 全 done；Phase 3 用 cp-kafka testcontainers 替代 redpanda——Kafka 事务参考实现 + CI 可拉 + 协议兼容，EOS 语义等价）。下一步 `openspec verify` → archive（spec `exactly-once-output` 合并主 specs）→ propose Change 4（状态 checkpoint）。
+### 下一步（2026-09-12 对齐）
+
+1. **合入 v1**：v1 领先 main 51 个提交、main 零领先（单向干净窗口）。评审整改已全部归档，`openspec/changes/` 仅剩 `archive/`。合并 v1 是一切新方向的前置，拖久合并风险增大。
+2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。
+3. **方向选择**：方向② 四项全部闭环后，从第七节候选方向中确认下一主线（推荐序：数据面可观测性 → 企业集成安全 → AI 轻量切口），确认后展开 roadmap 并按 OpenSpec 立项。
 
 ---
 
-## 五、Hub 平台路线（2026-08-02）
+## 六、统一执行内核重建（2026-08-27 启动，进行中）
 
-### 5.1 当前进展
+用户决策（2026-08-27）：**允许破坏性更新，以 Job 运行时为本体重建引擎，对标最先进流处理产品**。OpenSpec change：`rebuild-unified-streaming-engine`（v1 分支）。
 
-Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的基础转型：
+### 已落地（29/30 任务，2026-08-28 第三批：执行器删除 + 收尾）
 
-- `add-control-plane` 已完成，建立了本地 `ControlPlane`、资源 API 和 Console 基础。
-- `make-control-plane-hub` 已完成 32/33 项：节点注册、租约、Agent 心跳与报告、节点资源聚合、目标命令派发、配置转发、Hub Console 基础能力均已实现；剩余一个 Hub + 两节点端到端 Smoke Test。
-- `rebuild-control-plane-system` 已完成 27/37 项：服务边界、资源 API、操作模型和 Console 架构已完成；剩余操作取消/重协调、完整 API 集成测试、Runtime/Configuration Console 完整体验，以及最终验证审计。
-- 当前 Hub 的边界仍明确保持为单 Hub、多 Compute Node；暂不引入 Raft、跨 Hub 共识或分布式调度。
+- **executor 内核**（`crates/arkflow-core/src/executor/`）：Envelope 通道、算子链融合、per-chain 事件循环（流水线并行 + 通道反压）、partitioned/broadcast 路由；12 项单测。
+- **异步 barrier checkpoint**：barrier 随数据流动、多输入对齐（有界缓冲）、异步快照不停世界、BarrierCoordinator 复用现有 checkpoint.rs 契约。
+- **事件时间门控**（`event_time_gate.rs`）：watermark 追踪、行级 Hold/Emit/Route/Update/Drop、held 行 FIFO 释放、延迟 ack、idle 刷新；接入源链事件循环。
+- **列式窗口算子**：向量化 tumbling 分配、keyed 聚合状态（持久化/恢复）、watermark/processing-time 双触发、迟到策略。
+- **有状态算子接线**（`stateful.rs`）：图构建期 StatefulOperator 包装（keyed counter 入 state backend 命名空间），无 backend 时构建拒绝。
+- **StreamConfig 编译器**：确定性编译 + buffer 映射 + error_output 侧边；全量 examples 黄金测试通过。
+- **三路执行全走内核**：① YAML `jobs`（Engine 直驱）；② streams（RuntimeManager::start → compile → run_job，真实二进制验证 generate→SQL→stdout）；③ Agent（spawn_kernel_job + KernelJobHandle 命令驱动快照，生命周期测试验证快照期间数据继续流动）。
+- **内核指标**（`metrics.rs`）：per-chain 吞吐/平均延迟/在途/错误 + checkpoint 时长/失败 + watermark lag + 迟到计数。
+- **性能基线**：generate→json_to_arrow→sql→drop（20 万行，batch=1000）：内核 528ms vs legacy 559ms（快 6%，`kernel_perf_baseline.rs`）。
+
+### 待办（已清零，2026-09-12 核实）
+
+- ~~5.6 双节点 smoke~~：已由自动化测试 `crates/arkflow-server/tests/two_node_job_smoke.rs` 闭环（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing；2026-09-12 实测通过，随 `3499843` 引入、`b17690d` 加固）。
+
+第三批（2026-08-28）完成：5.4 双执行器删除（-2966 行；迁移 partition-guard/Route-vs-Update 测试到 executor；WAL 重放迁入 WalInput 惰性队列；temporary 表经 StreamJobAdapter::build_resource 进入内核 Resource——修复了内核丢 temporary 的缺口）；4.5 examples 等价回归（inline 管道 + durability_example 含 WAL 重放路径）；2.6 故障注入（注入 snapshot 失败→checkpoint 失败但数据继续；恢复位置 ≤ checkpoint 位点）；3.5 sliding/session 窗口（多窗口隶属分配、会话按 gap 合并扩展，编译器按 legacy 字段名 interval/gap 映射）；5.2 指标接通（run_job_with_metrics → RuntimeMetrics：input/processing/output/error 计数）；6.2 CLAUDE.md 对齐；6.3 tasks 勾选。
+
+### 关键设计决策
+
+- 两套运行时统一方向：**Stream 编译为 JobSpec 走内核**（编译器 + adapter 保留 YAML 零改动），不是反向。
+- WAL 是 input 的持久化属性（`StreamJobAdapter::WalInput` 包装），与 Job checkpoint（barrier + 状态快照）互补：checkpoint 优先、WAL 兜底。
+- `Resource` 的 `RefCell` 仅构建期使用——图构建同步完成后释放，`run_job` future 因此可 Send。
+- Agent 切换内核需要"命令驱动快照"接口（现在是 barrier 注入式），是 5.3 的前置。
+
+---
+
+## 五、Hub 平台路线（2026-08-02 制定，2026-08-27 更新进展）
+
+### 5.1 当前进展（对齐 main @ 2f423ef 与 v1 @ cea1e8e）
+
+Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转型，且已延伸为分布式 Job 平台：
+
+- `add-control-plane` ✅ 已合入（PR #1200，71/71）：本地 `ControlPlane`、资源 API 和 Console 基础。
+- `make-control-plane-hub` ✅ 已合入（PR #1203，33/33）：节点注册、租约、Agent 心跳与报告、节点资源聚合、目标命令派发、配置转发、Hub Console。
+- `rebuild-control-plane-system` ✅ 已归档（2026-08-02，37 项收口）：服务边界、资源 API、操作模型和 Console 架构。
+- `add-control-plane-reconciliation` ✅ 已合入（PR #1204）：durable reconciliation 和 HTTP contract，SQLite storage actor 持久化（`arkflow-server/src/storage.rs`）。
+- `harden-control-plane-fleet` ✅ 已合入（PR #1216）：fleet rollout 操作加固。
+- **分布式 Job 运行时**（v1 分支）：Hub–Agent 扩展为管理 Job/Task/Checkpoint/恢复的流计算平台，Console 含可视化 DAG 编排器（详见第四节「战略边界修订」）。
 
 核心职责划分：Hub 管理节点目录、聚合资源和期望操作；Compute Node Agent 管理本地执行、观测状态和命令结果。
 
-### 5.2 当前生产化缺口
+### 5.2 剩余生产化缺口（对照 2026-08-02 清单修订；2026-09-13 按 v1 代码逐项核实）
 
-1. Hub 的节点会话、操作记录、事件和资源快照目前主要在内存中，Hub 重启后会丢失运行历史。
-2. 操作取消、超时、重试和节点重连后的 reconciliation 尚未形成完整状态机闭环。
-3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。
-4. Agent 命令轮询使用 URL 查询参数携带 session token，需要改为 Authorization Header，避免被代理访问日志记录。
-5. 配置以节点最新快照为主，尚缺少完整的版本化发布、批量发布、审批和回滚策略。
-6. Console 的 Overview、Runtime 详情和配置编辑/发布工作流仍需补全。
-7. 尚无覆盖注册、聚合、定向操作、重连和优雅关闭的双节点端到端测试。
+1. ~~Hub 运行历史内存态，重启丢失~~ → ✅ SQLite 持久化已落地（PR #1204）。
+2. ~~操作取消/超时/重试/重连 reconciliation 未闭环~~ → ✅ 已落地（#1204、#1216）；Job 级重平衡/恢复编排仍在 v1 演进。
+3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。（未动；RBAC 属阶段 4。注意阶段 3 的配置审批流隐含依赖多身份，建议排在 RBAC 之后避免返工）
+4. ~~Agent 命令轮询与结果上报用 URL 查询参数携带 session token~~ → ✅ 已完成（2026-09-13 核实）：`bearer_auth` 走 `Authorization: Bearer`（`agent.rs` `bearer_auth`），Hub 优先读 header，查询参数仅保留为升级窗口兼容。
+5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；批量发布/审批流未做。
+6. ~~Console Overview/Runtime/配置编辑未补全~~ → ✅ 已补齐（含组件目录、可视化 Job DAG 编排器）。
+7. ~~双节点端到端测试~~ → ✅ 已闭环：`crates/arkflow-server/tests/two_node_job_smoke.rs`（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing）；Stream 层面亦已覆盖。
+8. **新增**：v1 合入 main 前需完成 PR #1219 评审闭环（`repair-v1-review-defects` 已 38/38，待归档）；分布式 Job 的生产化验证（长稳、规模上限、状态后端除 embedded_kv 外的选项）未做。
+9. **2026-09-13 新核实的阶段 2 真剩余**（5.5 清单大部分已落地，勿重复立项，已完成项见下）：
+   - ~~**Job 操作零审计**~~ → ✅ `add-hub-job-audit-and-command-metrics` 已归档（2026-09-13）：job_start/stop/checkpoint/savepoint 接受与拒绝均落 `cp_audit_events`（接受审计 = 首次派发去重；checkpoint 触发审计在 HTTP handler，周期调度不进审计）；
+   - ~~**命令延迟/失败率直方图缺失**~~ → ✅ 同上 change：`arkflow_command_duration_bucket/_count/_sum` + `arkflow_command_total`，固定低基数标签，重启归零；
+   - ~~**Job 命令幂等元数据弱于 stream intents**~~ → ✅ 同上 change：`expires_at_ms`（serde 默认字段，零迁移）+ sweep 有界重试（上限常量 3，重试继承），仅覆盖 job_start/stop，工件触发走 command-lease 重放；
+   - ~~`cp_audit_events` 无界增长~~（核实中附带发现）→ ✅ 同上 change：30 天 + 100k 双界清理接入周期 sweep；
+   - ~~**Session token 会话期静态**~~ → ✅ `harden-agent-session-credentials` 已归档（2026-09-13）：绝对 TTL（默认 1h，`health_check.agent_session_ttl_ms`，无滑动续期）、过期 401 走既有 re-register 循环、`RegisterResponse.session_ttl_ms` 通告、Agent 收口 query 泄漏通道（Bearer-only；Hub 保留 legacy 回退 + deprecation 警告）、重连退避 equal-jitter。混布升级顺序约束（先 Hub 后 Agent）写入 spec 与部署文档；
+   - ~~长稳与规模上限验证的阻塞项~~ → ✅ `bound-control-plane-storage-history` 已归档（2026-09-13）：`cp_outbox` 已处理行与终态 `cp_attempts` 接入 24h/4096 双界清扫（未处理行/active 行永不回收）、retention 六件套移出 1s reconcile tick 改独立 60s 维护任务、vestigial `cp_job_observations` 表定义删除。
+   - ~~长稳与规模上限验证（item 8 后半）~~ → ✅ `verify-hub-production-readiness` 已实施（2026-09-14）：真实 `agent::run` 舰队 harness + 四个测试（CI 门禁 `staircase_ci`/`soak_ci` + `#[ignore]` 完整版）。**容量结论（2026-09-14 实测，in-memory store，本机 macOS）**：①规模阶梯 25→64→128→256 满员，命令轮次 p99 稳定在 1044-1051ms 与舰队规模无关，未观察到膝盖，256 满员进程 RSS 441MB；②一小时长稳（N=64、session TTL 30s、重启风暴 ×10、全舰队 rebirth）：2859 轮、round p99 1055→1193ms（+13%，无漂移）、RSS 斜率 38.5 KB/s（低于 50 KB/s 门限）、全部有界历史表收敛于保留界（终态 ops 2395 < 4096 界）、双清扫稳定性通过。**过程中抓获并修复两个生产缺陷**（独立 change `repair-hub-restart-lifecycle-wedge`）：Hub 重启不恢复操作映射导致已运行 Job 被重复派发 + agent 对死 Hub 连接无超时永久挂起 + 投递失败丢终态结果；附带修复同代 `job_start` 幂等化。**阶段 2 至此全部闭环**。
 
 ### 5.3 推荐交付顺序
 
@@ -244,6 +300,8 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的基�
 - 验证 Rust workspace、WAL 行为、Console 构建和 Hub 断连时本地数据面不受影响。
 
 ### 5.5 阶段 2：Hub 生产基础
+
+> **2026-09-13 状态**：本清单大部分已落地（持久化、操作状态机、幂等键、Authorization Header、审计基础、兼容性信息、记录保留）。真剩余收敛为 5.2-9 的四项，其中「Job 操作审计 + 命令延迟/失败率直方图 + Job 命令幂等元数据」立为一个收尾 change；session token 短期化涉协议演进，单独立项。
 
 建议新增独立 OpenSpec change `harden-hub-production-foundation`，重点包括：
 
@@ -283,3 +341,42 @@ Hub 的近期目标是成为可靠的单 Hub、多节点运营控制面，而不
 3. 配置发布与批量节点运营。
 4. RBAC、审计与告警。
 5. Hub 高可用与外部存储。
+
+---
+
+## 七、未来方向探索（2026-09-12）
+
+v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为候选结论，**尚未立项**，方向由用户确认后展开。
+
+### 7.1 现状刷新（相对 2026-08-27）
+
+- 统一内核自 2026-08-28 起是唯一运行时，其后 5 批提交全部为评审整改（kernel / event-time / control-plane / kafka-reconnect），2026-09-11/12 全部归档；5.6 双节点 smoke 已由自动化测试闭环。
+- **v1 未合入 main**：`main..v1` 领先 51 提交、`v1..main` 为 0。
+- 依赖盘点：`prometheus` 0.13、`redb` 2、`reqwest` 已在 workspace；**无任何 ML 推理库、无 OpenTelemetry、无 WASM 运行时**——①③④ 的基建半成品状态。
+
+### 7.2 分布式模型的真实边界（2026-09-12 核实）
+
+`ExecutionGraphBuilder::build_subgraph`（`crates/arkflow-core/src/executor/graph.rs:309`）注释明确：**assignment 不允许把一条边拆到两个节点，Hub placement 保证算子链共置**。因此当前分布式 = 「轻量 Hub 调度 + 按源分区/子任务水平扩展 + 分布式 barrier checkpoint 容错」：
+
+- 水平扩展路径是源分区切分（如 Kafka 20 分区两节点各消费一半）与独立子任务；
+- **没有跨节点 network shuffle**：单算子中间数据不出节点，跨节点数据交换走外部系统（如 Kafka 重分区）；
+- 适用：多分区并行消费、独立子任务、多节点 IoT 就近采集；不适用：需要 shuffle 的重型有状态聚合/join——与 1.3 节「避开 RisingWave/Arroyo 主场」的定位自洽。
+
+### 7.3 候选方向与推荐优先序
+
+| 序 | 方向 | 要点 |
+| --- | --- | --- |
+| 0 | **v1 合入 main + 收口** | 51 提交积压，一切新方向的前置 |
+| 1 | **③ 数据面可观测性** | 内核已有 `KernelMetricsSnapshot`、Hub 已有控制面 metrics spec（`control-plane-observability`），缺数据面 Prometheus 导出、单进程 `/ready`（issue #768）、OTel trace；`prometheus` crate 已就位，小投入补齐「生产可用」叙事 |
+| 2 | **⑤ 企业集成安全（本次新发现）** | Kafka SASL/SSL **零实现**（issue #902，核实 `input/kafka.rs`/`output/kafka.rs` 无命中）——企业环境接不了带认证的 Kafka，是入场券级缺口；延伸：全组件 TLS 核查、Secret 引用机制（为 Hub 阶段 4 Secret Manager 铺路） |
+| 3 | **① AI 轻量切口** | LLM/embedding processor（reqwest 调 OpenAI 兼容 API，列式批量天然友好）+ 向量库 output（qdrant/milvus/pgvector）；2026 行业主流叙事即 streaming + agentic AI（RisingWave 已全面转向，蓝海收窄但仍有时机）；README 宣传与实现的脱节是最大差异化机会 |
+| 4 | **① 本地推理 + ④ 生态** | ONNX(ort)/candle 推理 processor（IoT 异常检测与 Modbus 场景契合）、WASM processor（issue #88）、公开 benchmark（issue #87，扩展 `kernel_perf_baseline.rs`） |
+| 5 | **Hub 平台阶段 2 穿插** | ~~Authorization Header~~ 已完成(v1);~~session token 短期化/轮换~~ 已完成(`harden-agent-session-credentials`,2026-09-13);~~Job 操作审计~~、~~命令延迟直方图~~ 已完成;剩余长稳/规模验证(5.2-9)与 RBAC/OIDC |
+
+推荐逻辑：0-2 在 1-2 个月内把项目从「内核先进」推进到「能进企业生产」；3-4 打开差异化叙事。方向②打下的 CDC/Schema/EOS 底座恰是方向①「给 AI 供可靠数据」的叙事衔接点——两条线是承接而非切换。
+
+### 7.4 本次探索同步修复的文档缺口
+
+- `docs/docs/configuration/1-top-level.md` 补 `jobs` 字段与 JobSpec 文档（此前零覆盖）；
+- `docs/docs/control-plane/http-api-v1.md` 补 Job API 路由（此前零覆盖）；
+- `docs/docs/concepts/7-distributed-jobs.md` 显式声明 7.2 节的链共置/无 shuffle 边界。
