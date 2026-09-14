@@ -1517,6 +1517,66 @@ impl Hub {
         Ok(scheduled)
     }
 
+    /// Restore recently persisted operations into the in-memory map so the
+    /// terminal-state dispatch-skip memory and the `/operations` read API
+    /// survive a restart. A restored non-terminal operation's command died
+    /// with the old Hub process (commands are memory-only), so it can never
+    /// complete as-is: it is settled as timed out — `job_start`/`job_stop`
+    /// flow back through the existing reconcile retry path, checkpoint
+    /// triggers are re-fired by the periodic scheduler — instead of lingering
+    /// as a ghost pending record. Unparsable rows are skipped fail-open.
+    pub async fn restore_persisted_operations(&self) -> Result<usize, HubError> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(0);
+        };
+        let persisted = storage
+            .list_operations(None::<String>)
+            .await
+            .map_err(HubError::from)?;
+        let mut restored = 0usize;
+        let mut unsettled: Vec<HubOperation> = Vec::new();
+        {
+            let mut operations = self.operations.write().await;
+            for record in persisted {
+                if operations.len() >= MAX_OPERATIONS {
+                    break;
+                }
+                if operations.contains_key(&record.operation_id) {
+                    continue;
+                }
+                let Ok(mut operation) =
+                    serde_json::from_str::<HubOperation>(&record.operation_json)
+                else {
+                    tracing::warn!(
+                        operation_id = %record.operation_id,
+                        "skipping unparsable persisted operation during recovery"
+                    );
+                    continue;
+                };
+                if matches!(
+                    operation.state,
+                    HubOperationState::Queued
+                        | HubOperationState::Dispatched
+                        | HubOperationState::Acknowledged
+                        | HubOperationState::Running
+                ) {
+                    operation.state = HubOperationState::TimedOut;
+                    operation.finished_at_ms = Some(now_ms());
+                    operation.error = Some("Hub restarted before the command completed".into());
+                    unsettled.push(operation.clone());
+                }
+                operations.insert(operation.id.clone(), operation);
+                restored += 1;
+            }
+        }
+        for operation in &unsettled {
+            persist_operation(storage, operation)
+                .await
+                .map_err(HubError::from)?;
+        }
+        Ok(restored)
+    }
+
     /// Prometheus accounting for command dispatch. Counters reset on Hub
     /// restart in line with counter semantics.
     pub fn command_metrics(&self) -> &CommandMetrics {
@@ -5042,6 +5102,108 @@ mod tests {
         assert!(
             !commands.is_empty(),
             "a retried intent must produce a fresh command"
+        );
+    }
+
+    /// Restart recovery: persisted operations come back into the in-memory
+    /// map, and a succeeded lifecycle start at the current generation is
+    /// never re-dispatched — the dispatch-skip memory survives the restart.
+    #[tokio::test]
+    async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let session = hub1
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+                boot_id: Some("boot-a".into()),
+            })
+            .await
+            .unwrap();
+        hub1.upsert_job(JobRecord {
+            job_id: "job-1".into(),
+            version: 1,
+            spec_json: job_spec_json("job-1"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        hub1.reconcile_jobs().await.unwrap();
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session.session_token.clone(),
+        };
+        let commands = hub1.commands(auth.clone()).await.unwrap();
+        let start_command = commands
+            .iter()
+            .find(|command| command.operation == "job_start")
+            .expect("job_start must be dispatched for a desired-running job")
+            .clone();
+        hub1.command_result(
+            auth,
+            CommandResult {
+                command_id: start_command.id.clone(),
+                operation_id: start_command.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: start_command.correlation_id.clone(),
+                generation: start_command.generation,
+                observed_generation: Some(start_command.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // "Restart": same durable store, fresh in-memory state. hub1 also
+        // persisted its own bookkeeping rows (checkpoint triggers), so the
+        // restore brings back more than the start operation — assert on the
+        // semantics, not on an exact count.
+        let hub2 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let restored = hub2.restore_persisted_operations().await.unwrap();
+        assert!(restored >= 1, "at least the succeeded start is restored");
+        assert!(hub2.operations(None).await.iter().any(|operation| {
+            operation.operation == "job_start" && operation.state == HubOperationState::Succeeded
+        }));
+
+        let session2 = hub2
+            .register(RegisterRequest {
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+                boot_id: Some("boot-a".into()),
+            })
+            .await
+            .unwrap();
+        hub2.reconcile_jobs().await.unwrap();
+        let commands2 = hub2
+            .commands(AgentAuth {
+                node_id: "node-a".into(),
+                session_token: session2.session_token.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !commands2
+                .iter()
+                .any(|command| command.operation == "job_start"),
+            "a succeeded start at the current generation must not be re-dispatched after a restart"
         );
     }
 

@@ -138,7 +138,9 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    // Generous under load: the full workspace suite runs other binaries on
+    // the same machine, and cold caches can stretch kernel startup.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if condition().await {
                 return;

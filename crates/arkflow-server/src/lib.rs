@@ -394,6 +394,18 @@ pub async fn serve_hub(
              Hub beyond localhost."
         );
     }
+    // Restore persisted operations before binding the listener (and before
+    // readiness): the terminal-state dispatch-skip memory and the operations
+    // read API must reflect durable history before any reconcile tick or
+    // operator request runs. Manual `hub_router` test setups do not restart
+    // the Hub and skip this path by construction.
+    if hub.has_storage() {
+        let restored = hub.restore_persisted_operations().await?;
+        tracing::info!(
+            restored,
+            "restored persisted operations into the in-memory registry"
+        );
+    }
     let address: SocketAddr = config.address.parse()?;
     let listener = TcpListener::bind(address).await?;
     let sweep_hub = hub.clone();

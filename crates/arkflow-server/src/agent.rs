@@ -414,6 +414,17 @@ impl JobRuntime {
             {
                 return Err("job generation is stale".into());
             }
+            // A re-delivered start at the generation already running is a
+            // no-op success: cancelling and restarting a healthy kernel for
+            // a command the Hub re-sent after a restart would churn the data
+            // plane and (under load) wedge the start path behind a teardown
+            // that never finishes. Only a generation bump restarts.
+            if tasks
+                .get(&job_id)
+                .is_some_and(|task| task.generation == generation)
+            {
+                return Ok(());
+            }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
             let existing = tasks.remove(&job_id);
@@ -423,7 +434,7 @@ impl JobRuntime {
             existing
         };
         if let Some(existing) = existing {
-            let _ = existing.handle.await;
+            await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT).await;
         }
         let task_ids = assignments
             .iter()
@@ -1330,7 +1341,7 @@ pub async fn run(
     config: NodeAgentConfig,
     cancellation: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::new();
+    let client = build_agent_client(&config.hub_url)?;
     let mut backoff = Duration::from_millis(250);
     let mut completed_commands = CompletedCommandCache::new(1024);
     let job_runtime = JobRuntime::default();
@@ -1369,6 +1380,56 @@ pub async fn run(
             _ = tokio::time::sleep(jittered_backoff(backoff)) => {}
         }
         backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Build the Agent's HTTP client. Loopback hubs are never proxied: system
+/// proxy settings (macOS/Windows proxy configuration or stray env vars) that
+/// intercept 127.0.0.1 traffic silently break registration and command
+/// polling, and proxying a same-host control connection is always a
+/// misconfiguration. Every request carries a hard timeout: a Hub that dies
+/// mid-request (or a connection accepted into a dead listener's backlog that
+/// never responds) must fail the session after a bound so the reconnect loop
+/// — not a hung socket — owns recovery.
+fn build_agent_client(hub_url: &str) -> Result<Client, reqwest::Error> {
+    let builder = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
+    let loopback = url::Url::parse(hub_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+            })
+        })
+        .unwrap_or(false);
+    if loopback {
+        return builder.no_proxy().build();
+    }
+    builder.build()
+}
+
+/// How long a redundant start waits for the previous kernel's WAL-safe
+/// teardown before giving up on joining it. Well beyond any healthy teardown
+/// (millisecond-scale in practice), well short of "forever".
+const KERNEL_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Await a superseded kernel's teardown, bounded: a wedged teardown must not
+/// hold the start path (and its mutex) forever — after the bound the old task
+/// finishes detached and the new start proceeds (its own state-dir open may
+/// then fail terminally while the old kernel still holds the lock, which the
+/// Hub's retry machinery absorbs as a visible, bounded failure loop).
+async fn await_previous_teardown(
+    job_id: &str,
+    handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+    bound: Duration,
+) {
+    if tokio::time::timeout(bound, handle).await.is_err() {
+        warn!(
+            job_id = %job_id,
+            bound_ms = bound.as_millis() as u64,
+            "previous kernel teardown did not finish within the bounded wait; continuing with the new start"
+        );
     }
 }
 
@@ -2033,7 +2094,19 @@ async fn deliver_result(
     auth: &AgentAuth,
     result: CommandResult,
 ) -> Result<CommandResult, Box<dyn std::error::Error + Send + Sync>> {
-    send_result(client, config, auth, result.clone()).await?;
+    if let Err(error) = send_result(client, config, auth, result.clone()).await {
+        // The terminal result exists and MUST survive the session. Returning
+        // Ok lets the completed-command cache remember it, so after the (now
+        // certainly failing) session re-registers, the Hub's redelivery of
+        // the leased command replays the cached terminal result exactly once.
+        // Propagating the error would drop the result: the Hub operation
+        // would expire, retry, and lose again until its retry budget wedged.
+        warn!(
+            command_id = %result.command_id,
+            %error,
+            "terminal result delivery failed; cached for replay after re-registration"
+        );
+    }
     Ok(result)
 }
 
@@ -2189,6 +2262,22 @@ fn jittered_backoff_stays_within_the_equal_jitter_window() {
         }
     }
     assert_eq!(jittered_backoff(Duration::ZERO), Duration::ZERO);
+}
+
+/// A wedged previous kernel must not hold the start path forever: the join
+/// wait is bounded and then proceeds (the Hub retry machinery absorbs any
+/// bounded state-lock failures that follow).
+#[tokio::test]
+async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
+    let wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
+    let started = std::time::Instant::now();
+    await_previous_teardown("job-wedge", wedged, Duration::from_millis(100)).await;
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the bounded wait must not turn into an unbounded hang: {:?}",
+        started.elapsed()
+    );
 }
 
 #[cfg(test)]
