@@ -272,7 +272,8 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
    - ~~**Job 命令幂等元数据弱于 stream intents**~~ → ✅ 同上 change：`expires_at_ms`（serde 默认字段，零迁移）+ sweep 有界重试（上限常量 3，重试继承），仅覆盖 job_start/stop，工件触发走 command-lease 重放；
    - ~~`cp_audit_events` 无界增长~~（核实中附带发现）→ ✅ 同上 change：30 天 + 100k 双界清理接入周期 sweep；
    - ~~**Session token 会话期静态**~~ → ✅ `harden-agent-session-credentials` 已归档（2026-09-13）：绝对 TTL（默认 1h，`health_check.agent_session_ttl_ms`，无滑动续期）、过期 401 走既有 re-register 循环、`RegisterResponse.session_ttl_ms` 通告、Agent 收口 query 泄漏通道（Bearer-only；Hub 保留 legacy 回退 + deprecation 警告）、重连退避 equal-jitter。混布升级顺序约束（先 Hub 后 Agent）写入 spec 与部署文档；
-   - ~~长稳与规模上限验证的阻塞项~~ → ✅ `bound-control-plane-storage-history` 已归档（2026-09-13）：`cp_outbox` 已处理行与终态 `cp_attempts` 接入 24h/4096 双界清扫（未处理行/active 行永不回收）、retention 六件套移出 1s reconcile tick 改独立 60s 维护任务、vestigial `cp_job_observations` 表定义删除。长稳与规模上限验证（item 8 后半）本身仍未做——现为阶段 2 现存唯一剩余项，且所有「表行数收敛」断言已可硬，随时可立项 verification-only change。
+   - ~~长稳与规模上限验证的阻塞项~~ → ✅ `bound-control-plane-storage-history` 已归档（2026-09-13）：`cp_outbox` 已处理行与终态 `cp_attempts` 接入 24h/4096 双界清扫（未处理行/active 行永不回收）、retention 六件套移出 1s reconcile tick 改独立 60s 维护任务、vestigial `cp_job_observations` 表定义删除。
+   - ~~长稳与规模上限验证（item 8 后半）~~ → ✅ `verify-hub-production-readiness` 已实施（2026-09-14）：真实 `agent::run` 舰队 harness + 四个测试（CI 门禁 `staircase_ci`/`soak_ci` + `#[ignore]` 完整版）。**容量结论（2026-09-14 实测，in-memory store，本机 macOS）**：①规模阶梯 25→64→128→256 满员，命令轮次 p99 稳定在 1044-1051ms 与舰队规模无关，未观察到膝盖，256 满员进程 RSS 441MB；②一小时长稳（N=64、session TTL 30s、重启风暴 ×10、全舰队 rebirth）：2859 轮、round p99 1055→1193ms（+13%，无漂移）、RSS 斜率 38.5 KB/s（低于 50 KB/s 门限）、全部有界历史表收敛于保留界（终态 ops 2395 < 4096 界）、双清扫稳定性通过。**过程中抓获并修复两个生产缺陷**（独立 change `repair-hub-restart-lifecycle-wedge`）：Hub 重启不恢复操作映射导致已运行 Job 被重复派发 + agent 对死 Hub 连接无超时永久挂起 + 投递失败丢终态结果；附带修复同代 `job_start` 幂等化。**阶段 2 至此全部闭环**。
 
 ### 5.3 推荐交付顺序
 
