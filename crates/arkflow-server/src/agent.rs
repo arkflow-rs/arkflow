@@ -406,7 +406,7 @@ impl JobRuntime {
         if assignments.is_empty() {
             return Err("Job command contains no task assignments".into());
         }
-        let existing = {
+        let (existing, previous_exited_on_its_own) = {
             let tasks = self.tasks.lock().await;
             if tasks
                 .get(&job_id)
@@ -415,26 +415,55 @@ impl JobRuntime {
                 return Err("job generation is stale".into());
             }
             // A re-delivered start at the generation already running is a
-            // no-op success: cancelling and restarting a healthy kernel for
-            // a command the Hub re-sent after a restart would churn the data
-            // plane and (under load) wedge the start path behind a teardown
-            // that never finishes. Only a generation bump restarts.
+            // no-op success — but only while that kernel is actually alive:
+            // cancelling and restarting a healthy kernel for a command the
+            // Hub re-sent after a restart would churn the data plane and
+            // (under load) wedge the start path behind a teardown that never
+            // finishes. An exited kernel at the same generation (a crash
+            // between the poll drain and this reader) must fall through to
+            // the restart path instead of being reported as a healthy no-op.
             if tasks
                 .get(&job_id)
-                .is_some_and(|task| task.generation == generation)
+                .is_some_and(|task| task.generation == generation && !task.handle.is_finished())
             {
                 return Ok(());
             }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
             let existing = tasks.remove(&job_id);
+            // Observed on the removal lock, right before the cancel: a kernel
+            // that exited on its own has a genuine crash outcome worth
+            // surfacing below; an exit after the cancel is this start's own
+            // teardown and is never reported as a crash.
+            let previous_exited_on_its_own = existing
+                .as_ref()
+                .is_some_and(|task| task.handle.is_finished());
             if let Some(existing) = &existing {
                 existing.cancellation.cancel();
             }
-            existing
+            (existing, previous_exited_on_its_own)
         };
+        let mut replaced_crash: Option<(u64, String)> = None;
         if let Some(existing) = existing {
-            await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT).await;
+            let outcome =
+                await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT)
+                    .await;
+            let _ = existing.state.close();
+            if previous_exited_on_its_own {
+                if let Some(Err(error)) = outcome {
+                    replaced_crash = Some((existing.generation, error));
+                }
+            }
+        }
+        if let Some((crashed_generation, error)) = replaced_crash {
+            warn!(
+                job_id = %job_id,
+                generation = crashed_generation,
+                %error,
+                "replaced kernel had exited on its own; surfacing its crash as a job observation"
+            );
+            self.park_observations(vec![(job_id.clone(), crashed_generation, Err(error))])
+                .await;
         }
         let task_ids = assignments
             .iter()
@@ -1383,6 +1412,20 @@ pub async fn run(
     }
 }
 
+/// Whether an HTTP host is this machine: loopback addresses (the whole
+/// 127/8, `::1`, bracketed IPv6 forms) plus `0.0.0.0`/`::` (unspecified
+/// addresses that connect to the local host) and the `localhost` literal.
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    let candidate = host.trim_start_matches('[').trim_end_matches(']');
+    candidate
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback() || ip.is_unspecified())
+        .unwrap_or(false)
+}
+
 /// Build the Agent's HTTP client. Loopback hubs are never proxied: system
 /// proxy settings (macOS/Windows proxy configuration or stray env vars) that
 /// intercept 127.0.0.1 traffic silently break registration and command
@@ -1397,11 +1440,7 @@ fn build_agent_client(hub_url: &str) -> Result<Client, reqwest::Error> {
         .timeout(Duration::from_secs(10));
     let loopback = url::Url::parse(hub_url)
         .ok()
-        .and_then(|url| {
-            url.host_str().map(|host| {
-                host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
-            })
-        })
+        .and_then(|url| url.host_str().map(is_loopback_host))
         .unwrap_or(false);
     if loopback {
         return builder.no_proxy().build();
@@ -1419,17 +1458,25 @@ const KERNEL_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// finishes detached and the new start proceeds (its own state-dir open may
 /// then fail terminally while the old kernel still holds the lock, which the
 /// Hub's retry machinery absorbs as a visible, bounded failure loop).
+/// Returns the joined outcome in the `FinishedJob` payload shape, or `None`
+/// when the bound expired with the task detached (no outcome exists).
 async fn await_previous_teardown(
     job_id: &str,
     handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
     bound: Duration,
-) {
-    if tokio::time::timeout(bound, handle).await.is_err() {
-        warn!(
-            job_id = %job_id,
-            bound_ms = bound.as_millis() as u64,
-            "previous kernel teardown did not finish within the bounded wait; continuing with the new start"
-        );
+) -> Option<Result<(), String>> {
+    match tokio::time::timeout(bound, handle).await {
+        Err(_) => {
+            warn!(
+                job_id = %job_id,
+                bound_ms = bound.as_millis() as u64,
+                "previous kernel teardown did not finish within the bounded wait; continuing with the new start"
+            );
+            None
+        }
+        Ok(Ok(Ok(()))) => Some(Ok(())),
+        Ok(Ok(Err(error))) => Some(Err(error.to_string())),
+        Ok(Err(error)) => Some(Err(error.to_string())),
     }
 }
 
@@ -2266,17 +2313,39 @@ fn jittered_backoff_stays_within_the_equal_jitter_window() {
 
 /// A wedged previous kernel must not hold the start path forever: the join
 /// wait is bounded and then proceeds (the Hub retry machinery absorbs any
-/// bounded state-lock failures that follow).
+/// bounded state-lock failures that follow). A detached teardown has no
+/// outcome — `None` — so the start path knows there is nothing to report.
 #[tokio::test]
 async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
     let wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
     let started = std::time::Instant::now();
-    await_previous_teardown("job-wedge", wedged, Duration::from_millis(100)).await;
+    let outcome = await_previous_teardown("job-wedge", wedged, Duration::from_millis(100)).await;
+    assert!(
+        outcome.is_none(),
+        "a detached teardown must report no outcome: {outcome:?}"
+    );
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the bounded wait must not turn into an unbounded hang: {:?}",
         started.elapsed()
+    );
+}
+
+/// A previous kernel that exited on its own with an error must surface that
+/// outcome through the join result, so the start path can park a crash
+/// observation instead of silently discarding the crash.
+#[tokio::test]
+async fn crashed_previous_teardown_surfaces_the_join_error() {
+    let crashed = tokio::spawn(async {
+        Result::<(), arkflow_core::Error>::Err(arkflow_core::Error::Process(
+            "kernel exploded".into(),
+        ))
+    });
+    let outcome = await_previous_teardown("job-crash", crashed, Duration::from_secs(5)).await;
+    assert!(
+        matches!(&outcome, Some(Err(message)) if message.contains("kernel exploded")),
+        "the crash outcome must pass through: {outcome:?}"
     );
 }
 
@@ -2441,6 +2510,209 @@ mod tests {
         assert!(runtime.take_finished().await.is_empty());
     }
 
+    /// Compile the generate→drop smoke spec for the replacement-path tests,
+    /// mirroring `aborted_start_leaves_no_unregistered_running_kernel`.
+    async fn replacement_test_plan(job_id: &str) -> (JobPlan, Vec<TaskAttempt>) {
+        let _ = arkflow_plugin::initialize();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": job_id,
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+        assert!(!assignments.is_empty());
+        (plan, assignments)
+    }
+
+    /// Register a synthetic task whose kernel has ALREADY exited with the
+    /// given outcome — the "crashed between the poll drain and this reader"
+    /// state, made deterministic by yielding until the handle is finished
+    /// before the entry becomes visible to `start`.
+    async fn insert_exited_task(
+        runtime: &JobRuntime,
+        job_id: &str,
+        generation: u64,
+        outcome: Result<(), arkflow_core::Error>,
+    ) {
+        // redb holds an exclusive file lock per path, and every test in this
+        // binary shares one process: key the synthetic state dir uniquely.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_root = std::env::temp_dir().join(format!(
+            "arkflow-agent-replacement-{job_id}-{generation}-{}-{sequence}",
+            std::process::id()
+        ));
+        let state: Arc<dyn StateBackend> =
+            Arc::new(RedbStateBackend::open(state_root, 1).expect("test state backend opens"));
+        let handle = tokio::spawn(async move { outcome });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        runtime.tasks.lock().await.insert(
+            job_id.to_string(),
+            JobTask {
+                generation,
+                cancellation: CancellationToken::new(),
+                assignments: Vec::new(),
+                watermark_partitions: BTreeMap::new(),
+                state,
+                checkpoint_store_uri: None,
+                kernel: None,
+                handle,
+            },
+        );
+    }
+
+    /// A start re-delivered at the generation whose kernel has already
+    /// crashed must NOT be an idempotent no-op success: the crash is surfaced
+    /// through the job-observation channel and a fresh kernel takes over.
+    #[tokio::test]
+    async fn same_generation_start_over_a_crashed_kernel_surfaces_the_crash() {
+        let runtime = Arc::new(JobRuntime::default());
+        insert_exited_task(
+            &runtime,
+            "orders-crash",
+            1,
+            Err(arkflow_core::Error::Process("kernel crashed".into())),
+        )
+        .await;
+        let (plan, assignments) = replacement_test_plan("orders-crash").await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.start(plan, assignments, 1, None, false, "node-a"),
+        )
+        .await
+        .expect("the replacement start must not hang");
+        assert!(result.is_ok(), "the fresh kernel must start: {result:?}");
+
+        let finished = runtime.take_finished().await;
+        assert!(
+            finished.iter().any(|(job_id, generation, outcome)| {
+                job_id == "orders-crash" && *generation == 1 && outcome.is_err()
+            }),
+            "the crashed kernel's exit must reach the observation channel: {finished:?}"
+        );
+
+        runtime.stop("orders-crash", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// A higher-generation start replacing an already-crashed kernel must not
+    /// swallow the crash: the observation rides the superseded generation.
+    #[tokio::test]
+    async fn generation_bump_over_a_crashed_kernel_reports_the_superseded_crash() {
+        let runtime = Arc::new(JobRuntime::default());
+        insert_exited_task(
+            &runtime,
+            "orders-bump",
+            1,
+            Err(arkflow_core::Error::Process("kernel crashed".into())),
+        )
+        .await;
+        let (plan, assignments) = replacement_test_plan("orders-bump").await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.start(plan, assignments, 2, None, false, "node-a"),
+        )
+        .await
+        .expect("the replacing start must not hang");
+        assert!(result.is_ok(), "the new generation must start: {result:?}");
+
+        let finished = runtime.take_finished().await;
+        assert!(
+            finished.iter().any(|(job_id, generation, outcome)| {
+                job_id == "orders-bump" && *generation == 1 && outcome.is_err()
+            }),
+            "the superseded kernel's crash must not be silently discarded: {finished:?}"
+        );
+
+        runtime.stop("orders-bump", 2).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// A superseded kernel that exited cleanly (Ok) produces no crash
+    /// observation — only genuine crashes are parked.
+    #[tokio::test]
+    async fn clean_replacement_produces_no_crash_observation() {
+        let runtime = Arc::new(JobRuntime::default());
+        insert_exited_task(&runtime, "orders-clean", 1, Ok(())).await;
+        let (plan, assignments) = replacement_test_plan("orders-clean").await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.start(plan, assignments, 2, None, false, "node-a"),
+        )
+        .await
+        .expect("the replacing start must not hang");
+        assert!(result.is_ok(), "the new generation must start: {result:?}");
+
+        let finished = runtime.take_finished().await;
+        assert!(
+            !finished
+                .iter()
+                .any(|(job_id, generation, _)| job_id == "orders-clean" && *generation == 1),
+            "a clean exit must not be reported as a crash: {finished:?}"
+        );
+
+        runtime.stop("orders-clean", 2).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// Regression guard for the idempotency narrowing: a LIVE kernel at the
+    /// same generation still short-circuits the start as a no-op success,
+    /// with no observation parked and no restart churn.
+    #[tokio::test]
+    async fn healthy_same_generation_start_stays_an_idempotent_no_op() {
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-idem").await;
+        runtime
+            .start(plan, assignments, 1, None, false, "node-a")
+            .await
+            .expect("the initial start succeeds");
+        let started_at = std::time::Instant::now();
+
+        let (plan, assignments) = replacement_test_plan("orders-idem").await;
+        runtime
+            .start(plan, assignments, 1, None, false, "node-a")
+            .await
+            .expect("the re-delivered same-generation start is a no-op success");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "the no-op must not wait behind a teardown"
+        );
+        let tasks = runtime.tasks.lock().await;
+        let task = tasks
+            .get("orders-idem")
+            .expect("the kernel stays registered");
+        assert_eq!(task.generation, 1);
+        assert!(!task.handle.is_finished(), "the kernel was not restarted");
+        assert!(runtime.pending_observations.lock().await.is_empty());
+        drop(tasks);
+
+        runtime.stop("orders-idem", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
     #[test]
     fn agent_mode_requires_hub_and_stable_identity() {
         let health = HealthCheckConfig {
@@ -2463,6 +2735,23 @@ mod tests {
     fn expired_commands_are_rejected_by_time_boundary() {
         assert!(command_expired(10, 10));
         assert!(!command_expired(11, 10));
+    }
+
+    /// Loopback detection for the no-proxy decision must cover the whole
+    /// 127/8 range and both IPv6 spellings — a system interception proxy
+    /// breaking `127.0.0.2` would wedge the agent just like `127.0.0.1`.
+    #[test]
+    fn loopback_detection_covers_the_whole_loopback_range() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.255.0.4"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("10.1.2.3"));
+        assert!(!is_loopback_host("::ffff:10.0.0.1"));
+        assert!(!is_loopback_host("hub.example.com"));
+        assert!(!is_loopback_host(""));
     }
 
     #[test]

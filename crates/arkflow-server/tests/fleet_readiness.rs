@@ -4,7 +4,9 @@
 //! parameters (see `verify-hub-production-readiness`):
 //!
 //! - CI-gated: `staircase_ci` and `soak_ci` keep the default
-//!   `cargo test --workspace` budget under three minutes.
+//!   `cargo test --workspace` budget under three minutes. Set
+//!   `ARKFLOW_SKIP_FLEET=1` to skip them for quick local cycles (CI never
+//!   sets it).
 //! - `#[ignore]`: `staircase_full` and `soak_one_hour` produce the capacity
 //!   numbers recorded in `openspec/PLANNING.md`.
 //!
@@ -96,6 +98,20 @@ type AgentResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 /// kernels contend for the same runtime and starve each other into timeouts.
 static FLEET_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Local-iteration escape hatch: `ARKFLOW_SKIP_FLEET=1` skips the CI-gated
+/// fleet runs so quick local `cargo test --workspace` cycles stay fast.
+/// CI never sets this variable; the default behavior is unchanged.
+fn fleet_run_skipped() -> bool {
+    let skipped = std::env::var("ARKFLOW_SKIP_FLEET").is_ok_and(|value| value == "1");
+    if skipped {
+        eprintln!(
+            "ARKFLOW_SKIP_FLEET=1: skipping fleet readiness run \
+             (local iteration only — CI must not set this)"
+        );
+    }
+    skipped
+}
 
 // --- Harness ----------------------------------------------------------------
 
@@ -952,12 +968,18 @@ async fn run_soak(fleet_size: usize, duration: Duration, restarts: usize, worker
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn staircase_ci() {
+    if fleet_run_skipped() {
+        return;
+    }
     let _gate = FLEET_SERIAL.lock().await;
     run_staircase(&[8, 16, 32], 2, "staircase-ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_ci() {
+    if fleet_run_skipped() {
+        return;
+    }
     let _gate = FLEET_SERIAL.lock().await;
     run_soak(16, SOAK_CI_DURATION, 3, "soak-ci").await;
 }
