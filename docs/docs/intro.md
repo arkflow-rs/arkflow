@@ -4,7 +4,7 @@ sidebar_position: 1
 
 # Introduction
 
-> **Canonical entry point:** Start with [Start here](./start-here.md) for the current task-oriented documentation journey. This page remains as a stable compatibility route for existing links.
+> **Canonical entry point:** Start from the [documentation home](./index.md) for the current area-based navigation. This page remains as a stable compatibility route for existing links.
 
 ![ArkFlow logo](./logo.svg)
 
@@ -17,7 +17,7 @@ or more sinks — all driven by a single YAML file.
 ## Core features
 
 - **High performance** — Rust + Tokio, columnar [Apache Arrow](https://arrow.apache.org/) data, multi-threaded pipelines.
-- **Durable delivery** — at-least-once by default via per-stream WAL durability; opt-in exactly-once for transactional sinks. See [Delivery semantics](./concepts/4-delivery-semantics.md).
+- **Durable delivery** — at-least-once by default via per-stream WAL durability; opt-in exactly-once for transactional sinks. See [Delivery semantics](./build/delivery-semantics.md).
 - **Many sources & sinks** — Kafka, MQTT, HTTP, files (with S3/GCS/Azure/HDFS), Pulsar, NATS, Redis, SQL, Modbus, WebSocket, InfluxDB, and more.
 - **Powerful processing** — SQL (DataFusion), VRL, Python UDFs, JSON, Protobuf, batching, windowing, and multi-source joins.
 - **Streaming codecs** — JSON, Protobuf, Debezium CDC envelopes, and Confluent Schema Registry wire-format.
@@ -26,9 +26,9 @@ or more sinks — all driven by a single YAML file.
 
 ## Next steps
 
-- [Getting started](./getting-started/2-quickstart.md) — install and run your first pipeline in minutes.
-- [Concepts](./concepts/1-architecture.md) — how the engine, streams, pipelines, backpressure, and metadata fit together.
-- [Configuration reference](./configuration/1-top-level.md) — the top-level YAML structure.
+- [Getting started](./get-started/2-quickstart.md) — install and run your first pipeline in minutes.
+- [Concepts](./build/architecture.md) — how the engine, streams, pipelines, backpressure, and metadata fit together.
+- [Configuration reference](./reference/configuration.md) — the top-level YAML structure.
 - [Components](./reference/component-inventory.md) — every input, output, processor, buffer, and codec.
 - [SQL reference](./sql/2-select.md) — query syntax and functions.
-- [Control plane](./control-plane/1-overview.md) — operate ArkFlow as a fleet.
+- [Control plane](./operate/control-plane/overview.md) — operate ArkFlow as a fleet.

@@ -85,4 +85,4 @@ output:
 
 - When `exactly_once: true`, `transactional_id` must be a non-empty value that is stable across restarts so the broker can fence stale producer epochs (zombie fencing). The builder rejects the configuration otherwise.
 - With exactly-once enabled, each acknowledged message batch is produced inside one Kafka transaction (begin → send → commit). On failure the transaction is aborted and the batch is replayed.
-- See [Exactly-once processing](../../concepts/6-exactly-once.md) for the end-to-end delivery-semantics contract.
+- See [Exactly-once processing](../../build/exactly-once.md) for the end-to-end delivery-semantics contract.

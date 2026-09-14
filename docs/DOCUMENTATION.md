@@ -1,13 +1,17 @@
 # Documentation system
 
-ArkFlow uses Docusaurus. The maintained documentation is organized around reader intent: tutorials, how-to guides, and end-to-end cases; pipeline concepts; component/configuration reference; operations; and contribution guidance.
+ArkFlow uses Docusaurus. The maintained documentation is organized into five
+audience-facing areas: get started, build, SQL, operate, and reference, plus
+a develop area for contributors. The unversioned tree is the primary site
+(`lastVersion: 'current'`); released snapshots hang off `/docs/<version>` and
+are switched with the version dropdown.
 
 ## Source of truth
 
 The component reference is generated from the engine registry, not maintained by hand:
 
 - `reference/component-inventory.json` is a **generated artifact** (format version 2) exported from the Rust component registry. Never edit it by hand.
-- `static/config-schema.json` is the engine configuration JSON Schema, generated the same way and published as a site asset for [IDE auto-completion](docs/configuration/2-ide-schema.md).
+- `static/config-schema.json` is the engine configuration JSON Schema, generated the same way and published as a site asset for [IDE auto-completion](docs/reference/ide-schema.md).
 - A Rust snapshot test keeps both files in sync with the code. When the registry or schema changes, `cargo test --workspace` fails until you regenerate:
 
 ```bash

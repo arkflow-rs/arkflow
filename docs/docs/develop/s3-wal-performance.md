@@ -1,3 +1,7 @@
+---
+title: S3 WAL backend performance
+description: Benchmark and design notes for the S3-backed WAL pipeline.
+---
 # S3 WAL Backend Performance
 
 This document describes the performance characteristics of the S3-backed WAL backend and provides guidance for tuning configuration based on workload requirements.
@@ -24,7 +28,7 @@ Input → append_batch (μs, memory) → segment buffer → channel → PUT work
 |-----------|---------|-------|
 | `append_batch` | ~1-50μs | In-memory write + channel send (non-blocking) |
 | Segment PUT | 10-200ms | Executes asynchronously in PUT worker |
-| Channel send | <1μs | Blocking only when channel full (backpressure) |
+| Channel send | `<1μs` | Blocking only when channel full (backpressure) |
 | Manifest PUT (batched) | 10-100ms | Small JSON payload, 8x less frequent |
 | Recovery (LIST + GET) | 100-500ms | Depends on segment count |
 
@@ -311,7 +315,7 @@ will be lower than these synthetic benchmarks but still substantial.
 |--------|-------------|-----------------|
 | `segment_put_latency` | Time to PUT a segment | >500ms p99 |
 | `segment_put_frequency` | PUTs per second | >10/sec (may need tuning) |
-| `segment_size` | Average segment bytes | <100KB or >10MB |
+| `segment_size` | Average segment bytes | `<100KB or >10MB` |
 | `cursor_lag` | Cursor vs max written seq | >10,000 entries |
 | `recovery_latency` | Time to replay WAL on startup | >5s |
 

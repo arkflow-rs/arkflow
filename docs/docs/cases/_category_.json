@@ -1,8 +1,0 @@
-{
-  "label": "Cases",
-  "position": 4,
-  "link": {
-    "type": "generated-index",
-    "description": "End-to-end case studies backed by CI-validated example configurations."
-  }
-}
