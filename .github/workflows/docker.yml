@@ -35,6 +35,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The release build inside the image uses fat LTO (lto=true,
+      # codegen-units=1): its link phase peaks beyond the runner's 15.6GiB of
+      # RAM and gets OOM-killed. Free the preinstalled toolchains' disk first
+      # (BuildKit cache and image layers need the room), then add swap on the
+      # large /mnt volume so the LTO link can page instead of dying.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Add swap for the release LTO link
+        run: |
+          sudo fallocate -l 10G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       # Install the cosign tool except on PR
       # https://github.com/sigstore/cosign-installer
       - name: Install cosign

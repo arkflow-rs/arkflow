@@ -26,6 +26,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The workspace's debug build (--all-targets) plus the restored target
+      # cache overflow the runner's ~20GB of free disk: drop the preinstalled
+      # toolchains we do not use (Android SDK, .NET, Haskell, CodeQL, ...)
+      # before building.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Cache cargo registry & git index
         uses: actions/cache@v4
         with:
