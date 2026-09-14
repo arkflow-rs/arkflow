@@ -12,33 +12,238 @@
  *    limitations under the License.
  */
 
-/**
- * Any CSS included here will be global. The classic template
- * bundles Infima by default. Infima is a CSS framework designed to
- * work well for content-centric websites.
- */
+/* Global theme: Infima design tokens plus ArkFlow-specific polish. */
 
-/* You can override the default Infima variables here. */
 :root {
+  color-scheme: light;
+
+  /* Primary palette — blue-600 scale (dark = more saturated for hovers). */
   --ifm-color-primary: #2563eb;
-  --ifm-color-primary-dark: #3b82f6;
-  --ifm-color-primary-darker: #60a5fa;
-  --ifm-color-primary-darkest: #93c5fd;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
+  --ifm-color-primary-dark: #1d4ed8;
+  --ifm-color-primary-darker: #1e40af;
+  --ifm-color-primary-darkest: #1e3a8a;
+  --ifm-color-primary-light: #3b82f6;
+  --ifm-color-primary-lighter: #60a5fa;
+  --ifm-color-primary-lightest: #93c5fd;
+
+  --ifm-font-family-base:
+    system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --ifm-font-family-monospace:
+    ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, Consolas,
+    monospace;
+  --ifm-heading-font-weight: 700;
   --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --ifm-line-height-base: 1.7;
+
+  --ifm-navbar-height: 3.75rem;
+  --ifm-navbar-shadow: 0 1px 0 0 rgba(15, 23, 42, 0.06);
+
+  --af-card-bg: #ffffff;
+  --af-card-border: #e5eaf2;
+  --af-band-bg: #f5f8fd;
+  --af-band-border: #e5eaf2;
+
+  --docusaurus-highlighted-code-line-bg: rgba(37, 99, 235, 0.12);
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary: #2563eb;
-  --ifm-color-primary-dark: #3b82f6;
-  --ifm-color-primary-darker: #60a5fa;
-  --ifm-color-primary-darkest: #93c5fd;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  color-scheme: dark;
+
+  --ifm-color-primary: #3b82f6;
+  --ifm-color-primary-dark: #60a5fa;
+  --ifm-color-primary-darker: #93c5fd;
+  --ifm-color-primary-darkest: #bfdbfe;
+  --ifm-color-primary-light: #2563eb;
+  --ifm-color-primary-lighter: #1d4ed8;
+  --ifm-color-primary-lightest: #1e40af;
+
+  --ifm-background-color: #0b1120;
+  --ifm-background-surface-color: #0e1526;
+  --ifm-navbar-background-color: rgba(11, 17, 32, 0.85);
+  --ifm-footer-background-color: #0a0f1e;
+
+  --af-card-bg: #0e1526;
+  --af-card-border: rgba(94, 122, 168, 0.25);
+  --af-band-bg: #0b1120;
+  --af-band-border: rgba(94, 122, 168, 0.18);
+
+  --docusaurus-highlighted-code-line-bg: rgba(59, 130, 246, 0.22);
+}
+
+/* ------------------------------------------------------------
+ * Base canvas: explicit backgrounds so the page never depends
+ * on the browser default canvas color.
+ * ------------------------------------------------------------ */
+
+html {
+  background-color: #ffffff;
+}
+
+body {
+  background-color: #ffffff;
+}
+
+[data-theme='dark'] html,
+[data-theme='dark'] body {
+  background-color: #0b1120;
+}
+
+/* ------------------------------------------------------------
+ * Docs body polish
+ * ------------------------------------------------------------ */
+
+.markdown h1 {
+  letter-spacing: -0.015em;
+}
+
+article .markdown h2 {
+  margin-top: 2.4rem;
+}
+
+/* Code blocks: rounded with a hairline border in both themes. */
+.theme-code-block {
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+code {
+  border-radius: 6px;
+}
+
+/* Tables breathe. */
+.markdown table {
+  display: table;
+  width: 100%;
+}
+
+.markdown th {
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------------
+ * Hub card grids used on the docs home and area hub pages.
+ * ------------------------------------------------------------ */
+
+.af-cards a.card {
+  display: block;
+  height: 100%;
+  text-decoration: none;
+  color: inherit;
+  background: var(--af-card-bg);
+  border: 1px solid var(--af-card-border);
+  border-radius: 14px;
+  transition:
+    transform 0.18s ease,
+    box-shadow 0.18s ease,
+    border-color 0.18s ease;
+}
+
+.af-cards a.card:hover {
+  transform: translateY(-3px);
+  text-decoration: none;
+  color: inherit;
+  border-color: var(--ifm-color-primary-light);
+  box-shadow: 0 14px 34px -14px rgba(37, 99, 235, 0.25);
+}
+
+.af-cards .card__header h3 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+
+.af-cards .card__body {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--ifm-color-emphasis-700);
+}
+
+/* ------------------------------------------------------------
+ * Navbar & footer
+ * ------------------------------------------------------------ */
+
+.navbar {
+  backdrop-filter: blur(8px);
+  background-color: color-mix(
+    in srgb,
+    var(--ifm-navbar-background-color) 92%,
+    transparent
+  );
+}
+
+.navbar__title {
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.footer {
+  border-top: 1px solid rgba(94, 122, 168, 0.18);
+}
+
+.footer__title {
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Announcement bar */
+:root {
+  --docusaurus-announcement-bar-height: auto;
+}
+
+div[class^='announcementBarContent'],
+div[class*='announcementBarContent'] {
+  font-size: 0.9rem;
+  padding: 0.55rem 1rem;
+}
+
+div[class^='announcementBarContent'] a,
+div[class*='announcementBarContent'] a {
+  color: #bfdbfe;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ------------------------------------------------------------
+ * Navbar GitHub icon
+ * ------------------------------------------------------------ */
+
+.header-github-link::before {
+  content: '';
+  width: 24px;
+  height: 24px;
+  display: flex;
+  background-color: var(--ifm-navbar-link-color);
+  mask-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12'/%3E%3C/svg%3E");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  transition: background-color 0.15s ease;
+}
+
+.header-github-link:hover::before {
+  background-color: var(--ifm-color-primary);
+}
+
+/* ------------------------------------------------------------
+ * Scrollbars (subtle, WebKit)
+ * ------------------------------------------------------------ */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.35);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.55);
+  background-clip: content-box;
+  border: 2px solid transparent;
 }

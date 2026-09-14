@@ -1,9 +1,0 @@
-{
-  "label": "Control plane",
-  "position": 7,
-  "link": {
-    "title": "Control plane",
-    "type": "generated-index",
-    "description": "Operate ArkFlow as a fleet: the Hub, console, agent reconciliation, and the HTTP API."
-  }
-}

@@ -58,6 +58,17 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
+          // The maintained (unversioned) tree is the primary docs served at
+          // /docs/; released snapshots hang off /docs/0.5.x etc. and are
+          // switched via the version dropdown. Version policy:
+          // docs/DOCUMENTATION.md.
+          lastVersion: 'current',
+          versions: {
+            current: {
+              label: 'Next',
+              banner: 'none',
+            },
+          },
           // Please change this to your repo.
           // Remove this to remove the "edit this page" links.
           editUrl:
@@ -88,6 +99,14 @@ const config: Config = {
   themeConfig: {
     // Replace with your project's social card
     image: 'img/arkflow.svg',
+    announcementBar: {
+      id: 'unified-kernel',
+      content:
+        '✨ <b>New architecture</b>: a unified streaming job runtime — kernel rebuild, durability, control plane, and web console. <a href="/docs/build/jobs">See what changed</a>',
+      backgroundColor: '#1e3a8a',
+      textColor: '#ffffff',
+      isCloseable: true,
+    },
     navbar: {
       title: 'ArkFlow',
       logo: {
@@ -101,6 +120,8 @@ const config: Config = {
           position: 'left',
           label: 'Docs',
         },
+        {to: '/docs/sql', label: 'SQL', position: 'left'},
+        {to: '/docs/reference/api', label: 'API', position: 'left'},
         {to: '/blog', label: 'Blog', position: 'left'},
         {
           type: 'docsVersionDropdown',
@@ -108,48 +129,61 @@ const config: Config = {
         },
         {
           href: 'https://github.com/arkflow-rs/arkflow',
-          label: 'GitHub',
           position: 'right',
+          className: 'header-github-link',
+          'aria-label': 'GitHub repository',
         },
-
       ],
     },
     footer: {
       style: 'dark',
       links: [
         {
-          title: 'Docs',
+          title: 'Learn',
           items: [
-            {
-              label: 'Start here',
-              to: '/docs/intro',
-            },
+            {label: 'Get started', to: '/docs/get-started/install'},
+            {label: 'Quickstart', to: '/docs/get-started/quickstart'},
+            {label: 'Architecture', to: '/docs/build/architecture'},
+            {label: 'Streaming jobs', to: '/docs/build/jobs'},
+          ],
+        },
+        {
+          title: 'Build',
+          items: [
+            {label: 'Components', to: '/docs/components'},
+            {label: 'SQL reference', to: '/docs/sql'},
+            {label: 'Recipes', to: '/docs/build/recipes'},
+            {label: 'Examples', to: '/docs/reference/examples'},
+          ],
+        },
+        {
+          title: 'Operate',
+          items: [
+            {label: 'Kubernetes', to: '/docs/operate/kubernetes'},
+            {label: 'Control plane', to: '/docs/operate/control-plane/overview'},
+            {label: 'Web console', to: '/docs/operate/control-plane/console'},
+            {label: 'Recovery runbook', to: '/docs/operate/recovery'},
+          ],
+        },
+        {
+          title: 'Reference',
+          items: [
+            {label: 'CLI', to: '/docs/reference/cli'},
+            {label: 'HTTP API', to: '/docs/reference/api'},
+            {label: 'Configuration', to: '/docs/reference/configuration'},
+            {label: 'Compatibility', to: '/docs/reference/compatibility'},
           ],
         },
         {
           title: 'Community',
           items: [
-            {
-              label: 'Discord',
-              href: 'https://discord.gg/CwKhzb8pux',
-            }
-          ],
-        },
-        {
-          title: 'More',
-          items: [
-            {
-              label: 'Blog',
-              to: '/blog',
-            },
-            {
-              label: 'GitHub',
-              href: 'https://github.com/arkflow-rs/arkflow',
-            },
+            {label: 'GitHub', href: 'https://github.com/arkflow-rs/arkflow'},
+            {label: 'Discord', href: 'https://discord.gg/CwKhzb8pux'},
+            {label: 'Blog', to: '/blog'},
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} ArkFlow, Inc. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} ArkFlow. Built with Docusaurus.`,
     },
     prism: {
       theme: prismThemes.github,
