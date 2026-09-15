@@ -64,20 +64,23 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
     resource: &mut Resource,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
-    run_job_with_checkpoints_started(spec, adapter, resource, cancellation, None).await
+    run_job_with_checkpoints_started(spec, adapter, resource, cancellation, None, None).await
 }
 
 /// Run a local Job and notify the caller once the graph's resource startup
 /// has completed. The notification is used by the Engine to delay readiness
 /// until component construction and resource connection have actually
 /// succeeded; the ordinary API keeps the notification optional for existing
-/// callers.
+/// callers. When `metrics_registry` is `Some`, the spawned Job's
+/// `KernelMetrics` are registered under the Job id for observability export
+/// and unregistered once the run finishes.
 pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     spec: &JobSpec,
     adapter: &A,
     resource: &mut Resource,
     cancellation: CancellationToken,
     mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    metrics_registry: Option<crate::runtime::JobMetricsRegistry>,
 ) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
     let checkpoint_root = spec
@@ -202,6 +205,9 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         }
     };
     let handle = Arc::new(spawned);
+    if let Some(registry) = metrics_registry.as_ref() {
+        registry.register(spec.id.as_str(), handle.metrics());
+    }
     if let Some(startup) = startup.take() {
         let _ = startup.send(Ok(()));
     }
@@ -222,6 +228,9 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         .watcher()
         .await
         .map_err(|error| Error::Process(format!("local Job runner task failed: {error}")))?;
+    if let Some(registry) = metrics_registry.as_ref() {
+        registry.unregister(spec.id.as_str());
+    }
     checkpoint_stop.cancel();
     if let Some(task) = checkpoint_task {
         let _ = task.await;
@@ -931,5 +940,224 @@ mod validation_tests {
         let error =
             validate_local_job(&spec).expect_err("unknown input component must fail validation");
         assert!(error.to_string().contains("Unknown input type"));
+    }
+}
+
+#[cfg(test)]
+mod metrics_registry_tests {
+    use super::*;
+    use crate::input::{Ack, Input};
+    use crate::job::{
+        EdgeSpec, JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec, TimeMode,
+        TimeSpec,
+    };
+    use crate::output::Output;
+    use crate::processor::Processor;
+    use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult};
+    use async_trait::async_trait;
+    use datafusion::arrow::{
+        array::Int64Array,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use std::sync::Mutex;
+
+    struct OneBatchThenEofInput {
+        sent: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Input for OneBatchThenEofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let mut sent = self.sent.lock().unwrap();
+            if *sent {
+                return Err(Error::EOF);
+            }
+            *sent = true;
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            Ok((
+                Arc::new(MessageBatch::new_arrow(batch)),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutput;
+
+    #[async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct PassThrough;
+
+    #[async_trait]
+    impl Processor for PassThrough {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct MinimalAdapter;
+
+    impl crate::job::JobComponentAdapter for MinimalAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }))
+        }
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNullOutput))
+        }
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(PassThrough))
+        }
+    }
+
+    fn registry_spec() -> JobSpec {
+        JobSpec {
+            id: JobId::new("registry-metrics-job").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 1,
+            parallelism: 1,
+            operators: vec![
+                OperatorSpec {
+                    id: "source".into(),
+                    kind: OperatorKind::Source,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
+                    id: "sink".into(),
+                    kind: OperatorKind::Sink,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![EdgeSpec {
+                id: "source-sink".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }],
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: "registry-test-input".into(),
+                config: serde_json::json!({}),
+                time: TimeSpec {
+                    mode: TimeMode::ProcessingTime,
+                    timestamp_field: None,
+                    watermark: None,
+                    allowed_lateness_ms: 0,
+                    late_event_policy: Default::default(),
+                    late_event_route: None,
+                },
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "registry-test-output".into(),
+                config: serde_json::json!({}),
+            }],
+            state: None,
+            checkpoint: None,
+            recovery: Default::default(),
+        }
+    }
+
+    /// The local runner registers the Job's KernelMetrics once the kernel has
+    /// spawned (before startup completion is reported) and unregisters them
+    /// when the run finishes, so export never observes a finished Job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registers_on_startup_and_unregisters_on_completion() {
+        let registry = crate::runtime::JobMetricsRegistry::default();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let spec = registry_spec();
+        let task_registry = registry.clone();
+        let run = tokio::spawn(async move {
+            let adapter = MinimalAdapter;
+            let mut resource = Resource {
+                temporary: std::collections::HashMap::new(),
+                input_names: std::cell::RefCell::new(Vec::new()),
+            };
+            run_job_with_checkpoints_started(
+                &spec,
+                &adapter,
+                &mut resource,
+                CancellationToken::default(),
+                Some(startup_tx),
+                Some(task_registry),
+            )
+            .await
+        });
+
+        startup_rx.await.unwrap().unwrap();
+        let metrics = registry
+            .get("registry-metrics-job")
+            .expect("Job metrics must be registered once startup completed");
+        // The handle is the live kernel registry: chains appear as the graph's
+        // event loops spin up.
+        let _ = metrics.snapshot();
+
+        run.await.unwrap().unwrap();
+        assert!(registry.get("registry-metrics-job").is_none());
+        assert!(registry.snapshots().is_empty());
+    }
+
+    /// A run without a registry keeps the legacy behavior (no registration).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runs_without_a_registry_are_untracked() {
+        let registry = crate::runtime::JobMetricsRegistry::default();
+        let spec = registry_spec();
+        let adapter = MinimalAdapter;
+        let mut resource = Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
+        run_job_with_checkpoints_started(
+            &spec,
+            &adapter,
+            &mut resource,
+            CancellationToken::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(registry.snapshots().is_empty());
     }
 }

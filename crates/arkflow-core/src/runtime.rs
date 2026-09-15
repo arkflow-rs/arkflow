@@ -358,17 +358,65 @@ impl RuntimeEntry {
     }
 }
 
+/// Registry of live kernel Job metrics keyed by Job id. The local Job runner
+/// registers each spawned Job's `KernelMetrics` so observability export can
+/// snapshot running Jobs without holding their handles. Locks are never held
+/// across awaits.
+#[derive(Clone, Default)]
+pub struct JobMetricsRegistry {
+    jobs: Arc<std::sync::Mutex<BTreeMap<String, Arc<crate::executor::metrics::KernelMetrics>>>>,
+}
+
+impl JobMetricsRegistry {
+    pub fn register(
+        &self,
+        job_id: impl Into<String>,
+        metrics: Arc<crate::executor::metrics::KernelMetrics>,
+    ) {
+        self.jobs.lock().unwrap().insert(job_id.into(), metrics);
+    }
+
+    pub fn unregister(&self, job_id: &str) {
+        self.jobs.lock().unwrap().remove(job_id);
+    }
+
+    pub fn get(
+        &self,
+        job_id: &str,
+    ) -> Option<Arc<crate::executor::metrics::KernelMetrics>> {
+        self.jobs.lock().unwrap().get(job_id).cloned()
+    }
+
+    /// Snapshot every registered Job's kernel metrics.
+    pub fn snapshots(
+        &self,
+    ) -> BTreeMap<String, crate::executor::metrics::KernelMetricsSnapshot> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(job_id, metrics)| (job_id.clone(), metrics.snapshot()))
+            .collect()
+    }
+}
+
 /// Process-local registry of independently managed Stream runtimes.
 #[derive(Clone, Default)]
 pub struct RuntimeManager {
     entries: Arc<RwLock<BTreeMap<String, Arc<Mutex<RuntimeEntry>>>>>,
     events: EventStore,
     observed_config_version: Arc<RwLock<Option<String>>>,
+    job_metrics: JobMetricsRegistry,
 }
 
 impl RuntimeManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Metrics registry for locally running kernel Jobs (observability).
+    pub fn job_metrics(&self) -> JobMetricsRegistry {
+        self.job_metrics.clone()
     }
 
     /// Register a Stream without awaiting while holding the registry lock.

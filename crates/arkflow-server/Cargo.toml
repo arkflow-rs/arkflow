@@ -28,6 +28,7 @@ sqlx = { workspace = true }
 rusqlite = { workspace = true }
 object_store = { workspace = true }
 bytes = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

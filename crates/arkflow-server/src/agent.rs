@@ -337,6 +337,24 @@ impl JobRuntime {
             .map(|task| task.generation)
     }
 
+    /// Per-Job kernel snapshots for the Hub's data-plane metrics export.
+    /// Unlike `metrics`, these keep the Job identity so the Hub can label
+    /// series per (node, job).
+    async fn job_snapshots(
+        &self,
+    ) -> BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot> {
+        self.tasks
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(job_id, task)| {
+                task.kernel
+                    .as_ref()
+                    .map(|kernel| (job_id.clone(), kernel.metrics().snapshot()))
+            })
+            .collect()
+    }
+
     /// Aggregate unified-kernel counters for the Agent report.  A JobTask owns
     /// one kernel handle even when its assigned subgraph has several chains;
     /// summing throughput while taking the maximum latency/lag keeps the
@@ -1689,6 +1707,7 @@ async fn report(
         operations: cp.operations().await,
         events: cp.events().await,
         metrics,
+        jobs: job_runtime.job_snapshots().await,
         configuration: redacted_config(&cp.configuration().await).ok(),
         configuration_version,
         boot_id: Some(boot_id.into()),

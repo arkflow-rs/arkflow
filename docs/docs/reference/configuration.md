@@ -67,6 +67,30 @@ API and the Hub agent when `hub_url` is set (see
 | `node_token` | string | no | — | Shared node registration credential. Never included in reports. |
 | `agent_lease_ttl_ms` | integer | no | `15000` | Lease duration (ms) a compute node advertises to its Hub. |
 | `agent_session_ttl_ms` | integer | no | `3600000` | Hard lifetime (ms) of a Hub-issued agent session credential; the Agent re-registers transparently when it elapses. |
+| `observability` | object | no | see below | Process-level Prometheus metrics and health probes (see [Observability](../operate/observability.md)). |
+
+### `health_check.observability`
+
+Exports process-level observability endpoints. They stay available even when
+`health_check.enabled` is `false` — a pure data-plane deployment (no
+control-plane API, no Hub) still exposes metrics and probes. The listener
+binds loopback by default; for production, set an explicit address or rely on
+host/firewall policy. When the control-plane server is enabled, its router
+serves the same endpoints and no second listener is started.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | no | `true` | Start the observability listener (unless the control-plane server already serves the endpoints). |
+| `address` | string | no | `127.0.0.1:8081` | Listen address. |
+| `metrics_path` | string | no | `/metrics` | Prometheus exposition endpoint (format 0.0.4). |
+| `ready_path` | string | no | `/ready` | Readiness probe: success once the engine finished starting the configured Streams and Jobs. |
+| `live_path` | string | no | `/live` | Liveness probe: success while the process is running. |
+
+:::note
+When the control-plane server is enabled, `/ready` and `/live` are also
+mounted on the server address next to the legacy `/health`, `/readiness`, and
+`/liveness` endpoints (which keep their original semantics).
+:::
 
 ## stream
 

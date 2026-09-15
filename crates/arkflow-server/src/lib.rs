@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod api_contract;
 pub mod hub;
+pub mod metrics;
 pub mod storage;
 
 use crate::api_contract::{
@@ -64,6 +65,8 @@ pub struct ServerConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_session_ttl_ms")]
     pub session_ttl_ms: u64,
+    #[serde(default)]
+    pub observability: arkflow_core::config::ObservabilityConfig,
 }
 
 impl ServerConfig {
@@ -81,6 +84,7 @@ impl ServerConfig {
             lease_ttl_ms: health.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: health.agent_session_ttl_ms,
+            observability: health.observability.clone(),
         }
     }
 }
@@ -99,6 +103,7 @@ impl Default for ServerConfig {
             lease_ttl_ms: default_lease_ttl_ms(),
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: default_session_ttl_ms(),
+            observability: arkflow_core::config::ObservabilityConfig::default(),
         }
     }
 }
@@ -232,6 +237,8 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
         .route(&config.health_path, get(health))
         .route(&config.readiness_path, get(readiness))
         .route(&config.liveness_path, get(liveness))
+        .route(&config.observability.ready_path, get(ready))
+        .route(&config.observability.live_path, get(live))
         .route("/metrics", get(metrics))
         .nest(prefix, api)
         .with_state(control_plane)
@@ -263,6 +270,52 @@ pub async fn serve(
     axum::serve(listener, router(control_plane, &config).into_make_service())
         .with_graceful_shutdown(cancellation.cancelled_owned())
         .await?;
+    Ok(())
+}
+
+/// The minimal observability router: metrics and health probes only, no
+/// resource APIs and no configuration content.
+pub fn observability_router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
+    let observability = &config.observability;
+    Router::new()
+        .route(&observability.metrics_path, get(metrics))
+        .route(&observability.ready_path, get(ready))
+        .route(&observability.live_path, get(live))
+        .with_state(control_plane)
+}
+
+/// Serve only the process observability endpoints (`/metrics`, `/ready`,
+/// `/live`, paths configurable). Used when the control-plane API server is
+/// disabled (or absent, e.g. Agent mode) so a pure data-plane process still
+/// exposes metrics and health probes. A bind failure logs a warning and
+/// returns without error: observability must never block the data plane.
+pub async fn serve_observability(
+    control_plane: ControlPlane,
+    config: ServerConfig,
+    cancellation: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let observability = &config.observability;
+    if !observability.enabled {
+        return Ok(());
+    }
+    let app = observability_router(control_plane, &config);
+    let address: SocketAddr = observability.address.parse()?;
+    match TcpListener::bind(address).await {
+        Ok(listener) => {
+            tracing::info!(%address, "observability listener started");
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(cancellation.cancelled_owned())
+                .await?;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                address = %observability.address,
+                "observability listener failed to bind; continuing without it \
+                 (configure health_check.observability.address)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2411,6 +2464,19 @@ async fn hub_metrics(
         }
     }
     body.push_str(&hub.command_metrics().render());
+    // Data-plane series reported by Agents: the kernel Job vocabulary with an
+    // extra `node` label. Expired-lease nodes are excluded by the Hub.
+    for (node_id, jobs) in hub.job_metrics().await {
+        for (job_id, snapshot) in &jobs {
+            body.push_str(&crate::metrics::encode_families(
+                crate::metrics::kernel_job_families(
+                    job_id,
+                    snapshot,
+                    &[("node", node_id.clone())],
+                ),
+            ));
+        }
+    }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -3121,45 +3187,16 @@ async fn schema() -> Json<serde_json::Value> {
 }
 
 async fn metrics(State(cp): State<ControlPlane>) -> Response {
-    let mut body = String::new();
-    for stream in cp.runtime_manager().snapshots().await {
-        body.push_str(&format!(
-            "arkflow_stream_input_messages{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.input_messages
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_output_messages{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.output_messages
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_restarts{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.restarts
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_in_flight{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.in_flight
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_mean_latency_us{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.mean_latency_us
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_checkpoint_duration_ms{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.checkpoint_duration_ms
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_checkpoint_failures{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.checkpoint_failures
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_watermark_lag_ms{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.watermark_lag_ms
-        ));
-        body.push_str(&format!(
-            "arkflow_stream_late_events{{stream_id=\"{}\"}} {}\n",
-            stream.id, stream.metrics.late_events
-        ));
-    }
+    let runtime = cp.runtime_manager();
+    let mut streams: Vec<(String, arkflow_core::control::StreamMetricsSnapshot)> = runtime
+        .snapshots()
+        .await
+        .into_iter()
+        .map(|status| (status.id, status.metrics))
+        .collect();
+    streams.sort_by(|left, right| left.0.cmp(&right.0));
+    let jobs = runtime.job_metrics().snapshots();
+    let body = crate::metrics::data_plane_exposition(&streams, &jobs);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -3177,6 +3214,16 @@ async fn health(State(cp): State<ControlPlane>) -> Response {
         .into_response()
 }
 async fn readiness(State(cp): State<ControlPlane>) -> Response {
+    ready(State(cp)).await
+}
+async fn liveness() -> Json<serde_json::Value> {
+    live().await
+}
+
+/// Readiness on the observability surface: success once the engine runtime
+/// has finished starting the configured Streams and Jobs (in local mode this
+/// is the same health state the control plane reports via `/readiness`).
+async fn ready(State(cp): State<ControlPlane>) -> Response {
     let ready = cp.health().is_ready();
     (
         if ready {
@@ -3188,7 +3235,7 @@ async fn readiness(State(cp): State<ControlPlane>) -> Response {
     )
         .into_response()
 }
-async fn liveness() -> Json<serde_json::Value> {
+async fn live() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive", "alive":true}))
 }
 
@@ -3521,6 +3568,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The API-server-disabled process still exposes observability endpoints:
+    /// `/metrics` returns a valid exposition and `/ready` flips from 503 to
+    /// 200 once the engine runtime reports readiness.
+    #[tokio::test]
+    async fn observability_router_serves_metrics_ready_and_live_without_the_api_server() {
+        let engine = Engine::new(EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        });
+        let control_plane = engine.control_plane();
+        control_plane.health().set_ready(false);
+        let app = observability_router(control_plane.clone(), &ServerConfig::default());
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "not_ready");
+        assert_eq!(value["ready"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/live")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        control_plane.health().set_ready(true);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // No streams and no jobs: a valid (empty) exposition.
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.lines().any(|line| !line.starts_with('#')));
+    }
+
+    /// The API-server router gains `/ready` and `/live` while the legacy
+    /// `/health`, `/readiness`, and `/liveness` paths keep their semantics.
+    #[tokio::test]
+    async fn local_router_keeps_legacy_health_paths_and_adds_ready_live() {
+        let engine = Engine::new(EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        });
+        let control_plane = engine.control_plane();
+        control_plane.health().set_ready(true);
+        control_plane.health().set_running(true);
+        let app = router(control_plane, &ServerConfig::default());
+        for path in ["/ready", "/live", "/readiness", "/liveness", "/health"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success(), "path failed: {path}");
+        }
     }
 
     #[tokio::test]
@@ -4417,6 +4568,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: Default::default(),
+            jobs: Default::default(),
             configuration: None,
             configuration_version: Some(config_version),
             boot_id: Some(session.session_token.clone()),

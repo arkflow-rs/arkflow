@@ -269,6 +269,22 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     })
     .await;
 
+    // Data-plane observability: both Agents report per-Job kernel metric
+    // snapshots to the Hub, so the Hub export covers both nodes.
+    wait_until(|| {
+        let hub = hub.clone();
+        async move { hub.job_metrics().await.len() == 2 }
+    })
+    .await;
+    let exported = hub.job_metrics().await;
+    for (node_id, jobs) in &exported {
+        assert!(
+            jobs.contains_key(&job_id),
+            "node {node_id} must export the smoke Job, got {:?}",
+            jobs.keys().collect::<Vec<_>>()
+        );
+    }
+
     assert_eq!(hub.schedule_periodic_checkpoints().await.unwrap(), 1);
     wait_until(|| {
         let hub = hub.clone();
