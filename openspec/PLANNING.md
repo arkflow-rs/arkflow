@@ -202,11 +202,18 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
 - Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 复用现有 upsert（零代码）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future。
 
-### 下一步（2026-09-12 对齐）
+### 下一步（2026-09-12 对齐，2026-09-15 更新）
 
-1. **合入 v1**：v1 领先 main 51 个提交、main 零领先（单向干净窗口）。评审整改已全部归档，`openspec/changes/` 仅剩 `archive/`。合并 v1 是一切新方向的前置，拖久合并风险增大。
+1. ~~**合入 v1**~~ → ✅ 已完成：PR #1222 squash 合入 main（`d656ae2`），main 与 v1 内容一致。
 2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。
-3. **方向选择**：方向② 四项全部闭环后，从第七节候选方向中确认下一主线（推荐序：数据面可观测性 → 企业集成安全 → AI 轻量切口），确认后展开 roadmap 并按 OpenSpec 立项。
+3. ~~**方向选择**~~ → ✅ 已确认：下一主线 = **数据面可观测性**，已立项 `changes/add-data-plane-observability`（2026-09-15）。
+
+### 数据面可观测性（2026-09-15 立项并实施，`add-data-plane-observability`）
+
+- **动机**：统一内核的 `KernelMetricsSnapshot` 无 Prometheus 出口——本地 `/metrics` 只导出 legacy Stream 序列、Agent 心跳指标滞留在 Hub JSON 诊断、`server.enabled=false` 时进程无可观测端点（issue #768）。
+- **落点**：`RuntimeManager::job_metrics()` 注册表（本地 YAML Job 的 KernelMetrics）；`arkflow-server/src/metrics.rs` 渲染层（prometheus proto + TextEncoder，HELP/TYPE、counter `_total`/gauge 词表 `arkflow_job_chain_*` / `arkflow_job_checkpoint_*` / `arkflow_job_watermark_lag_ms` / `arkflow_job_late_events_total`，标签封闭于 node/job/chain/stream_id）；`/ready`、`/live` 统一路径 + 独立 observability 监听（默认 `127.0.0.1:8081`，API server 启用时不重复监听）；心跳新增 per-Job 快照（serde default 双向兼容），Hub `/metrics` 以 node 标签导出（lease 过期即停导出）。
+- **明确不做**：OTel trace（后续独立立项）、新采集点、Console 可视化、remote write。
+- **后续候选**：方向⑤ 企业集成安全（Kafka SASL/SSL，issue #902）→ 方向① AI 轻量切口。
 
 ---
 

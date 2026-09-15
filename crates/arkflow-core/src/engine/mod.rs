@@ -88,12 +88,17 @@ impl Engine {
         // to the real resource connection path.
         let mut job_handles = Vec::new();
         let local_jobs_token = token.child_token();
+        // Local Jobs publish their kernel metrics here so the transport layer
+        // can export them. Compiled Streams report through RuntimeMetrics
+        // instead and must not double-register.
+        let job_metrics_registry = self.runtime_manager.job_metrics();
         let (local_job_failure_tx, mut local_job_failure_rx) =
             tokio::sync::mpsc::unbounded_channel::<String>();
         for job in &self.config.jobs {
             let spec = job.clone();
             let token = local_jobs_token.clone();
             let failure_tx = local_job_failure_tx.clone();
+            let metrics_registry = job_metrics_registry.clone();
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             info!(job_id = %spec.id, "starting local Job on the unified kernel");
             let handle = tokio::spawn(async move {
@@ -108,6 +113,7 @@ impl Engine {
                     &mut resource,
                     token,
                     Some(startup_tx),
+                    Some(metrics_registry),
                 )
                 .await;
                 if let Err(error) = &result {

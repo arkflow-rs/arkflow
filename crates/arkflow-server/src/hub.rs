@@ -145,6 +145,10 @@ pub struct NodeReport {
     pub events: Vec<ControlEvent>,
     #[serde(default)]
     pub metrics: BTreeMap<String, f64>,
+    /// Per-Job kernel metric snapshots for the data-plane Prometheus export.
+    /// Older Agents omit the field (empty map = no data-plane series).
+    #[serde(default)]
+    pub jobs: BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
     #[serde(default)]
     pub configuration: Option<serde_json::Value>,
     #[serde(default)]
@@ -330,6 +334,8 @@ struct NodeRecord {
     operations: Vec<OperationRecord>,
     events: Vec<ControlEvent>,
     metrics: BTreeMap<String, f64>,
+    /// Most recent per-Job kernel snapshots reported by the Agent.
+    jobs: BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
     configuration: Option<serde_json::Value>,
 }
 
@@ -2260,6 +2266,16 @@ impl Hub {
                     .map(|record| record.events.clone())
                     .unwrap_or_default(),
                 configuration: old.as_ref().and_then(|record| record.configuration.clone()),
+                // A boot change invalidates the previous process's local Jobs
+                // (their start operations are marked unavailable below), so
+                // their metric snapshots must not survive the re-registration.
+                jobs: if boot_changed {
+                    BTreeMap::new()
+                } else {
+                    old.as_ref()
+                        .map(|record| record.jobs.clone())
+                        .unwrap_or_default()
+                },
                 metrics: old.map(|record| record.metrics).unwrap_or_default(),
             },
         );
@@ -2442,6 +2458,7 @@ impl Hub {
         node.operations = report.operations;
         node.events = report.events.clone();
         node.metrics = sanitize_metrics(report.metrics);
+        node.jobs = bounded_job_snapshots(report.jobs);
         node.configuration = report.configuration;
         let persisted_version = node.resource.version.clone();
         let persisted_state = format!("{:?}", node.resource.state).to_lowercase();
@@ -4522,6 +4539,27 @@ impl Hub {
         aggregate
     }
 
+    /// Per-node, per-Job kernel metric snapshots for the data-plane Prometheus
+    /// export. Only Agents with an unexpired lease are included, so an Agent
+    /// that stops reporting (expired lease or deregistration) stops being
+    /// exported.
+    pub async fn job_metrics(
+        &self,
+    ) -> Vec<(
+        String,
+        BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
+    )> {
+        let now = now_ms();
+        self.nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| node.resource.lease_expires_at_ms > now)
+            .filter(|node| !node.jobs.is_empty())
+            .map(|node| (node.resource.id.clone(), node.jobs.clone()))
+            .collect()
+    }
+
     pub async fn metrics_by_node(&self, node_id: Option<&str>) -> Vec<HubNodeMetrics> {
         self.nodes
             .read()
@@ -4723,6 +4761,19 @@ fn sanitize_metrics(metrics: BTreeMap<String, f64>) -> BTreeMap<String, f64> {
             ALLOWED_NODE_METRICS.contains(&key.as_str()) && value.is_finite() && *value >= 0.0
         })
         .collect()
+}
+
+/// Upper bound on per-Job snapshots kept for one node. Jobs are
+/// operator-configured so this is generous; a misbehaving Agent cannot grow
+/// Hub memory without bound.
+const MAX_REPORTED_JOBS_PER_NODE: usize = 256;
+
+/// Keep the bounded set of reported Job snapshots, discarding finite values
+/// only: series cardinality stays at O(jobs x chains) per node.
+fn bounded_job_snapshots(
+    jobs: BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
+) -> BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot> {
+    jobs.into_iter().take(MAX_REPORTED_JOBS_PER_NODE).collect()
 }
 
 fn sanitize_capabilities(capabilities: Vec<String>) -> Vec<String> {
@@ -5820,6 +5871,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: Some("cfg-7".into()),
             boot_id: Some("boot-7".into()),
@@ -6071,6 +6123,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: Some("cfg-health".into()),
             boot_id: Some(session.session_token.clone()),
@@ -6178,6 +6231,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: Some("cfg-state-a".into()),
             boot_id: Some(node_a.session_token.clone()),
@@ -6361,6 +6415,7 @@ mod tests {
                 operations: vec![],
                 events: vec![],
                 metrics: BTreeMap::from([("streams_total".into(), 0.0)]),
+                jobs: BTreeMap::new(),
                 configuration: None,
                 configuration_version: Some("cfg-e2e".into()),
                 boot_id: Some(auth.session_token.clone()),
@@ -6442,6 +6497,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: Some(session2.session_token.clone()),
@@ -6492,6 +6548,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: None,
@@ -6582,6 +6639,181 @@ mod tests {
         assert!(!session.session_token.is_empty());
     }
 
+    fn job_snapshot(rows: u64) -> arkflow_core::executor::metrics::KernelMetricsSnapshot {
+        let mut chains = BTreeMap::new();
+        chains.insert(
+            "src".to_string(),
+            arkflow_core::executor::metrics::ChainMetricsSnapshot {
+                rows,
+                ..Default::default()
+            },
+        );
+        arkflow_core::executor::metrics::KernelMetricsSnapshot {
+            chains,
+            ..Default::default()
+        }
+    }
+
+    /// An Agent that predates the per-Job reporting field (empty map after
+    /// serde defaults) must not produce any data-plane series.
+    #[tokio::test]
+    async fn report_without_job_snapshots_exports_no_data_plane_series() {
+        let hub = Hub::new(config());
+        let session = hub
+            .register(RegisterRequest {
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec![],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        hub.report(NodeReport {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: session.session_token.clone(),
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: None,
+            report_seq: 1,
+        })
+        .await
+        .unwrap();
+        assert!(hub.job_metrics().await.is_empty());
+    }
+
+    /// Two reporting Agents produce the same series vocabulary distinguished
+    /// by the `node` label, per (node, job) granularity.
+    #[tokio::test]
+    async fn reported_job_metrics_carry_node_and_job_labels() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: "v1".into(),
+                    capabilities: vec![],
+                    boot_id: None,
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+            hub.report(NodeReport {
+                auth: AgentAuth {
+                    node_id: node_id.into(),
+                    session_token: session.session_token.clone(),
+                },
+                version: "test".into(),
+                state: "online".into(),
+                capabilities: vec![],
+                streams: vec![],
+                operations: vec![],
+                events: vec![],
+                metrics: BTreeMap::new(),
+                jobs: BTreeMap::from([("job-1".into(), job_snapshot(if node_id == "node-a" { 7 } else { 9 }))]),
+                configuration: None,
+                configuration_version: None,
+                boot_id: None,
+                report_seq: 1,
+            })
+            .await
+            .unwrap();
+        }
+        let exported = hub.job_metrics().await;
+        assert_eq!(exported.len(), 2);
+        for (node_id, jobs) in &exported {
+            let snapshot = jobs.get("job-1").expect("job-1 snapshot stored");
+            let expected_rows = if node_id == "node-a" { 7 } else { 9 };
+            assert_eq!(snapshot.chains["src"].rows, expected_rows);
+            let text = crate::metrics::encode_families(crate::metrics::kernel_job_families(
+                "job-1",
+                snapshot,
+                &[("node", node_id.clone())],
+            ));
+            assert!(
+                text.contains(&format!("node=\"{node_id}\"")),
+                "series must carry the node label"
+            );
+        }
+    }
+
+    /// An Agent whose lease expires stops being exported while a live peer's
+    /// series remain.
+    #[tokio::test]
+    async fn expired_lease_stops_data_plane_export() {
+        let hub = Hub::new(HubConfig {
+            lease_ttl_ms: 1,
+            ..config()
+        });
+        let mut sessions = BTreeMap::new();
+        for node_id in ["n1", "n2"] {
+            let session = hub
+                .register(RegisterRequest {
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: "v1".into(),
+                    capabilities: vec![],
+                    boot_id: None,
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+            hub.report(NodeReport {
+                auth: AgentAuth {
+                    node_id: node_id.into(),
+                    session_token: session.session_token.clone(),
+                },
+                version: "test".into(),
+                state: "online".into(),
+                capabilities: vec![],
+                streams: vec![],
+                operations: vec![],
+                events: vec![],
+                metrics: BTreeMap::new(),
+                jobs: BTreeMap::from([(format!("{node_id}-job"), job_snapshot(1))]),
+                configuration: None,
+                configuration_version: None,
+                boot_id: None,
+                report_seq: 1,
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(hub.job_metrics().await.len(), 2);
+
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        hub.heartbeat(HeartbeatRequest {
+            auth: AgentAuth {
+                node_id: "n2".into(),
+                session_token: sessions["n2"].clone(),
+            },
+            state: "online".into(),
+            protocol_version: Some("v1".into()),
+            software_version: None,
+            capabilities: vec![],
+            rollout_id: None,
+        })
+        .await
+        .unwrap();
+
+        let exported = hub.job_metrics().await;
+        assert_eq!(exported.len(), 1, "only the live node keeps exporting");
+        assert_eq!(exported[0].0, "n2");
+        assert!(exported[0].1.contains_key("n2-job"));
+    }
+
     #[tokio::test]
     async fn unsupported_capability_is_rejected_before_dispatch() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
@@ -6669,6 +6901,7 @@ mod tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: Some(session.session_token.clone()),
@@ -8207,6 +8440,7 @@ mod session_report_tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: Some(session.session_token.clone()),
@@ -8316,6 +8550,7 @@ mod session_report_tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: Some("boot-1".into()),
@@ -8602,6 +8837,7 @@ mod session_report_tests {
             operations: vec![],
             events: vec![],
             metrics: BTreeMap::new(),
+            jobs: BTreeMap::new(),
             configuration: None,
             configuration_version: None,
             boot_id: Some(second.session_token.clone()),
@@ -8626,6 +8862,7 @@ mod session_report_tests {
                 operations: vec![],
                 events: vec![],
                 metrics: BTreeMap::new(),
+                jobs: BTreeMap::new(),
                 configuration: None,
                 configuration_version: None,
                 boot_id: Some(first.session_token.clone()),

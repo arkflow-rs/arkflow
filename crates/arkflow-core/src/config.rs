@@ -51,6 +51,53 @@ pub struct LoggingConfig {
     pub format: LogFormat,
 }
 
+/// Process-level observability endpoints (`/metrics`, `/ready`, `/live`).
+/// They stay available even when the control-plane API server is disabled.
+/// The default bind is loopback so enabling never exposes metrics off-host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    /// Whether the observability export is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Listening address for the observability endpoints
+    #[serde(default = "default_observability_address")]
+    pub address: String,
+    /// Path for the Prometheus metrics endpoint
+    #[serde(default = "default_observability_metrics_path")]
+    pub metrics_path: String,
+    /// Path for the readiness endpoint
+    #[serde(default = "default_observability_ready_path")]
+    pub ready_path: String,
+    /// Path for the liveness endpoint
+    #[serde(default = "default_observability_live_path")]
+    pub live_path: String,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            address: default_observability_address(),
+            metrics_path: default_observability_metrics_path(),
+            ready_path: default_observability_ready_path(),
+            live_path: default_observability_live_path(),
+        }
+    }
+}
+
+fn default_observability_address() -> String {
+    "127.0.0.1:8081".into()
+}
+fn default_observability_metrics_path() -> String {
+    "/metrics".into()
+}
+fn default_observability_ready_path() -> String {
+    "/ready".into()
+}
+fn default_observability_live_path() -> String {
+    "/live".into()
+}
+
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
@@ -93,6 +140,9 @@ pub struct HealthCheckConfig {
     /// Lifetime of a Hub-issued agent session credential.
     #[serde(default = "default_agent_session_ttl_ms")]
     pub agent_session_ttl_ms: u64,
+    /// Process-level observability export (metrics, readiness, liveness).
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 /// Engine configuration
@@ -235,6 +285,7 @@ impl Default for HealthCheckConfig {
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -373,6 +424,7 @@ mod tests {
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
+            observability: ObservabilityConfig::default(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -385,6 +437,30 @@ mod tests {
         assert_eq!(deserialized.liveness_path, "/live");
         assert_eq!(deserialized.api_prefix, "/api/v1");
         assert_eq!(deserialized.api_token.as_deref(), Some("test-token"));
+        assert!(deserialized.observability.enabled);
+    }
+
+    #[test]
+    fn test_observability_config_defaults() {
+        let config = ObservabilityConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.address, "127.0.0.1:8081");
+        assert_eq!(config.metrics_path, "/metrics");
+        assert_eq!(config.ready_path, "/ready");
+        assert_eq!(config.live_path, "/live");
+    }
+
+    #[test]
+    fn test_health_check_without_observability_section_uses_defaults() {
+        let health: HealthCheckConfig = serde_json::from_str(json!({}).to_string().as_str())
+            .expect("an empty object must deserialize with all defaults");
+        assert!(health.observability.enabled);
+        assert_eq!(health.observability.address, "127.0.0.1:8081");
+
+        let health: HealthCheckConfig =
+            serde_json::from_str(json!({"observability": {"enabled": false}}).to_string().as_str())
+                .unwrap();
+        assert!(!health.observability.enabled);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use arkflow_core::cli::Cli;
 use arkflow_core::engine::Engine;
 use arkflow_plugin::initialize;
-use arkflow_server::{agent, serve, ServerConfig};
+use arkflow_server::{agent, serve, serve_observability, ServerConfig};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -29,11 +29,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     arkflow_core::cli::init_logging(&config);
     let engine = Engine::new(config.clone());
     let cancellation = CancellationToken::new();
+    let server_config = ServerConfig::from_engine(&config);
     let agent_config = agent::NodeAgentConfig::from_engine(&config);
+    // The observability listener is skipped only when this very process also
+    // serves the control-plane API router, which already exposes the same
+    // endpoints under the server address.
+    let local_api_server = agent_config.is_none() && server_config.enabled;
     let server_task = if agent_config.is_none() {
         Some(tokio::spawn(serve(
             engine.control_plane(),
-            ServerConfig::from_engine(&config),
+            server_config.clone(),
+            cancellation.clone(),
+        )))
+    } else {
+        None
+    };
+    let observability_task = if !local_api_server {
+        Some(tokio::spawn(serve_observability(
+            engine.control_plane(),
+            server_config,
             cancellation.clone(),
         )))
     } else {
@@ -50,6 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cancellation.cancel();
     if let Some(server_task) = server_task {
         let result = server_task.await?;
+        result.map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
+    }
+    if let Some(observability_task) = observability_task {
+        let result = observability_task.await?;
         result.map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
     }
     if let Some(agent_task) = agent_task {
