@@ -331,6 +331,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
         }],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     }
 }
@@ -567,6 +568,7 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
         }],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     })
     .unwrap();
@@ -711,6 +713,7 @@ async fn multi_input_chain_preserves_every_upstream_channel() {
         }],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     let plan = JobPlan::compile(job).unwrap();
@@ -834,6 +837,7 @@ async fn multi_input_watermark_uses_the_slowest_upstream() {
         }],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     let plan = JobPlan::compile(job).unwrap();
@@ -903,6 +907,7 @@ async fn processor_failure_uses_error_output_without_receiving_successes() {
         ],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     let plan = JobPlan::compile(job).unwrap();
@@ -1458,7 +1463,7 @@ async fn partitioned_edge_routes_by_key_hash() {
         Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
     let graph = ExecutionGraphBuilder::default()
         .with_state(backend)
-        .build_subgraph(&plan, &task_ids, &adapter, &resource())
+        .build_subgraph(&plan, &task_ids, &adapter, &resource(), None)
         .unwrap_or_else(|error| panic!("build failed: {error}"));
     // Building the parallel graph with partitioned edges succeeds and each
     // agg subtask receives its own channel.
@@ -1490,6 +1495,7 @@ fn rejects_assignment_that_splits_an_edge() {
         &["source-0".to_string()],
         &adapter,
         &resource(),
+        None,
     );
     assert!(matches!(result, Err(Error::Config(message)) if message.contains("co-located")));
 }
@@ -2591,7 +2597,7 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
     let result = ExecutionGraphBuilder::default()
         .with_state(backend)
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource);
+        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None);
     assert!(
         matches!(&result, Err(Error::Config(message)) if message.contains("does not support partitioned")),
         "expected partition guard failure, got {}",
@@ -2783,6 +2789,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
             max_pending_transactions: None,
         }),
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     job.operators[0] = map_source_operator("left-source");
@@ -3833,6 +3840,7 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
         ],
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     let plan = JobPlan::compile(job).unwrap();
@@ -4087,4 +4095,534 @@ async fn pooled_control_fences_survive_rapid_barriers() {
         .expect("kernel did not stop after cancellation")
         .unwrap()
         .unwrap();
+}
+
+// ---------- remote edge graph tests (loopback full semantics) ----------
+
+/// Input that yields one batch then blocks forever, so a chain stays alive
+/// until an edge failure surfaces on its send path.
+struct OneBatchThenPendingInput {
+    delivered: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Input for OneBatchThenPendingInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        if !self.delivered.swap(true, Ordering::SeqCst) {
+            return Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                Arc::new(crate::input::NoopAck),
+            ));
+        }
+        futures::future::pending::<()>().await;
+        unreachable!("pending never resolves");
+    }
+    fn supports_partitioning(&self) -> bool {
+        true
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+fn keyed_map_operator(id: &str) -> OperatorSpec {
+    OperatorSpec {
+        id: id.into(),
+        kind: OperatorKind::Map,
+        stateful: false,
+        key_field: Some("key".into()),
+        config: serde_json::json!({}),
+    }
+}
+
+fn partitioned_edge(from: &str, to: &str) -> EdgeSpec {
+    EdgeSpec {
+        id: format!("{from}-{to}"),
+        from: from.into(),
+        to: to.into(),
+        partitioned: true,
+    }
+}
+
+fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
+    // source → (keyed) map → sink, parallelism 2; the source→map edge is
+    // partitioned so remote subtasks exercise key-group routing.
+    let spec = crate::job::JobSpec {
+        id: crate::job::JobId::new("remote-job").unwrap(),
+        version: crate::job::JobVersion(1),
+        max_parallelism: 2,
+        parallelism: 2,
+        operators: vec![
+            OperatorSpec {
+                id: "source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            keyed_map_operator("map"),
+            OperatorSpec {
+                id: "sink".into(),
+                kind: OperatorKind::Sink,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+        ],
+        edges: vec![
+            if partitioned {
+                partitioned_edge("source", "map")
+            } else {
+                edge("source", "map")
+            },
+            edge("map", "sink"),
+        ],
+        sources: vec![crate::job::SourceSpec {
+            operator_id: "source".into(),
+            input_type: "vec".into(),
+            config: serde_json::json!({}),
+            time: crate::job::TimeSpec {
+                mode: crate::job::TimeMode::ProcessingTime,
+                timestamp_field: None,
+                watermark: None,
+                allowed_lateness_ms: 0,
+                late_event_policy: Default::default(),
+                late_event_route: None,
+            },
+        }],
+        sinks: vec![crate::job::SinkSpec {
+            operator_id: "sink".into(),
+            output_type: "collect".into(),
+            config: serde_json::json!({}),
+        }],
+        state: None,
+        checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
+        recovery: Default::default(),
+        ..spec(vec![], vec![], 2)
+    };
+    crate::job::JobPlan::compile(spec).unwrap()
+}
+
+fn task_nodes() -> BTreeMap<String, String> {
+    [
+        ("source-0", "node-a"),
+        ("source-1", "node-a"),
+        ("map-0", "node-b"),
+        ("map-1", "node-b"),
+        ("sink-0", "node-b"),
+        ("sink-1", "node-b"),
+    ]
+    .into_iter()
+    .map(|(task, node)| (task.to_string(), node.to_string()))
+    .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_graph_routes_data_across_nodes() {
+    let plan = remote_job_plan(true);
+    let manager_a = crate::executor::remote::NetworkManager::new(1024);
+    let manager_b = crate::executor::remote::NetworkManager::new(1024);
+    manager_a.spawn();
+    manager_b.spawn();
+    let port = manager_b
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let collector = Arc::new(CollectOutput::default());
+    let adapter_b = Adapter {
+        input: Arc::new(VecInput::new(vec![])),
+        output: collector.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let adapter_a = Adapter {
+        input: Arc::new(VecInput::new(vec![
+            vec![(1, "a".into()), (2, "b".into())],
+            vec![(3, "a".into()), (4, "b".into())],
+        ])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+
+    let context_a = crate::executor::graph::RemoteEdgeContext {
+        local_node: "node-a".into(),
+        task_nodes: task_nodes(),
+        node_addrs: BTreeMap::from([(
+            "node-b".to_string(),
+            format!("127.0.0.1:{port}").parse().unwrap(),
+        )]),
+        manager: manager_a.clone(),
+    };
+    let context_b = crate::executor::graph::RemoteEdgeContext {
+        local_node: "node-b".into(),
+        task_nodes: task_nodes(),
+        node_addrs: BTreeMap::new(),
+        manager: manager_b.clone(),
+    };
+
+    let graph_a = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string(), "source-1".to_string()],
+            &adapter_a,
+            &resource(),
+            Some(&context_a),
+        )
+        .unwrap_or_else(|error| panic!("node A build failed: {error}"));
+    let graph_b = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &[
+                "map-0".to_string(),
+                "map-1".to_string(),
+                "sink-0".to_string(),
+                "sink-1".to_string(),
+            ],
+            &adapter_b,
+            &resource(),
+            Some(&context_b),
+        )
+        .unwrap_or_else(|error| panic!("node B build failed: {error}"));
+
+    let cancellation_a = CancellationToken::new();
+    let cancellation_b = CancellationToken::new();
+    let run_a = tokio::spawn(run_graph(graph_a, cancellation_a.clone()));
+    let run_b = tokio::spawn(run_graph(graph_b, cancellation_b.clone()));
+
+    // Every row routed by key to some remote map subtask and collected by a
+    // sink; the broadcast edge duplicates each delivery to both sinks.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows: usize = collector
+                .written
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+            if rows >= 8 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("remote rows never arrived");
+
+    cancellation_a.cancel();
+    cancellation_b.cancel();
+    tokio::time::timeout(Duration::from_secs(5), run_a)
+        .await
+        .expect("graph A did not stop")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), run_b)
+        .await
+        .expect("graph B did not stop")
+        .unwrap()
+        .unwrap();
+    manager_a.shutdown();
+    manager_b.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_graph_fails_closed_when_downstream_unreachable() {
+    let plan = remote_job_plan(false);
+    let manager_a = crate::executor::remote::NetworkManager::new(1024);
+    manager_a.spawn();
+
+    // Point node B's data plane at a closed port: connect retries exhaust and
+    // the source chain's send path fails closed.
+    let context_a = crate::executor::graph::RemoteEdgeContext {
+        local_node: "node-a".into(),
+        task_nodes: task_nodes(),
+        node_addrs: BTreeMap::from([(
+            "node-b".to_string(),
+            "127.0.0.1:1".parse().unwrap(),
+        )]),
+        manager: manager_a.clone(),
+    };
+    let adapter_a = Adapter {
+        input: Arc::new(OneBatchThenPendingInput {
+            delivered: std::sync::atomic::AtomicBool::new(false),
+        }),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph_a = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string(), "source-1".to_string()],
+            &adapter_a,
+            &resource(),
+            Some(&context_a),
+        )
+        .unwrap_or_else(|error| panic!("node A build failed: {error}"));
+
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph_a, cancellation.clone()));
+    let result = tokio::time::timeout(Duration::from_secs(15), runner)
+        .await
+        .expect("graph kept running despite a dead remote edge")
+        .unwrap();
+    assert!(result.is_err(), "expected the source chain to fail closed");
+    cancellation.cancel();
+    manager_a.shutdown();
+}
+
+// ---------- openspec verification round: scenario coverage ----------
+
+/// Scenario "多输入顶点跨远程边对齐" + "控制元素到达全部副本" at graph level:
+/// every map chain has TWO remote inputs (source-0/source-1 quads); barriers
+/// injected staggered across those inputs must align inside the chain (buffer
+/// the lagging input's pre-barrier data), snapshot, and release — exactly the
+/// `Aligner` contract, exercised through real remote edges. Barriers reach
+/// BOTH map subtasks (all replicas of the partitioned edge).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
+    let plan = remote_job_plan(true);
+    let manager_a = crate::executor::remote::NetworkManager::new(64);
+    let manager_b = crate::executor::remote::NetworkManager::new(1024);
+    manager_a.spawn();
+    manager_b.spawn();
+    let port = manager_b
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let collector = Arc::new(CollectOutput::default());
+    let adapter_b = Adapter {
+        input: Arc::new(VecInput::new(vec![])),
+        output: collector.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let context_b = crate::executor::graph::RemoteEdgeContext {
+        local_node: "node-b".into(),
+        task_nodes: task_nodes(),
+        node_addrs: BTreeMap::new(),
+        manager: manager_b.clone(),
+    };
+    let graph_b = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &[
+                "map-0".to_string(),
+                "map-1".to_string(),
+                "sink-0".to_string(),
+                "sink-1".to_string(),
+            ],
+            &adapter_b,
+            &resource(),
+            Some(&context_b),
+        )
+        .unwrap_or_else(|error| panic!("node B build failed: {error}"));
+
+    let (snapshot_tx, mut snapshot_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::executor::barrier::ChainSnapshot>();
+    let mut hooks = BTreeMap::new();
+    for entry in ["map-0", "map-1"] {
+        hooks.insert(
+            entry.to_string(),
+            crate::executor::task::CheckpointHook {
+                reporter: Some(snapshot_tx.clone()),
+                task_id: Some(entry.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph_with_hooks(
+        graph_b,
+        cancellation.clone(),
+        hooks,
+    ));
+
+    // One edge per (source subtask → map subtask) quad, over real TCP.
+    let transport = || {
+        std::sync::Arc::new(crate::executor::remote::TcpEdgeTransport {
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            max_attempts: 5,
+        }) as std::sync::Arc<dyn crate::executor::remote::EdgeTransport>
+    };
+    // Derive quad routing ids the same way the graph builder does — the
+    // spec's `operators` list also carries source/sink entries, so positions
+    // are not the obvious 0/1.
+    let routing = crate::executor::graph::operator_routing_index(&plan);
+    let source_op = routing["source"];
+    let map_op = routing["map"];
+    let quad = move |src: u32, dst: u32| crate::executor::remote::Quad {
+        src_op: source_op,
+        src_subtask: src,
+        dst_op: map_op,
+        dst_subtask: dst,
+    };
+    let edges = [
+        manager_a.open_edge_deferred(transport(), quad(0, 0)),
+        manager_a.open_edge_deferred(transport(), quad(1, 0)),
+        manager_a.open_edge_deferred(transport(), quad(0, 1)),
+        manager_a.open_edge_deferred(transport(), quad(1, 1)),
+    ];
+
+    let barrier = |checkpoint: &str| {
+        Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: checkpoint.into(),
+            generation: 3,
+        })
+    };
+    let data = |value: i64, key: &str| {
+        Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(value, key.into())]))),
+            Arc::new(crate::input::NoopAck),
+        )
+    };
+
+    // Stagger: map-0's first input gets its barrier early, its second input
+    // delivers pre-barrier data first — the aligner must hold that data until
+    // the second barrier lands. map-1 receives everything after.
+    edges[0].sender.send_async(data(1, "a")).await.unwrap();
+    edges[0].sender.send_async(barrier("c-9")).await.unwrap();
+    edges[1].sender.send_async(data(2, "b")).await.unwrap();
+    edges[1].sender.send_async(data(3, "a")).await.unwrap();
+    edges[1].sender.send_async(barrier("c-9")).await.unwrap();
+    edges[2].sender.send_async(data(4, "b")).await.unwrap();
+    edges[2].sender.send_async(barrier("c-9")).await.unwrap();
+    edges[3].sender.send_async(data(5, "a")).await.unwrap();
+    edges[3].sender.send_async(barrier("c-9")).await.unwrap();
+
+    // Both map replicas report the aligned snapshot for c-9.
+    let mut reported = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while reported.len() < 2 {
+        let snapshot = match tokio::time::timeout_at(deadline, snapshot_rx.recv()).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => panic!("reporter channel closed early"),
+            Err(_) => panic!("snapshot within timeout"),
+        };
+        assert_eq!(snapshot.barrier.checkpoint_id, "c-9");
+        reported.insert(snapshot.task_id.clone(), snapshot.barrier.generation);
+    }
+    assert_eq!(
+        reported.keys().collect::<Vec<_>>(),
+        vec!["map-0", "map-1"],
+        "both replicas of the partitioned edge observed the barrier"
+    );
+
+    // All five rows survive alignment and land in both sinks (broadcast).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows: usize = collector
+                .written
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+            if rows >= 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("aligned rows never arrived");
+
+    // End the job the production way: the peer stops and forwards Eos on
+    // every quad. Chains observe Eos on ALL remote inputs and finish cleanly
+    // (also pins Eos propagation across remote edges); the cancellation drain
+    // path, by contrast, waits for channel closure and only completes once
+    // the peer's Eos or connection death closes the inbound senders — a
+    // stop-ordering property recorded in the design's as-built notes.
+    for edge in &edges {
+        edge.sender.send_async(Envelope::Eos).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("graph did not finish after Eos")
+        .unwrap()
+        .unwrap();
+    manager_a.shutdown();
+    manager_b.shutdown();
+}
+
+/// Scenario "下游处理失败靠超时发现": a processing failure drops the delivered
+/// envelope's acknowledgement without ack or abort (the kernel's error path).
+/// The upstream fan-out branch must stay pending — no spurious completion, no
+/// immediate failure; discovery belongs to the source chain's barrier drain
+/// timeout, whose fail-closed behavior the kernel's local-ack tests already
+/// pin (the remote branch is just another `Arc<dyn Ack>` to that machinery).
+#[tokio::test(flavor = "multi_thread")]
+async fn downstream_processing_failure_keeps_upstream_branch_pending() {
+    let quad = crate::executor::remote::Quad {
+        src_op: 0,
+        src_subtask: 0,
+        dst_op: 1,
+        dst_subtask: 0,
+    };
+    let upstream = crate::executor::remote::NetworkManager::new(64);
+    let downstream = crate::executor::remote::NetworkManager::new(64);
+    upstream.spawn();
+    downstream.spawn();
+
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(64);
+    downstream.register_inbound(quad, input_tx);
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    downstream.accept_stream(Box::new(server_side));
+    let edge = upstream.open_edge_with_stream(Box::new(client_side), quad);
+
+    // A counting ack so "pending" is observable.
+    #[derive(Default)]
+    struct NeverAck {
+        acked: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Ack for NeverAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let branch = Arc::new(NeverAck::default());
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+            branch.clone(),
+        ))
+        .await
+        .expect("send");
+
+    let received = tokio::time::timeout(Duration::from_secs(5), input_rx.recv_async())
+        .await
+        .expect("delivery within timeout")
+        .expect("channel open");
+    let Envelope::Data(_batch, dropped_ack) = received else {
+        panic!("expected data");
+    };
+    // Processing failure: the envelope is consumed and its ack is dropped
+    // without ack() or abort().
+    drop(dropped_ack);
+
+    // The branch stays pending: no receipt will ever arrive for it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !branch.acked.load(Ordering::SeqCst),
+        "a dropped (failed) downstream acknowledgement must never complete the upstream branch"
+    );
+    // And nothing failed on the manager yet — discovery is drain-timeout
+    // domain, not edge-failure domain.
+    assert!(
+        upstream
+            .failure_receiver()
+            .try_recv()
+            .err()
+            .is_some_and(|error| matches!(error, flume::TryRecvError::Empty)),
+        "no edge failure may be reported for a processing-level failure"
+    );
+
+    upstream.shutdown();
+    downstream.shutdown();
 }

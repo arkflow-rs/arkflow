@@ -46,12 +46,33 @@ pub struct NodeAgentConfig {
     pub heartbeat_interval: Duration,
     pub report_interval: Duration,
     pub poll_interval: Duration,
+    /// Data-plane listen port. `Some` enables the cross-node shuffle data
+    /// plane and advertises the `network_shuffle` capability to the Hub;
+    /// placement continues to keep every edge co-located until the Hub
+    /// learns to split them, so the default (`None`) stays byte-compatible.
+    pub data_port: Option<u16>,
+    /// Routable host advertised to peers for the data plane. Required for
+    /// split placement; without it the node stays colocated-only.
+    pub data_host: Option<String>,
+}
+
+/// Split-placement context carried by the Hub's job_start payload.
+#[derive(Clone, Default)]
+struct SplitPlacementPayload {
+    /// Full task→node mapping for the Job (remote peers must be nameable).
+    task_nodes: Option<BTreeMap<String, String>>,
+    /// Peer node → advertised data-plane address.
+    node_data_ports: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Default)]
 struct JobRuntime {
     tasks: Arc<Mutex<BTreeMap<String, JobTask>>>,
     starts: Arc<Mutex<()>>,
+    /// Cross-node shuffle data plane. `None` keeps the legacy co-location
+    /// contract: every edge is materialized in-process and no data port
+    /// listens.
+    data_plane: Option<Arc<arkflow_core::executor::remote::NetworkManager>>,
     /// Finished-task observations whose delivery to the Hub failed. They are
     /// retried by the next session; dropping them would leave the Hub
     /// reporting a dead job as running forever (the start operation stays
@@ -418,6 +439,7 @@ impl JobRuntime {
         recovery_id: Option<String>,
         recovery_savepoint: bool,
         node_id: &str,
+        split: &SplitPlacementPayload,
     ) -> Result<(), String> {
         let _start_guard = self.starts.lock().await;
         let job_id = plan.spec.id.to_string();
@@ -617,12 +639,53 @@ impl JobRuntime {
         // Spawn the Job on the unified kernel: the same plan, adapter and
         // state backend drive pipelined chain execution, and the handle backs
         // command-driven checkpoints.
+        // Remote-edge wiring: only when this node runs a data plane AND the
+        // Hub command advertised peers' data ports. Otherwise (the default)
+        // the co-location contract holds and the build keeps local edges.
+        let remote_context = self.data_plane.as_ref().and_then(|manager| {
+            if split.node_data_ports.is_empty() {
+                return None;
+            }
+            let mut node_addrs = BTreeMap::new();
+            for (node, addr) in &split.node_data_ports {
+                match addr.parse::<std::net::SocketAddr>() {
+                    Ok(parsed) => {
+                        node_addrs.insert(node.clone(), parsed);
+                    }
+                    Err(error) => {
+                        warn!(%node, %addr, %error, "ignoring malformed peer data-plane address");
+                    }
+                }
+            }
+            // The Hub's split dispatch carries the FULL task→node map; the
+            // per-node assignment subset alone cannot name remote peers.
+            let task_nodes = match split.task_nodes.clone() {
+                Some(task_nodes) => task_nodes,
+                None => {
+                    warn!(
+                        node_id = %node_id,
+                        "split dispatch without a full task→node map;                          deriving remote peers from the local assignment only"
+                    );
+                    assignments
+                        .iter()
+                        .map(|assignment| (assignment.task_id.clone(), assignment.node_id.clone()))
+                        .collect()
+                }
+            };
+            Some(arkflow_core::executor::graph::RemoteEdgeContext {
+                local_node: node_id.to_string(),
+                task_nodes,
+                node_addrs,
+                manager: manager.clone(),
+            })
+        });
         let spawn_result = spawn_kernel_job(
             &plan,
             &task_ids,
             state.clone(),
             recovery.as_ref(),
             cancellation.clone(),
+            remote_context.as_ref(),
         )
         .await;
         let kernel = match spawn_result {
@@ -1052,6 +1115,7 @@ async fn spawn_kernel_job(
     state: Arc<dyn StateBackend>,
     recovery: Option<&RecoveryPlan>,
     cancellation: CancellationToken,
+    remote: Option<&arkflow_core::executor::graph::RemoteEdgeContext>,
 ) -> Result<arkflow_core::executor::kernel_handle::KernelJobHandle, String> {
     let mut resource = Resource {
         temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
@@ -1059,7 +1123,7 @@ async fn spawn_kernel_job(
     };
     let mut graph = arkflow_core::executor::graph::ExecutionGraphBuilder::default()
         .with_state(state.clone())
-        .build_subgraph(plan, task_ids, &RegistryJobAdapter, &mut resource)
+        .build_subgraph(plan, task_ids, &RegistryJobAdapter, &mut resource, remote)
         .map_err(|error| error.to_string())?;
     // The graph builder constructs temporary resources through `Resource`;
     // transfer those instances into the unified graph so the resource guard
@@ -1379,8 +1443,26 @@ impl NodeAgentConfig {
             heartbeat_interval: Duration::from_millis(ttl / 3),
             report_interval: Duration::from_secs(2),
             poll_interval: Duration::from_secs(1),
+            data_port: config.health_check.data_port,
+            data_host: config.health_check.data_host.clone(),
         })
     }
+}
+
+/// Node capabilities advertised at registration and refreshed by heartbeats.
+fn agent_capabilities(network_shuffle: bool) -> Vec<String> {
+    let mut capabilities = vec![
+        "stream_lifecycle".to_string(),
+        "configuration".to_string(),
+        "metrics".to_string(),
+        "job_runtime".to_string(),
+        "state_backend".to_string(),
+        "checkpoint_recovery".to_string(),
+    ];
+    if network_shuffle {
+        capabilities.push("network_shuffle".to_string());
+    }
+    capabilities
 }
 
 pub async fn run(
@@ -1391,13 +1473,53 @@ pub async fn run(
     let client = build_agent_client(&config.hub_url)?;
     let mut backoff = Duration::from_millis(250);
     let mut completed_commands = CompletedCommandCache::new(1024);
-    let job_runtime = JobRuntime::default();
+    let mut job_runtime = JobRuntime::default();
+    // Cross-node shuffle data plane: one listener per Agent process. A bind
+    // failure degrades to the co-location contract (warn, no listener) rather
+    // than blocking node startup — observability and placement still work.
+    let mut data_address: Option<String> = None;
+    if let Some(port) = config.data_port {
+        let manager = arkflow_core::executor::remote::NetworkManager::new(1024);
+        manager.spawn();
+        match manager
+            .bind_tcp(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+            .await
+        {
+            Ok(bound) => {
+                data_address = config
+                    .data_host
+                    .as_ref()
+                    .map(|host| format!("{host}:{bound}"));
+                match &data_address {
+                    Some(address) => info!(
+                        node_id = %config.node_id,
+                        %address,
+                        "Network shuffle data plane listening"
+                    ),
+                    None => warn!(
+                        node_id = %config.node_id,
+                        port = bound,
+                        "data plane bound without data_host; the node stays colocated-only"
+                    ),
+                }
+                job_runtime.data_plane = Some(manager);
+            }
+            Err(error) => {
+                manager.shutdown();
+                warn!(node_id = %config.node_id, %error, "data plane bind failed; running without network shuffle");
+            }
+        }
+    }
+    let network_shuffle = job_runtime.data_plane.is_some();
     loop {
         if cancellation.is_cancelled() {
             job_runtime.stop_all().await;
+            if let Some(manager) = &job_runtime.data_plane {
+                manager.shutdown();
+            }
             return Ok(());
         }
-        match register(&client, &config).await {
+        match register(&client, &config, data_address.clone()).await {
             Ok(session) => {
                 info!(node_id = %config.node_id, hub = %config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
@@ -1409,6 +1531,7 @@ pub async fn run(
                     cancellation.clone(),
                     &mut completed_commands,
                     job_runtime.clone(),
+                    network_shuffle,
                 )
                 .await
                 {
@@ -1422,6 +1545,9 @@ pub async fn run(
         tokio::select! {
             _ = cancellation.cancelled() => {
                 job_runtime.stop_all().await;
+                if let Some(manager) = &job_runtime.data_plane {
+                    manager.shutdown();
+                }
                 return Ok(())
             },
             _ = tokio::time::sleep(jittered_backoff(backoff)) => {}
@@ -1501,6 +1627,7 @@ async fn await_previous_teardown(
 async fn register(
     client: &Client,
     config: &NodeAgentConfig,
+    data_address: Option<String>,
 ) -> Result<RegisterResponse, reqwest::Error> {
     client
         .post(format!(
@@ -1511,15 +1638,11 @@ async fn register(
             node_id: config.node_id.clone(),
             node_token: config.node_token.clone(),
             protocol_version: "v1".into(),
-            capabilities: vec![
-                "stream_lifecycle".into(),
-                "configuration".into(),
-                "metrics".into(),
-                "job_runtime".into(),
-                "state_backend".into(),
-                "checkpoint_recovery".into(),
-            ],
+            // data_address is Some only when the data plane actually bound —
+            // a node whose port was taken must not advertise shuffle.
+            capabilities: agent_capabilities(data_address.is_some()),
             boot_id: Some(config.boot_id.clone()),
+            data_address,
         })
         .send()
         .await?
@@ -1536,6 +1659,7 @@ async fn run_session(
     cancellation: CancellationToken,
     completed_commands: &mut CompletedCommandCache,
     job_runtime: JobRuntime,
+    network_shuffle: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
         node_id: config.node_id.clone(),
@@ -1553,7 +1677,7 @@ async fn run_session(
                 command_tasks.abort_all();
                 while command_tasks.join_next().await.is_some() {}
                 job_runtime.stop_all().await;
-                let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await;
+                let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await;
                 return Ok(())
             },
             joined = command_tasks.join_next(), if !command_tasks.is_empty() => {
@@ -1576,8 +1700,8 @@ async fn run_session(
                     None => {}
                 }
             },
-            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: vec!["stream_lifecycle".into(), "configuration".into(), "metrics".into(), "job_runtime".into(), "state_backend".into(), "checkpoint_recovery".into()], rollout_id: None }).await?; }
-            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime).await).await?; }
+            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?; }
+            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime, network_shuffle).await).await?; }
             _ = poll.tick() => {
                 let finished = job_runtime.take_finished().await;
                 for (index, (job_id, generation, outcome)) in finished.iter().enumerate() {
@@ -1650,6 +1774,7 @@ async fn report(
     boot_id: &str,
     report_seq: u64,
     job_runtime: &JobRuntime,
+    network_shuffle: bool,
 ) -> NodeReport {
     let streams = cp.runtime_manager().snapshots().await;
     let configuration_version = cp
@@ -1695,14 +1820,7 @@ async fn report(
         } else {
             "starting".into()
         },
-        capabilities: vec![
-            "stream_lifecycle".into(),
-            "configuration".into(),
-            "metrics".into(),
-            "job_runtime".into(),
-            "state_backend".into(),
-            "checkpoint_recovery".into(),
-        ],
+        capabilities: agent_capabilities(network_shuffle),
         streams,
         operations: cp.operations().await,
         events: cp.events().await,
@@ -2072,6 +2190,15 @@ async fn execute_job_operation(
             )
             .map_err(|error| error.to_string())?;
             let (recovery_id, recovery_savepoint) = parse_recovery_payload(payload)?;
+            let split = SplitPlacementPayload {
+                task_nodes: payload
+                    .get("task_nodes")
+                    .and_then(|nodes| serde_json::from_value::<BTreeMap<String, String>>(nodes.clone()).ok()),
+                node_data_ports: payload
+                    .get("node_data_ports")
+                    .and_then(|ports| serde_json::from_value::<BTreeMap<String, String>>(ports.clone()).ok())
+                    .unwrap_or_default(),
+            };
             if command.operation == "job_restart" {
                 job_runtime
                     .stop(&command.resource_id, command.generation)
@@ -2085,6 +2212,7 @@ async fn execute_job_operation(
                     recovery_id,
                     recovery_savepoint,
                     &config.node_id,
+                    &split,
                 )
                 .await?;
             Ok(None)
@@ -2437,12 +2565,14 @@ mod tests {
         }))
         .unwrap();
         let plan = arkflow_core::job::JobPlan::compile(spec).unwrap();
-        let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .expect("colocated placement succeeds");
         assert!(!assignments.is_empty());
         let spawn_runtime = runtime.clone();
         let start_task = tokio::spawn(async move {
             spawn_runtime
-                .start(plan, assignments, 1, None, false, "node-a")
+                .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
                 .await
         });
         // Registration-first: observe the entry as early as possible.
@@ -2493,9 +2623,11 @@ mod tests {
             }))
             .unwrap();
             let plan = arkflow_core::job::JobPlan::compile(spec).unwrap();
-            let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+            let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .expect("colocated placement succeeds");
             spawn_runtime
-                .start(plan, assignments, 2, None, false, "node-a")
+                .start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default())
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), restart)
@@ -2551,7 +2683,9 @@ mod tests {
         }))
         .unwrap();
         let plan = JobPlan::compile(spec).unwrap();
-        let assignments = plan.assignments_for_nodes(&["node-a".to_string()], 1);
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .expect("colocated placement succeeds");
         assert!(!assignments.is_empty());
         (plan, assignments)
     }
@@ -2612,7 +2746,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 1, None, false, "node-a"),
+            runtime.start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default()),
         )
         .await
         .expect("the replacement start must not hang");
@@ -2647,7 +2781,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 2, None, false, "node-a"),
+            runtime.start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default()),
         )
         .await
         .expect("the replacing start must not hang");
@@ -2676,7 +2810,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 2, None, false, "node-a"),
+            runtime.start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default()),
         )
         .await
         .expect("the replacing start must not hang");
@@ -2703,14 +2837,14 @@ mod tests {
         let runtime = Arc::new(JobRuntime::default());
         let (plan, assignments) = replacement_test_plan("orders-idem").await;
         runtime
-            .start(plan, assignments, 1, None, false, "node-a")
+            .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
             .await
             .expect("the initial start succeeds");
         let started_at = std::time::Instant::now();
 
         let (plan, assignments) = replacement_test_plan("orders-idem").await;
         runtime
-            .start(plan, assignments, 1, None, false, "node-a")
+            .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
             .await
             .expect("the re-delivered same-generation start is a no-op success");
 
@@ -2748,6 +2882,42 @@ mod tests {
         let agent = NodeAgentConfig::from_engine(&config).unwrap();
         assert_eq!(agent.node_id, "node-a");
         assert_eq!(agent.api_prefix, "/api/v1");
+    }
+
+    /// The data-plane port rides the health-check config into the agent and
+    /// flips the `network_shuffle` capability; absent (the default) keeps the
+    /// co-location contract and never advertises shuffle.
+    #[test]
+    fn data_plane_port_flows_from_config_into_capabilities() {
+        let base = agent_capabilities(false);
+        let shuffle = agent_capabilities(true);
+        assert!(!base.contains(&"network_shuffle".to_string()));
+        assert_eq!(shuffle.len(), base.len() + 1);
+        assert!(shuffle.contains(&"network_shuffle".to_string()));
+
+        let mut health = HealthCheckConfig {
+            hub_url: Some("http://hub".into()),
+            node_id: Some("node-a".into()),
+            ..Default::default()
+        };
+        let config = EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: health.clone(),
+        };
+        let agent = NodeAgentConfig::from_engine(&config).unwrap();
+        assert_eq!(agent.data_port, None);
+
+        health.data_port = Some(9501);
+        let config = EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: health,
+        };
+        let agent = NodeAgentConfig::from_engine(&config).unwrap();
+        assert_eq!(agent.data_port, Some(9501));
     }
 
     #[test]
@@ -2868,9 +3038,11 @@ mod tests {
             hub_url: "http://hub".into(),
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
+            data_host: None,
             node_token: "token".into(),
             boot_id: "boot-1".into(),
             heartbeat_interval: Duration::from_secs(5),
+            data_port: None,
             report_interval: Duration::from_secs(5),
             poll_interval: Duration::from_secs(5),
         };

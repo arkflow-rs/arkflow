@@ -84,6 +84,10 @@ pub struct RegisterRequest {
     /// does not look like a process restart to report/reconciliation logic.
     #[serde(default)]
     pub boot_id: Option<String>,
+    /// Advertised cross-node data-plane address ("host:port"). Present only
+    /// on nodes running the network shuffle data plane.
+    #[serde(default)]
+    pub data_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +177,9 @@ pub struct HubNode {
     pub streams_failed: usize,
     #[serde(default)]
     pub maintenance_state: NodeMaintenanceState,
+    /// Advertised cross-node data-plane address ("host:port").
+    #[serde(default)]
+    pub data_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,7 +941,50 @@ impl Hub {
                 }
             }
         }
-        let assignments = plan.assignments_for_nodes(&targets, job.generation);
+        let assignments = plan
+            .assignments_for_nodes(&targets, job.generation)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Split placement: validate that every target node runs the data
+        // plane, then attach the full task→node map and peer data addresses
+        // so each node's graph build can wire its remote edges without any
+        // further lookup.
+        let mut split_payload = None;
+        if spec.placement == arkflow_core::job::PlacementStrategy::Split {
+            let nodes = self.nodes.read().await;
+            let mut node_data_ports = BTreeMap::new();
+            for node_id in &targets {
+                let Some(record) = nodes.get(node_id) else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement target node '{node_id}' is not registered"
+                    )));
+                };
+                if !record
+                    .resource
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "network_shuffle")
+                {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' with the network_shuffle capability"
+                    )));
+                }
+                let Some(address) = &record.resource.data_address else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' to advertise a data address"
+                    )));
+                };
+                node_data_ports.insert(node_id.clone(), address.clone());
+            }
+            drop(nodes);
+            let mut task_nodes = BTreeMap::new();
+            for assignment in &assignments {
+                task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
+            }
+            split_payload = Some(serde_json::json!({
+                "task_nodes": task_nodes,
+                "node_data_ports": node_data_ports,
+            }));
+        }
         let explicit_recovery_id = job.checkpoint_id.clone();
         let mut recovery_candidates = self
             .job_checkpoints(&job.job_id)
@@ -1001,14 +1051,22 @@ impl Hub {
             if operation == "job_start" && node_assignments.is_empty() {
                 continue;
             }
-            let payload = Some(serde_json::json!({
+            let mut payload_value = serde_json::json!({
                 "job_id": job.job_id,
                 "spec": spec,
                 "plan": plan,
                 "assignments": node_assignments,
                 "generation": job.generation,
                 "recovery": recovery,
-            }));
+            });
+            if let (Some(base), Some(extra)) =
+                (payload_value.as_object_mut(), split_payload.as_ref().and_then(|extra| extra.as_object()))
+            {
+                for (key, value) in extra {
+                    base.insert(key.clone(), value.clone());
+                }
+            }
+            let payload = Some(payload_value);
             self.enqueue_with_metadata(
                 node_id,
                 operation.into(),
@@ -1342,7 +1400,9 @@ impl Hub {
             })
             .collect::<Vec<_>>();
         drop(nodes);
-        let assignments = plan.assignments_for_nodes(&targets, job.generation);
+        let assignments = plan
+            .assignments_for_nodes(&targets, job.generation)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
         let operation = if record.kind == "savepoint" {
             "job_savepoint"
         } else {
@@ -2219,6 +2279,7 @@ impl Hub {
             streams_running: 0,
             streams_failed: 0,
             maintenance_state: NodeMaintenanceState::Active,
+            data_address: request.data_address.clone().filter(|address| !address.trim().is_empty()),
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
@@ -3510,7 +3571,9 @@ impl Hub {
         } else {
             job.node_ids.clone()
         };
-        let assignments = plan.assignments_for_nodes(&candidates, operation.generation);
+        let assignments = plan
+            .assignments_for_nodes(&candidates, operation.generation)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
         let expected_nodes = assignments
             .iter()
             .map(|assignment| assignment.node_id.clone())
@@ -5028,6 +5091,7 @@ mod tests {
         for node_id in ["node-a", "node-b", "node-c"] {
             let session = hub
                 .register(RegisterRequest {
+                    data_address: None,
                     node_id: node_id.into(),
                     node_token: "node-secret".into(),
                     protocol_version: "v1".into(),
@@ -5056,6 +5120,7 @@ mod tests {
         // value.
         let re_registered = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5077,6 +5142,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage.clone());
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5135,6 +5201,7 @@ mod tests {
         // reconnects before the reconciler retries.
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5165,6 +5232,7 @@ mod tests {
         let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
         let session = hub1
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5234,6 +5302,7 @@ mod tests {
 
         let session2 = hub2
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5284,6 +5353,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage);
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5369,6 +5439,7 @@ mod tests {
         let hub = Hub::new(config());
         for node_id in ["node-a", "node-b"] {
             hub.register(RegisterRequest {
+                data_address: None,
                 node_id: node_id.into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -5621,6 +5692,7 @@ mod tests {
     async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
         let hub = Hub::new(config());
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "node-a".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -5686,6 +5758,7 @@ mod tests {
             .resource
             .lease_expires_at_ms = now_ms();
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "node-b".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -5927,6 +6000,7 @@ mod tests {
 
         let hub2 = Hub::with_storage(config(), storage);
         hub2.register(RegisterRequest {
+            data_address: None,
             node_id: "node-a".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -6034,6 +6108,7 @@ mod tests {
         let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
         for node_id in ["node-a", "node-b"] {
             hub.register(RegisterRequest {
+                data_address: None,
                 node_id: node_id.into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6083,6 +6158,7 @@ mod tests {
         let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6155,6 +6231,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage.clone());
         let node_a = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6164,6 +6241,7 @@ mod tests {
             .await
             .unwrap();
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "node-b".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -6350,6 +6428,7 @@ mod tests {
         for node_id in ["agent-a", "agent-b"] {
             let session = hub
                 .register(RegisterRequest {
+                    data_address: None,
                     node_id: node_id.into(),
                     node_token: "node-secret".into(),
                     protocol_version: "v1".into(),
@@ -6437,6 +6516,7 @@ mod tests {
         let hub1 = Hub::with_storage(config(), storage.clone());
         let session1 = hub1
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6471,6 +6551,7 @@ mod tests {
         let hub2 = Hub::with_storage(config(), storage);
         let session2 = hub2
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6517,6 +6598,7 @@ mod tests {
         let hub = Hub::new(config());
         assert!(matches!(
             hub.register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "bad".into(),
                 protocol_version: "v1".into(),
@@ -6528,6 +6610,7 @@ mod tests {
         ));
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6620,6 +6703,7 @@ mod tests {
         });
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6661,6 +6745,7 @@ mod tests {
         let hub = Hub::new(config());
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6701,6 +6786,7 @@ mod tests {
         for node_id in ["node-a", "node-b"] {
             let session = hub
                 .register(RegisterRequest {
+                    data_address: None,
                     node_id: node_id.into(),
                     node_token: "node-secret".into(),
                     protocol_version: "v1".into(),
@@ -6761,6 +6847,7 @@ mod tests {
         for node_id in ["n1", "n2"] {
             let session = hub
                 .register(RegisterRequest {
+                    data_address: None,
                     node_id: node_id.into(),
                     node_token: "node-secret".into(),
                     protocol_version: "v1".into(),
@@ -6821,6 +6908,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage.clone());
         assert!(matches!(
             hub.register(RegisterRequest {
+                data_address: None,
                 node_id: "incompatible".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v0".into(),
@@ -6836,6 +6924,7 @@ mod tests {
             Some("incompatible_protocol")
         );
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "n1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -6863,6 +6952,7 @@ mod tests {
         let hub = Hub::new(config());
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -6922,6 +7012,7 @@ mod tests {
         let hub = Hub::with_storage(config(), crate::storage::StorageActor::start(store, 8));
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7000,6 +7091,7 @@ mod tests {
         let hub = Hub::new(config());
         let first = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7010,6 +7102,7 @@ mod tests {
             .unwrap();
         let second = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7054,6 +7147,7 @@ mod tests {
     async fn command_queues_are_bounded_and_isolated_per_node() {
         let hub = Hub::new(config());
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "n1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -7064,6 +7158,7 @@ mod tests {
         .unwrap();
         let n2_session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n2".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7239,6 +7334,7 @@ mod tests {
         let hub = Hub::new(config());
         let registration = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7469,6 +7565,7 @@ mod tests {
         // instead of treating the absent local Job as already running.
         let restarted = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7502,6 +7599,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage);
         let node_a = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7512,6 +7610,7 @@ mod tests {
             .unwrap();
         let node_b = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-2".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7708,6 +7807,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage);
         let node_a = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7718,6 +7818,7 @@ mod tests {
             .unwrap();
         let node_b = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-2".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7831,6 +7932,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage);
         let registration = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7922,6 +8024,7 @@ mod tests {
             StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         hub1.register(RegisterRequest {
+            data_address: None,
             node_id: "compute-1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -7960,6 +8063,7 @@ mod tests {
         hub2.recover_persisted_state().await.unwrap();
         let registration = hub2
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -7996,6 +8100,7 @@ mod tests {
         let hub = Hub::with_storage(config(), storage);
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "compute-1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8271,6 +8376,7 @@ mod tests {
             StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
         let hub = Hub::with_storage(config(), storage);
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "compute-1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -8411,6 +8517,7 @@ mod session_report_tests {
         );
         let session = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8450,6 +8557,7 @@ mod session_report_tests {
         // Re-register: a fresh session identity with a fresh cursor.
         let second = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8494,6 +8602,7 @@ mod session_report_tests {
 
     async fn register_with_boot(hub: &Hub, boot_id: &str) -> RegisterResponse {
         hub.register(RegisterRequest {
+            data_address: None,
             node_id: "n1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -8608,6 +8717,7 @@ mod session_report_tests {
         let hub = Hub::with_storage(hub_config, StorageActor::start(store, 8));
         let registration = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "agent-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8669,6 +8779,7 @@ mod session_report_tests {
         // state survives because the boot did not change.
         let reauth = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "agent-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8690,6 +8801,7 @@ mod session_report_tests {
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         let reauth2 = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "agent-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
@@ -8816,6 +8928,7 @@ mod session_report_tests {
         let (hub, first) = registered_hub().await;
         let second = hub
             .register(RegisterRequest {
+                data_address: None,
                 node_id: "n1".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),

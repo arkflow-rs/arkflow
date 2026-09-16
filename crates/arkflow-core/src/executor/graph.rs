@@ -13,6 +13,59 @@ use std::sync::Arc;
 
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Cross-node edge wiring for `build_subgraph`. When present, placement may
+/// split an edge between this node and a peer: the split endpoints become
+/// remote network edges (see [`super::remote`]) instead of failing the build.
+/// Error and late-event side edges never split — they stay co-located by
+/// contract, and the build rejects assignments that try.
+pub struct RemoteEdgeContext {
+    /// This node's placement id.
+    pub local_node: String,
+    /// Every task of the job mapped to its assigned node (the Hub's
+    /// assignment). Local tasks must agree with the `task_ids` argument.
+    pub task_nodes: BTreeMap<String, String>,
+    /// Data-plane address of each remote node this graph reaches.
+    pub node_addrs: BTreeMap<String, std::net::SocketAddr>,
+    pub manager: std::sync::Arc<super::remote::NetworkManager>,
+}
+
+/// Deterministic routing index for quad identities: the operator's position
+/// across the spec's sources, operators, and sinks sections, with later
+/// sections overwriting earlier ones for shared operator ids. Both endpoints
+/// of a remote edge derive it from the same plan, so tests reuse this instead
+/// of hand-computing indices.
+pub fn operator_routing_index(plan: &JobPlan) -> BTreeMap<String, u32> {
+    let source_count = plan.spec.sources.len();
+    let operator_count = plan.spec.operators.len();
+    plan.spec
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.operator_id.clone(), position as u32))
+        .chain(plan.spec.operators.iter().enumerate().map(|(position, operator)| {
+            (operator.id.clone(), (source_count + position) as u32)
+        }))
+        .chain(plan.spec.sinks.iter().enumerate().map(|(position, sink)| {
+            (
+                sink.operator_id.clone(),
+                (source_count + operator_count + position) as u32,
+            )
+        }))
+        .collect()
+}
+
+impl RemoteEdgeContext {
+    /// The node a task is assigned to, failing closed on an incomplete
+    /// assignment view.
+    fn node_of(&self, task_id: &str) -> Result<&str, Error> {
+        self.task_nodes.get(task_id).map(String::as_str).ok_or_else(|| {
+            Error::Config(format!(
+                "remote edge context has no node for task '{task_id}'"
+            ))
+        })
+    }
+}
+
 /// An outbound edge endpoint from a task inside a chain.
 #[derive(Clone)]
 pub enum EdgeTarget {
@@ -77,6 +130,11 @@ pub struct Chain {
     /// `late_events` metric because the source gate cannot classify
     /// session lateness.
     pub window_late_event_rows: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Fatal remote-edge failures shared across the graph's chains. A failure
+    /// received here cancels the chain and fails the graph closed even when
+    /// every chain is idle (blocked on input) and would otherwise never
+    /// observe the dead edge on its own send path.
+    pub edge_failures: Option<flume::Receiver<crate::Error>>,
 }
 
 impl Chain {
@@ -100,6 +158,7 @@ impl Chain {
             window_timings: Vec::new(),
             watermark_group: None,
             window_late_event_rows: None,
+            edge_failures: None,
         }
     }
 
@@ -119,6 +178,7 @@ impl Chain {
             inputs: Vec::new(),
             outputs: self.outputs.clone(),
             error_outputs: self.error_outputs.clone(),
+            edge_failures: None,
             late_event_outputs: self.late_event_outputs.clone(),
             source_time: None,
             source_partition: None,
@@ -332,18 +392,20 @@ impl ExecutionGraphBuilder {
             .iter()
             .map(|task| task.id.clone())
             .collect::<Vec<_>>();
-        self.build_subgraph(plan, &task_ids, adapter, resource)
+        self.build_subgraph(plan, &task_ids, adapter, resource, None)
     }
 
     /// Build the subgraph for the assigned task subset (Agent mode). The same
-    /// code path as `build`; the assignment must not split an edge between
-    /// nodes (the Hub placement already guarantees co-location).
+    /// code path as `build`; edges whose endpoints the placement split across
+    /// nodes are materialized as remote network edges when `remote` is
+    /// provided, and otherwise fail the build (co-location contract).
     pub fn build_subgraph<A: JobComponentAdapter>(
         &self,
         plan: &JobPlan,
         task_ids: &[String],
         adapter: &A,
         resource: &Resource,
+        remote: Option<&RemoteEdgeContext>,
     ) -> Result<ExecutionGraph, Error> {
         plan.spec.validate()?;
         validate_shared_watermark_specs(plan)?;
@@ -453,11 +515,33 @@ impl ExecutionGraphBuilder {
                 };
                 // Downstream tasks of this operator inside the assignment,
                 // with the edge's routing rule (mirrors the legacy runner).
+                // Tasks the placement put on other nodes become remote edge
+                // targets when remote wiring is enabled.
                 let target_tasks: Vec<&TaskSpec> = tasks
                     .iter()
                     .filter(|candidate| candidate.operator_id == downstream_operator)
                     .collect();
-                if target_tasks.is_empty() {
+                let is_error_edge = index.is_error_sink(&downstream_operator);
+                let mut remote_task_targets: Vec<TaskSpec> = Vec::new();
+                if let Some(ctx) = remote {
+                    for candidate in index
+                        .plan
+                        .tasks
+                        .iter()
+                        .filter(|candidate| candidate.operator_id == downstream_operator)
+                    {
+                        if ctx.node_of(&candidate.id)? != ctx.local_node {
+                            if is_error_edge {
+                                return Err(Error::Config(format!(
+                                    "error edge '{}->{}' must stay co-located; task '{}' is remote",
+                                    task.operator_id, downstream_operator, candidate.id
+                                )));
+                            }
+                            remote_task_targets.push(candidate.clone());
+                        }
+                    }
+                }
+                if target_tasks.is_empty() && remote_task_targets.is_empty() {
                     return Err(Error::Config(format!(
                         "Job assignment splits edge '{}->{}'; connected tasks must be co-located",
                         task.operator_id, downstream_operator
@@ -478,14 +562,14 @@ impl ExecutionGraphBuilder {
                         target_runs.push(target_run);
                     }
                 }
-                if target_runs.is_empty() {
+                if target_runs.is_empty() && remote_task_targets.is_empty() {
                     continue;
                 }
-                let targets = target_runs
+                let mut targets = target_runs
                     .iter()
                     .map(|run_index| runs[*run_index][0].id.clone())
                     .collect::<Vec<_>>();
-                let key_group_ranges = if partitioned {
+                let mut key_group_ranges = if partitioned {
                     target_runs
                         .iter()
                         .map(|run_index| {
@@ -504,6 +588,26 @@ impl ExecutionGraphBuilder {
                 } else {
                     Vec::new()
                 };
+                // Remote targets append in plan order after the local ones so
+                // `EdgeTarget::Partitioned`'s channel and key-group vectors
+                // stay index-aligned across both kinds of subtask.
+                for remote_task in &remote_task_targets {
+                    targets.push(remote_task.id.clone());
+                    if partitioned {
+                        key_group_ranges.push(
+                            remote_task
+                                .partitions
+                                .first()
+                                .map(|partition| partition.key_group.clone())
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "remote target '{}' for '{}->{}' has no key-group partition",
+                                        remote_task.id, task.operator_id, downstream_operator
+                                    ))
+                                })?,
+                        );
+                    }
+                }
                 let kind = if partitioned {
                     OutboundKind::Route
                 } else if targets.len() == 1 {
@@ -690,6 +794,14 @@ impl ExecutionGraphBuilder {
         }
 
         // 3. Materialize channels per (upstream task, target run entry).
+        // Remote targets get an edge channel backed by the network manager
+        // instead of a peer flume channel; the graph cannot tell the
+        // difference — both are bounded `Sender<Envelope>`s.
+        //
+        // Quad routing identity derives from the operator's position across
+        // sources, operators, and sinks; both sides of an edge compute it
+        // from the same plan, so the mapping is deterministic.
+        let operator_index = operator_routing_index(plan);
         let mut senders: BTreeMap<(String, String), Sender<super::envelope::Envelope>> =
             BTreeMap::new();
         // A run may have several upstream edges. Keep every receiver instead
@@ -700,10 +812,107 @@ impl ExecutionGraphBuilder {
         for (upstream_task_id, edges) in &outbound {
             for edge in edges {
                 for target in &edge.targets {
-                    if !senders.contains_key(&(upstream_task_id.clone(), target.clone())) {
-                        let (sender, receiver) = flume::bounded(self.channel_capacity);
+                    if senders.contains_key(&(upstream_task_id.clone(), target.clone())) {
+                        continue;
+                    }
+                    let upstream_task = index
+                        .task(upstream_task_id.as_str())
+                        .ok_or_else(|| Error::Config(format!("task '{upstream_task_id}' lost its run")))?;
+                    if run_of_task.get(target.as_str()).is_none() {
+                        // Remote target: route through the network manager.
+                        let Some(ctx) = remote else {
+                            return Err(Error::Config(format!(
+                                "edge target '{target}' is remote but no remote edge context is wired"
+                            )));
+                        };
+                        let target_task = index
+                            .task(target.as_str())
+                            .ok_or_else(|| Error::Config(format!("unknown remote target '{target}'")))?;
+                        let quad = super::remote::Quad {
+                            src_op: *operator_index.get(&upstream_task.operator_id)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "operator '{}' has no routing index",
+                                        upstream_task.operator_id
+                                    ))
+                                })?,
+                            src_subtask: upstream_task.subtask,
+                            dst_op: *operator_index.get(&target_task.operator_id)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "operator '{}' has no routing index",
+                                        target_task.operator_id
+                                    ))
+                                })?,
+                            dst_subtask: target_task.subtask,
+                        };
+                        let node = ctx.node_of(target)?;
+                        let addr = *ctx.node_addrs.get(node).ok_or_else(|| {
+                            Error::Config(format!(
+                                "no data-plane address for remote node '{node}'"
+                            ))
+                        })?;
+                        let transport = std::sync::Arc::new(
+                            super::remote::TcpEdgeTransport { addr, max_attempts: 5 },
+                        );
+                        let sender = ctx.manager.open_edge_deferred(transport, quad).sender;
                         senders.insert((upstream_task_id.clone(), target.clone()), sender);
-                        receivers.entry(target.clone()).or_default().push(receiver);
+                        continue;
+                    }
+                    let (sender, receiver) = flume::bounded(self.channel_capacity);
+                    senders.insert((upstream_task_id.clone(), target.clone()), sender);
+                    receivers.entry(target.clone()).or_default().push(receiver);
+                }
+            }
+        }
+
+        // Downstream side of remote edges: local runs whose upstream operator
+        // has tasks on other nodes register an inbound channel per remote
+        // (upstream subtask → local subtask) quad; the node's network manager
+        // feeds decoded envelopes into them.
+        if let Some(ctx) = remote {
+            for task in &tasks {
+                for upstream_operator in index
+                    .upstream
+                    .get(task.operator_id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    for upstream_task in index
+                        .plan
+                        .tasks
+                        .iter()
+                        .filter(|candidate| candidate.operator_id == upstream_operator)
+                    {
+                        if ctx.node_of(&upstream_task.id)? == ctx.local_node {
+                            continue; // handled by the local channel path above
+                        }
+                        let quad = super::remote::Quad {
+                            src_op: *operator_index.get(upstream_operator)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "operator '{upstream_operator}' has no routing index"
+                                    ))
+                                })?,
+                            src_subtask: upstream_task.subtask,
+                            dst_op: *operator_index.get(&task.operator_id)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "operator '{}' has no routing index",
+                                        task.operator_id
+                                    ))
+                                })?,
+                            dst_subtask: task.subtask,
+                        };
+                        let (sender, receiver) = flume::bounded(self.channel_capacity);
+                        ctx.manager.register_inbound(quad, sender);
+                        let entry_run = *run_of_task
+                            .get(task.id.as_str())
+                            .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
+                        receivers
+                            .entry(runs[entry_run][0].id.clone())
+                            .or_default()
+                            .push(receiver);
                     }
                 }
             }
@@ -959,6 +1168,7 @@ impl ExecutionGraphBuilder {
                     None
                 },
                 window_late_event_rows,
+                edge_failures: remote.map(|ctx| ctx.manager.failure_receiver()),
             });
         }
 

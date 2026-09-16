@@ -290,7 +290,7 @@ pub async fn run_job_tasks<A: JobComponentAdapter>(
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
     let mut graph =
-        ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource)?;
+        ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource, None)?;
     graph.temporaries = resource.temporary.values().cloned().collect();
     run_graph(graph, cancellation).await
 }
@@ -928,7 +928,8 @@ mod validation_tests {
             }],
             state: None,
             checkpoint: None,
-            recovery: Default::default(),
+            placement: crate::job::PlacementStrategy::Colocated,
+        recovery: Default::default(),
         }
     }
 
@@ -1095,7 +1096,8 @@ mod metrics_registry_tests {
             }],
             state: None,
             checkpoint: None,
-            recovery: Default::default(),
+            placement: crate::job::PlacementStrategy::Colocated,
+        recovery: Default::default(),
         }
     }
 

@@ -118,6 +118,7 @@ impl arkflow_core::job::JobComponentAdapter for FixtureAdapter {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_kernel_job_snapshots_and_stops() {
     let spec = JobSpec {
+        placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("kernel-agent-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -182,7 +183,7 @@ async fn agent_kernel_job_snapshots_and_stops() {
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource)
+        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
         .unwrap();
     let inputs = graph
         .chains
@@ -307,7 +308,7 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource)
+        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
         .unwrap();
     let inputs = graph
         .chains
@@ -419,7 +420,7 @@ async fn recovery_restores_positions_before_new_reads() {
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource)
+        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
         .unwrap();
     let inputs = graph
         .chains
@@ -464,6 +465,7 @@ async fn recovery_restores_positions_before_new_reads() {
 
 fn kernel_job_spec() -> JobSpec {
     JobSpec {
+        placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("fault-injection").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,

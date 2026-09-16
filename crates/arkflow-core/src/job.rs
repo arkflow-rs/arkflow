@@ -238,6 +238,20 @@ pub enum RecoveryPolicy {
     Fail,
 }
 
+/// Placement strategy for a Job's tasks across compute nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementStrategy {
+    /// Keep every connected component of the Job graph on one node — the
+    /// historical contract. An edge split across nodes fails placement.
+    #[default]
+    Colocated,
+    /// Spread tasks across nodes in physical plan order (round-robin); data
+    /// edges cross nodes via the network shuffle data plane. Side edges
+    /// (error, late-event route) must stay co-located.
+    Split,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSpec {
     pub id: JobId,
@@ -259,6 +273,10 @@ pub struct JobSpec {
     pub checkpoint: Option<CheckpointSpec>,
     #[serde(default)]
     pub recovery: RecoveryPolicy,
+    /// Task placement across compute nodes. Defaults to the historical
+    /// co-location contract.
+    #[serde(default)]
+    pub placement: PlacementStrategy,
 }
 
 fn default_max_parallelism() -> u32 {
@@ -703,11 +721,110 @@ impl JobPlan {
             .collect()
     }
 
-    pub fn assignments_for_nodes(&self, node_ids: &[String], generation: u64) -> Vec<TaskAttempt> {
+    /// Assign every plan task to a compute node under the Job's placement
+    /// strategy. Colocated keeps each connected component on one node; split
+    /// round-robins tasks in physical plan order and rejects the assignment
+    /// when a side edge (error, late-event route) would cross nodes.
+    pub fn assignments_for_nodes(
+        &self,
+        node_ids: &[String],
+        generation: u64,
+    ) -> Result<Vec<TaskAttempt>, Error> {
         if node_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        // The current runner has no cross-node shuffle/transport. Co-locate
+        match self.spec.placement {
+            // Split placement REJECTS the whole assignment when a side edge
+            // would cross nodes — callers surface the error as a failed
+            // placement, never a panic inside placement bookkeeping.
+            PlacementStrategy::Split => self.assignments_split(node_ids, generation),
+            PlacementStrategy::Colocated => Ok(self.assignments_colocated(node_ids, generation)),
+        }
+    }
+
+    /// Split placement: physical plan order round-robin across the node set.
+    /// Side edges (error, late-event route) must stay co-located — a split
+    /// that would separate one fails placement before any dispatch.
+    fn assignments_split(
+        &self,
+        node_ids: &[String],
+        generation: u64,
+    ) -> Result<Vec<TaskAttempt>, Error> {
+        self.validate_split_side_edges(node_ids)?;
+        Ok(self
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let node_id = &node_ids[index % node_ids.len()];
+                TaskAttempt {
+                    id: format!("{}:{node_id}:{generation}", task.id),
+                    job_id: self.spec.id.clone(),
+                    job_version: self.spec.version,
+                    task_id: task.id.clone(),
+                    generation,
+                    node_id: node_id.clone(),
+                    state: TaskAttemptState::Queued,
+                }
+            })
+            .collect())
+    }
+
+    /// Side edges (error sinks, late-event routes) must land on one node
+    /// under the given node count; a violation names the offending edge.
+    fn validate_split_side_edges(&self, node_ids: &[String]) -> Result<(), Error> {
+        let mut first_task_index = BTreeMap::<&str, usize>::new();
+        for (index, task) in self.tasks.iter().enumerate() {
+            first_task_index
+                .entry(task.operator_id.as_str())
+                .or_insert(index);
+        }
+        let parallelism = self.spec.parallelism.max(1) as usize;
+        let check = |from_op: &str, to_op: &str| -> Result<(), Error> {
+            let (Some(from), Some(to)) = (
+                first_task_index.get(from_op),
+                first_task_index.get(to_op),
+            ) else {
+                return Ok(()); // unknown operators fail edge validation earlier
+            };
+            for subtask in 0..parallelism {
+                let left = &node_ids[(from + subtask) % node_ids.len()];
+                let right = &node_ids[(to + subtask) % node_ids.len()];
+                if left != right {
+                    return Err(Error::Config(format!(
+                        "split placement requires co-located side edges: '{from_op}'->'{to_op}' splits across '{left}' and '{right}' on subtask {subtask}"
+                    )));
+                }
+            }
+            Ok(())
+        };
+        for edge in &self.spec.edges {
+            let error_sink = self
+                .spec
+                .operators
+                .iter()
+                .find(|operator| operator.id == edge.to)
+                .and_then(|operator| operator.config.get("__arkflow_error_sink"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if error_sink {
+                check(&edge.from, &edge.to)?;
+            }
+        }
+        for source in &self.spec.sources {
+            if let Some(route) = source.time.late_event_route.as_ref() {
+                check(&source.operator_id, route)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn assignments_colocated(
+        &self,
+        node_ids: &[String],
+        generation: u64,
+    ) -> Vec<TaskAttempt> {
+        // The colocated runner has no cross-node data edges. Co-locate
         // every connected operator component so an edge can never disappear
         // merely because its endpoints were assigned to different Agents.
         let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
@@ -950,8 +1067,9 @@ pub trait JobComponentAdapter: Send + Sync {
 mod tests {
     use super::*;
 
-    fn base_job() -> JobSpec {
+    pub(super) fn base_job() -> JobSpec {
         JobSpec {
+            placement: PlacementStrategy::Colocated,
             id: JobId::new("orders").unwrap(),
             version: JobVersion(1),
             max_parallelism: 16,
@@ -1260,7 +1378,7 @@ mod tests {
     fn assignments_keep_connected_edges_on_one_node() {
         let plan = JobPlan::compile(base_job()).unwrap();
         let nodes = vec!["node-a".into(), "node-b".into()];
-        let assignments = plan.assignments_for_nodes(&nodes, 4);
+        let assignments = plan.assignments_for_nodes(&nodes, 4).unwrap();
         for edge in &plan.spec.edges {
             let from = assignments
                 .iter()
@@ -1296,4 +1414,83 @@ mod tests {
     fn rejects_unbounded_job_channel() {
         assert!(bounded_job_channel::<u8>(0).is_err());
     }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::tests::base_job;
+    use super::*;
+
+    fn split_job() -> JobSpec {
+        let mut job = base_job();
+        job.placement = PlacementStrategy::Split;
+        job
+    }
+
+    #[test]
+    fn split_placement_round_robins_tasks_deterministically() {
+        let plan = JobPlan::compile(split_job()).unwrap();
+        let nodes = vec!["a".to_string(), "b".to_string()];
+        let assignments = plan.assignments_for_nodes(&nodes, 7).unwrap();
+        assert_eq!(assignments.len(), 6); // 3 operators × 2 subtasks
+
+        // Physical order alternates across the node set.
+        assert_eq!(assignments[0].node_id, "a");
+        assert_eq!(assignments[1].node_id, "b");
+        assert_eq!(assignments[2].node_id, "a");
+        assert_eq!(assignments[3].node_id, "b");
+
+        // Deterministic: the same placement input derives the same mapping.
+        assert_eq!(plan.assignments_for_nodes(&nodes, 7).unwrap(), assignments);
+        // Generation rides the attempt identity.
+        assert!(assignments.iter().all(|attempt| attempt.generation == 7));
+
+        // Same-operator subtasks spread across nodes: the aggregate operator's
+        // two subtasks land on different nodes.
+        let aggregate_nodes: BTreeSet<String> = assignments
+            .iter()
+            .filter(|attempt| attempt.task_id.starts_with("aggregate"))
+            .map(|attempt| attempt.node_id.clone())
+            .collect();
+        assert_eq!(aggregate_nodes.len(), 2);
+    }
+
+    #[test]
+    fn split_placement_rejects_cross_node_late_event_route() {
+        let mut job = split_job();
+        // parallelism 1: source is task 0 (node a); a dedicated late-event
+        // sink operator is task 3 (node b) — the route crosses nodes under
+        // any alternating assignment.
+        job.parallelism = 1;
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        for source in &mut job.sources {
+            source.time.late_event_route = Some("late_sink".into());
+        }
+        let plan = JobPlan::compile(job).unwrap();
+        let nodes = vec!["a".to_string(), "b".to_string()];
+        let error = plan
+            .assignments_for_nodes(&nodes, 1)
+            .expect_err("side-edge split must reject the placement");
+        assert!(
+            error.to_string().contains("co-located side edges"),
+            "expected a side-edge placement rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn colocated_placement_ignores_split_rules() {
+        let plan = JobPlan::compile(base_job()).unwrap();
+        let nodes = vec!["a".to_string(), "b".to_string()];
+        // Colocated keeps whole components: every task of one job lands on ONE
+        // node (round-robin over components, single component here).
+        let assignments = plan.assignments_for_nodes(&nodes, 1).unwrap();
+        assert!(assignments.iter().all(|attempt| attempt.node_id == "a"));
+    }
+
 }

@@ -932,13 +932,25 @@ async fn hub_job_detail(
             .filter(|node| job.node_ids.iter().any(|id| id == &node.id))
             .collect::<Vec<_>>()
     };
-    let assignments = plan.assignments_for_nodes(
+    // A placement that violates its own strategy (for example a split Job
+    // whose side edges would cross nodes) must render as a detail-page error,
+    // not a handler panic.
+    let assignments = match plan.assignments_for_nodes(
         &selected_nodes
             .iter()
             .map(|node| node.id.clone())
             .collect::<Vec<_>>(),
         job.generation,
-    );
+    ) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            return problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_placement",
+                error.to_string(),
+            )
+        }
+    };
     let operations = hub
         .operations(None)
         .await
@@ -4077,6 +4089,7 @@ mod tests {
             storage::StorageActor::start(store, 8),
         );
         hub.register(hub::RegisterRequest {
+            data_address: None,
             node_id: "compute-1".into(),
             node_token: "node-secret".into(),
             protocol_version: "v1".into(),
@@ -4522,6 +4535,7 @@ mod tests {
 
         let session = hub
             .register(hub::RegisterRequest {
+                data_address: None,
                 node_id: "node-a".into(),
                 node_token: "node-secret".into(),
                 protocol_version: "v1".into(),
