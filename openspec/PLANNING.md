@@ -200,13 +200,21 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。（前三项已全部闭环）
 - ~~状态 checkpoint（Change 4）守「单节点、不引入分布式」~~ → 已修订为分布式 Job 运行时（见上节）。
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
-- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 复用现有 upsert（零代码）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future。
+- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 = SQL output 的 `upsert: true` + `upsert_keys`（2026-09-16 前该能力虚标未实现，`fix-sql-output-upsert` 后实装）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future（方向② backlog）。
 
-### 下一步（2026-09-12 对齐，2026-09-15 更新）
+### 下一步（2026-09-12 对齐，2026-09-16 更新）
 
 1. ~~**合入 v1**~~ → ✅ 已完成：PR #1222 squash 合入 main（`d656ae2`），main 与 v1 内容一致。
-2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。
-3. ~~**方向选择**~~ → ✅ 已确认：下一主线 = **数据面可观测性**，已立项 `changes/add-data-plane-observability`（2026-09-15）。
+2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。（仍未做）
+3. ~~**方向选择**~~ → ✅ 已确认：下一主线 = **数据面可观测性**，已立项 `changes/add-data-plane-observability`（2026-09-15，当日归档合入）。
+4. ~~**方向②剩余缺口**~~ → ✅ 2026-09-16 闭环两个 change（见下节）；方向② backlog 收敛为：原生 CDC 直连 input、EOS L3、状态后端选项（rocksdb/远程）。
+
+### 方向②收尾（2026-09-16 归档）
+
+- **`fix-sql-output-upsert`** ✅：sql output 元数据虚标修复 + upsert 实装。此前元数据宣称 `connection`/`table`/`batch_size`/`upsert`/`upsert_keys` 与真实配置（`output_type`/`table_name`）完全不符且 upsert 无实现；现已实装两方言 upsert（MySQL `ON DUPLICATE KEY UPDATE` / PG `ON CONFLICT DO UPDATE`，作用于非 key 列）、build 期 `upsert=true ⇒ 非空 upsert_keys` 校验、写入期 key 列校验，元数据对齐真实字段。新 capability spec：`sql-output`。
+- **`add-schema-registry-avro-compatibility`** ✅：补齐 Change 2 原定未交付范围。Avro wire format 解码（`apache-avro` 0.22，schemaType 分派，扁平 Arrow 映射含逻辑类型/nullable union，嵌套结构明确报错）；`message_type` 降为条件必填（仅 protobuf id 需要）；新增主题兼容性门禁（`subject` + `min_compatibility`，首条消息惰性查 `GET /config/{subject}`，秩比较 NONE<BACKWARD/FORWARD(+T)<FULL(+T)，OnceCell 缓存，fail-fast）。另修正 `howto_cdc_schema_registry.yaml` 的 envelope 扁平化失实注释。
+- **修正过期表述**：本文件 Change 3 决策中「SQL L1 复用现有 upsert（零代码）」不实——sql output 此前只有裸 INSERT、元数据虚标 upsert，本次 `fix-sql-output-upsert` 后该表述才成立（即 L1 幂等吸收现可通过 `upsert: true` + `upsert_keys` 使用）。
+- **CR 遗留跟进（2026-09-16 review，未立项）**：① Avro 路径每条消息重建 `GenericDatumReader`（含 schema 名字表 resolve），未随 id 缓存——大 schema 高吞吐下有开销，优化需处理生命周期自引用，宜先出基准再立项；② 兼容性门禁的 subject 未做 URL 编码，含 `/`/空格等字符的 subject 会拼错路径（需定 percent-encoding 依赖 vs 手写，宜单独小 change）；③ decode 合并阶段 `concat_batches` 对字段集合不同的多版本消息报错（protobuf 既有行为如实继承），spec「互不干扰」措辞略宽，未来如需支持要在合并层做 schema 对齐。
 
 ### 数据面可观测性（2026-09-15 立项并实施，`add-data-plane-observability`）
 

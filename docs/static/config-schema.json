@@ -199,7 +199,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -298,7 +298,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -404,7 +404,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -522,7 +522,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -659,7 +659,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -753,7 +753,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -893,7 +893,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1031,7 +1031,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1150,7 +1150,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1290,7 +1290,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1406,7 +1406,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1609,7 +1609,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1714,7 +1714,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1846,7 +1846,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -1925,7 +1925,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2053,7 +2053,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2245,7 +2245,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2384,7 +2384,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2482,7 +2482,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2619,7 +2619,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2757,7 +2757,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2858,7 +2858,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -2980,12 +2980,12 @@
         {
           "type": "object",
           "title": "sql",
-          "description": "Batch-inserts records into a SQL database. Supports upsert and transaction management.",
+          "description": "Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes.",
           "properties": {
             "type": {
               "type": "string",
               "const": "sql",
-              "description": "Batch-inserts records into a SQL database. Supports upsert and transaction management."
+              "description": "Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes."
             },
             "name": {
               "type": "string",
@@ -3038,7 +3038,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3051,30 +3051,45 @@
                 }
               ]
             },
-            "connection": {
+            "output_type": {
               "type": "object",
-              "description": "Database connection settings (type, uri, etc.)."
+              "description": "Database connection settings, tagged by `type` (`mysql` or `postgres`), each with `uri` and optional `ssl`.",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "mysql",
+                    "postgres"
+                  ]
+                },
+                "uri": {
+                  "type": "string"
+                },
+                "ssl": {
+                  "type": "object",
+                  "description": "Optional SSL configuration (ssl_mode, root_cert, client_cert, client_key)."
+                }
+              },
+              "required": [
+                "type",
+                "uri"
+              ]
             },
-            "table": {
+            "table_name": {
               "type": "string",
               "description": "Destination table."
-            },
-            "batch_size": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Number of rows per insert batch."
             },
             "upsert": {
               "type": "boolean",
               "default": false,
-              "description": "Use upsert (ON CONFLICT) instead of plain insert."
+              "description": "Use upsert (MySQL ON DUPLICATE KEY UPDATE / PostgreSQL ON CONFLICT DO UPDATE) instead of a plain insert."
             },
             "upsert_keys": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Columns used to detect conflicts for upsert."
+              "description": "Columns used as the conflict target for upsert. Required (non-empty) when upsert is true."
             }
           },
           "required": [
@@ -3082,12 +3097,15 @@
           ],
           "examples": [
             {
-              "connection": {
+              "output_type": {
                 "type": "postgres",
                 "uri": "postgres://user:pass@localhost/db"
               },
-              "table": "events",
-              "batch_size": 500
+              "table_name": "events",
+              "upsert": true,
+              "upsert_keys": [
+                "id"
+              ]
             }
           ]
         },
@@ -3152,7 +3170,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3270,7 +3288,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3354,7 +3372,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3458,7 +3476,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3557,7 +3575,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3641,7 +3659,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3742,7 +3760,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3842,7 +3860,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -3965,7 +3983,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4082,7 +4100,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4176,7 +4194,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4283,7 +4301,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4383,7 +4401,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4515,7 +4533,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4594,7 +4612,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4678,7 +4696,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4717,12 +4735,12 @@
         {
           "type": "object",
           "title": "schema_registry",
-          "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+          "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
           "properties": {
             "type": {
               "type": "string",
               "const": "schema_registry",
-              "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry."
+              "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate."
             },
             "name": {
               "type": "string",
@@ -4775,7 +4793,7 @@
                 {
                   "type": "object",
                   "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry.",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
                   "properties": {
                     "type": {
                       "type": "string",
@@ -4794,7 +4812,21 @@
             },
             "message_type": {
               "type": "string",
-              "description": "Fully-qualified Protobuf message type."
+              "description": "Fully-qualified Protobuf message type. Required for Protobuf schemas; omit for Avro."
+            },
+            "subject": {
+              "type": "string",
+              "description": "Registry subject for the compatibility gate."
+            },
+            "min_compatibility": {
+              "type": "string",
+              "enum": [
+                "none",
+                "backward",
+                "forward",
+                "full"
+              ],
+              "description": "Minimum subject compatibility level enforced on the first decoded message. Requires `subject`."
             },
             "auth": {
               "type": "object",

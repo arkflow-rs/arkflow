@@ -2,12 +2,13 @@
 #
 # Same pipeline as examples/cdc_debezium.yaml, but the Kafka records carry
 # Confluent wire-format Protobuf instead of JSON: the `schema_registry`
-# codec resolves the schema id from the registry and decodes the envelope
-# payload. Envelope fields land on the batch exactly as with `debezium_json`
-# (op, ts_ms, source_db, source_table, before, source).
+# codec resolves the schema id from the registry and decodes the payload.
 #
-# Validate offline:
-#   ./target/release/arkflow --config examples/howto_cdc_schema_registry.yaml --validate
+# NOTE: the codec maps the payload's top-level fields as declared in the
+# registered Protobuf schema — it does NOT flatten the Debezium envelope.
+# Nested envelope structs (`source`, `before`) are not supported by the flat
+# Arrow mapping, so register a flat schema and select its top-level fields
+# (here: op, id, name, ts_ms; assume the topic carries a flat user schema).
 
 logging:
   level: info
@@ -37,8 +38,6 @@ streams:
               op,
               id,
               name,
-              source_db,
-              source_table,
               ts_ms
             FROM flow
 

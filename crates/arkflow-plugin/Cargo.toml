@@ -35,6 +35,7 @@ arrow-pyarrow = { workspace = true }
 arrow-array = "58.4"
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
+apache-avro = { workspace = true }
 protobuf-parse = { workspace = true }
 protobuf = { workspace = true }
 lazy_static = { workspace = true }

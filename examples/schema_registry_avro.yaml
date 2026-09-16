@@ -1,0 +1,42 @@
+# Confluent wire-format Avro decoding via the Schema Registry.
+#
+# The `schema_registry` codec dispatches on the registry's `schemaType`
+# response: Avro subjects need no `message_type`. The optional
+# `subject` + `min_compatibility` gate fails the stream fast when the
+# subject's registered compatibility level drops below the requirement.
+#
+# Validate offline:
+#   ./target/release/arkflow --config examples/schema_registry_avro.yaml --validate
+
+logging:
+  level: info
+
+streams:
+  - id: avro-schema-registry
+    input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - orders
+      consumer_group: arkflow-avro
+      client_id: arkflow-avro
+      start_from_latest: true
+      codec:
+        type: schema_registry
+        registry_url: "http://localhost:8081"
+        subject: "orders-value"
+        min_compatibility: backward
+        auth:
+          type: basic
+          username: ${SR_USER}
+          password: ${SR_PASS}
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: sql
+          query: "SELECT * FROM flow"
+
+    output:
+      type: stdout

@@ -13,6 +13,7 @@
  */
 use arkflow_core::Error;
 
+pub mod avro_arrow;
 pub mod debezium;
 pub mod json;
 pub mod protobuf;
