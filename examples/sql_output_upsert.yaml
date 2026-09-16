@@ -1,0 +1,25 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: "generate"
+      context: '{ "id": 1, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 10
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: "json_to_arrow"
+
+    output:
+      type: "sql"
+      output_type:
+        type: "postgres"
+        uri: "postgres://user:pass@localhost:5432/arkflow"
+      table_name: "arkflow_test"
+      upsert: true
+      upsert_keys: ["id"]
+
+    error_output:
+      type: "stdout"

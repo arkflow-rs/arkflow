@@ -65,6 +65,16 @@
       "name": "howto-cdc-schema-registry",
       "path": "../examples/howto_cdc_schema_registry.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "sql-output-upsert",
+      "path": "../examples/sql_output_upsert.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "schema-registry-avro",
+      "path": "../examples/schema_registry_avro.yaml",
+      "kind": "yaml"
     }
   ]
 }

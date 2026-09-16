@@ -17,7 +17,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | codec | `debezium_json` | Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset. | [reference](../components/codecs/debezium) |
 | codec | `json` | Encodes/decodes Arrow RecordBatches as JSON byte payloads. | [reference](../components/codecs/json) |
 | codec | `protobuf` | Encodes/decodes Arrow RecordBatches using a Protobuf descriptor. | [reference](../components/codecs/protobuf) |
-| codec | `schema_registry` | Decodes Confluent wire-format Protobuf messages by resolving the schema id from a Schema Registry. | [reference](../components/codecs/schema-registry) |
+| codec | `schema_registry` | Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate. | [reference](../components/codecs/schema-registry) |
 | input | `file` | Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats. | [reference](../components/inputs/file) |
 | input | `generate` | Generates synthetic text messages on a fixed interval (useful for testing and load simulation). | [reference](../components/inputs/generate) |
 | input | `http` | Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint. | [reference](../components/inputs/http) |
@@ -40,7 +40,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |
 | output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
 | output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |
-| output | `sql` | Batch-inserts records into a SQL database. Supports upsert and transaction management. | [reference](../components/outputs/sql) |
+| output | `sql` | Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes. | [reference](../components/outputs/sql) |
 | output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
 | processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
 | processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
