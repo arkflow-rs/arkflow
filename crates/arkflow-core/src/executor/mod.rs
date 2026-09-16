@@ -15,6 +15,7 @@ pub mod graph;
 pub mod job_runner_adapter;
 pub mod kernel_handle;
 pub mod metrics;
+pub mod remote;
 pub mod resource_guard;
 pub mod state_journal;
 pub mod stateful;

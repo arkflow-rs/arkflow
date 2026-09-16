@@ -158,7 +158,12 @@ impl KernelJobHandle {
             checkpoint_id,
             generation,
         };
-        if self.barrier_senders.is_empty() {
+        // Split placement: a node hosting no source tasks receives its
+        // barriers from upstream nodes over the data plane. Skip local
+        // injection and wait passively — the report matching below enforces
+        // that the arriving barrier carries exactly this round's identity.
+        let inject_locally = !self.barrier_senders.is_empty();
+        if !inject_locally && self.participants.is_empty() {
             return Err(Error::Process(
                 "kernel graph has no source barrier channel".into(),
             ));
@@ -174,14 +179,16 @@ impl KernelJobHandle {
                 ended.insert(task_id);
             }
         }
-        for (task_id, sender) in &self.barrier_senders {
-            if ended.contains(task_id) {
-                continue;
+        if inject_locally {
+            for (task_id, sender) in &self.barrier_senders {
+                if ended.contains(task_id) {
+                    continue;
+                }
+                sender
+                    .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
+                    .await
+                    .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
             }
-            sender
-                .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
-                .await
-                .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
         }
         let mut remaining: BTreeSet<String> = self
             .participants

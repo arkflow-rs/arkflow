@@ -249,9 +249,32 @@ async fn run_graph_inner(
             .get(chain.entry_task_id())
             .cloned()
             .unwrap_or_default();
-        tasks.push(tokio::spawn(
-            async move { run_chain(chain, hook, token).await },
-        ));
+        tasks.push(tokio::spawn(async move {
+            let edge_failures = chain.edge_failures.clone();
+            let Some(edge_failures) = edge_failures else {
+                return run_chain(chain, hook, token).await;
+            };
+            // Remote-edge failure watcher: an idle chain (blocked on input)
+            // never observes a dead edge on its own send path, so a manager
+            // failure cancels the chain and surfaces as its result. The chain
+            // still exits through its own cancellation path, closing every
+            // owned resource.
+            let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
+            let watcher_token = token.clone();
+            let watcher = tokio::spawn(async move {
+                if let Ok(error) = edge_failures.recv_async().await {
+                    watcher_token.cancel();
+                    let _ = failure_tx.send(error);
+                }
+            });
+            let result = run_chain(chain, hook, token).await;
+            let result = match (result, failure_rx.try_recv()) {
+                (Ok(()), Ok(error)) => Err(error),
+                (result, _) => result,
+            };
+            watcher.abort();
+            result
+        }));
     }
     // The chains own their source/sink close paths from here on.
     guard.hand_off_stream_resources();
@@ -1215,7 +1238,12 @@ async fn run_interior_chain_loop(
     for (index, receiver) in chain.inputs.iter().enumerate() {
         readers.push(recv_envelope(index, receiver.clone()));
     }
-    let mut aligner = super::barrier::Aligner::new(chain.inputs.len(), 1024);
+    // Alignment buffering shares one bound across the vertex's inputs. Remote
+    // inputs add an RTT-sized in-flight window each, so scale the bound with
+    // the input count instead of letting a wide fan-in starve each edge's
+    // share and trip checkpoint rounds on slow networks.
+    let alignment_bound = 1024usize.max(512 * chain.inputs.len());
+    let mut aligner = super::barrier::Aligner::new(chain.inputs.len(), alignment_bound);
     let mut ended_inputs = BTreeSet::new();
     // Watermarks arriving on different input edges represent independent
     // progress. Keep one value per edge and only forward the minimum once

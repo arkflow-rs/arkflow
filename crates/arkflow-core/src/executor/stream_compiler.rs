@@ -216,6 +216,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         sinks,
         state: None,
         checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
     };
     spec.validate()?;

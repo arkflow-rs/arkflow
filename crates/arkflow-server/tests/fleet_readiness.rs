@@ -140,6 +140,7 @@ fn fleet_job(job_id: &str, node_id: &str, checkpoint_uri: String) -> JobSpec {
         late_event_route: None,
     };
     JobSpec {
+        placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new(job_id).unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -341,6 +342,8 @@ impl Fleet {
                     heartbeat_interval: Duration::from_millis(AGENT_HEARTBEAT_MS),
                     report_interval: Duration::from_millis(AGENT_REPORT_MS),
                     poll_interval: Duration::from_millis(AGENT_POLL_MS),
+                    data_port: None,
+                    data_host: None,
                 },
                 cancel.clone(),
             ));
@@ -376,6 +379,8 @@ impl Fleet {
                 heartbeat_interval: Duration::from_millis(AGENT_HEARTBEAT_MS),
                 report_interval: Duration::from_millis(AGENT_REPORT_MS),
                 poll_interval: Duration::from_millis(AGENT_POLL_MS),
+                data_port: None,
+                data_host: None,
             };
             agent.task = tokio::spawn(agent::run(empty_control_plane(), config, cancel));
         }

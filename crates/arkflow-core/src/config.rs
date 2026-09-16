@@ -140,6 +140,16 @@ pub struct HealthCheckConfig {
     /// Lifetime of a Hub-issued agent session credential.
     #[serde(default = "default_agent_session_ttl_ms")]
     pub agent_session_ttl_ms: u64,
+    /// Data-plane listen port for cross-node shuffle. When absent the node
+    /// runs without a network data plane and the Hub placement keeps every
+    /// Job edge co-located (the default contract).
+    #[serde(default)]
+    pub data_port: Option<u16>,
+    /// Routable host advertised to peers for the data plane (for example the
+    /// node's LAN IP). Required (together with `data_port`) for the node to
+    /// take part in split placement; loopback-only nodes stay colocated-only.
+    #[serde(default)]
+    pub data_host: Option<String>,
     /// Process-level observability export (metrics, readiness, liveness).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -285,6 +295,8 @@ impl Default for HealthCheckConfig {
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
+            data_port: None,
+            data_host: None,
             observability: ObservabilityConfig::default(),
         }
     }
@@ -424,6 +436,8 @@ mod tests {
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
+            data_port: None,
+            data_host: None,
             observability: ObservabilityConfig::default(),
         };
 

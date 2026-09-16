@@ -35,6 +35,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String) -> JobSpec {
         late_event_route: None,
     };
     JobSpec {
+        placement: arkflow_core::job::PlacementStrategy::Colocated,
         id,
         version: JobVersion(1),
         max_parallelism: 1,
@@ -211,6 +212,8 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(20),
+            data_port: None,
+            data_host: None,
         },
         cancel_a.clone(),
     ));
@@ -225,6 +228,8 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(20),
+            data_port: None,
+            data_host: None,
         },
         cancel_b.clone(),
     ));
@@ -321,6 +326,8 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(20),
             poll_interval: Duration::from_millis(20),
+            data_port: None,
+            data_host: None,
         },
         cancel_a_restart.clone(),
     ));
@@ -354,6 +361,203 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     cancel_a_restart.cancel();
     cancel_b.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), restarted_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), agent_b).await;
+    reconcile_cancel.cancel();
+    let _ = reconcile_task.await;
+    hub_cancel.cancel();
+    let _ = hub_task.await;
+}
+
+/// Split placement end to end: the source runs on node-a, the sink on
+/// node-b, and the forward edge between them crosses the real TCP data
+/// plane. Proof points: both agents build remote-edge graphs (kernel metrics
+/// show sink-side rows on node-b), the Hub-dispatched checkpoint barriers
+/// align through the network edge, and the checkpoint completes through the
+/// existing aggregation path (all_nodes_succeeded → job_checkpoint_commit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
+    arkflow_plugin::initialize().unwrap();
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let job_id = format!("split-smoke-{}", std::process::id());
+
+    let mut spec = two_component_job(
+        JobId::new(&job_id).unwrap(),
+        format!("file://{}", checkpoint_dir.path().display()),
+    );
+    // Reshape into a two-task split job: generate source → drop sink, with
+    // the edge crossing the network.
+    spec.placement = arkflow_core::job::PlacementStrategy::Split;
+    spec.operators.retain(|operator| {
+        operator.id == "source-a" || operator.id == "sink-a"
+    });
+    spec.edges.retain(|edge| edge.id == "edge-a");
+    spec.sources.retain(|source| source.operator_id == "source-a");
+    spec.sinks.retain(|sink| sink.operator_id == "sink-a");
+
+    let hub = Hub::new(HubConfig {
+        operator_token: None,
+        node_token: None,
+        lease_ttl_ms: 2_000,
+        poll_interval_ms: 20,
+        session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hub_cancel = CancellationToken::new();
+    let server_hub = hub.clone();
+    let server_cancel = hub_cancel.clone();
+    let hub_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            hub_router(server_hub, &ServerConfig::default()).into_make_service(),
+        )
+        .with_graceful_shutdown(server_cancel.cancelled_owned())
+        .await
+    });
+    let reconcile_cancel = CancellationToken::new();
+    let reconcile_hub = hub.clone();
+    let reconcile_stop = reconcile_cancel.clone();
+    let reconcile_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                _ = reconcile_stop.cancelled() => return,
+                _ = tick.tick() => {
+                    let _ = reconcile_hub.reconcile_jobs().await;
+                }
+            }
+        }
+    });
+
+    let hub_url = format!("http://{}", address);
+    let cancel_a = CancellationToken::new();
+    let cancel_b = CancellationToken::new();
+    let agent_a = tokio::spawn(agent::run(
+        empty_control_plane(),
+        NodeAgentConfig {
+            hub_url: hub_url.clone(),
+            api_prefix: "/api/v1".into(),
+            node_id: "node-a".into(),
+            node_token: String::new(),
+            boot_id: "split-boot-a".into(),
+            heartbeat_interval: Duration::from_millis(50),
+            report_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(20),
+            data_port: Some(29_601),
+            data_host: Some("127.0.0.1".into()),
+        },
+        cancel_a.clone(),
+    ));
+    let agent_b = tokio::spawn(agent::run(
+        empty_control_plane(),
+        NodeAgentConfig {
+            hub_url: hub_url.clone(),
+            api_prefix: "/api/v1".into(),
+            node_id: "node-b".into(),
+            node_token: String::new(),
+            boot_id: "split-boot-b".into(),
+            heartbeat_interval: Duration::from_millis(50),
+            report_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(20),
+            data_port: Some(29_602),
+            data_host: Some("127.0.0.1".into()),
+        },
+        cancel_b.clone(),
+    ));
+
+    wait_until(|| {
+        let hub = hub.clone();
+        async move {
+            let nodes = hub.nodes().await;
+            nodes.len() == 2
+                && nodes.iter().all(|node| {
+                    node.data_address.is_some()
+                        && node
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "network_shuffle")
+                })
+        }
+    })
+    .await;
+
+    hub.upsert_job(JobRecord {
+        job_id: job_id.clone(),
+        version: 1,
+        spec_json: serde_json::to_string(&spec).unwrap(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["node-a".into(), "node-b".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+
+    // Both assignments start: the split placement dispatched, meaning the
+    // data-plane capability validation passed for both nodes.
+    wait_until(|| {
+        let hub = hub.clone();
+        let job_id = job_id.clone();
+        async move {
+            hub.operations(None)
+                .await
+                .iter()
+                .filter(|operation| {
+                    operation.resource_id == job_id
+                        && operation.operation == "job_start"
+                        && operation.state == HubOperationState::Succeeded
+                })
+                .count()
+                == 2
+        }
+    })
+    .await;
+
+    // Data actually crossed the network: node-b's kernel shows the sink-side
+    // chain consuming remote batches.
+    wait_until(|| {
+        let hub = hub.clone();
+        let job_id = job_id.clone();
+        async move {
+            hub.job_metrics()
+                .await
+                .iter()
+                .find(|(node, _)| node == "node-b")
+                .and_then(|(_, jobs)| jobs.get(&job_id))
+                .cloned()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .chains
+                        .values()
+                        .any(|chain| chain.batches_in > 0)
+                })
+        }
+    })
+    .await;
+
+    // The checkpoint must aggregate: both nodes snapshot, the coordinator
+    // merges both manifests, and the record completes.
+    assert_eq!(hub.schedule_periodic_checkpoints().await.unwrap(), 1);
+    wait_until(|| {
+        let hub = hub.clone();
+        let job_id = job_id.clone();
+        async move {
+            hub.job_checkpoints(&job_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| record.status == "completed")
+        }
+    })
+    .await;
+
+    cancel_a.cancel();
+    cancel_b.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), agent_a).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), agent_b).await;
     reconcile_cancel.cancel();
     let _ = reconcile_task.await;
