@@ -6,7 +6,7 @@ sidebar_position: 1
 
 ## Prerequisites
 
-- **Rust ≥ 1.88** (toolchain, for building from source)
+- **Rust ≥ 1.97** (toolchain, for building from source)
 - **Protobuf compiler** (`protoc`) — required at build time for protobuf codecs
 
 ```bash

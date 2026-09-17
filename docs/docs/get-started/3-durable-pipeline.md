@@ -43,7 +43,7 @@ streams:
       context: '{ "value": 10, "sensor": "temp_1" }'
       interval: 1ns
       batch_size: 1
-      count: 100000
+      count: 1000
 
     durability:
       enabled: true
@@ -92,7 +92,7 @@ Restart the engine:
 ```
 
 On startup, ArkFlow detects unacknowledged WAL entries and replays them. The
-`count: 100000` messages all reach the output — possibly a few duplicated
+`count: 1000` messages all reach the output — possibly a few duplicated
 (messages in flight at the moment of the crash may be delivered again, which
 is exactly what at-least-once means).
 

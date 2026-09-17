@@ -113,19 +113,23 @@ streams: # Stream definition list
 
 ArkFlow supports multiple input sources:
 
-- **Kafka**: Read data from Kafka topics
-- **MQTT**: Subscribe to messages from MQTT topics
-- **HTTP**: Receive data via HTTP
-- **File**: Reading data from files (CSV, JSON, Parquet, Avro, Arrow) with cloud storage support
-- **Generate**: Generate synthetic test data
-- **SQL**: Query data from SQL databases (MySQL, PostgreSQL, SQLite)
-- **NATS**: Subscribe to messages from NATS topics with JetStream support
-- **Pulsar**: Subscribe to messages from Pulsar topics
-- **Redis**: Subscribe to messages from Redis streams, lists, or pub/sub channels
-- **WebSocket**: Subscribe to messages from WebSocket connections
-- **Modbus**: Read data from Modbus devices
-- **Memory**: In-memory data source for testing
-- **Multiple Inputs**: Combine multiple input streams into one pipeline
+<!-- README_COMPONENTS:input START -->
+
+- **Kafka** (`kafka`): Read data from Kafka topics
+- **MQTT** (`mqtt`): Subscribe to messages from MQTT topics
+- **HTTP** (`http`): Receive data via HTTP
+- **File** (`file`): Reading data from files (CSV, JSON, Parquet, Avro, Arrow) with cloud storage support
+- **Generate** (`generate`): Generate synthetic test data
+- **SQL** (`sql`): Query data from SQL databases (MySQL, PostgreSQL, SQLite)
+- **NATS** (`nats`): Subscribe to messages from NATS topics with JetStream support
+- **Pulsar** (`pulsar`): Subscribe to messages from Pulsar topics
+- **Redis** (`redis`): Subscribe to messages from Redis streams, lists, or pub/sub channels
+- **WebSocket** (`websocket`): Subscribe to messages from WebSocket connections
+- **Modbus** (`modbus`): Read data from Modbus devices
+- **Memory** (`memory`): In-memory data source for testing
+- **Multiple Inputs** (`multiple_inputs`): Combine multiple input streams into one pipeline
+
+<!-- README_COMPONENTS:input END -->
 
 Example:
 
@@ -145,12 +149,16 @@ input:
 
 ArkFlow provides multiple data processors:
 
-- **JSON**: JSON data processing and transformation (`json_to_arrow` / `arrow_to_json`)
-- **SQL**: Process data using SQL queries
-- **Protobuf**: Protobuf encoding/decoding (`arrow_to_protobuf` / `protobuf_to_arrow`)
-- **Batch Processing**: Process messages in batches
-- **VRL**: Process data using [VRL](https://vector.dev/docs/reference/vrl/)
-- **Python**: Run Python user-defined functions over the batch
+<!-- README_COMPONENTS:processor START -->
+
+- **JSON** (`json_to_arrow` / `arrow_to_json`): JSON data processing and transformation
+- **SQL** (`sql`): Process data using SQL queries
+- **Protobuf** (`arrow_to_protobuf` / `protobuf_to_arrow`): Protobuf encoding/decoding
+- **Batch Processing** (`batch`): Process messages in batches
+- **VRL** (`vrl`): Process data using [VRL](https://vector.dev/docs/reference/vrl/)
+- **Python** (`python`): Run Python user-defined functions over the batch
+
+<!-- README_COMPONENTS:processor END -->
 
 Example:
 
@@ -167,17 +175,21 @@ pipeline:
 
 ArkFlow supports multiple output targets:
 
-- **Kafka**: Write data to Kafka topics
-- **MQTT**: Publish messages to MQTT topics
-- **HTTP**: Send data via HTTP
-- **InfluxDB**: Write time-series data to InfluxDB 2.x
-- **MongoDB**: Write documents to a MongoDB collection
-- **NATS**: Publish messages to NATS topics
-- **Pulsar**: Publish messages to Pulsar topics
-- **Redis**: Write to Redis streams, lists, or pub/sub channels
-- **SQL**: Write to SQL databases (MySQL, PostgreSQL, SQLite) with batch inserts and UPSERT
-- **Standard Output**: Output data to the console
-- **Drop**: Discard data
+<!-- README_COMPONENTS:output START -->
+
+- **Kafka** (`kafka`): Write data to Kafka topics
+- **MQTT** (`mqtt`): Publish messages to MQTT topics
+- **HTTP** (`http`): Send data via HTTP
+- **InfluxDB** (`influxdb`): Write time-series data to InfluxDB 2.x
+- **MongoDB** (`mongodb`): Write documents to a MongoDB collection
+- **NATS** (`nats`): Publish messages to NATS topics
+- **Pulsar** (`pulsar`): Publish messages to Pulsar topics
+- **Redis** (`redis`): Write to Redis streams, lists, or pub/sub channels
+- **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL) with batch inserts and UPSERT
+- **Standard Output** (`stdout`): Output data to the console
+- **Drop** (`drop`): Discard data
+
+<!-- README_COMPONENTS:output END -->
 
 Example:
 
@@ -217,18 +229,20 @@ error_output:
 
 ArkFlow provides buffer capabilities to handle backpressure and temporary storage of messages:
 
-- **Memory Buffer**: Memory buffer, for high-throughput scenarios and window aggregation. Compiled Streams treat it
-  as a no-op pass-through; its `capacity`/`timeout` options are ignored.
-- **Session Window**: The Session Window buffer component provides a session-based message grouping mechanism where
+<!-- README_COMPONENTS:buffer START -->
+
+- **Memory Buffer** (`memory`): Memory buffer, for high-throughput scenarios and window aggregation. Compiled Streams treat it
+  as a no-op pass-through; its capacity/timeout options are ignored.
+- **Session Window** (`session_window`): The Session Window buffer component provides a session-based message grouping mechanism where
   messages are grouped based on activity gaps. It implements a session window that closes after a configurable period of
   inactivity. Compiled into a processing-time window operator.
-- **Sliding Window (deprecated)**: Deprecated and unreachable in Stream configs — the stream compiler rejects the
+- **Sliding Window (deprecated)** (`sliding_window`): Deprecated and unreachable in Stream configs — the stream compiler rejects the
   sliding window buffer. Use an event-time sliding window operator in a Job DAG instead.
-- **Tumbling Window**: The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism
+- **Tumbling Window** (`tumbling_window`): The Tumbling Window buffer component provides a fixed-size, non-overlapping windowing mechanism
   for processing message batches. It implements a tumbling window algorithm with configurable interval settings.
   Compiled into a processing-time window operator.
-- **Join (deprecated)**: Deprecated and unreachable in Stream configs — the stream compiler rejects the join buffer
-  with a migration message pointing to Job DAG configuration.
+
+<!-- README_COMPONENTS:buffer END -->
 
 Example:
 
@@ -236,6 +250,34 @@ Example:
 buffer:
   type: memory
 ```
+
+The legacy join buffer is also deprecated and unreachable in Stream configs — the stream
+compiler rejects it with a migration message pointing to Job DAG configuration; it is not
+a standalone buffer type.
+
+### Codec Components
+
+Codecs attach to inputs and outputs through the `codec` configuration to encode and decode
+message payloads:
+
+<!-- README_COMPONENTS:codec START -->
+
+- **JSON** (`json`): Encode/decode Arrow RecordBatches as JSON byte payloads
+- **Protobuf** (`protobuf`): Encode/decode Arrow RecordBatches using a Protobuf descriptor
+- **Debezium JSON** (`debezium_json`): Decode Debezium CDC envelope JSON from Kafka change-event topics
+- **Schema Registry** (`schema_registry`): Decode Confluent wire-format Protobuf and Avro messages by resolving schemas from a Schema Registry
+
+<!-- README_COMPONENTS:codec END -->
+
+### Temporary Components
+
+Temporary components provide external lookup state that processors can query at runtime:
+
+<!-- README_COMPONENTS:temporary START -->
+
+- **Redis** (`redis`): Redis-backed temporary lookup store (single node or cluster) read through a codec
+
+<!-- README_COMPONENTS:temporary END -->
 
 ## Examples
 

@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: pnpm/action-setup@v2
+      - uses: pnpm/action-setup@v4
         with:
           version: 10
       - uses: actions/setup-node@v4
@@ -26,7 +26,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./docs
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: Build website
         working-directory: ./docs
         run: pnpm run build

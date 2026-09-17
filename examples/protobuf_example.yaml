@@ -22,11 +22,11 @@ streams:
           query: "SELECT count(timestamp) as timestamp, sum(value) as value, cast(count(sensor) as string) as  sensor FROM flow WHERE value >= 10 order by sensor"
         - type: "arrow_to_protobuf"
           proto_inputs:
-            - "examples/"
+            - "examples/message.proto"
           message_type: "message.Message"
         - type: "protobuf_to_arrow"
           proto_inputs:
-            - "examples/"
+            - "examples/message.proto"
           message_type: "message.Message"
 
     output:

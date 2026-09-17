@@ -49,7 +49,8 @@ pub trait ProtobufConfig {
     fn proto_includes(&self) -> &Option<Vec<String>>;
 }
 
-/// List all files in a directory
+/// List the `.proto` inputs: directories are expanded to their files,
+/// and a direct file path is accepted as-is (as documented for `proto_inputs`).
 pub fn list_files_in_dir<P: AsRef<Path>>(dir: P) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if dir.as_ref().is_dir() {
@@ -60,6 +61,8 @@ pub fn list_files_in_dir<P: AsRef<Path>>(dir: P) -> io::Result<Vec<PathBuf>> {
                 files.push(path);
             }
         }
+    } else {
+        files.push(dir.as_ref().to_path_buf());
     }
     Ok(files)
 }
@@ -78,10 +81,24 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
                 .collect::<Vec<_>>(),
         )
     }
-    let proto_includes = config
-        .proto_includes()
-        .clone()
-        .unwrap_or(config.proto_inputs().clone());
+    // The parser requires every input file to reside inside an include
+    // directory, so a direct file input contributes its parent directory.
+    let proto_includes = config.proto_includes().clone().unwrap_or_else(|| {
+        config
+            .proto_inputs()
+            .iter()
+            .map(|input| {
+                let path = Path::new(input);
+                if path.is_dir() {
+                    input.clone()
+                } else {
+                    path.parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                }
+            })
+            .collect()
+    });
 
     if proto_inputs.is_empty() {
         return Err(Error::Config("No proto files found in the specified paths. Please ensure the paths contain valid .proto files".to_string()));
@@ -93,7 +110,7 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
         .inputs(proto_inputs)
         .includes(proto_includes)
         .parse_and_typecheck()
-        .map_err(|e| Error::Config(format!("Failed to parse the proto file: {}", e)))?
+        .map_err(|e| Error::Config(format!("Failed to parse the proto file: {:#}", e)))?
         .file_descriptors;
 
     if file_descriptor_protos.is_empty() {

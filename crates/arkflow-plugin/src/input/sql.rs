@@ -356,6 +356,6 @@ pub fn init() -> Result<(), Error> {
     ).with_example(serde_json::json!({
         "select_sql": "SELECT id, name FROM users",
         "poll_interval": "10s",
-        "input_type": {"type": "sqlite", "uri": "file:./data.db"}
+        "input_type": {"type": "sqlite", "name": "users", "path": "./data.db"}
     })))
 }

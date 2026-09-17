@@ -66,3 +66,39 @@ skipping SHALL NOT be permitted.
   satisfy
 - **THEN** its manifest entry records `validate: false` with a reason, and
   the validation test documents the exclusion rather than skipping silently
+
+### Requirement: The example manifest SHALL cover every example YAML on disk
+Every `*.yaml`/`*.yml` file directly under `examples/` SHALL be registered in
+`docs/reference/example-manifest.json`; the documentation validation command
+SHALL fail when a new example file is not registered, so examples cannot be
+added without entering the offline-validation gate.
+
+#### Scenario: A new example YAML is added without registration
+- **WHEN** a contributor adds `examples/foo_example.yaml` without a manifest
+  entry and the documentation validation command runs
+- **THEN** the command fails naming `examples/foo_example.yaml` as
+  unregistered
+
+#### Scenario: An example cannot pass offline validation
+- **WHEN** a registered example cannot be deep-validated offline (for
+  instance a legacy configuration the compiler rejects by design)
+- **THEN** its manifest entry records `validate: false` with a stated reason
+  instead of leaving the file unregistered
+
+### Requirement: Component builders and docs metadata SHALL be name-aligned
+Each component kind SHALL expose its registered builder names, and the
+workspace test run SHALL include a test that fails when a builder is
+registered without matching docs metadata or docs metadata exists without a
+registered builder, because either misalignment silently breaks
+`components list`, the docs inventory, or the IDE schema.
+
+#### Scenario: A plugin registers a builder without docs metadata
+- **WHEN** a plugin's `init()` calls the builder registration but not the
+  metadata registration, and the workspace tests run
+- **THEN** the registry consistency test fails naming the kind and component
+
+#### Scenario: Docs metadata exists without a builder
+- **WHEN** metadata is registered for a component name that has no
+  registered builder, and the workspace tests run
+- **THEN** the registry consistency test fails naming the orphan metadata
+  entry
