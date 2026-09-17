@@ -185,7 +185,7 @@ ArkFlow supports multiple output targets:
 - **NATS** (`nats`): Publish messages to NATS topics
 - **Pulsar** (`pulsar`): Publish messages to Pulsar topics
 - **Redis** (`redis`): Write to Redis streams, lists, or pub/sub channels
-- **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL, SQLite) with batch inserts and UPSERT
+- **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL) with batch inserts and UPSERT
 - **Standard Output** (`stdout`): Output data to the console
 - **Drop** (`drop`): Discard data
 

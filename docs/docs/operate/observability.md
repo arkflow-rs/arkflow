@@ -20,7 +20,9 @@ Both the engine node and the Hub expose Prometheus text exposition at
 scrape_configs:
   - job_name: arkflow
     static_configs:
-      - targets: ["node-a.example:7491", "hub.example:7492"]
+      # Engine nodes: dedicated observability listener (default 127.0.0.1:8081).
+      # Hub: the control-plane API server (default 127.0.0.1:8080).
+      - targets: ["node-a.example:8081", "hub.example:8080"]
 ```
 
 ### Data-plane metrics
@@ -72,21 +74,29 @@ and probed. See [`health_check.observability`](../reference/configuration.md#hea
 ### Hub fleet export
 
 The Hub re-exports the data-plane vocabulary reported by its Agents on its own
-`/metrics` endpoint, with an extra `node` label distinguishing reporters. Only
-Agents with a live lease are exported — an Agent that stops reporting (expired
-lease or deregistration) drops out of the exposition. The endpoint requires
-the operator credential (`Authorization: Bearer <operator token>`), matching
-the rest of the Hub metrics API.
+`/metrics` endpoint, with an extra `node` label distinguishing reporters.
+Job/stream series are exported only for Agents with a live lease — an Agent
+that stops reporting (expired lease or deregistration) drops out of the
+exposition; the raw `arkflow_node_metric` series keep their last reported
+values. When an operator token is configured the endpoint requires it
+(`Authorization: Bearer <operator token>`); with no token configured the
+endpoint is served without authentication, like the rest of the Hub API.
 
-Key metric families:
+Hub-side metric families:
 
-| Metric | Source | Meaning |
-|--------|--------|---------|
-| `arkflow_command_duration_bucket{command,le}` | Hub | Enqueue-to-acknowledgement latency per command type. |
-| `arkflow_command_total{command,outcome}` | Hub | Dispatch counters with outcome classes (`succeeded`, `failed`, `timed_out`, `node_unavailable`, `capacity`, `rejected`). |
-| Readiness / reconciliation / outbox / fleet-state gauges | Hub | Hub health and fleet convergence posture. |
-| `arkflow_job_*{node,job,chain}` | Hub (from Agents) | The data-plane vocabulary above, per reporting node. |
-| Per-node stream and processing metrics | Node | Stream state and throughput on each compute node. |
+| Metric | Meaning |
+|--------|---------|
+| `arkflow_control_plane_ready` | 1 when the Hub finished recovery and accepts writes. |
+| `arkflow_command_duration_bucket{command,le}` / `_count` / `_sum` | Enqueue-to-acknowledgement latency per command type. |
+| `arkflow_command_total{command,outcome}` | Dispatch counters. Outcome classes include `succeeded`, `failed`, `timed_out`, `node_unavailable`, `capacity`, `rejected`, `cancelled`, `superseded`, `acknowledged`, and `expired`. |
+| `arkflow_reconciliation_runs_total` / `_failures_total` | Reconcile loop activity and failures. |
+| `arkflow_outbox_pending` / `arkflow_outbox_claimed` | Command outbox depth. |
+| `arkflow_stale_nodes` / `arkflow_active_attempts` / `arkflow_non_terminal_intents` | Fleet convergence posture. |
+| `arkflow_nodes_state{state}` / `arkflow_nodes_maintenance_state{state}` | Node counts by lifecycle/maintenance state. |
+| `arkflow_intents_state{state}` / `arkflow_attempts_state{state}` / `arkflow_rollouts_state{state}` | Intent/attempt/rollout counts by state. |
+| `arkflow_node_compatibility{...}` / `arkflow_node_capability{...}` | Per-node protocol compatibility and declared capabilities (e.g. `network_shuffle`). |
+| `arkflow_node_metric{node_id,metric}` | Last stream/processing metric value reported by each node. |
+| `arkflow_job_*{node,job,chain}` | The data-plane vocabulary above, per reporting node. |
 
 ## Events
 

@@ -67,6 +67,8 @@ API and the Hub agent when `hub_url` is set (see
 | `node_token` | string | no | — | Shared node registration credential. Never included in reports. |
 | `agent_lease_ttl_ms` | integer | no | `15000` | Lease duration (ms) a compute node advertises to its Hub. |
 | `agent_session_ttl_ms` | integer | no | `3600000` | Hard lifetime (ms) of a Hub-issued agent session credential; the Agent re-registers transparently when it elapses. |
+| `data_port` | integer | no | — | Data-plane listen port for cross-node shuffle. When absent the node runs without a network data plane and never advertises the `network_shuffle` capability. Set together with `data_host` on every node participating in a `split` placement. |
+| `data_host` | string | no | — | Routable host peers use to reach this node's data plane (e.g. a LAN IP). Required together with `data_port` for split placement. |
 | `observability` | object | no | see below | Process-level Prometheus metrics and health probes (see [Observability](../operate/observability.md)). |
 
 ### `health_check.observability`

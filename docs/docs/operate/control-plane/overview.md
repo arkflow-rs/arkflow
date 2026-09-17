@@ -7,6 +7,10 @@ sidebar_position: 1
 ArkFlow has an optional control plane for operating many compute nodes as a
 fleet: a **Hub** (the authoritative registry and command broker), per-node
 **Agents** that report runtime state and execute commands, and a web **console**.
+Agents declare their capabilities at registration — for example, a node
+configured with a shuffle data plane advertises `network_shuffle` plus a
+routable data address, which placement uses to decide which jobs it can
+accept.
 
 The control plane shares the same HTTP server as the health checks. Configure
 its bind address and versioned prefix with `health_check.address` and

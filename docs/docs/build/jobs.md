@@ -121,7 +121,11 @@ Start from the maintained examples:
 
 Each node config sets `health_check.hub_url`, `node_id`, `node_token`, and
 `agent_lease_ttl_ms`; the node registers with the Hub and reports heartbeat
-and observation state.
+and observation state. Nodes that will participate in a `split` placement
+(see [What scales](#what-scales--and-how)) additionally set
+`health_check.data_port` (enables the shuffle data-plane listener) and
+`health_check.data_host` (the routable address peers use), which the node
+advertises as its `network_shuffle` capability.
 
 ### Submit flow
 
@@ -195,22 +199,33 @@ artifact's state format is incompatible with the job version, so a bad
 restore cannot corrupt state. Kill-and-restart recovery is exercised
 end-to-end by the two-node smoke test in `crates/arkflow-server/tests/`.
 
-## What scales — and what does not
+## What scales — and how
 
-Task placement keeps operator chains co-located: an assignment never splits
-an edge between two nodes. The practical consequences:
+Task placement has two modes, selected by the job's `placement` field:
 
-- **Scales well**: running a job's source partitions across nodes (for
-  example, a 20-partition Kafka topic consumed half by each of two nodes),
-  independent subtasks, and many jobs per fleet.
-- **Does not apply**: cross-node network shuffle. An operator's intermediate
-  data stays on its node. Computations that need a shuffle across the whole
-  stream should pass through an external system instead — for example,
-  re-partition by key into an intermediate Kafka topic and run a second job
-  on it.
+- **`colocated` (default)** — an assignment never splits an edge between two
+  nodes; adjacent operators sit on the same node and an operator's
+  intermediate data never leaves it. This scales well with source-partition
+  parallelism (for example, a 20-partition Kafka topic consumed half by each
+  of two nodes), independent subtasks, and many jobs per fleet. Computations
+  that need a shuffle across the whole stream should pass through an external
+  system instead — for example, re-partition by key into an intermediate
+  Kafka topic and run a second job on it.
+- **`split` (opt-in)** — the Hub round-robins the physical tasks across the
+  target nodes in deterministic plan order, and edges whose endpoints land on
+  different nodes become remote network edges over the shuffle data plane:
+  partitioned edges route records by key-group to the owning subtask over
+  bounded TCP channels with the same FIFO/barrier/ack semantics as local
+  edges. Side edges (error sinks and late-event routes) must stay co-located,
+  and the Hub dispatches a `split` placement only to nodes advertising the
+  `network_shuffle` capability (set `health_check.data_port` and
+  `health_check.data_host` on every participating node) — otherwise
+  validation or dispatch fails closed. Deployments that never set these
+  fields keep colocated behavior unchanged: no data-plane listener, no
+  capability, identical placement.
 
-This keeps the operational model light (one Hub, N nodes, no data-plane
-mesh) while covering the parallel-data workloads ArkFlow targets.
+Either way the operational model stays light: one Hub, N nodes, and a data
+plane only on the nodes you opt in.
 
 ## Checklist
 

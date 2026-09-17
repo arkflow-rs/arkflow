@@ -28,7 +28,10 @@ desired target.
 
 Temporary transport/node failures preserve desired state and schedule a
 backoff retry. Permanent execution failures become `blocked` and require a
-new generation, such as a corrected configuration or rollback. A dispatched
+new generation, such as a corrected configuration or rollback. Placement
+rejections fail closed the same way: a `split` placement whose target nodes
+do not all advertise the `network_shuffle` capability and a data address is
+rejected before dispatch, with no partial `job_start` sent. A dispatched
 Attempt whose result is lost becomes `ambiguous`; the Hub does not blindly
 replay it. A newer full report is required before a divergent Intent receives
 another Attempt.

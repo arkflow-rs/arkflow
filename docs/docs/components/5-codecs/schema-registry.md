@@ -15,7 +15,7 @@ The `schema_registry` codec decodes Confluent wire-format messages by resolving 
 | registry_url | string | yes | — | Confluent Schema Registry root URL, e.g. `http://localhost:8081` |
 | message_type | string | conditional | — | Fully qualified Protobuf message type. Required for Protobuf schemas; omit for Avro. |
 | subject | string | no | — | Registry subject for the compatibility gate. |
-| min_compatibility | string | no | — | `none`, `backward`, `forward` or `full`. Minimum subject compatibility level enforced on the first decoded message. Requires `subject`. |
+| min_compatibility | string | no | — | `none`, `backward`, `forward` or `full` (lowercase only; other values are rejected at config load). Minimum subject compatibility level enforced on the first decoded message. Requires `subject`. |
 | auth | object | no | — | Registry authentication configuration |
 | auth.type | string | yes (if `auth`) | — | Authentication method: `basic` or `bearer` |
 | auth.username | string | no | — | Username for `basic` mode |

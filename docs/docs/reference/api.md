@@ -246,14 +246,18 @@ with node session credentials, pull commands, and push observations.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `POST` | `/agent/register` | Register a node; establishes a session. |
-| `POST` | `/agent/heartbeat` | Heartbeat with lease renewal. |
+| `POST` | `/agent/register` | Register a node; establishes a session. The payload declares node `capabilities` (e.g. `network_shuffle`) and, when the data plane is enabled, the routable `data_address` peers use for remote edges. |
+| `POST` | `/agent/heartbeat` | Heartbeat with lease renewal; re-asserts capabilities and data address. |
 | `POST` | `/agent/report` | Observed stream/node state; carries `boot_id` and monotonic `report_seq`. |
 | `POST` | `/agent/job-observations` | Report job-level observations from the co-located kernel runtime. |
 | `GET` | `/agent/commands` | Pull pending commands. |
 | `POST` | `/agent/commands/{id}/result` | Report a command result. |
 
-Commands carry generation, Attempt ID, configuration version, and expiry.
+Commands carry generation, Attempt ID, configuration version, and expiry. A
+`job_start` for a `split` placement additionally carries the full
+`task_nodes` map and `node_data_ports`, so every node can derive its remote
+edges without extra lookups; the Hub only dispatches such placements to nodes
+that advertised the `network_shuffle` capability and a data address.
 Command acknowledgement is transport state only — convergence is always
 derived from reports, never from acks.
 

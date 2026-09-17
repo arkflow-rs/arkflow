@@ -183,7 +183,7 @@ ArkFlow支持多种输出目标：
 - **NATS** (`nats`)：将消息发布到 NATS 主题
 - **Pulsar** (`pulsar`)：将消息发布到 Pulsar 主题
 - **Redis** (`redis`)：写入 Redis 流、列表或发布/订阅频道
-- **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL、SQLite），支持批量插入与 UPSERT
+- **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL），支持批量插入与 UPSERT
 - **标准输出** (`stdout`)：将数据输出到控制台
 - **Drop** (`drop`)：丢弃数据
 

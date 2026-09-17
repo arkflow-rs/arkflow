@@ -28,7 +28,7 @@ cargo clippy --workspace --all-targets      # lint before finishing
 ./target/release/arkflow schema             # emit JSON Schema of the config
 ```
 
-CI requires the protobuf compiler (`protoc` on PATH). Rust 1.97+ (`rust-version`). Note the README still advertises 1.88 in places — `Cargo.toml` is authoritative.
+CI requires the protobuf compiler (`protoc` on PATH). Rust 1.97+ (`rust-version`).
 
 ## Documentation workflow
 

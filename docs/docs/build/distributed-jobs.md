@@ -13,9 +13,12 @@ physical task plan.
 
 The Hub is a pure control plane: it persists intent (SQLite), makes placement
 decisions, and aggregates observations. Agents are the data plane, each running
-a co-located subgraph of the unified kernel. Agents have no direct data
-channels between them; they share only object storage (recovery artifacts) and
-external systems (sources/sinks).
+a subgraph of the unified kernel. By default an edge whose endpoints land on
+different nodes is a placement error: agents then share only object storage
+(recovery artifacts) and external systems (sources/sinks). A job that opts
+into `placement: split` — with every participating node running a shuffle data
+plane — additionally connects the agents with direct, bounded TCP channels
+(see [Placement modes](#placement-modes) below).
 
 ```mermaid
 flowchart TB
@@ -37,7 +40,8 @@ flowchart TB
         KB["JobRuntime → kernel<br/>co-located subgraph"]
     end
     OS[("Object store (file:// or s3://)<br/>manifests · state snapshots · artifacts")]
-    EXT[("External systems<br/>Kafka · SQL · MQTT · HTTP …<br/>the only cross-node bridge")]
+    EXT[("External systems<br/>Kafka · SQL · MQTT · HTTP …<br/>the cross-node bridge in colocated placement")]
+    DP[("Shuffle data plane (split placement)<br/>bounded TCP edges · key-group routing")]
 
     C -- "Bearer (operator)" --> API
     PL -- "commands (agent poll, session token)" --> NA
@@ -48,6 +52,8 @@ flowchart TB
     NB -- "artifacts" --> OS
     NA -- "data" --> EXT
     NB -- "data" --> EXT
+    NA <-. "remote edges (split only)" .-> DP
+    NB <-. "remote edges (split only)" .-> DP
 ```
 
 Control flow runs top-down (write intent → outbox claim-lease dispatch → Agent
@@ -179,17 +185,36 @@ The legacy YAML Stream tumbling/session buffers keep their
 legacy row-count `sliding_window` is not misread as a time window, and
 incompatible configurations fail at compile time with a migration hint.
 
-**Task placement co-locates operator chains**: an assignment never splits an
-edge across two nodes, and Hub placement guarantees that adjacent operators
-sit on the same Compute node. The current model therefore has **no cross-node
-network shuffle**: horizontal scale comes from source-partition splitting
-(e.g. spreading Kafka partitions across nodes) and independent subtasks, and a
-single operator's intermediate data never leaves its node. Computations that
-need a cross-node exchange should chain two jobs through an external system
-(for example a Kafka topic repartitioned by key). The model fits
-multi-partition parallel consumption, independent subtasks, and
-collect-near-the-source workloads — not heavy stateful aggregations that
-require shuffle.
+### Placement modes
+
+**Task placement has two modes**, selected by the job spec's `placement`
+field.
+
+With the default `placement: colocated`, an assignment never splits an edge
+across two nodes, and Hub placement guarantees that adjacent operators sit on
+the same Compute node: intermediate data never leaves its node, and horizontal
+scale comes from source-partition splitting (e.g. spreading Kafka partitions
+across nodes) and independent subtasks. Computations that need a shuffle
+across the whole stream should chain two jobs through an external system (for
+example a Kafka topic repartitioned by key) — or opt into `split`.
+
+With `placement: split`, the Hub round-robins the plan's physical tasks across
+the target nodes in deterministic plan order, so subtasks of the same operator
+can land on different nodes. Edges whose endpoints end up on different nodes
+are materialized as **remote network edges**: partitioned edges route records
+by key-group range to the owning subtask over one bounded TCP channel per
+(subtask-pair, operator-pair), with the same FIFO, barrier, watermark, and
+acknowledgement semantics as local bounded channels — an upstream source ack
+completes only after every downstream replica has acknowledged, and
+window-held batches stay excluded from barrier drain exactly as locally. Side
+edges — error sinks and late-event routes — must remain co-located; if a plan
+would split one across nodes, the entire placement is rejected before
+dispatch. The Hub dispatches `split` placements only to nodes that run a data
+plane (a configured `health_check.data_port` with a routable
+`health_check.data_host`, advertised as the `network_shuffle` capability);
+otherwise placement fails closed with no partial dispatch. Deployments that
+never set these fields keep the colocated behavior unchanged — no extra
+listener, no capability, byte-identical placement.
 
 ### Failure and readiness semantics
 

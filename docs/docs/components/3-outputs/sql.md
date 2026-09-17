@@ -41,7 +41,7 @@ The SQL output batch-inserts records into a MySQL or PostgreSQL database. Each r
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| ssl_mode | string | yes | — | SSL mode (driver-specific, e.g. `preferred`, `require`, `verify_ca`, `verify_full`). |
+| ssl_mode | string | yes | — | SSL mode (`disable`, `prefer`, `require`, `verify_ca`, or `verify_full`). |
 | root_cert | string | no | — | Path to the root CA certificate. |
 | client_cert | string | no | — | Path to the client certificate. |
 | client_key | string | no | — | Path to the client key. |
@@ -112,4 +112,5 @@ Conflict detection relies on the primary key / unique index of the target table 
 
 - Supported column types: Utf8, Int64, UInt64, Float64, Boolean. Other Arrow types are rejected with a process error.
 - Identifier quoting follows each dialect: backticks for MySQL, double quotes for PostgreSQL.
+- `upsert: true` requires a non-empty `upsert_keys` list without duplicates; violations are rejected at configuration load, before the stream starts.
 - `upsert_keys` columns must exist in the incoming batch schema; otherwise the write fails with an error.
