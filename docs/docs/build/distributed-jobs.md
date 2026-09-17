@@ -4,11 +4,18 @@ sidebar_position: 7
 
 # Distributed Jobs
 
-ArkFlow 的 Job 是面向有状态流处理的新运行时契约，与现有 YAML Stream 并行存在。Job 由带稳定 ID 的算子和边组成，提交后生成不可变的 `JobVersion` 与物理任务计划。
+ArkFlow Jobs are the new runtime contract for stateful stream processing and
+exist alongside the existing YAML Stream API. A Job is a graph of operators and
+edges with stable IDs; submitting one produces an immutable `JobVersion` and a
+physical task plan.
 
-## 总体架构
+## Architecture
 
-Hub 是纯控制面：持久化意图（SQLite）、做放置决策、聚合观察；Agent 是数据面，各自运行统一内核的共置子图。Agent 之间没有直连数据通道，只共享对象存储（恢复工件）与外部系统（源/汇）。
+The Hub is a pure control plane: it persists intent (SQLite), makes placement
+decisions, and aggregates observations. Agents are the data plane, each running
+a co-located subgraph of the unified kernel. Agents have no direct data
+channels between them; they share only object storage (recovery artifacts) and
+external systems (sources/sinks).
 
 ```mermaid
 flowchart TB
@@ -43,23 +50,50 @@ flowchart TB
     NB -- "data" --> EXT
 ```
 
-控制流自上而下（写意图 → outbox 认领派发 → Agent 轮询取命令）；观察流自下而上（心跳续租、report 单调上报，generation fencing 拒绝旧代）。
+Control flow runs top-down (write intent → outbox claim-lease dispatch → Agent
+polls for commands); observation flows bottom-up (heartbeat lease renewal,
+monotonic reports, generation fencing rejects stale generations).
 
-## 时间语义
+## Event-time semantics
 
-Job 可以声明事件时间字段、每分区 watermark、空闲分区超时和允许迟到时间。watermark 由活跃分区的最小进度聚合；超过窗口边界的事件按 `drop`、`route` 或 `update` 策略处理。
+A Job can declare an event-time field, per-partition watermarks, an idle
+partition timeout, and allowed lateness. The watermark is aggregated from the
+minimum progress across active partitions; events beyond a window boundary are
+handled by the `drop`, `route`, or `update` policy.
 
-事件时间字段接受 Int64(毫秒)以及 Arrow `Timestamp` 的秒、毫秒、微秒、纳秒列,统一换算为毫秒;负时间戳按与窗口边界一致的 `div_euclid` 规则取整,溢出返回可定位的字段错误而不是静默回绕。**空时间戳永远不会被无限期 Hold**:配置了 `route` 时它随迟到事件进入 side output,否则丢弃并完成确认。
+Event-time fields accept Int64 (milliseconds) and Arrow `Timestamp` columns in
+seconds, milliseconds, microseconds, or nanoseconds — all normalized to
+milliseconds; negative timestamps are rounded with the same `div_euclid` rule
+as window boundaries, and overflow returns a field-localized error rather than
+silently wrapping. **Null timestamps are never held indefinitely**: when
+`route` is configured they follow late events into the side output, otherwise
+they are dropped and acknowledged.
 
-同一批次先推进 watermark 再分类当前行:一个 `[2100, 100]` 的批次中,100 立即按迟到策略处理,只有真正的未来行保持 Held。窗口聚合的数值类型保持输入类型 — `Float64` 求和后以 `Float64` 输出,`Float32` 以 `Float32` 兼容 schema 输出,`sum`/`min`/`max` 不再退化为整数哨兵(该行为为 **BREAKING** 变更;整数输入保持 Int64)。非整除的滑动窗口(`size=5, slide=2`)枚举每一个包含事件时间戳的窗口起点,不做整数除法截断。
+Within a batch, the watermark advances before the current rows are
+classified: in a `[2100, 100]` batch, `100` is immediately handled by the late
+policy and only genuinely future rows stay held. Window aggregations preserve
+the input numeric type — a `Float64` sum is emitted as `Float64` and a
+`Float32` as `Float32` with a compatible schema; `sum`/`min`/`max` no longer
+degrade to integer sentinels (a **BREAKING** change; integer inputs remain
+Int64). Non-integral sliding windows (`size=5, slide=2`) enumerate every window
+start that contains an event timestamp instead of truncating with integer
+division.
 
-已触发的窗口在其允许迟到期限内保留:期限内的迟到 `Update` 修改同一个 `(operator, key, window)` 聚合,并带 `__arkflow_window_update` 标记列重发完整修正结果;超过期限后缓冲区才清理。
+Triggered windows are retained for their allowed-lateness period: a late
+`Update` within that period revises the same `(operator, key, window)`
+aggregation and re-emits the full corrected result with an
+`__arkflow_window_update` marker column; the buffer is only cleaned up after
+the period expires.
 
-## 嵌入式状态与检查点
+## Embedded state and checkpoints
 
-热路径状态保存在 Compute 本地的嵌入式 KV 中,按 Job、算子和 key namespace 隔离,并支持 TTL、大小计量和格式版本。检查点将状态快照、源位置和 watermark 以校验和保护的 manifest 写入共享对象存储;恢复顺序是先恢复状态和源位置,再开始读取输入。
+Hot-path state lives in an embedded KV store local to the Compute node,
+isolated by job, operator, and key namespace, with TTL, size metering, and a
+format version. A checkpoint writes a checksum-protected manifest containing
+the state snapshot, source positions, and watermarks to shared object storage;
+recovery restores state and source positions before reading any input.
 
-单个节点上,命令驱动的执行与 checkpoint 流转如下:
+On a single node, command-driven execution and checkpoint flow look like this:
 
 ```mermaid
 flowchart TB
@@ -76,31 +110,103 @@ flowchart TB
     HG --> MAN[("manifest: checksum · format_version<br/>checkpoint / savepoint artifacts")]
 ```
 
-### 已确认切点(acknowledged cut)
+### Acknowledged cut
 
-检查点的源位置、watermark、算子状态和 barrier 必须来自同一个**已确认边界**:源链在注入 barrier 前先排空在途(非 held)确认 — 每个确认都先落状态 journal、再推进 WAL 游标、最后提交源端 offset — 然后封存包含位置与 watermark 的不可变 cut。有状态算子的变更先进入执行本地 journal,只有输出成功确认后才提交到状态后端;输出失败或任务失败时回滚,重放不会重复提交。多输入链在 barrier 对齐后、释放 barrier 后数据前捕获已提交 epoch 的快照。窗口缓冲区中被 Hold 的确认不阻塞 barrier:其状态保持 staged,恢复后由源位置重放重建。
+A checkpoint's source positions, watermarks, operator state, and barriers must
+all come from the same **acknowledged boundary**: before injecting a barrier,
+the source chain drains in-flight (non-held) acknowledgements — each ack first
+commits to the state journal, then advances the WAL cursor, and finally commits
+the source-side offset — and only then is the immutable cut containing
+positions and watermarks sealed. Mutations of stateful operators first enter
+an execution-local journal and are committed to the state backend only after
+their output has been acknowledged; on output or task failure they roll back,
+so replays never double-apply. Multi-input chains capture a snapshot of the
+committed epoch after barrier alignment, before releasing post-barrier data.
+Acknowledgements held in window buffers do not block barriers: their state
+stays staged, and recovery rebuilds it by replaying from the source positions.
 
-Kafka 的检查点位置是每个 topic-partition 的**最高连续已确认 offset**:乱序完成的 fan-out 分支不会跳过间隙中未确认的记录。单个源任务保持连接器的全分区订阅,只有多个物理任务才执行显式分区分配;恢复时 checkpoint 位置合并进完整配置 assignment,未记录的分区保留配置起点,并且恢复位置直接作为下一轮 checkpoint 的游标。
+Kafka checkpoint positions are the **highest contiguous acknowledged offset**
+per topic-partition: fan-out branches that complete out of order cannot skip
+unacknowledged records in a gap. A single source task keeps the connector's
+full-partition subscription; only multiple physical tasks perform an explicit
+partition assignment. On recovery the checkpointed positions are merged into
+the complete configured assignment — partitions without a recorded position
+keep their configured starting point, and the restored positions become the
+cursor for the next checkpoint.
 
-启用 WAL 的输入在 `read()` 返回前完成持久化 flush;确认时先推进 WAL 游标,再提交原生源端 offset。恢复会把已被 checkpoint 覆盖的 WAL 连续前缀并入本地游标,因此过滤 replay 不会留下确认缺口。关闭、重连和 processor 并发池都监听取消信号;停止时先等待 worker/collector 结束,再关闭源、sink 和 WAL。
+WAL-enabled inputs complete their durable flush before `read()` returns; on
+ack, the WAL cursor advances first, then the native source offset commits.
+Recovery folds the WAL contiguous prefix already covered by a checkpoint into
+the local cursor, so filtered replays leave no acknowledgement gap.
+Shutdown, reconnects, and the processor concurrency pool all listen for the
+cancellation signal; on stop, workers and collectors are joined before
+sources, sinks, and the WAL are closed.
 
-只有携带完整计划任务集合的 manifest 才会被封存为 Completed:缺失、重复或多余任务条目都会导致拒绝,节点离线时保留上一个有效恢复点。**状态格式相同即允许目标 Job 版本升级**(较新的版本恢复较旧的 savepoint);降级或格式变更没有迁移路径,双方一致拒绝。
+Only a manifest carrying the complete planned task set is sealed as
+Completed: missing, duplicate, or extra task entries cause rejection, and the
+last valid recovery point is retained while a node is offline. **Upgrading to
+a newer Job version is allowed when the state format matches** (a newer
+version can restore an older savepoint); downgrades and format changes have no
+migration path and are rejected on both sides.
 
-## 控制面与兼容性
+## Control plane and compatibility
 
-Hub 持久化 Job、版本、任务分配和恢复记录,使用 generation 防止旧任务报告覆盖新意图。Agent 通过能力声明确认 Job runtime、状态后端和 checkpoint 协议版本。旧的 `Stream` YAML API 不被转换或删除,可继续按原路径运行。
+The Hub persists jobs, versions, task assignments, and recovery records, and
+uses generations to keep stale task reports from overwriting newer intent.
+Agents confirm the job runtime, state backend, and checkpoint protocol
+versions through capability declarations. The legacy `Stream` YAML API is
+neither converted nor removed and keeps running on its original path.
 
-Job 的观察状态由同一 (generation, action) 下**全部预期 assignment 的聚合结果**推导:所有 assignment 成功才报告 running/stopped,任一仍在 pending 或可重试降级时保持 converging,单个节点的暂态失败不会覆盖健康节点。checkpoint 提交同样要求完整的预期 assignment 集合,离线节点的部分结果不会发布为可恢复 artifact。Agent 使用稳定的**进程 boot identity**区分实际重启,使用注册 session 令牌保护请求;每次重新注册的 report 序列从 0 开始,旧 session 的迟到报告被拒绝且不会回退新 session 的观察快照。长时间 checkpoint 在后台执行,heartbeat、report 和取消轮询仍持续运行;命令失败会返回带 correlation metadata 的 terminal `Failed` 结果。
+A job's observed status is derived from the aggregation of **all expected
+assignments under the same (generation, action)**: running/stopped is reported
+only when every assignment succeeds; anything still pending or retryably
+degraded keeps the job converging, and one node's transient failure never
+overrides healthy nodes. Checkpoint commits likewise require the complete set
+of expected assignments; a partial result from an offline node is never
+published as a recoverable artifact. Agents use a stable **process boot
+identity** to distinguish real restarts and a registered session token to
+protect requests; each re-registration restarts the report sequence at 0, and
+late reports from an old session are rejected without rolling back the new
+session's observation snapshot. Long checkpoints run in the background while
+heartbeats, reports, and cancellation polls continue; command failures return
+a terminal `Failed` result with correlation metadata.
 
-分区边按照 JobPlan 的 key-group range 选择下游 task,而不是按物理 source subtask 取模。同一个 key 从不同 source partition 到达时仍归属同一个下游 owner。旧 YAML Stream 的 tumbling/session buffer 保持“先聚合缓冲、再进入 pipeline”的顺序并输出原始 schema/rows;旧的 row-count `sliding_window` 不会被误读成时间窗口,不兼容配置会在编译期给出迁移提示。
+Partition edges select the downstream task by the JobPlan's key-group range
+rather than by modulo over physical source subtasks, so the same key arriving
+from different source partitions still lands on the same downstream owner.
+The legacy YAML Stream tumbling/session buffers keep their
+"aggregate-then-pipeline" ordering and emit the original schema/rows; the
+legacy row-count `sliding_window` is not misread as a time window, and
+incompatible configurations fail at compile time with a migration hint.
 
-**任务放置以算子链为单位共置**:任务分配(assignment)不允许把一条边拆到两个节点,Hub placement 保证相邻算子位于同一 Compute 节点。因此当前模型**没有跨节点 network shuffle**:水平扩展通过源分区切分(如 Kafka 多分区分散到多节点)与独立子任务实现,单个算子的中间数据不出节点;需要跨节点交换的计算应经过外部系统(例如按 key 重分区的 Kafka topic)串联两段 Job。适用场景是多分区并行消费、独立子任务与多节点就近采集,而非需要 shuffle 的重型有状态聚合。
+**Task placement co-locates operator chains**: an assignment never splits an
+edge across two nodes, and Hub placement guarantees that adjacent operators
+sit on the same Compute node. The current model therefore has **no cross-node
+network shuffle**: horizontal scale comes from source-partition splitting
+(e.g. spreading Kafka partitions across nodes) and independent subtasks, and a
+single operator's intermediate data never leaves its node. Computations that
+need a cross-node exchange should chain two jobs through an external system
+(for example a Kafka topic repartitioned by key). The model fits
+multi-partition parallel consumption, independent subtasks, and
+collect-near-the-source workloads — not heavy stateful aggregations that
+require shuffle.
 
-### 失败与就绪状态
+### Failure and readiness semantics
 
-所有校验入口(`--validate`、配置 API、YAML 声明的本地 Job、编译后的 Stream)执行与真实启动相同的免副作用深度构建:未知组件、不支持的状态后端、非法图边在校验期报错,而不是运行期。dry-run 打开的 WAL 在返回前关闭,同一 redb 路径可立即被真实运行时重开。进入 `Starting` 的运行时若在 dry-run、图构建或资源连接处失败,先转为 `Failed` 再返回错误;本地 Job 构建失败会让引擎启动失败而不是带病宣布就绪。临时资源(temporary)、源和 sink 在任何任务循环启动前按依赖顺序连接,部分启动按逆序关闭已连接资源。
+Every validation entry point (`--validate`, the configuration API, local Jobs
+declared in YAML, and compiled Streams) performs the same side-effect-free
+deep build used at real startup: unknown components, unsupported state
+backends, and illegal graph edges fail at validation time rather than at
+runtime. WALs opened by a dry run are closed before it returns, and the same
+redb path can be reopened immediately by a real runtime. A runtime that fails
+a dry run, graph build, or resource connection after entering `Starting`
+transitions to `Failed` before the error is returned; a local Job build
+failure fails engine startup instead of announcing readiness while broken.
+Temporary resources, sources, and sinks are connected in dependency order
+before any task loop starts, and a partial startup closes the connected
+resources in reverse order.
 
-## API 示例
+## API examples
 
 ```http
 POST /api/v1/jobs/validate
@@ -115,7 +221,11 @@ POST /api/v1/jobs/{job_id}/upgrades
 POST /api/v1/jobs/{job_id}/upgrades/{upgrade_id}/rollback
 ```
 
-工作台和 API 都应先调用 `validate` 检查编译计划与节点能力，再以 `stopped` 提交并检查
-`detail`。确认后才切换为 `running`。版本升级要求 Job 已停止并收敛，且选择一个已完成、
-状态格式兼容的 savepoint；升级失败时保持停止状态，由操作者明确恢复旧版本。checkpoint/savepoint
-的生命周期与 Job 版本、状态格式版本绑定。
+Both the workbench and API clients should call `validate` to check the
+compiled plan and node capabilities first, then submit with `stopped` and
+inspect `detail`; switch to `running` only after confirmation. Version
+upgrades require the job to be stopped and converged, with a completed
+savepoint whose state format is compatible; when an upgrade fails the job
+stays stopped and the operator explicitly restores the old version. The
+checkpoint/savepoint lifecycle is bound to the job version and the state
+format version.
