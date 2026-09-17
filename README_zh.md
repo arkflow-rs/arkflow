@@ -111,19 +111,23 @@ streams: # 流定义列表
 
 ArkFlow支持多种输入源：
 
-- **Kafka**：从Kafka主题读取数据
-- **MQTT**：从MQTT主题订阅消息
-- **HTTP**：通过HTTP接收数据
-- **文件**：从文件（CSV、JSON、Parquet、Avro、Arrow）读取数据，支持云存储
-- **生成器（Generate）**：生成测试数据
-- **SQL**：从 SQL 数据库（MySQL、PostgreSQL、SQLite）查询数据
-- **NATS**：订阅来自 NATS 主题的消息，支持 JetStream
-- **Pulsar**：订阅来自 Pulsar 主题的消息
-- **Redis**：订阅来自 Redis 流、列表或发布/订阅频道的消息
-- **WebSocket**：订阅来自 WebSocket 连接的消息
-- **Modbus**：从 Modbus 设备读取数据
-- **内存（Memory）**：用于测试的内存数据源
-- **多输入（Multiple Inputs）**：将多个输入流合并到一个管道
+<!-- README_COMPONENTS:input START -->
+
+- **Kafka** (`kafka`)：从Kafka主题读取数据
+- **MQTT** (`mqtt`)：从MQTT主题订阅消息
+- **HTTP** (`http`)：通过HTTP接收数据
+- **文件** (`file`)：从文件（CSV、JSON、Parquet、Avro、Arrow）读取数据，支持云存储
+- **生成器** (`generate`)：生成测试数据
+- **SQL** (`sql`)：从 SQL 数据库（MySQL、PostgreSQL、SQLite）查询数据
+- **NATS** (`nats`)：订阅来自 NATS 主题的消息，支持 JetStream
+- **Pulsar** (`pulsar`)：订阅来自 Pulsar 主题的消息
+- **Redis** (`redis`)：订阅来自 Redis 流、列表或发布/订阅频道的消息
+- **WebSocket** (`websocket`)：订阅来自 WebSocket 连接的消息
+- **Modbus** (`modbus`)：从 Modbus 设备读取数据
+- **内存** (`memory`)：用于测试的内存数据源
+- **多输入** (`multiple_inputs`)：将多个输入流合并到一个管道
+
+<!-- README_COMPONENTS:input END -->
 
 示例：
 
@@ -143,12 +147,16 @@ input:
 
 ArkFlow提供多种数据处理器：
 
-- **JSON**：JSON数据处理和转换（`json_to_arrow` / `arrow_to_json`）
-- **SQL**：使用SQL查询处理数据
-- **Protobuf**：Protobuf编解码（`arrow_to_protobuf` / `protobuf_to_arrow`）
-- **批处理**：将消息批量处理
-- **VRL**：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
-- **Python**：对每个批次运行用户自定义的 Python 函数
+<!-- README_COMPONENTS:processor START -->
+
+- **JSON** (`json_to_arrow` / `arrow_to_json`)：JSON数据处理和转换
+- **SQL** (`sql`)：使用SQL查询处理数据
+- **Protobuf** (`arrow_to_protobuf` / `protobuf_to_arrow`)：Protobuf编解码
+- **批处理** (`batch`)：将消息批量处理
+- **VRL** (`vrl`)：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
+- **Python** (`python`)：对每个批次运行用户自定义的 Python 函数
+
+<!-- README_COMPONENTS:processor END -->
 
 示例：
 
@@ -165,17 +173,21 @@ pipeline:
 
 ArkFlow支持多种输出目标：
 
-- **Kafka**：将数据写入Kafka主题
-- **MQTT**：将消息发布到MQTT主题
-- **HTTP**：通过HTTP发送数据
-- **InfluxDB**：将时序数据写入 InfluxDB 2.x
-- **MongoDB**：将文档写入 MongoDB 集合
-- **NATS**：将消息发布到 NATS 主题
-- **Pulsar**：将消息发布到 Pulsar 主题
-- **Redis**：写入 Redis 流、列表或发布/订阅频道
-- **SQL**：写入 SQL 数据库（MySQL、PostgreSQL、SQLite），支持批量插入与 UPSERT
-- **标准输出**：将数据输出到控制台
-- **Drop**：丢弃数据
+<!-- README_COMPONENTS:output START -->
+
+- **Kafka** (`kafka`)：将数据写入Kafka主题
+- **MQTT** (`mqtt`)：将消息发布到MQTT主题
+- **HTTP** (`http`)：通过HTTP发送数据
+- **InfluxDB** (`influxdb`)：将时序数据写入 InfluxDB 2.x
+- **MongoDB** (`mongodb`)：将文档写入 MongoDB 集合
+- **NATS** (`nats`)：将消息发布到 NATS 主题
+- **Pulsar** (`pulsar`)：将消息发布到 Pulsar 主题
+- **Redis** (`redis`)：写入 Redis 流、列表或发布/订阅频道
+- **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL、SQLite），支持批量插入与 UPSERT
+- **标准输出** (`stdout`)：将数据输出到控制台
+- **Drop** (`drop`)：丢弃数据
+
+<!-- README_COMPONENTS:output END -->
 
 示例：
 
@@ -211,11 +223,14 @@ error_output:
 
 ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:
 
-- **内存缓冲**: 内存缓冲区，用于高吞吐量场景和窗口聚合。编译后的 Stream 中它退化为直通，`capacity`/`timeout` 选项被忽略。
-- **会话窗口 (Session Window)**：会话窗口缓冲组件提供了一种基于会话的消息分组机制，其中消息根据活动间隙进行分组。它实现了一个会话窗口，在可配置的非活动期后关闭。编译为处理时间窗口算子。
-- **滑动窗口 (Sliding Window，已弃用)**：已弃用且在 Stream 配置中不可达——流编译器会拒绝滑动窗口缓冲。请改用 Job DAG 中的事件时间滑动窗口算子。
-- **滚动窗口 (Tumbling Window)**：滚动窗口缓冲组件提供了一种固定大小、不重叠的批处理消息的窗口机制。它实现了一种滚动窗口算法，具有可配置的间隔设置。编译为处理时间窗口算子。
-- **Join（已弃用）**：已弃用且在 Stream 配置中不可达——流编译器会拒绝 join 缓冲，并给出指向 Job DAG 配置的迁移提示。
+<!-- README_COMPONENTS:buffer START -->
+
+- **内存缓冲** (`memory`)：内存缓冲区，用于高吞吐量场景和窗口聚合。编译后的 Stream 中它退化为直通，capacity/timeout 选项被忽略。
+- **会话窗口** (`session_window`)：会话窗口缓冲组件提供了一种基于会话的消息分组机制，其中消息根据活动间隙进行分组。它实现了一个会话窗口，在可配置的非活动期后关闭。编译为处理时间窗口算子。
+- **滑动窗口（已弃用）** (`sliding_window`)：已弃用且在 Stream 配置中不可达——流编译器会拒绝滑动窗口缓冲。请改用 Job DAG 中的事件时间滑动窗口算子。
+- **滚动窗口** (`tumbling_window`)：滚动窗口缓冲组件提供了一种固定大小、不重叠的批处理消息的窗口机制。它实现了一种滚动窗口算法，具有可配置的间隔设置。编译为处理时间窗口算子。
+
+<!-- README_COMPONENTS:buffer END -->
 
 示例：
 
@@ -223,6 +238,31 @@ ArkFlow 提供缓冲能力，以处理消息的背压和临时存储:
 buffer:
   type: memory
 ```
+
+旧版 join 缓冲同样已弃用且在 Stream 配置中不可达——流编译器会拒绝 join 缓冲，并给出指向 Job DAG 配置的迁移提示；它不是独立的缓冲类型。
+
+### 编解码组件（Codec）
+
+编解码组件通过 `codec` 配置挂载到输入/输出上，负责消息负载的编码与解码：
+
+<!-- README_COMPONENTS:codec START -->
+
+- **JSON** (`json`)：将 Arrow RecordBatch 编码/解码为 JSON 负载
+- **Protobuf** (`protobuf`)：使用 Protobuf 描述符编码/解码 Arrow RecordBatch
+- **Debezium JSON** (`debezium_json`)：解码来自 Kafka 变更事件主题的 Debezium CDC 信封 JSON
+- **Schema Registry** (`schema_registry`)：通过 Schema Registry 解析模式，解码 Confluent 线路格式的 Protobuf 与 Avro 消息
+
+<!-- README_COMPONENTS:codec END -->
+
+### 临时状态组件（Temporary）
+
+临时状态组件提供处理器可在运行期查询的外部查找状态：
+
+<!-- README_COMPONENTS:temporary START -->
+
+- **Redis** (`redis`)：基于 Redis 的临时查找存储（单机或集群），通过编解码器读取
+
+<!-- README_COMPONENTS:temporary END -->
 
 ## 示例
 
