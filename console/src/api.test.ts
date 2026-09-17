@@ -14,9 +14,10 @@ describe('control-plane event stream', () => {
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       calls += 1
       if (calls === 2) expect(new Headers(init?.headers).get('Last-Event-ID')).toBe('42')
-      const payload = calls === 1
-        ? 'id: 42\nevent: stream_changed\ndata: {"event_type":"stream_changed","outcome":"accepted"}\n\n'
-        : ''
+      const payload =
+        calls === 1
+          ? 'id: 42\nevent: stream_changed\ndata: {"event_type":"stream_changed","outcome":"accepted"}\n\n'
+          : ''
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           if (payload) controller.enqueue(new TextEncoder().encode(payload))
@@ -26,7 +27,7 @@ describe('control-plane event stream', () => {
       return Promise.resolve({ ok: true, status: 200, body: stream })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const controller = streamEvents(event => events.push(event))
+    const controller = streamEvents((event) => events.push(event))
     await vi.waitFor(() => expect(events).toHaveLength(1))
     await vi.advanceTimersByTimeAsync(1000)
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))

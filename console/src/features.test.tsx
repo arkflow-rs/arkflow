@@ -16,12 +16,38 @@ describe('configuration workflow', () => {
 
   it('waits for a successful publish operation before reloading', async () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/configuration/draft')) return Promise.resolve({ ok: true, json: async () => ({ format: 'json', content: '{"streams":[]}' }) })
-      if (url.endsWith('/configuration')) return Promise.resolve({ ok: true, json: async () => ({ streams: [] }) })
+      if (url.endsWith('/configuration/draft'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ format: 'json', content: '{"streams":[]}' }),
+        })
+      if (url.endsWith('/configuration'))
+        return Promise.resolve({ ok: true, json: async () => ({ streams: [] }) })
       if (url.endsWith('/configuration/versions')) return Promise.resolve({ ok: true, json: async () => [] })
-      if (url.endsWith('/configuration/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, errors: [] }) })
-      if (init?.method === 'POST' && url.endsWith('/configuration/apply')) return Promise.resolve({ ok: true, json: async () => ({ id: 'op-1', operation: 'apply_configuration', state: 'queued', progress: 0, created_at_ms: 1 }) })
-      if (url.endsWith('/operations/op-1')) return Promise.resolve({ ok: true, json: async () => ({ id: 'op-1', operation: 'apply_configuration', state: 'succeeded', progress: 100, created_at_ms: 1 }) })
+      if (url.endsWith('/configuration/validate'))
+        return Promise.resolve({ ok: true, json: async () => ({ valid: true, errors: [] }) })
+      if (init?.method === 'POST' && url.endsWith('/configuration/apply'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'op-1',
+            operation: 'apply_configuration',
+            state: 'queued',
+            progress: 0,
+            created_at_ms: 1,
+          }),
+        })
+      if (url.endsWith('/operations/op-1'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'op-1',
+            operation: 'apply_configuration',
+            state: 'succeeded',
+            progress: 100,
+            created_at_ms: 1,
+          }),
+        })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -31,7 +57,9 @@ describe('configuration workflow', () => {
     await screen.findByText(/Draft is saved/)
     await waitFor(() => expect(screen.getByRole('button', { name: 'Publish' })).not.toBeDisabled())
     fireEvent.click(screen.getByRole('button', { name: 'Publish' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/operations/op-1'), expect.anything()))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/operations/op-1'), expect.anything()),
+    )
     expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/configuration')).length).toBeGreaterThan(1)
   })
 })
@@ -39,43 +67,140 @@ describe('configuration workflow', () => {
 describe('rollout workflow', () => {
   it('creates a bounded rollout from selected nodes', async () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/rollouts') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ rollout_id: 'r-1', config_version_id: 'cfg-1', state: 'pending', batch_size: 1, current_batch: 0, total_targets: 1, created_at_ms: 1, updated_at_ms: 1 }) })
+      if (url.endsWith('/rollouts') && init?.method === 'POST')
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            rollout_id: 'r-1',
+            config_version_id: 'cfg-1',
+            state: 'pending',
+            batch_size: 1,
+            current_batch: 0,
+            total_targets: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+          }),
+        })
       if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [] })
-      if (url.endsWith('/rollouts/r-1')) return Promise.resolve({ ok: true, json: async () => ({ rollout: { rollout_id: 'r-1', config_version_id: 'cfg-1', state: 'pending', batch_size: 1, current_batch: 0, total_targets: 1, created_at_ms: 1, updated_at_ms: 1 }, targets: [{ rollout_id: 'r-1', node_id: 'node-a', ordinal: 0, state: 'pending', updated_at_ms: 1 }] }) })
-      if (url.includes('/audit')) return Promise.resolve({ ok: true, json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }) })
+      if (url.endsWith('/rollouts/r-1'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            rollout: {
+              rollout_id: 'r-1',
+              config_version_id: 'cfg-1',
+              state: 'pending',
+              batch_size: 1,
+              current_batch: 0,
+              total_targets: 1,
+              created_at_ms: 1,
+              updated_at_ms: 1,
+            },
+            targets: [
+              { rollout_id: 'r-1', node_id: 'node-a', ordinal: 0, state: 'pending', updated_at_ms: 1 },
+            ],
+          }),
+        })
+      if (url.includes('/audit'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(<Rollouts nodes={[{ id: 'node-a', state: 'online', version: 'test', capabilities: [], streams_total: 0, streams_running: 0, streams_failed: 0 }]} onError={vi.fn()} />)
+    render(
+      <Rollouts
+        nodes={[
+          {
+            id: 'node-a',
+            state: 'online',
+            version: 'test',
+            capabilities: [],
+            streams_total: 0,
+            streams_running: 0,
+            streams_failed: 0,
+          },
+        ]}
+        onError={vi.fn()}
+      />,
+    )
     fireEvent.change(await screen.findByLabelText('Configuration version'), { target: { value: 'cfg-1' } })
     fireEvent.click(screen.getByRole('checkbox', { name: /node-a/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Create rollout' }))
     expect(await screen.findByText('r-1')).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/rollouts'), expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/rollouts'),
+      expect.objectContaining({ method: 'POST' }),
+    )
   })
 
   it('renders rollout state transitions and exposes the next allowed action', async () => {
     let state = 'applying'
-    const rollout = () => ({ rollout_id: 'r-1', config_version_id: 'cfg-1', state, batch_size: 1, current_batch: 0, total_targets: 1, created_at_ms: 1, updated_at_ms: 1 })
+    const rollout = () => ({
+      rollout_id: 'r-1',
+      config_version_id: 'cfg-1',
+      state,
+      batch_size: 1,
+      current_batch: 0,
+      total_targets: 1,
+      created_at_ms: 1,
+      updated_at_ms: 1,
+    })
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/rollouts') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => rollout() })
+      if (url.endsWith('/rollouts') && init?.method === 'POST')
+        return Promise.resolve({ ok: true, json: async () => rollout() })
       if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [rollout()] })
       if (url.endsWith('/rollouts/r-1/actions')) {
         state = 'paused'
         return Promise.resolve({ ok: true, json: async () => rollout() })
       }
-      if (url.endsWith('/rollouts/r-1')) return Promise.resolve({ ok: true, json: async () => ({ rollout: rollout(), targets: [{ rollout_id: 'r-1', node_id: 'node-a', ordinal: 0, state, updated_at_ms: 1 }] }) })
-      if (url.includes('/audit')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ event_id: 1, action: 'rollout.pause', outcome: 'accepted', occurred_at_ms: 1 }], page: 1, page_size: 50, total: 1 }) })
+      if (url.endsWith('/rollouts/r-1'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            rollout: rollout(),
+            targets: [{ rollout_id: 'r-1', node_id: 'node-a', ordinal: 0, state, updated_at_ms: 1 }],
+          }),
+        })
+      if (url.includes('/audit'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            items: [{ event_id: 1, action: 'rollout.pause', outcome: 'accepted', occurred_at_ms: 1 }],
+            page: 1,
+            page_size: 50,
+            total: 1,
+          }),
+        })
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(<Rollouts nodes={[{ id: 'node-a', state: 'online', version: 'test', capabilities: [], streams_total: 0, streams_running: 0, streams_failed: 0 }]} onError={vi.fn()} />)
+    render(
+      <Rollouts
+        nodes={[
+          {
+            id: 'node-a',
+            state: 'online',
+            version: 'test',
+            capabilities: [],
+            streams_total: 0,
+            streams_running: 0,
+            streams_failed: 0,
+          },
+        ]}
+        onError={vi.fn()}
+      />,
+    )
     fireEvent.click(await screen.findByRole('button', { name: /r-1/ }))
     expect(await screen.findByText('applying')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
     expect(await screen.findByText('paused')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/rollouts/r-1/actions'), expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/rollouts/r-1/actions'),
+      expect.objectContaining({ method: 'POST' }),
+    )
   })
 })
 
@@ -83,8 +208,31 @@ describe('distributed Job workbench', () => {
   it('validates a Job plan before creating it in stopped state', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: { tasks: [] }, required_capabilities: [], nodes: [], warnings: [] }) })
-      if (url.endsWith('/jobs') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ job_id: 'new-job', version: 1, desired_state: 'stopped', observed_state: 'validated', convergence: 'pending', generation: 1, node_ids: [], updated_at_ms: 1 }) })
+      if (url.endsWith('/jobs/validate'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            valid: true,
+            plan: { tasks: [] },
+            required_capabilities: [],
+            nodes: [],
+            warnings: [],
+          }),
+        })
+      if (url.endsWith('/jobs') && init?.method === 'POST')
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            job_id: 'new-job',
+            version: 1,
+            desired_state: 'stopped',
+            observed_state: 'validated',
+            convergence: 'pending',
+            generation: 1,
+            node_ids: [],
+            updated_at_ms: 1,
+          }),
+        })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -94,13 +242,22 @@ describe('distributed Job workbench', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
     expect(await screen.findByText('Plan is valid')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Create stopped' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/jobs'), expect.objectContaining({ method: 'POST' })))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/jobs'),
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    )
     expect(refresh).toHaveBeenCalled()
   })
 
   it('requires a fresh validation after Job settings change', async () => {
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }) })
+      if (url.endsWith('/jobs/validate'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }),
+        })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -115,7 +272,13 @@ describe('distributed Job workbench', () => {
 
   it('shows a retryable component-catalogue failure in the Job palette', async () => {
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/components')) return Promise.resolve({ ok: false, status: 503, json: async () => ({ message: 'catalogue unavailable' }), headers: new Headers() })
+      if (url.endsWith('/components'))
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          json: async () => ({ message: 'catalogue unavailable' }),
+          headers: new Headers(),
+        })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -127,8 +290,14 @@ describe('distributed Job workbench', () => {
   })
 
   it('filters the Job palette by component kind and search term', async () => {
-    const components = [{ kind: 'input', name: 'generate', description: 'Generate records' }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON' }, { kind: 'output', name: 'stdout', description: 'Write output' }]
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, json: async () => components })) as unknown as typeof fetch
+    const components = [
+      { kind: 'input', name: 'generate', description: 'Generate records' },
+      { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON' },
+      { kind: 'output', name: 'stdout', description: 'Write output' },
+    ]
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({ ok: true, json: async () => components }),
+    ) as unknown as typeof fetch
     const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
     const local = within(view.container)
     fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
@@ -143,8 +312,19 @@ describe('distributed Job workbench', () => {
 
 describe('component catalogue', () => {
   it('filters entries and shows details only for the selected component', async () => {
-    const components = [{ kind: 'input', name: 'generate', description: 'Generate records', schema: { type: 'object' }, example: { batch_size: 1 } }, { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON', schema: { type: 'object' } }]
-    globalThis.fetch = vi.fn((url: string) => Promise.resolve({ ok: true, json: async () => url.endsWith('/components') ? components : {} })) as unknown as typeof fetch
+    const components = [
+      {
+        kind: 'input',
+        name: 'generate',
+        description: 'Generate records',
+        schema: { type: 'object' },
+        example: { batch_size: 1 },
+      },
+      { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON', schema: { type: 'object' } },
+    ]
+    globalThis.fetch = vi.fn((url: string) =>
+      Promise.resolve({ ok: true, json: async () => (url.endsWith('/components') ? components : {}) }),
+    ) as unknown as typeof fetch
     const view = render(<Components onError={vi.fn()} />)
     const local = within(view.container)
     expect(await local.findByText('generate')).toBeInTheDocument()
@@ -160,25 +340,86 @@ describe('job editor determinism', () => {
     { kind: 'input', name: 'generate', description: 'Generate', schema: null, example: {} },
     { kind: 'output', name: 'drop', description: 'Drop', schema: null, example: {} },
   ]
-  const editorFetchMock = () => vi.fn((url: string) => {
-    if (url.endsWith('/components')) return Promise.resolve({ ok: true, json: async () => componentCatalogue })
-    if (url.endsWith('/jobs/validate')) return Promise.resolve({ ok: true, json: async () => ({ valid: true, warnings: [], plan: undefined, required_capabilities: [], nodes: [] }) })
-    return Promise.resolve({ ok: true, json: async () => [] })
-  })
+  const editorFetchMock = () =>
+    vi.fn((url: string) => {
+      if (url.endsWith('/components'))
+        return Promise.resolve({ ok: true, json: async () => componentCatalogue })
+      if (url.endsWith('/jobs/validate'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            valid: true,
+            warnings: [],
+            plan: undefined,
+            required_capabilities: [],
+            nodes: [],
+          }),
+        })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
 
   const upgradeJob = {
-    job_id: 'orders', version: 3, generation: 7, desired_state: 'stopped', state: 'stopped',
-    node_ids: [], spec: { id: 'orders', version: 3, operators: [{ id: 'kept-source', kind: 'source', component: 'generate', config: {} }], sources: [{ operator_id: 'kept-source', input_type: 'generate' }], sinks: [], edges: [] },
+    job_id: 'orders',
+    version: 3,
+    generation: 7,
+    desired_state: 'stopped',
+    state: 'stopped',
+    node_ids: [],
+    spec: {
+      id: 'orders',
+      version: 3,
+      operators: [{ id: 'kept-source', kind: 'source', component: 'generate', config: {} }],
+      sources: [{ operator_id: 'kept-source', input_type: 'generate' }],
+      sinks: [],
+      edges: [],
+    },
   }
 
   it('resets the draft when the editor target switches from create to upgrade', async () => {
     globalThis.fetch = editorFetchMock() as unknown as typeof fetch
-    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    const view = render(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
     await screen.findByText('generate')
     fireEvent.click(view.getByRole('button', { name: /generate/ }))
     await view.findAllByText('generate-1')
     // Switch the same mounted editor to an upgrade target.
-    view.rerender(<JobEditor mode="upgrade" job={upgradeJob as unknown as Job} savepoint={{ checkpoint_id: 'sp-1', kind: 'savepoint', status: 'completed', job_version: 3, format_version: 1, created_at_ms: 1 } as unknown as JobCheckpoint} nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    view.rerender(
+      <JobEditor
+        mode="upgrade"
+        job={upgradeJob as unknown as Job}
+        savepoint={
+          {
+            checkpoint_id: 'sp-1',
+            kind: 'savepoint',
+            status: 'completed',
+            job_version: 3,
+            format_version: 1,
+            created_at_ms: 1,
+          } as unknown as JobCheckpoint
+        }
+        nodes={[]}
+        busy={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
     // The create draft is gone: the editor shows the target Job's id.
     await view.findByDisplayValue('orders')
     expect(view.queryByText('generate-1')).toBeNull()
@@ -188,7 +429,20 @@ describe('job editor determinism', () => {
   it('generates collision-free node ids across add/delete/add', async () => {
     const fetchMock = editorFetchMock()
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    const view = render(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
     await screen.findAllByRole('button', { name: /generate/ })
     fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
     await view.findByRole('button', { name: 'Delete node' })
@@ -198,8 +452,10 @@ describe('job editor determinism', () => {
     fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
     await view.findByRole('button', { name: 'Delete node' })
     fireEvent.click(view.getByRole('button', { name: 'Validate Plan' }))
-    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/jobs/validate'))).toBe(true))
-    const validateCall = fetchMock.mock.calls.find(call => call[0].endsWith('/jobs/validate'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/jobs/validate'))).toBe(true),
+    )
+    const validateCall = fetchMock.mock.calls.find((call) => call[0].endsWith('/jobs/validate'))
     const body = JSON.parse((validateCall?.at(1) as RequestInit | undefined)?.body as string)
     const operatorIds = body.spec.operators.map((operator: { id: string }) => operator.id)
     expect(new Set(operatorIds).size).toBe(operatorIds.length)
@@ -211,12 +467,33 @@ describe('job editor determinism', () => {
   it('does not unlock submission for a graph edited while validating', async () => {
     let releaseValidation: (() => void) | undefined
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/components')) return Promise.resolve({ ok: true, json: async () => componentCatalogue })
-      if (url.endsWith('/jobs/validate')) return new Promise(resolve => { releaseValidation = () => resolve({ ok: true, json: async () => ({ valid: true, warnings: [], required_capabilities: [], nodes: [] }) }) })
+      if (url.endsWith('/components'))
+        return Promise.resolve({ ok: true, json: async () => componentCatalogue })
+      if (url.endsWith('/jobs/validate'))
+        return new Promise((resolve) => {
+          releaseValidation = () =>
+            resolve({
+              ok: true,
+              json: async () => ({ valid: true, warnings: [], required_capabilities: [], nodes: [] }),
+            })
+        })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(<JobEditor mode="create" nodes={[]} busy={false} onClose={vi.fn()} onError={vi.fn()} onSaved={vi.fn()} onRefresh={vi.fn()} onAction={async (_label, fn) => { await fn() }} />)
+    const view = render(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
     await screen.findAllByRole('button', { name: /generate/ })
     fireEvent.click(view.getAllByRole('button', { name: /generate/ })[0])
     await view.findByRole('button', { name: 'Delete node' })
@@ -227,7 +504,9 @@ describe('job editor determinism', () => {
     await view.findByRole('button', { name: 'Delete node' })
     // ...then let the stale response arrive.
     releaseValidation?.()
-    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/jobs/validate')).length).toBe(1))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/jobs/validate')).length).toBe(1),
+    )
     expect(view.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
   })
 })

@@ -1,1 +1,0 @@
-export { Configuration } from '../features'
