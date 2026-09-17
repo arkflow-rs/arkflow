@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\""
   },
   "dependencies": {
     "@xyflow/react": "^12.11.2",
@@ -22,6 +24,7 @@
     "@types/react-dom": "18.3.1",
     "@vitejs/plugin-react": "6.0.5",
     "jsdom": "25.0.1",
+    "prettier": "^3.9.7",
     "typescript": "5.6.3",
     "vite": "8.2.0",
     "vitest": "4.1.10"

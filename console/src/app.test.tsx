@@ -8,20 +8,62 @@ beforeEach(() => {
   fetchMock.mockReset()
   globalThis.fetch = fetchMock
   window.history.replaceState(null, '', '/')
-  fetchMock.mockImplementation((url: string) => Promise.resolve({ ok: true, json: async () => {
-    if (url.endsWith('/system')) return { version: 'test', state: 'running', uptime_seconds: 4, streams_total: 1, streams_running: 1, streams_failed: 0, capabilities: [] }
-    if (url.includes('/nodes?')) return page([{ id: 'local-node', role: 'standalone', version: 'test', state: 'running', capabilities: [], streams_total: 1, streams_running: 1, streams_failed: 0 }])
-    if (url.includes('/streams')) return page([{ id: 'orders', state: 'running', metrics: { input_messages: 3, output_messages: 2 }, last_error: undefined }])
-    return page([])
-  } }))
+  fetchMock.mockImplementation((url: string) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (url.endsWith('/system'))
+          return {
+            version: 'test',
+            state: 'running',
+            uptime_seconds: 4,
+            streams_total: 1,
+            streams_running: 1,
+            streams_failed: 0,
+            capabilities: [],
+          }
+        if (url.includes('/nodes?'))
+          return page([
+            {
+              id: 'local-node',
+              role: 'standalone',
+              version: 'test',
+              state: 'running',
+              capabilities: [],
+              streams_total: 1,
+              streams_running: 1,
+              streams_failed: 0,
+            },
+          ])
+        if (url.includes('/streams'))
+          return page([
+            {
+              id: 'orders',
+              state: 'running',
+              metrics: { input_messages: 3, output_messages: 2 },
+              last_error: undefined,
+            },
+          ])
+        return page([])
+      },
+    }),
+  )
 })
-afterEach(() => { cleanup(); vi.restoreAllMocks() })
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('console application', () => {
   it('renders dashboard state and stream metrics', async () => {
     render(<App />)
     expect(await screen.findByText('Fleet health')).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/nodes?page=1&page_size=50'), expect.objectContaining({ headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }) }))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/nodes?page=1&page_size=50'),
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }),
+      }),
+    )
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     expect(screen.getByText(/3 input messages/)).toBeInTheDocument()
   })
@@ -32,16 +74,32 @@ describe('console application', () => {
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     await screen.findByText('orders')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
-    await waitFor(() => expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/stop'), expect.anything()))
+    await waitFor(() =>
+      expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/stop'), expect.anything()),
+    )
   })
 
   it('keeps redacted configuration values as display-only content', async () => {
-    fetchMock.mockImplementation((url: string) => Promise.resolve({ ok: true, json: async () => {
-      if (url.endsWith('/system')) return { version: 'test', state: 'running', uptime_seconds: 4, streams_total: 0, streams_running: 0, streams_failed: 0, capabilities: [] }
-      if (url.includes('/nodes?')) return page([])
-      if (url.includes('/configuration')) return {}
-      return page([])
-    } }))
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return {
+              version: 'test',
+              state: 'running',
+              uptime_seconds: 4,
+              streams_total: 0,
+              streams_running: 0,
+              streams_failed: 0,
+              capabilities: [],
+            }
+          if (url.includes('/nodes?')) return page([])
+          if (url.includes('/configuration')) return {}
+          return page([])
+        },
+      }),
+    )
     render(<App />)
     fireEvent.click(screen.getByText('Configuration', { selector: 'a' }))
     expect(screen.getByLabelText('Configuration editor')).toBeInTheDocument()
@@ -57,12 +115,43 @@ describe('console application', () => {
   })
 
   it('selects a node and disables mutations when its lease is stale', async () => {
-    fetchMock.mockImplementation((url: string) => Promise.resolve({ ok: true, json: async () => {
-      if (url.endsWith('/system')) return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
-      if (url.includes('/nodes?')) return page([{ id: 'node-a', state: 'stale', capabilities: [], last_seen_at_ms: Date.now() - 5000, lease_expires_at_ms: Date.now() - 1000, streams_total: 1, streams_running: 1, streams_failed: 0 }])
-      if (url.includes('/streams')) return { items: [{ id: 'orders', node_id: 'node-a', state: 'running', metrics: { input_messages: 0, output_messages: 0 } }], page: 1, page_size: 1, total: 1 }
-      return { items: [], page: 1, page_size: 0, total: 0 }
-    } }))
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+          if (url.includes('/nodes?'))
+            return page([
+              {
+                id: 'node-a',
+                state: 'stale',
+                capabilities: [],
+                last_seen_at_ms: Date.now() - 5000,
+                lease_expires_at_ms: Date.now() - 1000,
+                streams_total: 1,
+                streams_running: 1,
+                streams_failed: 0,
+              },
+            ])
+          if (url.includes('/streams'))
+            return {
+              items: [
+                {
+                  id: 'orders',
+                  node_id: 'node-a',
+                  state: 'running',
+                  metrics: { input_messages: 0, output_messages: 0 },
+                },
+              ],
+              page: 1,
+              page_size: 1,
+              total: 1,
+            }
+          return { items: [], page: 1, page_size: 0, total: 0 }
+        },
+      }),
+    )
     render(<App />)
     const selector = await screen.findByLabelText('Compute node')
     fireEvent.change(selector, { target: { value: 'node-a' } })
@@ -75,31 +164,133 @@ describe('console application', () => {
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     let operationReads = 0
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => Promise.resolve({ ok: true, json: async () => {
-      if (url.endsWith('/system')) return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
-      if (url.includes('/nodes?')) return page([{ id: 'node-a', state: 'online', capabilities: ['stream_lifecycle'], streams_total: 1, streams_running: 1, streams_failed: 0 }])
-      if (url.includes('/operations/hop-1')) { operationReads += 1; return { id: 'hop-1', operation: 'start', resource_type: 'stream', resource_id: 'orders', node_id: 'node-a', state: 'succeeded', progress: 100, created_at_ms: 1, correlation_id: 'console-test' } }
-      if (url.includes('/operations?')) return page([{ id: 'hop-1', operation: 'start', resource_type: 'stream', resource_id: 'orders', node_id: 'node-a', state: operationReads ? 'succeeded' : 'queued', progress: operationReads ? 100 : 0, created_at_ms: 1, correlation_id: 'console-test' }])
-      if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start')) return { id: 'hop-1', operation: 'start', resource_type: 'stream', resource_id: 'orders', node_id: 'node-a', state: 'queued', progress: 0, created_at_ms: 1, correlation_id: 'console-test' }
-      if (url.includes('/streams')) return page([{ id: 'orders', node_id: 'node-a', state: 'running', metrics: { input_messages: 0, output_messages: 0 } }])
-      return page([])
-    } }))
+    fetchMock.mockImplementation((url: string, init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+          if (url.includes('/nodes?'))
+            return page([
+              {
+                id: 'node-a',
+                state: 'online',
+                capabilities: ['stream_lifecycle'],
+                streams_total: 1,
+                streams_running: 1,
+                streams_failed: 0,
+              },
+            ])
+          if (url.includes('/operations/hop-1')) {
+            operationReads += 1
+            return {
+              id: 'hop-1',
+              operation: 'start',
+              resource_type: 'stream',
+              resource_id: 'orders',
+              node_id: 'node-a',
+              state: 'succeeded',
+              progress: 100,
+              created_at_ms: 1,
+              correlation_id: 'console-test',
+            }
+          }
+          if (url.includes('/operations?'))
+            return page([
+              {
+                id: 'hop-1',
+                operation: 'start',
+                resource_type: 'stream',
+                resource_id: 'orders',
+                node_id: 'node-a',
+                state: operationReads ? 'succeeded' : 'queued',
+                progress: operationReads ? 100 : 0,
+                created_at_ms: 1,
+                correlation_id: 'console-test',
+              },
+            ])
+          if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
+            return {
+              id: 'hop-1',
+              operation: 'start',
+              resource_type: 'stream',
+              resource_id: 'orders',
+              node_id: 'node-a',
+              state: 'queued',
+              progress: 0,
+              created_at_ms: 1,
+              correlation_id: 'console-test',
+            }
+          if (url.includes('/streams'))
+            return page([
+              {
+                id: 'orders',
+                node_id: 'node-a',
+                state: 'running',
+                metrics: { input_messages: 0, output_messages: 0 },
+              },
+            ])
+          return page([])
+        },
+      }),
+    )
     render(<App />)
     fireEvent.change(await screen.findByLabelText('Compute node'), { target: { value: 'node-a' } })
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
     expect(await screen.findByText('succeeded')).toBeInTheDocument()
     expect(operationReads).toBeGreaterThan(0)
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/nodes/node-a/streams/orders/start'), expect.objectContaining({ headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }) }))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/nodes/node-a/streams/orders/start'),
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }),
+      }),
+    )
   })
 
   it('shows a permission failure without retrying the mutation', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start')) return Promise.resolve({ ok: false, status: 403, headers: new Headers(), json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }) })
-      if (url.endsWith('/system')) return Promise.resolve({ ok: true, json: async () => ({ version: 'hub', state: 'running', node_count: 1, capabilities: [] }) })
-      if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => page([{ id: 'node-a', state: 'online', capabilities: ['stream_lifecycle'], streams_total: 1, streams_running: 1, streams_failed: 0 }]) })
-      if (url.includes('/streams')) return Promise.resolve({ ok: true, json: async () => page([{ id: 'orders', node_id: 'node-a', state: 'running', metrics: { input_messages: 0, output_messages: 0 } }]) })
+      if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          headers: new Headers(),
+          json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
+        })
+      if (url.endsWith('/system'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ version: 'hub', state: 'running', node_count: 1, capabilities: [] }),
+        })
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                state: 'online',
+                capabilities: ['stream_lifecycle'],
+                streams_total: 1,
+                streams_running: 1,
+                streams_failed: 0,
+              },
+            ]),
+        })
+      if (url.includes('/streams'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'orders',
+                node_id: 'node-a',
+                state: 'running',
+                metrics: { input_messages: 0, output_messages: 0 },
+              },
+            ]),
+        })
       return Promise.resolve({ ok: true, json: async () => page([]) })
     })
     render(<App />)
@@ -107,6 +298,8 @@ describe('console application', () => {
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
     expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
-    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST')).toHaveLength(1)
+    expect(
+      fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
+    ).toHaveLength(1)
   })
 })

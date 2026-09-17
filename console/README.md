@@ -38,3 +38,28 @@ VITE_API_TOKEN=operator-secret npm run dev
 ```
 
 Vite reads this value at startup, so restart the dev server after changing it.
+
+## Checks
+
+CI runs the full gate for every change under `console/`
+(`.github/workflows/console.yml`):
+
+```bash
+npm run typecheck    # tsc --noEmit
+npm run format:check # prettier --check (format with: npm run format)
+npm test             # vitest
+npm run build        # tsc -b && vite build
+```
+
+## UI conventions
+
+- Navigation deep-links through `?page=` (and `?node_id=` for the node
+  filter), so views survive reloads and can be bookmarked.
+- Live SSE events coalesce into one debounced snapshot refresh
+  (`REFRESH_DEBOUNCE_MS`) instead of triggering a full fan-out per event;
+  polling cadences live as constants in `src/api.ts` and the Settings view
+  derives its copy from them.
+- List panels fetch the first server page and state the server-side total
+  when it exceeds what is shown (streams, operations, events).
+- Destructive actions still use native `window.confirm`; job and version
+  plans render in an in-app modal rather than `window.alert`.

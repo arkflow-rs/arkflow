@@ -1,86 +1,809 @@
 import { useEffect, useMemo, useState } from 'react'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import { api, Component, ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion, ControlEvent, ControlNode, EngineStatus, MetricsResponse, Operation, StreamStatus, SystemResource, Job, waitForOperation } from './api'
+import {
+  api,
+  Component,
+  ConfigCandidate,
+  ConfigDiff,
+  ConfigIssue,
+  ConfigVersion,
+  ControlEvent,
+  ControlNode,
+  EngineStatus,
+  errorMessage,
+  formatTime,
+  MetricsResponse,
+  Operation,
+  SNAPSHOT_INTERVAL_MS,
+  StreamStatus,
+  SystemResource,
+  Job,
+  waitForOperation,
+} from './api'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './features/component-browser'
 
-export type Snapshot = { system: SystemResource|null; status: EngineStatus|null; nodes: ControlNode[]; streams: StreamStatus[]; jobs: Job[]; operations: Operation[]; events: ControlEvent[]; metrics?: MetricsResponse }
-export type Command = (id: string, action: 'start'|'stop'|'restart') => Promise<void>
+export type Snapshot = {
+  system: SystemResource | null
+  status: EngineStatus | null
+  nodes: ControlNode[]
+  streams: StreamStatus[]
+  jobs: Job[]
+  operations: Operation[]
+  events: ControlEvent[]
+  metrics?: MetricsResponse
+  totals?: { nodes: number; streams: number; operations: number; events: number }
+}
+export type Command = (id: string, action: 'start' | 'stop' | 'restart') => Promise<void>
 
 export { Jobs } from './features/jobs'
 
-const number = (value: number|undefined) => value === undefined ? '—' : new Intl.NumberFormat().format(value)
-const time = (value?: number) => value ? new Date(value).toLocaleString() : '—'
-const active = (state: Operation['state']) => ['queued','dispatched','acknowledged','running'].includes(state)
+const number = (value: number | undefined) =>
+  value === undefined ? '—' : new Intl.NumberFormat().format(value)
+const active = (state: Operation['state']) =>
+  ['queued', 'dispatched', 'acknowledged', 'running'].includes(state)
 
-export function convertConfiguration(content: string, from: ConfigCandidate['format'], to: ConfigCandidate['format']): string {
+export function convertConfiguration(
+  content: string,
+  from: ConfigCandidate['format'],
+  to: ConfigCandidate['format'],
+): string {
   if (from === to) return content
-  if (from !== 'yaml' && from !== 'json') throw new Error(`${from.toUpperCase()} conversion is not available in the console`)
+  if (from !== 'yaml' && from !== 'json')
+    throw new Error(`${from.toUpperCase()} conversion is not available in the console`)
   const value = parseYaml(content)
   if (to === 'json') return JSON.stringify(value, null, 2)
   return stringifyYaml(value)
 }
 
-export function Overview({snapshot}:{snapshot:Snapshot}) {
-  const running = snapshot.streams.filter(stream => stream.state === 'running').length
-  const failed = snapshot.streams.filter(stream => stream.state === 'failed').length
-  const online = snapshot.nodes.filter(node => node.state === 'online').length
-  const stale = snapshot.nodes.filter(node => node.state !== 'online').length
-  const activeOperations = snapshot.operations.filter(operation => active(operation.state)).length
+export function Overview({ snapshot }: { snapshot: Snapshot }) {
+  const running = snapshot.streams.filter((stream) => stream.state === 'running').length
+  const failed = snapshot.streams.filter((stream) => stream.state === 'failed').length
+  const online = snapshot.nodes.filter((node) => node.state === 'online').length
+  const stale = snapshot.nodes.filter((node) => node.state !== 'online').length
+  const activeOperations = snapshot.operations.filter((operation) => active(operation.state)).length
   const metrics = snapshot.metrics?.aggregate ?? {}
-  return <>
-    <section className="cards">
-      <Card label="Control plane" value={snapshot.system?.state ?? 'Loading…'} hint={snapshot.system?.version}/>
-      <Card label="Nodes online" value={`${online}/${snapshot.nodes.length || snapshot.system?.node_count || 0}`} hint={stale ? `${stale} need attention` : 'All nodes healthy'}/>
-      <Card label="Streams running" value={`${running}/${snapshot.streams.length || snapshot.status?.streams_total || 0}`} hint={failed ? `${failed} failed` : 'No failures reported'}/>
-      <Card label="Active operations" value={activeOperations || snapshot.system?.active_operations || 0} hint="Queued and running"/>
-    </section>
-    <section className="overview-grid">
-      <section className="panel"><div className="panel-title"><h3>Fleet health</h3><span>{snapshot.nodes.length} registered</span></div>
-        {snapshot.nodes.length === 0 ? <p className="empty">No compute nodes connected.</p> : <div className="node-grid">{snapshot.nodes.map(node => <article className="node-card" key={node.id}><div className="panel-title"><strong>{node.id}</strong><span className={`state ${node.state}`}>{node.state}</span></div><small>Last seen {time(node.last_seen_at_ms)} · protocol {node.protocol_version ?? 'unknown'} · software {node.version}</small><div className="node-stats"><span><strong>{node.streams_running}</strong> running</span><span><strong>{node.streams_total}</strong> total</span><span><strong>{node.streams_failed}</strong> failed</span></div><small>{(node.capabilities ?? []).join(' · ') || 'No capabilities reported'}</small></article>)}</div>}
+  return (
+    <>
+      <section className="cards">
+        <Card
+          label="Control plane"
+          value={snapshot.system?.state ?? 'Loading…'}
+          hint={snapshot.system?.version}
+        />
+        <Card
+          label="Nodes online"
+          value={`${online}/${snapshot.nodes.length || snapshot.system?.node_count || 0}`}
+          hint={stale ? `${stale} need attention` : 'All nodes healthy'}
+        />
+        <Card
+          label="Streams running"
+          value={`${running}/${snapshot.streams.length || snapshot.status?.streams_total || 0}`}
+          hint={failed ? `${failed} failed` : 'No failures reported'}
+        />
+        <Card
+          label="Active operations"
+          value={activeOperations || snapshot.system?.active_operations || 0}
+          hint="Queued and running"
+        />
       </section>
-      <section className="panel"><div className="panel-title"><h3>Aggregate metrics</h3><span>Latest report</span></div><div className="metric-list">{Object.entries(metrics).length ? Object.entries(metrics).map(([key,value]) => <div className="metric" key={key}><span>{key.replaceAll('_',' ')}</span><strong>{number(value)}</strong></div>) : <p className="empty">No metrics reported yet.</p>}</div></section>
+      <section className="overview-grid">
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Fleet health</h3>
+            <span>{snapshot.nodes.length} registered</span>
+          </div>
+          {snapshot.nodes.length === 0 ? (
+            <p className="empty">No compute nodes connected.</p>
+          ) : (
+            <div className="node-grid">
+              {snapshot.nodes.map((node) => (
+                <article className="node-card" key={node.id}>
+                  <div className="panel-title">
+                    <strong>{node.id}</strong>
+                    <span className={`state ${node.state}`}>{node.state}</span>
+                  </div>
+                  <small>
+                    Last seen {formatTime(node.last_seen_at_ms)} · protocol{' '}
+                    {node.protocol_version ?? 'unknown'} · software {node.version}
+                  </small>
+                  <div className="node-stats">
+                    <span>
+                      <strong>{node.streams_running}</strong> running
+                    </span>
+                    <span>
+                      <strong>{node.streams_total}</strong> total
+                    </span>
+                    <span>
+                      <strong>{node.streams_failed}</strong> failed
+                    </span>
+                  </div>
+                  <small>{(node.capabilities ?? []).join(' · ') || 'No capabilities reported'}</small>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Aggregate metrics</h3>
+            <span>Latest report</span>
+          </div>
+          <div className="metric-list">
+            {Object.entries(metrics).length ? (
+              Object.entries(metrics).map(([key, value]) => (
+                <div className="metric" key={key}>
+                  <span>{key.replaceAll('_', ' ')}</span>
+                  <strong>{number(value)}</strong>
+                </div>
+              ))
+            ) : (
+              <p className="empty">No metrics reported yet.</p>
+            )}
+          </div>
+        </section>
+      </section>
+      <section className="panel">
+        <div className="panel-title">
+          <h3>Recent activity</h3>
+          <span>{snapshot.events.length} events</span>
+        </div>
+        {snapshot.events.length ? (
+          snapshot.events
+            .slice(0, 8)
+            .map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)
+        ) : (
+          <p className="empty">No recent events.</p>
+        )}
+      </section>
+    </>
+  )
+}
+
+export function Runtime({
+  streams,
+  operations,
+  events,
+  command,
+  canMutate = true,
+  onOperationChanged,
+  streamTotal,
+  operationTotal,
+}: {
+  streams: StreamStatus[]
+  operations: Operation[]
+  events?: ControlEvent[]
+  command: Command
+  canMutate?: boolean
+  onOperationChanged?: () => void
+  streamTotal?: number
+  operationTotal?: number
+}) {
+  const [filter, setFilter] = useState('')
+  const [state, setState] = useState('all')
+  const [page, setPage] = useState(1)
+  const [selected, setSelected] = useState<string>()
+  const filtered = useMemo(
+    () =>
+      streams.filter(
+        (stream) =>
+          (!filter ||
+            stream.id.toLowerCase().includes(filter.toLowerCase()) ||
+            (stream.node_id ?? '').toLowerCase().includes(filter.toLowerCase())) &&
+          (state === 'all' || stream.state === state),
+      ),
+    [streams, filter, state],
+  )
+  const pageSize = 8
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
+  const visible = filtered.slice((page - 1) * pageSize, page * pageSize)
+  const detail = streams.find((stream) => stream.id === selected)
+  useEffect(() => {
+    if (page > pages) setPage(pages)
+  }, [page, pages])
+  return (
+    <>
+      <section className="panel">
+        <div className="panel-title">
+          <h3>Stream runtimes</h3>
+          <span>
+            {filtered.length} matching resources
+            {streamTotal !== undefined && streamTotal > streams.length
+              ? ` · ${streamTotal} registered server-side`
+              : ''}
+          </span>
+        </div>
+        <div className="toolbar">
+          <input
+            aria-label="Stream filter"
+            placeholder="Filter by stream or node"
+            value={filter}
+            onChange={(event) => {
+              setFilter(event.target.value)
+              setPage(1)
+            }}
+          />
+          <select
+            aria-label="Stream state"
+            value={state}
+            onChange={(event) => {
+              setState(event.target.value)
+              setPage(1)
+            }}
+          >
+            <option value="all">All states</option>
+            {['running', 'starting', 'stopped', 'failed', 'restarting'].map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+        </div>
+        {visible.length === 0 ? (
+          <p className="empty">No streams match the current filters.</p>
+        ) : (
+          <div className="table">
+            {visible.map((stream) => (
+              <div
+                className={`row ${selected === stream.id ? 'selected' : ''}`}
+                key={`${stream.node_id ?? 'local'}:${stream.id}`}
+              >
+                <button className="link-button" onClick={() => setSelected(stream.id)}>
+                  <strong>{stream.id}</strong>
+                  <small>
+                    {stream.node_id ?? 'local-node'} · desired: {stream.desired_state ?? 'unknown'} ·
+                    generation {stream.desired_generation ?? '—'}
+                  </small>
+                </button>
+                <div>
+                  <span className={`state ${stream.state}`}>{stream.state}</span>
+                  <small>
+                    convergence: {stream.convergence ?? 'unknown'} · observed generation{' '}
+                    {stream.observed_generation ?? '—'}
+                  </small>
+                  <small>
+                    {number(stream.metrics.input_messages)} input messages ·{' '}
+                    {number(stream.metrics.output_messages)} output messages
+                  </small>
+                </div>
+                <div className="actions">
+                  {(['start', 'stop', 'restart'] as const).map((action) => (
+                    <button
+                      disabled={!canMutate}
+                      key={action}
+                      onClick={() => {
+                        if (window.confirm(`${action} ${stream.id}?`)) void command(stream.id, action)
+                      }}
+                    >
+                      {action[0].toUpperCase() + action.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        <Pagination page={page} pages={pages} onChange={setPage} />
+      </section>
+      {detail && (
+        <RuntimeDetail
+          stream={detail}
+          operations={operations.filter((operation) => operation.resource_id === detail.id)}
+          events={(events ?? []).filter((event) => event.stream_id === detail.id)}
+          onClose={() => setSelected(undefined)}
+        />
+      )}
+      <section className="panel">
+        <div className="panel-title">
+          <h3>Administrative operations</h3>
+          <span>
+            {operations.filter((operation) => active(operation.state)).length} active
+            {operationTotal !== undefined && operationTotal > operations.length
+              ? ` · ${operationTotal} recorded server-side`
+              : ''}
+          </span>
+        </div>
+        {operations.length ? (
+          operations
+            .slice(0, 12)
+            .map((operation) => (
+              <OperationRow operation={operation} onChanged={onOperationChanged} key={operation.id} />
+            ))
+        ) : (
+          <p className="empty">No operations recorded.</p>
+        )}
+      </section>
+    </>
+  )
+}
+
+function RuntimeDetail({
+  stream,
+  operations,
+  events,
+  onClose,
+}: {
+  stream: StreamStatus
+  operations: Operation[]
+  events: ControlEvent[]
+  onClose: () => void
+}) {
+  return (
+    <section className="panel detail">
+      <div className="panel-title">
+        <div>
+          <span className="eyebrow">STREAM DETAIL</span>
+          <h3>{stream.id}</h3>
+        </div>
+        <button onClick={onClose}>Close</button>
+      </div>
+      <div className="detail-grid">
+        <div>
+          <span className={`state ${stream.state}`}>{stream.state}</span>
+          <p>
+            Node: <strong>{stream.node_id ?? 'local-node'}</strong>
+          </p>
+          <p>
+            Desired: <strong>{stream.desired_state ?? 'unknown'}</strong> · generation{' '}
+            {stream.desired_generation ?? '—'}
+          </p>
+          <p>
+            Observed: <strong>{stream.state}</strong> · generation {stream.observed_generation ?? '—'}
+          </p>
+          <p>
+            Convergence: <strong>{stream.convergence ?? 'unknown'}</strong>
+          </p>
+          <p>
+            Config: {stream.desired_config_version ?? 'none'} → {stream.observed_config_version ?? 'unknown'}
+          </p>
+          <p>
+            Retry: {stream.retry_count ?? 0}
+            {stream.next_retry_at_ms ? ` · next ${formatTime(stream.next_retry_at_ms)}` : ''}
+          </p>
+          <p>Active operation: {stream.active_operation_id ?? 'None'}</p>
+        </div>
+        <div className="metric-list">
+          <div className="metric">
+            <span>Input messages</span>
+            <strong>{number(stream.metrics.input_messages)}</strong>
+          </div>
+          <div className="metric">
+            <span>Output messages</span>
+            <strong>{number(stream.metrics.output_messages)}</strong>
+          </div>
+          <div className="metric">
+            <span>Processing errors</span>
+            <strong>{number(stream.metrics.processing_errors)}</strong>
+          </div>
+        </div>
+      </div>
+      {stream.last_error && (
+        <div className="error-row">
+          <strong>{stream.last_error.stage}</strong> {stream.last_error.message} ·{' '}
+          {formatTime(stream.last_error.occurred_at_ms)}
+        </div>
+      )}
+      <h4>Operation history</h4>
+      {operations.length ? (
+        operations.map((operation) => <OperationRow operation={operation} key={operation.id} />)
+      ) : (
+        <p className="empty">No operation history.</p>
+      )}
+      <h4>Related events</h4>
+      {events.length ? (
+        events.map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)
+      ) : (
+        <p className="empty">No related events.</p>
+      )}
     </section>
-    <section className="panel"><div className="panel-title"><h3>Recent activity</h3><span>{snapshot.events.length} events</span></div>{snapshot.events.length ? snapshot.events.slice(0,8).map((event,index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`}/>) : <p className="empty">No recent events.</p>}</section>
-  </>
+  )
 }
 
-export function Runtime({streams,operations,events,command,canMutate=true,onOperationChanged}:{streams:StreamStatus[];operations:Operation[];events?:ControlEvent[];command:Command;canMutate?:boolean;onOperationChanged?:()=>void}) {
-  const [filter,setFilter] = useState(''); const [state,setState] = useState('all'); const [page,setPage] = useState(1); const [selected,setSelected] = useState<string>()
-  const filtered = useMemo(() => streams.filter(stream => (!filter || stream.id.toLowerCase().includes(filter.toLowerCase()) || (stream.node_id ?? '').toLowerCase().includes(filter.toLowerCase())) && (state === 'all' || stream.state === state)), [streams,filter,state])
-  const pageSize = 8; const pages = Math.max(1,Math.ceil(filtered.length/pageSize)); const visible = filtered.slice((page-1)*pageSize,page*pageSize); const detail = streams.find(stream => stream.id === selected)
-  useEffect(() => { if (page > pages) setPage(pages) }, [page,pages])
-  return <>
-    <section className="panel"><div className="panel-title"><h3>Stream runtimes</h3><span>{filtered.length} matching resources</span></div><div className="toolbar"><input aria-label="Stream filter" placeholder="Filter by stream or node" value={filter} onChange={event=>{setFilter(event.target.value);setPage(1)}}/><select aria-label="Stream state" value={state} onChange={event=>{setState(event.target.value);setPage(1)}}><option value="all">All states</option>{['running','starting','stopped','failed','restarting'].map(value=><option key={value}>{value}</option>)}</select></div>
-      {visible.length === 0 ? <p className="empty">No streams match the current filters.</p> : <div className="table">{visible.map(stream => <div className={`row ${selected === stream.id ? 'selected' : ''}`} key={`${stream.node_id ?? 'local'}:${stream.id}`}><button className="link-button" onClick={()=>setSelected(stream.id)}><strong>{stream.id}</strong><small>{stream.node_id ?? 'local-node'} · desired: {stream.desired_state ?? 'unknown'} · generation {stream.desired_generation ?? '—'}</small></button><div><span className={`state ${stream.state}`}>{stream.state}</span><small>convergence: {stream.convergence ?? 'unknown'} · observed generation {stream.observed_generation ?? '—'}</small><small>{number(stream.metrics.input_messages)} input messages · {number(stream.metrics.output_messages)} output messages</small></div><div className="actions">{(['start','stop','restart'] as const).map(action=><button disabled={!canMutate} key={action} onClick={()=>{if(window.confirm(`${action} ${stream.id}?`))void command(stream.id,action)}}>{action[0].toUpperCase()+action.slice(1)}</button>)}</div></div>)}</div>}
-      <Pagination page={page} pages={pages} onChange={setPage}/>
+export function Configuration({ onError, nodeId }: { onError: (message: string) => void; nodeId?: string }) {
+  const [content, setContent] = useState('streams: []\n')
+  const [format, setFormat] = useState<ConfigCandidate['format']>('yaml')
+  const [issues, setIssues] = useState<ConfigIssue[]>([])
+  const [validatedCandidate, setValidatedCandidate] = useState<string>()
+  const [versions, setVersions] = useState<ConfigVersion[]>([])
+  const [saved, setSaved] = useState('')
+  const [savedFormat, setSavedFormat] = useState<ConfigCandidate['format']>('yaml')
+  const [busy, setBusy] = useState('')
+  const [diff, setDiff] = useState<ConfigDiff>()
+  const [editable, setEditable] = useState(false)
+  const [activeSnapshot, setActiveSnapshot] = useState(false)
+  const candidate = { format, content }
+  const identity = `${format}\u0000${content}`
+  const dirty = content !== saved || format !== savedFormat
+  const validated = editable && !dirty && validatedCandidate === identity && issues.length === 0
+  const load = async () => {
+    try {
+      const [draft, config, history] = await Promise.all([
+        nodeId ? Promise.resolve(undefined) : api.draft(),
+        api.config(nodeId),
+        api.versions(nodeId),
+      ])
+      const next = draft ?? { format: 'json' as const, content: JSON.stringify(config, null, 2) }
+      setContent(next.content)
+      setFormat(next.format)
+      setSaved(next.content)
+      setSavedFormat(next.format)
+      setEditable(Boolean(draft))
+      setActiveSnapshot(!draft)
+      setVersions(history)
+      setIssues([])
+      setValidatedCandidate(undefined)
+    } catch (cause) {
+      onError(errorMessage(cause))
+    }
+  }
+  useEffect(() => {
+    void load()
+  }, [nodeId])
+  const run = async (label: string, action: () => Promise<unknown>) => {
+    try {
+      setBusy(label)
+      await action()
+      setBusy('')
+      return true
+    } catch (cause) {
+      setBusy('')
+      onError(errorMessage(cause))
+      return false
+    }
+  }
+  const validate = () =>
+    void run('Validating…', async () => {
+      const report = await api.validateConfig(candidate)
+      setIssues(report.errors)
+      setValidatedCandidate(report.valid ? identity : undefined)
+    })
+  const saveDraft = () =>
+    void run('Saving draft…', async () => {
+      await api.saveDraft(candidate)
+      setSaved(content)
+      setSavedFormat(format)
+      setEditable(true)
+      setActiveSnapshot(false)
+      setValidatedCandidate(undefined)
+    })
+  const publish = () =>
+    void run('Publishing…', async () => {
+      const operation = await api.applyConfig(candidate, nodeId)
+      await waitForOperation(operation.id)
+      await load()
+    })
+  const rollback = async (id: string) => {
+    if (!window.confirm(`Rollback ${id}?`)) return
+    await run('Rolling back…', async () => {
+      const operation = await api.rollback(id, nodeId)
+      await waitForOperation(operation.id)
+      await load()
+    })
+  }
+  const compare = async (id: string) => {
+    const to = versions.find((version) => version.id !== id)?.id
+    if (!to) return
+    await run('Comparing…', async () => setDiff(await api.diff(id, to)))
+  }
+  const changeFormat = (next: ConfigCandidate['format']) => {
+    if (next === format) return
+    try {
+      const converted = convertConfiguration(content, format, next)
+      setFormat(next)
+      setContent(converted)
+      setIssues([])
+      setValidatedCandidate(undefined)
+    } catch (cause) {
+      setIssues([
+        {
+          path: 'document',
+          message: `Cannot convert configuration: ${cause instanceof Error ? cause.message : String(cause)}`,
+        },
+      ])
+    }
+  }
+  return (
+    <section className="panel config">
+      <div className="panel-title">
+        <div>
+          <h3>Configuration {nodeId && `· ${nodeId}`}</h3>
+          <small>
+            {activeSnapshot
+              ? 'Active configuration is redacted and read-only'
+              : dirty
+                ? 'Unsaved draft'
+                : 'Draft is saved'}
+            {busy && ` · ${busy}`}
+            {!validated && ' · Validate current content before publishing'}
+          </small>
+        </div>
+        <div className="actions">
+          <select
+            aria-label="Configuration format"
+            value={format}
+            disabled={!editable || !!busy}
+            onChange={(event) => changeFormat(event.target.value as ConfigCandidate['format'])}
+          >
+            <option value="yaml">YAML</option>
+            <option value="json">JSON</option>
+          </select>
+          <button disabled={!editable || !dirty || !!busy} onClick={saveDraft}>
+            Save draft
+          </button>
+          <button disabled={!editable || !!busy} onClick={validate}>
+            Validate
+          </button>
+          <button disabled={!validated || !!busy} onClick={publish}>
+            Publish
+          </button>
+        </div>
+      </div>
+      <textarea
+        aria-label="Configuration editor"
+        value={content}
+        readOnly={!editable || !!busy}
+        onChange={(event) => {
+          setContent(event.target.value)
+          setIssues([])
+          setValidatedCandidate(undefined)
+        }}
+        spellCheck={false}
+      />
+      {issues.length > 0 && (
+        <div className="validation">
+          <strong>{issues.length} validation issue(s)</strong>
+          {issues.map((issue, index) => (
+            <p key={index}>
+              <strong>{issue.path || 'document'}</strong>: {issue.message}
+            </p>
+          ))}
+        </div>
+      )}
+      {versions.length > 0 && (
+        <>
+          <h3 className="subheading">Version history</h3>
+          {versions.map((version) => (
+            <div className="version" key={version.id}>
+              <span>
+                <strong>{version.id}</strong> · {version.format} · {formatTime(version.created_at_ms)}
+              </span>
+              <div className="actions">
+                <button disabled={versions.length < 2 || !!busy} onClick={() => void compare(version.id)}>
+                  Compare
+                </button>
+                <button disabled={!!busy} onClick={() => void rollback(version.id)}>
+                  Rollback
+                </button>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+      {diff && (
+        <div className="validation">
+          <strong>
+            Comparing {diff.from} → {diff.to}
+          </strong>
+          <p>
+            {diff.changed ? 'Content differs.' : 'No content changes.'} Formats:{' '}
+            {diff.from_format ?? 'unknown'} → {diff.to_format ?? 'unknown'}
+          </p>
+          <button onClick={() => setDiff(undefined)}>Close</button>
+        </div>
+      )}
     </section>
-    {detail && <RuntimeDetail stream={detail} operations={operations.filter(operation=>operation.resource_id===detail.id)} events={(events ?? []).filter(event=>event.stream_id===detail.id)} onClose={()=>setSelected(undefined)}/>}
-    <section className="panel"><div className="panel-title"><h3>Administrative operations</h3><span>{operations.filter(operation=>active(operation.state)).length} active</span></div>{operations.length ? operations.slice(0,12).map(operation=><OperationRow operation={operation} onChanged={onOperationChanged} key={operation.id}/>) : <p className="empty">No operations recorded.</p>}</section>
-  </>
+  )
 }
 
-function RuntimeDetail({stream,operations,events,onClose}:{stream:StreamStatus;operations:Operation[];events:ControlEvent[];onClose:()=>void}) { return <section className="panel detail"><div className="panel-title"><div><span className="eyebrow">STREAM DETAIL</span><h3>{stream.id}</h3></div><button onClick={onClose}>Close</button></div><div className="detail-grid"><div><span className={`state ${stream.state}`}>{stream.state}</span><p>Node: <strong>{stream.node_id ?? 'local-node'}</strong></p><p>Desired: <strong>{stream.desired_state ?? 'unknown'}</strong> · generation {stream.desired_generation ?? '—'}</p><p>Observed: <strong>{stream.state}</strong> · generation {stream.observed_generation ?? '—'}</p><p>Convergence: <strong>{stream.convergence ?? 'unknown'}</strong></p><p>Config: {stream.desired_config_version ?? 'none'} → {stream.observed_config_version ?? 'unknown'}</p><p>Retry: {stream.retry_count ?? 0}{stream.next_retry_at_ms ? ` · next ${time(stream.next_retry_at_ms)}` : ''}</p><p>Active operation: {stream.active_operation_id ?? 'None'}</p></div><div className="metric-list"><div className="metric"><span>Input messages</span><strong>{number(stream.metrics.input_messages)}</strong></div><div className="metric"><span>Output messages</span><strong>{number(stream.metrics.output_messages)}</strong></div><div className="metric"><span>Processing errors</span><strong>{number(stream.metrics.processing_errors)}</strong></div></div></div>{stream.last_error && <div className="error-row"><strong>{stream.last_error.stage}</strong> {stream.last_error.message} · {time(stream.last_error.occurred_at_ms)}</div>}<h4>Operation history</h4>{operations.length ? operations.map(operation=><OperationRow operation={operation} key={operation.id}/>) : <p className="empty">No operation history.</p>}<h4>Related events</h4>{events.length ? events.map((event,index)=><EventRow event={event} key={`${event.occurred_at_ms}-${index}`}/>) : <p className="empty">No related events.</p>}</section> }
-
-export function Configuration({onError,nodeId}:{onError:(message:string)=>void;nodeId?:string}) {
-  const [content,setContent] = useState('streams: []\n'); const [format,setFormat] = useState<ConfigCandidate['format']>('yaml'); const [issues,setIssues] = useState<ConfigIssue[]>([]); const [validatedCandidate,setValidatedCandidate] = useState<string>(); const [versions,setVersions] = useState<ConfigVersion[]>([]); const [saved,setSaved] = useState(''); const [savedFormat,setSavedFormat] = useState<ConfigCandidate['format']>('yaml'); const [busy,setBusy] = useState(''); const [diff,setDiff] = useState<ConfigDiff>(); const [editable,setEditable] = useState(false); const [activeSnapshot,setActiveSnapshot] = useState(false); const candidate={format,content}; const identity=`${format}\u0000${content}`; const dirty=content!==saved||format!==savedFormat; const validated=editable&&!dirty&&validatedCandidate===identity&&issues.length===0
-  const load=async()=>{try{const [draft,config,history]=await Promise.all([nodeId?Promise.resolve(undefined):api.draft(),api.config(nodeId),api.versions(nodeId)]);const next=draft ?? {format:'json' as const,content:JSON.stringify(config,null,2)};setContent(next.content);setFormat(next.format);setSaved(next.content);setSavedFormat(next.format);setEditable(Boolean(draft));setActiveSnapshot(!draft);setVersions(history);setIssues([]);setValidatedCandidate(undefined)}catch(cause){onError(errorMessage(cause))}}
-  useEffect(()=>{void load()},[nodeId])
-  const run=async(label:string, action:()=>Promise<unknown>)=>{try{setBusy(label);await action();setBusy('');return true}catch(cause){setBusy('');onError(errorMessage(cause));return false}}
-  const validate=()=>void run('Validating…',async()=>{const report=await api.validateConfig(candidate);setIssues(report.errors);setValidatedCandidate(report.valid?identity:undefined)})
-  const saveDraft=()=>void run('Saving draft…',async()=>{await api.saveDraft(candidate);setSaved(content);setSavedFormat(format);setEditable(true);setActiveSnapshot(false);setValidatedCandidate(undefined)})
-  const publish=()=>void run('Publishing…',async()=>{const operation=await api.applyConfig(candidate,nodeId);await waitForOperation(operation.id);await load()})
-  const rollback=async(id:string)=>{if(!window.confirm(`Rollback ${id}?`))return;await run('Rolling back…',async()=>{const operation=await api.rollback(id,nodeId);await waitForOperation(operation.id);await load()})}
-  const compare=async(id:string)=>{const to=versions.find(version=>version.id!==id)?.id;if(!to)return;await run('Comparing…',async()=>setDiff(await api.diff(id,to)))}
-  const changeFormat=(next:ConfigCandidate['format'])=>{if(next===format)return;try{const converted=convertConfiguration(content,format,next);setFormat(next);setContent(converted);setIssues([]);setValidatedCandidate(undefined)}catch(cause){setIssues([{path:'document',message:`Cannot convert configuration: ${cause instanceof Error?cause.message:String(cause)}`}])}}
-  return <section className="panel config"><div className="panel-title"><div><h3>Configuration {nodeId&&`· ${nodeId}`}</h3><small>{activeSnapshot?'Active configuration is redacted and read-only':dirty?'Unsaved draft':'Draft is saved'}{busy&&` · ${busy}`}{!validated&&' · Validate current content before publishing'}</small></div><div className="actions"><select aria-label="Configuration format" value={format} disabled={!editable||!!busy} onChange={event=>changeFormat(event.target.value as ConfigCandidate['format'])}><option value="yaml">YAML</option><option value="json">JSON</option></select><button disabled={!editable||!dirty||!!busy} onClick={saveDraft}>Save draft</button><button disabled={!editable||!!busy} onClick={validate}>Validate</button><button disabled={!validated||!!busy} onClick={publish}>Publish</button></div></div><textarea aria-label="Configuration editor" value={content} readOnly={!editable||!!busy} onChange={event=>{setContent(event.target.value);setIssues([]);setValidatedCandidate(undefined)}} spellCheck={false}/>{issues.length>0&&<div className="validation"><strong>{issues.length} validation issue(s)</strong>{issues.map((issue,index)=><p key={index}><strong>{issue.path||'document'}</strong>: {issue.message}</p>)}</div>}{versions.length>0&&<><h3 className="subheading">Version history</h3>{versions.map(version=><div className="version" key={version.id}><span><strong>{version.id}</strong> · {version.format} · {time(version.created_at_ms)}</span><div className="actions"><button disabled={versions.length<2||!!busy} onClick={()=>void compare(version.id)}>Compare</button><button disabled={!!busy} onClick={()=>void rollback(version.id)}>Rollback</button></div></div>)}</>}{diff&&<div className="validation"><strong>Comparing {diff.from} → {diff.to}</strong><p>{diff.changed?'Content differs.':'No content changes.'} Formats: {diff.from_format??'unknown'} → {diff.to_format??'unknown'}</p><button onClick={()=>setDiff(undefined)}>Close</button></div>}</section>
+export function Components({ onError }: { onError: (message: string) => void }) {
+  const [items, setItems] = useState<Component[]>([])
+  const [kind, setKind] = useState<ComponentKind>('input')
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<string>()
+  useEffect(() => {
+    api
+      .components()
+      .then(setItems)
+      .catch((cause) => onError(errorMessage(cause)))
+  }, [onError])
+  const visible = useMemo(() => filterComponents(items, kind, query), [items, kind, query])
+  useEffect(() => {
+    if (!visible.some((item) => `${item.kind}:${item.name}` === selected))
+      setSelected(visible[0] && `${visible[0].kind}:${visible[0].name}`)
+  }, [visible, selected])
+  const current = visible.find((item) => `${item.kind}:${item.name}` === selected)
+  return (
+    <section className="panel component-catalogue">
+      <div className="panel-title">
+        <div>
+          <h3>Component catalogue</h3>
+          <span>{items.length} registered</span>
+        </div>
+      </div>
+      <ComponentBrowserControls
+        kind={kind}
+        query={query}
+        onKindChange={setKind}
+        onQueryChange={setQuery}
+        count={visible.length}
+      />
+      <div className="component-browser">
+        <div className="component-list">
+          {visible.length ? (
+            visible.map((item) => (
+              <button
+                type="button"
+                className={current === item ? 'selected' : ''}
+                key={`${item.kind}-${item.name}`}
+                onClick={() => setSelected(`${item.kind}:${item.name}`)}
+              >
+                <strong>{item.name}</strong>
+                <small>{item.description ?? 'No description'}</small>
+              </button>
+            ))
+          ) : (
+            <p className="empty">No matching components.</p>
+          )}
+        </div>
+        <div className="component-detail">
+          {current ? (
+            <>
+              <span className="eyebrow">{current.kind}</span>
+              <h4>{current.name}</h4>
+              <p>{current.description ?? 'No description'}</p>
+              {current.example !== undefined && (
+                <details open>
+                  <summary>Example</summary>
+                  <pre className="schema">{JSON.stringify(current.example, null, 2)}</pre>
+                </details>
+              )}
+              <details>
+                <summary>Configuration schema</summary>
+                <pre className="schema">{JSON.stringify(current.schema ?? {}, null, 2)}</pre>
+              </details>
+            </>
+          ) : (
+            <p className="empty">Select a component to inspect its configuration.</p>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+export function Events({ events, total }: { events: ControlEvent[]; total?: number }) {
+  const [filter, setFilter] = useState('')
+  const visible = events.filter(
+    (event) =>
+      !filter ||
+      `${event.event_type} ${event.stream_id ?? ''} ${event.outcome} ${event.message ?? ''}`
+        .toLowerCase()
+        .includes(filter.toLowerCase()),
+  )
+  return (
+    <section className="panel">
+      <div className="panel-title">
+        <h3>Events</h3>
+        <div className="actions">
+          <input
+            aria-label="Event filter"
+            placeholder="Filter events"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+          />
+          <span>
+            {visible.length} matching
+            {total !== undefined && total > events.length ? ` · ${total} stored server-side` : ''}
+          </span>
+        </div>
+      </div>
+      {visible.length ? (
+        visible.map((event, i) => <EventRow event={event} key={i} />)
+      ) : (
+        <p className="empty">No matching events.</p>
+      )}
+    </section>
+  )
+}
+export function Settings({ status }: { status: EngineStatus | null }) {
+  return (
+    <section className="panel">
+      <div className="panel-title">
+        <h3>Settings</h3>
+        <span>Security and capability status</span>
+      </div>
+      <div className="settings-grid">
+        <p>
+          <small>API version</small>
+          <strong>v1</strong>
+        </p>
+        <p>
+          <small>Backend</small>
+          <strong>{status?.version ?? 'Loading…'}</strong>
+        </p>
+        <p>
+          <small>Snapshot polling</small>
+          <strong>every {SNAPSHOT_INTERVAL_MS / 1000} seconds</strong>
+        </p>
+      </div>
+      <p>
+        Credentials are read from build-time environment configuration and never rendered in the UI. Live
+        updates stream over SSE; the periodic snapshot is a fallback.
+      </p>
+    </section>
+  )
 }
 
-export function Components({onError}:{onError:(message:string)=>void}){const[items,setItems]=useState<Component[]>([]);const[kind,setKind]=useState<ComponentKind>('input');const[query,setQuery]=useState('');const[selected,setSelected]=useState<string>();useEffect(()=>{api.components().then(setItems).catch(cause=>onError(errorMessage(cause)))},[onError]);const visible=useMemo(()=>filterComponents(items,kind,query),[items,kind,query]);useEffect(()=>{if(!visible.some(item=>`${item.kind}:${item.name}`===selected))setSelected(visible[0]&&`${visible[0].kind}:${visible[0].name}`)},[visible,selected]);const current=visible.find(item=>`${item.kind}:${item.name}`===selected);return <section className="panel component-catalogue"><div className="panel-title"><div><h3>Component catalogue</h3><span>{items.length} registered</span></div></div><ComponentBrowserControls kind={kind} query={query} onKindChange={setKind} onQueryChange={setQuery} count={visible.length}/><div className="component-browser"><div className="component-list">{visible.length?visible.map(item=><button type="button" className={current===item?'selected':''} key={`${item.kind}-${item.name}`} onClick={()=>setSelected(`${item.kind}:${item.name}`)}><strong>{item.name}</strong><small>{item.description??'No description'}</small></button>):<p className="empty">No matching components.</p>}</div><div className="component-detail">{current?<><span className="eyebrow">{current.kind}</span><h4>{current.name}</h4><p>{current.description??'No description'}</p>{current.example!==undefined&&<details open><summary>Example</summary><pre className="schema">{JSON.stringify(current.example,null,2)}</pre></details>}<details><summary>Configuration schema</summary><pre className="schema">{JSON.stringify(current.schema??{},null,2)}</pre></details></>:<p className="empty">Select a component to inspect its configuration.</p>}</div></div></section>}
-export function Events({events}:{events:ControlEvent[]}){const[filter,setFilter]=useState('');const visible=events.filter(event=>!filter||`${event.event_type} ${event.stream_id??''} ${event.outcome} ${event.message??''}`.toLowerCase().includes(filter.toLowerCase()));return <section className="panel"><div className="panel-title"><h3>Events</h3><div className="actions"><input aria-label="Event filter" placeholder="Filter events" value={filter} onChange={event=>setFilter(event.target.value)}/><span>{visible.length} matching</span></div></div>{visible.length?visible.map((event,i)=><EventRow event={event} key={i}/>):<p className="empty">No matching events.</p>}</section>}
-export function Settings({status}:{status:EngineStatus|null}){return <section className="panel"><div className="panel-title"><h3>Settings</h3><span>Security and capability status</span></div><div className="settings-grid"><p><small>API version</small><strong>v1</strong></p><p><small>Backend</small><strong>{status?.version??'Loading…'}</strong></p><p><small>Polling</small><strong>5 seconds</strong></p></div><p>Credentials are read from build-time environment configuration and never rendered in the UI.</p></section>}
-
-function OperationRow({operation,onChanged}:{operation:Operation;onChanged?:()=>void}){return <div className="operation-row"><div><strong>{operation.operation}</strong><small>{operation.node_id??'local-node'} · {operation.resource_id} · generation {operation.generation ?? '—'} · {operation.id}{operation.correlation_id?` · ${operation.correlation_id}`:''}</small></div><div className="progress-wrap"><span className={`state ${operation.convergence_state ?? operation.state}`}>{operation.intent_state ?? operation.state}</span><progress max="100" value={operation.progress}/><small>{operation.progress}%{operation.retry_count ? ` · retry ${operation.retry_count}` : ''}</small></div><div>{active(operation.state)&&<button onClick={()=>void api.cancel(operation.id).then(()=>onChanged?.())}>Cancel</button>}{operation.failure_class&&<small className="error-text">{operation.failure_class}</small>}{operation.error&&<small className="error-text">{operation.error}</small>}</div></div>}
-function EventRow({event}:{event:ControlEvent}){return <div className="event-row"><strong>{event.event_type}</strong><span>{event.stream_id??'system'} · {event.outcome}</span><small>{time(event.occurred_at_ms)}{event.operation_id?` · ${event.operation_id}`:''}</small>{event.message&&<p>{event.message}</p>}</div>}
-function Pagination({page,pages,onChange}:{page:number;pages:number;onChange:(page:number)=>void}){return pages<=1?null:<div className="pagination"><button disabled={page===1} onClick={()=>onChange(page-1)}>Previous</button><span>Page {page} of {pages}</span><button disabled={page===pages} onClick={()=>onChange(page+1)}>Next</button></div>}
-function Card({label,value,hint}:{label:string;value:string|number;hint?:string}){return <div className="card"><span>{label}</span><strong>{value}</strong>{hint&&<small>{hint}</small>}</div>}
-function errorMessage(cause:unknown){return typeof cause==='object'&&cause&&'message'in cause?String(cause.message):cause instanceof Error?cause.message:'Control API unavailable'}
+function OperationRow({ operation, onChanged }: { operation: Operation; onChanged?: () => void }) {
+  return (
+    <div className="operation-row">
+      <div>
+        <strong>{operation.operation}</strong>
+        <small>
+          {operation.node_id ?? 'local-node'} · {operation.resource_id} · generation{' '}
+          {operation.generation ?? '—'} · {operation.id}
+          {operation.correlation_id ? ` · ${operation.correlation_id}` : ''}
+        </small>
+      </div>
+      <div className="progress-wrap">
+        <span className={`state ${operation.convergence_state ?? operation.state}`}>
+          {operation.intent_state ?? operation.state}
+        </span>
+        <progress max="100" value={operation.progress} />
+        <small>
+          {operation.progress}%{operation.retry_count ? ` · retry ${operation.retry_count}` : ''}
+        </small>
+      </div>
+      <div>
+        {active(operation.state) && (
+          <button onClick={() => void api.cancel(operation.id).then(() => onChanged?.())}>Cancel</button>
+        )}
+        {operation.failure_class && <small className="error-text">{operation.failure_class}</small>}
+        {operation.error && <small className="error-text">{operation.error}</small>}
+      </div>
+    </div>
+  )
+}
+function EventRow({ event }: { event: ControlEvent }) {
+  return (
+    <div className="event-row">
+      <strong>{event.event_type}</strong>
+      <span>
+        {event.stream_id ?? 'system'} · {event.outcome}
+      </span>
+      <small>
+        {formatTime(event.occurred_at_ms)}
+        {event.operation_id ? ` · ${event.operation_id}` : ''}
+      </small>
+      {event.message && <p>{event.message}</p>}
+    </div>
+  )
+}
+function Pagination({
+  page,
+  pages,
+  onChange,
+}: {
+  page: number
+  pages: number
+  onChange: (page: number) => void
+}) {
+  return pages <= 1 ? null : (
+    <div className="pagination">
+      <button disabled={page === 1} onClick={() => onChange(page - 1)}>
+        Previous
+      </button>
+      <span>
+        Page {page} of {pages}
+      </span>
+      <button disabled={page === pages} onClick={() => onChange(page + 1)}>
+        Next
+      </button>
+    </div>
+  )
+}
+function Card({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
+  return (
+    <div className="card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      {hint && <small>{hint}</small>}
+    </div>
+  )
+}
