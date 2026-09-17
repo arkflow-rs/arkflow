@@ -97,6 +97,10 @@ fn deep_validate(path: &Path) -> Result<(), String> {
 async fn registered_examples_validate_offline() {
     arkflow_plugin::initialize().expect("component catalogue registers");
 
+    // Examples reference auxiliary files (e.g. .proto descriptors) relative to
+    // the repository root, matching how users run the binary from there.
+    std::env::set_current_dir(repo_root()).expect("chdir to repository root");
+
     let mut failures = Vec::new();
     for (name, path, validate, reason) in manifest_entries() {
         if validate == Some(false) {

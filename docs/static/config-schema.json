@@ -1648,7 +1648,8 @@
               "poll_interval": "10s",
               "input_type": {
                 "type": "sqlite",
-                "uri": "file:./data.db"
+                "name": "users",
+                "path": "./data.db"
               }
             }
           ]

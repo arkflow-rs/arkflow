@@ -4,29 +4,16 @@ streams:
   - input:
       type: "sql"
       input_type:
-        type: "json"
-        #      input_type: "csv"
-        path: 's3://test/stream_data.json'
-        object_store:
-          type: s3
-          endpoint: "http://localhost:9000"
-          region: "us-east-1"
-          bucket_name: "test"
-          access_key_id: "XlmP2GPWWIyppydCmtb7"
-          secret_access_key: "7wDf9WyuLGtz5LsWHtO5BkGdqU0HqIhRpvNuL9ui"
-          allow_http: true
-      #      path: './examples/input_data.csv'
-      select_sql: |
-        select *,value + 999999 from flow;
-    
-    
+        type: "sqlite"
+        name: "flow"
+        path: "./data/flow.db"
+      select_sql: "SELECT *, value + 999999 AS adjusted_value FROM flow"
 
     pipeline:
       thread_num: 4
       processors:
         - type: "sql"
           query: "SELECT * FROM flow"
-
 
     output:
       type: "stdout"

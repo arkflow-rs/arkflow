@@ -169,6 +169,7 @@ struct CommonProtobufProcessorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArrowToProtobufProcessorConfig {
+    #[serde(flatten)]
     c: CommonProtobufProcessorConfig,
     fields_to_include: Option<HashSet<String>>,
 }
