@@ -27,6 +27,7 @@ use arkflow_core::{Bytes, Error, MessageBatch, Resource};
 use async_trait::async_trait;
 use apache_avro::Schema as AvroSchema;
 use dashmap::DashMap;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -34,6 +35,29 @@ use prost_reflect::MessageDescriptor;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Characters percent-encoded when a registry subject is placed into the URL
+/// path: `/` splits path segments, `?`/`#` start query/fragment, `%`
+/// introduces an escape, and the remainder are controls or illegal in a path
+/// per RFC 3986. Legal path characters (`:`, `@`, sub-delims) are preserved so
+/// Confluent context subjects like `:ctx:subject` stay readable.
+const SUBJECT_PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// A schema fetched from the registry, typed by the registry's `schemaType`.
 #[derive(Debug, Clone)]
@@ -320,11 +344,9 @@ impl SchemaResolver for RestSchemaResolver {
     }
 
     async fn fetch_subject_compatibility(&self, subject: &str) -> Result<String, Error> {
+        let encoded = utf8_percent_encode(subject, SUBJECT_PATH_SEGMENT);
         let body: SubjectConfigResponse = self
-            .get_json(&format!(
-                "/config/{}?defaultToGlobal=true",
-                subject
-            ))
+            .get_json(&format!("/config/{encoded}?defaultToGlobal=true"))
             .await?;
         body.compatibility_level.ok_or_else(|| {
             Error::Process(format!(
@@ -988,6 +1010,29 @@ mod tests {
         let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
         let level = resolver.fetch_subject_compatibility("orders").await.unwrap();
         assert_eq!(level, "FULL_TRANSITIVE");
+    }
+
+    #[tokio::test]
+    async fn test_rest_resolver_subject_compatibility_percent_encodes_subject() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // `orders/v2 prod%final` must arrive as one encoded path segment,
+        // not as nested paths / a broken escape sequence.
+        Mock::given(method("GET"))
+            .and(path("/config/orders%2Fv2%20prod%25final"))
+            .and(query_param("defaultToGlobal", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"compatibilityLevel": "BACKWARD"}),
+            ))
+            .mount(&server)
+            .await;
+        let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
+        let level = resolver
+            .fetch_subject_compatibility("orders/v2 prod%final")
+            .await
+            .unwrap();
+        assert_eq!(level, "BACKWARD");
     }
 
     #[test]

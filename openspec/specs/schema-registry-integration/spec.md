@@ -82,7 +82,7 @@ codec 对 Avro payload SHALL 按 writer schema 解析为 Avro 值，并按扁平
 - **THEN** 各自用对应版本 schema 解码，互不干扰
 
 ### Requirement: 主题兼容性门禁
-codec SHALL 支持可选配置 `subject` 与 `min_compatibility`（`none`/`backward`/`forward`/`full`，缺省 `none` 即不检查）。配置后 codec SHALL 在首次 decode 时经 `GET {registry}/config/{subject}?defaultToGlobal=true` 获取 subject 兼容级别，并按秩比较：`NONE`=0 < `BACKWARD`/`FORWARD`（含 `*_TRANSITIVE` 变体）=1 < `FULL`（含 `FULL_TRANSITIVE`）=2。subject 实际级别低于配置的最低秩时 SHALL 返回错误（fail-fast），错误信息含 subject、实际级别与要求级别；检查结果 MUST 在 codec 生命周期内缓存，不逐消息重复请求。未配置 `subject` 时 MUST 不发起该检查。
+codec SHALL 支持可选配置 `subject` 与 `min_compatibility`（`none`/`backward`/`forward`/`full`，缺省 `none` 即不检查）。配置后 codec SHALL 在首次 decode 时经 `GET {registry}/config/{subject}?defaultToGlobal=true` 获取 subject 兼容级别（subject MUST 作为单个路径段 percent-encode 后拼接，含 `/`、空格、`%` 等字符时不得改变 URL 结构），并按秩比较：`NONE`=0 < `BACKWARD`/`FORWARD`（含 `*_TRANSITIVE` 变体）=1 < `FULL`（含 `FULL_TRANSITIVE`）=2。subject 实际级别低于配置的最低秩时 SHALL 返回错误（fail-fast），错误信息含 subject、实际级别与要求级别；检查结果 MUST 在 codec 生命周期内缓存，不逐消息重复请求。未配置 `subject` 时 MUST 不发起该检查。
 
 #### Scenario: 达到最低兼容级别放行
 - **WHEN** 配置 `min_compatibility: backward`，registry 返回 subject 级别 `BACKWARD`
@@ -99,6 +99,10 @@ codec SHALL 支持可选配置 `subject` 与 `min_compatibility`（`none`/`backw
 #### Scenario: 未配置 subject 不检查
 - **WHEN** 配置不含 `subject`
 - **THEN** 不请求 config 端点，解码行为不受影响
+
+#### Scenario: subject 含特殊字符按单路径段编码
+- **WHEN** 配置 `subject: "orders/v2 prod%final"` 且配置了 `min_compatibility`
+- **THEN** config 请求路径为 `/config/orders%2Fv2%20prod%25final`（percent-encoded 单路径段），返回的兼容级别正常参与秩比较
 
 #### Scenario: 门禁结果缓存
 - **WHEN** 门禁通过后连续解码多条消息

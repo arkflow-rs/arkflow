@@ -320,6 +320,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "once_cell",
+ "percent-encoding",
  "prost-reflect 0.16.5",
  "prost-types 0.14.4",
  "protobuf 3.7.2",
