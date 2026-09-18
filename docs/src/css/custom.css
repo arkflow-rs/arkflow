@@ -12,7 +12,10 @@
  *    limitations under the License.
  */
 
-/* Global theme: Infima design tokens plus ArkFlow-specific polish. */
+/* Global theme: Infima design tokens plus the ArkFlow visual system
+ * ("Engine × Premium"): a polished base carrying terminal/flow motifs.
+ * All custom properties are namespaced --af-* and compose on top of
+ * Infima's --ifm-* variables. */
 
 :root {
   color-scheme: light;
@@ -44,6 +47,36 @@
   --af-band-bg: #f5f8fd;
   --af-band-border: #e5eaf2;
 
+  /* ---- ArkFlow visual system tokens ---- */
+
+  /* Brand "flow" gradient. Both stops stay AA-readable as large display
+   * text on the theme canvas; don't lighten the light-mode tail. */
+  --af-gradient: linear-gradient(92deg, #2563eb 0%, #0e7490 100%);
+
+  /* Depth: glows and rings (interactive/branded elements only). */
+  --af-glow-color: rgba(37, 99, 235, 0.25);
+  --af-glow-md: 0 14px 34px -14px var(--af-glow-color);
+  --af-ring: 0 0 0 1px rgba(37, 99, 235, 0.12);
+
+  /* Shape. */
+  --af-radius-card: 16px;
+  --af-radius-code: 12px;
+  --af-radius-pill: 999px;
+
+  /* Motion. Micro-interactions stay <= 200ms; loops are slow and subtle. */
+  --af-motion-fast: 150ms;
+  --af-motion-base: 200ms;
+  --af-motion-loop: 3.2s;
+  --af-motion-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Engine/Terminal accents. */
+  --af-accent: #0e7490;
+  --af-terminal-bar-bg: #f1f5f9;
+  --af-terminal-dot: #cbd5e1;
+  --af-terminal-border: #e2e8f0;
+  --af-badge-bg: rgba(37, 99, 235, 0.08);
+  --af-badge-border: rgba(37, 99, 235, 0.22);
+
   --docusaurus-highlighted-code-line-bg: rgba(37, 99, 235, 0.12);
 }
 
@@ -68,12 +101,26 @@
   --af-band-bg: #0b1120;
   --af-band-border: rgba(94, 122, 168, 0.18);
 
+  --af-gradient: linear-gradient(92deg, #60a5fa 0%, #22d3ee 100%);
+
+  --af-glow-color: rgba(59, 130, 246, 0.4);
+  --af-glow-md: 0 14px 40px -14px var(--af-glow-color);
+  --af-ring: 0 0 0 1px rgba(59, 130, 246, 0.25);
+
+  --af-accent: #22d3ee;
+  --af-terminal-bar-bg: rgba(148, 163, 184, 0.08);
+  --af-terminal-dot: rgba(148, 163, 184, 0.55);
+  --af-terminal-border: rgba(94, 122, 168, 0.3);
+  --af-badge-bg: rgba(59, 130, 246, 0.14);
+  --af-badge-border: rgba(96, 165, 250, 0.35);
+
   --docusaurus-highlighted-code-line-bg: rgba(59, 130, 246, 0.22);
 }
 
 /* ------------------------------------------------------------
- * Base canvas: explicit backgrounds so the page never depends
- * on the browser default canvas color.
+ * Base canvas: deep-space radial washes anchored to the page
+ * top; explicit backgrounds so the page never depends on the
+ * browser default canvas color.
  * ------------------------------------------------------------ */
 
 html {
@@ -82,6 +129,18 @@ html {
 
 body {
   background-color: #ffffff;
+  background-image:
+    radial-gradient(
+      90rem 42rem at 50% -14rem,
+      rgba(37, 99, 235, 0.07),
+      transparent 62%
+    ),
+    radial-gradient(
+      50rem 30rem at 88% 8rem,
+      rgba(14, 116, 144, 0.05),
+      transparent 65%
+    );
+  background-repeat: no-repeat;
 }
 
 [data-theme='dark'] html,
@@ -89,29 +148,143 @@ body {
   background-color: #0b1120;
 }
 
+[data-theme='dark'] body {
+  background-image:
+    radial-gradient(
+      90rem 46rem at 50% -14rem,
+      rgba(59, 130, 246, 0.16),
+      transparent 62%
+    ),
+    radial-gradient(
+      55rem 32rem at 88% 6rem,
+      rgba(34, 211, 238, 0.07),
+      transparent 65%
+    );
+}
+
+/* ------------------------------------------------------------
+ * Reduced motion: sitewide safety net. The landing page also
+ * gates its JS animations on the same query; this net covers
+ * every CSS transition/animation, including future ones.
+ * ------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* ------------------------------------------------------------
  * Docs body polish
  * ------------------------------------------------------------ */
 
 .markdown h1 {
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
+  /* Display headings carry the brand gradient; body text stays solid. */
+  background: var(--af-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@supports not (
+  (background-clip: text) or (-webkit-background-clip: text)
+) {
+  .markdown h1 {
+    background: none;
+    color: var(--ifm-heading-color);
+  }
 }
 
 article .markdown h2 {
   margin-top: 2.4rem;
 }
 
-/* Code blocks: rounded with a hairline border in both themes. */
+/* ------------------------------------------------------------
+ * Code blocks: terminal frame — title bar with window dots in
+ * both themes (the syntax palettes stay stock).
+ * ------------------------------------------------------------ */
+
 .theme-code-block {
-  border-radius: 12px;
-  box-shadow: none;
+  position: relative;
+  border-radius: var(--af-radius-code);
+  border: 1px solid var(--af-terminal-border);
+  padding-top: 2.1rem;
+  box-shadow: var(--af-ring);
+  overflow: hidden;
+}
+
+.theme-code-block::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2.1rem;
+  background: var(--af-terminal-bar-bg);
+  border-bottom: 1px solid var(--af-terminal-border);
+  pointer-events: none;
+}
+
+.theme-code-block::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0.85rem;
+  height: 2.1rem;
+  width: 2.34rem;
+  background-image: radial-gradient(
+    circle,
+    var(--af-terminal-dot) 0.29rem,
+    transparent 0.33rem
+  );
+  background-size: 0.78rem 100%;
+  background-repeat: repeat-x;
+  background-position: left center;
+  pointer-events: none;
+}
+
+/* Titled blocks: move the stock title into the terminal bar. */
+.theme-code-block [class^='codeBlockTitle'],
+.theme-code-block [class*=' codeBlockTitle'] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2.1rem;
+  margin: 0;
+  padding: 0 3.2rem 0 3.4rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.78rem;
+  font-weight: 500;
+  line-height: 2.1rem;
+  color: var(--ifm-color-emphasis-700);
+  background: transparent;
+  border-bottom: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-theme='dark'] .theme-code-block [class^='codeBlockTitle'],
+[data-theme='dark'] .theme-code-block [class*=' codeBlockTitle'] {
+  color: var(--ifm-color-emphasis-600);
 }
 
 code {
   border-radius: 6px;
 }
 
-/* Tables breathe. */
+/* ------------------------------------------------------------
+ * Tables breathe. First column (config field names) goes mono,
+ * stripes soften, rows tint on hover.
+ * ------------------------------------------------------------ */
+
 .markdown table {
   display: table;
   width: 100%;
@@ -119,6 +292,79 @@ code {
 
 .markdown th {
   font-weight: 700;
+}
+
+.markdown table td:first-child,
+.markdown table th:first-child {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.88em;
+}
+
+.markdown table tr:nth-child(2n) {
+  background-color: color-mix(
+    in srgb,
+    var(--ifm-color-emphasis-200) 36%,
+    transparent
+  );
+}
+
+.markdown table tbody tr {
+  transition: background-color var(--af-motion-fast) var(--af-motion-ease);
+}
+
+.markdown table tbody tr:hover {
+  background-color: var(--af-badge-bg);
+}
+
+/* ------------------------------------------------------------
+ * Admonitions: rounded panel with a gradient accent bar and a
+ * tinted icon chip per type.
+ * ------------------------------------------------------------ */
+
+.admonition {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--af-card-border);
+  border-left: none;
+  border-radius: var(--af-radius-code);
+}
+
+.admonition::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--af-gradient);
+}
+
+.admonition .admonition-icon {
+  align-items: center;
+  justify-content: center;
+  padding: 0.16rem;
+  border-radius: 0.5rem;
+}
+
+.admonition-note .admonition-icon {
+  background: color-mix(in srgb, var(--ifm-color-primary) 12%, transparent);
+}
+
+.admonition-tip .admonition-icon {
+  background: color-mix(in srgb, var(--ifm-color-success) 12%, transparent);
+}
+
+.admonition-info .admonition-icon {
+  background: color-mix(in srgb, var(--ifm-color-info) 12%, transparent);
+}
+
+.admonition-warning .admonition-icon,
+.admonition-caution .admonition-icon {
+  background: color-mix(in srgb, var(--ifm-color-warning) 16%, transparent);
+}
+
+.admonition-danger .admonition-icon {
+  background: color-mix(in srgb, var(--ifm-color-danger) 12%, transparent);
 }
 
 /* ------------------------------------------------------------
@@ -130,13 +376,26 @@ code {
   height: 100%;
   text-decoration: none;
   color: inherit;
-  background: var(--af-card-bg);
+  background: color-mix(in srgb, var(--af-card-bg) 88%, transparent);
   border: 1px solid var(--af-card-border);
-  border-radius: 14px;
+  border-radius: var(--af-radius-card);
   transition:
-    transform 0.18s ease,
-    box-shadow 0.18s ease,
-    border-color 0.18s ease;
+    transform var(--af-motion-base) var(--af-motion-ease),
+    box-shadow var(--af-motion-base) var(--af-motion-ease),
+    border-color var(--af-motion-base) var(--af-motion-ease);
+}
+
+@supports (backdrop-filter: blur(6px)) or (-webkit-backdrop-filter: blur(6px)) {
+  .af-cards a.card {
+    backdrop-filter: blur(6px);
+  }
+}
+
+.af-cards .card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .af-cards a.card:hover {
@@ -144,7 +403,7 @@ code {
   text-decoration: none;
   color: inherit;
   border-color: var(--ifm-color-primary-light);
-  box-shadow: 0 14px 34px -14px rgba(37, 99, 235, 0.25);
+  box-shadow: var(--af-glow-md);
 }
 
 .af-cards .card__header h3 {
@@ -160,7 +419,8 @@ code {
 }
 
 /* ------------------------------------------------------------
- * Navbar & footer
+ * Navbar, sidebar & footer: glass surfaces and the active-item
+ * brand indicator.
  * ------------------------------------------------------------ */
 
 .navbar {
@@ -172,9 +432,37 @@ code {
   );
 }
 
+@supports not (
+  (backdrop-filter: blur(8px)) or (-webkit-backdrop-filter: blur(8px))
+) {
+  .navbar {
+    background-color: var(--ifm-navbar-background-color);
+  }
+}
+
 .navbar__title {
   font-weight: 800;
   letter-spacing: -0.01em;
+}
+
+.theme-doc-sidebar-container {
+  border-right-color: var(--af-card-border);
+}
+
+.menu__link--active:not(.menu__link--sublist) {
+  position: relative;
+}
+
+.menu__link--active:not(.menu__link--sublist)::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.22rem;
+  bottom: 0.22rem;
+  width: 3px;
+  border-radius: var(--af-radius-pill);
+  background: var(--af-gradient);
+  box-shadow: 0 0 10px var(--af-glow-color);
 }
 
 .footer {
@@ -219,7 +507,7 @@ div[class*='announcementBarContent'] a {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  transition: background-color 0.15s ease;
+  transition: background-color var(--af-motion-fast) ease;
 }
 
 .header-github-link:hover::before {
@@ -240,7 +528,7 @@ div[class*='announcementBarContent'] a {
   font-weight: 800;
   line-height: 1;
   letter-spacing: -0.03em;
-  background: linear-gradient(92deg, #60a5fa 0%, #38bdf8 100%);
+  background: var(--af-gradient);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -263,6 +551,196 @@ div[class*='announcementBarContent'] a {
   justify-content: center;
   flex-wrap: wrap;
   gap: 0.75rem;
+}
+
+/* ------------------------------------------------------------
+ * Wayfinding: TOC scroll progress fill (renders over the stock
+ * left border of the TOC list) and the fixed reading-progress
+ * bar injected by the DocRoot swizzle.
+ * ------------------------------------------------------------ */
+
+.af-toc {
+  position: relative;
+}
+
+.af-toc__progress {
+  position: absolute;
+  left: -1px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: var(--af-radius-pill);
+  background: var(--ifm-toc-border-color);
+  pointer-events: none;
+}
+
+.af-toc__progress::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: calc(var(--af-toc-progress, 0) * 100%);
+  border-radius: inherit;
+  background: var(--af-gradient);
+  box-shadow: 0 0 8px var(--af-glow-color);
+}
+
+.af-reading-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: calc(var(--ifm-z-index-fixed, 2) + 1);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--af-motion-fast) var(--af-motion-ease);
+}
+
+.af-reading-progress[data-visible='true'] {
+  opacity: 1;
+}
+
+.af-reading-progress::after {
+  content: '';
+  display: block;
+  height: 100%;
+  width: calc(var(--af-reading-progress, 0) * 100%);
+  background: var(--af-gradient);
+  box-shadow: 0 0 8px var(--af-glow-color);
+}
+
+/* ------------------------------------------------------------
+ * Decoration kit: badges, status dots, and the pipeline header
+ * injected on component reference pages (see src/components/).
+ * Plain markdown hub pages reuse the same classes as inline HTML.
+ * ------------------------------------------------------------ */
+
+.af-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.14rem 0.55rem;
+  border-radius: var(--af-radius-pill);
+  border: 1px solid var(--af-badge-border);
+  background: var(--af-badge-bg);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--ifm-color-emphasis-800);
+  vertical-align: middle;
+}
+
+[data-theme='dark'] .af-badge {
+  color: var(--ifm-color-emphasis-300);
+}
+
+.af-badge--kind {
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+.af-badge--feature {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.af-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--af-radius-pill);
+  background: var(--af-terminal-dot);
+}
+
+.af-dot--active {
+  background: var(--af-accent);
+  box-shadow: 0 0 8px var(--af-accent);
+}
+
+.af-pipeline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin: 0 0 1.15rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--af-card-border);
+  border-radius: var(--af-radius-pill);
+  background: color-mix(in srgb, var(--af-card-bg) 72%, transparent);
+  font-size: 0.78rem;
+}
+
+.af-pipeline__types {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.af-pipeline__types-item {
+  display: inline-flex;
+}
+
+.af-pipeline__strip {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+}
+
+.af-pipeline__cell {
+  display: inline-flex;
+  align-items: center;
+}
+
+.af-pipeline__stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  padding: 0.1rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-pill);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ifm-color-emphasis-500);
+}
+
+.af-pipeline__stage--active {
+  color: var(--ifm-color-emphasis-900);
+  background: var(--af-badge-bg);
+  border-color: var(--af-badge-border);
+  box-shadow: 0 0 12px
+    color-mix(in srgb, var(--af-glow-color) 55%, transparent);
+}
+
+[data-theme='dark'] .af-pipeline__stage--active {
+  color: var(--ifm-color-emphasis-200);
+}
+
+/* Connector between pipeline stages: dashed line flowing toward the
+ * output end. Reduced motion is killed by the sitewide net above. */
+.af-pipeline__link {
+  flex: none;
+  width: 1.5rem;
+  height: 2px;
+  margin: 0 0.15rem;
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--af-terminal-dot) 0 4px,
+    transparent 4px 8px
+  );
+  animation: af-flow var(--af-motion-loop) linear infinite;
+}
+
+@keyframes af-flow {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 8px 0;
+  }
 }
 
 /* ------------------------------------------------------------
