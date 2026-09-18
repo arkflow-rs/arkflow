@@ -103,8 +103,8 @@ const config: Config = {
       id: 'unified-kernel',
       content:
         '✨ <b>New architecture</b>: a unified streaming job runtime — kernel rebuild, durability, control plane, and web console. <a href="/docs/build/jobs">See what changed</a>',
-      backgroundColor: '#1e3a8a',
-      textColor: '#ffffff',
+      backgroundColor: '#0b1120',
+      textColor: '#cbd5e1',
       isCloseable: true,
     },
     navbar: {
