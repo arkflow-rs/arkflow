@@ -588,7 +588,7 @@ div[class*='announcementBarContent'] a {
 
 .af-reading-progress {
   position: fixed;
-  top: 0;
+  top: env(safe-area-inset-top, 0);
   left: 0;
   right: 0;
   height: 3px;
@@ -777,4 +777,68 @@ div[class*='announcementBarContent'] a {
   background: rgba(100, 116, 139, 0.55);
   background-clip: content-box;
   border: 2px solid transparent;
+}
+
+/* ------------------------------------------------------------
+ * Mobile viewport compatibility (docs-visual-system spec).
+ * No docs page may produce page-level horizontal scroll at
+ * phone viewports, so wide content scrolls inside its own
+ * container instead.
+ *
+ * Tables: below Docusaurus's sidebar-collapse breakpoint the
+ * content column stops being desktop-sized; block-ifying the
+ * table gives it its own horizontal scrollbar. Desktop
+ * rendering (>996px) is untouched. Known cosmetic cost: a
+ * narrow table's zebra stripes track the inner table box, so
+ * they stop spanning the full container.
+ * ------------------------------------------------------------ */
+
+@media (max-width: 996px) {
+  .markdown table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Long monospace field names may break mid-token at render time, but
+   * `break-word` (unlike `anywhere`) keeps them at full width in the
+   * min-content calculation, so columns stay readable and a table that
+   * genuinely cannot fit scrolls instead of collapsing to one narrow
+   * letter-per-line column. */
+  .markdown table td,
+  .markdown table th {
+    overflow-wrap: break-word;
+  }
+}
+
+/* Pipeline role strip: the four stage chips plus connectors have a
+ * ~360px min-content width, which overflows the ~314px available on
+ * a 375px phone. Below 640px the chips wrap in reading order and the
+ * dashed connectors are dropped (they would point across the wrap).
+ * Above that width the one-line strip still fits, so it is kept. */
+@media (max-width: 640px) {
+  .af-pipeline__strip {
+    flex-wrap: wrap;
+    row-gap: 0.35rem;
+    margin-left: 0;
+  }
+
+  .af-pipeline__link {
+    display: none;
+  }
+}
+
+/* Mermaid renders at natural width (useMaxWidth: false, see
+ * docusaurus.config.ts) so diagram text stays legible on phones.
+ * Infima clamps every svg to max-width: 100%, which would rescale
+ * the diagram back down to the column, so release it inside the
+ * theme's mermaid container and scroll that container instead —
+ * same UX as the landing-page architecture diagram. */
+.docusaurus-mermaid-container {
+  overflow-x: auto;
+}
+
+.docusaurus-mermaid-container svg {
+  max-width: none;
 }
