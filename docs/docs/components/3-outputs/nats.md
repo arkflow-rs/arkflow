@@ -48,7 +48,7 @@ Only one of username/password or token should be configured; if both are present
 
 ### Regular subject with username/password
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "nats"
   url: "nats://localhost:4222"
@@ -65,7 +65,7 @@ output:
 
 ### JetStream with token
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "nats"
   url: "nats://localhost:4222"

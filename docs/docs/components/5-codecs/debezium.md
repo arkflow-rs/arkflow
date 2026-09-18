@@ -17,7 +17,7 @@ The `debezium_json` codec decodes Debezium CDC (Change Data Capture) Envelope JS
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: kafka
   brokers:
@@ -25,6 +25,7 @@ input:
   topics:
     - shop.users
   consumer_group: arkflow-cdc
+  start_from_latest: false
   codec:
     type: debezium_json
 ```

@@ -24,7 +24,7 @@ The MQTT input connects to an MQTT broker, subscribes to one or more topics, and
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "mqtt"
   host: "localhost"

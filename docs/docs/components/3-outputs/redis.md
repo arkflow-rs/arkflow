@@ -73,7 +73,7 @@ The Redis output writes messages to Redis using one of four data-structure opera
 
 ### Publish to a channel
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "redis"
   mode:
@@ -88,7 +88,7 @@ output:
 
 ### Push to a List
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "redis"
   mode:
@@ -103,7 +103,7 @@ output:
 
 ### Set a Hash field
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "redis"
   mode:
@@ -121,7 +121,7 @@ output:
 
 ### Set a String
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "redis"
   mode:
@@ -136,7 +136,7 @@ output:
 
 ### Cluster connection
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "redis"
   mode:

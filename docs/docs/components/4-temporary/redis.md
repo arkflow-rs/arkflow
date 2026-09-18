@@ -35,7 +35,7 @@ The Redis temporary serves as a query-side lookup table via the SQL processor's 
 
 Declaring a temporary resource and referencing it with a static key in the SQL processor:
 
-```yaml
+```yaml validate=fragment wrap=stream
 temporary:
   - name: redis_temporary
     type: redis
@@ -61,7 +61,7 @@ pipeline:
 
 Computing the key dynamically with an expression (using the `device_id` column of the batch as the Redis key):
 
-```yaml
+```yaml validate=foreign reason="SQL processor temporary_list option fragment"
 temporary_list:
   - name: redis_temporary
     table_name: redis_table
@@ -72,7 +72,7 @@ temporary_list:
 
 Full example (generate → SQL join Redis → stdout):
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info
 

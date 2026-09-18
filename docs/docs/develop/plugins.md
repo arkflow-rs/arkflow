@@ -109,7 +109,7 @@ these pass:
    config schema, config example), so keep them meaningful.
 2. **Declare page ownership** — add or update a page under
    `docs/docs/components/` with front matter naming your component:
-   ```yaml
+   ```text
    ---
    components: [output/my_component]
    ---

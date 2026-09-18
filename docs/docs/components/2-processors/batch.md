@@ -17,14 +17,13 @@ The Batch processor accumulates incoming message batches and flushes them as a s
 
 ## Examples
 
-```yaml
-- processor:
-    type: "batch"
-    count: 1000
-    timeout_ms: 1000
+```yaml validate=fragment wrap=processors
+- type: "batch"
+  count: 1000
+  timeout_ms: 1000
 ```
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: "memory"

@@ -34,7 +34,7 @@ Install the [YAML extension](https://marketplace.visualstudio.com/items?itemName
 then associate the schema with ArkFlow configuration files. Either add a
 modeline comment at the top of the configuration file:
 
-```yaml
+```yaml validate=full
 # yaml-language-server: $schema=https://arkflow-rs.com/config-schema.json
 ```
 
@@ -64,7 +64,7 @@ Point your editor at a locally generated schema instead of the published URL:
 ./target/release/arkflow schema > arkflow.schema.json
 ```
 
-```yaml
+```yaml validate=full
 # yaml-language-server: $schema=./arkflow.schema.json
 ```
 

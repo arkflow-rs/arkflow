@@ -18,13 +18,13 @@ The WebSocket input connects to a remote WebSocket server as a client, decodes e
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "websocket"
   url: "ws://localhost:8080/ws"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "websocket"
   url: "wss://secure.example.com/ws"

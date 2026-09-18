@@ -33,7 +33,7 @@ replayed from the WAL on restart — that is *at-least-once* delivery.
 
 Create `durable.yaml`:
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info
 

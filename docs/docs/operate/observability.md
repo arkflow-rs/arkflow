@@ -16,7 +16,7 @@ fleet.
 Both the engine node and the Hub expose Prometheus text exposition at
 `GET /metrics`. Scrape them with any Prometheus-compatible collector:
 
-```yaml
+```yaml validate=foreign reason="Prometheus scrape config"
 scrape_configs:
   - job_name: arkflow
     static_configs:
@@ -122,7 +122,7 @@ live stream.
 The engine logs through `tracing`. Level and output are configuration
 settings (not CLI flags):
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info        # trace | debug | info | warn | error
   format: json       # json | plain

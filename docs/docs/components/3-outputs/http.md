@@ -22,20 +22,19 @@ The HTTP output sends each message as an HTTP request to a configured URL. It su
 
 ### auth
 
-`auth` is a tagged object (selected by its `type` field).
+`auth` is an externally tagged object: the key selects the variant (`Basic`
+or `Bearer`) and its value carries the fields.
 
-| Field | Type | Required | Default | Description |
+| Variant key | Fields | Required | Description |
 |-------|------|----------|---------|-------------|
-| type | string | yes | — | `basic` or `bearer`. |
-| username | string | yes (basic) | — | Username (basic auth). |
-| password | string | yes (basic) | — | Password (basic auth). |
-| token | string | yes (bearer) | — | Token (bearer auth). |
+| `Basic` | username, password | yes | Basic authentication. |
+| `Bearer` | token | yes | Bearer-token authentication. |
 
 ## Examples
 
 ### Basic HTTP Request
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "http"
   url: "http://example.com/post/data"
@@ -48,7 +47,7 @@ output:
 
 ### With Basic Authentication
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "http"
   url: "http://example.com/data"
@@ -56,14 +55,14 @@ output:
   timeout_ms: 5000
   retry_count: 1
   auth:
-    type: "basic"
-    username: "user"
-    password: "pass"
+    Basic:
+      username: "user"
+      password: "pass"
 ```
 
 ### With Bearer Token
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "http"
   url: "http://example.com/api/data"
@@ -71,8 +70,8 @@ output:
   timeout_ms: 5000
   retry_count: 1
   auth:
-    type: "bearer"
-    token: "your-token"
+    Bearer:
+      token: "your-token"
 ```
 
 ## Notes

@@ -40,33 +40,35 @@ Tagged union (`type` field selects the variant, snake_cased):
 
 ### Basic SQL Query
 
-```yaml
-- processor:
-    type: "sql"
-    query: "SELECT id, name, age FROM flow WHERE age > 18"
-    table_name: "flow"
+```yaml validate=fragment wrap=processors
+- type: "sql"
+  query: "SELECT id, name, age FROM flow WHERE age > 18"
+  table_name: "flow"
 ```
 
 ### SQL Query with Temporary Data Sources
 
-```yaml
-- temporary:
-    - name: user_profiles
-      type: "redis"
-      mode:
-        type: single
-        url: redis://127.0.0.1:6379
-      redis_type:
-        type: string
+```yaml validate=fragment wrap=stream
+temporary:
+  - name: user_profiles
+    type: "redis"
+    mode:
+      type: single
+      url: redis://127.0.0.1:6379
+    redis_type:
+      type: "string"
+    codec:
+      type: "json"
 
-  processor:
-    type: "sql"
-    query: "SELECT u.id, u.name, p.title FROM flow u JOIN profiles p ON u.id = p.user_id"
-    table_name: "flow"
-    temporary_list:
-      - name: "user_profiles"
-        table_name: "profiles"
-        key:
-          type: "expr"
-          expr: "user_id"
+pipeline:
+  processors:
+    - type: "sql"
+      query: "SELECT u.id, u.name, p.title FROM flow u JOIN profiles p ON u.id = p.user_id"
+      table_name: "flow"
+      temporary_list:
+        - name: "user_profiles"
+          table_name: "profiles"
+          key:
+            type: "expr"
+            expr: "user_id"
 ```

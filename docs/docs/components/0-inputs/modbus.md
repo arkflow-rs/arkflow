@@ -28,7 +28,7 @@ The Modbus input polls a Modbus TCP device at a fixed interval and supports four
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "modbus"
   addr: "192.168.1.100:502"

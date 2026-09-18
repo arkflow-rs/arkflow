@@ -18,11 +18,19 @@ For background on the at-least-once contract and replay semantics, see
 The minimal durable configuration uses the default (balanced) strategy
 with a single PUT worker and no compression:
 
-```yaml
+```yaml validate=full
 streams:
-  - input:
+  - id: durable-orders
+    input:
       type: kafka
-      # ...
+      brokers: [localhost:9092]
+      topics: [orders]
+      consumer_group: arkflow-orders
+      start_from_latest: false
+    pipeline:
+      processors: []
+    output:
+      type: drop
     durability:
       enabled: true
       backend:
@@ -54,10 +62,14 @@ Three presets cover the common cases:
 | `balanced` (default) | 1000 | 1 MB | 1 s | General-purpose streams |
 | `low_latency` | 100 | 100 KB | 100 ms | Real-time, minimal data loss |
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   backend:
     type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
     segment_tuning:
       strategy: aggressive   # or "balanced" / "low_latency"
 ```
@@ -66,10 +78,14 @@ durability:
 
 Any preset parameter can be overridden individually:
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   backend:
     type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
     segment_tuning:
       strategy: aggressive
       max_entries: 20000      # override default 10000
@@ -103,10 +119,14 @@ The `parallel_put` block configures concurrent S3 upload workers. Each
 worker owns an independent bounded channel (16 segments), giving per-worker
 backpressure without global contention.
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   backend:
     type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
     parallel_put:
       workers: 4              # 1-8, default 1
       shutdown_timeout: "30s" # wait time for in-flight uploads on close
@@ -140,10 +160,14 @@ The `compression` block enables per-segment compression before upload.
 Compressed segments reduce storage cost, transfer time, and the size of
 recovery LIST/GET operations.
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   backend:
     type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
     compression:
       type: zstd   # or "lz4" / "none"
       level: 3     # algorithm-specific range (see below)
@@ -181,7 +205,7 @@ storage-bound workloads.
 
 Minimize S3 PUT requests; tolerate up to ~100K messages at risk.
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   enabled: true
   backend:
@@ -193,14 +217,17 @@ durability:
     compression:
       type: zstd
       level: 3
-    # ... node_id, stream_id, s3: ...
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
 ```
 
 ### Real-Time Stream with Tight Loss Window
 
 Minimize crash window; throughput is secondary.
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   enabled: true
   backend:
@@ -211,14 +238,17 @@ durability:
       workers: 2       # still useful for occasional bursts
     compression:
       type: lz4        # faster than zstd; less CPU
-    # ... node_id, stream_id, s3: ...
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
 ```
 
 ### Cost-Sensitive Cold Storage
 
 Maximum compression, minimal PUTs, accept higher loss window.
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   enabled: true
   backend:
@@ -229,7 +259,10 @@ durability:
     compression:
       type: zstd
       level: 9                # maximum compression
-    # ... node_id, stream_id, s3: ...
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
 ```
 
 ## Validation

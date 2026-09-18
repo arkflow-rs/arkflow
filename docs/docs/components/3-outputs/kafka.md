@@ -36,7 +36,7 @@ The Kafka output produces messages to an Apache Kafka topic using librdkafka. It
 
 ### Static topic and key
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "kafka"
   brokers:
@@ -54,7 +54,7 @@ output:
 
 ### Dynamic topic via SQL expression
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "kafka"
   brokers:
@@ -68,7 +68,7 @@ output:
 
 ### Exactly-once production
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "kafka"
   brokers:

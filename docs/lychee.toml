@@ -1,0 +1,37 @@
+# Configuration for the weekly report-only external-link check
+# (.github/workflows/docs-link-check.yml). Never gates pull requests.
+
+# Retry transient failures before declaring a link dead.
+retry_wait_time = 5
+retries = 3
+timeout = 20
+
+# Be gentle with external sites.
+max_concurrency = 8
+
+# Accept plenty of success statuses: 200..299 plus common rate-limit /
+# auth-wall responses that still prove the target exists (default lychee
+# accept list already covers most; keep explicit for clarity).
+accept = [
+  "200", "201", "202", "204", "206", "301", "302", "303", "307", "308",
+  "403",  # auth-walled but exists (e.g. some wikis, vendor portals)
+  "429",  # rate-limited but exists
+]
+
+exclude = [
+  # Auth-walled / bot-hostile targets that reliably reject checkers.
+  'https://www.jetbrains.com.*',
+  'https://marketplace.visualstudio.com.*',
+  # Example placeholders in documentation, not real targets.
+  'https://auth\.example\.com.*',
+  'http://example\.com.*',
+  'http://localhost.*',
+  'https?://127\.0\.0\.1.*',
+  'https?://\$\{.*',
+]
+
+exclude_path = [
+  # Versioned snapshots are frozen releases; only the maintained tree is checked.
+  "docs/versioned_docs",
+  "docs/build",
+]

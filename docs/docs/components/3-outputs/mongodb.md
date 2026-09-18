@@ -20,7 +20,7 @@ The output supports UTF-8 strings, signed and unsigned integers that fit BSON in
 
 ## Example
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "mongodb"
   uri: "mongodb://localhost:27017"

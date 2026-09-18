@@ -251,6 +251,8 @@ dependencies = [
  "arkflow-plugin",
  "arkflow-server",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

@@ -21,30 +21,28 @@ The Python processor executes user-supplied Python code on each message batch vi
 
 ### Using a Python Module
 
-```yaml
-- processor:
-    type: "python"
-    function: "process_batch"
-    module: "example1"
-    python_path: ["./examples/python"]
+```yaml validate=fragment wrap=processors
+- type: "python"
+  function: "process_batch"
+  module: "example1"
+  python_path: ["./examples/python"]
 ```
 
 ### Using an Inline Python Script
 
-```yaml
-- processor:
-    type: "python"
-    script: |
-      def process_batch(batch):
-          # Process the batch here
-          # For example, you can modify the batch or create a new one
-          return [batch]
-    function: "process_batch"
+```yaml validate=fragment wrap=processors
+- type: "python"
+  script: |
+    def process_batch(batch):
+        # Process the batch here
+        # For example, you can modify the batch or create a new one
+        return [batch]
+  function: "process_batch"
 ```
 
 ### Complete Pipeline Example
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: "memory"

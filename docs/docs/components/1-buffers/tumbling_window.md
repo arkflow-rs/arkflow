@@ -30,7 +30,7 @@ The `codec` field is a `CodecConfig` object: a `type` string selecting the codec
 
 ### Basic Configuration
 
-```yaml
+```yaml validate=fragment wrap=buffer
 buffer:
   type: "tumbling_window"
   interval: "1s"
@@ -38,7 +38,7 @@ buffer:
 
 ### With Join Configuration
 
-```yaml
+```yaml validate=foreign reason="legacy join configuration — join buffers cannot compile to the unified kernel; declare a Job DAG with an explicit join operator"
 buffer:
   type: "tumbling_window"
   interval: "5s"

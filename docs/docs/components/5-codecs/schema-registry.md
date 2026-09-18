@@ -26,7 +26,7 @@ The `schema_registry` codec decodes Confluent wire-format messages by resolving 
 
 Protobuf topic:
 
-```yaml
+```yaml validate=fragment wrap=codec
 codec:
   type: schema_registry
   registry_url: http://localhost:8081
@@ -35,7 +35,7 @@ codec:
 
 Avro topic with a compatibility gate:
 
-```yaml
+```yaml validate=fragment wrap=codec
 codec:
   type: schema_registry
   registry_url: http://registry:8081
@@ -45,7 +45,7 @@ codec:
 
 Bearer form:
 
-```yaml
+```yaml validate=fragment wrap=codec
 codec:
   type: schema_registry
   registry_url: http://registry:8081

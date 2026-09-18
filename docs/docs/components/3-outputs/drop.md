@@ -17,7 +17,7 @@ The Drop output accepts no other fields; a codec may be attached but is ignored.
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "drop"
 ```

@@ -18,7 +18,7 @@ This document describes how to deploy ArkFlow in a Kubernetes cluster.
 
 First, create a ConfigMap to store the ArkFlow configuration file:
 
-```yaml
+```yaml validate=foreign reason="Kubernetes manifest"
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -34,7 +34,7 @@ data:
 
 ### Deployment
 
-```yaml
+```yaml validate=foreign reason="Kubernetes manifest"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -91,7 +91,7 @@ spec:
 
 ### Service
 
-```yaml
+```yaml validate=foreign reason="Kubernetes manifest"
 apiVersion: v1
 kind: Service
 metadata:
@@ -158,7 +158,7 @@ kubectl get svc arkflow
 
 If your ArkFlow deployment requires persistent storage, you can add a PersistentVolumeClaim:
 
-```yaml
+```yaml validate=foreign reason="Kubernetes manifest"
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -173,7 +173,7 @@ spec:
 
 Then update your Deployment to use this PVC:
 
-```yaml
+```yaml validate=foreign reason="Kubernetes manifest fragment"
 # Add to the volumes section
 volumes:
 - name: data

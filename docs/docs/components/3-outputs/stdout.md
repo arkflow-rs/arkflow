@@ -16,7 +16,7 @@ The Stdout output writes each message payload to standard output. It is handy fo
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "stdout"
   append_newline: true

@@ -30,7 +30,7 @@ The HTTP input runs as an Axum HTTP server and accepts POST requests sent to `ad
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "http"
   address: "0.0.0.0:8080"
@@ -38,7 +38,7 @@ input:
   cors_enabled: true
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "http"
   address: "0.0.0.0:8080"
@@ -49,7 +49,7 @@ input:
     password: "pass"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "http"
   address: "0.0.0.0:8080"

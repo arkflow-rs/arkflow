@@ -47,7 +47,7 @@ The Redis input reads from Redis with both standalone and cluster connection mod
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "redis"
   mode:
@@ -62,7 +62,7 @@ input:
         - "events"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "redis"
   mode:

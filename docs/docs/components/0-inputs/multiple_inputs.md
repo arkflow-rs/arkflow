@@ -26,7 +26,7 @@ Each element is a standard input configuration (with its own `type` and fields) 
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "multiple_inputs"
   inputs:
@@ -35,6 +35,7 @@ input:
       brokers: ["localhost:9092"]
       topics: ["topic1"]
       consumer_group: "group1"
+      start_from_latest: false
     - name: "http_api"
       type: "http"
       address: "0.0.0.0:8080"

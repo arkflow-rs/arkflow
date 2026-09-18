@@ -35,7 +35,7 @@ messages must never reach the table — or stop the pipeline.
 
 Validated example: [`examples/case_order_stream_sql.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/case_order_stream_sql.yaml)
 
-```yaml
+```yaml validate=full
 streams:
   - id: orders-to-mysql
     input:

@@ -18,7 +18,7 @@ The Protobuf codec converts between binary Protobuf messages and columnar Arrow 
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: kafka
   brokers:
@@ -26,21 +26,20 @@ input:
   topics:
     - users
   consumer_group: arkflow
+  start_from_latest: false
   codec:
     type: protobuf
-    message_type: com.example.User
+    message_type: message.Message
     proto_inputs:
-      - /etc/arkflow/proto/user.proto
+      - ./examples/message.proto
 ```
 
-```yaml
+```yaml validate=fragment wrap=codec
 codec:
   type: protobuf
-  message_type: test.TestMessage
+  message_type: message.Message
   proto_inputs:
-    - /etc/arkflow/proto/test_message.proto
-  proto_includes:
-    - /usr/include/protos
+    - ./examples/message.proto
 ```
 
 ## Notes
