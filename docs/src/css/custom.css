@@ -12,6 +12,8 @@
  *    limitations under the License.
  */
 
+@import '@fontsource-variable/inter';
+
 /* Global theme: Infima design tokens plus the ArkFlow visual system
  * ("Engine × Premium"): a polished base carrying terminal/flow motifs.
  * All custom properties are namespaced --af-* and compose on top of
@@ -30,8 +32,8 @@
   --ifm-color-primary-lightest: #93c5fd;
 
   --ifm-font-family-base:
-    system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
-    sans-serif;
+    'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
   --ifm-font-family-monospace:
     ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, Consolas,
     monospace;
@@ -53,21 +55,27 @@
    * text on the theme canvas; don't lighten the light-mode tail. */
   --af-gradient: linear-gradient(92deg, #2563eb 0%, #0e7490 100%);
 
-  /* Depth: glows and rings (interactive/branded elements only). */
+  /* Depth: layered shadows (ambient + key) and rings for interactive
+   * /branded elements only. */
   --af-glow-color: rgba(37, 99, 235, 0.25);
   --af-glow-md: 0 14px 34px -14px var(--af-glow-color);
   --af-ring: 0 0 0 1px rgba(37, 99, 235, 0.12);
+  --af-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --af-shadow-card:
+    0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 32px -16px rgba(15, 23, 42, 0.16);
+  --af-inset-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 
   /* Shape. */
   --af-radius-card: 16px;
   --af-radius-code: 12px;
   --af-radius-pill: 999px;
 
-  /* Motion. Micro-interactions stay <= 200ms; loops are slow and subtle. */
+  /* Motion. Micro-interactions stay <= 200ms on an ease-out curve;
+   * loops are slow and subtle. */
   --af-motion-fast: 150ms;
   --af-motion-base: 200ms;
   --af-motion-loop: 3.2s;
-  --af-motion-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --af-motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
 
   /* Engine/Terminal accents. */
   --af-accent: #0e7490;
@@ -106,6 +114,10 @@
   --af-glow-color: rgba(59, 130, 246, 0.4);
   --af-glow-md: 0 14px 40px -14px var(--af-glow-color);
   --af-ring: 0 0 0 1px rgba(59, 130, 246, 0.25);
+  --af-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --af-shadow-card:
+    0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px -16px rgba(0, 0, 0, 0.55);
+  --af-inset-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
   --af-accent: #22d3ee;
   --af-terminal-bar-bg: rgba(148, 163, 184, 0.08);
@@ -125,6 +137,23 @@
 
 html {
   background-color: #ffffff;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(37, 99, 235, 0.16);
+}
+
+[data-theme='dark'] ::selection {
+  background: rgba(59, 130, 246, 0.32);
+}
+
+:focus-visible {
+  outline: 2px solid
+    color-mix(in srgb, var(--ifm-color-primary) 55%, transparent);
+  outline-offset: 2px;
 }
 
 body {
@@ -183,8 +212,12 @@ body {
  * Docs body polish
  * ------------------------------------------------------------ */
 
+.markdown {
+  font-size: 1.035rem;
+}
+
 .markdown h1 {
-  letter-spacing: -0.02em;
+  letter-spacing: -0.025em;
   /* Display headings carry the brand gradient; body text stays solid. */
   background: var(--af-gradient);
   -webkit-background-clip: text;
@@ -202,7 +235,56 @@ body {
 }
 
 article .markdown h2 {
-  margin-top: 2.4rem;
+  margin-top: 3rem;
+  margin-bottom: 1rem;
+  letter-spacing: -0.015em;
+}
+
+article .markdown h3 {
+  margin-top: 2.1rem;
+  margin-bottom: 0.75rem;
+  letter-spacing: -0.01em;
+}
+
+article .markdown p {
+  margin-bottom: 1.15rem;
+}
+
+article .markdown li + li {
+  margin-top: 0.45em;
+}
+
+/* Markdown links: stock hover underline gains breathing room. */
+.markdown a {
+  text-underline-offset: 3px;
+}
+
+/* Heading anchor links: reveal on hover on pointer devices only;
+ * touch users keep them always visible, keyboard users keep the
+ * stock focus behavior. */
+@media (hover: hover) {
+  .hash-link {
+    opacity: 0;
+    transition: opacity var(--af-motion-fast) var(--af-motion-ease);
+  }
+
+  .markdown :is(h1, h2, h3, h4, h5, h6):hover .hash-link {
+    opacity: 1;
+  }
+}
+
+/* Breadcrumbs stay quiet; the page title owns the top of the page. */
+.theme-doc-breadcrumbs {
+  font-size: 0.82rem;
+}
+
+.theme-doc-breadcrumbs .breadcrumbs__link {
+  color: var(--ifm-color-emphasis-600);
+}
+
+.theme-doc-breadcrumbs .breadcrumbs__link:hover {
+  color: var(--ifm-color-primary);
+  text-decoration: none;
 }
 
 /* ------------------------------------------------------------
@@ -215,7 +297,9 @@ article .markdown h2 {
   border-radius: var(--af-radius-code);
   border: 1px solid var(--af-terminal-border);
   padding-top: 2.1rem;
-  box-shadow: var(--af-ring);
+  box-shadow:
+    var(--af-shadow-card),
+    var(--af-ring);
   overflow: hidden;
 }
 
@@ -228,6 +312,7 @@ article .markdown h2 {
   height: 2.1rem;
   background: var(--af-terminal-bar-bg);
   border-bottom: 1px solid var(--af-terminal-border);
+  box-shadow: var(--af-inset-highlight);
   pointer-events: none;
 }
 
@@ -276,6 +361,56 @@ article .markdown h2 {
   color: var(--ifm-color-emphasis-600);
 }
 
+/* Language micro-label for untitled blocks, mounted by the
+ * CodeBlock/Container swizzle (titled blocks never render it, so it
+ * never collides with the stock title). Occupies the same slot the
+ * title uses, right of the window dots. */
+.af-code-lang {
+  position: absolute;
+  top: 0;
+  left: 3.4rem;
+  height: 2.1rem;
+  line-height: 2.1rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-500);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Copy/word-wrap buttons lift out of the code area and into the
+ * terminal bar (the bar's center sits 1.05rem above the content
+ * box), toned down so they read as part of the chrome. Always
+ * faintly visible so touch users can find them. */
+.theme-code-block [class^='buttonGroup'],
+.theme-code-block [class*=' buttonGroup'] {
+  top: -1.05rem;
+  right: 0.6rem;
+  transform: translateY(-50%);
+}
+
+.theme-code-block [class^='buttonGroup'] button,
+.theme-code-block [class*=' buttonGroup'] button {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 6px;
+  color: var(--ifm-color-emphasis-500);
+  opacity: 0.45;
+}
+
+.theme-code-block:hover [class^='buttonGroup'] button,
+.theme-code-block:hover [class*=' buttonGroup'] button {
+  opacity: 0.85;
+}
+
+.theme-code-block [class^='buttonGroup'] button:hover,
+.theme-code-block [class*=' buttonGroup'] button:hover {
+  color: var(--ifm-color-primary);
+}
+
 code {
   border-radius: 6px;
 }
@@ -291,7 +426,11 @@ code {
 }
 
 .markdown th {
-  font-weight: 700;
+  font-weight: 650;
+  font-size: 0.92em;
+  letter-spacing: 0.01em;
+  color: var(--ifm-color-emphasis-800);
+  border-bottom: 2px solid var(--af-card-border);
 }
 
 .markdown table td:first-child,
@@ -303,7 +442,7 @@ code {
 .markdown table tr:nth-child(2n) {
   background-color: color-mix(
     in srgb,
-    var(--ifm-color-emphasis-200) 36%,
+    var(--ifm-color-emphasis-200) 22%,
     transparent
   );
 }
@@ -368,6 +507,38 @@ code {
 }
 
 /* ------------------------------------------------------------
+ * Blockquotes: the quiet admonition echo — gradient bar plus a
+ * near-invisible band. SQL reference pages carry dozens of
+ * blockquote signatures, so this must read as texture, not as
+ * a callout.
+ * ------------------------------------------------------------ */
+
+.markdown blockquote {
+  position: relative;
+  overflow: hidden;
+  padding: 0.55rem 1rem;
+  margin-bottom: 1rem;
+  border-left: none;
+  border-radius: var(--af-radius-code);
+  background: color-mix(
+    in srgb,
+    var(--ifm-color-emphasis-100) 55%,
+    transparent
+  );
+  color: var(--ifm-color-emphasis-800);
+}
+
+.markdown blockquote::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--af-gradient);
+}
+
+/* ------------------------------------------------------------
  * Hub card grids used on the docs home and area hub pages.
  * ------------------------------------------------------------ */
 
@@ -379,6 +550,7 @@ code {
   background: color-mix(in srgb, var(--af-card-bg) 88%, transparent);
   border: 1px solid var(--af-card-border);
   border-radius: var(--af-radius-card);
+  box-shadow: var(--af-shadow-sm);
   transition:
     transform var(--af-motion-base) var(--af-motion-ease),
     box-shadow var(--af-motion-base) var(--af-motion-ease),
@@ -419,15 +591,120 @@ code {
 }
 
 /* ------------------------------------------------------------
+ * Prev/next pagination: the af-cards surface language applied to
+ * the most-seen links at the bottom of every doc page. Side
+ * arrows point outward and light up on hover; below 640px the
+ * cards stack, so the arrows drop and padding relaxes.
+ * ------------------------------------------------------------ */
+
+.pagination-nav a.pagination-nav__link {
+  position: relative;
+  padding: 0.85rem 2.75rem;
+  border: 1px solid var(--af-card-border);
+  border-radius: var(--af-radius-card);
+  background: color-mix(in srgb, var(--af-card-bg) 88%, transparent);
+  transition:
+    transform var(--af-motion-base) var(--af-motion-ease),
+    box-shadow var(--af-motion-base) var(--af-motion-ease),
+    border-color var(--af-motion-base) var(--af-motion-ease);
+}
+
+.pagination-nav a.pagination-nav__link:hover {
+  transform: translateY(-3px);
+  border-color: var(--ifm-color-primary-light);
+  box-shadow: var(--af-glow-md);
+}
+
+.pagination-nav .pagination-nav__sublabel {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-500);
+}
+
+.pagination-nav .pagination-nav__label {
+  font-weight: 600;
+}
+
+/* The stock «/» glyphs are dropped: the side arrows carry the
+ * direction, and doubling both read as clutter. */
+.pagination-nav a.pagination-nav__link--prev .pagination-nav__label::before,
+.pagination-nav a.pagination-nav__link--next .pagination-nav__label::after {
+  content: none;
+}
+
+.pagination-nav a.pagination-nav__link::after {
+  position: absolute;
+  top: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--af-card-border);
+  border-radius: var(--af-radius-pill);
+  background: color-mix(in srgb, var(--af-card-bg) 70%, transparent);
+  font-size: 0.95rem;
+  line-height: 1;
+  color: var(--ifm-color-primary);
+  opacity: 0.9;
+  transition:
+    transform var(--af-motion-fast) var(--af-motion-ease),
+    border-color var(--af-motion-fast) var(--af-motion-ease),
+    background-color var(--af-motion-fast) var(--af-motion-ease);
+}
+
+.pagination-nav a.pagination-nav__link--prev::after {
+  content: '←';
+  left: 0.9rem;
+  transform: translateY(-50%);
+}
+
+.pagination-nav a.pagination-nav__link--next::after {
+  content: '→';
+  right: 0.9rem;
+  transform: translateY(-50%);
+}
+
+.pagination-nav a.pagination-nav__link:hover::after {
+  border-color: var(--af-badge-border);
+  background: var(--af-badge-bg);
+}
+
+.pagination-nav a.pagination-nav__link--prev:hover::after {
+  transform: translateY(-50%) translateX(-3px);
+}
+
+.pagination-nav a.pagination-nav__link--next:hover::after {
+  transform: translateY(-50%) translateX(3px);
+}
+
+@media (max-width: 640px) {
+  .pagination-nav a.pagination-nav__link {
+    padding: 0.75rem 1rem;
+  }
+
+  .pagination-nav a.pagination-nav__link::after {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------
  * Navbar, sidebar & footer: glass surfaces and the active-item
  * brand indicator.
  * ------------------------------------------------------------ */
 
 .navbar {
-  backdrop-filter: blur(8px);
+  backdrop-filter: blur(12px) saturate(160%);
   background-color: color-mix(
     in srgb,
     var(--ifm-navbar-background-color) 92%,
+    transparent
+  );
+  border-bottom: 1px solid color-mix(
+    in srgb,
+    var(--af-card-border) 70%,
     transparent
   );
 }
@@ -449,8 +726,14 @@ code {
   border-right-color: var(--af-card-border);
 }
 
+.menu__link {
+  border-radius: 8px;
+}
+
 .menu__link--active:not(.menu__link--sublist) {
   position: relative;
+  background: color-mix(in srgb, var(--ifm-color-primary) 6%, transparent);
+  font-weight: 600;
 }
 
 .menu__link--active:not(.menu__link--sublist)::before {
@@ -475,22 +758,40 @@ code {
   text-transform: uppercase;
 }
 
-/* Announcement bar */
+/* Announcement bar: deep navy band instead of the loud primary fill.
+ * The base color comes from docusaurus.config.ts (inline style); the
+ * gradient here paints above it for a subtle sheen. */
 :root {
   --docusaurus-announcement-bar-height: auto;
 }
 
+div[class^='announcementBar_'] {
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(96, 165, 250, 0.08) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
 div[class^='announcementBarContent'],
 div[class*='announcementBarContent'] {
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+  letter-spacing: 0.01em;
+  color: #cbd5e1;
   padding: 0.55rem 1rem;
 }
 
 div[class^='announcementBarContent'] a,
 div[class*='announcementBarContent'] a {
-  color: #bfdbfe;
+  color: #93c5fd;
+  font-weight: 500;
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+button[class*='announcementBarClose'] {
+  color: #94a3b8;
 }
 
 /* ------------------------------------------------------------
@@ -609,6 +910,67 @@ div[class*='announcementBarContent'] a {
   width: calc(var(--af-reading-progress, 0) * 100%);
   background: var(--af-gradient);
   box-shadow: 0 0 8px var(--af-glow-color);
+}
+
+/* ------------------------------------------------------------
+ * Back to top: fixed affordance for long reference pages,
+ * rendered by the DocRoot swizzle on docs pages only. Sits below
+ * Infima's fixed surfaces (navbar 200, overlay 400) so drawers
+ * always cover it; reveal/hide is opacity+transform, killed by
+ * the sitewide reduced-motion net.
+ * ------------------------------------------------------------ */
+
+.af-back-to-top {
+  position: fixed;
+  right: 1.1rem;
+  bottom: calc(1.1rem + env(safe-area-inset-bottom, 0));
+  z-index: calc(var(--ifm-z-index-fixed, 200) - 30);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+  border: 1px solid var(--af-card-border);
+  border-radius: var(--af-radius-pill);
+  background: color-mix(in srgb, var(--af-card-bg) 92%, transparent);
+  color: var(--ifm-color-primary);
+  cursor: pointer;
+  box-shadow: var(--af-shadow-card);
+  opacity: 0;
+  transform: translateY(0.75rem);
+  pointer-events: none;
+  transition:
+    opacity var(--af-motion-base) var(--af-motion-ease),
+    transform var(--af-motion-base) var(--af-motion-ease),
+    border-color var(--af-motion-fast) var(--af-motion-ease),
+    box-shadow var(--af-motion-base) var(--af-motion-ease);
+}
+
+@supports (backdrop-filter: blur(6px)) or (-webkit-backdrop-filter: blur(6px)) {
+  .af-back-to-top {
+    backdrop-filter: blur(6px);
+  }
+}
+
+.af-back-to-top[data-visible='true'] {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.af-back-to-top:hover {
+  border-color: var(--ifm-color-primary-light);
+  box-shadow:
+    var(--af-shadow-card),
+    var(--af-glow-md);
+  transform: scale(1.06);
+}
+
+@media print {
+  .af-back-to-top {
+    display: none;
+  }
 }
 
 /* ------------------------------------------------------------
