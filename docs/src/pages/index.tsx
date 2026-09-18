@@ -12,7 +12,8 @@
  *    limitations under the License.
  */
 
-import type {ReactNode} from 'react';
+import type {CSSProperties, MouseEvent, ReactNode} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
@@ -42,11 +43,160 @@ const PIPELINE_YAML = `streams:
     error_output:
       type: stdout`;
 
+const PIPELINE_LINES = PIPELINE_YAML.split('\n');
+const LINE_REVEAL_MS = 120;
+const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    window.matchMedia(REDUCED_MOTION_QUERY).matches
+  );
+}
+
+/* ============================================================
+ * Code window — YAML reveals line by line with a cursor, then a
+ * "pipeline running" status pulses in. Reduced motion: static.
+ * ============================================================ */
+
+function CodeWindow() {
+  const [visibleLines, setVisibleLines] = useState(0);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const done = visibleLines >= PIPELINE_LINES.length;
+
+  useEffect(() => {
+    if (prefersReducedMotion()) {
+      setVisibleLines(PIPELINE_LINES.length);
+      return;
+    }
+    const timer = setInterval(() => {
+      setVisibleLines((n) => {
+        if (n >= PIPELINE_LINES.length) {
+          clearInterval(timer);
+          return n;
+        }
+        return n + 1;
+      });
+    }, LINE_REVEAL_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handleTilt = (e: MouseEvent<HTMLDivElement>) => {
+    const el = frameRef.current;
+    if (!el || prefersReducedMotion()) return;
+    const rect = el.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width - 0.5;
+    const y = (e.clientY - rect.top) / rect.height - 0.5;
+    el.style.transform = `perspective(900px) rotateX(${(-y * 4).toFixed(
+      2,
+    )}deg) rotateY(${(x * 5).toFixed(2)}deg)`;
+  };
+
+  const resetTilt = () => {
+    if (frameRef.current) frameRef.current.style.transform = '';
+  };
+
+  return (
+    <div
+      className={styles.codeWindow}
+      ref={frameRef}
+      onMouseMove={handleTilt}
+      onMouseLeave={resetTilt}>
+      <div className={styles.codeChrome}>
+        <span className={clsx(styles.dot, styles.dotRed)} />
+        <span className={clsx(styles.dot, styles.dotYellow)} />
+        <span className={clsx(styles.dot, styles.dotGreen, styles.dotBreathe)} />
+        <span className={styles.codeTitle}>config.yaml</span>
+      </div>
+      <pre className={styles.codeBody}>
+        <code>
+          {PIPELINE_LINES.slice(0, visibleLines).map((line, index) => (
+            <span key={index} className={styles.codeLine}>
+              {line || ' '}
+              {index === visibleLines - 1 && !done && (
+                <span className={styles.cursor} aria-hidden="true" />
+              )}
+            </span>
+          ))}
+          {done && (
+            <span className={styles.codeStatus}>
+              <span className={styles.statusDot} aria-hidden="true" />
+              pipeline running · 0 dropped records
+            </span>
+          )}
+        </code>
+      </pre>
+    </div>
+  );
+}
+
+/* ============================================================
+ * Scroll reveal — content starts visible (SSR/no-JS safe), then
+ * JS arms it below the fold and fades it in on intersection.
+ * ============================================================ */
+
+function useReveal<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || prefersReducedMotion()) return;
+    el.classList.add(styles.revealPending);
+    // A healthy observer reports the initial state immediately, even
+    // when not intersecting. If it never calls back (broken webview),
+    // never leave the content invisible.
+    let gotCallback = false;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        gotCallback = true;
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            el.classList.add(styles.revealVisible);
+            observer.disconnect();
+          }
+        }
+      },
+      {threshold: 0.15, rootMargin: '0px 0px -40px 0px'},
+    );
+    observer.observe(el);
+    const failsafe = setTimeout(() => {
+      if (!gotCallback) {
+        observer.disconnect();
+        el.classList.add(styles.revealVisible);
+      }
+    }, 1500);
+    return () => {
+      clearTimeout(failsafe);
+      observer.disconnect();
+    };
+  }, []);
+  return ref;
+}
+
+function Reveal({
+  className,
+  style,
+  children,
+}: {
+  className?: string;
+  style?: CSSProperties;
+  children: ReactNode;
+}) {
+  const ref = useReveal<HTMLDivElement>();
+  return (
+    <div ref={ref} className={className} style={style}>
+      {children}
+    </div>
+  );
+}
+
 function Hero() {
   const {siteConfig} = useDocusaurusContext();
   return (
     <header className={styles.hero}>
       <div className={styles.heroBackdrop} aria-hidden="true" />
+      <div className={styles.heroGridLayer} aria-hidden="true" />
+      <div className={clsx(styles.heroOrb, styles.heroOrbA)} aria-hidden="true" />
+      <div className={clsx(styles.heroOrb, styles.heroOrbB)} aria-hidden="true" />
       <div className={clsx('container', styles.heroInner)}>
         <div className={styles.heroGrid}>
           <div className={styles.heroCopy}>
@@ -81,17 +231,7 @@ function Hero() {
               cluster required.
             </p>
           </div>
-          <div className={styles.codeWindow}>
-            <div className={styles.codeChrome}>
-              <span className={clsx(styles.dot, styles.dotRed)} />
-              <span className={clsx(styles.dot, styles.dotYellow)} />
-              <span className={clsx(styles.dot, styles.dotGreen)} />
-              <span className={styles.codeTitle}>config.yaml</span>
-            </div>
-            <pre className={styles.codeBody}>
-              <code>{PIPELINE_YAML}</code>
-            </pre>
-          </div>
+          <CodeWindow />
         </div>
       </div>
     </header>
@@ -144,15 +284,17 @@ function Features() {
           From a single binary on your laptop to an audited fleet rollout.
         </p>
         <div className="row">
-          {FEATURES.map((feature) => (
+          {FEATURES.map((feature, index) => (
             <div key={feature.title} className="col col--4 margin-bottom--lg">
-              <div className={styles.featureCard}>
+              <Reveal
+                className={styles.featureCard}
+                style={{transitionDelay: `${(index % 3) * 80}ms`}}>
                 <div className={styles.featureIcon} aria-hidden="true">
                   {feature.icon}
                 </div>
                 <h3>{feature.title}</h3>
                 <p>{feature.body}</p>
-              </div>
+              </Reveal>
             </div>
           ))}
         </div>
@@ -173,7 +315,7 @@ function PipelineBand() {
         <Heading as="h2" className={styles.bandTitle}>
           One config, the whole journey
         </Heading>
-        <div className={styles.pipeline}>
+        <Reveal className={styles.pipeline}>
           {stages.map((stage, index) => (
             <div key={stage.label} className={styles.pipelineStageWrap}>
               {index > 0 && (
@@ -184,8 +326,13 @@ function PipelineBand() {
               <div className={styles.pipelineStage}>
                 <div className={styles.pipelineLabel}>{stage.label}</div>
                 <div className={styles.pipelineChips}>
-                  {stage.items.map((item) => (
-                    <span key={item} className={styles.chip}>
+                  {stage.items.map((item, itemIndex) => (
+                    <span
+                      key={item}
+                      className={clsx(styles.chip, styles.chipFlow)}
+                      style={{
+                        animationDelay: `${index * 1.4 + itemIndex * 0.12}s`,
+                      }}>
                       {item}
                     </span>
                   ))}
@@ -193,7 +340,7 @@ function PipelineBand() {
               </div>
             </div>
           ))}
-        </div>
+        </Reveal>
         <div className={styles.bandChips}>
           <span className={styles.guarantee}>
             ✓ WAL durability before processing
@@ -243,13 +390,17 @@ function DocsPaths() {
           Where do you want to go?
         </Heading>
         <div className="row">
-          {paths.map((path) => (
+          {paths.map((path, index) => (
             <div key={path.title} className="col col--4 margin-bottom--lg">
-              <Link className={styles.pathCard} to={path.to}>
-                <h3>{path.title}</h3>
-                <p>{path.body}</p>
-                <span className={styles.pathCta}>{path.cta} →</span>
-              </Link>
+              <Reveal
+                className={styles.pathCardReveal}
+                style={{transitionDelay: `${index * 90}ms`}}>
+                <Link className={styles.pathCard} to={path.to}>
+                  <h3>{path.title}</h3>
+                  <p>{path.body}</p>
+                  <span className={styles.pathCta}>{path.cta} →</span>
+                </Link>
+              </Reveal>
             </div>
           ))}
         </div>
@@ -262,25 +413,27 @@ function CommunityBand() {
   return (
     <section className={styles.community}>
       <div className="container">
-        <Heading as="h2" className={styles.communityTitle}>
-          Join the flow
-        </Heading>
-        <p className={styles.communityLead}>
-          ArkFlow is open source under Apache-2.0 and listed in the CNCF
-          Landscape. Contributions, issues, and ideas are welcome.
-        </p>
-        <div className={styles.communityButtons}>
-          <Link
-            className="button button--primary button--lg"
-            href="https://github.com/arkflow-rs/arkflow">
-            Star on GitHub
-          </Link>
-          <Link
-            className={clsx('button button--lg', styles.communityGhost)}
-            href="https://discord.gg/CwKhzb8pux">
-            Chat on Discord
-          </Link>
-        </div>
+        <Reveal>
+          <Heading as="h2" className={styles.communityTitle}>
+            Join the flow
+          </Heading>
+          <p className={styles.communityLead}>
+            ArkFlow is open source under Apache-2.0 and listed in the CNCF
+            Landscape. Contributions, issues, and ideas are welcome.
+          </p>
+          <div className={styles.communityButtons}>
+            <Link
+              className="button button--primary button--lg"
+              href="https://github.com/arkflow-rs/arkflow">
+              Star on GitHub
+            </Link>
+            <Link
+              className={clsx('button button--lg', styles.communityGhost)}
+              href="https://discord.gg/CwKhzb8pux">
+              Chat on Discord
+            </Link>
+          </div>
+        </Reveal>
       </div>
     </section>
   );

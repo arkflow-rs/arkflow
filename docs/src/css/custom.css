@@ -227,6 +227,59 @@ div[class*='announcementBarContent'] a {
 }
 
 /* ------------------------------------------------------------
+ * 404 page
+ * ------------------------------------------------------------ */
+
+.af-notfound {
+  text-align: center;
+  max-width: 40rem;
+}
+
+.af-notfound__code {
+  font-size: clamp(4.5rem, 14vw, 7.5rem);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  background: linear-gradient(92deg, #60a5fa 0%, #38bdf8 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  margin-bottom: 0.75rem;
+}
+
+.af-notfound__title {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 0.6rem;
+}
+
+.af-notfound__lead {
+  color: var(--ifm-color-emphasis-700);
+  margin-bottom: 1.75rem;
+}
+
+.af-notfound__links {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+/* ------------------------------------------------------------
+ * Local search modal polish — the plugin consumes these
+ * --search-local-* variables plus Infima tokens, so brand
+ * tone follows the site palette in both themes.
+ * ------------------------------------------------------------ */
+
+:root {
+  --search-local-highlight-color: rgba(37, 99, 235, 0.18);
+}
+
+[data-theme='dark'] {
+  --search-local-highlight-color: rgba(59, 130, 246, 0.32);
+}
+
+/* ------------------------------------------------------------
  * Scrollbars (subtle, WebKit)
  * ------------------------------------------------------------ */
 
