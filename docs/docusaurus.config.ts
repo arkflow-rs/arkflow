@@ -200,6 +200,11 @@ const config: Config = {
         light: 'neutral',
         dark: 'dark',
       },
+      // Natural-width diagrams stay legible on phones; custom.css gives
+      // .mermaid a horizontal scroll container (landing-page arch-diagram UX).
+      options: {
+        flowchart: {useMaxWidth: false},
+      },
     },
   } satisfies Preset.ThemeConfig,
   themes: [
