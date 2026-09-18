@@ -91,6 +91,16 @@
 [data-theme='dark'] {
   color-scheme: dark;
 
+  /* The dark canvas must be painted on the root itself: Docusaurus sets
+   * data-theme on <html>, so a `[data-theme='dark'] html` descendant
+   * selector never matches, and Infima's `html, body { height: 100% }`
+   * confines body's background box to the first viewport. The value is
+   * hardcoded because Docusaurus re-declares --ifm-background-color on
+   * the higher-specificity `html[data-theme='dark']`, which would win
+   * any var() indirection. This rule still beats Infima's `html`
+   * background (attribute selector outranks type selector). */
+  background-color: #0b1120;
+
   --ifm-color-primary: #3b82f6;
   --ifm-color-primary-dark: #60a5fa;
   --ifm-color-primary-darker: #93c5fd;
@@ -172,7 +182,6 @@ body {
   background-repeat: no-repeat;
 }
 
-[data-theme='dark'] html,
 [data-theme='dark'] body {
   background-color: #0b1120;
 }
