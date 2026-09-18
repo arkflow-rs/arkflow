@@ -13,7 +13,7 @@
  */
 
 import type {CSSProperties, MouseEvent, ReactNode} from 'react';
-import {useEffect, useRef, useState} from 'react';
+import {Fragment, useEffect, useRef, useState} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
@@ -362,6 +362,595 @@ function PipelineBand() {
   );
 }
 
+/* ============================================================
+ * Architecture diagram — the anatomy of the engine, drawn as a
+ * live SVG. Batches (mini columnar Arrow glyphs) ride the input
+ * and output connectors, a light wave walks the kernel stages,
+ * and hovering any node swaps the readout line under the card.
+ * Static and fully readable with reduced motion or no SMIL.
+ * ============================================================ */
+
+const ARCH_INFO_DEFAULT =
+  'Hover any node to inspect it — the light wave is a batch moving through the kernel.';
+
+const ARCH_IO_Y = [224, 304, 384, 464];
+
+const ARCH_SOURCES = [
+  {
+    label: 'Kafka',
+    sub: 'consumer groups',
+    info: 'Kafka input: consumer-group offsets make reads resumable and replayable.',
+  },
+  {
+    label: 'MQTT',
+    sub: 'QoS subscriptions',
+    info: 'MQTT input: QoS-aware subscriptions; metadata columns tag topic and QoS.',
+  },
+  {
+    label: 'HTTP',
+    sub: 'REST push',
+    info: 'HTTP input: push batches over REST — a good fit for edge and app events.',
+  },
+  {
+    label: 'NATS',
+    sub: 'core · JetStream',
+    info: 'NATS input: core and JetStream subscriptions with durable cursors.',
+  },
+];
+
+const ARCH_SINKS = [
+  {
+    label: 'MySQL',
+    sub: 'upsert batches',
+    info: 'SQL output: batched upserts into MySQL — same sink family for Postgres and more.',
+  },
+  {
+    label: 'Kafka',
+    sub: 'transactions',
+    info: 'Kafka output: transactional producer closes the exactly-once duplicate window.',
+  },
+  {
+    label: 'Redis',
+    sub: 'hot path cache',
+    info: 'Redis output: fast lane for enrichment caches, counters, and lookaside data.',
+  },
+  {
+    label: 'InfluxDB',
+    sub: 'metrics',
+    info: 'InfluxDB output: windowed aggregates land as time-series metrics.',
+  },
+];
+
+const ARCH_STAGES = [
+  {
+    x: 304,
+    title: 'Input',
+    sub: 'source reader',
+    delay: 0,
+    info: 'Input worker pulls batches from the source and attaches __meta_* metadata columns.',
+  },
+  {
+    x: 429,
+    title: 'WAL',
+    sub: 'fsync · replay',
+    delay: 0.3,
+    info: 'Write-ahead log fsyncs every batch before processing — restart the process, lose nothing.',
+  },
+  {
+    x: 554,
+    title: 'Buffer',
+    sub: 'windows · joins',
+    delay: 0.6,
+    info: 'In-memory queue or windowing strategy: tumbling, sliding, session — with stream joins.',
+  },
+  {
+    x: 679,
+    title: 'Process',
+    sub: 'SQL · UDF · VRL',
+    delay: 0.9,
+    bars: true,
+    info: 'Processor chain over Arrow RecordBatches: DataFusion SQL, Python UDFs, VRL, codecs.',
+  },
+  {
+    x: 804,
+    title: 'Output',
+    sub: 'ordered sink',
+    delay: 1.2,
+    info: 'Ordered writer with at-least-once acks; Kafka transactions make it exactly-once.',
+  },
+];
+
+const ARCH_KERNEL_CHIPS = [
+  {
+    x: 300,
+    label: 'Arrow MessageBatch',
+    info: 'MessageBatch wraps an Arrow RecordBatch — columnar end to end, so SQL runs without reserializing.',
+  },
+  {
+    x: 500,
+    label: 'bounded channels · backpressure',
+    info: 'Stage edges are bounded flume channels: backpressure propagates upstream, nothing buffers unboundedly.',
+  },
+  {
+    x: 700,
+    label: 'checkpointed state',
+    info: 'Stateful mutations stage until the processing ack commits; checkpoints restore a consistent cut.',
+  },
+];
+
+const ARCH_BAR_HEIGHTS = [34, 20, 30, 14, 26];
+const ARCH_BAR_COLORS = ['#38bdf8', '#60a5fa', '#7dd3fc', '#60a5fa', '#38bdf8'];
+
+const ARCH_SOURCE_PATHS = [
+  'M176,250 C250,250 240,330 300,330',
+  'M176,330 C230,330 240,330 300,330',
+  'M176,410 C250,410 240,330 300,330',
+  'M176,490 C250,490 240,330 300,330',
+];
+
+const ARCH_SINK_PATHS = [
+  'M896,330 C966,330 950,250 1020,250',
+  'M896,330 C966,330 950,330 1020,330',
+  'M896,330 C966,330 950,410 1020,410',
+  'M896,330 C966,330 950,490 1020,490',
+];
+
+const ARCH_CTRL_PATH = 'M600,100 L600,164';
+const ARCH_ERROR_PATH = 'M725,379 L725,424';
+
+/** A flowing record batch: a tiny three-column Arrow glyph. */
+function ArchParticle({
+  pathId,
+  begin,
+  dur,
+}: {
+  pathId: string;
+  begin: number;
+  dur: number;
+}) {
+  return (
+    <g className={styles.particle}>
+      <circle r={11} fill="url(#afPGlow)" />
+      <rect x={-6.5} y={-2} width={3} height={9} rx={1} className={styles.pBarA} />
+      <rect x={-1.5} y={-7} width={3} height={14} rx={1} className={styles.pBarB} />
+      <rect x={3.5} y={-4} width={3} height={11} rx={1} className={styles.pBarC} />
+      <animateMotion
+        dur={`${dur}s`}
+        begin={`${begin}s`}
+        repeatCount="indefinite"
+        rotate="auto">
+        <mpath href={`#${pathId}`} />
+      </animateMotion>
+    </g>
+  );
+}
+
+function ArchitectureSection() {
+  const [info, setInfo] = useState(ARCH_INFO_DEFAULT);
+  const [stats, setStats] = useState({inV: 128_940, doneV: 128_940});
+
+  useEffect(() => {
+    if (prefersReducedMotion()) return;
+    const timer = setInterval(() => {
+      setStats((s) => ({
+        inV: s.inV + 780 + Math.floor(Math.random() * 2400),
+        // "processed" trails one tick behind "in" — in flight, never dropped.
+        doneV: s.inV,
+      }));
+    }, 700);
+    return () => clearInterval(timer);
+  }, []);
+
+  const hover = (text: string) => ({
+    onMouseEnter: () => setInfo(text),
+    onMouseLeave: () => setInfo(ARCH_INFO_DEFAULT),
+    onFocus: () => setInfo(text),
+    onBlur: () => setInfo(ARCH_INFO_DEFAULT),
+  });
+
+  const fmt = (n: number) => n.toLocaleString('en-US');
+
+  return (
+    <section className={styles.archSection}>
+      <div className="container">
+        <Heading as="h2" className={styles.archTitle}>
+          Under the hood
+        </Heading>
+        <p className={styles.archLead}>
+          Streams and distributed jobs compile to the same JobSpec and run on
+          one execution kernel. Batches stay durable, SQL does the heavy
+          lifting, sinks stay ordered — while a Hub/Agent control plane keeps
+          the fleet honest.
+        </p>
+        <Reveal className={styles.archCard}>
+          <div className={styles.archScrollWrap}>
+            <div className={styles.archScroll}>
+            <svg
+              viewBox="0 0 1200 610"
+              className={styles.archSvg}
+              role="img"
+              aria-labelledby="afArchTitle afArchDesc">
+              <title id="afArchTitle">ArkFlow engine architecture</title>
+              <desc id="afArchDesc">
+                Sources feed the ArkFlow engine — input, WAL, buffer,
+                processors, output over Arrow record batches — supervised by a
+                Hub/Agent control plane, and write to sinks.
+              </desc>
+              <defs>
+                <linearGradient id="afEngGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stopColor="#1d4ed8" />
+                  <stop offset="100%" stopColor="#0ea5e9" />
+                </linearGradient>
+                <radialGradient id="afGlowGrad">
+                  <stop offset="0%" stopColor="rgba(56,189,248,0.55)" />
+                  <stop offset="100%" stopColor="rgba(56,189,248,0)" />
+                </radialGradient>
+                <radialGradient id="afPGlow">
+                  <stop offset="0%" stopColor="rgba(125,211,252,0.5)" />
+                  <stop offset="100%" stopColor="rgba(125,211,252,0)" />
+                </radialGradient>
+                <marker
+                  id="afArrow"
+                  viewBox="0 0 10 10"
+                  refX="8.5"
+                  refY="5"
+                  markerWidth="6.5"
+                  markerHeight="6.5"
+                  orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 Z" fill="#60a5fa" />
+                </marker>
+                <marker
+                  id="afArrowMuted"
+                  viewBox="0 0 10 10"
+                  refX="8.5"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 Z" fill="#94a3b8" />
+                </marker>
+                <marker
+                  id="afArrowErr"
+                  viewBox="0 0 10 10"
+                  refX="8.5"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 Z" fill="#f87171" />
+                </marker>
+              </defs>
+
+              {/* Connectors — drawn first so nodes sit on top. */}
+              {ARCH_SOURCE_PATHS.map((d, i) => (
+                <path
+                  key={`src-${i}`}
+                  id={`afSrc${i}`}
+                  d={d}
+                  className={clsx(styles.conn, styles.connFlow)}
+                  markerEnd="url(#afArrow)"
+                />
+              ))}
+              {ARCH_SINK_PATHS.map((d, i) => (
+                <path
+                  key={`sink-${i}`}
+                  id={`afSink${i}`}
+                  d={d}
+                  className={clsx(styles.conn, styles.connFlow)}
+                  markerEnd="url(#afArrow)"
+                />
+              ))}
+              <path
+                id="afCtrl"
+                d={ARCH_CTRL_PATH}
+                className={styles.connCtrl}
+                markerEnd="url(#afArrowMuted)"
+              />
+              <path
+                d={ARCH_ERROR_PATH}
+                className={styles.connErr}
+                markerEnd="url(#afArrowErr)"
+              />
+              {ARCH_STAGES.slice(0, 4).map((stage) => (
+                <path
+                  key={`hop-${stage.x}`}
+                  d={`M${stage.x + 94},330 L${stage.x + 121},330`}
+                  className={styles.internalArrow}
+                  markerEnd="url(#afArrow)"
+                />
+              ))}
+
+              {/* Control plane band. */}
+              <g
+                tabIndex={0}
+                className={styles.hoverable}
+                {...hover(
+                  'Control plane: the Hub holds desired state, Agents reconcile jobs onto nodes, and the console edits and audits rollouts.',
+                )}>
+                <rect
+                  x="330"
+                  y="24"
+                  width="540"
+                  height="72"
+                  rx="12"
+                  className={styles.ctrlBand}
+                />
+                <text x="600" y="46" textAnchor="middle" className={styles.tCtrl}>
+                  CONTROL PLANE · ARKFLOW-SERVER
+                </text>
+                {[
+                  {x: 355, label: 'Web console'},
+                  {x: 525, label: 'Hub'},
+                  {x: 695, label: 'Agents'},
+                ].map((chip) => (
+                  <Fragment key={chip.label}>
+                    <rect
+                      x={chip.x}
+                      y="56"
+                      width="150"
+                      height="30"
+                      rx="8"
+                      className={styles.ctrlChipRect}
+                    />
+                    <text
+                      x={chip.x + 75}
+                      y="75"
+                      textAnchor="middle"
+                      className={styles.tChip}>
+                      {chip.label}
+                    </text>
+                  </Fragment>
+                ))}
+              </g>
+              <text x="620" y="136" className={styles.tTiny}>
+                desired state · reconcile
+              </text>
+
+              {/* Column headers. */}
+              <text x="106" y="204" textAnchor="middle" className={styles.tCol}>
+                SOURCES
+              </text>
+              <text x="1094" y="204" textAnchor="middle" className={styles.tCol}>
+                SINKS
+              </text>
+
+              {/* Engine container. */}
+              <rect
+                x="283"
+                y="173"
+                width="634"
+                height="380"
+                rx="18"
+                fill="none"
+                stroke="rgba(29,78,216,0.16)"
+                strokeWidth="9"
+              />
+              <rect
+                x="281.5"
+                y="171.5"
+                width="637"
+                height="383"
+                rx="17"
+                fill="none"
+                stroke="rgba(56,189,248,0.18)"
+                strokeWidth="3.5"
+              />
+              <rect
+                x="280"
+                y="170"
+                width="640"
+                height="386"
+                rx="16"
+                fill="rgba(11,19,34,0.78)"
+                stroke="url(#afEngGrad)"
+                strokeWidth="1.6"
+              />
+              <text x="600" y="204" textAnchor="middle" className={styles.tEngine}>
+                ARKFLOW ENGINE
+              </text>
+              <text x="600" y="224" textAnchor="middle" className={styles.tEngineSub}>
+                streams &amp; jobs compile to one JobSpec · unified execution kernel
+              </text>
+
+              {/* Kernel stages. */}
+              {ARCH_STAGES.map((stage) => (
+                <g
+                  key={stage.title}
+                  tabIndex={0}
+                  className={styles.hoverable}
+                  {...hover(stage.info)}>
+                  <ellipse
+                    cx={stage.x + 46}
+                    cy="330"
+                    rx="74"
+                    ry="50"
+                    fill="url(#afGlowGrad)"
+                    className={styles.stageGlow}
+                    style={{animationDelay: `${stage.delay}s`}}
+                  />
+                  <rect
+                    x={stage.x}
+                    y="285"
+                    width="92"
+                    height="90"
+                    rx="12"
+                    className={styles.stageRect}
+                    style={{animationDelay: `${stage.delay}s`}}
+                  />
+                  <text
+                    x={stage.x + 46}
+                    y={stage.bars ? 310 : 332}
+                    textAnchor="middle"
+                    className={styles.tStage}>
+                    {stage.title}
+                  </text>
+                  <text
+                    x={stage.x + 46}
+                    y={stage.bars ? 325 : 350}
+                    textAnchor="middle"
+                    className={styles.tStageSub}>
+                    {stage.sub}
+                  </text>
+                  {stage.bars &&
+                    ARCH_BAR_HEIGHTS.map((h, i) => (
+                      <rect
+                        key={i}
+                        x={695 + i * 13}
+                        y={368 - h}
+                        width="8"
+                        height={h}
+                        rx="2"
+                        fill={ARCH_BAR_COLORS[i]}
+                        className={styles.procBar}
+                        style={{
+                          animationDelay: `${i * 0.13}s`,
+                          animationDuration: `${0.9 + (i % 3) * 0.25}s`,
+                        }}
+                      />
+                    ))}
+                </g>
+              ))}
+
+              {/* Error output branch. */}
+              <g
+                tabIndex={0}
+                className={styles.hoverable}
+                {...hover(
+                  'Batches a processor failed on divert here — the stream never stalls or drops them silently.',
+                )}>
+                <rect
+                  x="655"
+                  y="428"
+                  width="140"
+                  height="34"
+                  rx="8"
+                  className={styles.errRect}
+                />
+                <text x="725" y="449" textAnchor="middle" className={styles.tErr}>
+                  error output
+                </text>
+              </g>
+
+              {/* Kernel fact chips. */}
+              {ARCH_KERNEL_CHIPS.map((chip) => (
+                <g
+                  key={chip.label}
+                  tabIndex={0}
+                  className={styles.hoverable}
+                  {...hover(chip.info)}>
+                  <rect
+                    x={chip.x}
+                    y="486"
+                    width="180"
+                    height="30"
+                    rx="8"
+                    className={styles.kernelRect}
+                  />
+                  <text
+                    x={chip.x + 90}
+                    y="505"
+                    textAnchor="middle"
+                    className={styles.tKernel}>
+                    {chip.label}
+                  </text>
+                </g>
+              ))}
+
+              {/* Sources and sinks. */}
+              {ARCH_SOURCES.map((source, i) => (
+                <g
+                  key={source.label}
+                  tabIndex={0}
+                  className={styles.hoverable}
+                  {...hover(source.info)}>
+                  <rect
+                    x="36"
+                    y={ARCH_IO_Y[i]}
+                    width="140"
+                    height="52"
+                    rx="10"
+                    className={styles.ioRect}
+                  />
+                  <text x="106" y={ARCH_IO_Y[i] + 24} textAnchor="middle" className={styles.tLabel}>
+                    {source.label}
+                  </text>
+                  <text x="106" y={ARCH_IO_Y[i] + 40} textAnchor="middle" className={styles.tSub}>
+                    {source.sub}
+                  </text>
+                </g>
+              ))}
+              {ARCH_SINKS.map((sink, i) => (
+                <g
+                  key={sink.label}
+                  tabIndex={0}
+                  className={styles.hoverable}
+                  {...hover(sink.info)}>
+                  <rect
+                    x="1024"
+                    y={ARCH_IO_Y[i]}
+                    width="140"
+                    height="52"
+                    rx="10"
+                    className={styles.ioRect}
+                  />
+                  <text x="1094" y={ARCH_IO_Y[i] + 24} textAnchor="middle" className={styles.tLabel}>
+                    {sink.label}
+                  </text>
+                  <text x="1094" y={ARCH_IO_Y[i] + 40} textAnchor="middle" className={styles.tSub}>
+                    {sink.sub}
+                  </text>
+                </g>
+              ))}
+
+              {/* Flowing batches. */}
+              {ARCH_SOURCE_PATHS.map((_, i) => (
+                <Fragment key={`psrc-${i}`}>
+                  <ArchParticle pathId={`afSrc${i}`} begin={0} dur={2.6} />
+                  <ArchParticle pathId={`afSrc${i}`} begin={-1.3} dur={2.6} />
+                </Fragment>
+              ))}
+              {ARCH_SINK_PATHS.map((_, i) => (
+                <Fragment key={`psink-${i}`}>
+                  <ArchParticle pathId={`afSink${i}`} begin={-0.4} dur={2.2} />
+                  <ArchParticle pathId={`afSink${i}`} begin={-1.5} dur={2.2} />
+                </Fragment>
+              ))}
+              <g className={styles.particle}>
+                <circle r="4" fill="#93c5fd" opacity="0.9" />
+                <animateMotion dur="3.2s" begin="-1s" repeatCount="indefinite">
+                  <mpath href="#afCtrl" />
+                </animateMotion>
+              </g>
+            </svg>
+            </div>
+            <span className={styles.scrollHint} aria-hidden="true">
+              Swipe to explore
+              <span className={styles.scrollHintArrow}>→</span>
+            </span>
+          </div>
+          <div className={styles.archFooter}>
+            <div className={styles.archInfo}>
+              <span className={styles.infoDot} aria-hidden="true" />
+              {info}
+            </div>
+            <div className={styles.archStats}>
+              <span>
+                records in <b>{fmt(stats.inV)}</b>
+              </span>
+              <span>
+                processed <b>{fmt(stats.doneV)}</b>
+              </span>
+              <span className={styles.statOk}>
+                dropped <b>0</b>
+              </span>
+            </div>
+          </div>
+        </Reveal>
+      </div>
+    </section>
+  );
+}
+
 function DocsPaths() {
   const paths = [
     {
@@ -449,6 +1038,7 @@ export default function Home(): ReactNode {
       <main>
         <Features />
         <PipelineBand />
+        <ArchitectureSection />
         <DocsPaths />
         <CommunityBand />
       </main>

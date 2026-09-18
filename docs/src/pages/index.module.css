@@ -553,6 +553,355 @@
 }
 
 /* ============================================================
+ * Architecture diagram
+ * ============================================================ */
+
+.archSection {
+  padding: 4.5rem 0 4.5rem;
+  background:
+    radial-gradient(ellipse 60% 45% at 50% 0%, rgba(59, 130, 246, 0.14), transparent 70%),
+    linear-gradient(180deg, #0a0f1e 0%, #0b1322 60%, #0a0f1e 100%);
+  color: #e6edf7;
+  border-top: 1px solid rgba(94, 122, 168, 0.18);
+  border-bottom: 1px solid rgba(94, 122, 168, 0.18);
+}
+
+.archTitle {
+  text-align: center;
+  font-size: clamp(1.6rem, 3.4vw, 2.2rem);
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  margin-bottom: 0.6rem;
+  color: #f8fafc;
+}
+
+.archLead {
+  text-align: center;
+  color: #b7c3d9;
+  max-width: 44rem;
+  margin: 0 auto 2.4rem;
+  font-size: 1.02rem;
+  line-height: 1.65;
+}
+
+.archCard {
+  border-radius: 16px;
+  background: #0d1526;
+  border: 1px solid rgba(94, 122, 168, 0.28);
+  box-shadow:
+    0 24px 60px -18px rgba(2, 8, 23, 0.85),
+    0 0 0 1px rgba(59, 130, 246, 0.08);
+  overflow: hidden;
+}
+
+.archScrollWrap {
+  position: relative;
+}
+
+/* Right-edge fade hinting that the diagram continues — mobile only,
+   where the SVG is wider than the viewport and scrolls horizontally. */
+.archScrollWrap::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 36px;
+  background: linear-gradient(to left, #0d1526, rgba(13, 21, 38, 0));
+  pointer-events: none;
+  opacity: 0;
+}
+
+.scrollHint {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0 0.6rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #7c8aa5;
+}
+
+.scrollHintArrow {
+  color: #60a5fa;
+}
+
+.archScroll {
+  overflow-x: auto;
+  padding: 0.75rem 0.5rem 0;
+}
+
+@media (max-width: 995px) {
+  .archScrollWrap::after {
+    opacity: 1;
+  }
+
+  .scrollHint {
+    display: flex;
+  }
+}
+
+@media (max-width: 480px) {
+  .archSection {
+    padding: 3.2rem 0;
+  }
+
+  .archStats {
+    gap: 0.9rem;
+    font-size: 0.72rem;
+  }
+}
+
+.archSvg {
+  display: block;
+  width: 100%;
+  min-width: 880px;
+  height: auto;
+}
+
+.archFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 2rem;
+  flex-wrap: wrap;
+  padding: 0.8rem 1.3rem 1rem;
+  border-top: 1px dashed rgba(94, 122, 168, 0.3);
+}
+
+.archInfo {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.86rem;
+  line-height: 1.45;
+  color: #b7c3d9;
+  min-height: 1.4em;
+  max-width: 36rem;
+}
+
+.infoDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #38bdf8;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.8);
+  flex-shrink: 0;
+}
+
+.archStats {
+  display: flex;
+  gap: 1.4rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8rem;
+  color: #7c8aa5;
+  white-space: nowrap;
+}
+
+.archStats b {
+  color: #e6edf7;
+  margin-left: 0.4rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.statOk b {
+  color: #4ade80;
+}
+
+/* --- SVG pieces --- */
+
+.hoverable {
+  cursor: default;
+  outline: none;
+}
+
+.hoverable:hover rect,
+.hoverable:focus-visible rect {
+  stroke: #93c5fd;
+}
+
+.ioRect {
+  fill: #101a30;
+  stroke: rgba(148, 163, 184, 0.35);
+  stroke-width: 1;
+}
+
+.tLabel {
+  font-size: 13px;
+  font-weight: 600;
+  fill: #dbe4f3;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tSub {
+  font-size: 10px;
+  fill: #7c8aa5;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tCol {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  fill: #64748b;
+  font-family: var(--ifm-font-family-base);
+}
+
+.conn {
+  fill: none;
+  stroke: rgba(96, 165, 250, 0.5);
+  stroke-width: 1.5;
+}
+
+.connFlow {
+  stroke-dasharray: 5 7;
+}
+
+.connCtrl {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.5);
+  stroke-width: 1.3;
+  stroke-dasharray: 4 6;
+}
+
+.connErr {
+  fill: none;
+  stroke: rgba(252, 165, 165, 0.75);
+  stroke-width: 1.6;
+  stroke-dasharray: 4 5;
+}
+
+.internalArrow {
+  fill: none;
+  stroke: #60a5fa;
+  stroke-width: 1.6;
+  stroke-dasharray: 4 4;
+}
+
+.ctrlBand {
+  fill: rgba(15, 23, 42, 0.85);
+  stroke: rgba(148, 163, 184, 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 5 5;
+}
+
+.tCtrl {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  fill: #94a3b8;
+  font-family: var(--ifm-font-family-base);
+}
+
+.ctrlChipRect {
+  fill: rgba(148, 163, 184, 0.07);
+  stroke: rgba(148, 163, 184, 0.3);
+  stroke-width: 1;
+}
+
+.tChip {
+  font-size: 11px;
+  font-weight: 600;
+  fill: #cbd5e1;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tTiny {
+  font-size: 9.5px;
+  fill: #7c8aa5;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tEngine {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  fill: #e2e8f0;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tEngineSub {
+  font-size: 10px;
+  fill: #7c8aa5;
+  font-family: var(--ifm-font-family-base);
+}
+
+.stageRect {
+  fill: #122040;
+  stroke: rgba(59, 130, 246, 0.45);
+  stroke-width: 1.2;
+}
+
+.stageGlow {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tStage {
+  font-size: 12.5px;
+  font-weight: 700;
+  fill: #e6edf7;
+  font-family: var(--ifm-font-family-base);
+}
+
+.tStageSub {
+  font-size: 10px;
+  fill: #7c8aa5;
+  font-family: var(--ifm-font-family-base);
+}
+
+.procBar {
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  opacity: 0.9;
+}
+
+.errRect {
+  fill: rgba(248, 113, 113, 0.07);
+  stroke: rgba(248, 113, 113, 0.45);
+  stroke-width: 1;
+}
+
+.tErr {
+  font-size: 10.5px;
+  font-weight: 600;
+  fill: #fca5a5;
+  font-family: var(--ifm-font-family-base);
+}
+
+.kernelRect {
+  fill: rgba(59, 130, 246, 0.08);
+  stroke: rgba(59, 130, 246, 0.28);
+  stroke-width: 1;
+}
+
+.tKernel {
+  font-size: 10px;
+  font-weight: 600;
+  fill: #9fb3d1;
+  font-family: var(--ifm-font-family-base);
+}
+
+.particle {
+  pointer-events: none;
+}
+
+.pBarA {
+  fill: #7dd3fc;
+}
+
+.pBarB {
+  fill: #38bdf8;
+}
+
+.pBarC {
+  fill: #60a5fa;
+}
+
+/* ============================================================
  * Motion choreography — everything lives inside
  * prefers-reduced-motion: no-preference so users who opt out
  * (or UAs with animations disabled) simply see the static page.
@@ -681,6 +1030,55 @@
   }
 }
 
+@keyframes archDashFlow {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
+@keyframes archStageGlowWave {
+  0%,
+  22%,
+  100% {
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes archStageStrokeWave {
+  0%,
+  22%,
+  100% {
+    stroke: rgba(59, 130, 246, 0.45);
+  }
+  10% {
+    stroke: #7dd3fc;
+  }
+}
+
+@keyframes archBarDance {
+  from {
+    transform: scaleY(0.3);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes hintNudge {
+  0%,
+  100% {
+    transform: translateX(0);
+    opacity: 0.7;
+  }
+  50% {
+    transform: translateX(5px);
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: no-preference) {
   /* Hero entrance: badges → title → subtitle → CTAs → hint → code. */
   .badgeRow {
@@ -769,6 +1167,37 @@
   .chipFlow {
     animation: chipGlow 4.2s ease-in-out infinite;
   }
+
+  /* Architecture diagram: dashes stream forward, a glow wave walks
+     Input → WAL → Buffer → Process → Output, and the SQL node's
+     columns dance. Delays come from inline styles per node. */
+  .connFlow {
+    animation: archDashFlow 1.1s linear infinite;
+  }
+
+  .internalArrow {
+    animation: archDashFlow 0.9s linear infinite;
+  }
+
+  .stageGlow {
+    animation: archStageGlowWave 1.8s ease-in-out infinite;
+  }
+
+  .stageRect {
+    animation: archStageStrokeWave 1.8s ease-in-out infinite;
+  }
+
+  .procBar {
+    animation: archBarDance 1.05s ease-in-out infinite alternate;
+  }
+
+  .infoDot {
+    animation: dotBreathe 2.4s ease-in-out infinite;
+  }
+
+  .scrollHintArrow {
+    animation: hintNudge 1.6s ease-in-out infinite;
+  }
 }
 
 /* ------------------------------------------------------------
@@ -789,6 +1218,12 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* The moving batches are pure decoration — drop them, keep the
+     static diagram fully readable. */
+  .particle {
+    display: none;
+  }
+
   .revealPending {
     opacity: 1;
     transform: none;
