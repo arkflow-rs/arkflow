@@ -35,7 +35,7 @@ acknowledged only after Kafka confirms the produce.
 
 Validated example: [`examples/case_webhook_durable.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/case_webhook_durable.yaml)
 
-```yaml
+```yaml validate=full
 streams:
   - id: webhooks-to-kafka
     input:

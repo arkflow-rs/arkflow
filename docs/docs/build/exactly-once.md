@@ -35,7 +35,7 @@ range is replayed on recovery — which begins a fresh transaction.
 
 Enable exactly-once on the Kafka output with two keys:
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: kafka
   brokers:
@@ -58,7 +58,7 @@ Exactly-once is layered on top of at-least-once ingestion, so the input side
 needs durability enabled so that a crash between read and output does not lose
 data:
 
-```yaml
+```yaml validate=fragment wrap=durability
 durability:
   enabled: true
   path: "./data/wal-eos"

@@ -32,7 +32,7 @@ interval; the SQL processor computes the aggregate over the released batch.
 
 Validated example: [`examples/case_telemetry_windows.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/case_telemetry_windows.yaml)
 
-```yaml
+```yaml validate=full
 streams:
   - id: telemetry-window-agg
     input:

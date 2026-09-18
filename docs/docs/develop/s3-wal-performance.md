@@ -78,7 +78,7 @@ loss_window = min(
 
 Controls when the in-memory segment is sealed and PUT to S3.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 segment:
   max_entries: 1000      # default
   max_bytes: 1048576     # 1 MiB default
@@ -104,7 +104,7 @@ segment:
 
 Controls how often the committed cursor (watermark) is persisted to `manifest.json`.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 cursor:
   max_entries: 1000
   interval: 1s
@@ -160,7 +160,7 @@ The S3 WAL backend supports three preset strategies via `segment_tuning.strategy
 
 For high throughput, low cost — tolerates a larger crash window.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
   strategy: aggressive
 ```
@@ -178,7 +178,7 @@ Defaults:
 
 Default trade-off between throughput and crash window.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
   strategy: balanced
 ```
@@ -195,7 +195,7 @@ Defaults:
 
 For minimal crash window — highest PUT frequency.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
   strategy: low_latency
 ```
@@ -212,7 +212,7 @@ Defaults:
 
 Override individual parameters of any preset:
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
   strategy: aggressive
   max_entries: 20000      # override default 10000
@@ -223,7 +223,7 @@ segment_tuning:
 
 Configure multiple PUT workers for 2-3x throughput improvement.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 parallel_put:
   workers: 4              # 1-8, default 1
   shutdown_timeout: "30s" # how long to wait for in-flight uploads
@@ -252,7 +252,7 @@ for the delivery-contract details.
 
 Reduce S3 storage and network costs by 50-70% via segment compression.
 
-```yaml
+```yaml validate=foreign reason="WAL tuning option fragment"
 compression:
   type: zstd  # or "lz4", "none"
   level: 3    # algorithm-specific

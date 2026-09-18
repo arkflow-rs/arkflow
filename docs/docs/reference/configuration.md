@@ -9,7 +9,7 @@ control-plane server, the list of streams to run, and optional streaming
 `jobs` executed by the unified kernel. The file format is selected by
 extension — `.yaml`/`.yml`, `.json`, or `.toml` are all accepted.
 
-```yaml
+```yaml validate=full
 logging:
   level: info
 
@@ -19,9 +19,12 @@ health_check:
 
 streams:
   - id: orders
-    input:    { ... }
-    pipeline: { ... }
-    output:   { ... }
+    input:
+      type: memory        # any registered input — see the component pages
+    pipeline:
+      processors: []      # optional processors
+    output:
+      type: drop          # any registered output
 
 jobs: []      # optional declarative streaming jobs, see "job" below
 ```
@@ -126,7 +129,7 @@ locally through the same unified kernel as streams, and the same job shape is
 what the Hub distributes to compute nodes (see
 [Distributed jobs](../build/distributed-jobs.md)).
 
-```yaml
+```yaml validate=full
 jobs:
   - id: local-job
     version: 1

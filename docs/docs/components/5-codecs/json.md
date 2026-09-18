@@ -18,7 +18,7 @@ The JSON codec converts between line-delimited JSON byte payloads and columnar A
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: kafka
   brokers:
@@ -26,11 +26,12 @@ input:
   topics:
     - events
   consumer_group: arkflow
+  start_from_latest: false
   codec:
     type: json
 ```
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: stdout
   codec:

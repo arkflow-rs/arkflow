@@ -41,6 +41,52 @@ pnpm build
 
 Example YAML files under `examples/` that are registered in `reference/example-manifest.json` are deep-validated by a Rust workspace test (the same checks as `--validate`). An example that cannot be validated offline carries an explicit `"validate": false` entry with a reason in the manifest.
 
+## Inline YAML blocks
+
+Every fenced ` ```yaml ` block in the maintained tree (`docs/docs/`) carries a
+classification in the fence metastring; the metastring is Docusaurus metadata
+and is never rendered or copied. Both gates — `pnpm docs:check` and the Rust
+snippet test (`crates/arkflow/tests/docs_snippets_validate.rs`) — enforce the
+same vocabulary; an unclassified block or an unknown marker is an error.
+
+| Marker | Meaning | Validation |
+| --- | --- | --- |
+| `validate=full` | Complete ArkFlow configuration | Parsed and semantically validated through the real engine config parser |
+| `validate=fragment wrap=<kind>` | Snippet; a wrap template completes it | Wrapped, then validated like `full` |
+| `validate=foreign reason="..."` | Non-ArkFlow YAML (k8s manifest, prometheus config, illustrative-only) | YAML well-formedness only; the reason is required |
+
+Wrap kinds for `fragment`:
+
+- `wrap=input` — the block carries the stream's `input:` section and merges
+  over a stub (`output: {type: drop}`)
+- `wrap=output` — the block carries the `output:` section (stub input is
+  `input: {type: memory}`)
+- `wrap=processors` — the block is the `pipeline.processors:` list, or a
+  `pipeline:` mapping containing it
+- `wrap=durability` / `wrap=buffer` / `wrap=stream` — the block carries
+  stream-level sections (`durability:`, `buffer:`, or a hybrid like
+  `temporary:` + `pipeline:`)
+- `wrap=codec` — the block carries a `codec:` section; it merges under the
+  stream's input
+- `wrap=engine` — the block is a mapping merged into the engine root
+  (`logging:`, `jobs:`, ...) alongside a minimal stream
+
+Every wrapped snippet is validated after parsing by asserting the parsed
+configuration contains the snippet at its wrap target, so a section cannot be
+silently dropped by config deserialization.
+
+If a snippet cannot pass validation (it documents an intentionally invalid
+state, or depends on external resources), classify it `validate=foreign` with
+a reason — silent skipping is not permitted.
+
+```md
+```yaml validate=fragment wrap=input
+input:
+  type: generate
+  ...
+```
+```
+
 ## Version policy
 
 The unversioned `docs/docs/` tree is the next/current development documentation. Versioned trees are release snapshots and are changed only for release corrections or explicit backports; generation and ownership checks apply to the unversioned tree only. A release checklist must verify links, examples, inventory, build output, and the version dropdown before publication.

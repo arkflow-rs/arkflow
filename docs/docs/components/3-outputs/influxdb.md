@@ -44,7 +44,7 @@ The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Proto
 
 ### Basic InfluxDB Output
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "influxdb"
   url: "http://localhost:8086"
@@ -60,7 +60,7 @@ output:
 
 ### With Tags and Timestamp
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "influxdb"
   url: "http://localhost:8086"
@@ -88,7 +88,7 @@ output:
 
 ### With Batching and Retry
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "influxdb"
   url: "https://influxdb.example.com:8086"

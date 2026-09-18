@@ -1,0 +1,58 @@
+name: Documentation external-link check
+
+# Report-only: never gates pull requests. Runs weekly and on demand; files
+# or refreshes a tracking issue when dead links are found. See
+# openspec/specs/documentation-quality-gates (external links are checked
+# periodically, report-only).
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # every Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run lychee
+        id: lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # Checked-in config: docs/lychee.toml (retries, timeouts, exclusions)
+          args: --config ./docs/lychee.toml './docs/docs/**/*.md' './docs/docs/**/*.mdx' './README.md' './README_zh.md' './docs/DOCUMENTATION.md'
+          # Report-only: the action never fails this workflow; the lychee
+          # exit code is read from the step output below.
+          fail: false
+          output: ./lychee-report.md
+          format: markdown
+      - name: Report dead links (issue)
+        # The action's documented contract: exit_code != 0 means dead links.
+        if: steps.lychee.outputs.exit_code != 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "The weekly external-link check (report-only, never blocks PRs) found failures ($(date -u +%Y-%m-%d))."
+            echo
+            cat lychee-report.md
+          } > issue-body.md
+          # Refresh the existing tracking issue if one is open, else create it.
+          ISSUE_NUMBER=$(gh issue list --repo "$REPO" --state open \
+            --search 'in:title "Dead links in documentation"' \
+            --json number --jq '.[0].number' || true)
+          if [ -n "$ISSUE_NUMBER" ]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file issue-body.md
+          else
+            gh issue create --repo "$REPO" \
+              --title 'Dead links in documentation' \
+              --body-file issue-body.md
+          fi
+      - name: Link check summary
+        if: steps.lychee.outputs.exit_code == 0
+        run: echo "No dead links detected."

@@ -43,7 +43,7 @@ The NATS input connects to a NATS server and supports two modes: regular subscri
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "nats"
   url: "nats://localhost:4222"
@@ -53,7 +53,7 @@ input:
     queue_group: "my_group"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "nats"
   url: "nats://localhost:4222"

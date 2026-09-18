@@ -24,7 +24,7 @@ you select or filter on them like any other field.
 Because metadata columns are ordinary columns, you can project and filter on
 them directly:
 
-```yaml
+```yaml validate=fragment wrap=processors
 pipeline:
   processors:
     - type: "sql"

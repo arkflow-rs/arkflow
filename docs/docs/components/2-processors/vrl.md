@@ -17,15 +17,14 @@ The VRL processor transforms messages using Vector Remap Language (VRL), a safe 
 
 ## Examples
 
-```yaml
-- processor:
-    type: "vrl"
-    statement: ".v2, err = .value * 2; ."
+```yaml validate=fragment wrap=processors
+- type: "vrl"
+  statement: ".v2, err = .value * 2; ."
 ```
 
 ### Complete Pipeline Example
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: "generate"

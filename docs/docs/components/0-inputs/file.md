@@ -86,54 +86,64 @@ The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. I
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
-  type: "json"
-  path: "/data/sensor_data.json"
+  type: "file"
+  input_type:
+    type: "json"
+    path: "/data/sensor_data.json"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
-  type: "parquet"
-  path: "s3://my-bucket/data/sensor_readings.parquet"
-  store:
-    type: "s3"
-    region: "us-west-2"
-    bucket_name: "my-bucket"
-    access_key_id: "${AWS_ACCESS_KEY_ID}"
-    secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+  type: "file"
+  input_type:
+    type: "parquet"
+    path: "s3://my-bucket/data/sensor_readings.parquet"
+    store:
+      type: "s3"
+      region: "us-west-2"
+      bucket_name: "my-bucket"
+      access_key_id: "${AWS_ACCESS_KEY_ID}"
+      secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
-  type: "csv"
-  path: "/data/sensors.csv"
+  type: "file"
+  input_type:
+    type: "csv"
+    path: "/data/sensors.csv"
   query:
     query: "SELECT sensor_id, AVG(temperature) as avg_temp FROM flow GROUP BY sensor_id"
     table: "sensor_data"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
-  type: "parquet"
-  path: "s3://analytics/data.parquet"
-  store:
-    type: "s3"
-    endpoint: "http://localhost:9000"
-    region: "us-east-1"
-    bucket_name: "analytics"
-    access_key_id: "minioadmin"
-    secret_access_key: "minioadmin"
-    allow_http: true
+  type: "file"
+  input_type:
+    type: "parquet"
+    path: "s3://analytics/data.parquet"
+    store:
+      type: "s3"
+      endpoint: "http://localhost:9000"
+      region: "us-east-1"
+      bucket_name: "analytics"
+      access_key_id: "minioadmin"
+      secret_access_key: "minioadmin"
+      allow_http: true
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
-  type: "csv"
-  path: "az://my-container/data/input.csv"
-  store:
-    type: "az"
-    account: "mystorageaccount"
-    container_name: "my-container"
-    access_key: "${AZURE_STORAGE_ACCESS_KEY}"
+  type: "file"
+  input_type:
+    type: "csv"
+    path: "az://my-container/data/input.csv"
+    store:
+      type: "az"
+      account: "mystorageaccount"
+      container_name: "my-container"
+      access_key: "${AZURE_STORAGE_ACCESS_KEY}"
 ```

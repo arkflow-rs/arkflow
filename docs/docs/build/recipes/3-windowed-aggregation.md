@@ -26,7 +26,7 @@ Batch messages into time windows and compute per-window aggregates with SQL.
 A complete, CI-validated configuration ships as
 [`examples/case_telemetry_windows.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/case_telemetry_windows.yaml):
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: generate

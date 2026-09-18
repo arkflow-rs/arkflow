@@ -25,7 +25,7 @@ envelopes are decoded before the pipeline runs. A complete, CI-validated
 configuration ships as
 [`examples/cdc_debezium.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/cdc_debezium.yaml):
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: kafka
@@ -59,7 +59,7 @@ When Debezium is configured with the Confluent Protobuf converter, use the
 `schema_registry` codec instead — validated as
 `examples/howto_cdc_schema_registry.yaml`:
 
-```yaml
+```yaml validate=fragment wrap=codec
       codec:
         type: schema_registry
         registry_url: "http://localhost:8081"

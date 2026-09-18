@@ -38,7 +38,7 @@ The MQTT output publishes each message to an MQTT broker topic. It supports QoS 
 
 ### Static topic
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "mqtt"
   host: "localhost"
@@ -58,7 +58,7 @@ output:
 
 ### Dynamic topic via SQL expression
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "mqtt"
   host: "localhost"

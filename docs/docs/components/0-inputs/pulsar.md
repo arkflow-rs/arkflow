@@ -25,11 +25,11 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| type | string | yes | `"token"` or `"oauth2"` |
+| type | string | yes | `"token"` or `"o_auth2"` |
 | token | string | yes (token) | Token string |
-| issuer_url | string | yes (oauth2) | OAuth2 issuer URL |
-| credentials_url | string | yes (oauth2) | OAuth2 credentials URL |
-| audience | string | yes (oauth2) | OAuth2 audience |
+| issuer_url | string | yes (o_auth2) | OAuth2 issuer URL |
+| credentials_url | string | yes (o_auth2) | OAuth2 credentials URL |
+| audience | string | yes (o_auth2) | OAuth2 audience |
 
 ### retry_config
 
@@ -42,7 +42,7 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "pulsar"
   service_url: "pulsar://localhost:6650"
@@ -50,7 +50,7 @@ input:
   subscription_name: "my-subscription"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "pulsar"
   service_url: "pulsar://pulsar-cluster:6650"
@@ -59,7 +59,7 @@ input:
   subscription_type: "shared"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "pulsar"
   service_url: "pulsar+ssl://secure-pulsar:6651"
@@ -70,16 +70,16 @@ input:
     token: "${PULSAR_TOKEN}"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "pulsar"
   service_url: "pulsar+ssl://pulsar.cloud:6651"
   topic: "cloud-topic"
   subscription_name: "oauth-subscription"
   auth:
-    type: "oauth2"
+    type: "o_auth2"
     issuer_url: "https://auth.example.com"
-    credentials_url: "file:///path/to/credentials.json"
+    credentials_url: "https://auth.example.com/credentials.json"
     audience: "pulsar-cluster"
 ```
 

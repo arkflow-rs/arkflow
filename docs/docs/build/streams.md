@@ -14,13 +14,15 @@ same YAML compiles to a `JobSpec`, so what you read here also holds for
 
 ## Anatomy
 
-```yaml
+```yaml validate=full
 streams:
   - id: orders-to-mysql        # unique stream id
     input:
       type: kafka              # registered input type
       brokers: [localhost:9092]
       topics: [shop.orders]
+      consumer_group: arkflow-orders
+      start_from_latest: false
     pipeline:
       thread_num: 4            # parallel processing chains
       processors:
@@ -82,12 +84,17 @@ continues — the difference between a resilient pipeline and a 3 a.m. incident.
 
 Add stream-level durability to make the stream crash-safe:
 
-```yaml
+```yaml validate=full
 streams:
   - id: webhooks
     input:
       type: http
-      # ...
+      address: "0.0.0.0:8080"
+      path: "/webhook"
+    pipeline:
+      processors: []
+    output:
+      type: drop
     durability:
       enabled: true
       path: "./data/wal"

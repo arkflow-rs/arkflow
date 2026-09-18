@@ -21,23 +21,21 @@ The two types share the same configuration fields. `value_field` selects the bin
 
 ### JSON to Arrow
 
-```yaml
-- processor:
-    type: "json_to_arrow"
-    value_field: "data"
-    fields_to_include:
-      - "field1"
-      - "field2"
+```yaml validate=fragment wrap=processors
+- type: "json_to_arrow"
+  value_field: "data"
+  fields_to_include:
+    - "field1"
+    - "field2"
 ```
 
 ### Arrow to JSON
 
-```yaml
-- processor:
-    type: "arrow_to_json"
-    fields_to_include:
-      - "field1"
-      - "field2"
+```yaml validate=fragment wrap=processors
+- type: "arrow_to_json"
+  fields_to_include:
+    - "field1"
+    - "field2"
 ```
 
 ## Notes

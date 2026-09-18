@@ -19,7 +19,7 @@ The Generate input produces synthetic text messages at a fixed interval, primari
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "generate"
   context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'

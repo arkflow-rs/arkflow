@@ -24,25 +24,22 @@ Both types share `proto_inputs`, `proto_includes`, and `message_type`. Additiona
 
 ### Arrow to Protobuf
 
-```yaml
-- processor:
-    type: "arrow_to_protobuf"
-    proto_inputs: ["./protos/example.proto"]
-    message_type: "example.MyMessage"
-    fields_to_include:
-      - "field1"
-      - "field2"
+```yaml validate=fragment wrap=processors
+- type: "arrow_to_protobuf"
+  proto_inputs: ["./examples/message.proto"]
+  message_type: "message.Message"
+  fields_to_include:
+    - "field1"
+    - "field2"
 ```
 
 ### Protobuf to Arrow
 
-```yaml
-- processor:
-    type: "protobuf_to_arrow"
-    proto_inputs: ["./protos/example.proto"]
-    proto_includes: ["./protos/"]
-    message_type: "example.MyMessage"
-    value_field: "data"
+```yaml validate=fragment wrap=processors
+- type: "protobuf_to_arrow"
+  proto_inputs: ["./examples/message.proto"]
+  message_type: "message.Message"
+  value_field: "data"
 ```
 
 ## Notes

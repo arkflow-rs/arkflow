@@ -50,7 +50,7 @@ The SQL output batch-inserts records into a MySQL or PostgreSQL database. Each r
 
 ### MySQL
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "sql"
   output_type:
@@ -61,7 +61,7 @@ output:
 
 ### PostgreSQL
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "sql"
   output_type:
@@ -72,7 +72,7 @@ output:
 
 ### PostgreSQL with SSL
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "sql"
   output_type:
@@ -88,7 +88,7 @@ output:
 
 ### PostgreSQL upsert
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "sql"
   output_type:

@@ -24,7 +24,7 @@ The Kafka input consumes messages from one or more Apache Kafka topics using a c
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "kafka"
   brokers:
@@ -36,7 +36,7 @@ input:
   start_from_latest: false
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "kafka"
   brokers:

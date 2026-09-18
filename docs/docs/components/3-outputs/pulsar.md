@@ -29,7 +29,7 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 
 ### auth
 
-`auth` is a tagged object (selected by its `type` field). Supported variants: `token` and `oauth2`.
+`auth` is a tagged object (selected by its `type` field). Supported variants: `token` and `o_auth2`.
 
 #### token
 
@@ -38,11 +38,11 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 | type | string | yes | `token`. |
 | token | string | yes | Authentication token. |
 
-#### oauth2
+#### o_auth2
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| type | string | yes | `oauth2`. |
+| type | string | yes | `o_auth2`. |
 | issuer_url | string | yes | OAuth2 issuer URL. |
 | credentials_url | string | yes | URL to the client credentials file. |
 | audience | string | yes | OAuth2 audience. |
@@ -51,7 +51,7 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 
 ### Basic Pulsar Producer
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "pulsar"
   service_url: "pulsar://localhost:6650"
@@ -62,7 +62,7 @@ output:
 
 ### With Token Authentication
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "pulsar"
   service_url: "pulsar+ssl://secure-pulsar:6651"
@@ -76,7 +76,7 @@ output:
 
 ### With OAuth2 Authentication
 
-```yaml
+```yaml validate=fragment wrap=output
 output:
   type: "pulsar"
   service_url: "pulsar+ssl://secure-pulsar:6651"
@@ -84,13 +84,13 @@ output:
     type: "value"
     value: "persistent://public/default/events"
   auth:
-    type: "oauth2"
+    type: "o_auth2"
     issuer_url: "https://auth.example.com/oauth2"
-    credentials_url: "file:///etc/pulsar/credentials.json"
+    credentials_url: "https://auth.example.com/credentials.json"
     audience: "urn:pulsar:cluster"
 ```
 
 ## Notes
 
 - The output validates the service URL and auth fields at build and connect time; misconfiguration fails fast.
-- Pulsar authentication supports `token` and `oauth2` (client credentials). Basic username/password authentication is not supported.
+- Pulsar authentication supports `token` and `o_auth2` (client credentials). Basic username/password authentication is not supported.

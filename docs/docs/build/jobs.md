@@ -27,7 +27,7 @@ A job is a directed acyclic graph: `operators` connected by `edges`, with
 component `sources` and `sinks` attached to the graph's `source` and `sink`
 operators:
 
-```yaml
+```yaml validate=full
 streams: []
 jobs:
   - id: sensor-window-job

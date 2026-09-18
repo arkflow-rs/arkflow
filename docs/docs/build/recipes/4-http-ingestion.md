@@ -15,7 +15,7 @@ messages.
 
 ## Configuration
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info
 

@@ -17,14 +17,14 @@ The Memory buffer is an in-memory message queue that accumulates incoming messag
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=buffer
 buffer:
   type: "memory"
   capacity: 100
   timeout: "1s"
 ```
 
-```yaml
+```yaml validate=full
 streams:
   - input:
       type: "generate"

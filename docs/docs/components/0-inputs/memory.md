@@ -16,7 +16,7 @@ The Memory input reads messages from an in-memory queue that can be pre-seeded w
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "memory"
   messages:

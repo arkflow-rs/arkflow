@@ -21,7 +21,7 @@ with one ArkFlow stream.
 Save as `kafka-to-sql.yaml` (also validated in CI as
 `examples/case_order_stream_sql.yaml`):
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info
 

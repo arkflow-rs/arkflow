@@ -52,7 +52,7 @@ The SQL input executes a `select_sql` query through DataFusion to read from a da
 
 ## Examples
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "sql"
   select_sql: "SELECT * FROM flow"
@@ -65,7 +65,7 @@ input:
       root_cert: "/path/to/cert.pem"
 ```
 
-```yaml
+```yaml validate=fragment wrap=input
 input:
   type: "sql"
   select_sql: "SELECT * FROM flow where id > 1000"

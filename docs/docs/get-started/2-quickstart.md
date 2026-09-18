@@ -11,7 +11,7 @@ them with SQL, and prints the result to the console.
 
 Save this as `config.yaml`:
 
-```yaml
+```yaml validate=fragment wrap=engine
 logging:
   level: info
 
