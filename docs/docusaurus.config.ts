@@ -109,6 +109,7 @@ const config: Config = {
     },
     navbar: {
       title: 'ArkFlow',
+      hideOnScroll: true,
       logo: {
         alt: 'ArkFlow',
         src: 'img/logo.svg',
@@ -123,6 +124,10 @@ const config: Config = {
         {to: '/docs/sql', label: 'SQL', position: 'left'},
         {to: '/docs/reference/api', label: 'API', position: 'left'},
         {to: '/blog', label: 'Blog', position: 'left'},
+        {
+          type: 'search',
+          position: 'right',
+        },
         {
           type: 'docsVersionDropdown',
           position: 'right',
@@ -188,9 +193,28 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
+      additionalLanguages: ['rust', 'http'],
+    },
+    mermaid: {
+      theme: {
+        light: 'neutral',
+        dark: 'dark',
+      },
     },
   } satisfies Preset.ThemeConfig,
-  themes: ['@docusaurus/theme-mermaid'],
+  themes: [
+    '@docusaurus/theme-mermaid',
+    [
+      '@easyops-cn/docusaurus-search-local',
+      {
+        // Docs + blog are indexed; the landing page stays out.
+        indexDocs: true,
+        indexBlog: true,
+        indexPages: false,
+        highlightSearchTermsOnTargetPage: true,
+      },
+    ],
+  ],
   plugins: [
     function disableIncompatibleWebpackBar() {
       return {

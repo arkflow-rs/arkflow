@@ -40,15 +40,55 @@
       ellipse 40% 50% at 12% 90%,
       rgba(56, 189, 248, 0.12),
       transparent 60%
-    ),
+    );
+}
+
+/* Blueprint grid on its own layer so it can drift independently. */
+.heroGridLayer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
     linear-gradient(rgba(148, 163, 184, 0.055) 1px, transparent 1px),
     linear-gradient(90deg, rgba(148, 163, 184, 0.055) 1px, transparent 1px);
-  background-size:
-    100% 100%,
-    100% 100%,
-    44px 44px,
-    44px 44px;
-  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 1), rgba(0, 0, 0, 0.35));
+  background-size: 44px 44px;
+  mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 1),
+    rgba(0, 0, 0, 0.35)
+  );
+}
+
+/* Soft light orbs that slowly drift through the hero. */
+.heroOrb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(70px);
+  pointer-events: none;
+}
+
+.heroOrbA {
+  width: 540px;
+  height: 420px;
+  top: -140px;
+  right: -80px;
+  background: radial-gradient(
+    circle,
+    rgba(59, 130, 246, 0.26),
+    transparent 70%
+  );
+}
+
+.heroOrbB {
+  width: 470px;
+  height: 380px;
+  bottom: -170px;
+  left: -120px;
+  background: radial-gradient(
+    circle,
+    rgba(56, 189, 248, 0.16),
+    transparent 70%
+  );
 }
 
 .heroInner {
@@ -99,6 +139,7 @@
 
 .heroAccent {
   background: linear-gradient(92deg, #60a5fa 0%, #38bdf8 100%);
+  background-size: 200% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -157,6 +198,8 @@
     0 24px 60px -18px rgba(2, 8, 23, 0.85),
     0 0 0 1px rgba(59, 130, 246, 0.08);
   overflow: hidden;
+  transition: transform 0.25s ease;
+  will-change: transform;
 }
 
 .codeChrome {
@@ -201,11 +244,47 @@
   color: #c7d4ea;
   background: transparent;
   overflow-x: auto;
+  /* Reserve the full typed height so the window doesn't jump while
+     lines stream in (19 lines + status row). */
+  min-height: 35em;
 }
 
 .codeBody code {
   color: inherit;
   white-space: pre;
+}
+
+.codeLine {
+  display: block;
+  min-height: 1.6em;
+}
+
+.cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: #60a5fa;
+}
+
+.codeStatus {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.85rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed rgba(94, 122, 168, 0.35);
+  color: #4ade80;
+  font-size: 0.82rem;
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #34d399;
+  flex-shrink: 0;
 }
 
 /* ============================================================
@@ -273,6 +352,11 @@
 .featureIcon {
   font-size: 1.5rem;
   margin-bottom: 0.7rem;
+  transition: transform 0.25s ease;
+}
+
+.featureCard:hover .featureIcon {
+  transform: translateY(-3px) scale(1.12);
 }
 
 /* ============================================================
@@ -380,6 +464,10 @@
  * Path cards
  * ============================================================ */
 
+.pathCardReveal {
+  height: 100%;
+}
+
 .pathCard {
   display: flex;
   flex-direction: column;
@@ -462,4 +550,251 @@
 .communityGhost:hover {
   background: rgba(148, 163, 184, 0.12);
   color: #fff;
+}
+
+/* ============================================================
+ * Motion choreography — everything lives inside
+ * prefers-reduced-motion: no-preference so users who opt out
+ * (or UAs with animations disabled) simply see the static page.
+ * ============================================================ */
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes codeIn {
+  from {
+    opacity: 0;
+    transform: translateY(24px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes gridDrift {
+  to {
+    background-position: 44px 44px;
+  }
+}
+
+@keyframes orbDriftA {
+  from {
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    transform: translate(-60px, 40px) scale(1.12);
+  }
+}
+
+@keyframes orbDriftB {
+  from {
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    transform: translate(70px, -30px) scale(1.08);
+  }
+}
+
+@keyframes accentShift {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes cursorBlink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes lineIn {
+  from {
+    opacity: 0;
+    transform: translateX(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes statusPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(52, 211, 153, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
+  }
+}
+
+@keyframes dotBreathe {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes arrowSweep {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
+}
+
+@keyframes chipGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+  }
+  6% {
+    box-shadow: 0 0 0 6px rgba(37, 99, 235, 0.12);
+    border-color: rgba(59, 130, 246, 0.7);
+  }
+  12% {
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+  }
+}
+
+@keyframes ctaGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+  50% {
+    box-shadow: 0 0 22px 2px rgba(59, 130, 246, 0.45);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Hero entrance: badges → title → subtitle → CTAs → hint → code. */
+  .badgeRow {
+    animation: riseIn 0.6s cubic-bezier(0.2, 0.7, 0.3, 1) 0.05s backwards;
+  }
+
+  .heroTitle {
+    animation: riseIn 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) 0.15s backwards;
+  }
+
+  .heroSubtitle {
+    animation: riseIn 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) 0.25s backwards;
+  }
+
+  .heroButtons {
+    animation: riseIn 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) 0.35s backwards;
+  }
+
+  .heroHint {
+    animation: riseIn 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) 0.45s backwards;
+  }
+
+  .codeWindow {
+    animation: codeIn 0.8s cubic-bezier(0.2, 0.7, 0.3, 1) 0.3s backwards;
+  }
+
+  /* Ambient loops. */
+  .heroGridLayer {
+    animation: gridDrift 22s linear infinite;
+  }
+
+  .heroOrbA {
+    animation: orbDriftA 16s ease-in-out infinite alternate;
+  }
+
+  .heroOrbB {
+    animation: orbDriftB 19s ease-in-out infinite alternate;
+  }
+
+  .heroAccent {
+    animation: accentShift 7s ease-in-out infinite alternate;
+  }
+
+  .heroButtons :global(.button--primary) {
+    animation: ctaGlow 3s ease-in-out infinite;
+  }
+
+  /* Typewriter chrome. */
+  .codeLine {
+    animation: lineIn 0.28s ease both;
+  }
+
+  .cursor {
+    animation: cursorBlink 1s steps(1) infinite;
+  }
+
+  .codeStatus {
+    animation: lineIn 0.4s ease both;
+  }
+
+  .statusDot {
+    animation: statusPulse 2s ease-out infinite;
+  }
+
+  .dotBreathe {
+    animation: dotBreathe 2.4s ease-in-out infinite;
+  }
+
+  /* Data flowing through the pipeline band. */
+  .pipelineArrow {
+    background: linear-gradient(
+      100deg,
+      rgba(37, 99, 235, 0.25) 0%,
+      rgba(37, 99, 235, 0.25) 42%,
+      var(--ifm-color-primary) 50%,
+      rgba(37, 99, 235, 0.25) 58%,
+      rgba(37, 99, 235, 0.25) 100%
+    );
+    background-size: 260% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: arrowSweep 2.1s linear infinite;
+  }
+
+  .chipFlow {
+    animation: chipGlow 4.2s ease-in-out infinite;
+  }
+}
+
+/* ------------------------------------------------------------
+ * Scroll reveal
+ * ------------------------------------------------------------ */
+
+.revealPending {
+  opacity: 0;
+  transform: translateY(20px);
+}
+
+.revealVisible {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 0.65s cubic-bezier(0.2, 0.7, 0.3, 1),
+    transform 0.65s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .revealPending {
+    opacity: 1;
+    transform: none;
+  }
+
+  .revealVisible {
+    transition: none;
+  }
 }

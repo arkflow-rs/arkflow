@@ -49,7 +49,7 @@ arkflow components list [--kind KIND] [--format FORMAT]
 | `-k, --kind <KIND>` | Filter by component kind: `input`, `output`, `processor`, `buffer`, `codec`, `temporary`. |
 | `-f, --format <FORMAT>` | `text` (default, aligned columns) or `json` (machine-readable registry export). |
 
-```console
+```bash
 $ arkflow components list --kind codec
 codec:
   json        JSON codec for parsing and serializing message payloads
@@ -75,7 +75,7 @@ arkflow components show <KIND> <NAME> [--format FORMAT]
 | `<NAME>` | Registered component type name (required). |
 | `-f, --format <FORMAT>` | `text` (default) or `json`. |
 
-```console
+```bash
 $ arkflow components show input kafka
 kafka: Kafka input component for consuming messages from Kafka topics
 kind: input
