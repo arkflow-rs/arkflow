@@ -7229,10 +7229,7 @@ mod tests {
     /// series remain.
     #[tokio::test]
     async fn expired_lease_stops_data_plane_export() {
-        let hub = Hub::new(HubConfig {
-            lease_ttl_ms: 1,
-            ..config()
-        });
+        let hub = Hub::new(config());
         let mut sessions = BTreeMap::new();
         for node_id in ["n1", "n2"] {
             let session = hub
@@ -7270,7 +7267,15 @@ mod tests {
         }
         assert_eq!(hub.job_metrics().await.len(), 2);
 
-        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        // n1's lease lapses deterministically; a tiny TTL would race the
+        // wall clock across the registration awaits above.
+        hub.nodes
+            .write()
+            .await
+            .get_mut("n1")
+            .unwrap()
+            .resource
+            .lease_expires_at_ms = now_ms();
         hub.heartbeat(HeartbeatRequest {
             auth: AgentAuth {
                 node_id: "n2".into(),
