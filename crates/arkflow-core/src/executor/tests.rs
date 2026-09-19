@@ -277,6 +277,9 @@ fn resource() -> Resource {
 
 fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) -> JobSpec {
     let mut operators = operators;
+    let has_window = operators
+        .iter()
+        .any(|operator| operator.kind == OperatorKind::Window);
     let has_source = operators
         .iter()
         .any(|operator| operator.kind == OperatorKind::Source);
@@ -329,7 +332,16 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
             output_type: "collect".into(),
             config: serde_json::json!({}),
         }],
-        state: None,
+        state: has_window.then_some(crate::job::StateSpec {
+            backend: "embedded_kv".into(),
+            durability: crate::job::StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        }),
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
@@ -438,10 +450,13 @@ fn stateful_operator_breaks_the_chain() {
     );
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
@@ -566,7 +581,16 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
             output_type: "collect".into(),
             config: serde_json::json!({}),
         }],
-        state: None,
+        state: Some(crate::job::StateSpec {
+            backend: "embedded_kv".into(),
+            durability: crate::job::StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        }),
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
@@ -1445,10 +1469,13 @@ async fn partitioned_edge_routes_by_key_hash() {
     );
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
@@ -2461,10 +2488,13 @@ fn stateful_operator_wrapped_with_task_namespace() {
     );
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -2490,7 +2520,13 @@ fn stateful_operator_wrapped_with_task_namespace() {
     // task namespace (wrapper injected the count column).
     let batch = Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())])));
     futures_check(agg_chain.processors[0].clone(), batch).unwrap();
-    assert_eq!(backend.scan("job:test-job:task:agg-0").unwrap().len(), 1);
+    assert_eq!(
+        backend
+            .scan("job:test-job:state:default:operator:agg:task:agg-0")
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn futures_check(
@@ -2517,10 +2553,13 @@ fn stateful_operator_without_backend_is_rejected() {
     // build without a backend to trigger the builder guard.
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
@@ -2577,10 +2616,13 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
     );
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let adapter = UnpartitionedAdapter(Adapter {
@@ -2783,10 +2825,13 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
         }],
         state: Some(crate::job::StateSpec {
             backend: "embedded_kv".into(),
+            durability: crate::job::StateDurability::Ephemeral,
+            root: None,
             namespace: None,
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_bytes: None,
         }),
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
@@ -2846,7 +2891,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
 
     // The committed snapshot contains exactly the acknowledged pre-barrier
     // mutations: a and b keyed counters, never the post-barrier c/d rows.
-    let namespace = "job:race-job:task:agg-0";
+    let namespace = "job:race-job:state:default:operator:agg:task:agg-0";
     let keys = snapshot
         .entries
         .iter()
@@ -3124,10 +3169,13 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
     );
     job.state = Some(crate::job::StateSpec {
         backend: "embedded_kv".into(),
+        durability: crate::job::StateDurability::Ephemeral,
+        root: None,
         namespace: None,
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -3172,7 +3220,7 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
         "barrier must wait for the pre-cut sink write (elapsed {:?})",
         started.elapsed()
     );
-    let namespace = "job:test-job:task:agg-0";
+    let namespace = "job:test-job:state:default:operator:agg:task:agg-0";
     let committed = snapshot
         .entries
         .iter()
@@ -3668,6 +3716,7 @@ fn thread_num_does_not_change_source_partition_topology() {
         error_output: None,
         buffer: None,
         durability: None,
+        state: None,
         temporary: None,
     };
     let spec = crate::executor::stream_compiler::compile_stream(&stream, 0).unwrap();
@@ -4256,12 +4305,14 @@ async fn remote_graph_routes_data_across_nodes() {
             format!("127.0.0.1:{port}").parse().unwrap(),
         )]),
         manager: manager_a.clone(),
+        generation: 1,
     };
     let context_b = crate::executor::graph::RemoteEdgeContext {
         local_node: "node-b".into(),
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::new(),
         manager: manager_b.clone(),
+        generation: 1,
     };
 
     let graph_a = ExecutionGraphBuilder::default()
@@ -4345,6 +4396,7 @@ async fn remote_graph_fails_closed_when_downstream_unreachable() {
             "127.0.0.1:1".parse().unwrap(),
         )]),
         manager: manager_a.clone(),
+        generation: 1,
     };
     let adapter_a = Adapter {
         input: Arc::new(OneBatchThenPendingInput {
@@ -4372,6 +4424,52 @@ async fn remote_graph_fails_closed_when_downstream_unreachable() {
     assert!(result.is_err(), "expected the source chain to fail closed");
     cancellation.cancel();
     manager_a.shutdown();
+}
+
+#[test]
+fn remote_graph_rejects_incomplete_side_edge_assignment() {
+    let mut job = spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    );
+    job.operators.push(sink_operator("late_sink", false));
+    job.sources[0].time.late_event_route = Some("late_sink".into());
+    let plan = JobPlan::compile(job).unwrap();
+    let manager = crate::executor::remote::NetworkManager::new(16);
+    let context = crate::executor::graph::RemoteEdgeContext {
+        local_node: "node-a".into(),
+        // Deliberately omit late_sink-0: an Agent must not defer this failure
+        // until the first late event is emitted.
+        task_nodes: BTreeMap::from([
+            ("source-0".to_string(), "node-a".to_string()),
+            ("map-0".to_string(), "node-a".to_string()),
+            ("sink-0".to_string(), "node-a".to_string()),
+        ]),
+        node_addrs: BTreeMap::new(),
+        manager,
+        generation: 1,
+    };
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".into(), "map-0".into(), "sink-0".into()],
+            &adapter,
+            &resource(),
+            Some(&context),
+        )
+        .err()
+        .expect("incomplete side-edge assignment must fail graph construction");
+    assert!(
+        error.to_string().contains("late-event side edge")
+            && error.to_string().contains("late_sink-0"),
+        "expected an actionable incomplete side-edge error, got {error}"
+    );
 }
 
 // ---------- openspec verification round: scenario coverage ----------
@@ -4405,6 +4503,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::new(),
         manager: manager_b.clone(),
+        generation: 1,
     };
     let graph_b = ExecutionGraphBuilder::default()
         .build_subgraph(

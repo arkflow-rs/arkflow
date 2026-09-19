@@ -9,6 +9,7 @@ use arkflow_server::agent::{self, NodeAgentConfig};
 use arkflow_server::hub::{Hub, HubConfig, HubOperationState};
 use arkflow_server::storage::JobRecord;
 use arkflow_server::{hub_router, ServerConfig};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,7 @@ fn empty_control_plane() -> ControlPlane {
     )
 }
 
-fn two_component_job(id: JobId, checkpoint_uri: String) -> JobSpec {
+fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> JobSpec {
     let processing_time = || TimeSpec {
         mode: TimeMode::ProcessingTime,
         timestamp_field: None,
@@ -120,10 +121,13 @@ fn two_component_job(id: JobId, checkpoint_uri: String) -> JobSpec {
         ],
         state: Some(StateSpec {
             backend: "embedded_kv".into(),
+            durability: arkflow_core::job::StateDurability::Durable,
+            root: Some(state_root),
             namespace: None,
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {
             interval_ms: 60_000,
@@ -139,6 +143,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    static WAIT_INDEX: AtomicUsize = AtomicUsize::new(0);
+    let wait_index = WAIT_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
     // Generous under load: the full workspace suite runs other binaries on
     // the same machine, and cold caches can stretch kernel startup.
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -150,7 +156,7 @@ where
         }
     })
     .await
-    .expect("two-node smoke condition timed out");
+    .unwrap_or_else(|_| panic!("two-node smoke condition {wait_index} timed out"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -161,11 +167,13 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let spec = two_component_job(
         JobId::new(&job_id).unwrap(),
         format!("file://{}", checkpoint_dir.path().display()),
+        checkpoint_dir.path().join("state").display().to_string(),
     );
 
     let hub = Hub::new(HubConfig {
         operator_token: None,
         node_token: None,
+        insecure_local: true,
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
         session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
@@ -383,6 +391,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let mut spec = two_component_job(
         JobId::new(&job_id).unwrap(),
         format!("file://{}", checkpoint_dir.path().display()),
+        checkpoint_dir.path().join("state").display().to_string(),
     );
     // Reshape into a two-task split job: generate source → drop sink, with
     // the edge crossing the network.
@@ -397,6 +406,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let hub = Hub::new(HubConfig {
         operator_token: None,
         node_token: None,
+        insecure_local: true,
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
         session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
@@ -430,6 +440,11 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     });
 
     let hub_url = format!("http://{}", address);
+    // The TCP shuffle plane is authenticated independently of the in-process
+    // Hub test mode. Both Agents use the same explicit test secret so this
+    // exercises the production handshake instead of the unauthenticated
+    // in-memory transport used by core unit tests.
+    let data_plane_secret = "split-data-plane-secret".to_string();
     let cancel_a = CancellationToken::new();
     let cancel_b = CancellationToken::new();
     let agent_a = tokio::spawn(agent::run(
@@ -438,7 +453,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
             hub_url: hub_url.clone(),
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
-            node_token: String::new(),
+            node_token: data_plane_secret.clone(),
             boot_id: "split-boot-a".into(),
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),
@@ -454,7 +469,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
             hub_url: hub_url.clone(),
             api_prefix: "/api/v1".into(),
             node_id: "node-b".into(),
-            node_token: String::new(),
+            node_token: data_plane_secret,
             boot_id: "split-boot-b".into(),
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),

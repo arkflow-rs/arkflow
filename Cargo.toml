@@ -53,6 +53,8 @@ clap = { version = "4.5", features = ["derive"] }
 colored = "3.0"
 flume = "=0.11"
 subtle = "2.6"
+hmac = "0.12"
+sha2 = "0.10"
 rand = "0.9"
 governor = "0.6"
 dashmap = "6.1"

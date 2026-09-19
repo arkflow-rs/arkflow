@@ -1104,6 +1104,7 @@ mod tests {
             error_output: None,
             buffer: None,
             durability: None,
+            state: None,
             temporary: None,
         }
     }

@@ -1122,6 +1122,28 @@ impl StateBackend for RedbStateBackend {
         if !snapshot.verify() {
             return Err(Error::Process("state snapshot checksum mismatch".into()));
         }
+        let now = now_ms();
+        let mut live_entries = BTreeMap::<String, &StateEntry>::new();
+        for entry in &snapshot.entries {
+            if entry
+                .expires_at_ms
+                .is_some_and(|expires| expires <= now)
+            {
+                continue;
+            }
+            live_entries.insert(Self::storage_key(&entry.namespace, &entry.key), entry);
+        }
+        let restored_bytes = live_entries
+            .values()
+            .map(|entry| entry.value.len() as u64)
+            .sum::<u64>();
+        if let Some(max_bytes) = self.max_bytes {
+            if restored_bytes > max_bytes {
+                return Err(Error::Process(format!(
+                    "state restore exceeds budget: {restored_bytes} > {max_bytes} bytes"
+                )));
+            }
+        }
         let _write_guard = self.write_lock.lock().unwrap();
         let tx = self
             .db
@@ -1144,24 +1166,13 @@ impl StateBackend for RedbStateBackend {
                     .remove(key.as_str())
                     .map_err(|error| Error::Process(format!("state restore clear: {error}")))?;
             }
-            let mut restored_keys = 0_u64;
-            let mut restored_bytes = 0_u64;
-            for entry in &snapshot.entries {
-                let key = Self::storage_key(&entry.namespace, &entry.key);
-                if entry
-                    .expires_at_ms
-                    .is_some_and(|expires| expires <= now_ms())
-                {
-                    continue;
-                }
+            for (key, entry) in &live_entries {
                 let encoded = encode_value(&entry.value, entry.expires_at_ms)?;
                 table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(|error| Error::Process(format!("state restore: {error}")))?;
-                restored_keys = restored_keys.saturating_add(1);
-                restored_bytes = restored_bytes.saturating_add(entry.value.len() as u64);
             }
-            (restored_keys, restored_bytes)
+            (live_entries.len() as u64, restored_bytes)
         };
         tx.commit()
             .map_err(|error| Error::Process(format!("state commit: {error}")))?;
@@ -1319,9 +1330,41 @@ mod tests {
         backend
             .put_with_ttl("orders", b"a", b"1", Some(10_000), base)
             .unwrap();
+        // Exactly reaching the configured live-byte budget is valid.
+        backend.put("orders", b"b", b"1").unwrap();
+        assert_eq!(backend.metrics().unwrap().bytes, 2);
+        assert_eq!(backend.get("orders", b"b").unwrap(), Some(b"1".to_vec()));
+        // The next write exceeds the budget and must not partially commit.
         assert!(backend.put("orders", b"b", b"22").is_err());
+        assert_eq!(backend.get("orders", b"b").unwrap(), Some(b"1".to_vec()));
         assert_eq!(backend.purge_expired(base + 9_999).unwrap(), 0);
         assert_eq!(backend.purge_expired(base + 10_000).unwrap(), 1);
+    }
+
+    #[test]
+    fn restore_rejects_a_snapshot_over_the_state_budget_without_clearing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1)
+            .unwrap()
+            .with_max_bytes(2);
+        backend.put("orders", b"existing", b"ok").unwrap();
+        let snapshot = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "orders".into(),
+                key: b"restored".to_vec(),
+                value: b"too-large".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+
+        let error = backend.restore(&snapshot).unwrap_err();
+        assert!(error.to_string().contains("state restore exceeds budget"));
+        assert_eq!(
+            backend.get("orders", b"existing").unwrap(),
+            Some(b"ok".to_vec())
+        );
+        assert_eq!(backend.get("orders", b"restored").unwrap(), None);
     }
 
     /// Regression: the byte counters are observability only. They used to gate

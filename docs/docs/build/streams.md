@@ -66,6 +66,9 @@ described in [backpressure & ordering](./backpressure.md).
 Windows (tumbling, sliding, session) attach as buffers — see the
 [buffer components](../components/1-buffers/tumbling_window.md) and the
 [windowed aggregation recipe](./recipes/3-windowed-aggregation.md).
+Window buffers are stateful: legacy streams must declare
+`state.durability: ephemeral` when state loss is acceptable; use a `jobs`
+entry with a checkpoint policy when the window must recover after restart.
 
 ### Output
 

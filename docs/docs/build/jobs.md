@@ -70,6 +70,8 @@ jobs:
 
     state:
       backend: embedded_kv
+      durability: durable
+      root: ./data/arkflow-state
       ttl_ms: 3600000
       format_version: 1
     checkpoint:
@@ -90,8 +92,8 @@ Key points:
   reaches the same downstream task regardless of which source partition or
   upstream subtask delivered it.
 - Operator `kind` is one of `source`, `map`, `filter`, `aggregate`,
-  `window`, `join`, `sink`, `udf`. Intermediate kinds are primarily produced
-  by the streaming SQL compiler and the console DAG orchestrator today.
+  `window`, `sink`, or `udf`. `join` is reserved in the public shape but is
+  rejected until a dedicated distributed multi-input runtime exists.
 - Event-time sources declare `mode`, a `timestamp_field`, watermark
   parameters, and a late-event policy (`drop`, `route`, or `update`).
 

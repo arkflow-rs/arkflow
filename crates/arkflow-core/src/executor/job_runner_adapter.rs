@@ -88,6 +88,22 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         .as_ref()
         .map(|checkpoint| local_checkpoint_root(&checkpoint.object_store_uri))
         .transpose()?;
+    let recovery_required = durable_local_recovery_required(&plan);
+    let recovery_manifest = if recovery_required {
+        let Some(root) = checkpoint_root.as_deref() else {
+            return Err(Error::Config(
+                "durable local Job state requires a checkpoint artifact before restart".into(),
+            ));
+        };
+        Some(latest_local_checkpoint(root, &plan)?.ok_or_else(|| {
+            Error::Config(format!(
+                "durable local Job '{}' requires recovery but no compatible checkpoint was found",
+                plan.spec.id
+            ))
+        })?)
+    } else {
+        None
+    };
     let state = local_state_backend(&plan)?;
     let builder = match state.clone() {
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
@@ -112,51 +128,76 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     let states = state_map(&plan, state.clone());
     let mut watermark_gates = event_time_gates(&graph)?;
     let mut prepared_inputs = false;
-    if let Some(root) = checkpoint_root.as_deref() {
-        if !matches!(plan.spec.recovery, crate::job::RecoveryPolicy::Fail) {
-            if let Some(manifest) = latest_local_checkpoint(root, &plan)? {
-                let state = state.as_ref().ok_or_else(|| {
-                    Error::Config("local checkpoint recovery requires a state backend".into())
-                })?;
-                let repository = crate::checkpoint::CheckpointRepository::new(
-                    crate::checkpoint::FileCheckpointStore::new(root)?,
-                );
-                restore_local_snapshot(&repository, &manifest, state)?;
-                for input in &inputs {
-                    if let Err(error) = input.connect().await {
-                        close_inputs(&inputs).await;
-                        let _ = startup
-                            .take()
-                            .map(|sender| sender.send(Err(error.to_string())));
-                        return Err(error);
-                    }
-                }
-                if let Err(error) = seed_event_time_partitions(&graph, &watermark_gates).await {
-                    close_inputs(&inputs).await;
-                    let _ = state.close();
-                    let _ = startup
-                        .take()
-                        .map(|sender| sender.send(Err(error.to_string())));
-                    return Err(error);
-                }
-                for input in &inputs {
-                    if let Err(error) = input.restore_positions(&manifest.source_positions).await {
-                        close_inputs(&inputs).await;
-                        let _ = startup
-                            .take()
-                            .map(|sender| sender.send(Err(error.to_string())));
-                        return Err(error);
-                    }
-                }
-                restore_event_time_watermarks(
-                    &graph,
-                    &watermark_gates,
-                    &manifest.watermarks_ms,
-                    &manifest.watermark_partitions,
-                )
-                .await;
-                prepared_inputs = true;
+    if let Some(manifest) = recovery_manifest.as_ref() {
+        let Some(root) = checkpoint_root.as_deref() else {
+            return Err(Error::Config(
+                "local checkpoint recovery requires a checkpoint root".into(),
+            ));
+        };
+        let state = state.as_ref().ok_or_else(|| {
+            Error::Config("local checkpoint recovery requires a state backend".into())
+        })?;
+        let repository = crate::checkpoint::CheckpointRepository::new(
+            crate::checkpoint::FileCheckpointStore::new(root)?,
+        );
+        let namespace_prefix =
+            crate::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
+        restore_local_snapshot(&repository, manifest, state, &namespace_prefix)?;
+        for input in &inputs {
+            if let Err(error) = input.connect().await {
+                close_inputs(&inputs).await;
+                let _ = startup
+                    .take()
+                    .map(|sender| sender.send(Err(error.to_string())));
+                return Err(error);
             }
+        }
+        if let Err(error) = seed_event_time_partitions(&graph, &watermark_gates).await {
+            close_inputs(&inputs).await;
+            let _ = state.close();
+            let _ = startup
+                .take()
+                .map(|sender| sender.send(Err(error.to_string())));
+            return Err(error);
+        }
+        for input in &inputs {
+            if let Err(error) = input.restore_positions(&manifest.source_positions).await {
+                close_inputs(&inputs).await;
+                let _ = startup
+                    .take()
+                    .map(|sender| sender.send(Err(error.to_string())));
+                return Err(error);
+            }
+        }
+        restore_event_time_watermarks(
+            &graph,
+            &watermark_gates,
+            &manifest.watermarks_ms,
+            &manifest.watermark_partitions,
+        )
+        .await;
+        prepared_inputs = true;
+    }
+    let start_marker = if durable_local_state(&plan) {
+        local_state_start_marker(&plan)
+    } else {
+        None
+    };
+    if let Some(marker) = start_marker.as_deref() {
+        if let Err(error) = persist_start_marker(marker) {
+            if prepared_inputs {
+                close_inputs(&inputs).await;
+            }
+            if let Some(state) = state.as_ref() {
+                let _ = state.close();
+            }
+            let error = Error::Process(format!(
+                "durable local Job could not persist its start marker: {error}"
+            ));
+            let _ = startup
+                .take()
+                .map(|sender| sender.send(Err(error.to_string())));
+            return Err(error);
         }
     }
     let spawned_result = if prepared_inputs {
@@ -192,6 +233,9 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     let spawned = match spawned_result {
         Ok(handle) => handle,
         Err(error) => {
+            if let Some(marker) = start_marker.as_deref() {
+                remove_start_marker(marker);
+            }
             if prepared_inputs {
                 close_inputs(&inputs).await;
             }
@@ -330,12 +374,75 @@ fn local_state_backend(
             state.backend
         )));
     }
-    let root = PathBuf::from(std::env::temp_dir())
-        .join("arkflow-local-job-state")
-        .join(plan.spec.id.as_str())
-        .join(format!("version-{}", plan.spec.version.0));
+    let root = local_state_root(plan).expect("state section checked above");
     let backend = crate::state::RedbStateBackend::open(root, state.format_version)?;
+    let backend = match state.max_bytes {
+        Some(max_bytes) => backend.with_max_bytes(max_bytes),
+        None => backend,
+    };
     Ok(Some(std::sync::Arc::new(backend)))
+}
+
+fn local_state_root(plan: &JobPlan) -> Option<PathBuf> {
+    let state = plan.spec.state.as_ref()?;
+    let base = match state.durability {
+        crate::job::StateDurability::Durable => crate::job::configured_state_root(state),
+        crate::job::StateDurability::Ephemeral => std::env::temp_dir()
+            .join("arkflow-ephemeral-job-state")
+            .join(ephemeral_state_nonce()),
+    };
+    Some(
+        base.join("jobs")
+            .join(plan.spec.id.as_str())
+            .join(format!("version-{}", plan.spec.version.0)),
+    )
+}
+
+fn ephemeral_state_nonce() -> String {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{timestamp}-{attempt}", std::process::id())
+}
+
+fn local_state_start_marker(plan: &JobPlan) -> Option<PathBuf> {
+    Some(local_state_root(plan)?.join(".arkflow-started"))
+}
+
+fn persist_start_marker(marker: &std::path::Path) -> std::io::Result<()> {
+    let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+    if let Err(error) = std::fs::write(&temporary, b"started\n") {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, marker) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_start_marker(marker: &std::path::Path) {
+    let _ = std::fs::remove_file(marker);
+    let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(temporary);
+}
+
+fn durable_local_recovery_required(plan: &JobPlan) -> bool {
+    durable_local_state(plan)
+        && local_state_start_marker(plan).is_some_and(|marker| marker.is_file())
+}
+
+fn durable_local_state(plan: &JobPlan) -> bool {
+    plan.spec
+        .state
+        .as_ref()
+        .is_some_and(|state| state.durability == crate::job::StateDurability::Durable)
+        && plan.spec.requires_state()
+        && plan.spec.checkpoint.is_some()
 }
 
 fn state_map(
@@ -615,11 +722,34 @@ fn latest_local_checkpoint(
             );
             continue;
         }
-        if manifest
-            .state_snapshots
-            .iter()
-            .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
-        {
+        if let Err(reason) = crate::checkpoint::validate_state_snapshot_task_set(
+            &manifest.state_snapshots,
+            &planned_tasks,
+        ) {
+            tracing::warn!(
+                job_id = %plan.spec.id,
+                checkpoint = %manifest.checkpoint_id,
+                expected = ?planned_tasks,
+                reason = %reason,
+                "skipping local recovery artifact with invalid task snapshots"
+            );
+            continue;
+        }
+        let namespace_prefix =
+            crate::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
+        let snapshots_are_compatible = manifest.state_snapshots.iter().all(|snapshot_ref| {
+            repository
+                .read_state_snapshot(snapshot_ref)
+                .ok()
+                .is_some_and(|snapshot| {
+                    crate::checkpoint::validate_state_snapshot_namespace(
+                        &snapshot,
+                        &namespace_prefix,
+                    )
+                    .is_ok()
+                })
+        });
+        if snapshots_are_compatible {
             return Ok(Some(manifest));
         }
     }
@@ -630,10 +760,13 @@ fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(
     repository: &crate::checkpoint::CheckpointRepository<S>,
     manifest: &crate::checkpoint::CheckpointManifest,
     state: &Arc<dyn crate::state::StateBackend>,
+    namespace_prefix: &str,
 ) -> Result<(), Error> {
     let mut entries = BTreeMap::<(String, Vec<u8>), crate::state::StateEntry>::new();
     for snapshot_ref in &manifest.state_snapshots {
         let snapshot = repository.read_state_snapshot(snapshot_ref)?;
+        crate::checkpoint::validate_state_snapshot_namespace(&snapshot, namespace_prefix)
+            .map_err(Error::Config)?;
         if snapshot.format_version != state.format_version() {
             return Err(Error::Config(format!(
                 "checkpoint state format {} is incompatible with local backend format {}",
@@ -877,7 +1010,8 @@ pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
 mod validation_tests {
     use super::*;
     use crate::job::{
-        JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec, TimeMode, TimeSpec,
+        CheckpointSpec, JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec,
+        StateDurability, StateSpec, TimeMode, TimeSpec,
     };
 
     fn local_spec(input_type: &str, output_type: &str) -> JobSpec {
@@ -929,7 +1063,7 @@ mod validation_tests {
             state: None,
             checkpoint: None,
             placement: crate::job::PlacementStrategy::Colocated,
-        recovery: Default::default(),
+            recovery: Default::default(),
         }
     }
 
@@ -941,6 +1075,84 @@ mod validation_tests {
         let error =
             validate_local_job(&spec).expect_err("unknown input component must fail validation");
         assert!(error.to_string().contains("Unknown input type"));
+    }
+
+    #[test]
+    fn durable_local_state_reuses_a_stable_root_and_requires_a_checkpoint_after_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spec = local_spec("memory", "drop");
+        spec.operators.insert(
+            1,
+            OperatorSpec {
+                id: "aggregate".into(),
+                kind: OperatorKind::Aggregate,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({}),
+            },
+        );
+        spec.edges = vec![
+            crate::job::EdgeSpec {
+                id: "source-aggregate".into(),
+                from: "source".into(),
+                to: "aggregate".into(),
+                partitioned: false,
+            },
+            crate::job::EdgeSpec {
+                id: "aggregate-sink".into(),
+                from: "aggregate".into(),
+                to: "sink".into(),
+                partitioned: false,
+            },
+        ];
+        spec.state = Some(StateSpec {
+            backend: "embedded_kv".into(),
+            durability: StateDurability::Durable,
+            root: Some(temp.path().display().to_string()),
+            namespace: Some("stable".into()),
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        });
+        spec.checkpoint = Some(CheckpointSpec {
+            interval_ms: 1_000,
+            retention: 1,
+            object_store_uri: format!("file://{}", temp.path().join("checkpoints").display()),
+        });
+        let plan = JobPlan::compile(spec).unwrap();
+        let first_root = local_state_root(&plan).unwrap();
+        let second_root = local_state_root(&plan).unwrap();
+        assert_eq!(first_root, second_root);
+        assert!(!durable_local_recovery_required(&plan));
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::write(local_state_start_marker(&plan).unwrap(), b"started\n").unwrap();
+        assert!(durable_local_recovery_required(&plan));
+    }
+
+    #[test]
+    fn ephemeral_state_does_not_turn_an_empty_start_into_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spec = local_spec("memory", "drop");
+        spec.state = Some(StateSpec {
+            backend: "embedded_kv".into(),
+            durability: StateDurability::Ephemeral,
+            root: Some(temp.path().display().to_string()),
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        });
+        spec.checkpoint = None;
+        let plan = JobPlan::compile(spec).unwrap();
+        let first_root = local_state_root(&plan).unwrap();
+        let second_root = local_state_root(&plan).unwrap();
+        assert_ne!(
+            first_root, second_root,
+            "each ephemeral Job attempt must get an isolated state directory"
+        );
+        assert!(!durable_local_recovery_required(&plan));
     }
 }
 
@@ -979,7 +1191,11 @@ mod metrics_registry_tests {
             }
             *sent = true;
             let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
                 vec![Arc::new(Int64Array::from(vec![1]))],
             )
             .unwrap();
@@ -1097,7 +1313,7 @@ mod metrics_registry_tests {
             state: None,
             checkpoint: None,
             placement: crate::job::PlacementStrategy::Colocated,
-        recovery: Default::default(),
+            recovery: Default::default(),
         }
     }
 

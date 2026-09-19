@@ -35,7 +35,10 @@ async fn run_example_on_kernel(path: &str, wal_path: &std::path::Path) -> usize 
                 .unwrap();
         let mut resource = adapter.build_resource().unwrap();
         tokio::time::timeout(
-            Duration::from_secs(20),
+            // The workspace runs many Arrow/DataFusion tests concurrently;
+            // keep the bounded-completion assertion meaningful without
+            // making scheduler contention look like a kernel hang.
+            Duration::from_secs(60),
             run_job(&spec, &adapter, &mut resource, CancellationToken::new()),
         )
         .await

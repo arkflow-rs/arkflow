@@ -169,10 +169,7 @@ impl CheckpointStore for FileCheckpointStore {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| Error::Config("invalid checkpoint store key".into()))?;
-        let temp_path = path.with_file_name(format!(
-            ".{file_name}.tmp-{}",
-            std::process::id()
-        ));
+        let temp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
         let write_atomic = || -> Result<(), Error> {
             use std::io::Write;
             let mut file = std::fs::File::create(&temp_path)
@@ -312,7 +309,7 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
         let task_ids = manifest
             .task_attempts
             .iter()
-            .map(|attempt| attempt.task_id.as_str())
+            .map(|attempt| attempt.task_id.clone())
             .collect::<BTreeSet<_>>();
         if task_ids.is_empty() || manifest.state_snapshots.is_empty() {
             return Err(Error::Process(
@@ -320,16 +317,8 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
                     .into(),
             ));
         }
-        let snapshot_tasks = manifest
-            .state_snapshots
-            .iter()
-            .map(|snapshot| snapshot.task_id.as_str())
-            .collect::<BTreeSet<_>>();
-        if !task_ids.is_subset(&snapshot_tasks) {
-            return Err(Error::Process(
-                "recovery manifest is missing a state snapshot for a participating task".into(),
-            ));
-        }
+        validate_state_snapshot_task_set(&manifest.state_snapshots, &task_ids)
+            .map_err(Error::Process)?;
         for snapshot in &manifest.state_snapshots {
             self.read_state_snapshot(snapshot)?;
         }
@@ -619,6 +608,62 @@ pub fn evaluate_recovery_compatibility(
     RecoveryCompatibility::ok()
 }
 
+/// Require exactly one state snapshot reference per planned task.  A subset
+/// check is insufficient here: an extra or duplicate reference is later
+/// merged into the backend and can overwrite a valid task's state or inject
+/// state from an unplanned task.
+pub fn validate_state_snapshot_task_set(
+    snapshots: &[StateSnapshotRef],
+    planned_tasks: &BTreeSet<String>,
+) -> Result<(), String> {
+    let snapshot_tasks = snapshots
+        .iter()
+        .map(|snapshot| snapshot.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    if snapshot_tasks.len() != snapshots.len() {
+        return Err("recovery manifest contains duplicate state snapshot task references".into());
+    }
+    if &snapshot_tasks != planned_tasks {
+        let missing = planned_tasks
+            .difference(&snapshot_tasks)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = snapshot_tasks
+            .difference(planned_tasks)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "recovery state snapshot task set does not match the planned assignment (missing: {missing:?}, extra: {extra:?})"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a materialized state snapshot belongs to the Job namespace
+/// that is about to restore it.  The manifest checksum authenticates the
+/// artifact envelope, but the snapshot contents are the boundary where a
+/// namespace collision could otherwise reintroduce another Job's keys.
+pub fn validate_state_snapshot_namespace(
+    snapshot: &StateSnapshot,
+    expected_prefix: &str,
+) -> Result<(), String> {
+    if !snapshot.verify() {
+        return Err("state snapshot checksum mismatch".into());
+    }
+    if let Some(entry) = snapshot.entries.iter().find(|entry| {
+        !entry
+            .namespace
+            .strip_prefix(expected_prefix)
+            .is_some_and(|suffix| suffix.starts_with("operator:"))
+    }) {
+        return Err(format!(
+            "state snapshot contains namespace '{}' outside the expected prefix '{}'",
+            entry.namespace, expected_prefix
+        ));
+    }
+    Ok(())
+}
+
 impl RecoveryPlan {
     pub fn from_manifest(manifest: &CheckpointManifest) -> Result<Self, Error> {
         if !manifest.verify() {
@@ -745,15 +790,8 @@ impl CheckpointCoordinator {
                 "checkpoint task attempts do not cover all participating tasks".into(),
             ));
         }
-        let snapshot_tasks = state_snapshots
-            .iter()
-            .map(|snapshot| snapshot.task_id.clone())
-            .collect::<BTreeSet<_>>();
-        if !self.participants.is_subset(&snapshot_tasks) {
-            return Err(Error::Process(
-                "checkpoint state snapshots do not cover all participating tasks".into(),
-            ));
-        }
+        validate_state_snapshot_task_set(&state_snapshots, &self.participants)
+            .map_err(Error::Process)?;
         let barrier = self
             .barrier
             .clone()
@@ -1247,6 +1285,61 @@ mod compatibility_tests {
         assert!(verdict.reason.unwrap().contains("belongs to job"));
     }
 
+    #[test]
+    fn state_snapshot_namespace_must_match_the_job_prefix() {
+        let valid = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:orders:state:stable:operator:aggregate:task:task-0".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        assert!(validate_state_snapshot_namespace(&valid, "job:orders:state:stable:").is_ok());
+
+        let foreign = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:payments:state:stable:operator:aggregate:task:task-0".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let error =
+            validate_state_snapshot_namespace(&foreign, "job:orders:state:stable:").unwrap_err();
+        assert!(error.contains("outside the expected prefix"), "{error}");
+
+        let nested_namespace = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:orders:state:stable%3Aevil:operator:aggregate:task:task-0".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let error =
+            validate_state_snapshot_namespace(&nested_namespace, "job:orders:state:stable:")
+                .unwrap_err();
+        assert!(error.contains("outside the expected prefix"), "{error}");
+
+        let raw_nested_namespace = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:orders:state:stable:evil:operator:aggregate:task:task-0".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let error =
+            validate_state_snapshot_namespace(&raw_nested_namespace, "job:orders:state:stable:")
+                .unwrap_err();
+        assert!(error.contains("outside the expected prefix"), "{error}");
+    }
+
     /// Task 5.3: the repository refuses to seal a checkpoint whose manifest
     /// does not carry the complete planned assignment.
     #[test]
@@ -1282,11 +1375,39 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn state_snapshot_task_validation_rejects_extra_and_duplicate_refs() {
+        let reference = StateSnapshotRef {
+            task_id: "task-0".into(),
+            node_id: None,
+            uri: "state/task-0.json".into(),
+            checksum: 1,
+            bytes: 1,
+        };
+        let planned = BTreeSet::from(["task-0".to_string()]);
+        assert!(validate_state_snapshot_task_set(
+            &[reference.clone(), reference.clone()],
+            &planned
+        )
+        .unwrap_err()
+        .contains("duplicate"));
+        let extra = StateSnapshotRef {
+            task_id: "task-extra".into(),
+            ..reference
+        };
+        assert!(validate_state_snapshot_task_set(&[extra], &planned)
+            .unwrap_err()
+            .contains("does not match"));
+    }
+
+    #[test]
     fn file_store_put_is_atomic_and_leaves_no_temp_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileCheckpointStore::new(dir.path()).unwrap();
         store.put("cp/a/manifest.json", b"v1").unwrap();
-        assert_eq!(store.get("cp/a/manifest.json").unwrap().as_deref(), Some(b"v1".as_slice()));
+        assert_eq!(
+            store.get("cp/a/manifest.json").unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
         // A replacement fully replaces the object; a torn partial write can
         // never appear under the final key because publication happens
         // through an atomic rename after fsync.

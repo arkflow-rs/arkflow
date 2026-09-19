@@ -91,6 +91,17 @@ serves the same endpoints and no second listener is started.
 | `ready_path` | string | no | `/ready` | Readiness probe: success once the engine finished starting the configured Streams and Jobs. |
 | `live_path` | string | no | `/live` | Liveness probe: success while the process is running. |
 
+### Standalone Hub startup safety
+
+The standalone `arkflow-server` control plane is fail-closed by default. Set
+`ARKFLOW_HUB_STORAGE` to a durable SQLite path, `ARKFLOW_OPERATOR_TOKEN` for
+operator APIs, and `ARKFLOW_NODE_TOKEN` for Agent registration before binding
+the Hub beyond loopback. For explicitly local development only, set
+`ARKFLOW_HUB_INSECURE_LOCAL=1` while keeping `ARKFLOW_HUB_ADDRESS` on a
+loopback address; this permits volatile state and omitted credentials. The Hub
+restores durable state before binding its listener, so a recovery error leaves
+the server unavailable rather than serving a partial view.
+
 :::note
 When the control-plane server is enabled, `/ready` and `/live` are also
 mounted on the server address next to the legacy `/health`, `/readiness`, and
@@ -112,6 +123,7 @@ the shape is:
 | `error_output` | object | no | — | Output that receives batches a processor failed on. |
 | `buffer` | object | no | — | Buffer / windowing strategy between input and processors. |
 | `durability` | object | no | — | Per-stream WAL durability (see [Delivery semantics](../build/delivery-semantics.md)). |
+| `state` | object | no | — | State contract for legacy windows. Declare `durability: ephemeral` for a non-recoverable window, or use a `jobs` entry with checkpoints for durable state. |
 | `temporary` | array&lt;object&gt; | no | — | Temporary storage tables for joins. |
 
 ### `pipeline`
@@ -158,11 +170,11 @@ jobs:
 | `version` | integer | yes | — | Job version; state-format compatibility on recovery is evaluated against it. |
 | `parallelism` | integer | no | `1` | Default task parallelism. |
 | `max_parallelism` | integer | no | `128` | Upper bound used for key-group partitioning. |
-| `operators` | array&lt;object&gt; | yes | — | DAG nodes: `id`, `kind` (`source`, `map`, `filter`, `aggregate`, `window`, `join`, `sink`, `udf`), `stateful`, `key_field`, `config`. |
+| `operators` | array&lt;object&gt; | yes | — | DAG nodes: `id`, `kind` (`source`, `map`, `filter`, `aggregate`, `window`, `sink`, `udf`); `join` is reserved but rejected until a distributed multi-input runtime exists. |
 | `edges` | array&lt;object&gt; | no | `[]` | DAG edges: `id`, `from`, `to`, `partitioned` (key-group routing instead of same-subtask). |
 | `sources` | array&lt;object&gt; | no | `[]` | Attach a component input to a `source` operator: `operator_id`, `input_type`, `config`, `time`. |
 | `sinks` | array&lt;object&gt; | no | `[]` | Attach a component output to a `sink` operator: `operator_id`, `output_type`, `config`. |
-| `state` | object | no | — | `backend` (e.g. `embedded_kv`), `namespace`, `ttl_ms`, `format_version`, `max_pending_transactions` (positive; default 4096; raise it when a window sees very high per-window key cardinality, since one transaction is held per open window group or unacknowledged output). Required by stateful operators. |
+| `state` | object | no | — | `backend` (e.g. `embedded_kv`), `durability` (`durable` by default or explicit `ephemeral`), optional stable `root` (or `ARKFLOW_STATE_ROOT`), `namespace`, `ttl_ms`, `format_version`, `max_pending_transactions` (positive; default 4096; raise it when a window sees very high per-window key cardinality, since one transaction is held per open window group or unacknowledged output), optional positive `max_bytes` live-state budget. Required by stateful operators; durable state also requires `checkpoint`. |
 | `checkpoint` | object | no | — | `interval_ms`, `retention`, `object_store_uri` (e.g. `file://...` or `s3://...`). |
 | `recovery` | string | no | `latest_checkpoint` | `latest_checkpoint`, `latest_savepoint`, or `fail`. |
 
