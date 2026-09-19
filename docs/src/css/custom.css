@@ -705,7 +705,6 @@ code {
  * ------------------------------------------------------------ */
 
 .navbar {
-  backdrop-filter: blur(12px) saturate(160%);
   background-color: color-mix(
     in srgb,
     var(--ifm-navbar-background-color) 92%,
@@ -716,6 +715,22 @@ code {
     var(--af-card-border) 70%,
     transparent
   );
+}
+
+/* The glass blur lives on a pseudo-element instead of .navbar itself:
+ * a backdrop-filter on the navbar would make it the containing block
+ * for the fixed-positioned navbar-sidebar (rendered inside <nav>),
+ * clipping the mobile drawer to the 60px navbar box. The nav is
+ * positioned with Infima's z-index, so this negative-z pseudo stays in
+ * its stacking context behind the translucent background — the same
+ * composite as a backdrop-filter on the element itself. The same
+ * constraint bans filter/transform on .navbar for the same reason. */
+.navbar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  backdrop-filter: blur(12px) saturate(160%);
 }
 
 @supports not (
