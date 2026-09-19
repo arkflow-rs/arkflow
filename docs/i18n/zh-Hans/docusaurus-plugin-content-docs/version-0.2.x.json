@@ -1,0 +1,90 @@
+{
+  "version.label": {
+    "message": "0.2.x",
+    "description": "The label for version 0.2.x"
+  },
+  "sidebar.tutorialSidebar.category.Components": {
+    "message": "Components",
+    "description": "The label for category 'Components' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Components.link.generated-index.title": {
+    "message": "Components",
+    "description": "The generated-index page title for category 'Components' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Components.link.generated-index.description": {
+    "message": "Components ",
+    "description": "The generated-index page description for category 'Components' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs": {
+    "message": "Inputs",
+    "description": "The label for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs.link.generated-index.title": {
+    "message": "Inputs",
+    "description": "The generated-index page title for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs.link.generated-index.description": {
+    "message": "Input components are responsible for consuming data from various sources such as Kafka, MQTT, HTTP, and Memory. Each input component has its own configuration options that can be customized according to your needs.",
+    "description": "The generated-index page description for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers": {
+    "message": "Buffers",
+    "description": "The label for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers.link.generated-index.title": {
+    "message": "Buffers",
+    "description": "The generated-index page title for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers.link.generated-index.description": {
+    "message": "A buffer is an optional component type that immediately follows the input layer and can be used as a way to decouple the transaction model from downstream components such as processing layers and outputs. This is considered a high-level component, as most users may not benefit from buffers, but they allow you to group messages using windowing algorithms. ",
+    "description": "The generated-index page description for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors": {
+    "message": "Processors",
+    "description": "The label for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors.link.generated-index.title": {
+    "message": "Processors",
+    "description": "The generated-index page title for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors.link.generated-index.description": {
+    "message": "A processor is a function applied to messages passed through a pipeline. ",
+    "description": "The generated-index page description for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs": {
+    "message": "Outputs",
+    "description": "The label for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs.link.generated-index.title": {
+    "message": "Outputs",
+    "description": "The generated-index page title for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs.link.generated-index.description": {
+    "message": "The output is the receiving point where we want to send consumed data after applying an optional processor array. ",
+    "description": "The generated-index page description for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.SQL": {
+    "message": "SQL",
+    "description": "The label for category 'SQL' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.SQL.link.generated-index.title": {
+    "message": "SQL",
+    "description": "The generated-index page title for category 'SQL' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.SQL.link.generated-index.description": {
+    "message": "SQL query engine documentation, including comprehensive coverage of data types, operators, query syntax, subqueries, aggregate functions, window functions, and more",
+    "description": "The generated-index page description for category 'SQL' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Deploy": {
+    "message": "Deploy",
+    "description": "The label for category 'Deploy' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Deploy.link.generated-index.title": {
+    "message": "Deploy",
+    "description": "The generated-index page title for category 'Deploy' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Deploy.link.generated-index.description": {
+    "message": "Deploy ArkFlow to the cloud",
+    "description": "The generated-index page description for category 'Deploy' in sidebar 'tutorialSidebar'"
+  }
+}

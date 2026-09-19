@@ -10,7 +10,7 @@ messages.
 
 **Prerequisites**
 
-- ArkFlow [installed](../../get-started/1-install.md)
+- ArkFlow [installed](/docs/get-started/install)
 - No other services required for the basic path
 
 ## Configuration

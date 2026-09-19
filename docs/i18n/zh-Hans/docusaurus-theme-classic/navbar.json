@@ -1,0 +1,26 @@
+{
+  "title": {
+    "message": "ArkFlow",
+    "description": "The title in the navbar"
+  },
+  "logo.alt": {
+    "message": "ArkFlow",
+    "description": "The alt text of navbar logo"
+  },
+  "item.label.Docs": {
+    "message": "文档",
+    "description": "Navbar item with label Docs"
+  },
+  "item.label.SQL": {
+    "message": "SQL",
+    "description": "Navbar item with label SQL"
+  },
+  "item.label.API": {
+    "message": "API",
+    "description": "Navbar item with label API"
+  },
+  "item.label.Blog": {
+    "message": "博客",
+    "description": "Navbar item with label Blog"
+  }
+}

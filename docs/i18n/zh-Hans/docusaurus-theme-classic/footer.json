@@ -1,0 +1,102 @@
+{
+  "link.title.Learn": {
+    "message": "学习",
+    "description": "The title of the footer links column with title=Learn in the footer"
+  },
+  "link.title.Build": {
+    "message": "构建",
+    "description": "The title of the footer links column with title=Build in the footer"
+  },
+  "link.title.Operate": {
+    "message": "运维",
+    "description": "The title of the footer links column with title=Operate in the footer"
+  },
+  "link.title.Reference": {
+    "message": "参考",
+    "description": "The title of the footer links column with title=Reference in the footer"
+  },
+  "link.title.Community": {
+    "message": "社区",
+    "description": "The title of the footer links column with title=Community in the footer"
+  },
+  "link.item.label.Get started": {
+    "message": "快速开始",
+    "description": "The label of footer link with label=Get started linking to /docs/get-started/install"
+  },
+  "link.item.label.Quickstart": {
+    "message": "快速入门",
+    "description": "The label of footer link with label=Quickstart linking to /docs/get-started/quickstart"
+  },
+  "link.item.label.Architecture": {
+    "message": "架构",
+    "description": "The label of footer link with label=Architecture linking to /docs/build/architecture"
+  },
+  "link.item.label.Streaming jobs": {
+    "message": "流式作业",
+    "description": "The label of footer link with label=Streaming jobs linking to /docs/build/jobs"
+  },
+  "link.item.label.Components": {
+    "message": "组件",
+    "description": "The label of footer link with label=Components linking to /docs/components"
+  },
+  "link.item.label.SQL reference": {
+    "message": "SQL 参考",
+    "description": "The label of footer link with label=SQL reference linking to /docs/sql"
+  },
+  "link.item.label.Recipes": {
+    "message": "实战配方",
+    "description": "The label of footer link with label=Recipes linking to /docs/build/recipes"
+  },
+  "link.item.label.Examples": {
+    "message": "示例",
+    "description": "The label of footer link with label=Examples linking to /docs/reference/examples"
+  },
+  "link.item.label.Kubernetes": {
+    "message": "Kubernetes",
+    "description": "The label of footer link with label=Kubernetes linking to /docs/operate/kubernetes"
+  },
+  "link.item.label.Control plane": {
+    "message": "控制平面",
+    "description": "The label of footer link with label=Control plane linking to /docs/operate/control-plane/overview"
+  },
+  "link.item.label.Web console": {
+    "message": "Web 控制台",
+    "description": "The label of footer link with label=Web console linking to /docs/operate/control-plane/console"
+  },
+  "link.item.label.Recovery runbook": {
+    "message": "恢复手册",
+    "description": "The label of footer link with label=Recovery runbook linking to /docs/operate/recovery"
+  },
+  "link.item.label.CLI": {
+    "message": "CLI",
+    "description": "The label of footer link with label=CLI linking to /docs/reference/cli"
+  },
+  "link.item.label.HTTP API": {
+    "message": "HTTP API",
+    "description": "The label of footer link with label=HTTP API linking to /docs/reference/api"
+  },
+  "link.item.label.Configuration": {
+    "message": "配置",
+    "description": "The label of footer link with label=Configuration linking to /docs/reference/configuration"
+  },
+  "link.item.label.Compatibility": {
+    "message": "兼容性",
+    "description": "The label of footer link with label=Compatibility linking to /docs/reference/compatibility"
+  },
+  "link.item.label.GitHub": {
+    "message": "GitHub",
+    "description": "The label of footer link with label=GitHub linking to https://github.com/arkflow-rs/arkflow"
+  },
+  "link.item.label.Discord": {
+    "message": "Discord",
+    "description": "The label of footer link with label=Discord linking to https://discord.gg/CwKhzb8pux"
+  },
+  "link.item.label.Blog": {
+    "message": "博客",
+    "description": "The label of footer link with label=Blog linking to /blog"
+  },
+  "copyright": {
+    "message": "Copyright © 2026 ArkFlow. 基于 Docusaurus 构建。",
+    "description": "The footer copyright"
+  }
+}

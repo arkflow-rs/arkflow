@@ -9,7 +9,7 @@ Batch messages into time windows and compute per-window aggregates with SQL.
 
 **Prerequisites**
 
-- ArkFlow [installed](../../get-started/1-install.md)
+- ArkFlow [installed](/docs/get-started/install)
 - No external services needed — the guide uses the `generate` source so you
   can run it as-is
 

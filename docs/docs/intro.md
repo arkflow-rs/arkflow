@@ -26,8 +26,8 @@ or more sinks — all driven by a single YAML file.
 
 ## Next steps
 
-- [Getting started](./get-started/2-quickstart.md) — install and run your first pipeline in minutes.
-- [Concepts](./build/architecture.md) — how the engine, streams, pipelines, backpressure, and metadata fit together.
+- [Getting started](/docs/get-started/quickstart) — install and run your first pipeline in minutes.
+- [Concepts](/docs/build/architecture) — how the engine, streams, pipelines, backpressure, and metadata fit together.
 - [Configuration reference](./reference/configuration.md) — the top-level YAML structure.
 - [Components](./reference/component-inventory.md) — every input, output, processor, buffer, and codec.
 - [SQL reference](./sql/2-select.md) — query syntax and functions.

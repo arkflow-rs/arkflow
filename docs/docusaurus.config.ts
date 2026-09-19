@@ -15,12 +15,31 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import ConfigLocalized from './docusaurus.config.localized.json';
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
+// Config-level strings (tagline, announcement bar) can't use the theme's
+// <Translate> machinery: the config is loaded by jiti, outside the webpack
+// alias space that provides @docusaurus/Translate. Same approach as the
+// official Docusaurus site: per-locale values resolved through the
+// DOCUSAURUS_CURRENT_LOCALE env var that buildLocale/start set per build.
+const defaultLocale = 'en';
+
+function getLocalizedConfigValue(key: keyof typeof ConfigLocalized): string {
+  const currentLocale = process.env.DOCUSAURUS_CURRENT_LOCALE ?? defaultLocale;
+  const values = ConfigLocalized[key] as Record<string, string>;
+  if (!(currentLocale in values)) {
+    throw new Error(
+      `docusaurus.config.localized.json: key "${key}" is missing a "${currentLocale}" entry`,
+    );
+  }
+  return values[currentLocale];
+}
+
 const config: Config = {
   title: 'ArkFlow',
-  tagline: 'High-performance Rust stream processing engine',
+  tagline: getLocalizedConfigValue('tagline'),
   favicon: 'img/favicon.svg',
 
   // Set the production url of your site here
@@ -45,11 +64,12 @@ const config: Config = {
   },
 
   // Even if you don't use internationalization, you can use this field to set
-  // useful metadata like html lang. For example, if your site is Chinese, you
-  // may want to replace "en" with "zh-Hans".
+  // useful metadata like html lang. English is the canonical locale served at
+  // the site root; Simplified Chinese is a progressive translation layer under
+  // /zh-Hans/ (see docs/DOCUMENTATION.md).
   i18n: {
     defaultLocale: 'en',
-    locales: ['en'],
+    locales: ['en', 'zh-Hans'],
   },
 
   presets: [
@@ -101,8 +121,7 @@ const config: Config = {
     image: 'img/arkflow.svg',
     announcementBar: {
       id: 'unified-kernel',
-      content:
-        '✨ <b>New architecture</b>: a unified streaming job runtime — kernel rebuild, durability, control plane, and web console. <a href="/docs/build/jobs">See what changed</a>',
+      content: getLocalizedConfigValue('announcementBar.content'),
       backgroundColor: '#0b1120',
       textColor: '#cbd5e1',
       isCloseable: true,
@@ -126,6 +145,10 @@ const config: Config = {
         {to: '/blog', label: 'Blog', position: 'left'},
         {
           type: 'search',
+          position: 'right',
+        },
+        {
+          type: 'localeDropdown',
           position: 'right',
         },
         {
@@ -217,6 +240,9 @@ const config: Config = {
         indexBlog: true,
         indexPages: false,
         highlightSearchTermsOnTargetPage: true,
+        // English + Chinese tokenization; each locale build gets its own
+        // index over its rendered content.
+        language: ['en', 'zh'],
       },
     ],
   ],
