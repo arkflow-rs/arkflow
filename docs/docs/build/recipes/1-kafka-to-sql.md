@@ -14,7 +14,7 @@ with one ArkFlow stream.
   JSON messages
 - MySQL reachable with database `arkflow` and a table that matches your event
   columns (ArkFlow appends rows; it does not create tables)
-- ArkFlow [installed](../../get-started/1-install.md)
+- ArkFlow [installed](/docs/get-started/install)
 
 ## Configuration
 

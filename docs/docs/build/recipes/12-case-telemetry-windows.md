@@ -83,7 +83,7 @@ input interval, `samples` is close to 100 and min/max/avg reflect the window.
 
 - **Late readings** matter if sensors retry: window emission and lateness
   handling are described in
-  event-time and lateness handling in [streaming jobs](../jobs.md) and the
+  event-time and lateness handling in [streaming jobs](/docs/build/jobs) and the
   [window buffer references](../../components/1-buffers/tumbling_window.md).
 - Replace `generate` with `mqtt` and keep the rest identical — the source
   produces the same JSON payload shape (see

@@ -93,6 +93,15 @@ The unversioned `docs/docs/` tree is the next/current development documentation.
 
 When a page moves, keep a redirect or compatibility stub until the route migration is announced. When a feature is unavailable in a versioned tree, add a compatibility note that points to the supported version.
 
+## Internationalization (zh-Hans)
+
+English is the canonical documentation locale, served at the site root. Simplified Chinese (`zh-Hans`) is a progressive translation layer under `/zh-Hans/`: untranslated routes render the English content with localized chrome, so partial coverage is a supported steady state.
+
+- **Never translated:** versioned trees (`versioned_docs/`) and blog posts. The first-mile translation set is `get-started/`, `getting-started/`, `concepts/`, and the core build pages (`build/index`, `build/architecture`, `build/streams`, `build/jobs`).
+- **Translations may lag.** English is the single upstream: when you change an English page that has a counterpart under `docs/i18n/zh-Hans/docusaurus-plugin-content-docs/current/`, update the translation in the same PR when practical, or accept that it lags. Content staleness never fails a gate; structure does (below).
+- **What a translation must preserve** (enforced by `pnpm docs:check`): the English counterpart must exist at the mirrored path; front-matter identity (`id`, `slug`, `sidebar_position`, `sidebar_label`) and the `components:` list must be byte-equal to the English page; and every ` ```yaml ` fence — both the classification metastring and its content — must be byte-identical to the English fence. Only `title`, `description`, headings, and prose are the translation surface.
+- **Linking rules** (a Docusaurus constraint: a localized build resolves file-relative links only within its own locale tree): in translated pages, file-relative links may only target pages that also exist in the localized tree; link untranslated pages by their locale-prefixed absolute route, e.g. `[配置参考](/zh-Hans/docs/reference/configuration)` — the route renders the English fallback content. Conversely, an English page that has no translation must NOT use file-relative links to pages that are translated; link them by their absolute route (`/docs/build/streams`) instead — `pnpm docs:check` pre-detects violations of both directions, since the localized build would otherwise fail with an unresolved-link error. Site chrome (navbar, footer, sidebar categories) is translated in `docs/i18n/zh-Hans/*.json`; config-level strings (tagline, announcement bar) live in `docs/docusaurus.config.localized.json` keyed by locale.
+
 ## Release checklist
 
 - [ ] `ARKFLOW_REGENERATE_DOCS=1 cargo test -p arkflow-plugin --test docs_inventory_snapshot` is a no-op (inventory and schema asset current).

@@ -1,0 +1,122 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.tutorialSidebar.category.Get Started": {
+    "message": "Get Started",
+    "description": "The label for category 'Get Started' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Build": {
+    "message": "Build",
+    "description": "The label for category 'Build' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Data & Durability": {
+    "message": "Data & Durability",
+    "description": "The label for category 'Data & Durability' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Components": {
+    "message": "Components",
+    "description": "The label for category 'Components' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs": {
+    "message": "Inputs",
+    "description": "The label for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs.link.generated-index.title": {
+    "message": "Inputs",
+    "description": "The generated-index page title for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Inputs.link.generated-index.description": {
+    "message": "Input components are responsible for consuming data from various sources such as Kafka, MQTT, HTTP, and Memory. Each input component has its own configuration options that can be customized according to your needs.",
+    "description": "The generated-index page description for category 'Inputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers": {
+    "message": "Buffers",
+    "description": "The label for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers.link.generated-index.title": {
+    "message": "Buffers",
+    "description": "The generated-index page title for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Buffers.link.generated-index.description": {
+    "message": "A buffer is an optional component type that immediately follows the input layer and can be used as a way to decouple the transaction model from downstream components such as processing layers and outputs. This is considered a high-level component, as most users may not benefit from buffers, but they allow you to group messages using windowing algorithms. ",
+    "description": "The generated-index page description for category 'Buffers' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors": {
+    "message": "Processors",
+    "description": "The label for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors.link.generated-index.title": {
+    "message": "Processors",
+    "description": "The generated-index page title for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Processors.link.generated-index.description": {
+    "message": "A processor is a function applied to messages passed through a pipeline. ",
+    "description": "The generated-index page description for category 'Processors' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs": {
+    "message": "Outputs",
+    "description": "The label for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs.link.generated-index.title": {
+    "message": "Outputs",
+    "description": "The generated-index page title for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Outputs.link.generated-index.description": {
+    "message": "The output is the receiving point where we want to send consumed data after applying an optional processor array. ",
+    "description": "The generated-index page description for category 'Outputs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Temporary": {
+    "message": "Temporary",
+    "description": "The label for category 'Temporary' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Temporary.link.generated-index.title": {
+    "message": "Temporary",
+    "description": "The generated-index page title for category 'Temporary' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Temporary.link.generated-index.description": {
+    "message": "Temporary components provide temporary storage capabilities for data processing pipelines. They can be used to store intermediate results, cache data, or provide lookup tables for SQL queries.",
+    "description": "The generated-index page description for category 'Temporary' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Codecs": {
+    "message": "Codecs",
+    "description": "The label for category 'Codecs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Codecs.link.generated-index.description": {
+    "message": "Codec components handle serialization/deserialization between byte payloads and columnar Arrow batches at the input/output boundary.",
+    "description": "The generated-index page description for category 'Codecs' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Recipes": {
+    "message": "Recipes",
+    "description": "The label for category 'Recipes' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.SQL Reference": {
+    "message": "SQL Reference",
+    "description": "The label for category 'SQL Reference' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Operate": {
+    "message": "Operate",
+    "description": "The label for category 'Operate' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Control Plane": {
+    "message": "Control Plane",
+    "description": "The label for category 'Control Plane' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Reference": {
+    "message": "Reference",
+    "description": "The label for category 'Reference' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Develop": {
+    "message": "Develop",
+    "description": "The label for category 'Develop' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.Migration": {
+    "message": "Migration",
+    "description": "The label for category 'Migration' in sidebar 'tutorialSidebar'"
+  },
+  "sidebar.tutorialSidebar.category.About": {
+    "message": "About",
+    "description": "The label for category 'About' in sidebar 'tutorialSidebar'"
+  }
+}

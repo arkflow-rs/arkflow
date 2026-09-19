@@ -1,0 +1,10 @@
+{
+  "tagline": {
+    "en": "High-performance Rust stream processing engine",
+    "zh-Hans": "高性能 Rust 流处理引擎"
+  },
+  "announcementBar.content": {
+    "en": "✨ <b>New architecture</b>: a unified streaming job runtime — kernel rebuild, durability, control plane, and web console. <a href=\"/docs/build/jobs\">See what changed</a>",
+    "zh-Hans": "✨ <b>全新架构</b>:统一的流式作业运行时 —— 内核重构、持久化保障、控制平面与 Web 控制台。<a href=\"/zh-Hans/docs/build/jobs\">了解变更详情</a>"
+  }
+}

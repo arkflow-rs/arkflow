@@ -358,6 +358,216 @@ try {
   errors.push(`sidebars.ts: ${error.message}`);
 }
 
+// ---------------------------------------------------------------------------
+// Localized trees (docs/i18n/<locale>/docusaurus-plugin-content-docs/current).
+// English is canonical; a translated page must structurally mirror its
+// English counterpart: the counterpart must exist, front-matter identity and
+// component ownership must be preserved, file-relative links/anchors must
+// resolve inside the localized tree (untranslated targets are linked via
+// locale-prefixed absolute routes, which render English fallback content),
+// and YAML code fences must be byte-identical so translated pages are
+// snippet-valid by construction (the Rust-side validator keeps reading
+// docs/docs/ only).
+// ---------------------------------------------------------------------------
+
+const FRONT_MATTER_PARITY_KEYS = ['id', 'slug', 'sidebar_position', 'sidebar_label'];
+
+function frontMatterBlock(text) {
+  const match = /^---\n([\s\S]*?)\n---/.exec(text);
+  return match ? match[1] : null;
+}
+
+function scalarFrontMatter(text) {
+  const block = frontMatterBlock(text);
+  const scalars = {};
+  if (block === null) return scalars;
+  for (const line of block.split('\n')) {
+    const match = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line);
+    if (match && !['components', 'tags', 'keywords'].includes(match[1])) {
+      scalars[match[1]] = match[2].trim().replace(/^['"]|['"]$/g, '');
+    }
+  }
+  return scalars;
+}
+
+function componentsDeclaration(text) {
+  const block = frontMatterBlock(text);
+  if (block === null) return null;
+  const lines = block.split('\n');
+  const at = lines.findIndex((line) => /^components:/.test(line));
+  if (at === -1) return null;
+  const inline = lines[at].slice('components:'.length).trim();
+  if (inline) return inline;
+  const items = [];
+  for (const line of lines.slice(at + 1)) {
+    if (/^\s*-\s*\S+\s*$/.test(line)) items.push(line.replace(/^\s*-\s*/, '').trim());
+    else if (line.trim() === '') continue;
+    else break;
+  }
+  return items.join(', ');
+}
+
+function yamlFences(text) {
+  const fences = [];
+  let inFence = false;
+  let meta = '';
+  let content = [];
+  for (const line of text.split('\n')) {
+    if (!inFence && /^\s*(```|~~~)/.test(line)) {
+      inFence = true;
+      meta = line.replace(/^\s*(```|~~~)/, '').trim();
+      content = [];
+      continue;
+    }
+    if (inFence && /^\s*(```|~~~)\s*$/.test(line)) {
+      inFence = false;
+      if (/^yaml(\s|$)/.test(meta)) fences.push({meta, content: content.join('\n')});
+      continue;
+    }
+    if (inFence) content.push(line);
+  }
+  return fences;
+}
+
+for (const locale of ['zh-Hans']) {
+  const localeDocsRoot = path.join(root, 'i18n', locale, 'docusaurus-plugin-content-docs', 'current');
+  if (!fs.existsSync(localeDocsRoot)) continue;
+  const localePrefix = `i18n/${locale}/docusaurus-plugin-content-docs/current`;
+
+  // Pre-detection for the localized-build resolution rule: a file-relative
+  // link from an untranslated English page to a page that HAS a localized
+  // counterpart fails the localized build (the target is registered under
+  // its localized source path). Convert such links to their absolute
+  // /docs/... route, or translate the English page (see docs/DOCUMENTATION.md).
+  for (const file of markdown) {
+    const rel = path.relative(docsRoot, file);
+    if (fs.existsSync(path.join(localeDocsRoot, rel))) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    for (const match of text.matchAll(/\]\(([^)]+)\)/g)) {
+      const raw = match[1].replace(/^<|>$/g, '').trim();
+      const hashAt = raw.indexOf('#');
+      const target = hashAt === -1 ? raw : raw.slice(0, hashAt);
+      if (
+        !target ||
+        !/\.(md|mdx)$/.test(target) ||
+        target.startsWith(('http')) ||
+        target.startsWith('/')
+      ) {
+        continue;
+      }
+      const base = path.resolve(path.dirname(file), target);
+      for (const candidate of [base, `${base}.md`, path.join(base, 'index.md')]) {
+        if (fs.existsSync(candidate) && fs.existsSync(path.join(localeDocsRoot, path.relative(docsRoot, candidate)))) {
+          errors.push(
+            `${path.relative(root, file)}: links to localized page ${target} — convert the link to its absolute /docs/... route, or translate this page, or the localized build fails to resolve the link (see docs/DOCUMENTATION.md)`,
+          );
+          break;
+        }
+      }
+    }
+  }
+
+  for (const file of walkFlat(localeDocsRoot)) {
+    if (!file.endsWith('.md') && !file.endsWith('.mdx')) continue;
+    const rel = path.relative(localeDocsRoot, file);
+    const where = `${localePrefix}${path.sep}${rel}`;
+    const enFile = path.join(docsRoot, rel);
+
+    if (!fs.existsSync(enFile)) {
+      errors.push(`${where}: no English counterpart at docs${path.sep}${rel} — the page moved or was deleted upstream; mirror the move or delete the translation`);
+      continue;
+    }
+
+    const text = fs.readFileSync(file, 'utf8');
+    const enText = fs.readFileSync(enFile, 'utf8');
+
+    if (!/^#\s+\S+/m.test(text)) {
+      errors.push(`${where}: missing level-one heading`);
+    }
+
+    const scalars = scalarFrontMatter(text);
+    const enScalars = scalarFrontMatter(enText);
+    for (const key of FRONT_MATTER_PARITY_KEYS) {
+      if ((scalars[key] ?? '') !== (enScalars[key] ?? '')) {
+        errors.push(
+          `${where}: front matter "${key}" must equal the English counterpart's (${enScalars[key] || 'unset'} != ${scalars[key] || 'unset'})`,
+        );
+      }
+    }
+
+    const components = componentsDeclaration(text);
+    const enComponents = componentsDeclaration(enText);
+    if (components !== enComponents) {
+      errors.push(
+        `${where}: "components:" ownership list must equal the English counterpart's (${enComponents ?? 'unset'} != ${components ?? 'unset'})`,
+      );
+    }
+
+    for (const match of text.matchAll(/\]\(([^)]+)\)/g)) {
+      const raw = match[1].replace(/^<|>$/g, '').trim();
+      const hashAt = raw.indexOf('#');
+      const target = hashAt === -1 ? raw : raw.slice(0, hashAt);
+      const anchor = hashAt === -1 ? null : raw.slice(hashAt + 1);
+      if (!target && !anchor) continue;
+      if (
+        target &&
+        (target.includes('/category/') ||
+          target.startsWith('http://') ||
+          target.startsWith('https://') ||
+          target.startsWith('mailto:') ||
+          target.startsWith('/'))
+      ) {
+        continue;
+      }
+
+      // File-relative links must resolve inside the localized tree: the
+      // production build (onBrokenMarkdownLinks: throw) resolves them the
+      // same way and cannot fall back to the English tree. Links to
+      // untranslated pages use locale-prefixed absolute routes instead
+      // (skipped here, same policy as the English tree).
+      let resolved = null;
+      if (!target) {
+        resolved = file;
+      } else {
+        const base = path.resolve(path.dirname(file), target);
+        const candidates = [base, `${base}.md`, path.join(base, 'index.md')];
+        resolved = candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
+        if (!resolved) {
+          errors.push(
+            `${where}: unresolved internal link ${target} — file-relative links must target a localized page; for untranslated pages link the /${locale}/... route absolutely`,
+          );
+          continue;
+        }
+      }
+
+      if (anchor && resolved && /\.(md|mdx)$/.test(resolved)) {
+        if (!slugsFor(resolved).has(anchor)) {
+          errors.push(`${where}: broken anchor #${anchor} in link to ${target || path.basename(file)}`);
+        }
+      }
+    }
+
+    const enFences = yamlFences(enText);
+    const localeFences = yamlFences(text);
+    if (localeFences.length !== enFences.length) {
+      errors.push(
+        `${where}: yaml code block count (${localeFences.length}) differs from the English counterpart (${enFences.length}) — code fences are not translated`,
+      );
+    } else {
+      for (let i = 0; i < enFences.length; i++) {
+        if (
+          localeFences[i].meta !== enFences[i].meta ||
+          localeFences[i].content !== enFences[i].content
+        ) {
+          errors.push(
+            `${where}: yaml code block #${i + 1} differs from the English counterpart — fence classification and content must be byte-identical`,
+          );
+        }
+      }
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`docs check failed (${errors.length} issue${errors.length === 1 ? '' : 's'}):`);
   for (const error of errors) console.error(`- ${error}`);

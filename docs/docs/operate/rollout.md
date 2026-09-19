@@ -10,8 +10,8 @@ nodes, managed by the control plane Hub.
 
 **Prerequisites**
 
-- ArkFlow [installed](../get-started/1-install.md)
-- Understand the [job configuration shape](../build/jobs.md) — start with
+- ArkFlow [installed](/docs/get-started/install)
+- Understand the [job configuration shape](/docs/build/jobs) — start with
   the local job example `examples/jobs_local.yaml`
 
 ## The pieces
