@@ -53,12 +53,18 @@ const ALLOWED_NODE_METRICS: &[&str] = &[
     "late_events",
     "jobs_total",
     "jobs_running",
+    "jobs_ephemeral_state",
+    "jobs_recovery_required",
 ];
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub operator_token: Option<String>,
     pub node_token: Option<String>,
+    /// Explicitly permit the legacy unauthenticated behavior for an
+    /// in-process/local-development Hub. Production startup validates this
+    /// flag against the loopback bind address before serving.
+    pub insecure_local: bool,
     pub lease_ttl_ms: u64,
     pub poll_interval_ms: u64,
     /// Hard lifetime of an issued agent session credential. Credentials are
@@ -529,11 +535,17 @@ impl Hub {
     /// Startup diagnostics for the fail-open token defaults: an unset token
     /// means the corresponding route class accepts unauthenticated callers.
     pub fn operator_token_is_set(&self) -> bool {
-        self.config.operator_token.is_some()
+        self.config
+            .operator_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     }
 
     pub fn node_token_is_set(&self) -> bool {
-        self.config.node_token.is_some()
+        self.config
+            .node_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     }
 
     pub async fn jobs(&self) -> Result<Vec<JobRecord>, HubError> {
@@ -737,6 +749,79 @@ impl Hub {
             "running" => "job_start",
             "stopped" => "job_stop",
             _ => return Ok(0),
+        };
+        // A durable state directory is not a disposable cache.  Once a Job
+        // has successfully run, a restart or a version/generation move must
+        // restore a compatible completed checkpoint before any source is
+        // started again.  The first start of a brand-new Job is exempt: no
+        // prior committed state exists yet.
+        let persisted_job_starts = if operation == "job_start"
+            && spec.state.as_ref().is_some_and(|state| {
+                state.durability == arkflow_core::job::StateDurability::Durable
+            })
+            && spec.requires_state()
+            && spec.checkpoint.is_some()
+        {
+            let records = match &self.storage {
+                Some(storage) => storage
+                    .list_job_start_operations(job.job_id.clone())
+                    .await
+                    .map_err(HubError::from)?,
+                None => Vec::new(),
+            };
+            records
+                .into_iter()
+                .filter_map(|record| {
+                    serde_json::from_str::<HubOperation>(&record.operation_json).ok()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let recovery_required = if operation == "job_start"
+            && spec.state.as_ref().is_some_and(|state| {
+                state.durability == arkflow_core::job::StateDurability::Durable
+            })
+            && spec.requires_state()
+            && spec.checkpoint.is_some()
+        {
+            let operations = self.operations.read().await;
+            // A successful start is a durable fact even after the Hub fences
+            // that operation because the Agent process was replaced.  The
+            // `recovery_required` failure class preserves that fact across
+            // the in-memory and SQLite operation histories; a plain
+            // NodeUnavailable/TimedOut record is not sufficient because it
+            // may represent a command that never reached an Agent.
+            let previous_generation_started =
+                operations.values().any(|operation_record| {
+                    operation_record.resource_id == job.job_id
+                        && is_durable_job_start(operation_record)
+                        && operation_record.generation < job.generation
+                }) || persisted_job_starts.iter().any(|operation_record| {
+                    is_durable_job_start(operation_record)
+                        && operation_record.generation < job.generation
+                });
+            let current_generation_requires_recovery =
+                operations.values().any(|operation_record| {
+                    operation_record.resource_id == job.job_id
+                        && operation_record.operation == "job_start"
+                        && operation_record.generation == job.generation
+                        && (operation_record.failure_class.as_deref() == Some("recovery_required")
+                            || (operation_record.state == HubOperationState::Succeeded
+                                && matches!(job.observed_state.as_str(), "failed" | "stopped")))
+                }) || persisted_job_starts.iter().any(|operation_record| {
+                    operation_record.resource_id == job.job_id
+                        && operation_record.generation == job.generation
+                        && operation_record.failure_class.as_deref() == Some("recovery_required")
+                });
+            // A checkpoint/savepoint pointer is an explicit recovery request.
+            // It must never be silently ignored just because the lifecycle
+            // operation at the current generation is still marked Succeeded.
+            job.checkpoint_id.is_some()
+                || previous_generation_started
+                || current_generation_requires_recovery
+        } else {
+            false
         };
         let candidates = if job.node_ids.is_empty() {
             self.nodes
@@ -944,6 +1029,12 @@ impl Hub {
         let assignments = plan
             .assignments_for_nodes(&targets, job.generation)
             .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Re-check the complete task→node map at the dispatch boundary.  The
+        // planner already validates it, but keeping this guard here prevents a
+        // future assignment source or persistence replay from bypassing the
+        // side-edge co-location contract.
+        plan.validate_side_edge_assignments(&assignments)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
         // Split placement: validate that every target node runs the data
         // plane, then attach the full task→node map and peer data addresses
         // so each node's graph build can wire its remote edges without any
@@ -991,12 +1082,12 @@ impl Hub {
             .await?
             .into_iter()
             .filter(|record| record.status == "completed")
-            .filter(|record| {
-                if explicit_recovery_id.as_deref() == Some(record.checkpoint_id.as_str()) {
-                    record.format_version == job_state_format_version(&spec)
-                } else {
-                    recovery_record_is_compatible(&spec, record)
+            .filter(|record| match explicit_recovery_id.as_deref() {
+                Some(requested) => {
+                    record.checkpoint_id == requested
+                        && recovery_record_is_compatible(&spec, record)
                 }
+                None => recovery_record_is_compatible(&spec, record),
             })
             .filter(|record| match spec.recovery {
                 arkflow_core::job::RecoveryPolicy::LatestCheckpoint => record.kind == "checkpoint",
@@ -1019,6 +1110,12 @@ impl Hub {
                     "savepoint": record.kind == "savepoint",
                 })
             });
+        if recovery_required && recovery.is_none() {
+            return Err(HubError::Invalid(format!(
+                "durable Job '{}' requires recovery, but no compatible completed checkpoint is available",
+                job.job_id
+            )));
+        }
         let mut dispatched = 0;
         for node_id in targets {
             // Terminal-state memory: a Succeeded lifecycle operation for THIS
@@ -1058,10 +1155,12 @@ impl Hub {
                 "assignments": node_assignments,
                 "generation": job.generation,
                 "recovery": recovery,
+                "recovery_required": recovery_required,
             });
-            if let (Some(base), Some(extra)) =
-                (payload_value.as_object_mut(), split_payload.as_ref().and_then(|extra| extra.as_object()))
-            {
+            if let (Some(base), Some(extra)) = (
+                payload_value.as_object_mut(),
+                split_payload.as_ref().and_then(|extra| extra.as_object()),
+            ) {
                 for (key, value) in extra {
                     base.insert(key.clone(), value.clone());
                 }
@@ -1783,10 +1882,28 @@ impl Hub {
                     | HubOperationState::Superseded
             )
         };
+        let mut protected_starts = BTreeMap::<String, (u64, u64, String)>::new();
+        for (id, record) in operations.iter() {
+            if !is_durable_job_start(record) {
+                continue;
+            }
+            let candidate = (record.generation, record.created_at_ms, id.clone());
+            let replace = protected_starts
+                .get(&record.resource_id)
+                .is_none_or(|current| candidate > *current);
+            if replace {
+                protected_starts.insert(record.resource_id.clone(), candidate);
+            }
+        }
+        let protected_ids = protected_starts
+            .into_values()
+            .map(|(_, _, id)| id)
+            .collect::<BTreeSet<_>>();
         let stale: Vec<String> = operations
             .iter()
             .filter(|(_, record)| {
                 terminal(&record.state)
+                    && !protected_ids.contains(&record.id)
                     && ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64) < cutoff
             })
             .map(|(id, _)| id.clone())
@@ -1796,7 +1913,7 @@ impl Hub {
         }
         let mut terminal_ids: Vec<(i64, String)> = operations
             .iter()
-            .filter(|(_, record)| terminal(&record.state))
+            .filter(|(_, record)| terminal(&record.state) && !protected_ids.contains(&record.id))
             .map(|(id, record)| {
                 (
                     (record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64,
@@ -2187,8 +2304,14 @@ impl Hub {
 
     pub fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
         let Some(expected) = self.config.operator_token.as_deref() else {
-            return Some(OperatorPrincipal::legacy_operator());
+            return self
+                .config
+                .insecure_local
+                .then(OperatorPrincipal::legacy_operator);
         };
+        if expected.trim().is_empty() {
+            return None;
+        }
         let (id, role, secret, scopes) = parse_operator_credential(expected);
         let supplied = supplied?;
         if !bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
@@ -2218,11 +2341,28 @@ impl Hub {
     }
 
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse, HubError> {
-        if let Some(expected) = self.config.node_token.as_deref() {
-            if !bool::from(request.node_token.as_bytes().ct_eq(expected.as_bytes())) {
+        let Some(expected) = self.config.node_token.as_deref() else {
+            if !self.config.insecure_local {
                 return Err(HubError::Unauthorized);
             }
+            // Explicit loopback development mode may omit the node token.
+            // The standalone server refuses to expose this mode externally.
+            let _ = &request.node_token;
+            return self.register_after_auth(request).await;
+        };
+        if expected.trim().is_empty() {
+            return Err(HubError::Unauthorized);
         }
+        if !bool::from(request.node_token.as_bytes().ct_eq(expected.as_bytes())) {
+            return Err(HubError::Unauthorized);
+        }
+        self.register_after_auth(request).await
+    }
+
+    async fn register_after_auth(
+        &self,
+        request: RegisterRequest,
+    ) -> Result<RegisterResponse, HubError> {
         if request.node_id.trim().is_empty() {
             return Err(HubError::Invalid("node_id must not be empty".into()));
         }
@@ -2279,7 +2419,10 @@ impl Hub {
             streams_running: 0,
             streams_failed: 0,
             maintenance_state: NodeMaintenanceState::Active,
-            data_address: request.data_address.clone().filter(|address| !address.trim().is_empty()),
+            data_address: request
+                .data_address
+                .clone()
+                .filter(|address| !address.trim().is_empty()),
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
@@ -2362,8 +2505,20 @@ impl Hub {
                         )
                 })
                 .map(|operation| {
+                    let was_succeeded = operation.state == HubOperationState::Succeeded;
                     operation.state = HubOperationState::NodeUnavailable;
                     operation.finished_at_ms = Some(now);
+                    if was_succeeded {
+                        operation.failure_class = Some("recovery_required".into());
+                        operation.error = Some(
+                            "previous successful Job start invalidated by a new Agent process boot"
+                                .into(),
+                        );
+                    } else {
+                        operation.error = Some(
+                            "in-flight Job start invalidated by a new Agent process boot".into(),
+                        );
+                    }
                     operation.clone()
                 })
                 .collect::<Vec<_>>()
@@ -2546,8 +2701,20 @@ impl Hub {
                         )
                 })
                 .map(|operation| {
+                    let was_succeeded = operation.state == HubOperationState::Succeeded;
                     operation.state = HubOperationState::NodeUnavailable;
                     operation.finished_at_ms = Some(now);
+                    if was_succeeded {
+                        operation.failure_class = Some("recovery_required".into());
+                        operation.error = Some(
+                            "previous successful Job start invalidated by a new Agent process boot"
+                                .into(),
+                        );
+                    } else {
+                        operation.error = Some(
+                            "in-flight Job start invalidated by a new Agent process boot".into(),
+                        );
+                    }
                     operation.clone()
                 })
                 .collect::<Vec<_>>()
@@ -4857,6 +5024,12 @@ fn bounded_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+fn is_durable_job_start(operation: &HubOperation) -> bool {
+    operation.operation == "job_start"
+        && (operation.state == HubOperationState::Succeeded
+            || operation.failure_class.as_deref() == Some("recovery_required"))
+}
+
 fn parse_operator_credential(configured: &str) -> (&str, OperatorRole, &str, Vec<ResourceScope>) {
     let mut fields = configured.splitn(4, '|');
     let Some(id) = fields.next() else {
@@ -5327,6 +5500,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_replacement_without_checkpoint_fails_closed_before_dispatch() {
+        let hub = Hub::new(config());
+        let session = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: "v1".into(),
+                capabilities: vec!["job_runtime".into(), "state_backend".into()],
+                boot_id: Some("boot-a".into()),
+            })
+            .await
+            .unwrap();
+        hub.upsert_job(JobRecord {
+            job_id: "durable-orders".into(),
+            version: 1,
+            spec_json: durable_job_spec_json("durable-orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let auth = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session.session_token,
+        };
+        let start = hub
+            .commands(auth.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("initial durable deployment is allowed to start empty");
+        assert_eq!(
+            start
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("recovery_required"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        hub.command_result(
+            auth,
+            CommandResult {
+                command_id: start.id.clone(),
+                operation_id: start.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: start.correlation_id.clone(),
+                generation: start.generation,
+                observed_generation: Some(start.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut replacement = hub.job("durable-orders").await.unwrap().unwrap();
+        replacement.version = 2;
+        let error = hub
+            .upsert_job(replacement)
+            .await
+            .expect_err("a replacement without a completed checkpoint must fail closed");
+        assert!(error.to_string().contains("requires recovery"));
+        assert!(hub
+            .nodes
+            .read()
+            .await
+            .get("node-a")
+            .is_some_and(|node| !node
+                .commands
+                .iter()
+                .any(|command| command.operation == "job_start" && command.generation == 2)));
+    }
+
     fn job_spec_json(id: &str) -> String {
         serde_json::json!({
             "id": id,
@@ -5340,6 +5601,106 @@ mod tests {
             "sinks": [{"operator_id": "sink", "output_type": "drop"}]
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn current_generation_recovery_required_failure_overrides_running_observation() {
+        let hub = Hub::new(config());
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: Some("boot-a".into()),
+        })
+        .await
+        .unwrap();
+        let job = JobRecord {
+            job_id: "durable-orders-restarted".into(),
+            version: 1,
+            spec_json: durable_job_spec_json("durable-orders-restarted"),
+            desired_state: "running".into(),
+            observed_state: "running".into(),
+            convergence: "reconciling".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        };
+        hub.operations.write().await.insert(
+            "recovery-required-start".into(),
+            HubOperation {
+                id: "recovery-required-start".into(),
+                intent_id: None,
+                command_id: "command-recovery-required".into(),
+                node_id: "node-a".into(),
+                operation: "job_start".into(),
+                resource_id: job.job_id.clone(),
+                checkpoint_id: None,
+                generation: job.generation,
+                attempt_id: None,
+                config_version_id: None,
+                state: HubOperationState::NodeUnavailable,
+                progress: 100,
+                created_at_ms: 1,
+                expires_at_ms: None,
+                dispatched_at_ms: None,
+                acknowledged_at_ms: None,
+                finished_at_ms: Some(2),
+                correlation_id: None,
+                error: Some("previous successful start invalidated by Agent reboot".into()),
+                failure_class: Some("recovery_required".into()),
+                intent_state: None,
+                convergence_state: None,
+                retry_count: 0,
+                next_retry_at_ms: None,
+                superseded_by_intent_id: None,
+                superseded_generation: None,
+                observed_generation: None,
+                observed_state: None,
+            },
+        );
+
+        let error = hub
+            .reconcile_job(&job)
+            .await
+            .expect_err("a rebooted durable Job must not start from empty state");
+        assert!(error.to_string().contains("requires recovery"), "{error}");
+        assert!(hub.nodes.read().await.get("node-a").is_some_and(|node| node
+            .commands
+            .iter()
+            .all(|command| command.operation != "job_start")));
+    }
+
+    fn durable_job_spec_json(id: &str) -> String {
+        let mut spec = serde_json::from_str::<serde_json::Value>(&job_spec_json(id)).unwrap();
+        spec["operators"] = serde_json::json!([
+            {"id": "source", "kind": "source"},
+            {
+                "id": "aggregate",
+                "kind": "aggregate",
+                "stateful": true,
+                "key_field": "key"
+            },
+            {"id": "sink", "kind": "sink"}
+        ]);
+        spec["edges"] = serde_json::json!([
+            {"id": "source-aggregate", "from": "source", "to": "aggregate"},
+            {"id": "aggregate-sink", "from": "aggregate", "to": "sink"}
+        ]);
+        spec["state"] = serde_json::json!({
+            "backend": "embedded_kv",
+            "durability": "durable",
+            "format_version": 1
+        });
+        spec["checkpoint"] = serde_json::json!({
+            "interval_ms": 1000,
+            "retention": 2,
+            "object_store_uri": "file:///tmp/arkflow-hub-recovery-test"
+        });
+        spec.to_string()
     }
 
     /// A stopped Job whose stop command already succeeded must not receive a
@@ -5840,10 +6201,36 @@ mod tests {
         HubConfig {
             operator_token: Some("operator".into()),
             node_token: Some("node-secret".into()),
+            insecure_local: false,
             lease_ttl_ms: 1000,
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
         }
+    }
+
+    #[tokio::test]
+    async fn secure_hub_fails_closed_for_missing_credentials_without_mutation() {
+        let hub = Hub::new(HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: false,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        assert!(!hub.operator_authorized(None));
+        let result = hub
+            .register(RegisterRequest {
+                node_id: "unauthorized-node".into(),
+                node_token: String::new(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: None,
+                data_address: None,
+            })
+            .await;
+        assert!(matches!(result, Err(HubError::Unauthorized)));
+        assert!(hub.nodes().await.is_empty());
     }
 
     #[test]
@@ -6808,7 +7195,10 @@ mod tests {
                 operations: vec![],
                 events: vec![],
                 metrics: BTreeMap::new(),
-                jobs: BTreeMap::from([("job-1".into(), job_snapshot(if node_id == "node-a" { 7 } else { 9 }))]),
+                jobs: BTreeMap::from([(
+                    "job-1".into(),
+                    job_snapshot(if node_id == "node-a" { 7 } else { 9 }),
+                )]),
                 configuration: None,
                 configuration_version: None,
                 boot_id: None,
@@ -6839,10 +7229,7 @@ mod tests {
     /// series remain.
     #[tokio::test]
     async fn expired_lease_stops_data_plane_export() {
-        let hub = Hub::new(HubConfig {
-            lease_ttl_ms: 1,
-            ..config()
-        });
+        let hub = Hub::new(config());
         let mut sessions = BTreeMap::new();
         for node_id in ["n1", "n2"] {
             let session = hub
@@ -6880,7 +7267,15 @@ mod tests {
         }
         assert_eq!(hub.job_metrics().await.len(), 2);
 
-        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        // n1's lease lapses deterministically; a tiny TTL would race the
+        // wall clock across the registration awaits above.
+        hub.nodes
+            .write()
+            .await
+            .get_mut("n1")
+            .unwrap()
+            .resource
+            .lease_expires_at_ms = now_ms();
         hub.heartbeat(HeartbeatRequest {
             auth: AgentAuth {
                 node_id: "n2".into(),
@@ -8475,6 +8870,7 @@ mod session_report_tests {
         HubConfig {
             operator_token: Some("operator".into()),
             node_token: Some("node-secret".into()),
+            insecure_local: false,
             lease_ttl_ms: 1000,
             poll_interval_ms: 1000,
             session_ttl_ms: default_session_ttl_ms(),

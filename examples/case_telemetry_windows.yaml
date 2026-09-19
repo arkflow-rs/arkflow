@@ -24,6 +24,12 @@ streams:
       type: tumbling_window
       interval: 10s
 
+    # Legacy streams must declare that this window is intentionally
+    # non-recoverable. Use a Job with checkpoints for durable window state.
+    state:
+      backend: embedded_kv
+      durability: ephemeral
+
     pipeline:
       thread_num: 4
       processors:

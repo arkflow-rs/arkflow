@@ -214,7 +214,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         edges,
         sources,
         sinks,
-        state: None,
+        // Legacy streams must opt into a state contract when they contain a
+        // window. A stream-level state section is copied into the compiled
+        // Job so the same validation rules apply to both configuration forms.
+        state: stream.state.clone(),
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
@@ -458,6 +461,7 @@ mod tests {
             error_output: None,
             buffer: None,
             durability: None,
+            state: None,
             temporary: None,
         }
     }
@@ -487,6 +491,16 @@ mod tests {
             buffer_type: "tumbling_window".into(),
             name: None,
             config: Some(json!({"size": "1m"})),
+        });
+        stream.state = Some(crate::job::StateSpec {
+            backend: "embedded_kv".into(),
+            durability: crate::job::StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
         });
         let spec = compile_stream(&stream, 0).unwrap();
         let window = spec
@@ -601,6 +615,16 @@ mod window_mapping_tests {
                 config: Some(buffer_config),
             }),
             durability: None,
+            state: Some(crate::job::StateSpec {
+                backend: "embedded_kv".into(),
+                durability: crate::job::StateDurability::Ephemeral,
+                root: None,
+                namespace: None,
+                ttl_ms: None,
+                format_version: 1,
+                max_pending_transactions: None,
+                max_bytes: None,
+            }),
             temporary: None,
         };
         compile_stream(&stream, 0).unwrap()
@@ -646,6 +670,7 @@ mod window_mapping_tests {
                     config: Some(json!({"interval": "30s", "slide_size": 5})),
                 }),
                 durability: None,
+                state: None,
                 temporary: None,
             },
             0,
@@ -688,6 +713,7 @@ mod window_mapping_tests {
                     })),
                 }),
                 durability: None,
+                state: None,
                 temporary: None,
             },
             0,

@@ -38,6 +38,10 @@ streams:
       type: tumbling_window
       interval: 10s
 
+    state:
+      backend: embedded_kv
+      durability: ephemeral
+
     pipeline:
       thread_num: 4
       processors:

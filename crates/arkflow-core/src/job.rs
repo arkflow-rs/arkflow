@@ -7,6 +7,7 @@
 use crate::{input::Input, output::Output, processor::Processor, Error, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -193,6 +194,14 @@ pub enum LateEventPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSpec {
     pub backend: String,
+    /// Whether state may be discarded when the process or node is replaced.
+    /// Durable is the safe default for stateful Jobs.
+    #[serde(default)]
+    pub durability: StateDurability,
+    /// Stable working-state root. When absent, the runtime uses
+    /// `ARKFLOW_STATE_ROOT` or `data/arkflow-state` for durable state.
+    #[serde(default)]
+    pub root: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
@@ -206,10 +215,88 @@ pub struct StateSpec {
     /// capacity planning.
     #[serde(default)]
     pub max_pending_transactions: Option<usize>,
+    /// Optional live state-byte budget enforced by disk-backed state.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateDurability {
+    #[default]
+    Durable,
+    Ephemeral,
 }
 
 fn default_state_format_version() -> u32 {
     1
+}
+
+/// Encode a namespace component without allowing its separators to become
+/// ambiguous with the surrounding state path.  Keep the common identifier
+/// characters readable while escaping every other byte, including `%`.
+fn encode_state_component(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(byte as char);
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+/// Build the stable namespace used by every keyed/window operator in a Job.
+/// The configured namespace is a logical prefix; Job/operator/task identity is
+/// always retained so equal user prefixes cannot collide across the plan.
+pub fn effective_state_namespace(
+    job_id: &JobId,
+    state: Option<&StateSpec>,
+    operator_id: &str,
+    task_id: &str,
+) -> String {
+    let prefix = state
+        .and_then(|state| state.namespace.as_deref())
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or("default");
+    format!(
+        "job:{}:state:{}:operator:{}:task:{}",
+        encode_state_component(job_id.as_str()),
+        encode_state_component(prefix),
+        encode_state_component(operator_id),
+        encode_state_component(task_id),
+    )
+}
+
+/// The stable logical prefix shared by every operator/task namespace in one
+/// Job. Checkpoint compatibility uses this prefix to reject artifacts written
+/// for a different user namespace before restoring any bytes.
+pub fn state_namespace_prefix(job_id: &JobId, state: Option<&StateSpec>) -> String {
+    let prefix = state
+        .and_then(|state| state.namespace.as_deref())
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or("default");
+    format!(
+        "job:{}:state:{}:",
+        encode_state_component(job_id.as_str()),
+        encode_state_component(prefix),
+    )
+}
+
+/// Resolve a durable working-state root without falling back to the process
+/// temporary directory. The caller appends Job/version/node/generation
+/// components appropriate for its execution mode.
+pub fn configured_state_root(state: &StateSpec) -> PathBuf {
+    state
+        .root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("ARKFLOW_STATE_ROOT").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("data/arkflow-state"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +375,108 @@ fn default_parallelism() -> u32 {
 }
 
 impl JobSpec {
+    /// Enumerate all runtime side edges which must remain local to a task
+    /// subtask.  These edges are not ordinary dataflow edges: error routes
+    /// and late-event routes are created by the executor while it builds a
+    /// graph, so placement must account for them before any Agent is
+    /// dispatched.
+    pub fn side_edges(&self) -> Vec<SideEdgeSpec> {
+        let mut side_edges = BTreeSet::new();
+
+        for edge in &self.edges {
+            let is_error_sink = self
+                .operators
+                .iter()
+                .find(|operator| operator.id == edge.to)
+                .and_then(|operator| operator.config.get("__arkflow_error_sink"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if is_error_sink {
+                side_edges.insert(SideEdgeSpec {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    kind: SideEdgeKind::Error,
+                });
+            }
+        }
+
+        for source in &self.sources {
+            let Some(route) = source.time.late_event_route.as_ref() else {
+                continue;
+            };
+            side_edges.insert(SideEdgeSpec {
+                from: source.operator_id.clone(),
+                to: route.clone(),
+                kind: SideEdgeKind::LateEvent,
+            });
+
+            // Unified event-time Session windows own their dynamic deadline.
+            // A late row can therefore be emitted directly by the window
+            // task, rather than by the source gate.  Account for that extra
+            // runtime edge during placement as well.
+            if source.time.mode != TimeMode::EventTime {
+                continue;
+            }
+            for operator in &self.operators {
+                if operator.kind != OperatorKind::Window
+                    || !self.operator_reachable(&source.operator_id, &operator.id)
+                {
+                    continue;
+                }
+                let Ok(config) = serde_json::from_value::<
+                    crate::executor::window::WindowOperatorConfig,
+                >(operator.config.clone()) else {
+                    continue;
+                };
+                if config.trigger == crate::executor::window::WindowTrigger::Watermark
+                    && !config.legacy_payload
+                    && matches!(
+                        config.kind,
+                        crate::executor::window::WindowKind::Session { .. }
+                    )
+                {
+                    side_edges.insert(SideEdgeSpec {
+                        from: operator.id.clone(),
+                        to: route.clone(),
+                        kind: SideEdgeKind::LateEvent,
+                    });
+                }
+            }
+        }
+
+        side_edges.into_iter().collect()
+    }
+
+    fn operator_reachable(&self, from: &str, target: &str) -> bool {
+        let mut queue = vec![from.to_owned()];
+        let mut visited = BTreeSet::new();
+        while let Some(operator_id) = queue.pop() {
+            if !visited.insert(operator_id.clone()) {
+                continue;
+            }
+            if operator_id == target {
+                return true;
+            }
+            queue.extend(
+                self.edges
+                    .iter()
+                    .filter(|edge| edge.from == operator_id)
+                    .map(|edge| edge.to.clone()),
+            );
+        }
+        false
+    }
+
+    /// Whether the Job contains an operator whose runtime state must survive
+    /// a restart. A Job may still declare a backend/checkpoint for metrics or
+    /// future use, but stateless source/sink plans have no keyed state that
+    /// requires a recovery artifact before they can be started again.
+    pub fn requires_state(&self) -> bool {
+        self.operators
+            .iter()
+            .any(|operator| operator.stateful || operator.kind == OperatorKind::Window)
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
         JobId::new(self.id.as_str())?;
         if let Some(state) = self.state.as_ref() {
@@ -319,12 +508,32 @@ impl JobSpec {
             return Err(Error::Config("Job max_parallelism must be positive".into()));
         }
 
+        let requires_state = self.requires_state();
+        if self.state.is_none() {
+            if requires_state {
+                return Err(Error::Config(
+                    "stateful or Window Jobs require an explicit state specification; configure state.durability: ephemeral for non-recoverable development runs or provide durable state and checkpoints".into(),
+                ));
+            }
+            if self.checkpoint.is_some() {
+                return Err(Error::Config(
+                    "checkpointing a Job requires a state specification".into(),
+                ));
+            }
+        }
+
         let mut operator_ids = BTreeSet::new();
         for operator in &self.operators {
             if operator.id.is_empty() || !operator_ids.insert(operator.id.clone()) {
                 return Err(Error::Config(format!(
                     "Job '{}' contains a duplicate or empty operator id",
                     self.id
+                )));
+            }
+            if operator.kind == OperatorKind::Join {
+                return Err(Error::Config(format!(
+                    "Join operator '{}' is not supported by the distributed runtime; use a supported single-input operator or a dedicated multi-input Join runtime",
+                    operator.id
                 )));
             }
             if operator.stateful && operator.key_field.is_none() {
@@ -600,9 +809,31 @@ impl JobSpec {
             }
         }
         if let Some(state) = &self.state {
+            if state
+                .root
+                .as_deref()
+                .is_some_and(|root| root.trim().is_empty())
+            {
+                return Err(Error::Config(
+                    "Job state root must not be empty when configured".into(),
+                ));
+            }
             if state.format_version == 0 {
                 return Err(Error::Config(
                     "Job state format_version must be positive".into(),
+                ));
+            }
+            if state.max_bytes == Some(0) {
+                return Err(Error::Config(
+                    "Job state max_bytes must be positive".into(),
+                ));
+            }
+            if requires_state
+                && state.durability == StateDurability::Durable
+                && self.checkpoint.is_none()
+            {
+                return Err(Error::Config(
+                    "durable stateful or Window Jobs require a checkpoint specification".into(),
                 ));
             }
         }
@@ -680,6 +911,29 @@ pub struct JobPlan {
     pub tasks: Vec<TaskSpec>,
 }
 
+/// Runtime edge which is not represented by a normal dataflow channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SideEdgeKind {
+    Error,
+    LateEvent,
+}
+
+impl SideEdgeKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::LateEvent => "late-event",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SideEdgeSpec {
+    pub from: String,
+    pub to: String,
+    pub kind: SideEdgeKind,
+}
+
 impl JobPlan {
     pub fn compile(spec: JobSpec) -> Result<Self, Error> {
         spec.validate()?;
@@ -750,8 +1004,7 @@ impl JobPlan {
         node_ids: &[String],
         generation: u64,
     ) -> Result<Vec<TaskAttempt>, Error> {
-        self.validate_split_side_edges(node_ids)?;
-        Ok(self
+        let assignments = self
             .tasks
             .iter()
             .enumerate()
@@ -767,53 +1020,80 @@ impl JobPlan {
                     state: TaskAttemptState::Queued,
                 }
             })
-            .collect())
+            .collect::<Vec<_>>();
+        self.validate_side_edge_assignments(&assignments)?;
+        Ok(assignments)
     }
 
-    /// Side edges (error sinks, late-event routes) must land on one node
-    /// under the given node count; a violation names the offending edge.
-    fn validate_split_side_edges(&self, node_ids: &[String]) -> Result<(), Error> {
-        let mut first_task_index = BTreeMap::<&str, usize>::new();
-        for (index, task) in self.tasks.iter().enumerate() {
-            first_task_index
-                .entry(task.operator_id.as_str())
-                .or_insert(index);
+    /// Validate every task assignment participating in a runtime side edge.
+    /// This is intentionally public so the Hub and Agent can both enforce the
+    /// same invariant at their trust boundaries.
+    pub fn validate_side_edge_assignments(
+        &self,
+        assignments: &[TaskAttempt],
+    ) -> Result<(), Error> {
+        let mut node_by_task = BTreeMap::new();
+        for assignment in assignments {
+            if node_by_task
+                .insert(assignment.task_id.clone(), assignment.node_id.clone())
+                .is_some()
+            {
+                return Err(Error::Config(format!(
+                    "duplicate task assignment for '{}'",
+                    assignment.task_id
+                )));
+            }
         }
-        let parallelism = self.spec.parallelism.max(1) as usize;
-        let check = |from_op: &str, to_op: &str| -> Result<(), Error> {
-            let (Some(from), Some(to)) = (
-                first_task_index.get(from_op),
-                first_task_index.get(to_op),
-            ) else {
-                return Ok(()); // unknown operators fail edge validation earlier
-            };
-            for subtask in 0..parallelism {
-                let left = &node_ids[(from + subtask) % node_ids.len()];
-                let right = &node_ids[(to + subtask) % node_ids.len()];
-                if left != right {
-                    return Err(Error::Config(format!(
-                        "split placement requires co-located side edges: '{from_op}'->'{to_op}' splits across '{left}' and '{right}' on subtask {subtask}"
-                    )));
+        self.validate_side_edge_nodes(&node_by_task)
+    }
+
+    /// Validate a task→node view before graph construction.  Missing tasks
+    /// fail closed instead of allowing a partial assignment to hide a side
+    /// route until an event reaches it at runtime.
+    pub fn validate_side_edge_nodes(
+        &self,
+        node_by_task: &BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        for side_edge in self.spec.side_edges() {
+            for from_subtask in 0..self.spec.parallelism {
+                let from_task = format!("{}-{from_subtask}", side_edge.from);
+                let from_node = node_by_task.get(&from_task).ok_or_else(|| {
+                    Error::Config(format!(
+                        "{} side edge '{} -> {}' is missing assignment for task '{}'",
+                        side_edge.kind.label(),
+                        side_edge.from,
+                        side_edge.to,
+                        from_task
+                    ))
+                })?;
+                // Runtime late/error routes broadcast from one source task to
+                // every target task on the local graph. Matching only equal
+                // subtasks would accept a placement where a cross-subtask
+                // target is remote and its route is silently omitted.
+                for to_subtask in 0..self.spec.parallelism {
+                    let to_task = format!("{}-{to_subtask}", side_edge.to);
+                    let to_node = node_by_task.get(&to_task).ok_or_else(|| {
+                        Error::Config(format!(
+                            "{} side edge '{} -> {}' is missing assignment for task '{}'",
+                            side_edge.kind.label(),
+                            side_edge.from,
+                            side_edge.to,
+                            to_task
+                        ))
+                    })?;
+                    if from_node != to_node {
+                        return Err(Error::Config(format!(
+                            "split placement requires co-located side edges: {} edge '{} -> {}' splits across '{}' and '{}' (tasks '{}' and '{}')",
+                            side_edge.kind.label(),
+                            side_edge.from,
+                            side_edge.to,
+                            from_node,
+                            to_node,
+                            from_task,
+                            to_task
+                        )));
+                    }
                 }
-            }
-            Ok(())
-        };
-        for edge in &self.spec.edges {
-            let error_sink = self
-                .spec
-                .operators
-                .iter()
-                .find(|operator| operator.id == edge.to)
-                .and_then(|operator| operator.config.get("__arkflow_error_sink"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if error_sink {
-                check(&edge.from, &edge.to)?;
-            }
-        }
-        for source in &self.spec.sources {
-            if let Some(route) = source.time.late_event_route.as_ref() {
-                check(&source.operator_id, route)?;
             }
         }
         Ok(())
@@ -841,17 +1121,15 @@ impl JobPlan {
                 .or_default()
                 .insert(edge.from.clone());
         }
-        for source in &self.spec.sources {
-            if let Some(route_operator) = source.time.late_event_route.as_ref() {
-                adjacency
-                    .entry(source.operator_id.clone())
-                    .or_default()
-                    .insert(route_operator.clone());
-                adjacency
-                    .entry(route_operator.clone())
-                    .or_default()
-                    .insert(source.operator_id.clone());
-            }
+        for side_edge in self.spec.side_edges() {
+            adjacency
+                .entry(side_edge.from.clone())
+                .or_default()
+                .insert(side_edge.to.clone());
+            adjacency
+                .entry(side_edge.to)
+                .or_default()
+                .insert(side_edge.from);
         }
         let mut component_by_operator = BTreeMap::new();
         let mut visited = BTreeSet::new();
@@ -1135,10 +1413,13 @@ mod tests {
             }],
             state: Some(StateSpec {
                 backend: "embedded_kv".into(),
+                durability: StateDurability::Durable,
+                root: None,
                 namespace: Some("orders".into()),
                 ttl_ms: None,
                 format_version: 1,
                 max_pending_transactions: None,
+                max_bytes: None,
             }),
             checkpoint: Some(CheckpointSpec {
                 interval_ms: 1_000,
@@ -1150,8 +1431,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_join_operator() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "join".into(),
+            kind: OperatorKind::Join,
+            stateful: true,
+            key_field: Some("customer_id".into()),
+            config: serde_json::json!({}),
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("Join operator 'join' is not supported"), "{error}");
+    }
+
+    #[test]
     fn validates_a_stateful_event_time_job() {
         assert!(base_job().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_stateful_job_without_state_or_checkpoint_contract() {
+        let mut missing_state = base_job();
+        missing_state.state = None;
+        let error = missing_state.validate().unwrap_err().to_string();
+        assert!(error.contains("require an explicit state specification"), "{error}");
+
+        let mut missing_checkpoint = base_job();
+        missing_checkpoint.checkpoint = None;
+        let error = missing_checkpoint.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("durable stateful or Window Jobs require a checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ephemeral_stateful_job_may_omit_checkpoint() {
+        let mut job = base_job();
+        job.checkpoint = None;
+        job.state.as_mut().unwrap().durability = StateDurability::Ephemeral;
+        assert!(job.validate().is_ok());
     }
 
     #[test]
@@ -1190,10 +1509,13 @@ mod tests {
         let mut job = base_job();
         job.state = Some(StateSpec {
             backend: "embedded_kv".into(),
+            durability: StateDurability::Durable,
+            root: None,
             namespace: Some("orders".into()),
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: Some(0),
+            max_bytes: None,
         });
         let error = job.validate().unwrap_err().to_string();
         assert!(error.contains("max_pending_transactions"), "{error}");
@@ -1207,6 +1529,55 @@ mod tests {
             state.max_pending_transactions = None;
         }
         job.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_zero_state_byte_budget() {
+        let mut job = base_job();
+        job.state.as_mut().expect("base job state").max_bytes = Some(0);
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("max_bytes"), "{error}");
+
+        job.state.as_mut().expect("base job state").max_bytes = Some(1);
+        job.validate().unwrap();
+    }
+
+    #[test]
+    fn effective_state_namespace_preserves_job_operator_and_task_identity() {
+        let job = base_job();
+        assert_eq!(
+            effective_state_namespace(
+                &job.id,
+                job.state.as_ref(),
+                "aggregate",
+                "aggregate-1"
+            ),
+            "job:orders:state:orders:operator:aggregate:task:aggregate-1"
+        );
+        assert_eq!(
+            effective_state_namespace(&job.id, None, "aggregate", "aggregate-1"),
+            "job:orders:state:default:operator:aggregate:task:aggregate-1"
+        );
+    }
+
+    #[test]
+    fn effective_state_namespace_escapes_component_separators() {
+        let mut job = base_job();
+        job.state.as_mut().unwrap().namespace = Some("stable:evil".into());
+        let namespace = effective_state_namespace(
+            &job.id,
+            job.state.as_ref(),
+            "aggregate:one",
+            "aggregate:one-0",
+        );
+        assert_eq!(
+            namespace,
+            "job:orders:state:stable%3Aevil:operator:aggregate%3Aone:task:aggregate%3Aone-0"
+        );
+        assert_eq!(
+            state_namespace_prefix(&job.id, job.state.as_ref()),
+            "job:orders:state:stable%3Aevil:"
+        );
     }
 
     #[test]
@@ -1480,6 +1851,163 @@ mod placement_tests {
         assert!(
             error.to_string().contains("co-located side edges"),
             "expected a side-edge placement rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn side_edge_validation_checks_all_source_target_subtasks() {
+        let mut job = split_job();
+        job.parallelism = 2;
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        let plan = JobPlan::compile(job).unwrap();
+
+        // Equal-subtask placement is co-located, but the runtime route also
+        // broadcasts source-0 to late_sink-1 (and vice versa).
+        let assignments = BTreeMap::from([
+            ("source-0".to_string(), "a".to_string()),
+            ("source-1".to_string(), "b".to_string()),
+            ("late_sink-0".to_string(), "a".to_string()),
+            ("late_sink-1".to_string(), "b".to_string()),
+        ]);
+        let error = plan
+            .validate_side_edge_nodes(&assignments)
+            .expect_err("cross-subtask side route must be rejected");
+        assert!(error.to_string().contains("source-0"));
+        assert!(error.to_string().contains("late_sink-1"));
+    }
+
+    #[test]
+    fn split_placement_rejects_dynamic_session_late_route() {
+        let mut job = split_job();
+        job.parallelism = 1;
+        // Keep the source-side route on node a while the session window lands
+        // on node b.  The source route alone would pass the old check; the
+        // dynamic window route is the regression this test protects.
+        let window = job
+            .operators
+            .iter_mut()
+            .find(|operator| operator.id == "aggregate")
+            .expect("base job window placeholder");
+        window.kind = OperatorKind::Window;
+        window.config = serde_json::json!({
+            "kind": "session",
+            "gap_ms": 1_000,
+            "timestamp_field": "timestamp",
+            "key_field": "customer_id",
+            "value_fields": ["amount"],
+            "trigger": "watermark",
+            "watermark_field": "timestamp"
+        });
+        let late_sink = OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        };
+        let sink_index = job
+            .operators
+            .iter()
+            .position(|operator| operator.id == "sink")
+            .expect("base sink");
+        job.operators.insert(sink_index, late_sink);
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+
+        let plan = JobPlan::compile(job).unwrap();
+        let error = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect_err("dynamic session side edge must reject the placement");
+        assert!(
+            error.to_string().contains("aggregate -> late_sink")
+                || error.to_string().contains("window -> late_sink"),
+            "expected the dynamic window side edge in the rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn split_placement_rejects_cross_node_error_route() {
+        let mut job = split_job();
+        job.parallelism = 1;
+        job.operators.push(OperatorSpec {
+            id: "error_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({"__arkflow_error_sink": true}),
+        });
+        job.edges.push(EdgeSpec {
+            id: "source-error".into(),
+            from: "source".into(),
+            to: "error_sink".into(),
+            partitioned: false,
+        });
+        let plan = JobPlan::compile(job).unwrap();
+        let error = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect_err("error side edge must reject the placement");
+        assert!(
+            error.to_string().contains("error edge 'source -> error_sink'"),
+            "expected the error side edge in the rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn split_placement_accepts_colocated_side_edge_with_split_data_edges() {
+        let mut job = split_job();
+        job.parallelism = 1;
+        let late_sink = OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        };
+        let sink_index = job
+            .operators
+            .iter()
+            .position(|operator| operator.id == "sink")
+            .expect("base sink");
+        job.operators.insert(sink_index, late_sink);
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+
+        let plan = JobPlan::compile(job).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect("co-located side edge should be accepted");
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.task_id == "source-0")
+                .unwrap()
+                .node_id,
+            "a"
+        );
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.task_id == "late_sink-0")
+                .unwrap()
+                .node_id,
+            "a"
+        );
+        assert_ne!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.task_id == "aggregate-0")
+                .unwrap()
+                .node_id,
+            assignments
+                .iter()
+                .find(|assignment| assignment.task_id == "source-0")
+                .unwrap()
+                .node_id
         );
     }
 

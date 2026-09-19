@@ -37,6 +37,13 @@ pub struct StreamConfig {
     pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
     pub durability: Option<WalConfig>,
+    /// Optional state contract for legacy streams that compile to a stateful
+    /// Job operator (for example a tumbling or session window). Durable
+    /// state belongs in a declarative `jobs` entry with a checkpoint policy;
+    /// legacy streams may explicitly opt into `ephemeral` state for local,
+    /// non-recoverable windowing.
+    #[serde(default)]
+    pub state: Option<crate::job::StateSpec>,
     pub temporary: Option<Vec<crate::temporary::TemporaryConfig>>,
 }
 
@@ -94,6 +101,7 @@ mod tests {
             error_output: None,
             buffer: None,
             durability: None,
+            state: None,
             temporary: None,
         }
     }

@@ -185,7 +185,7 @@ fn deep_merge(dst: &mut Value, src: &Value) {
 /// (its builder ignores config entirely).
 fn stub_config() -> Value {
     serde_yaml::from_str(
-        "streams:\n  - id: docs-snippet\n    input:\n      type: memory\n    pipeline:\n      processors: []\n    output:\n      type: drop\n",
+        "streams:\n  - id: docs-snippet\n    input:\n      type: memory\n    pipeline:\n      processors: []\n    output:\n      type: drop\n    state:\n      backend: embedded_kv\n      durability: ephemeral\n",
     )
     .expect("stub config parses")
 }

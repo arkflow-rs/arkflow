@@ -63,6 +63,8 @@ struct SplitPlacementPayload {
     task_nodes: Option<BTreeMap<String, String>>,
     /// Peer node → advertised data-plane address.
     node_data_ports: BTreeMap<String, String>,
+    /// Hub decision: this start may not initialize an empty durable backend.
+    recovery_required: bool,
 }
 
 #[derive(Clone, Default)]
@@ -85,6 +87,8 @@ type FinishedJob = (String, u64, Result<(), String>);
 
 struct JobTask {
     generation: u64,
+    ephemeral_state: bool,
+    recovery_required: bool,
     cancellation: CancellationToken,
     assignments: Vec<TaskAttempt>,
     watermark_partitions: BTreeMap<String, u32>,
@@ -274,6 +278,31 @@ fn validate_recovery_manifest(
     Ok(())
 }
 
+fn validate_recovery_snapshots<S: CheckpointStore>(
+    plan: &JobPlan,
+    repository: &CheckpointRepository<S>,
+    manifest: &arkflow_core::checkpoint::CheckpointManifest,
+) -> Result<(), String> {
+    let planned_tasks = plan
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    arkflow_core::checkpoint::validate_state_snapshot_task_set(
+        &manifest.state_snapshots,
+        &planned_tasks,
+    )?;
+    let expected_prefix =
+        arkflow_core::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
+    for snapshot_ref in &manifest.state_snapshots {
+        let snapshot = repository
+            .read_state_snapshot(snapshot_ref)
+            .map_err(|error| error.to_string())?;
+        arkflow_core::checkpoint::validate_state_snapshot_namespace(&snapshot, &expected_prefix)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn recovery_record_is_valid(
     spec: &arkflow_core::job::JobSpec,
     record: &crate::storage::JobCheckpointRecord,
@@ -311,17 +340,21 @@ pub(crate) fn recovery_record_is_valid(
     {
         return false;
     }
+    if validate_recovery_snapshots(&plan, &repository, &manifest).is_err() {
+        return false;
+    }
     let task_ids = manifest
         .task_attempts
         .iter()
-        .map(|attempt| attempt.task_id.as_str())
+        .map(|attempt| attempt.task_id.clone())
         .collect::<BTreeSet<_>>();
-    let snapshot_tasks = manifest
-        .state_snapshots
-        .iter()
-        .map(|snapshot| snapshot.task_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if task_ids.is_empty() || !task_ids.is_subset(&snapshot_tasks) {
+    if task_ids.is_empty()
+        || arkflow_core::checkpoint::validate_state_snapshot_task_set(
+            &manifest.state_snapshots,
+            &task_ids,
+        )
+        .is_err()
+    {
         return false;
     }
     manifest
@@ -330,12 +363,18 @@ pub(crate) fn recovery_record_is_valid(
         .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
 }
 
-fn parse_recovery_payload(payload: &serde_json::Value) -> Result<(Option<String>, bool), String> {
+fn parse_recovery_payload(
+    payload: &serde_json::Value,
+) -> Result<(Option<String>, bool, bool), String> {
+    let recovery_required = payload
+        .get("recovery_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let Some(recovery) = payload.get("recovery") else {
-        return Ok((None, false));
+        return Ok((None, false, recovery_required));
     };
     if recovery.is_null() {
-        return Ok((None, false));
+        return Ok((None, false, recovery_required));
     }
     let checkpoint_id = recovery
         .get("checkpoint_id")
@@ -346,7 +385,7 @@ fn parse_recovery_payload(payload: &serde_json::Value) -> Result<(Option<String>
         .get("savepoint")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    Ok((Some(checkpoint_id.to_owned()), savepoint))
+    Ok((Some(checkpoint_id.to_owned()), savepoint, recovery_required))
 }
 
 impl JobRuntime {
@@ -392,8 +431,16 @@ impl JobRuntime {
         let mut checkpoint_failures = 0_u64;
         let mut watermark_lag_ms = 0_u64;
         let mut late_events = 0_u64;
+        let mut ephemeral_jobs = 0_u64;
+        let mut recovery_required_jobs = 0_u64;
 
         for task in tasks.values() {
+            if task.ephemeral_state {
+                ephemeral_jobs = ephemeral_jobs.saturating_add(1);
+            }
+            if task.recovery_required {
+                recovery_required_jobs = recovery_required_jobs.saturating_add(1);
+            }
             let Some(kernel) = task.kernel.as_ref() else {
                 continue;
             };
@@ -428,6 +475,11 @@ impl JobRuntime {
             ("late_events".into(), late_events as f64),
             ("jobs_total".into(), tasks.len() as f64),
             ("jobs_running".into(), tasks.len() as f64),
+            ("jobs_ephemeral_state".into(), ephemeral_jobs as f64),
+            (
+                "jobs_recovery_required".into(),
+                recovery_required_jobs as f64,
+            ),
         ])
     }
 
@@ -446,6 +498,17 @@ impl JobRuntime {
         if assignments.is_empty() {
             return Err("Job command contains no task assignments".into());
         }
+        if split.recovery_required && recovery_id.is_none() {
+            return Err(format!(
+                "durable Job '{job_id}' requires recovery but no compatible checkpoint was supplied"
+            ));
+        }
+        let ephemeral_state =
+            plan.spec.state.as_ref().is_some_and(|state| {
+                state.durability == arkflow_core::job::StateDurability::Ephemeral
+            });
+        let recovery_required = split.recovery_required;
+        let local_recovery_marker = durable_recovery_marker(&plan, node_id, generation);
         let (existing, previous_exited_on_its_own) = {
             let tasks = self.tasks.lock().await;
             if tasks
@@ -468,6 +531,19 @@ impl JobRuntime {
             {
                 return Ok(());
             }
+            if local_recovery_marker
+                .as_ref()
+                .is_some_and(|marker| marker.is_file())
+                && recovery_id.is_none()
+            {
+                return Err(format!(
+                    "durable Job '{job_id}' requires recovery because state marker '{}' exists",
+                    local_recovery_marker
+                        .as_ref()
+                        .expect("marker checked above")
+                        .display()
+                ));
+            }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
             let existing = tasks.remove(&job_id);
@@ -485,10 +561,14 @@ impl JobRuntime {
         };
         let mut replaced_crash: Option<(u64, String)> = None;
         if let Some(existing) = existing {
+            let existing_generation = existing.generation;
             let outcome =
                 await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT)
                     .await;
             let _ = existing.state.close();
+            if let Some(manager) = &self.data_plane {
+                manager.remove_job_session(&job_id, existing_generation);
+            }
             if previous_exited_on_its_own {
                 if let Some(Err(error)) = outcome {
                     replaced_crash = Some((existing.generation, error));
@@ -519,24 +599,49 @@ impl JobRuntime {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        let state_root = std::env::temp_dir()
-            .join("arkflow-job-state")
+        let state_root_base = match plan.spec.state.as_ref() {
+            Some(state) if state.durability == arkflow_core::job::StateDurability::Durable => {
+                arkflow_core::job::configured_state_root(state)
+            }
+            Some(_) => std::env::temp_dir()
+                .join("arkflow-ephemeral-job-state")
+                .join(ephemeral_state_nonce()),
+            None => std::env::temp_dir().join("arkflow-stateless-job-state"),
+        };
+        let state_root = state_root_base
+            .join("jobs")
             .join(&job_id)
-            .join(format!("node-{}", safe_path_component(node_id)))
-            .join(format!(
+            .join(format!("node-{}", safe_path_component(node_id)));
+        let durable_state =
+            plan.spec.state.as_ref().is_some_and(|state| {
+                state.durability == arkflow_core::job::StateDurability::Durable
+            });
+        let state_root = if durable_state {
+            state_root
+                .join(format!("version-{}", plan.spec.version.0))
+                .join(format!("generation-{generation}"))
+        } else {
+            state_root.join(format!(
                 "version-{}-generation-{}",
                 plan.spec.version.0, generation
-            ));
+            ))
+        };
+        let recoverable_state =
+            durable_state && plan.spec.requires_state() && plan.spec.checkpoint.is_some();
+        let start_marker = recoverable_state.then(|| state_root.join(".arkflow-started"));
         let state_format_version = plan
             .spec
             .state
             .as_ref()
             .map(|state| state.format_version)
             .unwrap_or(1);
-        let state: Arc<dyn StateBackend> = Arc::new(
-            RedbStateBackend::open(state_root, state_format_version)
-                .map_err(|error| error.to_string())?,
-        );
+        let state_backend = RedbStateBackend::open(state_root, state_format_version)
+            .map_err(|error| error.to_string())?;
+        let state_backend = match plan.spec.state.as_ref().and_then(|state| state.max_bytes) {
+            Some(max_bytes) => state_backend.with_max_bytes(max_bytes),
+            None => state_backend,
+        };
+        let state: Arc<dyn StateBackend> = Arc::new(state_backend);
         let recovery = if let Some(checkpoint_id) = recovery_id {
             // Manifest/snapshot reads are object-store round trips (the
             // CheckpointStore trait is synchronous): run them on the blocking
@@ -545,62 +650,70 @@ impl JobRuntime {
             let plan_for_recovery = plan.clone();
             let assignments_for_recovery = assignments.clone();
             let state_for_restore = state.clone();
-            let recovered = tokio::task::spawn_blocking(
-                move || -> Result<RecoveryPlan, String> {
-                    let repository = checkpoint_repository(&plan_for_recovery)?;
-                    let artifact =
-                        recovery_artifact(&plan_for_recovery, &checkpoint_id, recovery_savepoint)?;
-                    let manifest = repository
-                        .read_manifest(&artifact)
-                        .map_err(|error| error.to_string())?;
-                    validate_recovery_manifest(
-                        &plan_for_recovery,
-                        &checkpoint_id,
+            let recovered = tokio::task::spawn_blocking(move || -> Result<RecoveryPlan, String> {
+                let repository = checkpoint_repository(&plan_for_recovery)?;
+                let artifact =
+                    recovery_artifact(&plan_for_recovery, &checkpoint_id, recovery_savepoint)?;
+                let manifest = repository
+                    .read_manifest(&artifact)
+                    .map_err(|error| error.to_string())?;
+                validate_recovery_manifest(
+                    &plan_for_recovery,
+                    &checkpoint_id,
+                    state_for_restore.format_version(),
+                    &manifest,
+                )?;
+                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest)?;
+                let assigned_task_ids = assignments_for_recovery
+                    .iter()
+                    .map(|assignment| assignment.task_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut snapshots = manifest
+                    .state_snapshots
+                    .iter()
+                    .filter(|snapshot_ref| {
+                        assigned_task_ids.contains(snapshot_ref.task_id.as_str())
+                    })
+                    .map(|snapshot_ref| {
+                        repository
+                            .read_state_snapshot(snapshot_ref)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if snapshots.len() > 1 {
+                    let entries = snapshots
+                        .drain(..)
+                        .flat_map(|snapshot| snapshot.entries)
+                        .collect();
+                    let snapshot = arkflow_core::state::StateSnapshot::new(
                         state_for_restore.format_version(),
-                        &manifest,
-                    )?;
-                    let assigned_task_ids = assignments_for_recovery
-                        .iter()
-                        .map(|assignment| assignment.task_id.as_str())
-                        .collect::<BTreeSet<_>>();
-                    let mut snapshots = manifest
-                        .state_snapshots
-                        .iter()
-                        .filter(|snapshot_ref| {
-                            assigned_task_ids.contains(snapshot_ref.task_id.as_str())
-                        })
-                        .map(|snapshot_ref| {
-                            repository
-                                .read_state_snapshot(snapshot_ref)
-                                .map_err(|error| error.to_string())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if snapshots.len() > 1 {
-                        let entries = snapshots
-                            .drain(..)
-                            .flat_map(|snapshot| snapshot.entries)
-                            .collect();
-                        let snapshot = arkflow_core::state::StateSnapshot::new(
-                            state_for_restore.format_version(),
-                            entries,
-                        );
-                        state_for_restore
-                            .restore(&snapshot)
-                            .map_err(|error| error.to_string())?;
-                    } else if let Some(snapshot) = snapshots.pop() {
-                        state_for_restore
-                            .restore(&snapshot)
-                            .map_err(|error| error.to_string())?;
-                    }
-                    RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())
-                },
-            )
+                        entries,
+                    );
+                    state_for_restore
+                        .restore(&snapshot)
+                        .map_err(|error| error.to_string())?;
+                } else if let Some(snapshot) = snapshots.pop() {
+                    state_for_restore
+                        .restore(&snapshot)
+                        .map_err(|error| error.to_string())?;
+                }
+                RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())
+            })
             .await
             .map_err(|error| format!("recovery read task failed: {error}"))??;
             Some(recovered)
         } else {
             None
         };
+        if let Some(marker) = start_marker.as_deref() {
+            if let Err(error) = persist_start_marker(marker) {
+                let _ = state.close();
+                return Err(format!(
+                    "persist durable Job start marker '{}': {error}",
+                    marker.display()
+                ));
+            }
+        }
         let cancellation = CancellationToken::new();
         // Register the Job BEFORE spawning the kernel: an abort of this
         // command task during the spawn window (session teardown, another
@@ -623,6 +736,8 @@ impl JobRuntime {
             job_id.clone(),
             JobTask {
                 generation,
+                ephemeral_state,
+                recovery_required,
                 cancellation: cancellation.clone(),
                 assignments: assignments.clone(),
                 watermark_partitions: watermark_partitions.clone(),
@@ -677,6 +792,7 @@ impl JobRuntime {
                 task_nodes,
                 node_addrs,
                 manager: manager.clone(),
+                generation,
             })
         });
         let spawn_result = spawn_kernel_job(
@@ -695,17 +811,24 @@ impl JobRuntime {
                 Arc::new(handle)
             }
             Err(error) => {
+                if let Some(marker) = start_marker.as_deref() {
+                    remove_start_marker(marker);
+                }
                 drop(started_tx);
                 let placeholder = self.tasks.lock().await.remove(&job_id);
                 if let Some(task) = placeholder {
                     task.cancellation.cancel();
                     let _ = task.handle.await;
                 }
+                if let Some(manager) = &self.data_plane {
+                    manager.remove_job_session(&job_id, generation);
+                }
                 let _ = state.close();
                 return Err(error);
             }
         };
         let handle = kernel.watcher();
+        let mut registered = false;
         {
             let mut tasks = self.tasks.lock().await;
             // Swap in the real kernel only if our placeholder still owns the
@@ -716,10 +839,13 @@ impl JobRuntime {
                 .get(&job_id)
                 .is_some_and(|task| task.generation == generation && task.kernel.is_none());
             if still_ours {
+                registered = true;
                 tasks.insert(
-                    job_id,
+                    job_id.clone(),
                     JobTask {
                         generation,
+                        ephemeral_state,
+                        recovery_required,
                         cancellation: cancellation.clone(),
                         assignments,
                         watermark_partitions,
@@ -733,6 +859,11 @@ impl JobRuntime {
                         handle,
                     },
                 );
+            }
+        }
+        if !registered {
+            if let Some(manager) = &self.data_plane {
+                manager.remove_job_session(&job_id, generation);
             }
         }
         Ok(())
@@ -1036,6 +1167,9 @@ impl JobRuntime {
                     Err(error) => Err(error.to_string()),
                 };
                 let _ = task.state.close();
+                if let Some(manager) = &self.data_plane {
+                    manager.remove_job_session(&job_id, task.generation);
+                }
                 finished.push((job_id, task.generation, result));
             }
         }
@@ -1055,14 +1189,15 @@ impl JobRuntime {
         let _start_guard = self.starts.lock().await;
         let tasks = {
             let mut tasks = self.tasks.lock().await;
-            std::mem::take(&mut *tasks)
-                .into_values()
-                .collect::<Vec<_>>()
+            std::mem::take(&mut *tasks).into_iter().collect::<Vec<_>>()
         };
-        for task in tasks {
+        for (job_id, task) in tasks {
             task.cancellation.cancel();
             let _ = task.handle.await;
             let _ = task.state.close();
+            if let Some(manager) = &self.data_plane {
+                manager.remove_job_session(&job_id, task.generation);
+            }
         }
     }
 
@@ -1078,31 +1213,89 @@ impl JobRuntime {
             tasks.remove(job_id)
         };
         if let Some(task) = task {
+            let task_generation = task.generation;
             task.cancellation.cancel();
             let _ = task.handle.await;
             let _ = task.state.close();
+            if let Some(manager) = &self.data_plane {
+                manager.remove_job_session(job_id, task_generation);
+            }
         }
         Ok(())
     }
 }
 
 fn safe_path_component(value: &str) -> String {
-    let component: String = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(128)
-        .collect();
+    // Keep the mapping injective: node IDs are part of the durable state and
+    // marker path. Replacing arbitrary characters with '_' (and truncating)
+    // aliases distinct nodes such as `a/b` and `a_b`, allowing them to open
+    // the same redb database after a restart.
+    let mut component = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.') {
+            component.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(component, "%{byte:02X}");
+        }
+    }
     if component.is_empty() {
         "unknown".into()
     } else {
         component
     }
+}
+
+fn ephemeral_state_nonce() -> String {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{timestamp}-{attempt}", std::process::id())
+}
+
+fn durable_recovery_marker(
+    plan: &JobPlan,
+    node_id: &str,
+    generation: u64,
+) -> Option<std::path::PathBuf> {
+    let state = plan.spec.state.as_ref()?;
+    if state.durability != arkflow_core::job::StateDurability::Durable
+        || !plan.spec.requires_state()
+        || plan.spec.checkpoint.is_none()
+    {
+        return None;
+    }
+    Some(
+        arkflow_core::job::configured_state_root(state)
+            .join("jobs")
+            .join(plan.spec.id.as_str())
+            .join(format!("node-{}", safe_path_component(node_id)))
+            .join(format!("version-{}", plan.spec.version.0))
+            .join(format!("generation-{generation}"))
+            .join(".arkflow-started"),
+    )
+}
+
+fn persist_start_marker(marker: &std::path::Path) -> std::io::Result<()> {
+    let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+    if let Err(error) = std::fs::write(&temporary, b"started\n") {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, marker) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_start_marker(marker: &std::path::Path) {
+    let _ = std::fs::remove_file(marker);
+    let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(temporary);
 }
 
 /// Spawn the assigned Job tasks on the unified kernel and return the
@@ -1479,34 +1672,78 @@ pub async fn run(
     // than blocking node startup — observability and placement still work.
     let mut data_address: Option<String> = None;
     if let Some(port) = config.data_port {
-        let manager = arkflow_core::executor::remote::NetworkManager::new(1024);
-        manager.spawn();
-        match manager
-            .bind_tcp(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
-            .await
-        {
-            Ok(bound) => {
-                data_address = config
-                    .data_host
-                    .as_ref()
-                    .map(|host| format!("{host}:{bound}"));
-                match &data_address {
-                    Some(address) => info!(
-                        node_id = %config.node_id,
-                        %address,
-                        "Network shuffle data plane listening"
-                    ),
-                    None => warn!(
-                        node_id = %config.node_id,
-                        port = bound,
-                        "data plane bound without data_host; the node stays colocated-only"
-                    ),
+        let data_secret = std::env::var("ARKFLOW_DATA_PLANE_SECRET")
+            .ok()
+            .filter(|secret| !secret.is_empty())
+            .or_else(|| (!config.node_token.is_empty()).then(|| config.node_token.clone()));
+        let manager = data_secret
+            .and_then(|data_secret| {
+                match arkflow_core::executor::remote::DataPlaneCredentials::new(
+                    config.node_id.clone(),
+                    data_secret,
+                ) {
+                    Ok(credentials) => Some(credentials),
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
+                        None
+                    }
                 }
-                job_runtime.data_plane = Some(manager);
-            }
-            Err(error) => {
-                manager.shutdown();
-                warn!(node_id = %config.node_id, %error, "data plane bind failed; running without network shuffle");
+            })
+            .and_then(|credentials| {
+                let mut manager_config =
+                    arkflow_core::executor::remote::NetworkManagerConfig::default();
+                manager_config.credentials = Some(credentials);
+                manager_config.channel_capacity = 1024;
+                match arkflow_core::executor::remote::NetworkManager::with_config(
+                    manager_config,
+                ) {
+                    Ok(manager) => Some(manager),
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
+                        None
+                    }
+                }
+            });
+        if let Some(manager) = manager {
+            manager.spawn();
+            match config
+                .data_host
+                .as_deref()
+                .unwrap_or("127.0.0.1")
+                .parse::<std::net::IpAddr>()
+            {
+                Ok(bind_host) => match manager
+                    .bind_tcp(std::net::SocketAddr::from((bind_host, port)))
+                    .await
+                {
+                    Ok(bound) => {
+                        data_address = config
+                            .data_host
+                            .as_ref()
+                            .map(|host| format!("{host}:{bound}"));
+                        match &data_address {
+                            Some(address) => info!(
+                                node_id = %config.node_id,
+                                %address,
+                                "Network shuffle data plane listening"
+                            ),
+                            None => warn!(
+                                node_id = %config.node_id,
+                                port = bound,
+                                "data plane bound without data_host; the node stays colocated-only"
+                            ),
+                        }
+                        job_runtime.data_plane = Some(manager);
+                    }
+                    Err(error) => {
+                        manager.shutdown();
+                        warn!(node_id = %config.node_id, %error, "data plane bind failed; running without network shuffle");
+                    }
+                },
+                Err(error) => {
+                    manager.shutdown();
+                    warn!(node_id = %config.node_id, %error, "data_host must be a bindable IP address; running colocated-only");
+                }
             }
         }
     }
@@ -2189,15 +2426,19 @@ async fn execute_job_operation(
                     .ok_or_else(|| "missing Job task assignments".to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            let (recovery_id, recovery_savepoint) = parse_recovery_payload(payload)?;
+            let (recovery_id, recovery_savepoint, recovery_required) =
+                parse_recovery_payload(payload)?;
             let split = SplitPlacementPayload {
-                task_nodes: payload
-                    .get("task_nodes")
-                    .and_then(|nodes| serde_json::from_value::<BTreeMap<String, String>>(nodes.clone()).ok()),
+                task_nodes: payload.get("task_nodes").and_then(|nodes| {
+                    serde_json::from_value::<BTreeMap<String, String>>(nodes.clone()).ok()
+                }),
                 node_data_ports: payload
                     .get("node_data_ports")
-                    .and_then(|ports| serde_json::from_value::<BTreeMap<String, String>>(ports.clone()).ok())
+                    .and_then(|ports| {
+                        serde_json::from_value::<BTreeMap<String, String>>(ports.clone()).ok()
+                    })
                     .unwrap_or_default(),
+                recovery_required,
             };
             if command.operation == "job_restart" {
                 job_runtime
@@ -2572,7 +2813,15 @@ mod tests {
         let spawn_runtime = runtime.clone();
         let start_task = tokio::spawn(async move {
             spawn_runtime
-                .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
+                .start(
+                    plan,
+                    assignments,
+                    1,
+                    None,
+                    false,
+                    "node-a",
+                    &SplitPlacementPayload::default(),
+                )
                 .await
         });
         // Registration-first: observe the entry as early as possible.
@@ -2624,10 +2873,18 @@ mod tests {
             .unwrap();
             let plan = arkflow_core::job::JobPlan::compile(spec).unwrap();
             let assignments = plan
-            .assignments_for_nodes(&["node-a".to_string()], 1)
-            .expect("colocated placement succeeds");
+                .assignments_for_nodes(&["node-a".to_string()], 1)
+                .expect("colocated placement succeeds");
             spawn_runtime
-                .start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default())
+                .start(
+                    plan,
+                    assignments,
+                    2,
+                    None,
+                    false,
+                    "node-a",
+                    &SplitPlacementPayload::default(),
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), restart)
@@ -2718,6 +2975,8 @@ mod tests {
             job_id.to_string(),
             JobTask {
                 generation,
+                ephemeral_state: false,
+                recovery_required: false,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
                 watermark_partitions: BTreeMap::new(),
@@ -2746,7 +3005,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default()),
+            runtime.start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            ),
         )
         .await
         .expect("the replacement start must not hang");
@@ -2781,7 +3048,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default()),
+            runtime.start(
+                plan,
+                assignments,
+                2,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            ),
         )
         .await
         .expect("the replacing start must not hang");
@@ -2810,7 +3085,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            runtime.start(plan, assignments, 2, None, false, "node-a", &SplitPlacementPayload::default()),
+            runtime.start(
+                plan,
+                assignments,
+                2,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            ),
         )
         .await
         .expect("the replacing start must not hang");
@@ -2837,14 +3120,30 @@ mod tests {
         let runtime = Arc::new(JobRuntime::default());
         let (plan, assignments) = replacement_test_plan("orders-idem").await;
         runtime
-            .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
             .await
             .expect("the initial start succeeds");
         let started_at = std::time::Instant::now();
 
         let (plan, assignments) = replacement_test_plan("orders-idem").await;
         runtime
-            .start(plan, assignments, 1, None, false, "node-a", &SplitPlacementPayload::default())
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
             .await
             .expect("the re-delivered same-generation start is a no-op success");
 
@@ -2998,22 +3297,67 @@ mod tests {
     fn recovery_payload_requires_a_checkpoint_id() {
         assert_eq!(
             parse_recovery_payload(&serde_json::json!({})).unwrap(),
-            (None, false)
+            (None, false, false)
         );
         assert_eq!(
             parse_recovery_payload(&serde_json::json!({
+                "recovery_required": true,
                 "recovery": {
                     "checkpoint_id": "cp-1",
                     "savepoint": true
                 }
             }))
             .unwrap(),
-            (Some("cp-1".into()), true)
+            (Some("cp-1".into()), true, true)
         );
         assert!(parse_recovery_payload(&serde_json::json!({
             "recovery": {}
         }))
         .is_err());
+    }
+
+    #[test]
+    fn durable_agent_state_isolated_by_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 4,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "aggregate", "kind": "aggregate", "stateful": true, "key_field": "key"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "source-aggregate", "from": "source", "to": "aggregate"},
+                {"id": "aggregate-sink", "from": "aggregate", "to": "sink"}
+            ],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": root.path().display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {
+                "interval_ms": 1000,
+                "retention": 2,
+                "object_store_uri": "file:///tmp/arkflow-agent-test-checkpoints"
+            }
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let generation_one = durable_recovery_marker(&plan, "node-a", 1).unwrap();
+        let generation_two = durable_recovery_marker(&plan, "node-a", 2).unwrap();
+        assert_ne!(generation_one, generation_two);
+        assert!(generation_one.ends_with("generation-1/.arkflow-started"));
+        assert!(generation_two.ends_with("generation-2/.arkflow-started"));
+    }
+
+    #[test]
+    fn node_state_path_encoding_does_not_alias_distinct_ids() {
+        assert_ne!(safe_path_component("node/a"), safe_path_component("node_a"));
+        assert_eq!(safe_path_component("node/a"), "node%2Fa");
     }
 
     #[tokio::test]

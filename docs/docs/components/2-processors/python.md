@@ -42,7 +42,7 @@ The Python processor executes user-supplied Python code on each message batch vi
 
 ### Complete Pipeline Example
 
-```yaml validate=full
+```yaml validate=foreign reason="requires the optional PyArrow Python runtime"
 streams:
   - input:
       type: "memory"

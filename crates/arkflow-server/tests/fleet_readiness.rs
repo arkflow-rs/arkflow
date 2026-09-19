@@ -130,7 +130,12 @@ fn empty_control_plane() -> ControlPlane {
     )
 }
 
-fn fleet_job(job_id: &str, node_id: &str, checkpoint_uri: String) -> JobSpec {
+fn fleet_job(
+    job_id: &str,
+    node_id: &str,
+    checkpoint_uri: String,
+    state_root: String,
+) -> JobSpec {
     let processing_time = || TimeSpec {
         mode: TimeMode::ProcessingTime,
         timestamp_field: None,
@@ -184,10 +189,13 @@ fn fleet_job(job_id: &str, node_id: &str, checkpoint_uri: String) -> JobSpec {
         }],
         state: Some(StateSpec {
             backend: "embedded_kv".into(),
+            durability: arkflow_core::job::StateDurability::Durable,
+            root: Some(state_root),
             namespace: None,
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {
             interval_ms: JOB_CHECKPOINT_INTERVAL_MS,
@@ -202,6 +210,7 @@ fn hub_config(session_ttl_ms: u64) -> HubConfig {
     HubConfig {
         operator_token: None,
         node_token: None,
+        insecure_local: true,
         // Command expiry and the node lease both derive from this TTL: keep a
         // 10x margin over the heartbeat so runtime-scheduling jitter under a
         // loaded fleet never expires commands (or leases) into a retry loop.
@@ -264,6 +273,7 @@ async fn serve_generation(hub: Hub, address: std::net::SocketAddr) -> LiveHub {
     let config = ServerConfig {
         address: address.to_string(),
         poll_interval_ms: HUB_POLL_INTERVAL_MS,
+        insecure_local: true,
         ..ServerConfig::default()
     };
     let serve_cancel = cancel.clone();
@@ -442,6 +452,7 @@ async fn create_fleet_jobs(
             &job_id,
             node,
             format!("file://{}/{job_id}", checkpoint_root.display()),
+            checkpoint_root.join("state").display().to_string(),
         );
         hub.upsert_job(JobRecord {
             job_id: job_id.clone(),
@@ -461,6 +472,22 @@ async fn create_fleet_jobs(
         jobs.push(job_id);
     }
     jobs
+}
+
+async fn stop_fleet_jobs(hub: &Hub, jobs: &[String]) {
+    for job_id in jobs {
+        let mut record = hub
+            .job(job_id)
+            .await
+            .unwrap_or_else(|error| panic!("failed to load {job_id} before shutdown: {error}"))
+            .unwrap_or_else(|| panic!("job {job_id} disappeared before shutdown"));
+        if record.desired_state != "stopped" {
+            record.desired_state = "stopped".into();
+            record.version = record.version.saturating_add(1);
+            record.generation = record.generation.saturating_add(1);
+            hub.upsert_job(record).await.unwrap();
+        }
+    }
 }
 
 async fn toggle_job_subset(hub: &Hub, jobs: &[String], round: usize) {
@@ -912,10 +939,13 @@ async fn run_soak(
     // is sweep stability: with the fleet drained, two consecutive full
     // retention sweeps must reclaim nothing — only a broken reclaim
     // mechanism fails that.
+    // Stop desired Jobs while the Agents are still online. Shutting down the
+    // fleet while desired state remains `running` intentionally creates
+    // durable queued starts, so a later quiescence wait would never settle.
+    stop_fleet_jobs(&live.hub, &jobs).await;
     let _ = wait_quiescent(&live.hub, ROUND_TIMEOUT).await;
     assert_history_converged(&live.hub, &store, "soak final").await;
     fleet.shutdown().await;
-    let _ = wait_quiescent(&live.hub, ROUND_TIMEOUT).await;
     hub_prune_all(&live.hub).await;
     let after_first = history_counts(&store).await;
     hub_prune_all(&live.hub).await;
@@ -947,6 +977,8 @@ async fn run_soak(
         if gate_rss_slope {
             let warm = &rss_samples[rss_samples.len() / 2..];
             if let Some(warm_slope) = rss_slope_kb_per_sec(warm) {
+                #[cfg(not(target_os = "linux"))]
+                let _ = warm_slope;
                 // macOS libmalloc does not return freed memory to the OS
                 // while kernels keep allocating, so a linear RSS ramp there
                 // is expected allocator behavior; glibc (the CI platform)

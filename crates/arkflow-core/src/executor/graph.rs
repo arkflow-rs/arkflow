@@ -27,6 +27,8 @@ pub struct RemoteEdgeContext {
     /// Data-plane address of each remote node this graph reaches.
     pub node_addrs: BTreeMap<String, std::net::SocketAddr>,
     pub manager: std::sync::Arc<super::remote::NetworkManager>,
+    /// Job attempt generation bound into authenticated data-plane sessions.
+    pub generation: u64,
 }
 
 /// Deterministic routing index for quad identities: the operator's position
@@ -409,6 +411,11 @@ impl ExecutionGraphBuilder {
     ) -> Result<ExecutionGraph, Error> {
         plan.spec.validate()?;
         validate_shared_watermark_specs(plan)?;
+        if let Some(remote) = remote {
+            // The Hub validates placement before dispatch, but an Agent must
+            // also fail closed if it receives a stale or incomplete task map.
+            plan.validate_side_edge_nodes(&remote.task_nodes)?;
+        }
         let index = PlanIndex::new(plan);
         let tasks = task_ids
             .iter()
@@ -422,10 +429,10 @@ impl ExecutionGraphBuilder {
         if tasks.is_empty() {
             return Err(Error::Config("Job assignment contains no tasks".into()));
         }
-        // Window operators are stateful even when a local StreamConfig has no
-        // explicit Job state section. Give that local graph a real backend;
-        // explicit Job state backends still take precedence and all other
-        // stateful operators retain the strict configuration requirement.
+        // Window operators are stateful. The stream compiler copies an
+        // explicit stream-level state contract into the JobSpec; this
+        // fallback remains for programmatic graph users that construct a
+        // pre-validated compatibility plan directly.
         let state_backend = match self.state_backend.clone() {
             Some(backend) => Some(backend),
             None if tasks.iter().any(|task| {
@@ -855,7 +862,16 @@ impl ExecutionGraphBuilder {
                         let transport = std::sync::Arc::new(
                             super::remote::TcpEdgeTransport { addr, max_attempts: 5 },
                         );
-                        let sender = ctx.manager.open_edge_deferred(transport, quad).sender;
+                        let sender = ctx
+                            .manager
+                            .open_edge_deferred_for_job(
+                                transport,
+                                quad,
+                                node.to_owned(),
+                                plan.spec.id.to_string(),
+                                ctx.generation,
+                            )?
+                            .sender;
                         senders.insert((upstream_task_id.clone(), target.clone()), sender);
                         continue;
                     }
@@ -905,7 +921,15 @@ impl ExecutionGraphBuilder {
                             dst_subtask: task.subtask,
                         };
                         let (sender, receiver) = flume::bounded(self.channel_capacity);
-                        ctx.manager.register_inbound(quad, sender);
+                        ctx.manager.register_inbound_for_session(
+                            quad,
+                            sender,
+                            super::remote::PeerExpectation {
+                                source_node: ctx.node_of(&upstream_task.id)?.to_owned(),
+                                job_id: plan.spec.id.to_string(),
+                                generation: ctx.generation,
+                            },
+                        )?;
                         let entry_run = *run_of_task
                             .get(task.id.as_str())
                             .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
@@ -1004,7 +1028,12 @@ impl ExecutionGraphBuilder {
                                 ))
                             })?;
                         config.validate()?;
-                        let namespace = format!("job:{}:task:{}", plan.spec.id, task.id);
+                        let namespace = crate::job::effective_state_namespace(
+                            &plan.spec.id,
+                            plan.spec.state.as_ref(),
+                            &operator.id,
+                            &task.id,
+                        );
                         let event_time_source = event_time_source_for_operator(plan, &operator.id);
                         let late_event_policy = event_time_source
                             .map(|source| source.time.late_event_policy)
@@ -1040,7 +1069,12 @@ impl ExecutionGraphBuilder {
                             Arc::new(super::stateful::StatefulOperator::with_journal(
                                 processor,
                                 shared_journal.clone().expect("state backend checked above"),
-                                format!("job:{}:task:{}", plan.spec.id, task.id),
+                                crate::job::effective_state_namespace(
+                                    &plan.spec.id,
+                                    plan.spec.state.as_ref(),
+                                    &operator.id,
+                                    &task.id,
+                                ),
                                 operator.key_field.clone().ok_or_else(|| {
                                     Error::Config(format!(
                                         "stateful operator '{}' requires key_field",
@@ -1168,7 +1202,10 @@ impl ExecutionGraphBuilder {
                     None
                 },
                 window_late_event_rows,
-                edge_failures: remote.map(|ctx| ctx.manager.failure_receiver()),
+                edge_failures: remote.map(|ctx| {
+                    ctx.manager
+                        .failure_receiver_for_job(plan.spec.id.as_str(), ctx.generation)
+                }),
             });
         }
 

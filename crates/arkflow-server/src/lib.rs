@@ -59,6 +59,15 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     #[serde(default)]
     pub node_token: Option<String>,
+    /// Permit volatile, unauthenticated Hub operation only for an explicitly
+    /// opted-in loopback development server. This is never valid externally.
+    #[serde(default)]
+    pub insecure_local: bool,
+    /// SQLite path used by the standalone Hub. It is intentionally absent by
+    /// default; secure startup rejects that absence instead of silently
+    /// falling back to volatile state.
+    #[serde(default)]
+    pub hub_storage: Option<String>,
     #[serde(default = "default_lease_ttl_ms")]
     pub lease_ttl_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
@@ -81,11 +90,49 @@ impl ServerConfig {
             liveness_path: health.liveness_path.clone(),
             cors_origins: health.cors_origins.clone(),
             node_token: health.node_token.clone(),
+            insecure_local: false,
+            hub_storage: None,
             lease_ttl_ms: health.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: health.agent_session_ttl_ms,
             observability: health.observability.clone(),
         }
+    }
+
+    /// Validate the deployment boundary before any Hub recovery work or
+    /// listener bind.  The returned address is the exact socket address that
+    /// the caller may safely bind.
+    pub fn validate_hub_startup(
+        &self,
+        hub: &hub::Hub,
+    ) -> Result<SocketAddr, std::io::Error> {
+        let address: SocketAddr = self.address.parse().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid Hub bind address '{}': {error}", self.address),
+            )
+        })?;
+        if self.insecure_local && !address.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "insecure_local is only allowed when the Hub binds a loopback address",
+            ));
+        }
+        if !self.insecure_local {
+            if !hub.has_storage() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "secure Hub startup requires durable storage; set ARKFLOW_HUB_STORAGE or enable insecure_local on loopback",
+                ));
+            }
+            if !hub.operator_token_is_set() || !hub.node_token_is_set() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "secure Hub startup requires both operator and node credentials; configure ARKFLOW_OPERATOR_TOKEN and ARKFLOW_NODE_TOKEN",
+                ));
+            }
+        }
+        Ok(address)
     }
 }
 
@@ -100,6 +147,8 @@ impl Default for ServerConfig {
             liveness_path: default_liveness_path(),
             cors_origins: Vec::new(),
             node_token: None,
+            insecure_local: false,
+            hub_storage: None,
             lease_ttl_ms: default_lease_ttl_ms(),
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: default_session_ttl_ms(),
@@ -432,6 +481,7 @@ pub async fn serve_hub(
     if !config.enabled {
         return Ok(());
     }
+    let address = config.validate_hub_startup(&hub)?;
     arkflow_plugin::initialize()?;
     hub.recover_persisted_state().await?;
     if !hub.operator_token_is_set() {
@@ -459,7 +509,6 @@ pub async fn serve_hub(
             "restored persisted operations into the in-memory registry"
         );
     }
-    let address: SocketAddr = config.address.parse()?;
     let listener = TcpListener::bind(address).await?;
     let sweep_hub = hub.clone();
     let sweep_cancel = cancellation.clone();
@@ -3405,6 +3454,7 @@ mod tests {
             hub::Hub::new(hub::HubConfig {
                 operator_token: None,
                 node_token: None,
+                insecure_local: true,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -3580,6 +3630,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
+        let local_hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let local = ServerConfig {
+            address: "127.0.0.1:8080".into(),
+            insecure_local: true,
+            ..ServerConfig::default()
+        };
+        assert!(local.validate_hub_startup(&local_hub).is_ok());
+
+        let mut external_insecure = local.clone();
+        external_insecure.address = "0.0.0.0:8080".into();
+        assert!(external_insecure
+            .validate_hub_startup(&local_hub)
+            .unwrap_err()
+            .to_string()
+            .contains("loopback"));
+
+        let secure = ServerConfig {
+            address: "0.0.0.0:8080".into(),
+            ..ServerConfig::default()
+        };
+        let credentialed_without_storage = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node".into()),
+            insecure_local: false,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        assert!(secure
+            .validate_hub_startup(&credentialed_without_storage)
+            .unwrap_err()
+            .to_string()
+            .contains("durable storage"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = storage::ControlPlaneStore::open(temp.path().join("hub.sqlite")).unwrap();
+        let missing_credentials = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: None,
+                node_token: None,
+                insecure_local: false,
+                lease_ttl_ms: 1_000,
+                poll_interval_ms: 10,
+                session_ttl_ms: default_session_ttl_ms(),
+            },
+            storage::StorageActor::start(store.clone(), 8),
+        );
+        assert!(secure
+            .validate_hub_startup(&missing_credentials)
+            .unwrap_err()
+            .to_string()
+            .contains("credentials"));
+
+        let valid_hub = hub::Hub::with_storage(
+            hub::HubConfig {
+                operator_token: Some("operator".into()),
+                node_token: Some("node".into()),
+                insecure_local: false,
+                lease_ttl_ms: 1_000,
+                poll_interval_ms: 10,
+                session_ttl_ms: default_session_ttl_ms(),
+            },
+            storage::StorageActor::start(store, 8),
+        );
+        assert!(secure.validate_hub_startup(&valid_hub).is_ok());
     }
 
     /// The API-server-disabled process still exposes observability endpoints:
@@ -3898,6 +4024,7 @@ mod tests {
         let hub = hub::Hub::new(hub::HubConfig {
             operator_token: Some("operator".into()),
             node_token: Some("node-secret".into()),
+            insecure_local: false,
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
@@ -3959,6 +4086,7 @@ mod tests {
         let hub = hub::Hub::new(hub::HubConfig {
             operator_token: Some("readonly|viewer|viewer-secret".into()),
             node_token: Some("node-secret".into()),
+            insecure_local: false,
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
@@ -4002,6 +4130,7 @@ mod tests {
         let hub = hub::Hub::new(hub::HubConfig {
             operator_token: Some("operator-secret".into()),
             node_token: None,
+            insecure_local: true,
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
@@ -4082,6 +4211,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator-secret".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4202,6 +4332,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("viewer|viewer|viewer-secret".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4256,6 +4387,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4291,6 +4423,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4502,6 +4635,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4614,6 +4748,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4657,6 +4792,7 @@ mod tests {
             hub::HubConfig {
                 operator_token: Some("operator".into()),
                 node_token: Some("node-secret".into()),
+                insecure_local: false,
                 lease_ttl_ms: 10_000,
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
@@ -4777,6 +4913,7 @@ mod tests {
         let hub = hub::Hub::new(hub::HubConfig {
             operator_token: Some("operator".into()),
             node_token: Some("node-secret".into()),
+            insecure_local: false,
             lease_ttl_ms: 10_000,
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),

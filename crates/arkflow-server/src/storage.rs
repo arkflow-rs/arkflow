@@ -597,6 +597,10 @@ enum StorageCommand {
         node_id: Option<String>,
         response: oneshot::Sender<Result<Vec<PersistedOperation>, StorageError>>,
     },
+    ListJobStartOperations {
+        resource_id: String,
+        response: oneshot::Sender<Result<Vec<PersistedOperation>, StorageError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -922,6 +926,12 @@ impl StorageActor {
                     }
                     StorageCommand::ListOperations { node_id, response } => {
                         let _ = response.send(store.list_operations(node_id.as_deref()));
+                    }
+                    StorageCommand::ListJobStartOperations {
+                        resource_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.list_job_start_operations(&resource_id));
                     }
                 }
             }
@@ -1699,6 +1709,21 @@ impl StorageActor {
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
+
+    pub async fn list_job_start_operations(
+        &self,
+        resource_id: impl Into<String>,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobStartOperations {
+                resource_id: resource_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
 }
 
 impl ControlPlaneStore {
@@ -2211,15 +2236,25 @@ impl ControlPlaneStore {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         self.immediate_transaction(|transaction| {
+            // Keep the newest durable start fact for each Job.  A successful
+            // start can later be rewritten to NodeUnavailable with the
+            // recovery_required failure class when an Agent process is
+            // replaced; both forms are recovery evidence and must survive
+            // operation-history retention.
+            let protected = "operation = 'job_start' AND (state = 'succeeded' OR operation_json LIKE '%\"failure_class\":\"recovery_required\"%') AND NOT EXISTS (SELECT 1 FROM cp_operations newer WHERE newer.resource_id = cp_operations.resource_id AND newer.operation = 'job_start' AND (newer.state = 'succeeded' OR newer.operation_json LIKE '%\"failure_class\":\"recovery_required\"%') AND (newer.updated_at_ms > cp_operations.updated_at_ms OR (newer.updated_at_ms = cp_operations.updated_at_ms AND newer.operation_id > cp_operations.operation_id)))";
             let mut deleted = transaction.execute(
-                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND updated_at_ms < ?1",
+                &format!(
+                    "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND updated_at_ms < ?1 AND NOT ({protected})"
+                ),
                 [older_than_ms],
             )?;
             // Count bound: keep the newest `max_retained` terminal rows when
             // long-lived deployments accumulate faster than the age window
             // reclaims them.
             deleted += transaction.execute(
-                "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND operation_id NOT IN (SELECT operation_id FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT ?1)",
+                &format!(
+                    "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND operation_id NOT IN (SELECT operation_id FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT ?1) AND NOT ({protected})"
+                ),
                 [max_retained],
             )?;
             Ok(deleted)
@@ -3020,6 +3055,30 @@ impl ControlPlaneStore {
                 "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE (?1 IS NULL OR node_id = ?1) ORDER BY created_at_ms DESC, operation_id DESC LIMIT 1024",
             )?;
             let rows = statement.query_map([node_id], |row| {
+                Ok(PersistedOperation {
+                    operation_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    resource_id: row.get(2)?,
+                    operation: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
+                    operation_json: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn list_job_start_operations(
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE resource_id = ?1 AND operation = 'job_start' AND (state = 'succeeded' OR operation_json LIKE '%\"failure_class\":\"recovery_required\"%') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT 4096",
+            )?;
+            let rows = statement.query_map([resource_id], |row| {
                 Ok(PersistedOperation {
                     operation_id: row.get(0)?,
                     node_id: row.get(1)?,
@@ -4155,10 +4214,20 @@ mod tests {
         // A concurrent checkpoint observation moves the pointer without
         // touching the generation.
         let concurrent = store
-            .update_job("orders", None, None, None, None, Some("ckpt-new".into()), None)
+            .update_job(
+                "orders",
+                None,
+                None,
+                None,
+                None,
+                Some("ckpt-new".into()),
+                None,
+            )
             .unwrap();
         assert_eq!(
-            concurrent.as_ref().and_then(|job| job.checkpoint_id.clone()),
+            concurrent
+                .as_ref()
+                .and_then(|job| job.checkpoint_id.clone()),
             Some("ckpt-new".to_string())
         );
 
@@ -5097,5 +5166,39 @@ mod job_storage_tests {
             .unwrap();
         assert_eq!(updated.generation, 4);
         assert_eq!(updated.convergence, "reconciling");
+    }
+
+    #[test]
+    fn operation_pruning_preserves_the_latest_job_start_recovery_fact() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .upsert_operation(PersistedOperation {
+                operation_id: "job-start-1".into(),
+                node_id: "node-a".into(),
+                resource_id: "orders".into(),
+                operation: "job_start".into(),
+                state: "succeeded".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                operation_json: r#"{"operation":"job_start","resource_id":"orders","generation":1,"state":"succeeded"}"#.into(),
+            })
+            .unwrap();
+        store
+            .upsert_operation(PersistedOperation {
+                operation_id: "old-stop".into(),
+                node_id: "node-a".into(),
+                resource_id: "orders".into(),
+                operation: "job_stop".into(),
+                state: "succeeded".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                operation_json: "{}".into(),
+            })
+            .unwrap();
+
+        store.prune_operation_history(100, 0).unwrap();
+        assert!(store.get_operation("job-start-1").unwrap().is_some());
+        assert!(store.get_operation("old-stop").unwrap().is_none());
+        assert_eq!(store.list_job_start_operations("orders").unwrap().len(), 1);
     }
 }

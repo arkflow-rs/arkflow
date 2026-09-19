@@ -524,6 +524,33 @@ pub fn build_config_schema() -> serde_json::Value {
                     }
                 },
                 "buffer": {"$ref": "#/$defs/buffer"},
+                "state": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["backend"],
+                    "properties": {
+                        "backend": {
+                            "type": "string",
+                            "enum": ["embedded_kv", "redb"],
+                            "description": "Keyed-state backend for legacy stream windows."
+                        },
+                        "durability": {
+                            "type": "string",
+                            "enum": ["durable", "ephemeral"],
+                            "default": "durable",
+                            "description": "Whether state must survive process/node replacement."
+                        },
+                        "root": {
+                            "type": "string",
+                            "description": "Stable working-state root; durable state also requires a checkpoint, so use a Job for recovery."
+                        },
+                        "namespace": {"type": "string"},
+                        "ttl_ms": {"type": "integer", "minimum": 0},
+                        "format_version": {"type": "integer", "minimum": 1, "default": 1},
+                        "max_pending_transactions": {"type": "integer", "minimum": 1},
+                        "max_bytes": {"type": "integer", "minimum": 1}
+                    }
+                },
                 "temporary": {
                     "type": "array",
                     "description": "Optional temporary (lookup) components shared by the pipeline.",
@@ -617,6 +644,16 @@ fn job_schema() -> serde_json::Value {
                         "enum": ["embedded_kv", "redb"],
                         "description": "Keyed-state backend (local execution)."
                     },
+                    "durability": {
+                        "type": "string",
+                        "enum": ["durable", "ephemeral"],
+                        "default": "durable",
+                        "description": "Whether state must survive process/node replacement."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Stable working-state root; defaults to ARKFLOW_STATE_ROOT or data/arkflow-state."
+                    },
                     "namespace": {"type": "string"},
                     "ttl_ms": {"type": "integer", "minimum": 0},
                     "format_version": {
@@ -629,6 +666,11 @@ fn job_schema() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Maximum simultaneously staged state-journal transactions (one per open window group or unacknowledged output). Raise it with realistic capacity planning when a window sees very high per-window key cardinality."
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional live-byte budget for the disk-backed keyed-state backend."
                     }
                 }
             },
