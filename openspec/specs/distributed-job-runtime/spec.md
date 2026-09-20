@@ -19,7 +19,7 @@ The runtime SHALL represent a Job as a versioned DAG with stable operator, task,
 
 ### Requirement: Compute nodes SHALL execute fenced task attempts
 
-Compute nodes SHALL execute fenced task attempts: each task attempt is bound to one (job, generation, node), stale generations are rejected, and a task's placement SHALL respect execution topology — colocated placement keeps every connected component on one node (an edge MUST NOT be split), while explicitly enabled split placement MAY place the endpoints of a data edge on different nodes when both nodes advertise the cross-node data plane (side edges — error and late-event routes — and nodes without the data plane keep the co-location constraint). Command dispatch, generation fencing, and per-node assignment filtering are unchanged by the placement strategy.
+Compute nodes SHALL execute fenced task attempts: each task attempt is bound to one (job, generation, node), stale generations are rejected, and a task's placement SHALL respect execution topology — colocated placement keeps every connected component on one node (an edge MUST NOT be split), while explicitly enabled split placement MAY place the endpoints of an ordinary data edge on different nodes when both nodes advertise the cross-node data plane. Side edges — error outputs and late-event routes — MUST remain co-located, and nodes without the data plane keep the co-location constraint. Command dispatch, generation fencing, and per-node assignment filtering are unchanged by the placement strategy.
 
 #### Scenario: colocated placement rejects a split edge
 
@@ -28,8 +28,13 @@ Compute nodes SHALL execute fenced task attempts: each task attempt is bound to 
 
 #### Scenario: split placement executes a cross-node data edge
 
-- **WHEN** split placement places a partitioned data edge's endpoints on two data-plane-capable nodes
+- **WHEN** split placement places an ordinary partitioned data edge's endpoints on two data-plane-capable nodes
 - **THEN** both assignments are accepted and each node's graph contains the remote edge
+
+#### Scenario: split placement rejects a cross-node side edge
+
+- **WHEN** split placement places an error or late-event route endpoint on a different node from its origin
+- **THEN** the assignment is rejected before any task attempt starts
 
 ### Requirement: Job execution SHALL provide bounded backpressure
 The runtime SHALL propagate input, operator, network, and output pressure through the Job DAG and SHALL expose a bounded state when a downstream task cannot make progress.
@@ -43,17 +48,31 @@ The runtime SHALL propagate input, operator, network, and output pressure throug
 - **THEN** processed results accumulate only within a bounded window, the workers stop accepting new deliveries, and the backpressure reaches the source chain instead of growing memory without bound
 
 ### Requirement: Job lifecycle SHALL support recovery operations
-The control plane SHALL support submitting, starting, stopping, restarting, cancelling, and observing Jobs without changing the lifecycle semantics of existing YAML Streams. Recovery SHALL restore source positions and every physical event-time partition watermark from one acknowledged checkpoint cut. When reconciliation re-places a Job onto a node set that excludes a node holding a successful start for the current generation, that stale claim SHALL be superseded and the abandoned node SHALL receive a stop command when it becomes reachable again, so exactly one live runner remains.
+
+The control plane SHALL support submitting, starting, stopping, restarting, cancelling, and observing Jobs without changing the lifecycle semantics of existing YAML Streams. Recovery SHALL restore source positions and every physical event-time partition watermark from one acknowledged checkpoint cut. The distributed Hub SHALL persist the Job lifecycle and recovery pointer before reporting ready, and an externally reachable Hub SHALL require authenticated operator/node access. When reconciliation re-places a Job onto a node set that excludes a node holding a successful start for the current generation, that stale claim SHALL be superseded and the abandoned node SHALL receive a stop command when it becomes reachable again, so exactly one live runner remains.
 
 #### Scenario: Restart a failed Job
+
 - **WHEN** an authorized operator requests a restart for a failed Job
 - **THEN** the Hub creates a new fenced task attempt and the Compute nodes restore or initialize the Job according to its recovery policy
 
+#### Scenario: Hub restarts with durable storage
+
+- **WHEN** the Hub process restarts after Jobs and checkpoint pointers have been persisted
+- **THEN** it restores the lifecycle records before becoming ready and reconciliation resumes from the durable desired state
+
+#### Scenario: External unauthenticated access is attempted
+
+- **WHEN** a caller reaches a non-loopback Hub without valid operator or node credentials
+- **THEN** the Hub rejects the request and does not mutate Jobs, leases, or operations
+
 #### Scenario: Re-placement after a node blip does not duplicate the Job
+
 - **WHEN** a placed node loses reachability, the Job is re-placed onto other nodes, and the original node later returns
 - **THEN** the original node's current-generation start is marked superseded and it receives a stop command instead of being deduped back into the target set
 
 #### Scenario: A stable placement is not disturbed
+
 - **WHEN** every node of the current successful placement remains inside the reconciled target set
 - **THEN** no start operation is superseded and no stop command is dispatched
 

@@ -103,3 +103,68 @@ The docs site SHALL render without page-level horizontal scroll at phone viewpor
 #### Scenario: Documentation quality gates still pass
 - **WHEN** the mobile-compatibility CSS and mermaid config changes are merged
 - **THEN** `pnpm docs:check`, `pnpm docs:build`, the lychee link check, and the Rust docs-validation tests pass with the gates' scripts and data files unchanged
+
+### Requirement: The mobile navigation drawer SHALL be fully usable at phone viewports
+The docs site's mobile navigation drawer (Docusaurus `navbar-sidebar`) SHALL cover the full viewport height when opened at phone widths, with its navigation entries (docs menu, versions, theme toggle, external links) visible and tappable. The navbar surface MUST NOT become the containing block for the fixed-positioned drawer: any paint-affecting property that establishes a containing block for `position: fixed` descendants (e.g. `backdrop-filter`, `filter`, `transform`) MUST be hosted on a layer that is not an ancestor of the drawer (e.g. a navbar pseudo-element). The navbar's rendered glass surface SHALL remain unchanged in both themes at all viewports.
+
+#### Scenario: Drawer opens full height on a phone
+- **WHEN** the hamburger button ("Toggle navigation bar") is tapped on any docs page at a phone viewport (e.g. 360px or 375px width)
+- **THEN** the drawer spans the full viewport height from the top of the page, the close button and the navigation entries (Docs, SQL, API, Blog, version selector, docs sidebar sections) are visible and tappable, and no entry is clipped to the navbar's own height
+
+#### Scenario: Navbar glass surface is unchanged
+- **WHEN** any docs page is viewed at desktop (>996px) or phone width, in light and dark themes
+- **THEN** the top bar renders the same glass surface as before this change — translucent tint over blurred page content with the hairline bottom border — and no element behind or beside the navbar changes appearance
+
+#### Scenario: No-backdrop-filter fallback is unchanged
+- **WHEN** the site is rendered by an engine that does not support `backdrop-filter`
+- **THEN** the navbar falls back to the solid background color exactly as before, and the drawer remains full-height
+
+#### Scenario: Documentation gates still pass
+- **WHEN** the navbar CSS change is merged
+- **THEN** `pnpm docs:check` and `pnpm build` pass in `docs/` with their scripts and data files unchanged
+
+### Requirement: The page canvas SHALL match the active theme at any scroll depth
+The docs site root canvas (`html`) SHALL carry the active theme's background color so that every region of the page not painted by a specific element shows the theme canvas in both light and dark mode, regardless of scroll position, page length, or overscroll. The dark-theme override MUST select the root element itself (e.g. `html[data-theme='dark']` or the `[data-theme='dark']` token block) rather than a descendant selector, because Docusaurus sets `data-theme` on `<html>`. Content elements that paint their own backgrounds (cards, code blocks, bands, footer) MUST remain unchanged.
+
+#### Scenario: Dark canvas below the first viewport on a docs page
+- **WHEN** a user scrolls beyond the first viewport on any docs page in dark mode (e.g. `/docs/get-started/quickstart`)
+- **THEN** the content column, sidebar, and table of contents areas show the dark canvas color (`--ifm-background-color`, `#0b1120`), and text remains light-on-dark and readable
+
+#### Scenario: Dark canvas on the landing page
+- **WHEN** a user scrolls through the landing page's transparent sections (Features, "Where do you want to go") in dark mode
+- **THEN** the section background shows the dark canvas color rather than white, with section headings readable against it
+
+#### Scenario: Overscroll does not flash white
+- **WHEN** a user rubber-band overscrolls at the top or bottom of any page in dark mode
+- **THEN** the exposed canvas area is the dark theme color, not white
+
+#### Scenario: Light mode is unchanged
+- **WHEN** the same pages are viewed in light mode
+- **THEN** the canvas remains the light design (`#ffffff` with the top-anchored radial washes) exactly as before this fix
+
+### Requirement: Reading surfaces SHALL carry finishing wayfinding and interaction affordances
+Doc-page reading surfaces SHALL be finished within the token system: the prev/next pagination renders as brand cards, long doc pages offer a back-to-top affordance that respects the reduced-motion preference, blockquotes carry the quiet brand treatment, untitled code blocks identify their language in the terminal bar, the code-block copy button sits within the terminal bar, and breadcrumbs, heading hash-links, and markdown links use subdued affordance styling. All treatments MUST apply in both light and dark themes and degrade to stock Infima styling when `--af-*` tokens are removed.
+
+#### Scenario: Pagination renders as brand cards
+- **WHEN** a user reaches the bottom of a doc page that has both previous and next pagination links
+- **THEN** both links render as cards with the token surface and radius, a muted sublabel over a semibold label, and a hover state with lift, glow, and border tint in the current theme
+
+#### Scenario: Back-to-top appears after scrolling and respects reduced motion
+- **WHEN** a user scrolls a long docs page past roughly one viewport height
+- **THEN** a back-to-top control appears fixed at the bottom right, scrolls the page to the top when activated, and under `prefers-reduced-motion` performs the jump instantly instead of animating
+
+#### Scenario: Blockquotes carry the quiet brand treatment
+- **WHEN** a docs page renders blockquotes (e.g. the SQL reference function-signature pages)
+- **THEN** each blockquote renders as a rounded band with the gradient accent bar and a subtle background tint in the current theme, visually quieter than an admonition
+
+#### Scenario: Untitled code blocks identify their language
+- **WHEN** a code block without a `title` meta string is rendered
+- **THEN** the terminal bar shows the block's language as a monospace micro-label without colliding with the copy button, and blocks with titles are unchanged
+
+#### Scenario: Reading surfaces carry the typographic and depth foundation
+- **WHEN** any docs page is viewed in either theme
+- **THEN** body text renders in the self-hosted Inter face with antialiased rendering, code blocks/cards/pagination/back-to-top carry the layered shadow tokens, and the announcement bar renders as a quiet deep-navy band
+
+#### Scenario: Documentation quality gates still pass
+- **WHEN** the finishing-affordance styles and the DocRoot swizzle addition are merged
+- **THEN** `pnpm docs:check`, `pnpm typecheck`, `pnpm docs:build`, the lychee link check, and the Rust docs-validation tests pass with the gates' scripts and data files unchanged
