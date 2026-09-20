@@ -84,9 +84,9 @@ input interval, `samples` is close to 100 and min/max/avg reflect the window.
 - **Late readings** matter if sensors retry: window emission and lateness
   handling are described in
   event-time and lateness handling in [streaming jobs](/docs/build/jobs) and the
-  [window buffer references](../../components/1-buffers/tumbling_window.md).
+  [window buffer references](/docs/components/buffers/tumbling_window).
 - Replace `generate` with `mqtt` and keep the rest identical — the source
   produces the same JSON payload shape (see
-  [MQTT input reference](../../components/0-inputs/mqtt.md)).
+  [MQTT input reference](/docs/components/inputs/mqtt)).
 - Point the same aggregate at InfluxDB instead of stdout by switching the
-  output (see [InfluxDB output reference](../../components/3-outputs/influxdb.md)).
+  output (see [InfluxDB output reference](/docs/components/outputs/influxdb)).

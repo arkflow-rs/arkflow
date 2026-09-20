@@ -122,7 +122,7 @@ the shape is:
 | `output` | object | yes | — | Output component (sink). |
 | `error_output` | object | no | — | Output that receives batches a processor failed on. |
 | `buffer` | object | no | — | Buffer / windowing strategy between input and processors. |
-| `durability` | object | no | — | Per-stream WAL durability (see [Delivery semantics](../build/delivery-semantics.md)). |
+| `durability` | object | no | — | Per-stream WAL durability (see [Delivery semantics](/docs/build/delivery-semantics)). |
 | `state` | object | no | — | State contract for legacy windows. Declare `durability: ephemeral` for a non-recoverable window, or use a `jobs` entry with checkpoints for durable state. |
 | `temporary` | array&lt;object&gt; | no | — | Temporary storage tables for joins. |
 
@@ -139,7 +139,7 @@ Each entry in `jobs` is a declarative streaming job: an operator DAG with
 explicit event-time, state, checkpoint, and recovery settings. Jobs run
 locally through the same unified kernel as streams, and the same job shape is
 what the Hub distributes to compute nodes (see
-[Distributed jobs](../build/distributed-jobs.md)).
+[Distributed jobs](/docs/build/distributed-jobs)).
 
 ```yaml validate=full
 jobs:

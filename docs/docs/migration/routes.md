@@ -4,7 +4,7 @@ description: Documentation route migration map.
 
 # Route migration map
 
-The 2026 documentation rebuild moved narrative pages into five audience-facing
+The 2026 documentation rebuild moved narrative pages into six audience-facing
 areas (Get Started, Build, SQL, Operate, Reference, Develop). **Every legacy
 route still resolves** — each old path keeps a compatibility stub page that
 points to the new location, and the route is only removed after the

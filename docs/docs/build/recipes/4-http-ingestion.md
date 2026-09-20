@@ -43,7 +43,7 @@ streams:
 The input listens on `address` and accepts POST requests on `path`; each
 request body (JSON) becomes one message. Basic and Bearer authentication and
 CORS are available — see the
-[HTTP input reference](../../components/0-inputs/http.md).
+[HTTP input reference](/docs/components/inputs/http).
 
 ## Run and verify
 

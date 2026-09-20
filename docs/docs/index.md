@@ -74,7 +74,7 @@ optional control plane for running a fleet.
 |------------|------------|
 | Evaluating ArkFlow | [Quickstart](/docs/get-started/quickstart) → [Architecture](/docs/build/architecture) |
 | Writing a pipeline | [Streams](/docs/build/streams) → [Components](./components/) → [Recipes](./build/recipes/) |
-| Migrating from Kafka Connect / Flink | [Compatibility policy](./reference/compatibility.md) → [Delivery semantics](./build/delivery-semantics.md) |
+| Migrating from Kafka Connect / Flink | [Compatibility policy](./reference/compatibility.md) → [Delivery semantics](/docs/build/delivery-semantics) |
 | Running in production | [Kubernetes](./operate/kubernetes.md) → [Observability](./operate/observability.md) → [Recovery](./operate/recovery.md) |
 | Running a fleet | [Control plane](./operate/control-plane/overview.md) → [Web console](./operate/control-plane/console.md) |
 | Extending the engine | [Writing a plugin](./develop/plugins.md) → [The kernel](./develop/kernel.md) |

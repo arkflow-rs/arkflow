@@ -25,6 +25,6 @@ the built-ins are not enough.
 | [UDFs](./sql/9-udf.md) | Registering and calling user-defined functions. |
 
 A `FROM batch` clause refers to the current Arrow batch flowing through the
-pipeline — see the [SQL processor](./components/2-processors/sql.md) for
+pipeline — see the [SQL processor](/docs/components/processors/sql) for
 configuration and semantics, and the
 [recipes](./build/recipes/1-kafka-to-sql.md) for end-to-end usage.

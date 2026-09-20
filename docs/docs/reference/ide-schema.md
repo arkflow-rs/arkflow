@@ -78,4 +78,4 @@ Point your editor at a locally generated schema instead of the published URL:
 
 The authoritative listing of registered components is the
 [component inventory](./component-inventory.md); each component page
-under [Components](../components/0-inputs/kafka.md) documents behavior in depth.
+under [Components](/docs/components/inputs/kafka) documents behavior in depth.

@@ -31,7 +31,7 @@ On restart the engine:
 
 The result is at-least-once delivery: an outage window is neither skipped nor
 silently dropped — it is replayed. Duplicate handling, when you need
-end-to-end exactly-once, is covered in [exactly-once delivery](../build/exactly-once.md).
+end-to-end exactly-once, is covered in [exactly-once delivery](/docs/build/exactly-once).
 
 Out-of-order and fan-out acknowledgements never skip a gap: if sequence N+1
 acks before N, the durable cursor stays before N until the gap closes.
@@ -114,6 +114,6 @@ design and measured trade-offs.
 
 ## Related pages
 
-- [WAL durability & performance](../build/wal.md) — how the WAL is structured and tuned.
-- [Delivery semantics](../build/delivery-semantics.md) — the guarantee ladder.
+- [WAL durability & performance](/docs/build/wal) — how the WAL is structured and tuned.
+- [Delivery semantics](/docs/build/delivery-semantics) — the guarantee ladder.
 - [HTTP API reference](../reference/api.md) — every recovery route shown above.

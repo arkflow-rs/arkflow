@@ -90,7 +90,7 @@ curl -X POST http://localhost:8080/webhooks \
 
 - `sync: per_entry` instead of `group_commit` trades throughput for a
   narrower loss window (see [WAL optimization](../wal.md)).
-- Swap the SQL processor for [VRL](../../components/2-processors/vrl.md) to
+- Swap the SQL processor for [VRL](/docs/components/processors/vrl) to
   redact fields before forwarding.
 - Exactly-once on the Kafka side is available with transactional output —
   see [exactly-once](../exactly-once.md).

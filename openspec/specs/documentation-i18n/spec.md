@@ -73,3 +73,75 @@ A translated documentation page SHALL keep the same front-matter identity (`id`,
 #### Scenario: A translator edits a YAML example inside a translated page
 - **WHEN** a translated page modifies a YAML code fence relative to its English source
 - **THEN** the change is invalid and must be rejected in review and by the validation gate
+
+### Requirement: The components reference SHALL be translated
+The Simplified Chinese locale SHALL include translations for every page under `docs/docs/components/` (inputs, buffers, processors, outputs, temporary, codecs) and for the `components.md` section index, mirrored at the same relative path under the `zh-Hans` docs tree. Each translated page SHALL satisfy the structural-fidelity contract (front-matter identity, `components:` ownership, byte-identical YAML fences) and the localized-tree linking rules enforced by the `documentation-quality-gates` capability. The localized sidebar SHALL render the components section category labels in Simplified Chinese.
+
+#### Scenario: A Chinese-speaking user reads a component page
+- **WHEN** a visitor opens any `zh-Hans` component page (for example the Kafka input)
+- **THEN** the prose, headings, and configuration-table descriptions render in Simplified Chinese, while configuration field names, type names, and YAML examples are unchanged from the English page
+
+#### Scenario: Component reference coverage is complete
+- **WHEN** the change is implemented
+- **THEN** every Markdown page under `docs/docs/components/` and the `components.md` index have a counterpart at the mirrored path under `docs/i18n/zh-Hans/docusaurus-plugin-content-docs/current/components/`, and `pnpm docs:check` passes
+
+#### Scenario: The localized sidebar labels the components categories
+- **WHEN** a visitor browses the docs sidebar under `zh-Hans`
+- **THEN** the components section categories (inputs, buffers, processors, outputs, temporary, codecs) are labeled in Simplified Chinese
+
+#### Scenario: The localized build succeeds
+- **WHEN** the documentation site is built with both locales
+- **THEN** the build succeeds with the translated component pages included in the `zh-Hans` tree
+
+### Requirement: The builder guides and SQL reference SHALL be translated
+The Simplified Chinese locale SHALL include translations for the `build/` section (including the recipes index and all recipe pages), the `sql/` section and `sql.md` index, the `configuration/` section, the `how-to/` section, the `tutorials/` section, the `cases/` section, and the root pages `streaming-jobs.md` and `build-pipelines.md`, mirrored at the same relative paths under the `zh-Hans` docs tree. Each translated page SHALL satisfy the structural-fidelity contract and the localized-tree linking rules enforced by the `documentation-quality-gates` capability. The localized sidebar SHALL render the Recipes and SQL Reference category labels in Simplified Chinese.
+
+#### Scenario: A Chinese-speaking builder follows a recipe
+- **WHEN** a visitor reads any `zh-Hans` recipe, how-to, tutorial, or case page
+- **THEN** the walkthrough prose renders in Simplified Chinese while YAML examples and configuration identifiers are unchanged from the English page
+
+#### Scenario: A Chinese-speaking developer looks up a SQL function
+- **WHEN** a visitor opens any `zh-Hans` SQL reference page, including the scalar-function reference
+- **THEN** function names, signatures, and SQL keywords are verbatim while descriptions are rendered in Simplified Chinese
+
+#### Scenario: Build-domain coverage is complete
+- **WHEN** the change is implemented
+- **THEN** every page in the listed sections has a counterpart at the mirrored path under the zh-Hans docs tree, and `pnpm docs:check` passes
+
+#### Scenario: English pages linking translated pages use absolute routes
+- **WHEN** an English page file-relative-links to a page that this change translates
+- **THEN** that link uses its absolute `/docs/...` route so the localized build resolves, and `pnpm docs:check` passes
+
+### Requirement: The operations and reference domain SHALL be translated
+The Simplified Chinese locale SHALL include translations for the `operate/` section (including `operate.md`), the `control-plane/` section, the `reference/` section, the `develop/` section, the `deploy/` page, the `migration/` section, the `about/` section, and the root pages `index.md`, `intro.md`, `start-here.md`, and `contribute.md`, mirrored at the same relative paths under the `zh-Hans` docs tree. Each translated page SHALL satisfy the structural-fidelity contract and the localized-tree linking rules enforced by the `documentation-quality-gates` capability. The localized sidebar SHALL render the Operate, Control Plane, Reference, Develop, Migration, and About category labels in Simplified Chinese. With this requirement satisfied, every non-versioned, non-blog documentation page SHALL have a `zh-Hans` counterpart.
+
+#### Scenario: An operator reads the operations pages
+- **WHEN** a visitor opens any `zh-Hans` operate, control-plane, or deploy page
+- **THEN** the prose renders in Simplified Chinese while configuration identifiers, paths, and YAML examples are unchanged from the English page
+
+#### Scenario: A developer reads the extension and API reference pages
+- **WHEN** a visitor opens any `zh-Hans` develop or reference page
+- **THEN** prose renders in Simplified Chinese while code identifiers, signatures, and CLI examples remain verbatim
+
+#### Scenario: Full-site coverage is complete
+- **WHEN** the change is implemented
+- **THEN** every Markdown page under `docs/docs/` outside `versioned_docs/` and blog has a counterpart at the mirrored path under the zh-Hans docs tree, and `pnpm docs:check` passes
+
+#### Scenario: The localized build succeeds with full coverage
+- **WHEN** the documentation site is built with both locales after this change
+- **THEN** the build succeeds and every localized route renders Simplified Chinese content or explicit English fallback for never-translated trees
+
+### Requirement: Translation freshness SHALL be reportable on demand
+The documentation tooling SHALL provide a report command that compares every translated `zh-Hans` page with its English source by the last git commit that touched each file, listing stale-candidate translations (English source committed more recently than its translation) and coverage statistics (translated pages vs total translatable pages, excluding versioned trees and blog posts per policy). The report SHALL be informational only: it SHALL NOT fail regardless of staleness findings, preserving the drift policy that content staleness never fails a gate.
+
+#### Scenario: A maintainer asks which translations lag
+- **WHEN** the report command runs after an English page is edited without updating its translation
+- **THEN** that page's translation is listed as a stale candidate together with coverage statistics, and the command exits 0
+
+#### Scenario: Staleness never fails the build
+- **WHEN** the repository contains any number of stale translations
+- **THEN** the report command, `pnpm docs:check`, and CI all pass; only the report output names the stale candidates
+
+#### Scenario: Never-translated trees are excluded
+- **WHEN** the report computes coverage statistics
+- **THEN** versioned documentation trees and blog posts are excluded from both the numerator and the denominator
