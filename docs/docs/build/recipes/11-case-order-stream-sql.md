@@ -83,6 +83,6 @@ garbage: nothing stops; the record is logged via the error output.
 - Add a [window buffer](./3-windowed-aggregation.md) before the sink
   to batch inserts and cut database round-trips.
 - The same pipeline targets PostgreSQL or SQLite — change only
-  `output_type` (see [SQL output reference](../../components/3-outputs/sql.md)).
+  `output_type` (see [SQL output reference](/docs/components/outputs/sql)).
 - For strict no-duplicate ingestion, use the transactional Kafka
   [exactly-once](../exactly-once.md) output plus an UPSERT sink.

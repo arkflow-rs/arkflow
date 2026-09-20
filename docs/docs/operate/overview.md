@@ -31,6 +31,6 @@ Operating many nodes as a fleet:
 ## Background reading
 
 Before changing throughput or concurrency, read
-[backpressure and ordering](../build/backpressure.md),
-[WAL optimization](../build/wal.md), and
-[delivery semantics](../build/delivery-semantics.md).
+[backpressure and ordering](/docs/build/backpressure),
+[WAL optimization](/docs/build/wal), and
+[delivery semantics](/docs/build/delivery-semantics).

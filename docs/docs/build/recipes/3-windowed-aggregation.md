@@ -87,4 +87,4 @@ window.
   names.
 - SQL joins across sources at window emission time are supported via the
   buffer's `join` configuration — see
-  [tumbling window reference](../../components/1-buffers/tumbling_window.md).
+  [tumbling window reference](/docs/components/buffers/tumbling_window).

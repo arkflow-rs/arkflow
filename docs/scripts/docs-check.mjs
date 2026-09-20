@@ -99,6 +99,7 @@ for (const file of markdown) {
         target.startsWith('http://') ||
         target.startsWith('https://') ||
         target.startsWith('mailto:') ||
+        target.startsWith('pathname:') ||
         target.startsWith('/'))
     ) {
       continue;
@@ -515,6 +516,7 @@ for (const locale of ['zh-Hans']) {
           target.startsWith('http://') ||
           target.startsWith('https://') ||
           target.startsWith('mailto:') ||
+          target.startsWith('pathname:') ||
           target.startsWith('/'))
       ) {
         continue;

@@ -149,7 +149,7 @@ bool_and(expression)
 
 ### `bool_or`
 
-Returns true if all non-null input values are true, otherwise false.
+Returns true if at least one non-null input value is true, otherwise false.
 
 ```sql
 bool_and(expression)
@@ -489,7 +489,7 @@ _Alias of [covar_samp](#covar_samp)._
 
 ### `covar_pop`
 
-Returns the sample covariance of a set of number pairs.
+Returns the population covariance of a set of number pairs.
 
 ```sql
 covar_samp(expression1, expression2)

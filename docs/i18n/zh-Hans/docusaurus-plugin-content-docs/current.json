@@ -16,107 +16,107 @@
     "description": "The label for category 'Data & Durability' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Components": {
-    "message": "Components",
+    "message": "组件",
     "description": "The label for category 'Components' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Inputs": {
-    "message": "Inputs",
+    "message": "输入",
     "description": "The label for category 'Inputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Inputs.link.generated-index.title": {
-    "message": "Inputs",
+    "message": "输入",
     "description": "The generated-index page title for category 'Inputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Inputs.link.generated-index.description": {
-    "message": "Input components are responsible for consuming data from various sources such as Kafka, MQTT, HTTP, and Memory. Each input component has its own configuration options that can be customized according to your needs.",
+    "message": "输入组件负责从 Kafka、MQTT、HTTP、Memory 等各类数据源消费数据。每个输入组件都有各自的配置项,可按需自定义。",
     "description": "The generated-index page description for category 'Inputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Buffers": {
-    "message": "Buffers",
+    "message": "缓冲",
     "description": "The label for category 'Buffers' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Buffers.link.generated-index.title": {
-    "message": "Buffers",
+    "message": "缓冲",
     "description": "The generated-index page title for category 'Buffers' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Buffers.link.generated-index.description": {
-    "message": "A buffer is an optional component type that immediately follows the input layer and can be used as a way to decouple the transaction model from downstream components such as processing layers and outputs. This is considered a high-level component, as most users may not benefit from buffers, but they allow you to group messages using windowing algorithms. ",
+    "message": "缓冲是一种可选的组件类型,紧跟在输入层之后,用于将事务模型与处理层、输出等下游组件解耦。缓冲属于高阶组件,大多数用户可能并不需要;它支持用窗口算法对消息进行分组。",
     "description": "The generated-index page description for category 'Buffers' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Processors": {
-    "message": "Processors",
+    "message": "处理器",
     "description": "The label for category 'Processors' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Processors.link.generated-index.title": {
-    "message": "Processors",
+    "message": "处理器",
     "description": "The generated-index page title for category 'Processors' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Processors.link.generated-index.description": {
-    "message": "A processor is a function applied to messages passed through a pipeline. ",
+    "message": "处理器是作用于流经流水线的消息的函数。",
     "description": "The generated-index page description for category 'Processors' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Outputs": {
-    "message": "Outputs",
+    "message": "输出",
     "description": "The label for category 'Outputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Outputs.link.generated-index.title": {
-    "message": "Outputs",
+    "message": "输出",
     "description": "The generated-index page title for category 'Outputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Outputs.link.generated-index.description": {
-    "message": "The output is the receiving point where we want to send consumed data after applying an optional processor array. ",
+    "message": "输出是数据的接收终点:在经过可选的处理器数组处理后,我们把消费到的数据发送到这里。",
     "description": "The generated-index page description for category 'Outputs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Temporary": {
-    "message": "Temporary",
+    "message": "临时存储",
     "description": "The label for category 'Temporary' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Temporary.link.generated-index.title": {
-    "message": "Temporary",
+    "message": "临时存储",
     "description": "The generated-index page title for category 'Temporary' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Temporary.link.generated-index.description": {
-    "message": "Temporary components provide temporary storage capabilities for data processing pipelines. They can be used to store intermediate results, cache data, or provide lookup tables for SQL queries.",
+    "message": "临时组件为数据处理流水线提供临时存储能力,可用于保存中间结果、缓存数据,或为 SQL 查询提供查找表。",
     "description": "The generated-index page description for category 'Temporary' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Codecs": {
-    "message": "Codecs",
+    "message": "编解码器",
     "description": "The label for category 'Codecs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Codecs.link.generated-index.description": {
-    "message": "Codec components handle serialization/deserialization between byte payloads and columnar Arrow batches at the input/output boundary.",
+    "message": "编解码器组件在输入/输出边界处理字节载荷与列式 Arrow 批次之间的序列化/反序列化。",
     "description": "The generated-index page description for category 'Codecs' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Recipes": {
-    "message": "Recipes",
+    "message": "实战配方",
     "description": "The label for category 'Recipes' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.SQL Reference": {
-    "message": "SQL Reference",
+    "message": "SQL 参考",
     "description": "The label for category 'SQL Reference' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Operate": {
-    "message": "Operate",
+    "message": "运维",
     "description": "The label for category 'Operate' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Control Plane": {
-    "message": "Control Plane",
+    "message": "控制平面",
     "description": "The label for category 'Control Plane' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Reference": {
-    "message": "Reference",
+    "message": "参考",
     "description": "The label for category 'Reference' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Develop": {
-    "message": "Develop",
+    "message": "开发",
     "description": "The label for category 'Develop' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.Migration": {
-    "message": "Migration",
+    "message": "迁移",
     "description": "The label for category 'Migration' in sidebar 'tutorialSidebar'"
   },
   "sidebar.tutorialSidebar.category.About": {
-    "message": "About",
+    "message": "关于",
     "description": "The label for category 'About' in sidebar 'tutorialSidebar'"
   }
 }

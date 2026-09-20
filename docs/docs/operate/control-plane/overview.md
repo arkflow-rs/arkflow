@@ -68,7 +68,7 @@ retries registration and heartbeats with bounded backoff, and surfaces a
 disconnected status locally; its in-flight streams keep running against their
 configured inputs and outputs. The WAL remains at-least-once — restarting a
 stream replays unacknowledged entries according to its configured WAL cursor
-semantics (see [Delivery semantics](../../build/delivery-semantics.md)).
+semantics (see [Delivery semantics](/docs/build/delivery-semantics)).
 
 ## Reconciliation model
 

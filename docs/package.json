@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "docs:check": "node scripts/docs-check.mjs && node scripts/check-readme-parity.mjs && node scripts/generate-component-inventory.mjs --check",
+    "docs:i18n-report": "node scripts/i18n-freshness-report.mjs",
     "components:generate": "node scripts/generate-component-inventory.mjs",
     "components:check": "node scripts/generate-component-inventory.mjs --check",
     "docusaurus": "docusaurus",
