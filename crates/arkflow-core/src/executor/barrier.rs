@@ -7,9 +7,7 @@
 //! data. The [`BarrierCoordinator`] injects barriers on an interval and
 //! completes a checkpoint once every chain reports its snapshot.
 
-use crate::checkpoint::{
-    CheckpointBarrier, CheckpointCoordinator, TaskAttemptSnapshot, TaskCheckpointAck,
-};
+use crate::checkpoint::{CheckpointBarrier, CheckpointCoordinator, TaskCheckpointAck};
 use crate::job::{JobId, JobVersion};
 use crate::state::{StateBackend, StateSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -241,6 +239,11 @@ pub struct ChainSnapshot {
 }
 
 /// Injects barriers on a timer and completes checkpoints from chain reports.
+///
+/// The coordinator's contract ends at "all participants reported": it assembles
+/// the acknowledged cut from chain snapshots and hands the result to callers.
+/// Persisting checkpoint manifests is owned by the Agent/Engine wiring (local
+/// checkpoint loop or hub-driven checkpoint commands), not this type.
 pub struct BarrierCoordinator {
     job_id: JobId,
     job_version: JobVersion,
@@ -342,18 +345,9 @@ impl BarrierCoordinator {
         &self,
         snapshots: &mut BTreeMap<String, ChainSnapshot>,
     ) -> Result<(), crate::Error> {
-        let attempts = snapshots
-            .values()
-            .map(|snapshot| TaskAttemptSnapshot {
-                task_id: snapshot.task_id.clone(),
-                attempt_id: snapshot.attempt_id.clone(),
-                node_id: String::new(),
-            })
-            .collect::<Vec<_>>();
-        let _ = attempts;
-        // Persisting manifests stays with the caller (Agent/Engine wiring);
-        // the coordinator's contract ends at "all participants reported".
-        let _ = self.participants.len();
+        // All participants reported for this barrier round. Persisting the
+        // manifest stays with the caller (Agent/Engine wiring).
+        let _ = snapshots;
         Ok(())
     }
 

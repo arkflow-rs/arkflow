@@ -4270,11 +4270,22 @@ fn task_nodes() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// TCP-path remote tests run the production contract: a manager without
+/// credentials can neither bind a listener nor open an edge.
+fn authenticated_manager(node: &str) -> std::sync::Arc<crate::executor::remote::NetworkManager> {
+    let credentials = crate::executor::remote::DataPlaneCredentials::new(node, "shuffle-secret")
+        .expect("test credentials");
+    let mut config = crate::executor::remote::NetworkManagerConfig::default();
+    config.credentials = Some(credentials);
+    config.registration_grace = Duration::from_millis(100);
+    crate::executor::remote::NetworkManager::with_config(config).expect("valid test config")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_graph_routes_data_across_nodes() {
     let plan = remote_job_plan(true);
-    let manager_a = crate::executor::remote::NetworkManager::new(1024);
-    let manager_b = crate::executor::remote::NetworkManager::new(1024);
+    let manager_a = authenticated_manager("node-a");
+    let manager_b = authenticated_manager("node-b");
     manager_a.spawn();
     manager_b.spawn();
     let port = manager_b
@@ -4383,7 +4394,7 @@ async fn remote_graph_routes_data_across_nodes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_graph_fails_closed_when_downstream_unreachable() {
     let plan = remote_job_plan(false);
-    let manager_a = crate::executor::remote::NetworkManager::new(1024);
+    let manager_a = authenticated_manager("node-a");
     manager_a.spawn();
 
     // Point node B's data plane at a closed port: connect retries exhaust and
@@ -4483,8 +4494,8 @@ fn remote_graph_rejects_incomplete_side_edge_assignment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
     let plan = remote_job_plan(true);
-    let manager_a = crate::executor::remote::NetworkManager::new(64);
-    let manager_b = crate::executor::remote::NetworkManager::new(1024);
+    let manager_a = authenticated_manager("node-a");
+    let manager_b = authenticated_manager("node-b");
     manager_a.spawn();
     manager_b.spawn();
     let port = manager_b
@@ -4560,12 +4571,17 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         dst_op: map_op,
         dst_subtask: dst,
     };
-    let edges = [
-        manager_a.open_edge_deferred(transport(), quad(0, 0)),
-        manager_a.open_edge_deferred(transport(), quad(1, 0)),
-        manager_a.open_edge_deferred(transport(), quad(0, 1)),
-        manager_a.open_edge_deferred(transport(), quad(1, 1)),
-    ];
+    let open_edge = |src: u32, dst: u32| {
+        manager_a.open_edge_deferred_for_session(
+            transport(),
+            quad(src, dst),
+            "node-b".into(),
+            plan.spec.id.to_string(),
+            1,
+        )
+        .expect("authenticated edge")
+    };
+    let edges = [open_edge(0, 0), open_edge(1, 0), open_edge(0, 1), open_edge(1, 1)];
 
     let barrier = |checkpoint: &str| {
         Envelope::Barrier(CheckpointBarrier {
