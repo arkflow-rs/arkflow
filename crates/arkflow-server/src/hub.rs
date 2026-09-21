@@ -1086,14 +1086,6 @@ impl Hub {
             } else {
                 targets
             };
-        // A ranked dispatch actually happened: remember its node order so
-        // later retained re-dispatches reproduce the identical mapping.
-        if operation == "job_start" && job.node_ids.is_empty() && !retention_won {
-            self.placement_order
-                .write()
-                .await
-                .insert(job.job_id.clone(), targets.clone());
-        }
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
         // Build and validate the assignment BEFORE any fencing: a target set
         // that cannot host the placement (a split side edge across nodes, or
@@ -1151,6 +1143,16 @@ impl Hub {
                 "task_nodes": task_nodes,
                 "node_data_ports": node_data_ports,
             }));
+        }
+        // The dispatch order is only real once the target set validated: a
+        // reconcile that fails validation above dispatches nothing, and
+        // recording its (never-dispatched) order here would corrupt the
+        // retention memory for the still-live placement.
+        if operation == "job_start" && job.node_ids.is_empty() && !retention_won {
+            self.placement_order
+                .write()
+                .await
+                .insert(job.job_id.clone(), targets.clone());
         }
         if operation == "job_start" {
             // Auto-placement fencing: when the reconciler re-places a Job
@@ -9774,6 +9776,66 @@ mod session_report_tests {
         ])
     }
 
+    fn shuffle_capabilities() -> Vec<String> {
+        vec![
+            "job_runtime".to_string(),
+            "state_backend".to_string(),
+            "network_shuffle".to_string(),
+        ]
+    }
+
+    /// Reports refresh the node capability list, so shuffle nodes' reports
+    /// must keep advertising it (the shared helper sends none).
+    async fn report_shuffle_node(
+        hub: &Hub,
+        auth: &AgentAuth,
+        used_ratio: f64,
+        cpu: f64,
+        report_seq: u64,
+    ) {
+        hub.report(NodeReport {
+            auth: auth.clone(),
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: shuffle_capabilities(),
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: resource_metrics(used_ratio, cpu),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some("boot".into()),
+            report_seq,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Sorted task ids from the node's pending (or most recent) job_start
+    /// command payload.
+    async fn start_command_tasks(hub: &Hub, auth: &AgentAuth) -> Vec<String> {
+        hub.commands(auth.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("job_start command")
+            .payload
+            .expect("job_start payload")
+            ["assignments"]
+            .as_array()
+            .map(|assignments| {
+                let mut tasks: Vec<String> = assignments
+                    .iter()
+                    .filter_map(|assignment| assignment["task_id"].as_str().map(String::from))
+                    .collect();
+                tasks.sort();
+                tasks
+            })
+            .unwrap_or_default()
+    }
+
     fn rebalance_job_spec_json(id: &str) -> String {
         let mut value: serde_json::Value = serde_json::from_str(&job_spec_json(id)).unwrap();
         value["rebalance"] =
@@ -10411,13 +10473,6 @@ mod session_report_tests {
         let hub = Hub::new(config());
         let mut sessions = BTreeMap::new();
         // Two shuffle-capable nodes place the Job first.
-        fn shuffle_capabilities() -> Vec<String> {
-            vec![
-                "job_runtime".to_string(),
-                "state_backend".to_string(),
-                "network_shuffle".to_string(),
-            ]
-        }
         for node_id in ["node-a", "node-b"] {
             let session = hub
                 .register(RegisterRequest {
@@ -10440,33 +10495,6 @@ mod session_report_tests {
             node_id: "node-b".into(),
             session_token: sessions["node-b"].clone(),
         };
-        // Reports refresh the node capability list, so the shuffle nodes'
-        // reports must keep advertising it (the shared helper sends none).
-        async fn report_shuffle_node(
-            hub: &Hub,
-            auth: &AgentAuth,
-            used_ratio: f64,
-            cpu: f64,
-            report_seq: u64,
-        ) {
-            hub.report(NodeReport {
-                auth: auth.clone(),
-                version: "test".into(),
-                state: "online".into(),
-                capabilities: shuffle_capabilities(),
-                streams: vec![],
-                operations: vec![],
-                events: vec![],
-                metrics: resource_metrics(used_ratio, cpu),
-                jobs: BTreeMap::new(),
-                configuration: None,
-                configuration_version: None,
-                boot_id: Some("boot".into()),
-                report_seq,
-            })
-            .await
-            .unwrap();
-        }
         report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 1).await;
         report_shuffle_node(&hub, &auth_b, 0.2, 10.0, 1).await;
 
@@ -10549,6 +10577,124 @@ mod session_report_tests {
                 .all(|operation_record| operation_record.operation != "job_stop"),
             "no stop command may be dispatched while the target set is invalid"
         );
+    }
+
+    /// A reconcile whose evicted target set fails validation must not
+    /// overwrite the remembered dispatch order: the never-dispatched order
+    /// would corrupt retention for the still-live placement (mapping flip on
+    /// the next real re-dispatch).
+    #[tokio::test]
+    async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        // node-a has the most headroom and must take the head of the ranked
+        // order: the split round-robin maps task 0 (source) onto node-a.
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.3, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        spec["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let first_on_a = start_command_tasks(&hub, &auth_a).await;
+        let first_on_b = start_command_tasks(&hub, &auth_b).await;
+        assert_eq!(first_on_a.len(), 1, "one task per node: {first_on_a:?}");
+        assert_eq!(first_on_b.len(), 1, "one task per node: {first_on_b:?}");
+        assert_ne!(first_on_a, first_on_b);
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+
+        // A plain node joins and trips the eviction into an invalid target
+        // set: the reconcile fails validation (no fencing, no dispatch) —
+        // and must not record that never-dispatched order either.
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-plain".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
+        let job_record = hub
+            .jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.job_id == "orders")
+            .expect("job record");
+        assert!(hub.reconcile_job(&job_record).await.is_err());
+
+        // Pressure subsides; the placement is retained in its original
+        // order, so the version bump re-dispatches the same mapping.
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 4).await;
+        let mut bumped: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        bumped["placement"] = serde_json::json!("split");
+        bumped["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        bumped["version"] = serde_json::json!(2);
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: bumped.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 2,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            start_command_tasks(&hub, &auth_a).await,
+            first_on_a,
+            "the retained order must be the original dispatch order, not the failed tick's"
+        );
+        assert_eq!(start_command_tasks(&hub, &auth_b).await, first_on_b);
     }
 
     #[tokio::test]
