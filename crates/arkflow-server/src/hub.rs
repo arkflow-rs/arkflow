@@ -1095,6 +1095,63 @@ impl Hub {
                 .insert(job.job_id.clone(), targets.clone());
         }
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
+        // Build and validate the assignment BEFORE any fencing: a target set
+        // that cannot host the placement (a split side edge across nodes, or
+        // a target without the shuffle data plane) must fail the reconcile as
+        // a no-op retry — superseding the old placement first would stop the
+        // only live runner and leave the Job down while the invalid set
+        // persists (for example a pressured node's eviction that leaves a
+        // non-shuffle node in the candidate set).
+        let assignments = plan
+            .assignments_for_nodes(&targets, job.generation)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Re-check the complete task→node map at the dispatch boundary.  The
+        // planner already validates it, but keeping this guard here prevents a
+        // future assignment source or persistence replay from bypassing the
+        // side-edge co-location contract.
+        plan.validate_side_edge_assignments(&assignments)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Split placement: validate that every target node runs the data
+        // plane, then attach the full task→node map and peer data addresses
+        // so each node's graph build can wire its remote edges without any
+        // further lookup.
+        let mut split_payload = None;
+        if spec.placement == arkflow_core::job::PlacementStrategy::Split {
+            let nodes = self.nodes.read().await;
+            let mut node_data_ports = BTreeMap::new();
+            for node_id in &targets {
+                let Some(record) = nodes.get(node_id) else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement target node '{node_id}' is not registered"
+                    )));
+                };
+                if !record
+                    .resource
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "network_shuffle")
+                {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' with the network_shuffle capability"
+                    )));
+                }
+                let Some(address) = &record.resource.data_address else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' to advertise a data address"
+                    )));
+                };
+                node_data_ports.insert(node_id.clone(), address.clone());
+            }
+            drop(nodes);
+            let mut task_nodes = BTreeMap::new();
+            for assignment in &assignments {
+                task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
+            }
+            split_payload = Some(serde_json::json!({
+                "task_nodes": task_nodes,
+                "node_data_ports": node_data_ports,
+            }));
+        }
         if operation == "job_start" {
             // Auto-placement fencing: when the reconciler re-places a Job
             // (its previous placement lost its lease or was partitioned), the
@@ -1189,56 +1246,6 @@ impl Hub {
                     .await?;
                 }
             }
-        }
-        let assignments = plan
-            .assignments_for_nodes(&targets, job.generation)
-            .map_err(|error| HubError::Invalid(error.to_string()))?;
-        // Re-check the complete task→node map at the dispatch boundary.  The
-        // planner already validates it, but keeping this guard here prevents a
-        // future assignment source or persistence replay from bypassing the
-        // side-edge co-location contract.
-        plan.validate_side_edge_assignments(&assignments)
-            .map_err(|error| HubError::Invalid(error.to_string()))?;
-        // Split placement: validate that every target node runs the data
-        // plane, then attach the full task→node map and peer data addresses
-        // so each node's graph build can wire its remote edges without any
-        // further lookup.
-        let mut split_payload = None;
-        if spec.placement == arkflow_core::job::PlacementStrategy::Split {
-            let nodes = self.nodes.read().await;
-            let mut node_data_ports = BTreeMap::new();
-            for node_id in &targets {
-                let Some(record) = nodes.get(node_id) else {
-                    return Err(HubError::Invalid(format!(
-                        "split placement target node '{node_id}' is not registered"
-                    )));
-                };
-                if !record
-                    .resource
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "network_shuffle")
-                {
-                    return Err(HubError::Invalid(format!(
-                        "split placement requires node '{node_id}' with the network_shuffle capability"
-                    )));
-                }
-                let Some(address) = &record.resource.data_address else {
-                    return Err(HubError::Invalid(format!(
-                        "split placement requires node '{node_id}' to advertise a data address"
-                    )));
-                };
-                node_data_ports.insert(node_id.clone(), address.clone());
-            }
-            drop(nodes);
-            let mut task_nodes = BTreeMap::new();
-            for assignment in &assignments {
-                task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
-            }
-            split_payload = Some(serde_json::json!({
-                "task_nodes": task_nodes,
-                "node_data_ports": node_data_ports,
-            }));
         }
         let explicit_recovery_id = job.checkpoint_id.clone();
         let mut recovery_candidates = self
@@ -10392,6 +10399,155 @@ mod session_report_tests {
         assert_eq!(
             component_tasks(&hub, &auth_a).await.expect("node-a re-dispatch"),
             first_on_a
+        );
+    }
+
+    /// Eviction must not stop the live placement when the remaining target
+    /// set cannot host it: split validation runs BEFORE any fencing, so an
+    /// incapable survivor node turns the eviction into a no-op retry instead
+    /// of an outage.
+    #[tokio::test]
+    async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        // Two shuffle-capable nodes place the Job first.
+        fn shuffle_capabilities() -> Vec<String> {
+            vec![
+                "job_runtime".to_string(),
+                "state_backend".to_string(),
+                "network_shuffle".to_string(),
+            ]
+        }
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        // Reports refresh the node capability list, so the shuffle nodes'
+        // reports must keep advertising it (the shared helper sends none).
+        async fn report_shuffle_node(
+            hub: &Hub,
+            auth: &AgentAuth,
+            used_ratio: f64,
+            cpu: f64,
+            report_seq: u64,
+        ) {
+            hub.report(NodeReport {
+                auth: auth.clone(),
+                version: "test".into(),
+                state: "online".into(),
+                capabilities: shuffle_capabilities(),
+                streams: vec![],
+                operations: vec![],
+                events: vec![],
+                metrics: resource_metrics(used_ratio, cpu),
+                jobs: BTreeMap::new(),
+                configuration: None,
+                configuration_version: None,
+                boot_id: Some("boot".into()),
+                report_seq,
+            })
+            .await
+            .unwrap();
+        }
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.2, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        spec["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+        assert_eq!(
+            start_operations(&hub, "orders")
+                .await
+                .into_iter()
+                .filter(|operation_record| operation_record.state == HubOperationState::Succeeded)
+                .count(),
+            2,
+            "both shuffle nodes hold a succeeded start"
+        );
+
+        // A plain node without the data plane joins the fleet.
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-plain".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+
+        // Sustained pressure on node-a trips the eviction, but the surviving
+        // candidate set contains the incapable node: the reconcile must fail
+        // validation BEFORE fencing, leaving the live placement untouched.
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
+        let job_record = hub
+            .jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.job_id == "orders")
+            .expect("job record");
+        let error = hub.reconcile_job(&job_record).await.unwrap_err();
+        assert!(
+            matches!(error, HubError::Invalid(_)),
+            "validation must fail the reconcile: {error}"
+        );
+        // Fleet-level reconcile swallows the invalid placement as a skipped
+        // tick (pre-existing semantics) — the live placement stays untouched.
+        hub.reconcile_jobs().await.unwrap();
+
+        let starts = start_operations(&hub, "orders").await;
+        assert!(
+            starts
+                .iter()
+                .all(|operation_record| operation_record.state == HubOperationState::Succeeded),
+            "no start may be superseded while the target set is invalid: {starts:?}"
+        );
+        assert!(
+            hub.operations(None)
+                .await
+                .iter()
+                .all(|operation_record| operation_record.operation != "job_stop"),
+            "no stop command may be dispatched while the target set is invalid"
         );
     }
 
