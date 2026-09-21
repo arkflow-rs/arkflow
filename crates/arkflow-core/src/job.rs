@@ -402,8 +402,8 @@ pub struct JobSpec {
     /// co-location contract.
     #[serde(default)]
     pub placement: PlacementStrategy,
-    /// Opt-in pressure rebalance. `None` behaves exactly like `off`.
-    #[serde(default)]
+    /// Opt-in pressure rebalance. `None` (and a missing field) behaves
+    /// exactly like `off`.
     pub rebalance: Option<RebalancePolicy>,
 }
 

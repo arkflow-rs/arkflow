@@ -216,6 +216,55 @@ otherwise placement fails closed with no partial dispatch. Deployments that
 never set these fields keep the colocated behavior unchanged — no extra
 listener, no capability, byte-identical placement.
 
+#### Resource-aware placement and rebalancing
+
+When a Job does not pin its target nodes with `node_ids`, the Hub ranks the
+eligible nodes by resource headroom before every placement: freshest agent
+gauges first (most memory available, then most CPU headroom, then node id),
+and nodes that have not reported gauges last in node-id order. The ordered
+set feeds the same deterministic round-robin as before, and a retained
+placement always re-dispatches in its original order, so a Job's
+task→node mapping never drifts between dispatches.
+
+By default a placement is never moved after it succeeds. Jobs that opt in
+with a `rebalance` policy may be relocated when their placed node sustains
+pressure (memory used or CPU above the thresholds across consecutive agent
+reports) and the per-Job cooldown has elapsed: the move goes through the
+same fenced re-placement as a node blip — the abandoned node's start is
+superseded, it receives a stop command, and exactly one runner remains on
+the best-ranked remaining nodes. Relocation restores from the latest
+checkpoint, exactly like any other re-placement; a pinned `node_ids` set
+cannot be combined with `rebalance: auto`.
+
+```yaml validate=full
+streams: []
+jobs:
+  - id: rebalanced-orders
+    version: 1
+    placement: split
+    rebalance:
+      mode: auto            # off (default) | auto
+      pressure_streak: 3    # consecutive pressuring reports before a move
+      cooldown_ms: 300000   # minimum delay between relocations
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: source-sink
+        from: source
+        to: sink
+    sources:
+      - operator_id: source
+        input_type: memory
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: drop
+```
+
 ### Failure and readiness semantics
 
 Every validation entry point (`--validate`, the configuration API, local Jobs

@@ -378,6 +378,13 @@ pub struct Hub {
     jobs: Arc<RwLock<BTreeMap<String, JobRecord>>>,
     job_versions: Arc<RwLock<BTreeMap<String, Vec<JobVersionRecord>>>>,
     job_checkpoints: Arc<RwLock<BTreeMap<String, Vec<JobCheckpointRecord>>>>,
+    /// The node order each Job's placement was actually dispatched in, so a
+    /// retained placement re-dispatches with the identical task→node mapping
+    /// (split round-robin and multi-component co-location are order
+    /// sensitive). In-memory by design: after a Hub restart the order falls
+    /// back to node-id order until the next ranked placement, which is a
+    /// legal re-placement (state restores per task attempt).
+    placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     command_metrics: Arc<CommandMetrics>,
 }
 
@@ -531,6 +538,7 @@ impl Hub {
             jobs: Arc::new(RwLock::new(BTreeMap::new())),
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
+            placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
         }
     }
@@ -742,6 +750,35 @@ impl Hub {
 
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
+    /// The retained placement set, in the order its placement was actually
+    /// dispatched in (remembered at ranked-dispatch time), so a retained
+    /// re-dispatch reproduces the identical task→node mapping. Nodes the
+    /// memory does not know (e.g. after a Hub restart) are appended in id
+    /// order.
+    async fn retained_targets_in_dispatch_order(
+        &self,
+        job_id: &str,
+        set: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let remembered = self
+            .placement_order
+            .read()
+            .await
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut ordered: Vec<String> = remembered
+            .into_iter()
+            .filter(|node_id| set.contains(node_id))
+            .collect();
+        for node_id in set {
+            if !ordered.contains(node_id) {
+                ordered.push(node_id.clone());
+            }
+        }
+        ordered
+    }
+
     /// Nodes in `targets` whose sustained-pressure streak trips the Job's
     /// opt-in rebalance policy, subject to its cooldown and rollout
     /// ownership. Empty unless rebalancing may proceed this tick; the caller
@@ -944,7 +981,8 @@ impl Hub {
         // Resource-aware ordering for unpinned placements: highest headroom
         // first, so a colocated Job lands on the freshest node and split
         // round-robin spreads from the best-ranked set. Pinned node_ids pass
-        // through verbatim.
+        // through verbatim. The dispatched order is remembered further below
+        // (only when this ranked order actually drives the dispatch).
         let mut targets = targets;
         if job.node_ids.is_empty() {
             let nodes = self.nodes.read().await;
@@ -1014,14 +1052,17 @@ impl Hub {
                 break;
             }
         }
-        let targets =
-            if operation == "job_start"
-                && job.node_ids.is_empty()
-                && previous_nodes_all_online
-                && evictions.is_empty()
-            {
-                previous_nodes.iter().cloned().collect::<Vec<_>>()
-            } else if operation == "job_stop" {
+        let retention_won =
+            operation == "job_start" && job.node_ids.is_empty() && previous_nodes_all_online
+                && evictions.is_empty();
+        let targets = if retention_won {
+            // Re-dispatch in the placement's original node order: split
+            // round-robin and multi-component co-location are order
+            // sensitive, and the mapping for a retained placement must not
+            // drift between dispatches.
+            self.retained_targets_in_dispatch_order(&job.job_id, &previous_nodes)
+                .await
+        } else if operation == "job_stop" {
                 // A stopped Job must reach every node that may still host an
                 // older generation. Such a node is not necessarily part of
                 // the current explicit placement (for example after a move
@@ -1045,6 +1086,14 @@ impl Hub {
             } else {
                 targets
             };
+        // A ranked dispatch actually happened: remember its node order so
+        // later retained re-dispatches reproduce the identical mapping.
+        if operation == "job_start" && job.node_ids.is_empty() && !retention_won {
+            self.placement_order
+                .write()
+                .await
+                .insert(job.job_id.clone(), targets.clone());
+        }
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
         if operation == "job_start" {
             // Auto-placement fencing: when the reconciler re-places a Job
@@ -2556,6 +2605,9 @@ impl Hub {
                 boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
                 last_report_at_ms: 0,
+                // Pressure history is deliberately not carried across
+                // registrations: a reconnecting node re-earns its streak
+                // within a few report intervals (bounded rebalance delay).
                 pressure_streak: 0,
                 // Commands queued for an old process belong to a runtime that
                 // no longer exists. Reconciliation below will enqueue the
@@ -10196,6 +10248,151 @@ mod session_report_tests {
             .await
             .iter()
             .all(|operation_record| operation_record.operation != "job_stop"));
+    }
+
+    /// Multi-component co-location is order sensitive: the component the
+    /// ranked order put on the head node must still be there when the
+    /// retained placement re-dispatches (e.g. after a version bump), instead
+    /// of drifting with BTreeSet iteration order.
+    #[tokio::test]
+    async fn retained_replacement_reproduces_the_dispatch_order() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let session_b = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-b".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: session_b.session_token.clone(),
+        };
+        // node-b reports more headroom and must win the head of the ranked
+        // order despite sorting after node-a by id.
+        report_resources(&hub, &auth_a, 0.9, 10.0, 1).await;
+        report_resources(&hub, &auth_b, 0.1, 10.0, 1).await;
+
+        let two_component_spec = |version: u64| {
+            serde_json::json!({
+                "id": "orders",
+                "version": version,
+                "placement": "colocated",
+                "operators": [
+                    {"id": "source-a", "kind": "source"},
+                    {"id": "sink-a", "kind": "sink"},
+                    {"id": "source-b", "kind": "source"},
+                    {"id": "sink-b", "kind": "sink"}
+                ],
+                "edges": [
+                    {"id": "e-a", "from": "source-a", "to": "sink-a"},
+                    {"id": "e-b", "from": "source-b", "to": "sink-b"}
+                ],
+                "sources": [
+                    {"operator_id": "source-a", "input_type": "memory", "time": {"mode": "processing_time"}},
+                    {"operator_id": "source-b", "input_type": "memory", "time": {"mode": "processing_time"}}
+                ],
+                "sinks": [
+                    {"operator_id": "sink-a", "output_type": "drop"},
+                    {"operator_id": "sink-b", "output_type": "drop"}
+                ]
+            })
+            .to_string()
+        };
+        async fn component_tasks(hub: &Hub, auth: &AgentAuth) -> Option<Vec<String>> {
+            hub.commands(auth.clone())
+                .await
+                .ok()?
+                .into_iter()
+                .find(|command| command.operation == "job_start")?
+                .payload
+                .map(|payload| {
+                    payload["assignments"]
+                        .as_array()
+                        .map(|assignments| {
+                            let mut tasks: Vec<String> = assignments
+                                .iter()
+                                .filter_map(|assignment| {
+                                    assignment["task_id"].as_str().map(String::from)
+                                })
+                                .collect();
+                            tasks.sort();
+                            tasks
+                        })
+                        .unwrap_or_default()
+                })
+        }
+
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: two_component_spec(1),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let first_on_b = component_tasks(&hub, &auth_b).await.expect("node-b start command");
+        let first_on_a = component_tasks(&hub, &auth_a).await.expect("node-a start command");
+        assert!(!first_on_b.is_empty() && !first_on_a.is_empty());
+        assert!(
+            first_on_b.iter().all(|task| !first_on_a.contains(task)),
+            "components must be split across the two nodes"
+        );
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        complete_start_commands(&hub, "node-b", &session_b.session_token).await;
+
+        // Version bump: same node set, same healthy state — the retained
+        // placement must re-dispatch with the identical component mapping.
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: two_component_spec(2),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 2,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            component_tasks(&hub, &auth_b).await.expect("node-b re-dispatch"),
+            first_on_b,
+            "the head node must keep its components across re-dispatches"
+        );
+        assert_eq!(
+            component_tasks(&hub, &auth_a).await.expect("node-a re-dispatch"),
+            first_on_a
+        );
     }
 
     #[tokio::test]
