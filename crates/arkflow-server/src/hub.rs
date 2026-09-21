@@ -1656,10 +1656,18 @@ impl Hub {
                 })
                 .map(|operation| operation.node_id.clone())
                 .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
         } else {
-            job.node_ids.clone()
+            job.node_ids.clone().into_iter().collect::<BTreeSet<_>>()
+        };
+        // Order the checkpoint targets in the placement's dispatch order so
+        // the re-derived split round-robin produces the same task→node
+        // mapping as the live placement (the command payload carries the
+        // assignments; Agents ignore them today, but they must not lie).
+        let candidates = if job.node_ids.is_empty() {
+            self.retained_targets_in_dispatch_order(&job.job_id, &candidates)
+                .await
+        } else {
+            candidates.into_iter().collect()
         };
         let nodes = self.nodes.read().await;
         let targets = candidates
@@ -10387,29 +10395,6 @@ mod session_report_tests {
             })
             .to_string()
         };
-        async fn component_tasks(hub: &Hub, auth: &AgentAuth) -> Option<Vec<String>> {
-            hub.commands(auth.clone())
-                .await
-                .ok()?
-                .into_iter()
-                .find(|command| command.operation == "job_start")?
-                .payload
-                .map(|payload| {
-                    payload["assignments"]
-                        .as_array()
-                        .map(|assignments| {
-                            let mut tasks: Vec<String> = assignments
-                                .iter()
-                                .filter_map(|assignment| {
-                                    assignment["task_id"].as_str().map(String::from)
-                                })
-                                .collect();
-                            tasks.sort();
-                            tasks
-                        })
-                        .unwrap_or_default()
-                })
-        }
 
         hub.upsert_job(JobRecord {
             job_id: "orders".into(),
@@ -10426,8 +10411,8 @@ mod session_report_tests {
         })
         .await
         .unwrap();
-        let first_on_b = component_tasks(&hub, &auth_b).await.expect("node-b start command");
-        let first_on_a = component_tasks(&hub, &auth_a).await.expect("node-a start command");
+        let first_on_b = start_command_tasks(&hub, &auth_b).await;
+        let first_on_a = start_command_tasks(&hub, &auth_a).await;
         assert!(!first_on_b.is_empty() && !first_on_a.is_empty());
         assert!(
             first_on_b.iter().all(|task| !first_on_a.contains(task)),
@@ -10454,12 +10439,12 @@ mod session_report_tests {
         .await
         .unwrap();
         assert_eq!(
-            component_tasks(&hub, &auth_b).await.expect("node-b re-dispatch"),
+            start_command_tasks(&hub, &auth_b).await,
             first_on_b,
             "the head node must keep its components across re-dispatches"
         );
         assert_eq!(
-            component_tasks(&hub, &auth_a).await.expect("node-a re-dispatch"),
+            start_command_tasks(&hub, &auth_a).await,
             first_on_a
         );
     }
@@ -10695,6 +10680,108 @@ mod session_report_tests {
             "the retained order must be the original dispatch order, not the failed tick's"
         );
         assert_eq!(start_command_tasks(&hub, &auth_b).await, first_on_b);
+    }
+
+    /// The checkpoint command payload re-derives split assignments; they
+    /// must match the live placement's dispatch order (Agents ignore the
+    /// payload assignments today, but they must not lie).
+    #[tokio::test]
+    async fn checkpoint_payload_assignments_match_the_live_mapping() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        // node-b has the headroom lead: the ranked dispatch order is
+        // [node-b, node-a], the opposite of id order.
+        report_shuffle_node(&hub, &auth_a, 0.3, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.1, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let start_on_a = start_command_tasks(&hub, &auth_a).await;
+        let start_on_b = start_command_tasks(&hub, &auth_b).await;
+        assert_eq!(start_on_a.len(), 1);
+        assert_eq!(start_on_b.len(), 1);
+        assert_ne!(start_on_a, start_on_b, "ranked order [b, a] must swap the mapping");
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+
+        hub.record_job_checkpoint(JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 1,
+            checkpoint_id: "checkpoint-1".into(),
+            kind: "checkpoint".into(),
+            status: "completed".into(),
+            manifest_uri: None,
+            format_version: 1,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        })
+        .await
+        .unwrap();
+        for (auth, start_tasks) in [(&auth_a, &start_on_a), (&auth_b, &start_on_b)] {
+            let checkpoint_tasks = hub
+                .commands(auth.clone())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|command| command.operation == "job_checkpoint")
+                .expect("checkpoint command")
+                .payload
+                .expect("checkpoint payload")["assignments"]
+                .as_array()
+                .map(|assignments| {
+                    let mut tasks: Vec<String> = assignments
+                        .iter()
+                        .filter_map(|assignment| {
+                            assignment["task_id"].as_str().map(String::from)
+                        })
+                        .collect();
+                    tasks.sort();
+                    tasks
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                &checkpoint_tasks, start_tasks,
+                "checkpoint assignments must match the live dispatch mapping"
+            );
+        }
     }
 
     #[tokio::test]
