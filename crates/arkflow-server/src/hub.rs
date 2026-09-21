@@ -2484,47 +2484,9 @@ impl Hub {
             },
         );
         drop(nodes);
-        // A fresh Agent process starts with an empty local JobRuntime. Mark
-        // every previous start attempt for this node unavailable before
-        // reconciliation, otherwise a persisted successful operation would
-        // suppress the new start command even though no local Job exists.
-        let invalidated_job_starts = if boot_changed {
-            let mut operations = self.operations.write().await;
-            operations
-                .values_mut()
-                .filter(|operation| {
-                    operation.node_id == request.node_id
-                        && operation.operation == "job_start"
-                        && !matches!(
-                            operation.state,
-                            HubOperationState::Failed
-                                | HubOperationState::TimedOut
-                                | HubOperationState::NodeUnavailable
-                                | HubOperationState::Cancelled
-                                | HubOperationState::Superseded
-                        )
-                })
-                .map(|operation| {
-                    let was_succeeded = operation.state == HubOperationState::Succeeded;
-                    operation.state = HubOperationState::NodeUnavailable;
-                    operation.finished_at_ms = Some(now);
-                    if was_succeeded {
-                        operation.failure_class = Some("recovery_required".into());
-                        operation.error = Some(
-                            "previous successful Job start invalidated by a new Agent process boot"
-                                .into(),
-                        );
-                    } else {
-                        operation.error = Some(
-                            "in-flight Job start invalidated by a new Agent process boot".into(),
-                        );
-                    }
-                    operation.clone()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let invalidated_job_starts = self
+            .invalidate_job_starts_on_boot_change(&request.node_id, boot_changed, now)
+            .await;
         if let Some(storage) = self.storage.as_ref() {
             storage
                 .upsert_node(NodeMutation {
@@ -2619,6 +2581,54 @@ impl Hub {
         Ok(())
     }
 
+    /// A fresh Agent process starts with an empty local JobRuntime. Mark every
+    /// previous start attempt for this node unavailable before reconciliation,
+    /// otherwise a persisted successful operation would suppress the new start
+    /// command even though no local Job exists. Shared by registration and
+    /// report so the invalidation semantics cannot drift between them.
+    async fn invalidate_job_starts_on_boot_change(
+        &self,
+        node_id: &str,
+        boot_changed: bool,
+        now: u64,
+    ) -> Vec<HubOperation> {
+        if !boot_changed {
+            return Vec::new();
+        }
+        let mut operations = self.operations.write().await;
+        operations
+            .values_mut()
+            .filter(|operation| {
+                operation.node_id == node_id
+                    && operation.operation == "job_start"
+                    && !matches!(
+                        operation.state,
+                        HubOperationState::Failed
+                            | HubOperationState::TimedOut
+                            | HubOperationState::NodeUnavailable
+                            | HubOperationState::Cancelled
+                            | HubOperationState::Superseded
+                    )
+            })
+            .map(|operation| {
+                let was_succeeded = operation.state == HubOperationState::Succeeded;
+                operation.state = HubOperationState::NodeUnavailable;
+                operation.finished_at_ms = Some(now);
+                if was_succeeded {
+                    operation.failure_class = Some("recovery_required".into());
+                    operation.error = Some(
+                        "previous successful Job start invalidated by a new Agent process boot"
+                            .into(),
+                    );
+                } else {
+                    operation.error =
+                        Some("in-flight Job start invalidated by a new Agent process boot".into());
+                }
+                operation.clone()
+            })
+            .collect()
+    }
+
     pub async fn report(&self, report: NodeReport) -> Result<(), HubError> {
         let reported_streams = report.streams.clone();
         let reported_configuration = report.configuration.clone();
@@ -2684,43 +2694,9 @@ impl Hub {
         let persisted_report_seq = Some(node.report_seq);
         let persisted_lease = node.resource.lease_expires_at_ms;
         drop(nodes);
-        let invalidated_job_starts = if boot_changed {
-            let mut operations = self.operations.write().await;
-            operations
-                .values_mut()
-                .filter(|operation| {
-                    operation.node_id == report.auth.node_id
-                        && operation.operation == "job_start"
-                        && !matches!(
-                            operation.state,
-                            HubOperationState::Failed
-                                | HubOperationState::TimedOut
-                                | HubOperationState::NodeUnavailable
-                                | HubOperationState::Cancelled
-                                | HubOperationState::Superseded
-                        )
-                })
-                .map(|operation| {
-                    let was_succeeded = operation.state == HubOperationState::Succeeded;
-                    operation.state = HubOperationState::NodeUnavailable;
-                    operation.finished_at_ms = Some(now);
-                    if was_succeeded {
-                        operation.failure_class = Some("recovery_required".into());
-                        operation.error = Some(
-                            "previous successful Job start invalidated by a new Agent process boot"
-                                .into(),
-                        );
-                    } else {
-                        operation.error = Some(
-                            "in-flight Job start invalidated by a new Agent process boot".into(),
-                        );
-                    }
-                    operation.clone()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let invalidated_job_starts = self
+            .invalidate_job_starts_on_boot_change(&report.auth.node_id, boot_changed, now)
+            .await;
         if let Some(storage) = self.storage.as_ref() {
             for operation in &invalidated_job_starts {
                 persist_operation(storage, operation)

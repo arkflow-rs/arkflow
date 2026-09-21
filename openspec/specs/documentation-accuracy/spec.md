@@ -75,9 +75,9 @@ downstream idempotency — and SHALL state that L3 true end-to-end EOS
   `openspec/specs/exactly-once-output/spec.md`
 
 ### Requirement: Component inventory parity across landing docs
-For the primary configurable categories (inputs, processors, outputs, and
-buffers), `README.md` and `README_zh.md` SHALL enumerate the same set of
-components, and that set SHALL equal the components registered in the engine
+`README.md` and `README_zh.md` SHALL enumerate the same set of components for
+the primary configurable categories (inputs, processors, outputs, and
+buffers), and that set SHALL equal the components registered in the engine
 (as surfaced by the generated component inventory) for those categories. The
 SQL input SHALL be named consistently ("SQL") across both documents.
 `docs/docs/intro.md` is a compatibility route: it SHALL link to the generated

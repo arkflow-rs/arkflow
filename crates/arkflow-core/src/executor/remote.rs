@@ -1494,6 +1494,13 @@ impl NetworkManager {
     /// Binds the TCP data-plane listener and feeds accepted connections into
     /// the serve loop. Returns the bound port (for registry advertisement).
     pub async fn bind_tcp(self: &Arc<Self>, addr: std::net::SocketAddr) -> Result<u16, Error> {
+        if self.config.credentials.is_none() {
+            // Serving without credentials would skip the session handshake for
+            // every inbound connection; refuse the bind instead.
+            return Err(Error::Config(
+                "refusing to bind the data-plane listener without credentials".into(),
+            ));
+        }
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|error| Error::Process(format!("data plane bind failed: {error}")))?;
@@ -1527,6 +1534,11 @@ impl NetworkManager {
     /// Opens the upstream side of a remote edge: connects, spawns the outbound
     /// pump and receipt read loop, and returns the edge channel sender to drop
     /// into `EdgeTarget` channel vectors.
+    ///
+    /// Test-only: bypasses the authenticated session handshake. Production
+    /// code opens edges through [`Self::open_edge_for_session`] or
+    /// [`Self::open_edge_deferred_for_session`].
+    #[cfg(test)]
     pub async fn open_edge(
         self: &Arc<Self>,
         transport: &dyn EdgeTransport,
@@ -1551,7 +1563,9 @@ impl NetworkManager {
         Ok(self.open_edge_with_auth(stream, quad, Some(auth)))
     }
 
-    /// Like [`Self::open_edge`] but over a caller-provided stream (tests).
+    /// Like [`Self::open_edge`] but over a caller-provided stream (tests,
+    /// without the session handshake).
+    #[cfg(test)]
     pub fn open_edge_with_stream(
         self: &Arc<Self>,
         stream: Box<dyn RemoteStream>,
@@ -1598,6 +1612,10 @@ impl NetworkManager {
     /// The edge channel already accepts envelopes while connecting — its bound
     /// applies backpressure. A failed connect fails the edge closed: pending
     /// branch acknowledgements abort and the sender's sends error out.
+    ///
+    /// Test-only: bypasses the authenticated session handshake. Production
+    /// graph builders open edges through [`Self::open_edge_deferred_for_session`].
+    #[cfg(test)]
     pub fn open_edge_deferred(
         self: &Arc<Self>,
         transport: Arc<dyn EdgeTransport>,
@@ -1666,9 +1684,9 @@ impl NetworkManager {
         Ok(self.open_edge_deferred_with_key(transport, quad, session_key, Some(auth)))
     }
 
-    /// Uses the authenticated session when this manager is configured for a
-    /// production data plane, while retaining the explicit in-memory test
-    /// transport path used by kernel unit tests.
+    /// Opens a deferred, authenticated edge for a planned remote edge. A
+    /// manager without data-plane credentials fails the graph build here
+    /// instead of degrading to an unauthenticated edge.
     pub fn open_edge_deferred_for_job(
         self: &Arc<Self>,
         transport: Arc<dyn EdgeTransport>,
@@ -1677,17 +1695,7 @@ impl NetworkManager {
         job_id: String,
         generation: u64,
     ) -> Result<RemoteEdge, Error> {
-        if self.config.credentials.is_some() {
-            self.open_edge_deferred_for_session(transport, quad, peer_node, job_id, generation)
-        } else {
-            self.claim_legacy_job_key(JobSessionKey { job_id, generation })?;
-            Ok(self.open_edge_deferred_with_key(
-                transport,
-                quad,
-                EdgeSessionKey::legacy(quad),
-                None,
-            ))
-        }
+        self.open_edge_deferred_for_session(transport, quad, peer_node, job_id, generation)
     }
 
     fn session_auth(
@@ -3380,11 +3388,24 @@ mod tests {
         downstream.shutdown();
     }
 
+    #[tokio::test]
+    async fn bind_tcp_refuses_without_credentials() {
+        let manager = NetworkManager::new(64);
+        let error = manager
+            .bind_tcp("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect_err("bind must refuse without credentials");
+        assert!(
+            error.to_string().contains("without credentials"),
+            "expected a credentials bind refusal, got: {error}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn tcp_transport_connects_and_receives() {
         let quad = quad_a_to_b();
-        let upstream = NetworkManager::new(64);
-        let downstream = NetworkManager::new(64);
+        let upstream = authenticated_manager("node-a", "shuffle-secret");
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
         upstream.spawn();
         downstream.spawn();
 
@@ -3393,13 +3414,24 @@ mod tests {
             .await
             .expect("bind");
         let (input_tx, input_rx) = flume::bounded::<Envelope>(64);
-        downstream.register_inbound(quad, input_tx);
+        downstream.register_inbound_for_session(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "tcp-job".into(),
+                generation: 1,
+            },
+        );
 
         let transport = TcpEdgeTransport {
             addr: format!("127.0.0.1:{port}").parse().expect("addr"),
             max_attempts: 3,
         };
-        let edge = upstream.open_edge(&transport, quad).await.expect("connect");
+        let edge = upstream
+            .open_edge_for_session(&transport, quad, "node-b", "tcp-job", 1)
+            .await
+            .expect("connect");
 
         let branch = std::sync::Arc::new(RecordingAck::default());
         edge.sender
