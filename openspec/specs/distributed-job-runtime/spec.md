@@ -49,7 +49,7 @@ The runtime SHALL propagate input, operator, network, and output pressure throug
 
 ### Requirement: Job lifecycle SHALL support recovery operations
 
-The control plane SHALL support submitting, starting, stopping, restarting, cancelling, and observing Jobs without changing the lifecycle semantics of existing YAML Streams. Recovery SHALL restore source positions and every physical event-time partition watermark from one acknowledged checkpoint cut. The distributed Hub SHALL persist the Job lifecycle and recovery pointer before reporting ready, and an externally reachable Hub SHALL require authenticated operator/node access. When reconciliation re-places a Job onto a node set that excludes a node holding a successful start for the current generation, that stale claim SHALL be superseded and the abandoned node SHALL receive a stop command when it becomes reachable again, so exactly one live runner remains.
+The control plane SHALL support submitting, starting, stopping, restarting, cancelling, and observing Jobs without changing the lifecycle semantics of existing YAML Streams. Recovery SHALL restore source positions and every physical event-time partition watermark from one acknowledged checkpoint cut. The distributed Hub SHALL persist the Job lifecycle and recovery pointer before reporting ready, and an externally reachable Hub SHALL require authenticated operator/node access. When reconciliation re-places a Job onto a node set that excludes a node holding a successful start for the current generation, that stale claim SHALL be superseded and the abandoned node SHALL receive a stop command when it becomes reachable again, so exactly one live runner remains. A stable placement SHALL NOT be disturbed by reconciliation alone; the only exception is the Job's explicit opt-in rebalance policy (see `resource-aware-placement`), which triggers a fenced re-placement after sustained resource pressure on its placed node.
 
 #### Scenario: Restart a failed Job
 
@@ -73,8 +73,13 @@ The control plane SHALL support submitting, starting, stopping, restarting, canc
 
 #### Scenario: A stable placement is not disturbed
 
-- **WHEN** every node of the current successful placement remains inside the reconciled target set
+- **WHEN** every node of the current successful placement remains inside the reconciled target set and the Job has not opted into pressure rebalancing
 - **THEN** no start operation is superseded and no stop command is dispatched
+
+#### Scenario: Opt-in pressure rebalance fences the abandoned node
+
+- **WHEN** a Job with the rebalance policy enabled trips its sustained-pressure trigger on the placed node
+- **THEN** the re-placement supersedes the abandoned node's start and dispatches its stop command through the same fencing path as any other re-placement
 
 ### Requirement: Job resources SHALL be connected before task execution
 The unified runtime SHALL connect all temporary resources, inputs, and outputs required by a Job before spawning its task event loops. Partial startup SHALL close every resource already opened and return the startup error.

@@ -339,6 +339,44 @@ pub enum PlacementStrategy {
     Split,
 }
 
+/// Whether the Hub may relocate a Job after sustained resource pressure on
+/// its placed node. `Off` (the default) keeps a stable placement forever.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceMode {
+    /// Never relocate: reconciliation alone may not disturb the placement.
+    #[default]
+    Off,
+    /// Relocate through the re-placement fencing path once the placed node
+    /// sustains pressure for `pressure_streak` consecutive reports and the
+    /// cooldown has elapsed.
+    Auto,
+}
+
+/// Opt-in pressure-rebalance policy. "Node pressuring" is a fleet-level
+/// judgment (Hub constants over the node resource gauges); the policy only
+/// tunes how much sustained pressure a Job tolerates and how often it may
+/// be moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct RebalancePolicy {
+    pub mode: RebalanceMode,
+    /// Consecutive pressuring reports required before a relocation.
+    pub pressure_streak: u32,
+    /// Minimum delay between relocations of one Job, in milliseconds.
+    pub cooldown_ms: u64,
+}
+
+impl Default for RebalancePolicy {
+    fn default() -> Self {
+        Self {
+            mode: RebalanceMode::Off,
+            pressure_streak: 3,
+            cooldown_ms: 300_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSpec {
     pub id: JobId,
@@ -364,6 +402,9 @@ pub struct JobSpec {
     /// co-location contract.
     #[serde(default)]
     pub placement: PlacementStrategy,
+    /// Opt-in pressure rebalance. `None` behaves exactly like `off`.
+    #[serde(default)]
+    pub rebalance: Option<RebalancePolicy>,
 }
 
 fn default_max_parallelism() -> u32 {
@@ -1347,6 +1388,7 @@ mod tests {
 
     pub(super) fn base_job() -> JobSpec {
         JobSpec {
+            rebalance: None,
             placement: PlacementStrategy::Colocated,
             id: JobId::new("orders").unwrap(),
             version: JobVersion(1),
@@ -2019,6 +2061,52 @@ mod placement_tests {
         // node (round-robin over components, single component here).
         let assignments = plan.assignments_for_nodes(&nodes, 1).unwrap();
         assert!(assignments.iter().all(|attempt| attempt.node_id == "a"));
+    }
+
+    #[test]
+    fn missing_rebalance_field_deserializes_to_none() {
+        // An old spec JSON without `rebalance` must deserialize unchanged and
+        // keep the stable-placement default.
+        let old = serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [],
+            "sources": [],
+            "sinks": [],
+            "placement": "colocated"
+        });
+        let spec: JobSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.rebalance, None);
+        assert_eq!(spec.placement, PlacementStrategy::Colocated);
+    }
+
+    #[test]
+    fn rebalance_policy_deserializes_with_defaults() {
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [],
+            "sources": [],
+            "sinks": [],
+            "rebalance": {"mode": "auto"}
+        }))
+        .unwrap();
+        let policy = spec.rebalance.expect("auto policy present");
+        assert_eq!(policy.mode, RebalanceMode::Auto);
+        assert_eq!(policy.pressure_streak, 3, "default streak");
+        assert_eq!(policy.cooldown_ms, 300_000, "default cooldown");
+        // A full policy round-trips.
+        let explicit: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [],
+            "sources": [],
+            "sinks": [],
+            "rebalance": {"mode": "auto", "pressure_streak": 5, "cooldown_ms": 60_000}
+        }))
+        .unwrap();
+        assert_eq!(explicit.rebalance,
+            Some(RebalancePolicy { mode: RebalanceMode::Auto, pressure_streak: 5, cooldown_ms: 60_000 }));
     }
 
 }

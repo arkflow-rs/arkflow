@@ -206,6 +206,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
     }
 
     let spec = JobSpec {
+        rebalance: None,
         id: job_id,
         version: JobVersion(1),
         max_parallelism: 1,
