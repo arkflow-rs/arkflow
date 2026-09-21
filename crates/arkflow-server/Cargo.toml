@@ -29,6 +29,7 @@ rusqlite = { workspace = true }
 object_store = { workspace = true }
 bytes = { workspace = true }
 prometheus = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

@@ -55,6 +55,12 @@ const ALLOWED_NODE_METRICS: &[&str] = &[
     "jobs_running",
     "jobs_ephemeral_state",
     "jobs_recovery_required",
+    // Host resource gauges sampled by the Agent (see agent.rs
+    // ResourceSampler): ephemeral registry state, exported as-is.
+    "node_cpu_usage_percent",
+    "node_memory_used_bytes",
+    "node_memory_total_bytes",
+    "node_memory_available_bytes",
 ];
 
 #[derive(Debug, Clone)]
@@ -347,6 +353,13 @@ struct NodeRecord {
     operations: Vec<OperationRecord>,
     events: Vec<ControlEvent>,
     metrics: BTreeMap<String, f64>,
+    /// Last report that carried the metrics above (0 = never reported).
+    /// Heartbeats refresh `last_seen_at_ms` but not this, so gauge freshness
+    /// stays honest for placement ranking and pressure detection.
+    last_report_at_ms: u64,
+    /// Consecutive reports over the fleet pressure predicate; reset by any
+    /// under-threshold (or gauge-less) report. Drives opt-in rebalancing.
+    pressure_streak: u32,
     /// Most recent per-Job kernel snapshots reported by the Agent.
     jobs: BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
     configuration: Option<serde_json::Value>,
@@ -365,6 +378,13 @@ pub struct Hub {
     jobs: Arc<RwLock<BTreeMap<String, JobRecord>>>,
     job_versions: Arc<RwLock<BTreeMap<String, Vec<JobVersionRecord>>>>,
     job_checkpoints: Arc<RwLock<BTreeMap<String, Vec<JobCheckpointRecord>>>>,
+    /// The node order each Job's placement was actually dispatched in, so a
+    /// retained placement re-dispatches with the identical task→node mapping
+    /// (split round-robin and multi-component co-location are order
+    /// sensitive). In-memory by design: after a Hub restart the order falls
+    /// back to node-id order until the next ranked placement, which is a
+    /// legal re-placement (state restores per task attempt).
+    placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     command_metrics: Arc<CommandMetrics>,
 }
 
@@ -518,6 +538,7 @@ impl Hub {
             jobs: Arc::new(RwLock::new(BTreeMap::new())),
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
+            placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
         }
     }
@@ -563,6 +584,21 @@ impl Hub {
     }
 
     pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, HubError> {
+        // A pinned placement has nothing to relocate to: rebalancing is a
+        // scheduler decision over unpinned Jobs, so an explicit pin combined
+        // with the auto policy is a configuration contradiction, not a
+        // silent no-op.
+        if let Ok(spec) = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json) {
+            if spec.rebalance.is_some_and(|policy| {
+                policy.mode == arkflow_core::job::RebalanceMode::Auto
+            }) && !job.node_ids.is_empty()
+            {
+                return Err(HubError::Invalid(
+                    "rebalance policy 'auto' requires an unpinned placement: remove node_ids"
+                        .into(),
+                ));
+            }
+        }
         let version_record = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
             .ok()
             .and_then(|spec| {
@@ -714,6 +750,98 @@ impl Hub {
 
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
+    /// The retained placement set, in the order its placement was actually
+    /// dispatched in (remembered at ranked-dispatch time), so a retained
+    /// re-dispatch reproduces the identical task→node mapping. Nodes the
+    /// memory does not know (e.g. after a Hub restart) are appended in id
+    /// order.
+    async fn retained_targets_in_dispatch_order(
+        &self,
+        job_id: &str,
+        set: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let remembered = self
+            .placement_order
+            .read()
+            .await
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut ordered: Vec<String> = remembered
+            .into_iter()
+            .filter(|node_id| set.contains(node_id))
+            .collect();
+        for node_id in set {
+            if !ordered.contains(node_id) {
+                ordered.push(node_id.clone());
+            }
+        }
+        ordered
+    }
+
+    /// Nodes in `targets` whose sustained-pressure streak trips the Job's
+    /// opt-in rebalance policy, subject to its cooldown and rollout
+    /// ownership. Empty unless rebalancing may proceed this tick; the caller
+    /// only evicts while at least one target remains (never into nothing).
+    async fn rebalance_evictions(
+        &self,
+        job: &JobRecord,
+        spec: &arkflow_core::job::JobSpec,
+        targets: &[String],
+    ) -> BTreeSet<String> {
+        let Some(policy) = &spec.rebalance else {
+            return BTreeSet::new();
+        };
+        if policy.mode != arkflow_core::job::RebalanceMode::Auto || !job.node_ids.is_empty() {
+            return BTreeSet::new();
+        }
+        if targets.is_empty() {
+            return BTreeSet::new();
+        }
+        let now = now_ms();
+        {
+            let operations = self.operations.read().await;
+            let mut latest_start_ms: Option<u64> = None;
+            for operation_record in operations.values() {
+                if operation_record.resource_id != job.job_id
+                    || operation_record.operation != "job_start"
+                    || operation_record.generation != job.generation
+                {
+                    continue;
+                }
+                latest_start_ms = Some(
+                    latest_start_ms
+                        .unwrap_or(0)
+                        .max(operation_record.created_at_ms),
+                );
+            }
+            // Hysteresis: a placement dispatched inside the cooldown window
+            // — the initial placement included — is not moved again yet.
+            if latest_start_ms.is_some_and(|latest| now.saturating_sub(latest) < policy.cooldown_ms)
+            {
+                return BTreeSet::new();
+            }
+        }
+        let mut evicted = BTreeSet::new();
+        {
+            let nodes = self.nodes.read().await;
+            for node_id in targets {
+                if nodes
+                    .get(node_id)
+                    .is_some_and(|node| node.pressure_streak >= policy.pressure_streak.max(1))
+                {
+                    evicted.insert(node_id.clone());
+                }
+            }
+        }
+        if evicted.len() >= targets.len() {
+            // Nowhere to relocate to (single-node fleet, or every target is
+            // pressuring): keep running where it is and retry next tick.
+            return BTreeSet::new();
+        }
+        evicted
+    }
+
     pub async fn reconcile_jobs(&self) -> Result<usize, HubError> {
         let jobs = self.jobs().await?;
         let mut dispatched = 0;
@@ -850,6 +978,27 @@ impl Hub {
                 })
                 .collect::<Vec<_>>()
         };
+        // Resource-aware ordering for unpinned placements: highest headroom
+        // first, so a colocated Job lands on the freshest node and split
+        // round-robin spreads from the best-ranked set. Pinned node_ids pass
+        // through verbatim. The dispatched order is remembered further below
+        // (only when this ranked order actually drives the dispatch).
+        let mut targets = targets;
+        if job.node_ids.is_empty() {
+            let nodes = self.nodes.read().await;
+            targets = rank_candidates(targets, &nodes, now_ms());
+        }
+        // Opt-in pressure rebalance: exclude nodes whose sustained-pressure
+        // streak trips the Job's policy. The abandoned-placement fencing
+        // below then supersedes their starts and dispatches their stops.
+        let evictions = if operation == "job_start" {
+            self.rebalance_evictions(job, &spec, &targets).await
+        } else {
+            BTreeSet::new()
+        };
+        if !evictions.is_empty() {
+            targets.retain(|node_id| !evictions.contains(node_id));
+        }
         let historical_nodes = self
             .operations
             .read()
@@ -903,10 +1052,17 @@ impl Hub {
                 break;
             }
         }
-        let targets =
-            if operation == "job_start" && job.node_ids.is_empty() && previous_nodes_all_online {
-                previous_nodes.iter().cloned().collect::<Vec<_>>()
-            } else if operation == "job_stop" {
+        let retention_won =
+            operation == "job_start" && job.node_ids.is_empty() && previous_nodes_all_online
+                && evictions.is_empty();
+        let targets = if retention_won {
+            // Re-dispatch in the placement's original node order: split
+            // round-robin and multi-component co-location are order
+            // sensitive, and the mapping for a retained placement must not
+            // drift between dispatches.
+            self.retained_targets_in_dispatch_order(&job.job_id, &previous_nodes)
+                .await
+        } else if operation == "job_stop" {
                 // A stopped Job must reach every node that may still host an
                 // older generation. Such a node is not necessarily part of
                 // the current explicit placement (for example after a move
@@ -931,6 +1087,73 @@ impl Hub {
                 targets
             };
         let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
+        // Build and validate the assignment BEFORE any fencing: a target set
+        // that cannot host the placement (a split side edge across nodes, or
+        // a target without the shuffle data plane) must fail the reconcile as
+        // a no-op retry — superseding the old placement first would stop the
+        // only live runner and leave the Job down while the invalid set
+        // persists (for example a pressured node's eviction that leaves a
+        // non-shuffle node in the candidate set).
+        let assignments = plan
+            .assignments_for_nodes(&targets, job.generation)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Re-check the complete task→node map at the dispatch boundary.  The
+        // planner already validates it, but keeping this guard here prevents a
+        // future assignment source or persistence replay from bypassing the
+        // side-edge co-location contract.
+        plan.validate_side_edge_assignments(&assignments)
+            .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Split placement: validate that every target node runs the data
+        // plane, then attach the full task→node map and peer data addresses
+        // so each node's graph build can wire its remote edges without any
+        // further lookup.
+        let mut split_payload = None;
+        if spec.placement == arkflow_core::job::PlacementStrategy::Split {
+            let nodes = self.nodes.read().await;
+            let mut node_data_ports = BTreeMap::new();
+            for node_id in &targets {
+                let Some(record) = nodes.get(node_id) else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement target node '{node_id}' is not registered"
+                    )));
+                };
+                if !record
+                    .resource
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "network_shuffle")
+                {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' with the network_shuffle capability"
+                    )));
+                }
+                let Some(address) = &record.resource.data_address else {
+                    return Err(HubError::Invalid(format!(
+                        "split placement requires node '{node_id}' to advertise a data address"
+                    )));
+                };
+                node_data_ports.insert(node_id.clone(), address.clone());
+            }
+            drop(nodes);
+            let mut task_nodes = BTreeMap::new();
+            for assignment in &assignments {
+                task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
+            }
+            split_payload = Some(serde_json::json!({
+                "task_nodes": task_nodes,
+                "node_data_ports": node_data_ports,
+            }));
+        }
+        // The dispatch order is only real once the target set validated: a
+        // reconcile that fails validation above dispatches nothing, and
+        // recording its (never-dispatched) order here would corrupt the
+        // retention memory for the still-live placement.
+        if operation == "job_start" && job.node_ids.is_empty() && !retention_won {
+            self.placement_order
+                .write()
+                .await
+                .insert(job.job_id.clone(), targets.clone());
+        }
         if operation == "job_start" {
             // Auto-placement fencing: when the reconciler re-places a Job
             // (its previous placement lost its lease or was partitioned), the
@@ -1025,56 +1248,6 @@ impl Hub {
                     .await?;
                 }
             }
-        }
-        let assignments = plan
-            .assignments_for_nodes(&targets, job.generation)
-            .map_err(|error| HubError::Invalid(error.to_string()))?;
-        // Re-check the complete task→node map at the dispatch boundary.  The
-        // planner already validates it, but keeping this guard here prevents a
-        // future assignment source or persistence replay from bypassing the
-        // side-edge co-location contract.
-        plan.validate_side_edge_assignments(&assignments)
-            .map_err(|error| HubError::Invalid(error.to_string()))?;
-        // Split placement: validate that every target node runs the data
-        // plane, then attach the full task→node map and peer data addresses
-        // so each node's graph build can wire its remote edges without any
-        // further lookup.
-        let mut split_payload = None;
-        if spec.placement == arkflow_core::job::PlacementStrategy::Split {
-            let nodes = self.nodes.read().await;
-            let mut node_data_ports = BTreeMap::new();
-            for node_id in &targets {
-                let Some(record) = nodes.get(node_id) else {
-                    return Err(HubError::Invalid(format!(
-                        "split placement target node '{node_id}' is not registered"
-                    )));
-                };
-                if !record
-                    .resource
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "network_shuffle")
-                {
-                    return Err(HubError::Invalid(format!(
-                        "split placement requires node '{node_id}' with the network_shuffle capability"
-                    )));
-                }
-                let Some(address) = &record.resource.data_address else {
-                    return Err(HubError::Invalid(format!(
-                        "split placement requires node '{node_id}' to advertise a data address"
-                    )));
-                };
-                node_data_ports.insert(node_id.clone(), address.clone());
-            }
-            drop(nodes);
-            let mut task_nodes = BTreeMap::new();
-            for assignment in &assignments {
-                task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
-            }
-            split_payload = Some(serde_json::json!({
-                "task_nodes": task_nodes,
-                "node_data_ports": node_data_ports,
-            }));
         }
         let explicit_recovery_id = job.checkpoint_id.clone();
         let mut recovery_candidates = self
@@ -1483,10 +1656,18 @@ impl Hub {
                 })
                 .map(|operation| operation.node_id.clone())
                 .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
         } else {
-            job.node_ids.clone()
+            job.node_ids.clone().into_iter().collect::<BTreeSet<_>>()
+        };
+        // Order the checkpoint targets in the placement's dispatch order so
+        // the re-derived split round-robin produces the same task→node
+        // mapping as the live placement (the command payload carries the
+        // assignments; Agents ignore them today, but they must not lie).
+        let candidates = if job.node_ids.is_empty() {
+            self.retained_targets_in_dispatch_order(&job.job_id, &candidates)
+                .await
+        } else {
+            candidates.into_iter().collect()
         };
         let nodes = self.nodes.read().await;
         let targets = candidates
@@ -2440,6 +2621,11 @@ impl Hub {
                 session_expires_at_ms: now.saturating_add(self.config.session_ttl_ms),
                 boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
+                last_report_at_ms: 0,
+                // Pressure history is deliberately not carried across
+                // registrations: a reconnecting node re-earns its streak
+                // within a few report intervals (bounded rebalance delay).
+                pressure_streak: 0,
                 // Commands queued for an old process belong to a runtime that
                 // no longer exists. Reconciliation below will enqueue the
                 // desired state for the new boot.
@@ -2684,6 +2870,12 @@ impl Hub {
         node.operations = report.operations;
         node.events = report.events.clone();
         node.metrics = sanitize_metrics(report.metrics);
+        node.last_report_at_ms = now;
+        node.pressure_streak = if node_under_pressure(&node.metrics) {
+            node.pressure_streak.saturating_add(1)
+        } else {
+            0
+        };
         node.jobs = bounded_job_snapshots(report.jobs);
         node.configuration = report.configuration;
         let persisted_version = node.resource.version.clone();
@@ -4969,6 +5161,91 @@ fn sanitize_metrics(metrics: BTreeMap<String, f64>) -> BTreeMap<String, f64> {
         .collect()
 }
 
+/// Fleet-level "node pressuring" judgment: memory used ratio or CPU above
+/// the threshold. Evaluated against the LATEST report's gauges; a node
+/// without usable gauges is never pressuring (fail-safe: no data, no move).
+const PRESSURE_MEMORY_USED_RATIO: f64 = 0.9;
+const PRESSURE_CPU_PERCENT: f64 = 90.0;
+
+fn node_under_pressure(metrics: &BTreeMap<String, f64>) -> bool {
+    let memory_pressuring = match (
+        metrics.get("node_memory_used_bytes"),
+        metrics.get("node_memory_total_bytes"),
+    ) {
+        (Some(used), Some(total))
+            if total.is_finite() && *total > 0.0 && used.is_finite() =>
+        {
+            used / total >= PRESSURE_MEMORY_USED_RATIO
+        }
+        _ => false,
+    };
+    let cpu_pressuring = metrics
+        .get("node_cpu_usage_percent")
+        .is_some_and(|cpu| cpu.is_finite() && *cpu >= PRESSURE_CPU_PERCENT);
+    memory_pressuring || cpu_pressuring
+}
+
+/// How long a node's gauges stay eligible for headroom ranking after its
+/// last report — twice the Agent sampling interval, mirroring the
+/// Agent-side freshness window.
+const RESOURCE_GAUGE_FRESH_MS: u64 = 10_000;
+
+/// Headroom ordering key for placement ranking: fresh-gauged nodes rank
+/// (1, memory-available ratio, CPU headroom), gauge-less nodes rank
+/// (0, 0, 0) and land after every gauged node, in id order. Larger is
+/// better in every component.
+fn headroom_key(record: Option<&NodeRecord>, now: u64) -> (u8, f64, f64) {
+    let Some(record) = record else {
+        return (0, 0.0, 0.0);
+    };
+    if record.last_report_at_ms == 0
+        || now.saturating_sub(record.last_report_at_ms) > RESOURCE_GAUGE_FRESH_MS
+    {
+        return (0, 0.0, 0.0);
+    }
+    let (Some(used), Some(total)) = (
+        record.metrics.get("node_memory_used_bytes"),
+        record.metrics.get("node_memory_total_bytes"),
+    ) else {
+        return (0, 0.0, 0.0);
+    };
+    if !total.is_finite() || *total <= 0.0 || !used.is_finite() {
+        return (0, 0.0, 0.0);
+    }
+    let memory_available_ratio = (1.0 - used / total).clamp(0.0, 1.0);
+    let cpu_headroom = record
+        .metrics
+        .get("node_cpu_usage_percent")
+        .filter(|cpu| cpu.is_finite())
+        .map(|cpu| (100.0 - cpu).clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+    (1, memory_available_ratio, cpu_headroom)
+}
+
+/// Rank eligible placement candidates by resource headroom. Pure and
+/// deterministic: the ordered output feeds the unchanged assignment logic,
+/// so `split-placement`'s "same input, same mapping" contract holds by
+/// construction. Nodes with equal headroom (and all gauge-less nodes) tie
+/// on node id.
+fn rank_candidates(
+    candidates: Vec<String>,
+    nodes: &BTreeMap<String, NodeRecord>,
+    now: u64,
+) -> Vec<String> {
+    let mut ranked = candidates;
+    ranked.sort_by(|left, right| {
+        let left_key = headroom_key(nodes.get(left), now);
+        let right_key = headroom_key(nodes.get(right), now);
+        right_key
+            .0
+            .cmp(&left_key.0)
+            .then_with(|| right_key.1.total_cmp(&left_key.1))
+            .then_with(|| right_key.2.total_cmp(&left_key.2))
+            .then_with(|| left.cmp(right))
+    });
+    ranked
+}
+
 /// Upper bound on per-Job snapshots kept for one node. Jobs are
 /// operator-configured so this is generous; a misbehaving Agent cannot grow
 /// Hub memory without bound.
@@ -6221,6 +6498,126 @@ mod tests {
         assert!(!metrics.contains_key("arbitrary_label"));
         assert!(!metrics.contains_key("output_errors"));
         assert!(!metrics.contains_key("restarts"));
+    }
+
+    #[test]
+    fn resource_gauges_pass_the_whitelist_into_the_node_view() {
+        let metrics = sanitize_metrics(BTreeMap::from([
+            ("node_cpu_usage_percent".into(), 37.5),
+            ("node_memory_used_bytes".into(), 1_000.0),
+            ("node_memory_total_bytes".into(), 8_000.0),
+            ("node_memory_available_bytes".into(), 7_000.0),
+            ("node_not_a_real_gauge".into(), 1.0),
+        ]));
+        assert_eq!(
+            metrics,
+            BTreeMap::from([
+                ("node_cpu_usage_percent".to_string(), 37.5),
+                ("node_memory_used_bytes".to_string(), 1_000.0),
+                ("node_memory_total_bytes".to_string(), 8_000.0),
+                ("node_memory_available_bytes".to_string(), 7_000.0),
+            ])
+        );
+    }
+
+    async fn register_and_report_resources(hub: &Hub, report_seq: u64) {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        hub.report(NodeReport {
+            auth: AgentAuth {
+                node_id: "n1".into(),
+                session_token: session.session_token,
+            },
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: BTreeMap::from([
+                ("node_cpu_usage_percent".to_string(), 12.5),
+                ("node_memory_total_bytes".to_string(), 16_000.0),
+            ]),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: None,
+            report_seq,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reported_resource_gauges_surface_in_the_node_metrics_view() {
+        let hub = Hub::new(config());
+        register_and_report_resources(&hub, 1).await;
+        let view = hub
+            .metrics_by_node(Some("n1"))
+            .await
+            .into_iter()
+            .next()
+            .expect("node view");
+        assert_eq!(view.metrics.get("node_cpu_usage_percent"), Some(&12.5));
+        assert_eq!(view.metrics.get("node_memory_total_bytes"), Some(&16_000.0));
+    }
+
+    #[tokio::test]
+    async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let storage = crate::storage::StorageActor::start(store, 8);
+        let hub1 = Hub::with_storage(config(), storage.clone());
+        register_and_report_resources(&hub1, 1).await;
+        assert!(
+            hub1.metrics_by_node(Some("n1"))
+                .await
+                .into_iter()
+                .next()
+                .expect("node view")
+                .metrics
+                .contains_key("node_cpu_usage_percent")
+        );
+        // After a restart the registry starts empty and the reconnecting
+        // node re-registers with an empty gauge set: gauges only reappear
+        // with the node's next report. No durable gauge history exists.
+        let hub2 = Hub::with_storage(config(), storage);
+        assert!(hub2.metrics_by_node(Some("n1")).await.is_empty());
+        let session = hub2
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: None,
+            })
+            .await
+            .unwrap();
+        let view = hub2
+            .metrics_by_node(Some("n1"))
+            .await
+            .into_iter()
+            .next()
+            .expect("re-registered node view");
+        assert!(!view.metrics.keys().any(|key| key.starts_with("node_")));
+        register_and_report_resources(&hub2, 2).await;
+        let view = hub2
+            .metrics_by_node(Some("n1"))
+            .await
+            .into_iter()
+            .next()
+            .expect("reported node view");
+        assert!(view.metrics.contains_key("node_cpu_usage_percent"));
+        drop(session);
     }
 
     #[test]
@@ -9360,5 +9757,1118 @@ mod session_report_tests {
             streams[0].1.state,
             arkflow_core::control::StreamState::Running
         );
+    }
+
+    // ----- resource-aware placement and opt-in rebalancing -----
+
+    fn job_spec_json(id: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        })
+        .to_string()
+    }
+
+    fn resource_metrics(used_ratio: f64, cpu: f64) -> BTreeMap<String, f64> {
+        BTreeMap::from([
+            ("node_memory_total_bytes".to_string(), 16_000.0),
+            ("node_memory_used_bytes".to_string(), 16_000.0 * used_ratio),
+            ("node_cpu_usage_percent".to_string(), cpu),
+        ])
+    }
+
+    fn shuffle_capabilities() -> Vec<String> {
+        vec![
+            "job_runtime".to_string(),
+            "state_backend".to_string(),
+            "network_shuffle".to_string(),
+        ]
+    }
+
+    /// Reports refresh the node capability list, so shuffle nodes' reports
+    /// must keep advertising it (the shared helper sends none).
+    async fn report_shuffle_node(
+        hub: &Hub,
+        auth: &AgentAuth,
+        used_ratio: f64,
+        cpu: f64,
+        report_seq: u64,
+    ) {
+        hub.report(NodeReport {
+            auth: auth.clone(),
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: shuffle_capabilities(),
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: resource_metrics(used_ratio, cpu),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some("boot".into()),
+            report_seq,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Sorted task ids from the node's pending (or most recent) job_start
+    /// command payload.
+    async fn start_command_tasks(hub: &Hub, auth: &AgentAuth) -> Vec<String> {
+        hub.commands(auth.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.operation == "job_start")
+            .expect("job_start command")
+            .payload
+            .expect("job_start payload")
+            ["assignments"]
+            .as_array()
+            .map(|assignments| {
+                let mut tasks: Vec<String> = assignments
+                    .iter()
+                    .filter_map(|assignment| assignment["task_id"].as_str().map(String::from))
+                    .collect();
+                tasks.sort();
+                tasks
+            })
+            .unwrap_or_default()
+    }
+
+    fn rebalance_job_spec_json(id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&job_spec_json(id)).unwrap();
+        value["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        value.to_string()
+    }
+
+    async fn report_resources(
+        hub: &Hub,
+        auth: &AgentAuth,
+        used_ratio: f64,
+        cpu: f64,
+        report_seq: u64,
+    ) {
+        hub.report(NodeReport {
+            auth: auth.clone(),
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: resource_metrics(used_ratio, cpu),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: None,
+            report_seq,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn start_operations(hub: &Hub, job_id: &str) -> Vec<HubOperation> {
+        hub.operations(None)
+            .await
+            .into_iter()
+            .filter(|operation_record| {
+                operation_record.resource_id == job_id
+                    && operation_record.operation == "job_start"
+            })
+            .collect()
+    }
+
+    async fn complete_start_commands(hub: &Hub, node_id: &str, session_token: &str) {
+        let auth = AgentAuth {
+            node_id: node_id.into(),
+            session_token: session_token.into(),
+        };
+        for command in hub.commands(auth.clone()).await.unwrap() {
+            hub.command_result(
+                auth.clone(),
+                CommandResult {
+                    command_id: command.id,
+                    operation_id: command.operation_id,
+                    state: HubOperationState::Succeeded,
+                    progress: 100,
+                    error: None,
+                    correlation_id: command.correlation_id,
+                    generation: command.generation,
+                    observed_generation: None,
+                    action_id: None,
+                    failure_class: None,
+                    config_version_id: command.config_version_id,
+                    rollout_id: command.rollout_id,
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn rank_candidates_is_deterministic_and_prefers_headroom() {
+        let now = now_ms();
+        let mut nodes = BTreeMap::new();
+        for (id, used_ratio, cpu, reported) in [
+            ("n-busy", 0.95, 90.0, true),
+            ("n-free", 0.10, 5.0, true),
+            ("n-mid", 0.50, 50.0, true),
+            ("n-blind", 0.0, 0.0, false),
+        ] {
+            let mut record = NodeRecord {
+                resource: HubNode {
+                    id: id.into(),
+                    protocol_version: "v1".into(),
+                    version: "test".into(),
+                    state: NodeConnectionState::Online,
+                    capabilities: vec![],
+                    last_seen_at_ms: now,
+                    lease_expires_at_ms: now + 1_000,
+                    streams_total: 0,
+                    streams_running: 0,
+                    streams_failed: 0,
+                    maintenance_state: NodeMaintenanceState::Active,
+                    data_address: None,
+                },
+                session_token: String::new(),
+                session_expires_at_ms: now + 1_000,
+                boot_id: Some("boot".into()),
+                report_seq: 0,
+                commands: VecDeque::new(),
+                leased_commands: BTreeMap::new(),
+                streams: vec![],
+                operations: vec![],
+                events: vec![],
+                metrics: BTreeMap::new(),
+                last_report_at_ms: if reported { now } else { 0 },
+                pressure_streak: 0,
+                jobs: BTreeMap::new(),
+                configuration: None,
+            };
+            if reported {
+                record.metrics = resource_metrics(used_ratio, cpu);
+            }
+            nodes.insert(id.to_string(), record);
+        }
+        let rank = |candidates: Vec<String>| {
+            rank_candidates(candidates, &nodes, now)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            "n-free".to_string(),
+            "n-mid".to_string(),
+            "n-busy".to_string(),
+            "n-blind".to_string(),
+        ];
+        assert_eq!(rank(vec!["n-blind".into(), "n-busy".into(), "n-free".into(), "n-mid".into()]), expected);
+        // Deterministic: the same input produces the same order.
+        assert_eq!(
+            rank(vec!["n-mid".into(), "n-blind".into(), "n-free".into(), "n-busy".into()]),
+            expected,
+            "ranking must be a pure function of (candidates, gauges, ids)"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_placement_lands_on_the_higher_headroom_node() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let session_b = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-b".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let _ = (&session_a, &session_b);
+        // node-a reports a fuller node; node-b has headroom and must win the
+        // first placement even though node-a sorts first by id.
+        report_resources(&hub, &AgentAuth { node_id: "node-a".into(), session_token: session_a.session_token.clone() }, 0.9, 10.0, 1).await;
+        report_resources(&hub, &AgentAuth { node_id: "node-b".into(), session_token: session_b.session_token.clone() }, 0.1, 10.0, 1).await;
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].node_id, "node-b");
+    }
+
+    #[tokio::test]
+    async fn gauge_less_fleet_keeps_id_order_placement() {
+        let hub = Hub::new(config());
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].node_id, "node-a", "no gauges: today's id order");
+    }
+
+    #[tokio::test]
+    async fn pressure_streak_counts_consecutive_pressuring_reports() {
+        let hub = Hub::new(config());
+        let session = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "n1".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth = AgentAuth {
+            node_id: "n1".into(),
+            session_token: session.session_token.clone(),
+        };
+        let streak = || async {
+            hub.nodes
+                .read()
+                .await
+                .get("n1")
+                .expect("registered node")
+                .pressure_streak
+        };
+        assert_eq!(streak().await, 0);
+        report_resources(&hub, &auth, 0.95, 5.0, 1).await;
+        assert_eq!(streak().await, 1, "one pressuring report");
+        report_resources(&hub, &auth, 0.95, 50.0, 2).await;
+        assert_eq!(streak().await, 2, "consecutive pressuring reports accrue");
+        report_resources(&hub, &auth, 0.10, 5.0, 3).await;
+        assert_eq!(streak().await, 0, "an under-threshold report resets");
+        // A report without usable gauges also resets: no data, no pressure.
+        hub.report(NodeReport {
+            auth: auth.clone(),
+            version: "test".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            streams: vec![],
+            operations: vec![],
+            events: vec![],
+            metrics: resource_metrics(0.95, 5.0)
+                .into_iter()
+                .filter(|(key, _)| key != "node_memory_total_bytes")
+                .collect(),
+            jobs: BTreeMap::new(),
+            configuration: None,
+            configuration_version: None,
+            boot_id: Some("boot".into()),
+            report_seq: 4,
+        })
+        .await
+        .unwrap();
+        assert_eq!(streak().await, 0, "gauge-less report is not pressuring");
+    }
+
+    #[tokio::test]
+    async fn opt_in_pressure_rebalance_relocates_with_fencing() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        // node-a starts healthier and wins the first placement.
+        report_resources(&hub, &auth_a, 0.1, 10.0, 1).await;
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: rebalance_job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(start_operations(&hub, "orders").await[0].node_id, "node-a");
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        assert_eq!(
+            start_operations(&hub, "orders")
+                .await
+                .into_iter()
+                .filter(|operation_record| operation_record.state == HubOperationState::Succeeded)
+                .count(),
+            1
+        );
+        // Sustained pressure: `pressure_streak` consecutive pressuring
+        // reports from node-a.
+        report_resources(&hub, &auth_a, 0.99, 5.0, 2).await;
+        report_resources(&hub, &auth_a, 0.99, 5.0, 3).await;
+        hub.reconcile_jobs().await.unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert!(
+            starts
+                .iter()
+                .any(|operation_record| operation_record.node_id == "node-a"
+                    && operation_record.state == HubOperationState::Superseded),
+            "the abandoned node's start must be superseded: {starts:?}"
+        );
+        assert!(
+            starts
+                .iter()
+                .any(|operation_record| operation_record.node_id == "node-b"
+                    && matches!(
+                        operation_record.state,
+                        HubOperationState::Queued
+                            | HubOperationState::Dispatched
+                            | HubOperationState::Acknowledged
+                            | HubOperationState::Running
+                            | HubOperationState::Succeeded
+                    )),
+            "the Job must be re-placed onto the remaining target: {starts:?}"
+        );
+        let stops = hub
+            .operations(None)
+            .await
+            .into_iter()
+            .filter(|operation_record| {
+                operation_record.resource_id == "orders"
+                    && operation_record.operation == "job_stop"
+                    && operation_record.node_id == "node-a"
+            })
+            .count();
+        assert_eq!(stops, 1, "the abandoned node must receive a stop command");
+    }
+
+    #[tokio::test]
+    async fn default_off_policy_never_disturbs_a_pressured_placement() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        // Sustained pressure without the opt-in: placement stays untouched.
+        for seq in 1..=5 {
+            report_resources(&hub, &auth_a, 0.99, 5.0, seq).await;
+        }
+        hub.reconcile_jobs().await.unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].node_id, "node-a");
+        assert_eq!(starts[0].state, HubOperationState::Succeeded);
+        assert!(hub
+            .operations(None)
+            .await
+            .iter()
+            .all(|operation_record| operation_record.operation != "job_stop"));
+    }
+
+    #[tokio::test]
+    async fn single_node_fleet_skips_relocation_under_pressure() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: rebalance_job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        for seq in 1..=4 {
+            report_resources(&hub, &auth_a, 0.99, 99.0, seq).await;
+        }
+        hub.reconcile_jobs().await.unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].node_id, "node-a");
+        assert_eq!(starts[0].state, HubOperationState::Succeeded);
+        assert!(hub
+            .operations(None)
+            .await
+            .iter()
+            .all(|operation_record| operation_record.operation != "job_stop"));
+    }
+
+    /// Multi-component co-location is order sensitive: the component the
+    /// ranked order put on the head node must still be there when the
+    /// retained placement re-dispatches (e.g. after a version bump), instead
+    /// of drifting with BTreeSet iteration order.
+    #[tokio::test]
+    async fn retained_replacement_reproduces_the_dispatch_order() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let session_b = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-b".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: session_b.session_token.clone(),
+        };
+        // node-b reports more headroom and must win the head of the ranked
+        // order despite sorting after node-a by id.
+        report_resources(&hub, &auth_a, 0.9, 10.0, 1).await;
+        report_resources(&hub, &auth_b, 0.1, 10.0, 1).await;
+
+        let two_component_spec = |version: u64| {
+            serde_json::json!({
+                "id": "orders",
+                "version": version,
+                "placement": "colocated",
+                "operators": [
+                    {"id": "source-a", "kind": "source"},
+                    {"id": "sink-a", "kind": "sink"},
+                    {"id": "source-b", "kind": "source"},
+                    {"id": "sink-b", "kind": "sink"}
+                ],
+                "edges": [
+                    {"id": "e-a", "from": "source-a", "to": "sink-a"},
+                    {"id": "e-b", "from": "source-b", "to": "sink-b"}
+                ],
+                "sources": [
+                    {"operator_id": "source-a", "input_type": "memory", "time": {"mode": "processing_time"}},
+                    {"operator_id": "source-b", "input_type": "memory", "time": {"mode": "processing_time"}}
+                ],
+                "sinks": [
+                    {"operator_id": "sink-a", "output_type": "drop"},
+                    {"operator_id": "sink-b", "output_type": "drop"}
+                ]
+            })
+            .to_string()
+        };
+
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: two_component_spec(1),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let first_on_b = start_command_tasks(&hub, &auth_b).await;
+        let first_on_a = start_command_tasks(&hub, &auth_a).await;
+        assert!(!first_on_b.is_empty() && !first_on_a.is_empty());
+        assert!(
+            first_on_b.iter().all(|task| !first_on_a.contains(task)),
+            "components must be split across the two nodes"
+        );
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        complete_start_commands(&hub, "node-b", &session_b.session_token).await;
+
+        // Version bump: same node set, same healthy state — the retained
+        // placement must re-dispatch with the identical component mapping.
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: two_component_spec(2),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 2,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            start_command_tasks(&hub, &auth_b).await,
+            first_on_b,
+            "the head node must keep its components across re-dispatches"
+        );
+        assert_eq!(
+            start_command_tasks(&hub, &auth_a).await,
+            first_on_a
+        );
+    }
+
+    /// Eviction must not stop the live placement when the remaining target
+    /// set cannot host it: split validation runs BEFORE any fencing, so an
+    /// incapable survivor node turns the eviction into a no-op retry instead
+    /// of an outage.
+    #[tokio::test]
+    async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        // Two shuffle-capable nodes place the Job first.
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.2, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        spec["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+        assert_eq!(
+            start_operations(&hub, "orders")
+                .await
+                .into_iter()
+                .filter(|operation_record| operation_record.state == HubOperationState::Succeeded)
+                .count(),
+            2,
+            "both shuffle nodes hold a succeeded start"
+        );
+
+        // A plain node without the data plane joins the fleet.
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-plain".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+
+        // Sustained pressure on node-a trips the eviction, but the surviving
+        // candidate set contains the incapable node: the reconcile must fail
+        // validation BEFORE fencing, leaving the live placement untouched.
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
+        let job_record = hub
+            .jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.job_id == "orders")
+            .expect("job record");
+        let error = hub.reconcile_job(&job_record).await.unwrap_err();
+        assert!(
+            matches!(error, HubError::Invalid(_)),
+            "validation must fail the reconcile: {error}"
+        );
+        // Fleet-level reconcile swallows the invalid placement as a skipped
+        // tick (pre-existing semantics) — the live placement stays untouched.
+        hub.reconcile_jobs().await.unwrap();
+
+        let starts = start_operations(&hub, "orders").await;
+        assert!(
+            starts
+                .iter()
+                .all(|operation_record| operation_record.state == HubOperationState::Succeeded),
+            "no start may be superseded while the target set is invalid: {starts:?}"
+        );
+        assert!(
+            hub.operations(None)
+                .await
+                .iter()
+                .all(|operation_record| operation_record.operation != "job_stop"),
+            "no stop command may be dispatched while the target set is invalid"
+        );
+    }
+
+    /// A reconcile whose evicted target set fails validation must not
+    /// overwrite the remembered dispatch order: the never-dispatched order
+    /// would corrupt retention for the still-live placement (mapping flip on
+    /// the next real re-dispatch).
+    #[tokio::test]
+    async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        // node-a has the most headroom and must take the head of the ranked
+        // order: the split round-robin maps task 0 (source) onto node-a.
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.3, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        spec["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let first_on_a = start_command_tasks(&hub, &auth_a).await;
+        let first_on_b = start_command_tasks(&hub, &auth_b).await;
+        assert_eq!(first_on_a.len(), 1, "one task per node: {first_on_a:?}");
+        assert_eq!(first_on_b.len(), 1, "one task per node: {first_on_b:?}");
+        assert_ne!(first_on_a, first_on_b);
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+
+        // A plain node joins and trips the eviction into an invalid target
+        // set: the reconcile fails validation (no fencing, no dispatch) —
+        // and must not record that never-dispatched order either.
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-plain".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
+        report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
+        let job_record = hub
+            .jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.job_id == "orders")
+            .expect("job record");
+        assert!(hub.reconcile_job(&job_record).await.is_err());
+
+        // Pressure subsides; the placement is retained in its original
+        // order, so the version bump re-dispatches the same mapping.
+        report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 4).await;
+        let mut bumped: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        bumped["placement"] = serde_json::json!("split");
+        bumped["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 2, "cooldown_ms": 0});
+        bumped["version"] = serde_json::json!(2);
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 2,
+            spec_json: bumped.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 2,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            start_command_tasks(&hub, &auth_a).await,
+            first_on_a,
+            "the retained order must be the original dispatch order, not the failed tick's"
+        );
+        assert_eq!(start_command_tasks(&hub, &auth_b).await, first_on_b);
+    }
+
+    /// The checkpoint command payload re-derives split assignments; they
+    /// must match the live placement's dispatch order (Agents ignore the
+    /// payload assignments today, but they must not lie).
+    #[tokio::test]
+    async fn checkpoint_payload_assignments_match_the_live_mapping() {
+        let hub = Hub::new(config());
+        let mut sessions = BTreeMap::new();
+        for node_id in ["node-a", "node-b"] {
+            let session = hub
+                .register(RegisterRequest {
+                    data_address: Some(format!("{node_id}:9100")),
+                    node_id: node_id.into(),
+                    node_token: "node-secret".into(),
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                    capabilities: shuffle_capabilities(),
+                    boot_id: Some("boot".into()),
+                })
+                .await
+                .unwrap();
+            sessions.insert(node_id.to_string(), session.session_token.clone());
+        }
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        };
+        let auth_b = AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        };
+        // node-b has the headroom lead: the ranked dispatch order is
+        // [node-b, node-a], the opposite of id order.
+        report_shuffle_node(&hub, &auth_a, 0.3, 10.0, 1).await;
+        report_shuffle_node(&hub, &auth_b, 0.1, 10.0, 1).await;
+
+        let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["placement"] = serde_json::json!("split");
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        let start_on_a = start_command_tasks(&hub, &auth_a).await;
+        let start_on_b = start_command_tasks(&hub, &auth_b).await;
+        assert_eq!(start_on_a.len(), 1);
+        assert_eq!(start_on_b.len(), 1);
+        assert_ne!(start_on_a, start_on_b, "ranked order [b, a] must swap the mapping");
+        for (node_id, token) in &sessions {
+            complete_start_commands(&hub, node_id, token).await;
+        }
+
+        hub.record_job_checkpoint(JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 1,
+            checkpoint_id: "checkpoint-1".into(),
+            kind: "checkpoint".into(),
+            status: "completed".into(),
+            manifest_uri: None,
+            format_version: 1,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        })
+        .await
+        .unwrap();
+        for (auth, start_tasks) in [(&auth_a, &start_on_a), (&auth_b, &start_on_b)] {
+            let checkpoint_tasks = hub
+                .commands(auth.clone())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|command| command.operation == "job_checkpoint")
+                .expect("checkpoint command")
+                .payload
+                .expect("checkpoint payload")["assignments"]
+                .as_array()
+                .map(|assignments| {
+                    let mut tasks: Vec<String> = assignments
+                        .iter()
+                        .filter_map(|assignment| {
+                            assignment["task_id"].as_str().map(String::from)
+                        })
+                        .collect();
+                    tasks.sort();
+                    tasks
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                &checkpoint_tasks, start_tasks,
+                "checkpoint assignments must match the live dispatch mapping"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_placement_rejects_auto_rebalance() {
+        let hub = Hub::new(config());
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        let error = hub
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: rebalance_job_spec_json("orders"),
+                desired_state: "running".into(),
+                observed_state: "validated".into(),
+                convergence: "pending".into(),
+                generation: 1,
+                node_ids: vec!["node-a".into()],
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HubError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn rebalance_cooldown_blocks_a_move_inside_the_window() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        // Same auto policy but with a cooldown far in the future relative to
+        // the fresh placement.
+        let mut spec: serde_json::Value =
+            serde_json::from_str(&job_spec_json("orders")).unwrap();
+        spec["rebalance"] =
+            serde_json::json!({"mode": "auto", "pressure_streak": 1, "cooldown_ms": 3_600_000});
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        // Pressure trip inside the cooldown window: the placement holds.
+        for seq in 1..=3 {
+            report_resources(&hub, &auth_a, 0.99, 99.0, seq).await;
+        }
+        hub.reconcile_jobs().await.unwrap();
+        let starts = start_operations(&hub, "orders").await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].node_id, "node-a");
+        assert_eq!(starts[0].state, HubOperationState::Succeeded);
+        assert!(hub
+            .operations(None)
+            .await
+            .iter()
+            .all(|operation_record| operation_record.operation != "job_stop"));
     }
 }

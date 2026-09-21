@@ -308,6 +308,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
         });
     }
     JobSpec {
+        rebalance: None,
         id: JobId::new("test-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 2,
@@ -544,6 +545,7 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
         processor: Arc::new(PassThroughProcessor),
     };
     let plan = JobPlan::compile(JobSpec {
+        rebalance: None,
         id: JobId::new("window-runtime-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -702,6 +704,7 @@ async fn multi_input_chain_preserves_every_upstream_channel() {
         processor: Arc::new(PassThroughProcessor),
     };
     let job = JobSpec {
+        rebalance: None,
         id: JobId::new("multi-input-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -813,6 +816,7 @@ async fn multi_input_watermark_uses_the_slowest_upstream() {
         late_event_route: None,
     };
     let job = JobSpec {
+        rebalance: None,
         id: JobId::new("multi-watermark-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -895,6 +899,7 @@ async fn processor_failure_uses_error_output_without_receiving_successes() {
         processor: Arc::new(FailingProcessor),
     };
     let job = JobSpec {
+        rebalance: None,
         id: JobId::new("error-route-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -2802,6 +2807,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
         processor: Arc::new(PassThroughProcessor),
     };
     let mut job = JobSpec {
+        rebalance: None,
         id: JobId::new("race-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 1,
@@ -3844,6 +3850,7 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
         processor: Arc::new(PassThroughProcessor),
     };
     let job = JobSpec {
+        rebalance: None,
         id: JobId::new("test-job").unwrap(),
         version: JobVersion(1),
         max_parallelism: 2,
@@ -4200,6 +4207,7 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
     // source → (keyed) map → sink, parallelism 2; the source→map edge is
     // partitioned so remote subtasks exercise key-group routing.
     let spec = crate::job::JobSpec {
+        rebalance: None,
         id: crate::job::JobId::new("remote-job").unwrap(),
         version: crate::job::JobVersion(1),
         max_parallelism: 2,

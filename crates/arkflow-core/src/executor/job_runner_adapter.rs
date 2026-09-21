@@ -1016,6 +1016,7 @@ mod validation_tests {
 
     fn local_spec(input_type: &str, output_type: &str) -> JobSpec {
         JobSpec {
+            rebalance: None,
             id: JobId::new("validate-job").unwrap(),
             version: JobVersion(1),
             max_parallelism: 1,
@@ -1266,6 +1267,7 @@ mod metrics_registry_tests {
 
     fn registry_spec() -> JobSpec {
         JobSpec {
+            rebalance: None,
             id: JobId::new("registry-metrics-job").unwrap(),
             version: JobVersion(1),
             max_parallelism: 1,

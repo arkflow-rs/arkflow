@@ -105,6 +105,41 @@ Hub 持久化作业、版本、任务分配与恢复记录,并使用 generation 
 
 `placement: split` 下,Hub 按确定性的计划顺序把计划的物理任务轮转分配到目标节点,因此同一算子的子任务可能落在不同节点。端点落在不同节点上的边被物化为**远程网络边**:分区边按键组范围把记录路由到拥有它的子任务,每个 (子任务对, 算子对) 一条有界 TCP 通道,具备与本地有界通道相同的 FIFO、屏障、水印与确认语义——上游源 ack 只有在每个下游副本都确认之后才完成,窗口持有的批次与本地完全一样地被排除在屏障排空之外。旁路边——错误 sink 与迟到事件路由——必须保持同位共置;如果计划会把某条旁路边拆到跨节点,整个放置会在派发前被拒绝。Hub 只把 `split` 放置派发给运行数据面的节点(配置了 `health_check.data_port` 且 `health_check.data_host` 可路由,并以 `network_shuffle` 能力宣告);否则放置直接失败(fail closed),不做部分派发。从不设置这些字段的部署保持共置行为不变——没有额外监听器、没有能力宣告、放置结果逐字节相同。
 
+#### 资源感知放置与再均衡
+
+当作业未用 `node_ids` 固定目标节点时,Hub 在每次放置前按资源余量为候选节点排序:有最新资源指标的节点优先(内存可用量降序、CPU 余量降序、节点 ID 升序),未上报指标的节点按 ID 序排在最后。排序后的集合仍走同一套确定性轮转,且被保留的放置总是按最初派发顺序重新分发,因此作业的 task→node 映射不会在多次派发之间漂移。
+
+默认情况下,放置成功后永不再移动。作业可通过 `rebalance` 策略显式开启再均衡:当所在节点的资源压力(内存占用或 CPU 超过阈值)连续多个上报周期持续存在、且作业级冷却期已过时,Hub 会把作业迁移走——迁移复用与节点闪断相同的 fencing 重放置路径:被弃节点的 start 被置为 superseded 并收到 stop 命令,剩余最优节点上始终只有一个运行实例。迁移与其余重放置一样从最近 checkpoint 恢复;固定 `node_ids` 的作业不能与 `rebalance: auto` 组合。
+
+```yaml validate=full
+streams: []
+jobs:
+  - id: rebalanced-orders
+    version: 1
+    placement: split
+    rebalance:
+      mode: auto            # off (default) | auto
+      pressure_streak: 3    # consecutive pressuring reports before a move
+      cooldown_ms: 300000   # minimum delay between relocations
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: source-sink
+        from: source
+        to: sink
+    sources:
+      - operator_id: source
+        input_type: memory
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: drop
+```
+
 ### 失败与就绪语义
 
 每个校验入口(`--validate`、配置 API、YAML 中声明的本地作业以及编译后的流)都执行与真实启动相同的无副作用深度构建:未知组件、不支持的状态后端与非法图边在校验期失败,而不是在运行时。dry run 打开的 WAL 会在其返回前关闭,同一 redb 路径可以立即被真实运行时重新打开。进入 `Starting` 之后,dry run、图构建或资源连接失败的运行时会在错误返回前转换为 `Failed`;本地作业构建失败会让引擎启动失败,而不是在损坏状态下宣告就绪。临时资源、源与 sink 按依赖顺序在任何任务循环启动之前连接,部分启动则以相反顺序关闭已连接的资源。
