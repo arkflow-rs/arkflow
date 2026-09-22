@@ -156,6 +156,7 @@ ArkFlow提供多种数据处理器：
 - **VRL** (`vrl`)：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
 - **Python** (`python`)：对每个批次运行用户自定义的 Python 函数
 - **Embedding** (`embedding`)：通过 OpenAI 兼容 API 批量向量化文本列并追加向量列
+- **LLM** (`llm`)：以有界并发将每行文本发送到 OpenAI 兼容对话补全 API 并追加补全列
 
 <!-- README_COMPONENTS:processor END -->
 

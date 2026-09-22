@@ -1,0 +1,32 @@
+# In-stream LLM rewriting: classify support tickets with a chat model and
+# print the original text plus the model's category. The api_key uses a
+# secret reference — never commit real keys.
+logging:
+  level: info
+streams:
+  - id: support-tagger
+    input:
+      type: memory
+      payload: |
+        [
+          {"text": "My invoice shows two charges for one subscription."},
+          {"text": "The dashboard crashes when I click Export."}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: llm
+          api_base: "http://localhost:9997/v1"
+          model: "gpt-4o-mini"
+          api_key: "${env:OPENAI_API_KEY:-}"
+          field: "text"
+          system_prompt: "Classify the support ticket with a single word: billing, bug, or feature."
+          target_field: "category"
+          temperature: 0
+          concurrency: 4
+        - type: arrow_to_json
+
+    output:
+      type: stdout

@@ -222,6 +222,11 @@
       "name": "embedding-processor",
       "path": "../examples/embedding_processor.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "llm-rewrite-pipeline",
+      "path": "../examples/llm_rewrite_pipeline.yaml",
+      "kind": "yaml"
     }
   ]
 }

@@ -3487,6 +3487,7 @@
             null,
             null,
             null,
+            null,
             null
           ],
           "description": "processor component type."
@@ -3989,6 +3990,146 @@
           },
           "required": [
             "type"
+          ]
+        },
+        {
+          "type": "object",
+          "title": "llm",
+          "description": "Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "llm",
+              "description": "Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "api_base": {
+              "type": "string",
+              "description": "Base URL of the API, e.g. https://api.openai.com/v1 (the request path is {api_base}/chat/completions)."
+            },
+            "model": {
+              "type": "string",
+              "description": "Chat model name, e.g. gpt-4o-mini."
+            },
+            "api_key": {
+              "type": "string",
+              "description": "API key sent as 'Authorization: Bearer'; supports secret references. Omit for unauthenticated endpoints."
+            },
+            "field": {
+              "type": "string",
+              "description": "Name of the input UTF-8 column to send."
+            },
+            "target_field": {
+              "type": "string",
+              "description": "Name of the appended completion column. Defaults to 'response'."
+            },
+            "system_prompt": {
+              "type": "string",
+              "description": "Optional system message prepended to each request."
+            },
+            "prompt_template": {
+              "type": "string",
+              "description": "Optional user-message template; '{{value}}' is replaced with the row text. When omitted the row text is the user message."
+            },
+            "temperature": {
+              "type": "number",
+              "description": "Sampling temperature; omitted from the request when unset."
+            },
+            "max_tokens": {
+              "type": "integer",
+              "description": "Completion token cap; omitted from the request when unset."
+            },
+            "concurrency": {
+              "type": "integer",
+              "description": "Maximum in-flight requests. Defaults to 4."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Extra HTTP headers."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "api_base": "https://api.openai.com/v1",
+              "model": "gpt-4o-mini",
+              "api_key": "${env:OPENAI_API_KEY}",
+              "field": "text",
+              "system_prompt": "You classify support tickets with one word.",
+              "concurrency": 4
+            }
           ]
         },
         {

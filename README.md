@@ -158,6 +158,7 @@ ArkFlow provides multiple data processors:
 - **VRL** (`vrl`): Process data using [VRL](https://vector.dev/docs/reference/vrl/)
 - **Python** (`python`): Run Python user-defined functions over the batch
 - **Embedding** (`embedding`): Batch-embed a text column via an OpenAI-compatible API and append vector columns
+- **LLM** (`llm`): Send each row to an OpenAI-compatible chat completions API with bounded concurrency and append completions
 
 <!-- README_COMPONENTS:processor END -->
 

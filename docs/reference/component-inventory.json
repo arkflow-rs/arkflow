@@ -1834,6 +1834,82 @@
     },
     {
       "kind": "processor",
+      "name": "llm",
+      "description": "Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_base": {
+            "type": "string",
+            "description": "Base URL of the API, e.g. https://api.openai.com/v1 (the request path is {api_base}/chat/completions)."
+          },
+          "model": {
+            "type": "string",
+            "description": "Chat model name, e.g. gpt-4o-mini."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references. Omit for unauthenticated endpoints."
+          },
+          "field": {
+            "type": "string",
+            "description": "Name of the input UTF-8 column to send."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended completion column. Defaults to 'response'."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Optional system message prepended to each request."
+          },
+          "prompt_template": {
+            "type": "string",
+            "description": "Optional user-message template; '{{value}}' is replaced with the row text. When omitted the row text is the user message."
+          },
+          "temperature": {
+            "type": "number",
+            "description": "Sampling temperature; omitted from the request when unset."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "description": "Completion token cap; omitted from the request when unset."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight requests. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "api_base",
+          "model",
+          "field"
+        ]
+      },
+      "config_example": {
+        "api_base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "api_key": "${env:OPENAI_API_KEY}",
+        "field": "text",
+        "system_prompt": "You classify support tickets with one word.",
+        "concurrency": 4
+      }
+    },
+    {
+      "kind": "processor",
       "name": "protobuf_to_arrow",
       "description": "Decodes Protobuf wire-format bytes into Arrow RecordBatches.",
       "config_optional": false,
