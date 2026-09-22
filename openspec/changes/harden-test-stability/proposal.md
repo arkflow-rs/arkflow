@@ -7,7 +7,12 @@
 - `executor/remote.rs` 测试：13 处 5s 断连/abort 传播预算统一提升为 `TEST_PROPAGATION_BUDGET`（30s）——这些等待只观察正常 ~100ms 完成的条件，上限放宽零成本。
 - `two_node_job_smoke.rs`：条件等待 30s → 60s；teardown 全部改为「有界等待 + 显式 abort()」（对齐 fleet_readiness 模式），并给「agent 必须停止」断言 15s 余量。
 - `node_resource_reporting.rs`：无界 `await` teardown 改为有界等待 + abort()。
+- `executor/tests.rs` tick 测试：读门 600ms → 1200ms——原 600ms 门与池内 400ms 延迟在负载下等比拉伸后空闲窗口消失（孤立复现率 ~1/5，孤立复现 6/6 绿），拉大余量修复。
 - 无任何产品行为变更。
+
+## 已知残留
+
+- 全量并行下仍可能有个别负载敏感测试（日志已保留于 /tmp 供事后分析）；本轮已修复全部已定位项并建立确定性 teardown 模式。
 
 ## Capabilities
 

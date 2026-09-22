@@ -3998,8 +3998,11 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                     Arc::new(crate::input::NoopAck),
                 )),
                 1 => {
-                    // Keep the chain alive past the first 100ms ticks.
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    // Keep the chain alive well past the first batch's 400ms
+                    // in-flight window: under a loaded scheduler both sleeps
+                    // stretch together, so this margin is what guarantees an
+                    // idle window in which ticks can actually fire.
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
