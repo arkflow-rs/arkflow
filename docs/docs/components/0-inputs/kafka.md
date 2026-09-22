@@ -21,6 +21,76 @@ The Kafka input consumes messages from one or more Apache Kafka topics using a c
 | fetch_max_bytes | integer | no | — | Maximum bytes returned by a single fetch request |
 | fetch_max_partition_bytes | integer | no | — | Maximum bytes returned per partition in a single fetch |
 | fetch_wait_max_ms | integer | no | — | Maximum time (ms) the broker waits for enough data to accumulate before responding |
+| security | object | no | — | SASL authentication and TLS settings; omit entirely for plaintext. See [Security](#security) |
+
+## Security
+
+The `security` block is identical for the Kafka input and output. The effective protocol is the explicitly declared `protocol`, or — when omitted — inferred from which sub-blocks are present:
+
+| `sasl` block | `tls` block | Inferred protocol |
+|--------------|-------------|-------------------|
+| no | no | `plaintext` (default) |
+| yes | no | `sasl_plaintext` |
+| no | yes | `ssl` |
+| yes | yes | `sasl_ssl` |
+
+| Field | Type | Description |
+|-------|------|-------------|
+| protocol | string | `plaintext` \| `ssl` \| `sasl_plaintext` \| `sasl_ssl`. Explicit declaration wins over inference; contradicting it with a provided sub-block is a configuration error. |
+| sasl.mechanism | string | `plain` \| `scram-sha-256` \| `scram-sha-512` |
+| sasl.username / sasl.password | string | Credentials; required and non-empty for `plain`/`scram-*` mechanisms |
+| tls.ca | string | CA certificate verifying the broker: a file path **or inline PEM text** (auto-detected via the `-----BEGIN` marker) |
+| tls.cert / tls.key | string | Client certificate and private key for mTLS: file path or inline PEM |
+| tls.key_password | string | Password protecting the client private key |
+| tls.insecure_skip_verify | boolean | `true` disables broker certificate verification — development/testing only |
+
+:::warning
+`sasl.username`, `sasl.password`, and `tls.*` values are stored as plain text in the configuration. Guard the configuration file and any control-plane storage accordingly.
+:::
+
+Inconsistent blocks fail fast at configuration validation time (before any stream starts): a `sasl_*` protocol without a `sasl` block, missing SCRAM credentials, or an explicit `plaintext` protocol alongside a `sasl`/`tls` block are all rejected.
+
+```yaml validate=fragment wrap=input
+input:
+  type: "kafka"
+  brokers:
+    - "broker1.example.com:9094"
+  topics:
+    - "events"
+  consumer_group: "arkflow"
+  start_from_latest: false
+  security:
+    protocol: sasl_ssl
+    sasl:
+      mechanism: scram-sha-256
+      username: arkflow
+      password: change-me
+    tls:
+      ca: /etc/arkflow/certs/ca.crt
+```
+
+Inline PEM is accepted wherever a certificate path is — useful when the configuration is managed centrally and no local file exists:
+
+```yaml validate=fragment wrap=input
+input:
+  type: "kafka"
+  brokers:
+    - "broker1.example.com:9094"
+  topics:
+    - "events"
+  consumer_group: "arkflow"
+  start_from_latest: false
+  security:
+    sasl:
+      mechanism: scram-sha-512
+      username: arkflow
+      password: change-me
+    tls:
+      ca: |
+        -----BEGIN CERTIFICATE-----
+        MIID...peer CA certificate...
+        -----END CERTIFICATE-----
+```
 
 ## Examples
 

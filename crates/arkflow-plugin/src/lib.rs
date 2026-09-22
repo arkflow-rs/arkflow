@@ -18,6 +18,7 @@ pub mod component;
 pub mod context_pool;
 pub mod expr;
 pub mod input;
+pub mod kafka_security;
 pub mod output;
 pub mod processor;
 pub mod pulsar;

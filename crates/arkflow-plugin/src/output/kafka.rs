@@ -26,6 +26,7 @@ use arkflow_core::{
 };
 
 use crate::expr::{EvaluateResult, Expr};
+use crate::kafka_security::KafkaSecurityConfig;
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
@@ -81,6 +82,9 @@ struct KafkaOutputConfig {
     /// Transactional id (required when exactly_once is true). Must be stable
     /// across restarts so the broker can fence prior producer epochs.
     transactional_id: Option<String>,
+    /// SASL authentication and TLS settings (optional; absent means
+    /// plaintext, exactly as before this field existed)
+    security: Option<KafkaSecurityConfig>,
 }
 
 /// Map a Kafka transaction error to an `Error`, logging which of rdkafka's
@@ -115,6 +119,56 @@ struct InnerKafkaOutput {
 }
 
 impl KafkaOutput {
+    /// Build the rdkafka `ClientConfig` from the output configuration.
+    ///
+    /// Extracted from `connect()` (mirroring the input side) so the
+    /// transactional and security properties are unit-testable without a
+    /// broker.
+    fn build_client_config(config: &KafkaOutputConfig) -> Result<ClientConfig, Error> {
+        let mut client_config = ClientConfig::new();
+
+        // Configure the Kafka server address
+        client_config.set("bootstrap.servers", config.brokers.join(","));
+
+        // Set the client ID
+        if let Some(client_id) = &config.client_id {
+            client_config.set("client.id", client_id);
+        }
+
+        // Set the compression type
+        if let Some(compression) = &config.compression {
+            client_config.set("compression.type", compression.to_string().to_lowercase());
+        }
+
+        // Set the confirmation level (default to "all" for reliability)
+        if let Some(acks) = &config.acks {
+            client_config.set("acks", acks);
+        }
+
+        let exactly_once = config.exactly_once.unwrap_or(false);
+
+        // Configure the transactional producer when exactly_once is enabled.
+        // Idempotence is implied by transactional.id but set explicitly.
+        if exactly_once {
+            client_config.set(
+                "transactional.id",
+                config
+                    .transactional_id
+                    .as_ref()
+                    .expect(
+                        "transactional_id presence is validated by the builder when exactly_once is on",
+                    ),
+            );
+            client_config.set("enable.idempotence", "true");
+        }
+
+        if let Some(security) = &config.security {
+            security.apply(&mut client_config)?;
+        }
+
+        Ok(client_config)
+    }
+
     /// Create a new Kafka output component
     pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
@@ -168,39 +222,7 @@ impl InnerKafkaOutput {
 #[async_trait]
 impl Output for KafkaOutput {
     async fn connect(&self) -> Result<(), Error> {
-        let mut client_config = ClientConfig::new();
-
-        // Configure the Kafka server address
-        client_config.set("bootstrap.servers", self.config.brokers.join(","));
-
-        // Set the client ID
-        if let Some(client_id) = &self.config.client_id {
-            client_config.set("client.id", client_id);
-        }
-
-        // Set the compression type
-        if let Some(compression) = &self.config.compression {
-            client_config.set("compression.type", compression.to_string().to_lowercase());
-        }
-
-        // Set the confirmation level (default to "all" for reliability)
-        if let Some(acks) = &self.config.acks {
-            client_config.set("acks", acks);
-        }
-
-        let exactly_once = self.config.exactly_once.unwrap_or(false);
-
-        // Configure the transactional producer when exactly_once is enabled.
-        // Idempotence is implied by transactional.id but set explicitly.
-        if exactly_once {
-            client_config.set(
-                "transactional.id",
-                self.config.transactional_id.as_ref().expect(
-                    "transactional_id presence is validated by the builder when exactly_once is on",
-                ),
-            );
-            client_config.set("enable.idempotence", "true");
-        }
+        let client_config = Self::build_client_config(&self.config)?;
 
         // Create a producer
         let producer: FutureProducer = client_config
@@ -208,7 +230,7 @@ impl Output for KafkaOutput {
             .map_err(|e| Error::Connection(format!("A Kafka producer cannot be created: {}", e)))?;
 
         // Initialize transactions once (blocking broker round-trip).
-        if exactly_once {
+        if self.config.exactly_once.unwrap_or(false) {
             let p = producer.clone();
             tokio::task::spawn_blocking(move || {
                 p.init_transactions(Timeout::After(Duration::from_secs(60)))
@@ -491,6 +513,12 @@ impl OutputBuilder for KafkaOutputBuilder {
             }
         }
 
+        // Fail before any stream starts on an inconsistent security block
+        // (spec: 构建期校验与错误语义) — `--validate` reaches this path.
+        if let Some(security) = &config.security {
+            security.validate()?;
+        }
+
         Ok(Arc::new(KafkaOutput::new(config, codec)?))
     }
 }
@@ -512,7 +540,8 @@ pub fn init() -> Result<(), Error> {
                 "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
                 "value_field": {"type": "string", "description": "Record field used as the message payload."},
                 "exactly_once": {"type": "boolean", "default": false, "description": "Enable exactly-once transactional production (L2)."},
-                "transactional_id": {"type": "string", "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."}
+                "transactional_id": {"type": "string", "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."},
+                "security": crate::kafka_security::json_schema()
             },
             "required": ["brokers", "topic"]
         }),
@@ -570,5 +599,71 @@ mod tests {
         let _output = KafkaOutputBuilder
             .build(None, &Some(config), None, &resource())
             .expect("build should succeed; producer is created at connect");
+    }
+
+    fn output_config(json: serde_json::Value) -> KafkaOutputConfig {
+        serde_json::from_value(json).expect("valid output config")
+    }
+
+    /// Regression (spec: 未配置 security 时保持 plaintext): with no
+    /// `security` block the client config must not carry any security/sasl/ssl
+    /// property — behaviour is identical to before the field existed.
+    #[test]
+    fn test_kafka_output_without_security_sets_no_security_properties() {
+        let config = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"}
+        }));
+        let client_config = KafkaOutput::build_client_config(&config).unwrap();
+        assert_eq!(client_config.get("bootstrap.servers"), Some("localhost:9092"));
+        for key in client_config.config_map().keys() {
+            assert!(
+                !key.starts_with("security.")
+                    && !key.starts_with("sasl.")
+                    && !key.starts_with("ssl."),
+                "unexpected security property without a security block: {key}"
+            );
+        }
+    }
+
+    /// Spec: 统一安全配置块 + SASL/TLS 装配 — the same security shape as the
+    /// input assembles the same librdkafka properties on the output side.
+    #[test]
+    fn test_kafka_output_assembles_sasl_ssl_properties() {
+        let ca_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        let config = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"},
+            "security": {
+                "protocol": "sasl_ssl",
+                "sasl": {"mechanism": "scram-sha-256", "username": "alice", "password": "secret"},
+                "tls": {"ca": ca_pem, "insecure_skip_verify": false}
+            }
+        }));
+        let client_config = KafkaOutput::build_client_config(&config).unwrap();
+        assert_eq!(client_config.get("security.protocol"), Some("sasl_ssl"));
+        assert_eq!(client_config.get("sasl.mechanisms"), Some("SCRAM-SHA-256"));
+        assert_eq!(client_config.get("sasl.username"), Some("alice"));
+        assert_eq!(client_config.get("sasl.password"), Some("secret"));
+        assert_eq!(client_config.get("ssl.ca.pem"), Some(ca_pem));
+    }
+
+    /// Spec: 构建期校验与错误语义 — the builder rejects an inconsistent
+    /// security block before any component is constructed (offline).
+    #[test]
+    fn test_kafka_output_builder_rejects_inconsistent_security() {
+        let config = serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"},
+            "security": {"sasl": {"mechanism": "scram-sha-512", "username": "u"}}
+        });
+        let err = match KafkaOutputBuilder.build(None, &Some(config), None, &resource()) {
+            Ok(_) => panic!("scram without a password must fail at build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("security.sasl.password"),
+            "expected the error to name security.sasl.password, got: {err}"
+        );
     }
 }

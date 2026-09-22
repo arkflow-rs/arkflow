@@ -197,6 +197,16 @@
       "kind": "yaml",
       "validate": false,
       "reason": "The legacy join buffer cannot compile to the unified kernel by design; the file is kept as a migration reference pointing to the Job DAG join operator."
+    },
+    {
+      "name": "kafka-input-sasl-ssl",
+      "path": "../examples/kafka_input_sasl_ssl.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "kafka-output-sasl-ssl",
+      "path": "../examples/kafka_output_sasl_ssl.yaml",
+      "kind": "yaml"
     }
   ]
 }

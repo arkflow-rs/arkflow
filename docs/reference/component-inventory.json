@@ -183,6 +183,75 @@
             "type": "integer",
             "minimum": 0,
             "description": "Maximum time to wait for fetch data in milliseconds."
+          },
+          "security": {
+            "type": "object",
+            "description": "SASL authentication and TLS settings. Omit entirely for plaintext.",
+            "properties": {
+              "protocol": {
+                "type": "string",
+                "enum": [
+                  "plaintext",
+                  "ssl",
+                  "sasl_plaintext",
+                  "sasl_ssl"
+                ],
+                "description": "Security protocol. Defaults to inferred from which sub-blocks are present: both -> sasl_ssl, only sasl -> sasl_plaintext, only tls -> ssl, neither -> plaintext."
+              },
+              "sasl": {
+                "type": "object",
+                "description": "SASL credentials (PLAIN or SCRAM).",
+                "properties": {
+                  "mechanism": {
+                    "type": "string",
+                    "enum": [
+                      "plain",
+                      "scram-sha-256",
+                      "scram-sha-512"
+                    ],
+                    "description": "SASL mechanism."
+                  },
+                  "username": {
+                    "type": "string",
+                    "description": "SASL username (required for plain/scram)."
+                  },
+                  "password": {
+                    "type": "string",
+                    "description": "SASL password (required for plain/scram)."
+                  }
+                },
+                "required": [
+                  "mechanism"
+                ]
+              },
+              "tls": {
+                "type": "object",
+                "description": "TLS settings. ca/cert/key accept a file path or inline PEM text (auto-detected).",
+                "properties": {
+                  "ca": {
+                    "type": "string",
+                    "description": "CA certificate for verifying the broker: file path or inline PEM."
+                  },
+                  "cert": {
+                    "type": "string",
+                    "description": "Client certificate for mTLS: file path or inline PEM."
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Client private key for mTLS: file path or inline PEM."
+                  },
+                  "key_password": {
+                    "type": "string",
+                    "description": "Password protecting the client private key."
+                  },
+                  "insecure_skip_verify": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable broker certificate verification. Development/testing only."
+                  }
+                }
+              }
+            }
           }
         },
         "required": [
@@ -1033,6 +1102,75 @@
           "transactional_id": {
             "type": "string",
             "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."
+          },
+          "security": {
+            "type": "object",
+            "description": "SASL authentication and TLS settings. Omit entirely for plaintext.",
+            "properties": {
+              "protocol": {
+                "type": "string",
+                "enum": [
+                  "plaintext",
+                  "ssl",
+                  "sasl_plaintext",
+                  "sasl_ssl"
+                ],
+                "description": "Security protocol. Defaults to inferred from which sub-blocks are present: both -> sasl_ssl, only sasl -> sasl_plaintext, only tls -> ssl, neither -> plaintext."
+              },
+              "sasl": {
+                "type": "object",
+                "description": "SASL credentials (PLAIN or SCRAM).",
+                "properties": {
+                  "mechanism": {
+                    "type": "string",
+                    "enum": [
+                      "plain",
+                      "scram-sha-256",
+                      "scram-sha-512"
+                    ],
+                    "description": "SASL mechanism."
+                  },
+                  "username": {
+                    "type": "string",
+                    "description": "SASL username (required for plain/scram)."
+                  },
+                  "password": {
+                    "type": "string",
+                    "description": "SASL password (required for plain/scram)."
+                  }
+                },
+                "required": [
+                  "mechanism"
+                ]
+              },
+              "tls": {
+                "type": "object",
+                "description": "TLS settings. ca/cert/key accept a file path or inline PEM text (auto-detected).",
+                "properties": {
+                  "ca": {
+                    "type": "string",
+                    "description": "CA certificate for verifying the broker: file path or inline PEM."
+                  },
+                  "cert": {
+                    "type": "string",
+                    "description": "Client certificate for mTLS: file path or inline PEM."
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Client private key for mTLS: file path or inline PEM."
+                  },
+                  "key_password": {
+                    "type": "string",
+                    "description": "Password protecting the client private key."
+                  },
+                  "insecure_skip_verify": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable broker certificate verification. Development/testing only."
+                  }
+                }
+              }
+            }
           }
         },
         "required": [

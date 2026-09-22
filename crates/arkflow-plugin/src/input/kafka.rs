@@ -25,6 +25,8 @@ use arkflow_core::executor::commit::{AckAdvance, CommitFrontier};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
+
+use crate::kafka_security::KafkaSecurityConfig;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -58,6 +60,9 @@ pub struct KafkaInputConfig {
     pub fetch_max_partition_bytes: Option<u32>,
     /// Fetch wait max milliseconds
     pub fetch_wait_max_ms: Option<u64>,
+    /// SASL authentication and TLS settings (optional; absent means
+    /// plaintext, exactly as before this field existed)
+    pub security: Option<KafkaSecurityConfig>,
 }
 
 /// Kafka input component
@@ -222,8 +227,9 @@ impl KafkaInput {
     /// Build the rdkafka `ClientConfig` from the input configuration.
     ///
     /// Extracted from `connect()` so the crash-safety settings (notably
-    /// `enable.auto.offset.store=false`) are unit-testable without a broker.
-    fn build_client_config(&self) -> ClientConfig {
+    /// `enable.auto.offset.store=false`) and the security properties are
+    /// unit-testable without a broker.
+    fn build_client_config(&self) -> Result<ClientConfig, Error> {
         let mut client_config = ClientConfig::new();
 
         // Configure the Kafka server address
@@ -279,14 +285,18 @@ impl KafkaInput {
         // stored — i.e. only acked messages.
         client_config.set("enable.auto.offset.store", "false");
 
-        client_config
+        if let Some(security) = &self.config.security {
+            security.apply(&mut client_config)?;
+        }
+
+        Ok(client_config)
     }
 }
 
 #[async_trait]
 impl Input for KafkaInput {
     async fn connect(&self) -> Result<(), Error> {
-        let client_config = self.build_client_config();
+        let client_config = self.build_client_config()?;
 
         // Create consumers
         let consumer: StreamConsumer = client_config
@@ -987,6 +997,11 @@ impl InputBuilder for KafkaInputBuilder {
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
         let kafka_config: KafkaInputConfig = parse_config(config, "Kafka input")?;
+        // Fail before any stream starts on an inconsistent security block
+        // (spec: 构建期校验与错误语义) — `--validate` reaches this path.
+        if let Some(security) = &kafka_config.security {
+            security.validate()?;
+        }
         Ok(Arc::new(KafkaInput::new(name, kafka_config, codec)?))
     }
 }
@@ -1008,7 +1023,8 @@ pub fn init() -> Result<(), Error> {
                 "fetch_min_bytes": {"type": "integer", "minimum": 0, "description": "Minimum bytes before the broker responds to a fetch request."},
                 "fetch_max_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes for a fetch request."},
                 "fetch_max_partition_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes per partition in a fetch request."},
-                "fetch_wait_max_ms": {"type": "integer", "minimum": 0, "description": "Maximum time to wait for fetch data in milliseconds."}
+                "fetch_wait_max_ms": {"type": "integer", "minimum": 0, "description": "Maximum time to wait for fetch data in milliseconds."},
+                "security": crate::kafka_security::json_schema()
             },
             "required": ["brokers", "topics", "consumer_group"]
         }),
@@ -1091,6 +1107,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
 
         let input = KafkaInput::new(None, config, None);
@@ -1116,6 +1133,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
 
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1142,6 +1160,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
 
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1183,6 +1202,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
         let frontier = input.frontier.clone();
@@ -1235,6 +1255,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
         // Seed directly (restore_positions itself needs a broker for
@@ -1279,6 +1300,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
         input
@@ -1319,6 +1341,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
         input
@@ -1507,6 +1530,7 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
         input.frontier.anchor_delivery(&SourcePosition {
@@ -1549,13 +1573,115 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
-        let client_config = input.build_client_config();
+        let client_config = input.build_client_config().unwrap();
         assert_eq!(
             client_config.get("enable.auto.offset.store"),
             Some("false"),
             "auto offset store MUST be disabled so offsets advance only on ack (at-least-once)"
+        );
+    }
+
+    /// Regression (spec: 未配置 security 时保持 plaintext): with no
+    /// `security` block the client config must not carry any security/sasl/ssl
+    /// property — behaviour is byte-identical to before the field existed.
+    #[test]
+    fn test_kafka_input_without_security_sets_no_security_properties() {
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: false,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+            security: None,
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        let client_config = input.build_client_config().unwrap();
+        for key in client_config.config_map().keys() {
+            assert!(
+                !key.starts_with("security.")
+                    && !key.starts_with("sasl.")
+                    && !key.starts_with("ssl."),
+                "unexpected security property without a security block: {key}"
+            );
+        }
+    }
+
+    /// Spec: 统一安全配置块 + SASL/TLS 装配 — SCRAM over TLS with an inline
+    /// PEM CA flows from the YAML-shaped config into librdkafka properties.
+    #[test]
+    fn test_kafka_input_assembles_sasl_ssl_properties() {
+        let ca_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        let config = KafkaInputConfig {
+            brokers: vec!["localhost:9092".to_string()],
+            topics: vec!["test-topic".to_string()],
+            consumer_group: "test-group".to_string(),
+            client_id: None,
+            start_from_latest: false,
+            fetch_min_bytes: None,
+            fetch_max_bytes: None,
+            fetch_max_partition_bytes: None,
+            fetch_wait_max_ms: None,
+            security: Some(crate::kafka_security::KafkaSecurityConfig {
+                protocol: None,
+                sasl: Some(crate::kafka_security::SaslConfig {
+                    mechanism: crate::kafka_security::SaslMechanism::ScramSha256,
+                    username: Some("alice".to_string()),
+                    password: Some("secret".to_string()),
+                }),
+                tls: Some(crate::kafka_security::TlsConfig {
+                    ca: Some(ca_pem.to_string()),
+                    cert: None,
+                    key: None,
+                    key_password: None,
+                    insecure_skip_verify: None,
+                }),
+            }),
+        };
+        let input = KafkaInput::new(None, config, None).unwrap();
+        let client_config = input.build_client_config().unwrap();
+        // sasl + tls with no explicit protocol infers sasl_ssl.
+        assert_eq!(client_config.get("security.protocol"), Some("sasl_ssl"));
+        assert_eq!(client_config.get("sasl.mechanisms"), Some("SCRAM-SHA-256"));
+        assert_eq!(client_config.get("sasl.username"), Some("alice"));
+        assert_eq!(client_config.get("sasl.password"), Some("secret"));
+        assert_eq!(client_config.get("ssl.ca.pem"), Some(ca_pem));
+    }
+
+    /// Spec: 构建期校验与错误语义 — the builder rejects an inconsistent
+    /// security block before any component is constructed (offline).
+    #[test]
+    fn test_kafka_input_builder_rejects_inconsistent_security() {
+        let config = serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topics": ["t"],
+            "consumer_group": "g",
+            "start_from_latest": false,
+            "security": {"protocol": "sasl_ssl"}
+        });
+        let err = match KafkaInputBuilder.build(
+            None,
+            &Some(config),
+            None,
+            &Resource {
+                temporary: HashMap::new(),
+                input_names: Default::default(),
+            },
+        ) {
+            Ok(_) => {
+                panic!("sasl_ssl without a sasl block must fail at build")
+            }
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("security.sasl"),
+            "expected the error to name security.sasl, got: {err}"
         );
     }
 
@@ -1591,6 +1717,7 @@ mod tests {
                 fetch_max_bytes: None,
                 fetch_max_partition_bytes: None,
                 fetch_wait_max_ms: None,
+                security: None,
             }
         }
 
