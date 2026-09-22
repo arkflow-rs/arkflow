@@ -56,7 +56,7 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
     let hub_cancel = CancellationToken::new();
     let server_hub = hub.clone();
     let server_cancel = hub_cancel.clone();
-    let hub_task = tokio::spawn(async move {
+    let mut hub_task = tokio::spawn(async move {
         axum::serve(
             listener,
             hub_router(server_hub, &ServerConfig::default()).into_make_service(),
@@ -66,7 +66,7 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
     });
 
     let agent_cancel = CancellationToken::new();
-    let agent_task = tokio::spawn(agent::run(
+    let mut agent_task = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: format!("http://{address}"),
@@ -150,6 +150,11 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
 
     agent_cancel.cancel();
     hub_cancel.cancel();
-    let _ = agent_task.await;
-    let _ = hub_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut hub_task).await;
+    // Deterministic teardown: a pending task polled during runtime drop can
+    // panic and abort the test binary after the summary printed, so abort
+    // anything the cancellation did not stop in time.
+    agent_task.abort();
+    hub_task.abort();
 }

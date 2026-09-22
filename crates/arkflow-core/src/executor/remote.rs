@@ -2441,6 +2441,13 @@ async fn pump_edge(
 
 #[cfg(test)]
 mod tests {
+    /// Polling budgets for asynchronous disconnect/abort propagation.
+    /// Under a fully parallel workspace test run, tokio timers can lag
+    /// several seconds; these waits only observe conditions that normally
+    /// complete within a tick (~100ms), so a generous ceiling costs nothing
+    /// when everything is healthy and keeps loaded CI stable.
+    const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
     use super::*;
     use crate::input::Ack as _;
     use datafusion::arrow::array::{DictionaryArray, Int64Array};
@@ -2695,7 +2702,7 @@ mod tests {
     }
 
     async fn next_envelope(rx: &flume::Receiver<Envelope>) -> Envelope {
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, rx.recv_async())
             .await
             .expect("envelope within timeout")
             .expect("channel open")
@@ -2739,7 +2746,7 @@ mod tests {
         };
         assert_eq!(batch.get_input_name(), Some("authenticated".into()));
         ack.ack().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -2997,7 +3004,7 @@ mod tests {
         // Downstream processes: acking the RemoteAck mirrors the receipt back
         // and completes the upstream branch.
         ack.ack().await.expect("remote ack");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3047,7 +3054,7 @@ mod tests {
         };
         ack2.mark_held();
         ack2.release_held();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch2.held.load(std::sync::atomic::Ordering::SeqCst)
                 || !branch2.released.load(std::sync::atomic::Ordering::SeqCst)
             {
@@ -3100,14 +3107,14 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !rejected.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("the batch rejected by the pending limit must be aborted");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !first.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -3115,7 +3122,7 @@ mod tests {
         .await
         .expect("the already pending batch must be aborted with the edge");
         let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
                 .await
                 .expect("pending limit failure within timeout")
                 .unwrap();
@@ -3155,7 +3162,7 @@ mod tests {
         // branch aborts, and the failure surfaces on the manager.
         downstream.shutdown();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3167,7 +3174,7 @@ mod tests {
             "an aborted branch must never complete its source ack"
         );
         let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
                 .await
                 .expect("failure within timeout")
                 .expect("failure channel open");
@@ -3176,7 +3183,7 @@ mod tests {
         );
 
         // The edge channel sender fails for new sends after the pump exits.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             loop {
                 let branch_retry = std::sync::Arc::new(RecordingAck::default());
                 if edge
@@ -3259,7 +3266,7 @@ mod tests {
         // Draining the consumer releases the pressure: the pending send
         // completes once the downstream channel accepts frames again.
         let mut received = 0;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while received < 1 {
                 if input_rx.try_recv().is_ok() {
                     received += 1;
@@ -3376,7 +3383,7 @@ mod tests {
         upstream.shutdown();
 
         let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
                 .await
                 .expect("failure within timeout")
                 .expect("failure channel open");
@@ -3449,7 +3456,7 @@ mod tests {
         };
         assert_eq!(batch.get_input_name(), Some("tcp".to_owned()));
         ack.ack().await.expect("ack");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

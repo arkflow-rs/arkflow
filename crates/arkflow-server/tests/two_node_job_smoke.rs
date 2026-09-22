@@ -147,8 +147,10 @@ where
     static WAIT_INDEX: AtomicUsize = AtomicUsize::new(0);
     let wait_index = WAIT_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
     // Generous under load: the full workspace suite runs other binaries on
-    // the same machine, and cold caches can stretch kernel startup.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // the same machine, and cold caches can stretch kernel startup. A full
+    // restart-recovery round trip (re-register, recovery, dispatch, run,
+    // complete) has been observed to exceed 30s under that load.
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if condition().await {
                 return;
@@ -184,7 +186,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let hub_cancel = CancellationToken::new();
     let server_hub = hub.clone();
     let server_cancel = hub_cancel.clone();
-    let hub_task = tokio::spawn(async move {
+    let mut hub_task = tokio::spawn(async move {
         axum::serve(
             listener,
             hub_router(server_hub, &ServerConfig::default()).into_make_service(),
@@ -195,7 +197,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let reconcile_cancel = CancellationToken::new();
     let reconcile_hub = hub.clone();
     let reconcile_stop = reconcile_cancel.clone();
-    let reconcile_task = tokio::spawn(async move {
+    let mut reconcile_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
@@ -210,7 +212,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let hub_url = format!("http://{}", address);
     let cancel_a = CancellationToken::new();
     let cancel_b = CancellationToken::new();
-    let agent_a = tokio::spawn(agent::run(
+    let mut agent_a = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
@@ -226,7 +228,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         },
         cancel_a.clone(),
     ));
-    let agent_b = tokio::spawn(agent::run(
+    let mut agent_b = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
@@ -317,14 +319,14 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     // must fence the old start attempt, dispatch the checkpoint recovery, and
     // converge both assignments again.
     cancel_a.cancel();
-    tokio::time::timeout(Duration::from_secs(5), agent_a)
+    tokio::time::timeout(Duration::from_secs(15), &mut agent_a)
         .await
         .expect("node-a agent did not stop")
         .unwrap()
         .unwrap();
 
     let cancel_a_restart = CancellationToken::new();
-    let restarted_a = tokio::spawn(agent::run(
+    let mut restarted_a = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url,
@@ -369,12 +371,18 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
 
     cancel_a_restart.cancel();
     cancel_b.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), restarted_a).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), agent_b).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut restarted_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_b).await;
+    // Deterministic teardown: a task that ignored its cancellation token
+    // must not outlive the test. A pending task polled during runtime drop
+    // can panic and abort the whole test binary *after* the summary printed
+    // (exit 101 with an all-green log), so abort anything left over.
+    restarted_a.abort();
+    agent_b.abort();
     reconcile_cancel.cancel();
-    let _ = reconcile_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), reconcile_task).await;
     hub_cancel.cancel();
-    let _ = hub_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }
 
 /// Split placement end to end: the source runs on node-a, the sink on
@@ -417,7 +425,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let hub_cancel = CancellationToken::new();
     let server_hub = hub.clone();
     let server_cancel = hub_cancel.clone();
-    let hub_task = tokio::spawn(async move {
+    let mut hub_task = tokio::spawn(async move {
         axum::serve(
             listener,
             hub_router(server_hub, &ServerConfig::default()).into_make_service(),
@@ -428,7 +436,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let reconcile_cancel = CancellationToken::new();
     let reconcile_hub = hub.clone();
     let reconcile_stop = reconcile_cancel.clone();
-    let reconcile_task = tokio::spawn(async move {
+    let mut reconcile_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
@@ -448,7 +456,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let data_plane_secret = "split-data-plane-secret".to_string();
     let cancel_a = CancellationToken::new();
     let cancel_b = CancellationToken::new();
-    let agent_a = tokio::spawn(agent::run(
+    let mut agent_a = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
@@ -464,7 +472,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         },
         cancel_a.clone(),
     ));
-    let agent_b = tokio::spawn(agent::run(
+    let mut agent_b = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
@@ -573,10 +581,13 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
 
     cancel_a.cancel();
     cancel_b.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), agent_a).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), agent_b).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_b).await;
+    // See the teardown note above: nothing may outlive the test.
+    agent_a.abort();
+    agent_b.abort();
     reconcile_cancel.cancel();
-    let _ = reconcile_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), reconcile_task).await;
     hub_cancel.cancel();
-    let _ = hub_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }
