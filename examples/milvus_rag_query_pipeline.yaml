@@ -1,0 +1,35 @@
+# RAG query against Milvus: embed the incoming question, retrieve the
+# top-k nearest documents in one batched request, and print the matches.
+# Prerequisite: documents already ingested (see
+# examples/embedding_milvus_pipeline.yaml).
+logging:
+  level: info
+streams:
+  - id: milvus-rag-query
+    input:
+      type: memory
+      payload: |
+        [
+          {"text": "What is ArkFlow?"}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+        - type: milvus_search
+          url: "http://localhost:19530"
+          collection: documents
+          vector_field: embedding
+          id_field: doc_id
+          metric: COSINE
+          top_k: 5
+        - type: arrow_to_json
+
+    output:
+      type: stdout

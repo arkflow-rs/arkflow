@@ -247,6 +247,11 @@
       "name": "pgvector-rag-query-pipeline",
       "path": "../examples/pgvector_rag_query_pipeline.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "milvus-rag-query-pipeline",
+      "path": "../examples/milvus_rag_query_pipeline.yaml",
+      "kind": "yaml"
     }
   ]
 }

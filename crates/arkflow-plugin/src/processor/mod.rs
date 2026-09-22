@@ -22,6 +22,7 @@ pub mod batch;
 pub mod embedding;
 pub mod json;
 pub mod llm;
+pub mod milvus_search;
 pub mod pgvector_search;
 pub mod protobuf;
 pub mod python;
@@ -40,5 +41,6 @@ pub fn init() -> Result<(), Error> {
     python::init()?;
     embedding::init()?;
     vector_search::init()?;
+    milvus_search::init()?;
     Ok(())
 }

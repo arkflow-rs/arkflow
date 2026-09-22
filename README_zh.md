@@ -158,6 +158,7 @@ ArkFlow提供多种数据处理器：
 - **Embedding** (`embedding`)：通过 OpenAI 兼容 API 批量向量化文本列并追加向量列
 - **LLM** (`llm`)：以有界并发将每行文本发送到 OpenAI 兼容对话补全 API 并追加补全列
 - **Vector Search** (`vector_search`)：在 Qdrant 集合中检索每行向量的 top-k 近邻并以 JSON 追加匹配结果
+- **Milvus Search** (`milvus_search`)：以单次批量请求在 Milvus 集合中检索每行向量的 top-k 近邻
 - **pgvector Search** (`pgvector_search`)：在启用了 pgvector 扩展的 PostgreSQL 表中检索每行向量的 top-k 近邻
 
 <!-- README_COMPONENTS:processor END -->

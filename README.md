@@ -160,6 +160,7 @@ ArkFlow provides multiple data processors:
 - **Embedding** (`embedding`): Batch-embed a text column via an OpenAI-compatible API and append vector columns
 - **LLM** (`llm`): Send each row to an OpenAI-compatible chat completions API with bounded concurrency and append completions
 - **Vector Search** (`vector_search`): Search a Qdrant collection for top-k nearest neighbors of each row's vector and append matches as JSON
+- **Milvus Search** (`milvus_search`): Search a Milvus collection for top-k nearest neighbors of each row's vector with one batched request
 - **pgvector Search** (`pgvector_search`): Search a PostgreSQL table with the pgvector extension for top-k nearest neighbors of each row's vector
 
 <!-- README_COMPONENTS:processor END -->

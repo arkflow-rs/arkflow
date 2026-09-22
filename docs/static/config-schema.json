@@ -3730,6 +3730,7 @@
             null,
             null,
             null,
+            null,
             null
           ],
           "description": "processor component type."
@@ -4371,6 +4372,146 @@
               "field": "text",
               "system_prompt": "You classify support tickets with one word.",
               "concurrency": 4
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "milvus_search",
+          "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "milvus_search",
+              "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "Milvus base URL, e.g. http://localhost:19530."
+            },
+            "collection": {
+              "type": "string",
+              "description": "Collection to search."
+            },
+            "vector_field": {
+              "type": "string",
+              "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+            },
+            "target_field": {
+              "type": "string",
+              "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+            },
+            "id_field": {
+              "type": "string",
+              "description": "Collection field returned as the match id. When omitted the id key is left out (auto-id collections)."
+            },
+            "payload_field": {
+              "type": "string",
+              "description": "Collection field included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+            },
+            "metric": {
+              "type": "string",
+              "enum": [
+                "COSINE",
+                "L2",
+                "IP"
+              ],
+              "description": "Metric type; must match the collection schema. Defaults to COSINE."
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "Number of neighbors per row. Defaults to 5."
+            },
+            "api_key": {
+              "type": "string",
+              "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Extra HTTP headers."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "http://localhost:19530",
+              "collection": "documents",
+              "vector_field": "embedding",
+              "id_field": "doc_id",
+              "top_k": 5
             }
           ]
         },

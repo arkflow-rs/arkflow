@@ -2018,6 +2018,81 @@
     },
     {
       "kind": "processor",
+      "name": "milvus_search",
+      "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Milvus base URL, e.g. http://localhost:19530."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Collection to search."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Collection field returned as the match id. When omitted the id key is left out (auto-id collections)."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "Collection field included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "COSINE",
+              "L2",
+              "IP"
+            ],
+            "description": "Metric type; must match the collection schema. Defaults to COSINE."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:19530",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id",
+        "top_k": 5
+      }
+    },
+    {
+      "kind": "processor",
       "name": "pgvector_search",
       "description": "Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
       "config_optional": false,
