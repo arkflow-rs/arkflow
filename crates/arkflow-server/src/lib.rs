@@ -23,6 +23,7 @@ use arkflow_core::control::{ApiError, Page};
 use arkflow_core::control_plane::ControlPlane;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, Query, State};
+use subtle::ConstantTimeEq;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -450,8 +451,15 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/agent/report", post(agent_report))
         .route("/agent/job-observations", post(agent_job_observation))
         .route("/agent/commands", get(agent_commands))
-        .route("/agent/commands/{id}/result", post(agent_command_result))
-        .with_state(hub.clone());
+        .route("/agent/commands/{id}/result", post(agent_command_result));
+    let api = if hub.oidc_login().is_some() {
+        api.route("/auth/oidc/login", get(hub_oidc_login))
+            .route("/auth/oidc/callback", get(hub_oidc_callback))
+            .route("/auth/oidc/logout", get(hub_oidc_logout))
+    } else {
+        api
+    }
+    .with_state(hub.clone());
     let app = Router::new()
         .route(&config.health_path, get(hub_health))
         .route(&config.readiness_path, get(hub_readiness))
@@ -575,7 +583,7 @@ pub async fn serve_hub(
 }
 
 async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -593,7 +601,7 @@ async fn hub_nodes(
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -608,7 +616,7 @@ async fn hub_streams(
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -645,7 +653,7 @@ async fn hub_stream(
     Path((node_id, stream_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -673,7 +681,7 @@ async fn hub_stream(
 }
 
 async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -701,7 +709,7 @@ async fn hub_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -724,7 +732,7 @@ async fn hub_job_plan(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -837,7 +845,7 @@ async fn hub_job_checkpoints(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -936,7 +944,7 @@ async fn hub_job_detail(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1037,7 +1045,7 @@ async fn hub_job_versions(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1569,7 +1577,7 @@ async fn hub_configuration(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1591,7 +1599,7 @@ async fn hub_configuration_versions(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2078,7 +2086,7 @@ async fn hub_operations(
     Query(query): Query<OperationQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2113,7 +2121,7 @@ async fn hub_operation(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2161,7 +2169,7 @@ async fn hub_events(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2199,7 +2207,7 @@ async fn hub_event_stream(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2303,7 +2311,7 @@ async fn hub_audit(
     Query(query): Query<AuditQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2364,7 +2372,7 @@ async fn create_rollout(
 }
 
 async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2382,7 +2390,7 @@ async fn hub_rollout(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2450,7 +2458,7 @@ async fn hub_metrics(
     Query(_query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2543,7 +2551,7 @@ async fn hub_metrics(
 }
 
 async fn hub_operational_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)).await {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2798,11 +2806,126 @@ async fn hub_liveness() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive","alive":true}))
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+pub(crate) async fn hub_oidc_login(State(hub): State<hub::Hub>) -> Response {
+    let Some(federation) = hub.oidc_login() else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "OIDC login is not enabled".into(),
+        );
+    };
+    use rand::TryRngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness");
+    let state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let location = federation.authorization_redirect(&state);
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .header(
+            header::SET_COOKIE,
+            format!("arkflow_oidc_state={state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+pub(crate) async fn hub_oidc_callback(
+    State(hub): State<hub::Hub>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(federation) = hub.oidc_login() else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "OIDC login is not enabled".into(),
+        );
+    };
+    let unauthorized = || {
+        problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "OIDC login failed".into(),
+        )
+    };
+    let Some(expected_state) = cookie_value(&headers, "arkflow_oidc_state") else {
+        return unauthorized();
+    };
+    let Some(supplied_state) = params.get("state") else {
+        return unauthorized();
+    };
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        expected_state.as_bytes().ct_eq(supplied_state.as_bytes()),
+    ) {
+        return unauthorized();
+    }
+    let Some(code) = params.get("code") else {
+        return unauthorized();
+    };
+    let Some(id_token) = federation.exchange_code(code).await else {
+        return unauthorized();
+    };
+    let Some(principal) = federation.authenticate(&id_token).await else {
+        return unauthorized();
+    };
+    let session_id = federation.create_session(principal);
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/")
+        .header(
+            header::SET_COOKIE,
+            format!(
+                "arkflow_session={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800"
+            ),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+pub(crate) async fn hub_oidc_logout(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Some(token) = bearer(&headers) {
+        if let Some(session_id) = token.strip_prefix("session:") {
+            if let Some(federation) = hub.oidc_login() {
+                federation.remove_session(session_id);
+            }
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::SET_COOKIE,
+            "arkflow_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        pair.strip_prefix(&format!("{name}="))
+            .map(str::to_string)
+    })
+}
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) {
+        return value.strip_prefix("Bearer ").map(str::to_string);
+    }
+    // Browser sessions authenticate with the OIDC login cookie; expose it
+    // through the same credential channel with an explicit prefix so the
+    // authorization path can tell the two apart.
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        let sid = pair.strip_prefix("arkflow_session=")?;
+        Some(format!("session:{sid}"))
+    })
 }
 
 fn prometheus_label(value: &str) -> String {
@@ -2813,8 +2936,8 @@ fn prometheus_label(value: &str) -> String {
         .collect()
 }
 
-async fn operator_denied(hub: &hub::Hub, supplied: Option<&str>, action: OperatorAction) -> Response {
-    if hub.operator_principal(supplied).await.is_none() {
+async fn operator_denied(hub: &hub::Hub, supplied: Option<String>, action: OperatorAction) -> Response {
+    if hub.operator_principal(supplied.as_deref()).await.is_none() {
         problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2837,7 +2960,7 @@ async fn require_operator_action(
     resource_id: Option<String>,
 ) -> Result<OperatorPrincipal, Response> {
     let supplied = bearer(headers);
-    let principal = hub.operator_principal(supplied).await;
+    let principal = hub.operator_principal(supplied.as_deref()).await;
     if principal
         .as_ref()
         .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id.as_deref()))

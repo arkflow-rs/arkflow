@@ -388,7 +388,7 @@ pub struct Hub {
     command_metrics: Arc<CommandMetrics>,
     /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
     /// operator credentials keep priority when both are configured.
-    oidc: Option<crate::oidc::OidcAuthenticator>,
+    oidc: Option<Arc<crate::oidc::OidcFederation>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -553,11 +553,17 @@ impl Hub {
         hub
     }
 
-    /// Enables OIDC JWT bearer principals (in addition to the static
-    /// operator credential). See `crate::oidc`.
-    pub fn with_oidc(mut self, oidc: crate::oidc::OidcAuthenticator) -> Self {
+    /// Enables OIDC JWT bearer principals and (when client credentials are
+    /// configured) the browser login flow. See `crate::oidc`.
+    pub fn with_oidc(mut self, oidc: Arc<crate::oidc::OidcFederation>) -> Self {
         self.oidc = Some(oidc);
         self
+    }
+
+    /// The federation when the browser login flow is enabled.
+    pub fn oidc_login(&self) -> Option<Arc<crate::oidc::OidcFederation>> {
+        let federation = self.oidc.as_ref()?;
+        federation.login_enabled().then(|| federation.clone())
     }
 
     pub fn has_storage(&self) -> bool {
@@ -2528,10 +2534,14 @@ impl Hub {
         }
 
         // Static credentials did not match (or are absent); fall back to
-        // OIDC JWT validation when federation is configured.
-        let authenticator = self.oidc.as_ref()?;
+        // browser session cookies and OIDC JWT validation when federation
+        // is configured.
+        let federation = self.oidc.as_ref()?;
         let token = supplied?;
-        authenticator.authenticate(token).await
+        if let Some(session_id) = token.strip_prefix("session:") {
+            return federation.resolve_session(session_id);
+        }
+        federation.authenticate(token).await
     }
 
     pub async fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {

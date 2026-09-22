@@ -65,18 +65,6 @@ impl OidcAuthenticator {
     /// `Some` only when both `ARKFLOW_OIDC_ISSUER` and
     /// `ARKFLOW_OIDC_AUDIENCE` are set — an unconfigured Hub behaves
     /// exactly as before.
-    pub fn from_env() -> Option<Self> {
-        let issuer = non_empty("ARKFLOW_OIDC_ISSUER")?;
-        let audience = non_empty("ARKFLOW_OIDC_AUDIENCE")?;
-        let jwks_url = std::env::var("ARKFLOW_OIDC_JWKS_URL").ok().filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| format!("{}/.well-known/jwks.json", issuer.trim_end_matches('/')));
-        let role_claim = std::env::var("ARKFLOW_OIDC_ROLE_CLAIM").ok().filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "roles".to_string());
-        let scopes_claim = std::env::var("ARKFLOW_OIDC_SCOPES_CLAIM").ok().filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "scopes".to_string());
-        Some(Self::new(issuer, audience, jwks_url, role_claim, scopes_claim))
-    }
-
     pub fn new(issuer: String, audience: String, jwks_url: String, role_claim: String, scopes_claim: String) -> Self {
         Self {
             issuer,
@@ -170,6 +158,261 @@ impl OidcAuthenticator {
             fetched_at: Instant::now(),
         })
     }
+}
+
+/// Federation facade: the JWT authenticator plus optional browser
+/// authorization-code login (client credentials + discovery) and the
+/// in-memory session table backing the `arkflow_session` cookie.
+pub struct OidcFederation {
+    authenticator: OidcAuthenticator,
+    login: Option<OidcLoginClient>,
+    sessions: Arc<std::sync::Mutex<HashMap<String, (OperatorPrincipal, Instant)>>>,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+pub struct OidcLoginClient {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// Environment-backed settings for [`OidcFederation::from_env`].
+#[derive(Debug, Clone, Default)]
+pub struct OidcSettings {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_url: Option<String>,
+    pub role_claim: Option<String>,
+    pub scopes_claim: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
+const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+
+impl OidcFederation {
+    /// Reads the standard `ARKFLOW_OIDC_*` environment variables. Returns
+    /// `None` when issuer/audience are absent (no federation, no routes).
+    pub async fn from_env() -> Option<Arc<Self>> {
+        let settings = OidcSettings {
+            issuer: std::env::var("ARKFLOW_OIDC_ISSUER").unwrap_or_default(),
+            audience: std::env::var("ARKFLOW_OIDC_AUDIENCE").unwrap_or_default(),
+            jwks_url: non_empty("ARKFLOW_OIDC_JWKS_URL"),
+            role_claim: non_empty("ARKFLOW_OIDC_ROLE_CLAIM"),
+            scopes_claim: non_empty("ARKFLOW_OIDC_SCOPES_CLAIM"),
+            client_id: non_empty("ARKFLOW_OIDC_CLIENT_ID"),
+            client_secret: non_empty("ARKFLOW_OIDC_CLIENT_SECRET"),
+            redirect_uri: non_empty("ARKFLOW_OIDC_REDIRECT_URI"),
+        };
+        Self::from_settings(settings).await
+    }
+
+    /// Builds the federation from explicit settings. Login flow activates
+    /// only when all three client fields are present; discovery failure
+    /// downgrades to bearer-only with a warning.
+    pub async fn from_settings(settings: OidcSettings) -> Option<Arc<Self>> {
+        if settings.issuer.trim().is_empty() || settings.audience.trim().is_empty() {
+            return None;
+        }
+        let issuer = settings.issuer.trim_end_matches('/').to_string();
+        let jwks_url = settings.jwks_url.clone().unwrap_or_else(|| {
+            format!("{issuer}/.well-known/jwks.json")
+        });
+        let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
+        let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
+        let authenticator =
+            OidcAuthenticator::new(issuer.clone(), settings.audience.clone(), jwks_url, role_claim, scopes_claim);
+
+        let login = match (
+            settings.client_id.as_deref().filter(|v| !v.trim().is_empty()),
+            settings.client_secret.as_deref().filter(|v| !v.trim().is_empty()),
+            settings.redirect_uri.as_deref().filter(|v| !v.trim().is_empty()),
+        ) {
+            (Some(client_id), Some(client_secret), Some(redirect_uri)) => {
+                match discover_endpoints(&issuer).await {
+                    Ok((authorization_endpoint, token_endpoint)) => Some(OidcLoginClient {
+                        client_id: client_id.to_string(),
+                        client_secret: client_secret.to_string(),
+                        redirect_uri: redirect_uri.to_string(),
+                        authorization_endpoint,
+                        token_endpoint,
+                    }),
+                    Err(error) => {
+                        eprintln!(
+                            "OIDC discovery failed (login disabled, bearer federation kept): {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        Some(Arc::new(Self {
+            authenticator,
+            login,
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("OIDC HTTP client must build"),
+        }))
+    }
+
+    /// Whether the browser authorization-code login routes are active.
+    pub fn login_enabled(&self) -> bool {
+        self.login.is_some()
+    }
+
+    /// Synchronous construction without discovery: the browser login flow
+    /// stays disabled (bearer federation only).
+    pub fn from_settings_blocking(settings: OidcSettings) -> Option<Arc<Self>> {
+        if settings.issuer.trim().is_empty() || settings.audience.trim().is_empty() {
+            return None;
+        }
+        let issuer = settings.issuer.trim_end_matches('/').to_string();
+        let jwks_url = settings.jwks_url.clone().unwrap_or_else(|| {
+            format!("{issuer}/.well-known/jwks.json")
+        });
+        let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
+        let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
+        let authenticator = OidcAuthenticator::new(
+            issuer,
+            settings.audience.clone(),
+            jwks_url,
+            role_claim,
+            scopes_claim,
+        );
+        Some(Arc::new(Self {
+            authenticator,
+            login: None,
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("OIDC HTTP client must build"),
+        }))
+    }
+
+    pub async fn authenticate(&self, token: &str) -> Option<OperatorPrincipal> {
+        self.authenticator.authenticate(token).await
+    }
+
+    /// The IdP redirect for starting a login: random state, authorization
+    /// endpoint, code flow, openid scope.
+    pub fn authorization_redirect(&self, state: &str) -> String {
+        let login = self.login.as_ref().expect("login enabled");
+        format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}",
+            login.authorization_endpoint,
+            urlencode(&login.client_id),
+            urlencode(&login.redirect_uri),
+            urlencode(state),
+        )
+    }
+
+    /// Exchanges an authorization code for an id_token via the token
+    /// endpoint (form-encoded POST with the client credentials).
+    pub async fn exchange_code(&self, code: &str) -> Option<String> {
+        let login = self.login.as_ref()?;
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", login.redirect_uri.as_str()),
+            ("client_id", login.client_id.as_str()),
+            ("client_secret", login.client_secret.as_str()),
+        ];
+        let encoded: Vec<String> = form
+            .iter()
+            .map(|(key, value)| format!("{}={}", urlencode(key), urlencode(value)))
+            .collect();
+        let response = self
+            .http
+            .post(&login.token_endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(encoded.join("&"))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        body.get("id_token").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// Creates an 8-hour session for the principal and returns the random
+    /// session id (the cookie value).
+    pub fn create_session(&self, principal: OperatorPrincipal) -> String {
+        use rand::TryRngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.try_fill_bytes(&mut bytes).expect("OS randomness");
+        let sid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, (_, created)| created.elapsed() < SESSION_TTL);
+        sessions.insert(sid.clone(), (principal, Instant::now()));
+        sid
+    }
+
+    /// Resolves a session id to its principal, dropping expired entries.
+    pub fn resolve_session(&self, session_id: &str) -> Option<OperatorPrincipal> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, (_, created)| created.elapsed() < SESSION_TTL);
+        sessions.get(session_id).map(|(principal, _)| principal.clone())
+    }
+
+    /// Deletes a session (logout).
+    pub fn remove_session(&self, session_id: &str) {
+        self.sessions.lock().unwrap().remove(session_id);
+    }
+}
+
+/// Fetches authorization/token endpoints from the provider's discovery
+/// document (`{issuer}/.well-known/openid-configuration`).
+async fn discover_endpoints(issuer: &str) -> Result<(String, String), String> {
+    let url = format!("{issuer}/.well-known/openid-configuration");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let document: Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let authorization_endpoint = document
+        .get("authorization_endpoint")
+        .and_then(Value::as_str)
+        .ok_or("discovery document lacks authorization_endpoint")?
+        .to_string();
+    let token_endpoint = document
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or("discovery document lacks token_endpoint")?
+        .to_string();
+    Ok((authorization_endpoint, token_endpoint))
+}
+
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn non_empty(var: &str) -> Option<String> {
@@ -468,18 +711,23 @@ mod tests {
         use crate::hub::HubConfig;
 
         let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
+        let federation = OidcFederation::from_settings(OidcSettings {
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            jwks_url: Some(format!("http://{}/jwks", mock.addr)),
+            ..OidcSettings::default()
+        })
+        .await
+        .unwrap();
         let hub = Hub::new(HubConfig {
             operator_token: Some("breakglass|admin|static-secret".into()),
-            ..HubConfig {
-                operator_token: None,
-                node_token: None,
-                insecure_local: false,
-                lease_ttl_ms: 10_000,
-                poll_interval_ms: 100,
-                session_ttl_ms: 3_600_000,
-            }
+            node_token: None,
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: 3_600_000,
         })
-        .with_oidc(authenticator(format!("http://{}/jwks", mock.addr)));
+        .with_oidc(federation);
 
         // Static credential wins without touching the JWKS endpoint.
         let principal = hub.operator_principal(Some("static-secret")).await.unwrap();
@@ -489,11 +737,288 @@ mod tests {
         assert!(hub.operator_authorized(Some("static-secret")).await);
     }
 
+    /// A full mock IdP: discovery + token + jwks endpoints, plus minting.
+    struct MockIdp {
+        addr: std::net::SocketAddr,
+        jwks_url: String,
+        discovery_url: String,
+        token_url: String,
+        requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl MockIdp {
+        fn spawn() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let request_log = requests.clone();
+            let base = format!("http://{addr}");
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    let request_log = request_log.clone();
+                    let base = base.clone();
+                    std::thread::spawn(move || {
+                        let mut buffer = Vec::new();
+                        let mut byte = [0u8; 1];
+                        loop {
+                            use std::io::Read;
+                            if stream.read_exact(&mut byte).is_err() {
+                                break;
+                            }
+                            buffer.push(byte[0]);
+                            if buffer.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buffer).to_string();
+                        let content_length = head
+                            .to_ascii_lowercase()
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\r\n").next())
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let mut body_bytes = vec![0u8; content_length];
+                        if content_length > 0 {
+                            use std::io::Read;
+                            let _ = stream.read_exact(&mut body_bytes);
+                        }
+                        let body = String::from_utf8_lossy(&body_bytes).to_string();
+                        request_log.lock().unwrap().push((head.clone(), body.clone()));
+
+                        let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                        let response_body = if path.starts_with("/.well-known/openid-configuration") {
+                            format!(
+                                r#"{{"authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token"}}"#
+                            )
+                        } else if path.starts_with("/jwks") {
+                            jwks_body(&[TEST_KID])
+                        } else {
+                            // token endpoint: mint an id_token whose iss is
+                            // this provider (the Hub validates it).
+                            let mut token_claims =
+                                claims("console-user", json!(["viewer"]), 600);
+                            token_claims["iss"] = json!(base);
+                            let id_token = mint(token_claims, Some(TEST_KID));
+                            format!(r#"{{"code":0,"id_token":"{id_token}"}}"#)
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                            response_body.len()
+                        );
+                        use std::io::Write;
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    });
+                }
+            });
+            Self {
+                addr,
+                jwks_url: format!("http://{addr}/jwks"),
+                discovery_url: format!("http://{addr}/discovery"),
+                token_url: format!("http://{addr}/token"),
+                requests,
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn from_env_disabled_without_vars() {
-        std::env::remove_var("ARKFLOW_OIDC_ISSUER");
-        std::env::remove_var("ARKFLOW_OIDC_AUDIENCE");
-        assert!(OidcAuthenticator::from_env().is_none());
+    async fn full_login_flow_creates_session_that_authorizes() {
+        use crate::api_contract::OperatorAction;
+        use axum::extract::State;
+        use crate::hub::Hub;
+        use crate::hub::HubConfig;
+        use std::collections::HashMap as StdMap;
+
+        let idp = MockIdp::spawn();
+        let issuer = format!("http://{}", idp.addr);
+        let federation = OidcFederation::from_settings(OidcSettings {
+            issuer: issuer.clone(),
+            audience: AUDIENCE.to_string(),
+            jwks_url: Some(idp.jwks_url.clone()),
+            client_id: Some("arkflow-console".to_string()),
+            client_secret: Some("console-secret".to_string()),
+            redirect_uri: Some(format!("http://console:3000/auth/callback")),
+            ..OidcSettings::default()
+        })
+        .await
+        .unwrap();
+        assert!(federation.login_enabled());
+
+        let hub = Hub::new(HubConfig {
+            operator_token: None,
+            node_token: None,
+            // Non-insecure: the session must resolve through the federation
+            // (a legacy admin principal would bypass RBAC here).
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: 3_600_000,
+        })
+        .with_oidc(federation.clone());
+
+        // 1. login: 302 to the IdP authorization endpoint + state cookie.
+        let response = crate::hub_oidc_login(State(hub.clone())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::FOUND);
+        let cookies = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let state = cookies
+            .split("; ")
+            .find_map(|cookie| cookie.strip_prefix("arkflow_oidc_state="))
+            .expect("state cookie")
+            .to_string();
+        assert!(
+            cookies.contains("HttpOnly") && cookies.contains("SameSite=Lax"),
+            "state cookie must be HttpOnly/SameSite=Lax: {cookies}"
+        );
+
+        // 2. callback: code + matching state -> session cookie.
+        let code = "auth-code-1";
+        let mut callback_headers = axum::http::HeaderMap::new();
+        callback_headers.insert(
+            axum::http::header::COOKIE,
+            format!("arkflow_oidc_state={state}").parse().unwrap(),
+        );
+        let mut query = StdMap::new();
+        query.insert("code".to_string(), code.to_string());
+        query.insert("state".to_string(), state.clone());
+        let response = crate::hub_oidc_callback(
+            State(hub.clone()),
+            axum::extract::Query(query),
+            callback_headers,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(axum::http::header::LOCATION),
+            Some(&axum::http::HeaderValue::from_static("/"))
+        );
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("arkflow_session="), "{set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        let session_id = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("arkflow_session=")
+            .to_string();
+
+        // 3. the session authorizes browser requests through RBAC.
+        let read_ok = hub
+            .operator_can(Some(&format!("session:{session_id}")), OperatorAction::Read)
+            .await;
+        let mutate_ok = hub
+            .operator_can(Some(&format!("session:{session_id}")), OperatorAction::Operate)
+            .await;
+        assert!(read_ok, "viewer session must read");
+        assert!(!mutate_ok, "viewer session must not mutate");
+
+        // 4. the token endpoint received the code exchange.
+        let requests = idp.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|(head, _)| head.starts_with("POST /token ")),
+            "code exchange must hit the token endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_mismatch_rejects_without_session() {
+        use axum::extract::State;
+        use crate::hub::Hub;
+        use crate::hub::HubConfig;
+        use std::collections::HashMap as StdMap;
+
+        let idp = MockIdp::spawn();
+        let issuer = format!("http://{}", idp.addr);
+        let federation = OidcFederation::from_settings(OidcSettings {
+            issuer: issuer.clone(),
+            audience: AUDIENCE.to_string(),
+            jwks_url: Some(idp.jwks_url.clone()),
+            client_id: Some("arkflow-console".to_string()),
+            client_secret: Some("console-secret".to_string()),
+            redirect_uri: Some("http://console:3000/auth/callback".to_string()),
+            ..OidcSettings::default()
+        })
+        .await
+        .unwrap();
+        let hub = Hub::new(HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: 3_600_000,
+        })
+        .with_oidc(federation.clone());
+
+        let response = crate::hub_oidc_login(State(hub.clone())).await;
+        let cookies = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let state = cookies
+            .split("; ")
+            .find_map(|cookie| cookie.strip_prefix("arkflow_oidc_state="))
+            .unwrap()
+            .to_string();
+
+        let mut callback_headers = axum::http::HeaderMap::new();
+        callback_headers.insert(
+            axum::http::header::COOKIE,
+            "arkflow_oidc_state=tampered".parse().unwrap(),
+        );
+        let mut query = StdMap::new();
+        query.insert("code".to_string(), "auth-code".to_string());
+        query.insert("state".to_string(), state);
+        let response = crate::hub_oidc_callback(
+            State(hub.clone()),
+            axum::extract::Query(query),
+            callback_headers,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            federation.resolve_session("anything").is_none(),
+            "no session may exist after a rejected login"
+        );
+    }
+
+    #[test]
+    fn federation_disabled_without_client_config() {
+        let settings = OidcSettings {
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            ..OidcSettings::default()
+        };
+        // No client credentials: bearer-only federation, login disabled.
+        let federation = OidcFederation::from_settings_blocking(settings).unwrap();
+        assert!(!federation.login_enabled());
+    }
+
+    #[test]
+    fn federation_disabled_without_issuer() {
+        let settings = OidcSettings {
+            issuer: String::new(),
+            ..OidcSettings::default()
+        };
+        assert!(OidcFederation::from_settings_blocking(settings).is_none());
     }
 
     #[test]

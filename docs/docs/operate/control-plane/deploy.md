@@ -29,6 +29,27 @@ it with environment variables:
 | `ARKFLOW_OIDC_JWKS_URL` | no | JWKS endpoint; defaults to `{issuer}/.well-known/jwks.json`. |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | no | Claim carrying the role(s); defaults to `roles`. |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | no | Claim carrying resource scopes; defaults to `scopes`. |
+| `ARKFLOW_OIDC_CLIENT_ID` | login | OAuth2 client id for the browser authorization-code flow. |
+| `ARKFLOW_OIDC_CLIENT_SECRET` | login | OAuth2 client secret. |
+| `ARKFLOW_OIDC_REDIRECT_URI` | login | Registered redirect URI, e.g. `https://hub.example.com/api/v1/auth/oidc/callback`. |
+
+When the three client variables are configured, the Hub discovers the IdP's
+authorization/token endpoints at startup and serves a browser login flow:
+
+- `GET /api/v1/auth/oidc/login` — redirects to the identity provider with a
+  random `state` bound to an HttpOnly cookie.
+- `GET /api/v1/auth/oidc/callback?code&state` — exchanges the code for an
+  id_token, validates it through the same pipeline as bearer JWTs, creates
+  an 8-hour server-side session, and sets an HttpOnly `arkflow_session`
+  cookie.
+- `GET /api/v1/auth/oidc/logout` — deletes the server-side session and
+  clears the cookie.
+
+Browser sessions participate in the same RBAC model as every other
+credential (the role comes from the role claim). Sessions live in memory:
+restarting the Hub signs everyone out, and there is no revocation list —
+prefer short-lived tokens at the identity provider. Without the client
+variables the Hub stays bearer-only and the login routes are absent.
 
 Claims map onto the existing RBAC model: `sub` becomes the principal id,
 the role claim accepts an array or a single string (`admin`, `operator`, or

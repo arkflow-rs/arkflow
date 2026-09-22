@@ -23,6 +23,24 @@ sidebar_position: 2
 | `ARKFLOW_OIDC_JWKS_URL` | 否 | JWKS 端点;缺省为 `{issuer}/.well-known/jwks.json`。 |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | 否 | 携带角色的 claim;缺省为 `roles`。 |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | 否 | 携带资源 scope 的 claim;缺省为 `scopes`。 |
+| `ARKFLOW_OIDC_CLIENT_ID` | 登录流 | 浏览器授权码流的 OAuth2 client id。 |
+| `ARKFLOW_OIDC_CLIENT_SECRET` | 登录流 | OAuth2 client secret。 |
+| `ARKFLOW_OIDC_REDIRECT_URI` | 登录流 | 已注册的重定向 URI,例如 `https://hub.example.com/api/v1/auth/oidc/callback`。 |
+
+三个 client 变量齐备时,Hub 会在启动时通过 discovery 获取 IdP 的
+授权/令牌端点,并提供浏览器登录流:
+
+- `GET /api/v1/auth/oidc/login` —— 302 跳转到身份提供方,携带绑定
+  HttpOnly cookie 的随机 `state`。
+- `GET /api/v1/auth/oidc/callback?code&state` —— 用 code 换取 id_token,
+  沿用与 bearer JWT 相同的验证管线,创建 8 小时服务端会话,并写入
+  HttpOnly 的 `arkflow_session` cookie。
+- `GET /api/v1/auth/oidc/logout` —— 删除服务端会话并清除 cookie。
+
+浏览器会话与其他凭据走同一套 RBAC 模型(角色来自角色 claim)。会话
+保存在内存中:重启 Hub 会强制所有人重新登录,也没有吊销列表——建议在
+身份提供方侧签发短时令牌。未配置 client 变量时 Hub 保持仅 bearer 模式,
+登录路由不存在。
 
 claims 映射到既有 RBAC 模型:`sub` 作为主 id;角色 claim 接受数组或单个字符串(`admin`、`operator`、`viewer`,取最高匹配角色);scope claim(数组或逗号分隔)沿用与静态凭据相同的 `type=id` 文法,例如 `["node=node-a", "stream"]`。仅接受非对称算法(ES256/RS256);签名、有效期、签发方与受众全部校验,JWKS 带缓存并在出现未知 key id 时按需刷新。建议在身份提供方侧签发短时令牌——Hub 没有吊销列表。配置了静态凭据时它仍然生效,因此自动化用的应急令牌可以保留,人工访问则迁移到身份提供方。
 

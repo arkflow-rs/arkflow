@@ -1,6 +1,6 @@
 use arkflow_server::{
     hub::{Hub, HubConfig},
-    oidc::OidcAuthenticator,
+    oidc::OidcFederation,
     serve_hub,
     storage::{ControlPlaneStore, StorageActor},
     ServerConfig,
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         Hub::new(hub_config)
     };
-    if let Some(oidc) = OidcAuthenticator::from_env() {
+    if let Some(oidc) = OidcFederation::from_env().await {
         hub = hub.with_oidc(oidc);
     }
     serve_hub(hub, config, cancellation).await
