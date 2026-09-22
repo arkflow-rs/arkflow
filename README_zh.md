@@ -155,6 +155,7 @@ ArkFlow提供多种数据处理器：
 - **批处理** (`batch`)：将消息批量处理
 - **VRL** (`vrl`)：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
 - **Python** (`python`)：对每个批次运行用户自定义的 Python 函数
+- **Embedding** (`embedding`)：通过 OpenAI 兼容 API 批量向量化文本列并追加向量列
 
 <!-- README_COMPONENTS:processor END -->
 
@@ -186,6 +187,7 @@ ArkFlow支持多种输出目标：
 - **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL），支持批量插入与 UPSERT
 - **标准输出** (`stdout`)：将数据输出到控制台
 - **Drop** (`drop`)：丢弃数据
+- **Qdrant** (`qdrant`)：将向量与负载写入 Qdrant 集合
 
 <!-- README_COMPONENTS:output END -->
 

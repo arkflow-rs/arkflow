@@ -212,6 +212,16 @@
       "name": "kafka-input-sasl-ssl-secrets",
       "path": "../examples/kafka_input_sasl_ssl_secrets.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "embedding-qdrant-pipeline",
+      "path": "../examples/embedding_qdrant_pipeline.yaml",
+      "kind": "yaml"
+    },
+    {
+      "name": "embedding-processor",
+      "path": "../examples/embedding_processor.yaml",
+      "kind": "yaml"
     }
   ]
 }

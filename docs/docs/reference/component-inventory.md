@@ -39,12 +39,14 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `mqtt` | Publishes messages to an MQTT broker topic. | [reference](../components/outputs/mqtt) |
 | output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |
 | output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
+| output | `qdrant` | Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload. | [reference](../components/outputs/qdrant) |
 | output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |
 | output | `sql` | Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes. | [reference](../components/outputs/sql) |
 | output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
 | processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
 | processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
 | processor | `batch` | Batches messages by count, size, or time interval before forwarding. | [reference](../components/processors/batch) |
+| processor | `embedding` | Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column. | [reference](../components/processors/embedding) |
 | processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
 | processor | `protobuf_to_arrow` | Decodes Protobuf wire-format bytes into Arrow RecordBatches. | [reference](../components/processors/protobuf) |
 | processor | `python` | Runs a user-defined Python function (with PyArrow) against each batch. | [reference](../components/processors/python) |

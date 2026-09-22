@@ -1404,6 +1404,70 @@
     },
     {
       "kind": "output",
+      "name": "qdrant",
+      "description": "Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Qdrant base URL, e.g. http://localhost:6333."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Target collection name."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Column used as the point id (unsigned integer or string). When omitted, Qdrant generates ids."
+          },
+          "payload_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Columns to include in the point payload. Defaults to every column except the vector and id columns."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "retry_count": {
+            "type": "integer",
+            "description": "Retry attempts for connection errors and 5xx responses. Defaults to 3."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:6333",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id"
+      }
+    },
+    {
+      "kind": "output",
       "name": "redis",
       "description": "Writes messages to Redis: streams, lists, or pub/sub channels.",
       "config_optional": false,
@@ -1690,6 +1754,65 @@
       "config_example": {
         "count": 100,
         "interval": "5s"
+      }
+    },
+    {
+      "kind": "processor",
+      "name": "embedding",
+      "description": "Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_base": {
+            "type": "string",
+            "description": "Base URL of the embeddings API, e.g. https://api.openai.com/v1 (the request path is {api_base}/embeddings)."
+          },
+          "model": {
+            "type": "string",
+            "description": "Embedding model name, e.g. text-embedding-3-small."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references. Omit for unauthenticated endpoints."
+          },
+          "field": {
+            "type": "string",
+            "description": "Name of the input UTF-8 column to embed."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended vector column. Defaults to 'embedding'."
+          },
+          "batch_size": {
+            "type": "integer",
+            "description": "Maximum rows per HTTP request. Defaults to 32."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers, e.g. Azure's 'api-key'."
+          }
+        },
+        "required": [
+          "api_base",
+          "model",
+          "field"
+        ]
+      },
+      "config_example": {
+        "api_base": "https://api.openai.com/v1",
+        "model": "text-embedding-3-small",
+        "api_key": "${env:OPENAI_API_KEY}",
+        "field": "text",
+        "batch_size": 32
       }
     },
     {

@@ -27,6 +27,7 @@ pub mod mongodb;
 pub mod mqtt;
 pub mod nats;
 pub mod pulsar;
+pub mod qdrant;
 pub mod redis;
 pub mod sql;
 pub mod stdout;
@@ -40,6 +41,7 @@ pub fn init() -> Result<(), Error> {
     mongodb::init()?;
     nats::init()?;
     pulsar::init()?;
+    qdrant::init()?;
     redis::init()?;
     sql::init()?;
     stdout::init()?;

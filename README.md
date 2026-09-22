@@ -157,6 +157,7 @@ ArkFlow provides multiple data processors:
 - **Batch Processing** (`batch`): Process messages in batches
 - **VRL** (`vrl`): Process data using [VRL](https://vector.dev/docs/reference/vrl/)
 - **Python** (`python`): Run Python user-defined functions over the batch
+- **Embedding** (`embedding`): Batch-embed a text column via an OpenAI-compatible API and append vector columns
 
 <!-- README_COMPONENTS:processor END -->
 
@@ -188,6 +189,7 @@ ArkFlow supports multiple output targets:
 - **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL) with batch inserts and UPSERT
 - **Standard Output** (`stdout`): Output data to the console
 - **Drop** (`drop`): Discard data
+- **Qdrant** (`qdrant`): Upsert vectors and payloads into a Qdrant collection
 
 <!-- README_COMPONENTS:output END -->
 
