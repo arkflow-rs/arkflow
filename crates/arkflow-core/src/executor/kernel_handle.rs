@@ -33,8 +33,6 @@ pub struct KernelJobHandle {
     cancellation: CancellationToken,
     /// Source inputs (for current_positions and restore).
     inputs: Vec<Arc<dyn Input>>,
-    /// State backends by task namespace (keyed by chain entry task id).
-    states: BTreeMap<String, Arc<dyn StateBackend>>,
     /// Event-time watermarks keyed by source task id.
     watermark_gates:
         BTreeMap<String, Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>>,
@@ -799,7 +797,6 @@ impl KernelJobRunner {
         Ok(KernelJobHandle {
             cancellation,
             inputs,
-            states,
             watermark_gates,
             gate_partitions,
             completion,

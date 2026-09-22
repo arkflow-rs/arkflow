@@ -3414,15 +3414,17 @@ mod tests {
             .await
             .expect("bind");
         let (input_tx, input_rx) = flume::bounded::<Envelope>(64);
-        downstream.register_inbound_for_session(
-            quad,
-            input_tx,
-            PeerExpectation {
-                source_node: "node-a".into(),
-                job_id: "tcp-job".into(),
-                generation: 1,
-            },
-        );
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "tcp-job".into(),
+                    generation: 1,
+                },
+            )
+            .expect("inbound registration succeeds");
 
         let transport = TcpEdgeTransport {
             addr: format!("127.0.0.1:{port}").parse().expect("addr"),
