@@ -1658,12 +1658,12 @@ fn agent_capabilities(network_shuffle: bool) -> Vec<String> {
     capabilities
 }
 
-/// How often the resource sampler refreshes its CPU/memory view. Well under
-/// any report interval, so every report can carry a fresh-enough gauge set.
-const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// A snapshot older than this multiple of the sampling interval is stale and
 /// omitted from reports: a dead sampler must not produce a lying dashboard.
 const RESOURCE_FRESHNESS_FACTOR: u64 = 2;
+/// Lower bound on the derived sampling interval: below this, sysinfo
+/// refreshes cost more than fresher gauges are worth.
+const MIN_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One host resource sample. CPU is only meaningful from the second refresh
 /// onward (sysinfo needs a prior window to average over); memory is valid
@@ -1678,17 +1678,33 @@ pub(crate) struct ResourceSnapshot {
 }
 
 /// Shared latest-snapshot slot between the sampler task and the report path.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ResourceSampler {
+    sample_interval: Duration,
     latest: Arc<std::sync::RwLock<Option<ResourceSnapshot>>>,
 }
 
 impl ResourceSampler {
+    /// Sample at half the report cadence (bounded below) so every report
+    /// reads a snapshot the previous report cannot have seen: a Hub-side
+    /// sustained-pressure streak then counts independent observations
+    /// instead of one sample echoed across consecutive reports.
+    fn new(report_interval: Duration) -> Self {
+        Self {
+            sample_interval: (report_interval / 2).max(MIN_RESOURCE_SAMPLE_INTERVAL),
+            latest: Arc::default(),
+        }
+    }
+
     fn publish(&self, snapshot: ResourceSnapshot) {
         *self
             .latest
             .write()
             .expect("resource sampler slot lock poisoned") = Some(snapshot);
+    }
+
+    fn fresh_window_ms(&self) -> u64 {
+        self.sample_interval.as_millis() as u64 * RESOURCE_FRESHNESS_FACTOR
     }
 
     /// The latest snapshot when it is still fresh for `now_ms`, else `None`.
@@ -1698,9 +1714,8 @@ impl ResourceSampler {
             .read()
             .expect("resource sampler slot lock poisoned")
             .as_ref()?;
-        let window_ms =
-            RESOURCE_SAMPLE_INTERVAL.as_millis() as u64 * RESOURCE_FRESHNESS_FACTOR;
-        (now_ms.saturating_sub(snapshot.sampled_at_ms) <= window_ms).then_some(snapshot)
+        (now_ms.saturating_sub(snapshot.sampled_at_ms) <= self.fresh_window_ms())
+            .then_some(snapshot)
     }
 }
 
@@ -1728,8 +1743,12 @@ fn merge_resource_gauges(
 /// shared slot. Best-effort by construction — every failure mode (unsupported
 /// platform, poisoned state, task death) leaves reports running without
 /// resource gauges and never touches the session loop.
-pub(crate) fn spawn_resource_sampler(cancellation: CancellationToken) -> ResourceSampler {
-    let sampler = ResourceSampler::default();
+pub(crate) fn spawn_resource_sampler(
+    report_interval: Duration,
+    cancellation: CancellationToken,
+) -> ResourceSampler {
+    let sampler = ResourceSampler::new(report_interval);
+    let sample_interval = sampler.sample_interval;
     let task_sampler = sampler.clone();
     tokio::spawn(async move {
         let mut system = sysinfo::System::new();
@@ -1740,7 +1759,7 @@ pub(crate) fn spawn_resource_sampler(cancellation: CancellationToken) -> Resourc
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => return,
-                _ = tokio::time::sleep(RESOURCE_SAMPLE_INTERVAL) => {}
+                _ = tokio::time::sleep(sample_interval) => {}
             }
             system.refresh_memory();
             system.refresh_cpu_usage();
@@ -1765,9 +1784,11 @@ pub async fn run(
     let mut backoff = Duration::from_millis(250);
     let mut completed_commands = CompletedCommandCache::new(1024);
     let mut job_runtime = JobRuntime::default();
-    // Host resource gauges: sampled on an independent interval for the whole
-    // process lifetime, so re-registration churn never resets the view.
-    let resource_sampler = spawn_resource_sampler(cancellation.clone());
+    // Host resource gauges: sampled on an interval derived from the report
+    // cadence for the whole process lifetime, so re-registration churn
+    // never resets the view.
+    let resource_sampler =
+        spawn_resource_sampler(config.report_interval, cancellation.clone());
     // Cross-node shuffle data plane: one listener per Agent process. A bind
     // failure degrades to the co-location contract (warn, no listener) rather
     // than blocking node startup — observability and placement still work.
@@ -3548,15 +3569,30 @@ mod tests {
 
     #[test]
     fn stale_snapshots_are_omitted_from_reports() {
-        let sampler = ResourceSampler::default();
+        let sampler = ResourceSampler::new(Duration::from_secs(2));
+        // The sampling cadence derives from the report interval: half of it,
+        // bounded below, so consecutive reports see independent samples.
+        assert_eq!(sampler.sample_interval, Duration::from_secs(1));
         assert!(sampler.fresh(1_000).is_none(), "nothing published yet");
         sampler.publish(snapshot(1_000));
-        let window_ms =
-            RESOURCE_SAMPLE_INTERVAL.as_millis() as u64 * RESOURCE_FRESHNESS_FACTOR;
+        let window_ms = sampler.fresh_window_ms();
         assert!(sampler.fresh(1_000 + window_ms).is_some());
         assert!(sampler.fresh(1_000 + window_ms + 1).is_none());
         // A fresher publish replaces the slot entirely.
         sampler.publish(snapshot(2_000));
         assert!(sampler.fresh(1_000 + window_ms + 1).is_some());
+    }
+
+    #[test]
+    fn sample_interval_tracks_the_report_interval_with_a_floor() {
+        assert_eq!(
+            ResourceSampler::new(Duration::from_secs(10)).sample_interval,
+            Duration::from_secs(5)
+        );
+        // absurdly fast reporting must not spin the sampler into the ground
+        assert_eq!(
+            ResourceSampler::new(Duration::from_millis(100)).sample_interval,
+            MIN_RESOURCE_SAMPLE_INTERVAL
+        );
     }
 }

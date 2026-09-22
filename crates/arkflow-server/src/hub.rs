@@ -780,9 +780,12 @@ impl Hub {
     }
 
     /// Nodes in `targets` whose sustained-pressure streak trips the Job's
-    /// opt-in rebalance policy, subject to its cooldown and rollout
-    /// ownership. Empty unless rebalancing may proceed this tick; the caller
-    /// only evicts while at least one target remains (never into nothing).
+    /// opt-in rebalance policy, subject to its cooldown hysteresis. A streak
+    /// only counts while the node's gauges are still fresh: a node that
+    /// stopped reporting freezes its last streak, and stale data must not
+    /// drive relocation. Empty unless rebalancing may proceed this tick;
+    /// the caller only evicts while at least one target remains (never into
+    /// nothing).
     async fn rebalance_evictions(
         &self,
         job: &JobRecord,
@@ -826,10 +829,18 @@ impl Hub {
         {
             let nodes = self.nodes.read().await;
             for node_id in targets {
-                if nodes
-                    .get(node_id)
-                    .is_some_and(|node| node.pressure_streak >= policy.pressure_streak.max(1))
+                let Some(node) = nodes.get(node_id) else {
+                    continue;
+                };
+                // A streak frozen by a node that stopped reporting is not
+                // sustained pressure: ranking and relocation must agree
+                // that only fresh gauges drive resource decisions.
+                if node.last_report_at_ms == 0
+                    || now.saturating_sub(node.last_report_at_ms) > RESOURCE_GAUGE_FRESH_MS
                 {
+                    continue;
+                }
+                if node.pressure_streak >= policy.pressure_streak.max(1) {
                     evicted.insert(node_id.clone());
                 }
             }
@@ -5185,9 +5196,12 @@ fn node_under_pressure(metrics: &BTreeMap<String, f64>) -> bool {
     memory_pressuring || cpu_pressuring
 }
 
-/// How long a node's gauges stay eligible for headroom ranking after its
-/// last report — twice the Agent sampling interval, mirroring the
-/// Agent-side freshness window.
+/// How long a node's gauges stay eligible for Hub resource decisions —
+/// headroom ranking and rebalance pressure alike — after its last report.
+/// Agents report every couple of seconds, so past this window (about five
+/// missed report ticks) a silent node ranks as gauge-less and its frozen
+/// pressure streak no longer drives relocation. The Agent-side sampler has
+/// its own independent staleness window; the two are not coupled.
 const RESOURCE_GAUGE_FRESH_MS: u64 = 10_000;
 
 /// Headroom ordering key for placement ranking: fresh-gauged nodes rank
@@ -10325,6 +10339,93 @@ mod session_report_tests {
             .await
             .iter()
             .all(|operation_record| operation_record.operation != "job_stop"));
+    }
+
+    #[tokio::test]
+    async fn stale_gauges_freeze_pressure_out_of_eviction() {
+        let hub = Hub::new(config());
+        let session_a = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: "node-a".into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+        let auth_a = AgentAuth {
+            node_id: "node-a".into(),
+            session_token: session_a.session_token.clone(),
+        };
+        // node-a reports fresh gauges and wins the first placement.
+        report_resources(&hub, &auth_a, 0.1, 10.0, 1).await;
+        hub.upsert_job(JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: rebalance_job_spec_json("orders"),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec![],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(start_operations(&hub, "orders").await[0].node_id, "node-a");
+        complete_start_commands(&hub, "node-a", &session_a.session_token).await;
+        // Sustained pressure: the streak trips the policy threshold...
+        report_resources(&hub, &auth_a, 0.99, 99.0, 2).await;
+        report_resources(&hub, &auth_a, 0.99, 99.0, 3).await;
+        // ...but then the node goes silent: the streak freezes high while
+        // the gauges age past the freshness window. Frozen, stale data must
+        // not drive relocation — otherwise a dead node would keep winning
+        // evictions long after its pressure was last observed.
+        {
+            let mut nodes = hub.nodes.write().await;
+            if let Some(node) = nodes.get_mut("node-a") {
+                node.last_report_at_ms = now_ms().saturating_sub(RESOURCE_GAUGE_FRESH_MS + 1);
+            }
+        }
+        hub.reconcile_jobs().await.unwrap();
+        assert!(
+            hub.operations(None)
+                .await
+                .iter()
+                .all(|operation_record| operation_record.operation != "job_stop"),
+            "a frozen streak on stale gauges must not evict the placement"
+        );
+        // One fresh pressuring report restores the streak's freshness: only
+        // the gate was holding the eviction back.
+        report_resources(&hub, &auth_a, 0.99, 99.0, 4).await;
+        hub.reconcile_jobs().await.unwrap();
+        assert_eq!(
+            hub.operations(None)
+                .await
+                .into_iter()
+                .filter(|operation_record| {
+                    operation_record.resource_id == "orders"
+                        && operation_record.operation == "job_stop"
+                        && operation_record.node_id == "node-a"
+                })
+                .count(),
+            1,
+            "the same streak on fresh gauges must evict the placement"
+        );
     }
 
     /// Multi-component co-location is order sensitive: the component the
