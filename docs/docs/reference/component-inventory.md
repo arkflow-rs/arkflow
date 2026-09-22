@@ -51,6 +51,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | processor | `embedding` | Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column. | [reference](../components/processors/embedding) |
 | processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
 | processor | `llm` | Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency. | [reference](../components/processors/llm) |
+| processor | `pgvector_search` | Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. | [reference](../components/processors/pgvector-search) |
 | processor | `protobuf_to_arrow` | Decodes Protobuf wire-format bytes into Arrow RecordBatches. | [reference](../components/processors/protobuf) |
 | processor | `python` | Runs a user-defined Python function (with PyArrow) against each batch. | [reference](../components/processors/python) |
 | processor | `sql` | Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables. | [reference](../components/processors/sql) |

@@ -2018,6 +2018,81 @@
     },
     {
       "kind": "processor",
+      "name": "pgvector_search",
+      "description": "Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Postgres connection string; supports secret references."
+          },
+          "table": {
+            "type": "string",
+            "description": "Table to search (must already exist with a pgvector column)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "id_column": {
+            "type": "string",
+            "description": "Table column returned as the match id (as text). Defaults to 'id'."
+          },
+          "vector_column": {
+            "type": "string",
+            "description": "Table column holding the stored vectors. Defaults to 'embedding'."
+          },
+          "payload_column": {
+            "type": "string",
+            "description": "jsonb column included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "l2",
+              "inner_product"
+            ],
+            "description": "Distance operator: <=> (cosine, default), <-> (l2), <#> (inner product, negative)."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight queries. Defaults to 4."
+          },
+          "max_connections": {
+            "type": "integer",
+            "description": "Connection pool size. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Pool acquire timeout in milliseconds. Defaults to 30000."
+          }
+        },
+        "required": [
+          "url",
+          "table"
+        ]
+      },
+      "config_example": {
+        "url": "postgres://postgres:postgres@localhost:5432/vectors",
+        "table": "documents",
+        "metric": "cosine",
+        "top_k": 5
+      }
+    },
+    {
+      "kind": "processor",
       "name": "protobuf_to_arrow",
       "description": "Decodes Protobuf wire-format bytes into Arrow RecordBatches.",
       "config_optional": false,

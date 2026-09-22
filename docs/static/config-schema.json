@@ -3729,6 +3729,7 @@
             null,
             null,
             null,
+            null,
             null
           ],
           "description": "processor component type."
@@ -4370,6 +4371,146 @@
               "field": "text",
               "system_prompt": "You classify support tickets with one word.",
               "concurrency": 4
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "pgvector_search",
+          "description": "Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pgvector_search",
+              "description": "Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "Postgres connection string; supports secret references."
+            },
+            "table": {
+              "type": "string",
+              "description": "Table to search (must already exist with a pgvector column)."
+            },
+            "vector_field": {
+              "type": "string",
+              "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+            },
+            "target_field": {
+              "type": "string",
+              "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+            },
+            "id_column": {
+              "type": "string",
+              "description": "Table column returned as the match id (as text). Defaults to 'id'."
+            },
+            "vector_column": {
+              "type": "string",
+              "description": "Table column holding the stored vectors. Defaults to 'embedding'."
+            },
+            "payload_column": {
+              "type": "string",
+              "description": "jsonb column included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+            },
+            "metric": {
+              "type": "string",
+              "enum": [
+                "cosine",
+                "l2",
+                "inner_product"
+              ],
+              "description": "Distance operator: <=> (cosine, default), <-> (l2), <#> (inner product, negative)."
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "Number of neighbors per row. Defaults to 5."
+            },
+            "concurrency": {
+              "type": "integer",
+              "description": "Maximum in-flight queries. Defaults to 4."
+            },
+            "max_connections": {
+              "type": "integer",
+              "description": "Connection pool size. Defaults to 4."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "Pool acquire timeout in milliseconds. Defaults to 30000."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "postgres://postgres:postgres@localhost:5432/vectors",
+              "table": "documents",
+              "metric": "cosine",
+              "top_k": 5
             }
           ]
         },

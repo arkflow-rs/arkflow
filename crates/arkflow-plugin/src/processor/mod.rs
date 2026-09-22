@@ -22,6 +22,7 @@ pub mod batch;
 pub mod embedding;
 pub mod json;
 pub mod llm;
+pub mod pgvector_search;
 pub mod protobuf;
 pub mod python;
 pub mod sql;
@@ -32,6 +33,7 @@ pub fn init() -> Result<(), Error> {
     batch::init()?;
     json::init()?;
     llm::init()?;
+    pgvector_search::init()?;
     protobuf::init()?;
     sql::init()?;
     vrl::init()?;
