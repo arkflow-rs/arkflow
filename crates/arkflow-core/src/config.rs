@@ -214,17 +214,37 @@ impl EngineConfig {
 
         // Determine the format based on the file extension.
         if let Some(format) = get_format_from_path(path) {
-            return match format {
-                ConfigFormat::YAML => serde_yaml::from_str(&content)
-                    .map_err(|e| Error::Config(format!("YAML parsing error: {}", e))),
-                ConfigFormat::JSON => serde_json::from_str(&content)
-                    .map_err(|e| Error::Config(format!("JSON parsing error: {}", e))),
-                ConfigFormat::TOML => toml::from_str(&content)
-                    .map_err(|e| Error::Config(format!("TOML parsing error: {}", e))),
-            };
+            return parse_engine_config(&content, format);
         };
 
         Err(Error::Config("The configuration file format cannot be determined. Please use YAML, JSON, or TOML format.".to_string()))
+    }
+}
+
+/// Parse a configuration document into `EngineConfig`.
+///
+/// Documents without a secret-reference marker take the direct
+/// deserialization path so parse errors keep their line/column locations.
+/// Documents containing `${` are resolved through a value tree first (see
+/// `crate::secret`).
+fn parse_engine_config(content: &str, format: ConfigFormat) -> Result<EngineConfig, Error> {
+    if crate::secret::contains_reference(content) {
+        let document = match format {
+            ConfigFormat::YAML => crate::secret::ConfigDocument::Yaml(content),
+            ConfigFormat::JSON => crate::secret::ConfigDocument::Json(content),
+            ConfigFormat::TOML => crate::secret::ConfigDocument::Toml(content),
+        };
+        let value = crate::secret::resolve_document(document)?;
+        return serde_json::from_value(value)
+            .map_err(|e| Error::Config(format!("Configuration error: {}", e)));
+    }
+    match format {
+        ConfigFormat::YAML => serde_yaml::from_str(content)
+            .map_err(|e| Error::Config(format!("YAML parsing error: {}", e))),
+        ConfigFormat::JSON => serde_json::from_str(content)
+            .map_err(|e| Error::Config(format!("JSON parsing error: {}", e))),
+        ConfigFormat::TOML => toml::from_str(content)
+            .map_err(|e| Error::Config(format!("TOML parsing error: {}", e))),
     }
 }
 
@@ -776,6 +796,91 @@ type = "stdout"
         assert_eq!(
             schema["$defs"]["stream"]["properties"]["id"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn test_from_file_resolves_env_reference() {
+        std::env::set_var("ARKFLOW_CONFIG_TEST_TOKEN", "from-env");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+logging:
+  level: debug
+health_check:
+  api_token: "${env:ARKFLOW_CONFIG_TEST_TOKEN}"
+"#,
+        )
+        .unwrap();
+        let config = EngineConfig::from_file(path.to_str().unwrap()).unwrap();
+        std::env::remove_var("ARKFLOW_CONFIG_TEST_TOKEN");
+        assert_eq!(config.health_check.api_token.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn test_from_file_resolves_file_reference_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("token.txt");
+        std::fs::write(&secret_path, b"from-file\n").unwrap();
+        let path = dir.path().join("config.json");
+        let content = serde_json::json!({
+            "logging": {"level": "debug"},
+            "health_check": {
+                "api_token": format!("${{file:{}}}", secret_path.display())
+            }
+        })
+        .to_string();
+        std::fs::write(&path, content).unwrap();
+        let config = EngineConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.health_check.api_token.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn test_from_file_unresolved_reference_names_path() {
+        std::env::remove_var("ARKFLOW_CONFIG_TEST_DEFINITELY_UNSET");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+logging:
+  level: debug
+health_check:
+  api_token: "${env:ARKFLOW_CONFIG_TEST_DEFINITELY_UNSET}"
+"#,
+        )
+        .unwrap();
+        let err = EngineConfig::from_file(path.to_str().unwrap()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("health_check.api_token"), "{message}");
+        assert!(
+            message.contains("${env:ARKFLOW_CONFIG_TEST_DEFINITELY_UNSET}"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_from_file_without_references_keeps_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+logging:
+  level: debug
+health_check:
+  agent_lease_ttl_ms: not-a-number
+"#,
+        )
+        .unwrap();
+        let err = EngineConfig::from_file(path.to_str().unwrap()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("YAML parsing error"), "{message}");
+        assert!(
+            message.contains("line ") && message.contains("column "),
+            "expected line/column location: {message}"
         );
     }
 }

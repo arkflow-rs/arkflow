@@ -108,6 +108,56 @@ mounted on the server address next to the legacy `/health`, `/readiness`, and
 `/liveness` endpoints (which keep their original semantics).
 :::
 
+## Secret references
+
+Sensitive values (passwords, tokens, key material) do not have to be written
+into the configuration file. Any **string value** may embed a reference that
+is resolved once, when the configuration is materialized — for file configs
+(`--config`), for `--validate`, and for configurations applied through the
+control plane. The stored/applied configuration keeps the reference text;
+only the running process holds the resolved value in memory.
+
+| Syntax | Meaning |
+|--------|---------|
+| `${env:VAR}` | Value of environment variable `VAR`; error if unset. |
+| `${env:VAR:-default}` | Value of `VAR`, or `default` when unset **or empty** (`${env:VAR:-}` allows an explicit empty value). |
+| `${file:/path}` | Content of the file at `/path` with trailing newlines stripped (e.g. a mounted Kubernetes secret). |
+| `$${` | Escape for a literal `${`. |
+
+Rules and guarantees:
+
+- References may appear anywhere inside a string value, including nested
+  maps/arrays (`host=${env:HOST};port=${env:PORT}` works).
+- `${...}` forms with unknown schemes are left verbatim (forward
+  compatibility); keys and non-string values are never touched.
+- Resolved values are not rescanned: a secret whose value contains `${...}`
+  stays literal (no injection).
+- Resolution errors name the configuration path and the reference — never
+  the secret value.
+
+```yaml validate=full
+logging:
+  level: info
+
+health_check:
+  api_token: "${env:ARKFLOW_API_TOKEN:-}"
+
+streams: []
+```
+
+If `ARKFLOW_API_TOKEN` is unset, the process fails at startup with an error
+like `Failed to resolve secret reference at health_check.api_token:
+environment variable 'ARKFLOW_API_TOKEN' is not set (reference:
+${env:ARKFLOW_API_TOKEN})`.
+
+:::note
+Resolution is strict everywhere a configuration is materialized. In a
+Hub–Agent deployment, a configuration referencing node-local secrets must be
+validated/applied where those secrets resolve (the standalone
+single-process deployment is unaffected). A central secret store is planned
+for a later Hub release.
+:::
+
 ## stream
 
 Each entry in `streams` is one independent processing pipeline. Stream fields

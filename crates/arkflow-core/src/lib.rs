@@ -46,6 +46,7 @@ pub mod output;
 pub mod pipeline;
 pub mod processor;
 pub mod runtime;
+pub mod secret;
 pub mod state;
 pub mod stream;
 pub mod temporary;

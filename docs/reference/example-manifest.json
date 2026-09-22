@@ -207,6 +207,11 @@
       "name": "kafka-output-sasl-ssl",
       "path": "../examples/kafka_output_sasl_ssl.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "kafka-input-sasl-ssl-secrets",
+      "path": "../examples/kafka_input_sasl_ssl_secrets.yaml",
+      "kind": "yaml"
     }
   ]
 }
