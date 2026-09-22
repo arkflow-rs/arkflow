@@ -38,6 +38,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `mongodb` | Writes Arrow rows to MongoDB as BSON documents. | [reference](../components/outputs/mongodb) |
 | output | `mqtt` | Publishes messages to an MQTT broker topic. | [reference](../components/outputs/mqtt) |
 | output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |
+| output | `pgvector` | Upserts batch rows into a PostgreSQL table with the pgvector extension: a Float32 list column becomes the vector, other columns are packed into a jsonb payload, and an optional id column keys ON CONFLICT upserts. | [reference](../components/outputs/pgvector) |
 | output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
 | output | `qdrant` | Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload. | [reference](../components/outputs/qdrant) |
 | output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |

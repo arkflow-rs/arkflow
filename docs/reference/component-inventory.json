@@ -1368,6 +1368,56 @@
     },
     {
       "kind": "output",
+      "name": "pgvector",
+      "description": "Upserts batch rows into a PostgreSQL table with the pgvector extension: a Float32 list column becomes the vector, other columns are packed into a jsonb payload, and an optional id column keys ON CONFLICT upserts.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Postgres connection string, e.g. postgres://user:pass@host:5432/db; supports secret references."
+          },
+          "table": {
+            "type": "string",
+            "description": "Target table (must already exist with a matching vector column)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Column used as the upsert conflict key (integer or string). When omitted, plain INSERTs are written."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "jsonb column receiving every remaining column as a per-row JSON object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "max_connections": {
+            "type": "integer",
+            "description": "Connection pool size. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Pool acquire/connect timeout in milliseconds. Defaults to 30000."
+          }
+        },
+        "required": [
+          "url",
+          "table"
+        ]
+      },
+      "config_example": {
+        "url": "postgres://postgres:postgres@localhost:5432/vectors",
+        "table": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id"
+      }
+    },
+    {
+      "kind": "output",
       "name": "pulsar",
       "description": "Produces messages to an Apache Pulsar topic.",
       "config_optional": false,

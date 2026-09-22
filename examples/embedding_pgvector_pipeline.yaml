@@ -1,0 +1,37 @@
+# RAG ingestion into Postgres: fetch documents, embed them through an
+# OpenAI-compatible API, and upsert vectors + JSON payloads into a
+# pgvector-enabled table. Create the table first:
+#   CREATE TABLE documents (
+#     doc_id BIGINT PRIMARY KEY,
+#     embedding vector(1536),
+#     payload jsonb
+#   );
+logging:
+  level: info
+streams:
+  - id: rag-to-postgres
+    input:
+      type: memory
+      payload: |
+        [
+          {"doc_id": 1, "text": "ArkFlow is a stream processing engine."},
+          {"doc_id": 2, "text": "Vectors enable semantic search."}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+          batch_size: 32
+
+    output:
+      type: pgvector
+      url: "postgres://postgres:${env:PG_PASSWORD:-}@localhost:5432/vectors"
+      table: documents
+      vector_field: embedding
+      id_field: doc_id

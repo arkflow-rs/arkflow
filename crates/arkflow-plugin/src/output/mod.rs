@@ -26,6 +26,7 @@ pub mod kafka;
 pub mod mongodb;
 pub mod mqtt;
 pub mod nats;
+pub mod pgvector;
 pub mod pulsar;
 pub mod qdrant;
 pub mod redis;
@@ -40,6 +41,7 @@ pub fn init() -> Result<(), Error> {
     mqtt::init()?;
     mongodb::init()?;
     nats::init()?;
+    pgvector::init()?;
     pulsar::init()?;
     qdrant::init()?;
     redis::init()?;

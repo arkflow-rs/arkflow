@@ -191,6 +191,7 @@ ArkFlow supports multiple output targets:
 - **Standard Output** (`stdout`): Output data to the console
 - **Drop** (`drop`): Discard data
 - **Qdrant** (`qdrant`): Upsert vectors and payloads into a Qdrant collection
+- **pgvector** (`pgvector`): Upsert vectors and JSON payloads into a PostgreSQL table with the pgvector extension
 
 <!-- README_COMPONENTS:output END -->
 

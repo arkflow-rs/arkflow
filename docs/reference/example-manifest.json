@@ -227,6 +227,11 @@
       "name": "llm-rewrite-pipeline",
       "path": "../examples/llm_rewrite_pipeline.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "embedding-pgvector-pipeline",
+      "path": "../examples/embedding_pgvector_pipeline.yaml",
+      "kind": "yaml"
     }
   ]
 }
