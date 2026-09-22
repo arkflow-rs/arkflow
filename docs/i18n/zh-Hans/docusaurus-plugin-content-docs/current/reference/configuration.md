@@ -97,6 +97,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `${env:VAR}` | 环境变量 `VAR` 的值;未设置则报错。 |
 | `${env:VAR:-default}` | `VAR` 的值;未设置**或为空**时使用 `default`(`${env:VAR:-}` 允许显式空值)。 |
 | `${file:/path}` | 读取 `/path` 文件内容并剥离尾部换行(例如挂载的 Kubernetes Secret)。 |
+| `${secret:NAME}` | 环境变量 `ARKFLOW_SECRET_<NAME>` 的值(名字逐字映射)——为凭据提供独立命名空间。支持 `:-` 默认值。 |
 | `$${` | 字面 `${` 的转义。 |
 
 规则与保证:

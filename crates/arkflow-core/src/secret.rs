@@ -136,11 +136,16 @@ fn resolve_string(text: &str, path: &str) -> Result<String, Error> {
 fn resolve_reference(inner: &str, token: &str, path: &str) -> Result<String, Error> {
     if let Some(spec) = inner.strip_prefix("env:") {
         resolve_env(spec, token, path)
+    } else if let Some(spec) = inner.strip_prefix("secret:") {
+        // Namespace convention: secret:NAME reads ARKFLOW_SECRET_<NAME>,
+        // keeping credentials in a dedicated, auditable prefix.
+        let spec = format!("ARKFLOW_SECRET_{spec}");
+        resolve_env(&spec, token, path)
     } else if let Some(spec) = inner.strip_prefix("file:") {
         resolve_file(spec, token, path)
     } else {
         // Unknown scheme: keep the reference text verbatim (forward
-        // compatibility, e.g. a future `${secret:...}` scheme).
+        // compatibility, e.g. a future `${vault:...}` scheme).
         Ok(token.to_string())
     }
 }
@@ -355,6 +360,36 @@ mod tests {
         assert!(err.to_string().contains("empty file path"));
     }
 
+    #[tokio::test]
+    async fn secret_scheme_resolves_from_arkflow_secret_prefix() {
+        set_env("ARKFLOW_SECRET_db_password", "hunter2");
+        set_env("ARKFLOW_SECRET_api_key", "sk-live");
+        let resolved = resolve_string(
+            "pw=${secret:db_password}; key=${secret:api_key:-none}",
+            "health.api_token",
+        )
+        .unwrap();
+        clear_env("ARKFLOW_SECRET_db_password");
+        clear_env("ARKFLOW_SECRET_api_key");
+        assert_eq!(resolved, "pw=hunter2; key=sk-live");
+    }
+
+    #[tokio::test]
+    async fn secret_scheme_default_and_missing_paths() {
+        clear_env("ARKFLOW_SECRET_missing");
+        set_env("ARKFLOW_SECRET_empty", "");
+        assert_eq!(
+            resolve_string("${secret:missing:-fallback}", "a").unwrap(),
+            "fallback"
+        );
+        assert_eq!(resolve_string("${secret:empty:-fb}", "a").unwrap(), "fb");
+        let err = resolve_string("${secret:missing}", "streams[0].pw").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ARKFLOW_SECRET_missing"), "{message}");
+        assert!(message.contains("streams[0].pw"), "{message}");
+        clear_env("ARKFLOW_SECRET_empty");
+    }
+
     #[test]
     fn escape_yields_literal_reference() {
         assert_eq!(
@@ -372,8 +407,8 @@ mod tests {
             "${vault:kv/foo}"
         );
         assert_eq!(
-            resolve_string("${secret:name}", "a").unwrap(),
-            "${secret:name}"
+            resolve_string("${kms:arn:key}", "a").unwrap(),
+            "${kms:arn:key}"
         );
         // Only known schemes resolve; a typo stays literal too.
         assert_eq!(
