@@ -159,6 +159,7 @@ ArkFlow provides multiple data processors:
 - **Python** (`python`): Run Python user-defined functions over the batch
 - **Embedding** (`embedding`): Batch-embed a text column via an OpenAI-compatible API and append vector columns
 - **LLM** (`llm`): Send each row to an OpenAI-compatible chat completions API with bounded concurrency and append completions
+- **Vector Search** (`vector_search`): Search a Qdrant collection for top-k nearest neighbors of each row's vector and append matches as JSON
 
 <!-- README_COMPONENTS:processor END -->
 

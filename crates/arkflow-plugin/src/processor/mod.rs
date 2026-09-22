@@ -25,6 +25,7 @@ pub mod llm;
 pub mod protobuf;
 pub mod python;
 pub mod sql;
+pub mod vector_search;
 pub mod vrl;
 
 pub fn init() -> Result<(), Error> {
@@ -36,5 +37,6 @@ pub fn init() -> Result<(), Error> {
     vrl::init()?;
     python::init()?;
     embedding::init()?;
+    vector_search::init()?;
     Ok(())
 }

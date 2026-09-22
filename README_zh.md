@@ -157,6 +157,7 @@ ArkFlow提供多种数据处理器：
 - **Python** (`python`)：对每个批次运行用户自定义的 Python 函数
 - **Embedding** (`embedding`)：通过 OpenAI 兼容 API 批量向量化文本列并追加向量列
 - **LLM** (`llm`)：以有界并发将每行文本发送到 OpenAI 兼容对话补全 API 并追加补全列
+- **Vector Search** (`vector_search`)：在 Qdrant 集合中检索每行向量的 top-k 近邻并以 JSON 追加匹配结果
 
 <!-- README_COMPONENTS:processor END -->
 

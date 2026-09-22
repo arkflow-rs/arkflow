@@ -2090,6 +2090,71 @@
     },
     {
       "kind": "processor",
+      "name": "vector_search",
+      "description": "Searches a Qdrant collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Qdrant base URL, e.g. http://localhost:6333."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Collection to search."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "score_threshold": {
+            "type": "number",
+            "description": "Minimum similarity score; omitted from the request when unset."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight requests. Defaults to 4."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:6333",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "top_k": 5
+      }
+    },
+    {
+      "kind": "processor",
       "name": "vrl",
       "description": "Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment.",
       "config_optional": false,

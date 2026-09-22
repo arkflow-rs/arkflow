@@ -1,0 +1,43 @@
+# Complete in-engine RAG query pipeline: embed the incoming question,
+# retrieve the top-k passages from Qdrant, compose question + passages,
+# and let an LLM produce the answer. Prerequisite: documents already
+# ingested (see examples/embedding_qdrant_pipeline.yaml).
+logging:
+  level: info
+streams:
+  - id: rag-query
+    input:
+      type: memory
+      payload: |
+        [
+          {"text": "What is ArkFlow?"}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+        - type: vector_search
+          url: "http://localhost:6333"
+          collection: documents
+          vector_field: embedding
+          top_k: 5
+          target_field: matches
+        - type: sql
+          query: "SELECT *, concat('Question: ', text, ' | Passages: ', matches) AS rag_prompt FROM flow"
+        - type: llm
+          api_base: "http://localhost:9997/v1"
+          model: "gpt-4o-mini"
+          api_key: "${env:OPENAI_API_KEY:-}"
+          field: "rag_prompt"
+          system_prompt: "Answer the user's question using only the provided passages."
+          target_field: "answer"
+        - type: arrow_to_json
+
+    output:
+      type: stdout

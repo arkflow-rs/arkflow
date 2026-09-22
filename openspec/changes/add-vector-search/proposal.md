@@ -4,18 +4,18 @@ PLANNING.md 7.3-3 的 AI 切片已交付摄取侧（embedding processor + qdrant
 
 ## What Changes
 
-- 新增 processor `vector-search`（`crates/arkflow-plugin/src/processor/vector_search.rs`）：
+- 新增 processor `vector_search`（`crates/arkflow-plugin/src/processor/vector_search.rs`）：
   - 读取输入 batch 的向量列（`vector_field`，Fixed/List Float32），逐行调 qdrant `POST /collections/{collection}/points/search`（`vector`/`limit=top_k`/`with_payload`/可选 `score_threshold`）；
   - 有界保序并发（`concurrency`，默认 4）；每行检索结果序列化为 JSON 数组文本，追加为 `target_field`（Utf8 列，默认 `matches`），数组按 qdrant 返回的得分降序；
   - `api_key`（Bearer）/`headers`/`timeout_ms`/loopback 代理绕过与既有组件同语义，`api_key` 支持 secret 引用；
   - 失败（非 2xx、向量列缺失/类型错/null/空向量）返回 `Error::Process` 走 error_output 语义。
-- 组件以 `vector-search` 注册 builder + metadata schema，接入文档体系；新增「完整 RAG 管道」示例打通查询文本 → embedding → 检索 → LLM 全链路。
+- 组件以 `vector_search` 注册 builder + metadata schema，接入文档体系；新增「完整 RAG 管道」示例打通查询文本 → embedding → 检索 → LLM 全链路。
 
 ## Capabilities
 
 ### New Capabilities
 
-- `vector-search`: vector-search processor 的配置形状、逐行检索与并发语义、结果 JSON 列、错误语义与鉴权（secret 引用兼容）。
+- `vector-search`（组件类型 `vector_search`）: vector_search processor 的配置形状、逐行检索与并发语义、结果 JSON 列、错误语义与鉴权（secret 引用兼容）。
 
 ### Modified Capabilities
 

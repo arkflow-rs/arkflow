@@ -232,6 +232,11 @@
       "name": "embedding-pgvector-pipeline",
       "path": "../examples/embedding_pgvector_pipeline.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "rag-query-pipeline",
+      "path": "../examples/rag_query_pipeline.yaml",
+      "kind": "yaml"
     }
   ]
 }

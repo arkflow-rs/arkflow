@@ -2,9 +2,9 @@
 
 ## ADDED Requirements
 
-### Requirement: vector-search processor 的配置与检索请求语义
+### Requirement: vector_search processor 的配置与检索请求语义
 
-`vector-search` processor SHALL 接受配置 `url`（必填，qdrant 基地址）、`collection`（必填）、`vector_field`（可选，默认 `embedding`）、`target_field`（可选，默认 `matches`）、`top_k`（可选，默认 5）、`score_threshold`（可选 number）、`concurrency`（可选，默认 4）、`api_key`（可选，支持 secret 引用）、`timeout_ms`（可选，默认 30000）与 `headers`（可选 map）。processor SHALL 读取输入 batch 的 `vector_field` 列，对每行发起一次 `POST {url}/collections/{collection}/points/search`（body `{"vector": [...], "limit": top_k, "with_payload": true}`，`score_threshold` 仅在配置时出现），并以有界并发（在途 ≤ concurrency）执行、按行序回填结果。
+`vector_search` processor SHALL 接受配置 `url`（必填，qdrant 基地址）、`collection`（必填）、`vector_field`（可选，默认 `embedding`）、`target_field`（可选，默认 `matches`）、`top_k`（可选，默认 5）、`score_threshold`（可选 number）、`concurrency`（可选，默认 4）、`api_key`（可选，支持 secret 引用）、`timeout_ms`（可选，默认 30000）与 `headers`（可选 map）。processor SHALL 读取输入 batch 的 `vector_field` 列，对每行发起一次 `POST {url}/collections/{collection}/points/search`（body `{"vector": [...], "limit": top_k, "with_payload": true}`，`score_threshold` 仅在配置时出现），并以有界并发（在途 ≤ concurrency）执行、按行序回填结果。
 
 #### Scenario: 检索结果按行序回填为 JSON 列
 
@@ -31,7 +31,7 @@
 - **WHEN** 输入 batch 为 0 行
 - **THEN** process 返回 `ProcessResult::None`，不发起 HTTP 请求
 
-### Requirement: vector-search processor 的错误语义
+### Requirement: vector_search processor 的错误语义
 
 以下情形 SHALL 返回指明原因的 `Error::Process`（批次走 error_output 语义）：`vector_field` 缺失、类型不是 Float32 列表、null 向量、空向量；API 非 2xx（错误含状态码与截断响应体）；响应缺 `result` 数组。构建期 SHALL 拒绝 `url`/`collection`/`vector_field` 为空与 `top_k`/`concurrency` 为 0 的配置。
 
@@ -57,7 +57,7 @@
 
 ### Requirement: 组件注册与文档体系一致性
 
-组件 SHALL 以 `vector-search` 注册 builder 与 metadata schema（`components list/show/schema` 可见），SHALL 有带 `components:` front matter 的文档页、双 README 组件清单条目、注册进 example-manifest 的完整 RAG 管道示例 YAML；生成的 inventory SHALL 与注册一致。
+组件 SHALL 以 `vector_search` 注册 builder 与 metadata schema（`components list/show/schema` 可见），SHALL 有带 `components:` front matter 的文档页、双 README 组件清单条目、注册进 example-manifest 的完整 RAG 管道示例 YAML；生成的 inventory SHALL 与注册一致。
 
 #### Scenario: registry 一致性
 
