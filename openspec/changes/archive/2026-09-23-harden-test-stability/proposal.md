@@ -12,7 +12,7 @@
 
 ## 已知残留
 
-- 全量并行下仍可能有个别负载敏感测试（日志已保留于 /tmp 供事后分析）；本轮已修复全部已定位项并建立确定性 teardown 模式。
+- `disconnect_aborts_pending_and_closes_edge` 在三重并行全量下仍复现一次（30s 整预算耗尽、零 abort）：根因为 `PendingReceipts::abort_all` 经 `tokio::spawn` 设置 abort 标志，极端负载下 spawn 的任务可被长期饥饿——产品行为正确（abort_all 本身同步执行、真实断连时 flush 立即失败），属测试环境调度饥饿属性；预算已提升至 30s 并记录，后续若再复现可考虑把 abort 标志改为同步原子设置。
 
 ## Capabilities
 
