@@ -170,6 +170,14 @@ async fn run_graph_inner(
     sources_preconnected: bool,
     mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
+    // Root span for this graph execution. Chain spans are created inside
+    // this span's context (below) so they become its children; the entered
+    // guard must live for the whole function.
+    let job_span = tracing::info_span!(
+        "job.run",
+        chains = graph.chains.len() as i64,
+    );
+    let _job_guard = job_span.enter();
     // Connect every resource in dependency order (temporary stores first,
     // then sources and sinks) before any task loop spawns: a processor's
     // first `get` cannot race a temporary's `connect`, and a partial startup
@@ -249,7 +257,13 @@ async fn run_graph_inner(
             .get(chain.entry_task_id())
             .cloned()
             .unwrap_or_default();
+        // Created while the job span is entered, so this span is its child.
+        // tokio child tasks do not inherit span context: the span is moved
+        // into the task and entered there.
+        let chain_span =
+            tracing::info_span!("chain.run", task = chain.entry_task_id());
         tasks.push(tokio::spawn(async move {
+            let _chain_guard = chain_span.enter();
             let edge_failures = chain.edge_failures.clone();
             let Some(edge_failures) = edge_failures else {
                 return run_chain(chain, hook, token).await;

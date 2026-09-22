@@ -71,6 +71,41 @@ pub struct ObservabilityConfig {
     /// Path for the liveness endpoint
     #[serde(default = "default_observability_live_path")]
     pub live_path: String,
+    /// OTel trace export (disabled by default).
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
+/// OTel trace export configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TracingConfig {
+    /// Whether OTel trace export is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP-JSON endpoint for span export
+    #[serde(default = "default_tracing_endpoint")]
+    pub endpoint: String,
+    /// Resource `service.name`
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_tracing_endpoint(),
+            service_name: default_tracing_service_name(),
+        }
+    }
+}
+
+fn default_tracing_endpoint() -> String {
+    "http://127.0.0.1:4318/v1/traces".to_string()
+}
+
+fn default_tracing_service_name() -> String {
+    "arkflow".to_string()
 }
 
 impl Default for ObservabilityConfig {
@@ -81,6 +116,7 @@ impl Default for ObservabilityConfig {
             metrics_path: default_observability_metrics_path(),
             ready_path: default_observability_ready_path(),
             live_path: default_observability_live_path(),
+            tracing: TracingConfig::default(),
         }
     }
 }

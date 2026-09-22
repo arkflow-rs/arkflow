@@ -4749,3 +4749,96 @@ async fn downstream_processing_failure_keeps_upstream_branch_pending() {
     upstream.shutdown();
     downstream.shutdown();
 }
+
+#[tokio::test]
+async fn job_and_chain_spans_are_exported_with_parent_links() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let exporter =
+        opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let tracer = provider.tracer("executor-span-test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let spec = spec(
+        vec![map_operator("a")],
+        vec![edge("source", "a"), edge("a", "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    // This test binary has no other global subscriber; installing the OTel
+    // subscriber globally covers the spawned chain tasks too.
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(otel_layer),
+    );
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let names: Vec<&str> = finished
+        .iter()
+        .map(|span| span.name.as_ref())
+        .filter(|name| *name == "job.run" || *name == "chain.run")
+        .collect();
+    assert!(
+        names.contains(&"job.run") && names.contains(&"chain.run"),
+        "expected job.run and chain.run spans, got {names:?}"
+    );
+
+    let job_spans: Vec<_> = finished
+        .iter()
+        .filter(|span| span.name.as_ref() == "job.run")
+        .collect();
+    assert_eq!(job_spans.len(), 1, "exactly one job.run span");
+    let job = job_spans[0];
+    let chains_attr = job
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "chains")
+        .expect("chains attribute");
+        let chains_value = match &chains_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        other => panic!("unexpected chains attribute: {other:?}"),
+    };
+    assert_eq!(chains_value, 3, "3 chains in this graph");
+
+    // Every chain.run must be a child of the job.run span.
+    let job_span_id = job.span_context.span_id();
+    let chain_runs: Vec<_> = finished
+        .iter()
+        .filter(|span| span.name.as_ref() == "chain.run")
+        .collect();
+    assert_eq!(chain_runs.len(), 3);
+    for chain in &chain_runs {
+        assert_eq!(
+            chain.parent_span_id, job_span_id,
+            "chain.run must be a child of job.run"
+        );
+    }
+
+    // The fused chain carries its entry task id in the `task` attribute.
+    let tasks: Vec<String> = chain_runs
+        .iter()
+        .filter_map(|span| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == "task")
+                .map(|kv| kv.value.as_str().to_string())
+        })
+        .collect();
+    assert!(tasks.iter().any(|task| task == "source-0"), "{tasks:?}");
+    assert!(tasks.iter().any(|task| task == "a-0"), "{tasks:?}");
+}

@@ -10,6 +10,9 @@ license.workspace = true
 
 
 [dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tokio = { workspace = true}
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

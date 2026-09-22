@@ -114,6 +114,30 @@ logging:
 `json` 格式适合日志采集器(Vector、Fluent Bit、Loki);`plain` 适合交互式调试。
 当 `file_path` 无法打开时,引擎会退回 stdout 日志,并在 stderr 上说明。
 
+## 追踪
+
+在 `health_check.observability.tracing` 下启用 OTel trace 导出。span 经
+OTLP HTTP-JSON 批量导出;默认关闭该节,对行为没有任何影响。
+
+```yaml validate=fragment wrap=engine
+health_check:
+  observability:
+    tracing:
+      enabled: true
+      endpoint: "http://localhost:4318/v1/traces"
+      service_name: "arkflow"
+```
+
+v1 的 span 模型是每次 Job 执行的生命周期骨架:
+
+- `job.run` —— 一次图执行的根 span,带 `chains` 属性(链数)。
+- `chain.run` —— 每条链一个子 span(属性 `task`,链的入口任务 id),
+  覆盖从启动到资源关闭的全程。
+
+已知的 v1 边界:没有 per-batch 或 per-connector span(worker 池的上下文
+传播是后续工作),跨节点不传播 trace 上下文——每个进程为其运行的 Job
+各自作为 trace 根。导出器故障绝不影响数据面。
+
 ## 面向仪表盘的运维状态
 
 `GET /api/v1/operations/status` 返回一个为状态页与告警设计的有界摘要:分发健康状况、待处理操作与机群收敛情况。

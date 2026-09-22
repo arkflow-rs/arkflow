@@ -18,7 +18,11 @@ use crate::engine::Engine;
 use clap::{Arg, ArgMatches, Command};
 use std::process;
 use tracing::{info, Level};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 #[derive(Default)]
 pub struct Cli {
@@ -327,63 +331,103 @@ pub fn init_logging(config: &EngineConfig) {
         "error" => Level::ERROR,
         _ => Level::INFO,
     };
+    let level_filter = LevelFilter::from(log_level);
 
-    let subscriber_builder = fmt::Subscriber::builder().with_max_level(log_level);
-
-    // Check if we need to output logs to a file
-    if let Some(file_path) = &config.logging.file_path {
-        // Create the file and parent directories if they don't exist
+    // Open the log file when a path is configured; failures fall back to
+    // console logging like before.
+    let file = config.logging.file_path.as_ref().and_then(|file_path| {
         if let Some(parent) = std::path::Path::new(file_path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
-
-        // Open the file for writing
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(file_path)
         {
             Ok(file) => {
-                match config.logging.format {
-                    LogFormat::JSON => {
-                        let subscriber = subscriber_builder
-                            .with_writer(std::sync::Mutex::new(file))
-                            .pretty()
-                            .json()
-                            .finish();
-                        tracing::subscriber::set_global_default(subscriber)
-                            .expect("You can't set a global default log subscriber");
-                    }
-                    LogFormat::PLAIN => {
-                        let subscriber = subscriber_builder
-                            .with_writer(std::sync::Mutex::new(file))
-                            .pretty()
-                            .finish();
-                        tracing::subscriber::set_global_default(subscriber)
-                            .expect("You can't set a global default log subscriber");
-                    }
-                }
-
                 info!("Logging to file: {}", file_path);
-                return;
+                Some(std::sync::Mutex::new(file))
             }
             Err(e) => {
                 eprintln!("Failed to open log file {}: {}", file_path, e);
-                // Fall back to console logging
+                None
             }
         }
-    }
+    });
 
-    match config.logging.format {
-        LogFormat::JSON => {
-            let subscriber = subscriber_builder.pretty().json().finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("You can't set a global default log subscriber");
-        }
-        LogFormat::PLAIN => {
-            let subscriber = subscriber_builder.pretty().finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("You can't set a global default log subscriber");
-        }
+    // The fmt layer reproduces the original subscriber behavior matrix
+    // (writer x format); the optional OTel layer adds span export without
+    // touching it.
+    let fmt_layer: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> =
+        match (file, config.logging.format.clone()) {
+            (Some(writer), LogFormat::JSON) => fmt::layer()
+                .with_writer(writer)
+                .json()
+                .with_filter(level_filter)
+                .boxed(),
+            (Some(writer), LogFormat::PLAIN) => fmt::layer()
+                .with_writer(writer)
+                .pretty()
+                .with_filter(level_filter)
+                .boxed(),
+            (None, LogFormat::JSON) => {
+                fmt::layer().json().with_filter(level_filter).boxed()
+            }
+            (None, LogFormat::PLAIN) => {
+                fmt::layer().pretty().with_filter(level_filter).boxed()
+            }
+        };
+
+    let otel_layer = build_otel_layer(&config.health_check.observability.tracing);
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(otel_layer)
+        .init();
+}
+
+/// Builds the OTel span-export layer when tracing is enabled. Any build
+/// failure is isolated: a warning is printed and `None` is returned so the
+/// data plane is never affected by the export pipeline.
+fn build_otel_layer<S>(
+    config: &crate::config::TracingConfig,
+) -> Option<Box<dyn tracing_subscriber::Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + Send + Sync,
+    S: for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if !config.enabled {
+        return None;
     }
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::{HasExportConfig, WithExportConfig};
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_export_config(opentelemetry_otlp::ExportConfig {
+            endpoint: Some(config.endpoint.clone()),
+            protocol: opentelemetry_otlp::Protocol::HttpJson,
+            ..opentelemetry_otlp::ExportConfig::default()
+        })
+        .build();
+    let exporter = match exporter {
+        Ok(exporter) => exporter,
+        Err(error) => {
+            eprintln!(
+                "Failed to build the OTLP span exporter (tracing disabled): {}",
+                error
+            );
+            return None;
+        }
+    };
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(config.service_name.clone())
+                .build(),
+        )
+        .build();
+    let tracer = provider.tracer("arkflow");
+    let _ = opentelemetry::global::set_tracer_provider(provider);
+    Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
 }
