@@ -1,0 +1,33 @@
+# Kafka input over SASL/SSL (SCRAM-SHA-256) — the common managed-Kafka
+# setup. `protocol` may be omitted here: a `sasl` + `tls` block pair infers
+# `sasl_ssl`. Replace the credentials and CA path with your own.
+logging:
+  level: info
+streams:
+  - input:
+      type: kafka
+      brokers:
+        - broker1.example.com:9094
+      topics:
+        - events
+      consumer_group: arkflow
+      start_from_latest: false
+      security:
+        protocol: sasl_ssl
+        sasl:
+          mechanism: scram-sha-256
+          username: arkflow
+          password: change-me
+        tls:
+          ca: /etc/arkflow/certs/ca.crt
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: "SELECT * FROM flow"
+        - type: arrow_to_json
+
+    output:
+      type: stdout

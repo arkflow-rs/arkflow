@@ -1,0 +1,35 @@
+# Kafka output over SASL/SSL (SCRAM-SHA-512) with mTLS client authentication.
+# `cert`/`key` accept a file path or inline PEM text (auto-detected via the
+# `-----BEGIN` marker). Replace the credentials and certificate paths.
+logging:
+  level: info
+streams:
+  - input:
+      type: generate
+      context: '{ "timestamp": 1625000000000, "value": 10, "sensor": "temp_1" }'
+      interval: 1s
+      batch_size: 1
+
+    pipeline:
+      thread_num: 2
+      processors:
+        - type: json_to_arrow
+
+    output:
+      type: kafka
+      brokers:
+        - broker1.example.com:9094
+      topic:
+        type: value
+        value: events-out
+      security:
+        protocol: sasl_ssl
+        sasl:
+          mechanism: scram-sha-512
+          username: arkflow
+          password: change-me
+        tls:
+          ca: /etc/arkflow/certs/ca.crt
+          cert: /etc/arkflow/certs/client.crt
+          key: /etc/arkflow/certs/client.key
+          key_password: change-me-too
