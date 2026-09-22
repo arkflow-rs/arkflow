@@ -35,6 +35,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
 | output | `influxdb` | Writes time-series data to InfluxDB v2.x using the Line Protocol. | [reference](../components/outputs/influxdb) |
 | output | `kafka` | Produces messages to Apache Kafka. Supports key-based partitioning and compression. | [reference](../components/outputs/kafka) |
+| output | `milvus` | Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row. | [reference](../components/outputs/milvus) |
 | output | `mongodb` | Writes Arrow rows to MongoDB as BSON documents. | [reference](../components/outputs/mongodb) |
 | output | `mqtt` | Publishes messages to an MQTT broker topic. | [reference](../components/outputs/mqtt) |
 | output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |

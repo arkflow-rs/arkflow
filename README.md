@@ -193,6 +193,7 @@ ArkFlow supports multiple output targets:
 - **Drop** (`drop`): Discard data
 - **Qdrant** (`qdrant`): Upsert vectors and payloads into a Qdrant collection
 - **pgvector** (`pgvector`): Upsert vectors and JSON payloads into a PostgreSQL table with the pgvector extension
+- **Milvus** (`milvus`): Upsert vectors and JSON payloads into a Milvus collection via the REST v2 API
 
 <!-- README_COMPONENTS:output END -->
 

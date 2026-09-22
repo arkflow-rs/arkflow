@@ -237,6 +237,11 @@
       "name": "rag-query-pipeline",
       "path": "../examples/rag_query_pipeline.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "embedding-milvus-pipeline",
+      "path": "../examples/embedding_milvus_pipeline.yaml",
+      "kind": "yaml"
     }
   ]
 }

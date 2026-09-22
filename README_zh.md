@@ -191,6 +191,7 @@ ArkFlow支持多种输出目标：
 - **Drop** (`drop`)：丢弃数据
 - **Qdrant** (`qdrant`)：将向量与负载写入 Qdrant 集合
 - **pgvector** (`pgvector`)：将向量与 JSON 负载写入启用了 pgvector 扩展的 PostgreSQL 表
+- **Milvus** (`milvus`)：通过 REST v2 API 将向量与 JSON 负载写入 Milvus 集合
 
 <!-- README_COMPONENTS:output END -->
 

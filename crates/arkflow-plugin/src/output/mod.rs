@@ -23,6 +23,7 @@ pub mod drop;
 pub mod http;
 pub mod influxdb;
 pub mod kafka;
+pub mod milvus;
 pub mod mongodb;
 pub mod mqtt;
 pub mod nats;
@@ -38,6 +39,7 @@ pub fn init() -> Result<(), Error> {
     http::init()?;
     influxdb::init()?;
     kafka::init()?;
+    milvus::init()?;
     mqtt::init()?;
     mongodb::init()?;
     nats::init()?;

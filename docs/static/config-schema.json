@@ -1847,6 +1847,7 @@
             null,
             null,
             null,
+            null,
             null
           ],
           "description": "output component type."
@@ -2461,6 +2462,129 @@
                 "localhost:9092"
               ],
               "topic": "events"
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "milvus",
+          "description": "Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "milvus",
+              "description": "Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "url": {
+              "type": "string",
+              "description": "Milvus base URL, e.g. http://localhost:19530."
+            },
+            "collection": {
+              "type": "string",
+              "description": "Target collection name (schema must already exist)."
+            },
+            "vector_field": {
+              "type": "string",
+              "description": "Name of the vector field (FixedSizeList/List of Float32). Defaults to 'embedding'."
+            },
+            "id_field": {
+              "type": "string",
+              "description": "Field carrying the row id (integer or string). When omitted the id key is left out (auto-id collections)."
+            },
+            "payload_field": {
+              "type": "string",
+              "description": "JSON field receiving every remaining column as a per-row object. Defaults to 'payload'; set to an empty string to disable."
+            },
+            "api_key": {
+              "type": "string",
+              "description": "Sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Extra HTTP headers."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "url": "http://localhost:19530",
+              "collection": "documents",
+              "vector_field": "embedding",
+              "id_field": "doc_id",
+              "api_key": "${env:MILVUS_CREDENTIALS}"
             }
           ]
         },

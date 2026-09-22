@@ -1187,6 +1187,64 @@
     },
     {
       "kind": "output",
+      "name": "milvus",
+      "description": "Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Milvus base URL, e.g. http://localhost:19530."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Target collection name (schema must already exist)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector field (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Field carrying the row id (integer or string). When omitted the id key is left out (auto-id collections)."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "JSON field receiving every remaining column as a per-row object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:19530",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id",
+        "api_key": "${env:MILVUS_CREDENTIALS}"
+      }
+    },
+    {
+      "kind": "output",
       "name": "mongodb",
       "description": "Writes Arrow rows to MongoDB as BSON documents.",
       "config_optional": false,
