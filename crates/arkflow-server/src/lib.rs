@@ -7,6 +7,7 @@ pub mod agent;
 pub mod api_contract;
 pub mod hub;
 pub mod metrics;
+pub mod oidc;
 pub mod storage;
 
 use crate::api_contract::{
@@ -574,7 +575,7 @@ pub async fn serve_hub(
 }
 
 async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -592,7 +593,7 @@ async fn hub_nodes(
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -607,7 +608,7 @@ async fn hub_streams(
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -644,7 +645,7 @@ async fn hub_stream(
     Path((node_id, stream_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -672,7 +673,7 @@ async fn hub_stream(
 }
 
 async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -700,7 +701,7 @@ async fn hub_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -723,7 +724,7 @@ async fn hub_job_plan(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -836,7 +837,7 @@ async fn hub_job_checkpoints(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -935,7 +936,7 @@ async fn hub_job_detail(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1036,7 +1037,7 @@ async fn hub_job_versions(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1568,7 +1569,7 @@ async fn hub_configuration(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1590,7 +1591,7 @@ async fn hub_configuration_versions(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2077,7 +2078,7 @@ async fn hub_operations(
     Query(query): Query<OperationQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2112,7 +2113,7 @@ async fn hub_operation(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2160,7 +2161,7 @@ async fn hub_events(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2198,7 +2199,7 @@ async fn hub_event_stream(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2302,7 +2303,7 @@ async fn hub_audit(
     Query(query): Query<AuditQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2363,7 +2364,7 @@ async fn create_rollout(
 }
 
 async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2381,7 +2382,7 @@ async fn hub_rollout(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2449,7 +2450,7 @@ async fn hub_metrics(
     Query(_query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2542,7 +2543,7 @@ async fn hub_metrics(
 }
 
 async fn hub_operational_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers)) {
+    if !hub.operator_authorized(bearer(&headers)).await {
         return problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2812,8 +2813,8 @@ fn prometheus_label(value: &str) -> String {
         .collect()
 }
 
-fn operator_denied(hub: &hub::Hub, supplied: Option<&str>, action: OperatorAction) -> Response {
-    if hub.operator_principal(supplied).is_none() {
+async fn operator_denied(hub: &hub::Hub, supplied: Option<&str>, action: OperatorAction) -> Response {
+    if hub.operator_principal(supplied).await.is_none() {
         problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -2836,7 +2837,7 @@ async fn require_operator_action(
     resource_id: Option<String>,
 ) -> Result<OperatorPrincipal, Response> {
     let supplied = bearer(headers);
-    let principal = hub.operator_principal(supplied);
+    let principal = hub.operator_principal(supplied).await;
     if principal
         .as_ref()
         .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id.as_deref()))
@@ -2870,7 +2871,7 @@ async fn require_operator_action(
             occurred_at_ms: hub::now_ms_for_metrics(),
         })
         .await;
-    Err(operator_denied(hub, supplied, action))
+    Err(operator_denied(hub, supplied, action).await)
 }
 
 fn hub_problem(error: hub::HubError) -> Response {

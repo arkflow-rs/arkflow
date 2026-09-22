@@ -1,5 +1,6 @@
 use arkflow_server::{
     hub::{Hub, HubConfig},
+    oidc::OidcAuthenticator,
     serve_hub,
     storage::{ControlPlaneStore, StorageActor},
     ServerConfig,
@@ -31,11 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         poll_interval_ms: config.poll_interval_ms,
         session_ttl_ms: config.session_ttl_ms,
     };
-    let hub = if let Some(path) = config.hub_storage.as_deref() {
+    let mut hub = if let Some(path) = config.hub_storage.as_deref() {
         let store = ControlPlaneStore::open(path)?;
         Hub::with_storage(hub_config, StorageActor::start(store, 128))
     } else {
         Hub::new(hub_config)
     };
+    if let Some(oidc) = OidcAuthenticator::from_env() {
+        hub = hub.with_oidc(oidc);
+    }
     serve_hub(hub, config, cancellation).await
 }

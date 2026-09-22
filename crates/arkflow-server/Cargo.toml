@@ -9,6 +9,7 @@ homepage.workspace = true
 license.workspace = true
 
 [dependencies]
+jsonwebtoken = { workspace = true }
 arkflow-core = { workspace = true }
 arkflow-plugin = { workspace = true }
 axum = { workspace = true }

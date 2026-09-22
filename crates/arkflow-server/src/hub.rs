@@ -386,6 +386,9 @@ pub struct Hub {
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     command_metrics: Arc<CommandMetrics>,
+    /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
+    /// operator credentials keep priority when both are configured.
+    oidc: Option<crate::oidc::OidcAuthenticator>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -540,6 +543,7 @@ impl Hub {
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
+            oidc: None,
         }
     }
 
@@ -547,6 +551,13 @@ impl Hub {
         let mut hub = Self::new(config);
         hub.storage = Some(storage);
         hub
+    }
+
+    /// Enables OIDC JWT bearer principals (in addition to the static
+    /// operator credential). See `crate::oidc`.
+    pub fn with_oidc(mut self, oidc: crate::oidc::OidcAuthenticator) -> Self {
+        self.oidc = Some(oidc);
+        self
     }
 
     pub fn has_storage(&self) -> bool {
@@ -2490,38 +2501,46 @@ impl Hub {
         Ok(Some(operation))
     }
 
-    pub fn operator_authorized(&self, supplied: Option<&str>) -> bool {
-        self.operator_principal(supplied).is_some()
+    pub async fn operator_authorized(&self, supplied: Option<&str>) -> bool {
+        self.operator_principal(supplied).await.is_some()
     }
 
-    pub fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
-        let Some(expected) = self.config.operator_token.as_deref() else {
-            return self
-                .config
-                .insecure_local
-                .then(OperatorPrincipal::legacy_operator);
-        };
-        if expected.trim().is_empty() {
-            return None;
+    pub async fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
+        if let Some(expected) = self.config.operator_token.as_deref() {
+            if !expected.trim().is_empty() {
+                if let Some(supplied) = supplied {
+                    let (id, role, secret, scopes) = parse_operator_credential(expected);
+                    if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
+                        return Some(OperatorPrincipal {
+                            id: id.to_owned(),
+                            roles: vec![role],
+                            scopes,
+                        });
+                    }
+                    // A bearer that is not the static credential falls
+                    // through to OIDC below (JWTs never ct_eq-match).
+                } else {
+                    return None;
+                }
+            }
+        } else if self.config.insecure_local {
+            return Some(OperatorPrincipal::legacy_operator());
         }
-        let (id, role, secret, scopes) = parse_operator_credential(expected);
-        let supplied = supplied?;
-        if !bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
-            return None;
-        }
-        Some(OperatorPrincipal {
-            id: id.to_owned(),
-            roles: vec![role],
-            scopes,
-        })
+
+        // Static credentials did not match (or are absent); fall back to
+        // OIDC JWT validation when federation is configured.
+        let authenticator = self.oidc.as_ref()?;
+        let token = supplied?;
+        authenticator.authenticate(token).await
     }
 
-    pub fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
+    pub async fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
         self.operator_principal(supplied)
+            .await
             .is_some_and(|principal| principal.can(action))
     }
 
-    pub fn operator_can_scope(
+    pub async fn operator_can_scope(
         &self,
         supplied: Option<&str>,
         action: OperatorAction,
@@ -2529,6 +2548,7 @@ impl Hub {
         resource_id: Option<&str>,
     ) -> bool {
         self.operator_principal(supplied)
+            .await
             .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id))
     }
 
@@ -6485,7 +6505,7 @@ mod tests {
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
         });
-        assert!(!hub.operator_authorized(None));
+        assert!(!hub.operator_authorized(None).await);
         let result = hub
             .register(RegisterRequest {
                 node_id: "unauthorized-node".into(),
@@ -6642,20 +6662,20 @@ mod tests {
         assert_eq!(capabilities, vec!["configuration"]);
     }
 
-    #[test]
-    fn compatibility_token_can_be_scoped_to_a_role() {
+    #[tokio::test]
+    async fn compatibility_token_can_be_scoped_to_a_role() {
         let hub = Hub::new(HubConfig {
             operator_token: Some("readonly|viewer|viewer-secret".into()),
             ..config()
         });
-        assert!(hub.operator_authorized(Some("viewer-secret")));
-        assert!(hub.operator_can(Some("viewer-secret"), OperatorAction::Read));
-        assert!(!hub.operator_can(Some("viewer-secret"), OperatorAction::Operate));
-        assert!(!hub.operator_authorized(Some("operator")));
+        assert!(hub.operator_authorized(Some("viewer-secret")).await);
+        assert!(hub.operator_can(Some("viewer-secret"), OperatorAction::Read).await);
+        assert!(!hub.operator_can(Some("viewer-secret"), OperatorAction::Operate).await);
+        assert!(!hub.operator_authorized(Some("operator")).await);
     }
 
-    #[test]
-    fn operator_credential_can_limit_resource_scope() {
+    #[tokio::test]
+    async fn operator_credential_can_limit_resource_scope() {
         let hub = Hub::new(HubConfig {
             operator_token: Some("ops|operator|operator-secret|node=node-a,rollout=".into()),
             ..config()
@@ -6665,19 +6685,19 @@ mod tests {
             OperatorAction::Operate,
             "node",
             Some("node-a")
-        ));
+        ).await);
         assert!(!hub.operator_can_scope(
             Some("operator-secret"),
             OperatorAction::Operate,
             "node",
             Some("node-b")
-        ));
+        ).await);
         assert!(hub.operator_can_scope(
             Some("operator-secret"),
             OperatorAction::ManageRollouts,
             "rollout",
             Some("rollout-1")
-        ));
+        ).await);
     }
 
     #[test]

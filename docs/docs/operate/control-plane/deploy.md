@@ -16,6 +16,32 @@ may be a raw token (admin) or `principal|role|secret`, for example
 `readonly|viewer|viewer-secret`; viewer credentials can read resources and
 audit history but cannot mutate Streams, nodes, or rollouts.
 
+### OIDC JWT federation
+
+Instead of (or alongside) the static operator credential, the Hub accepts
+bearer JWTs issued by your organization's OIDC identity provider. Configure
+it with environment variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ARKFLOW_OIDC_ISSUER` | yes | Token issuer; must match the token's `iss` claim. |
+| `ARKFLOW_OIDC_AUDIENCE` | yes | Expected `aud` claim for the Hub. |
+| `ARKFLOW_OIDC_JWKS_URL` | no | JWKS endpoint; defaults to `{issuer}/.well-known/jwks.json`. |
+| `ARKFLOW_OIDC_ROLE_CLAIM` | no | Claim carrying the role(s); defaults to `roles`. |
+| `ARKFLOW_OIDC_SCOPES_CLAIM` | no | Claim carrying resource scopes; defaults to `scopes`. |
+
+Claims map onto the existing RBAC model: `sub` becomes the principal id,
+the role claim accepts an array or a single string (`admin`, `operator`, or
+`viewer` — the highest matching role wins), and the scopes claim (array or
+comma-separated) uses the same `type=id` grammar as static credentials,
+for example `["node=node-a", "stream"]`. Only asymmetric algorithms
+(ES256/RS256) are accepted; signature, expiry, issuer, and audience are all
+validated, and the JWKS is cached with on-demand refresh when an unknown key
+id appears. Prefer short-lived tokens at your identity provider — there is
+no revocation list. The static credential still works when configured, so
+you can keep break-glass automation tokens while human access moves to the
+identity provider.
+
 The included `console/Dockerfile` builds static assets and serves them through
 Nginx. Its `/api/` and `/metrics` locations proxy to an `arkflow-hub:8080`
 service; deploy it on a private network with TLS and an authentication layer.
