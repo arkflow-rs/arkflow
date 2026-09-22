@@ -37,7 +37,11 @@ sidebar_position: 2
   HttpOnly 的 `arkflow_session` cookie。
 - `GET /api/v1/auth/oidc/logout` —— 删除服务端会话并清除 cookie。
 
-浏览器会话与其他凭据走同一套 RBAC 模型(角色来自角色 claim)。会话
+浏览器会话与其他凭据走同一套 RBAC 模型(角色来自角色 claim)。Console
+会自动集成:它探测 `GET /api/v1/auth/oidc/status`(公开端点,报告
+`login_enabled`、`authenticated` 与 principal),遇到 401 时跳转到登录
+流,并为已认证会话显示登出控件。`VITE_API_TOKEN` 部署保持不变——配置了
+静态令牌时控制台不会重定向。会话
 保存在内存中:重启 Hub 会强制所有人重新登录,也没有吊销列表——建议在
 身份提供方侧签发短时令牌。未配置 client 变量时 Hub 保持仅 bearer 模式,
 登录路由不存在。

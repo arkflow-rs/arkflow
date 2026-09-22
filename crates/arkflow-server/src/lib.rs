@@ -451,7 +451,8 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/agent/report", post(agent_report))
         .route("/agent/job-observations", post(agent_job_observation))
         .route("/agent/commands", get(agent_commands))
-        .route("/agent/commands/{id}/result", post(agent_command_result));
+        .route("/agent/commands/{id}/result", post(agent_command_result))
+        .route("/auth/oidc/status", get(hub_oidc_status));
     let api = if hub.oidc_login().is_some() {
         api.route("/auth/oidc/login", get(hub_oidc_login))
             .route("/auth/oidc/callback", get(hub_oidc_callback))
@@ -2804,6 +2805,21 @@ async fn hub_readiness(State(hub): State<hub::Hub>) -> Response {
 }
 async fn hub_liveness() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive","alive":true}))
+}
+
+async fn hub_oidc_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    let login_enabled = hub.oidc_login().is_some();
+    let principal = cookie_value(&headers, "arkflow_session")
+        .and_then(|session_id| hub.oidc_session_principal(&session_id));
+    let body = serde_json::json!({
+        "login_enabled": login_enabled,
+        "authenticated": principal.is_some(),
+        "principal": principal.map(|principal| serde_json::json!({
+            "id": principal.id,
+            "roles": principal.roles.iter().map(|role| format!("{role:?}").to_lowercase()).collect::<Vec<_>>(),
+        })),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 pub(crate) async fn hub_oidc_login(State(hub): State<hub::Hub>) -> Response {

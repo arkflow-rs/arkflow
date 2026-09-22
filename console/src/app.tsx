@@ -3,6 +3,8 @@ import {
   api,
   ControlNode,
   errorMessage,
+  oidcLogout,
+  oidcStatus,
   REFRESH_DEBOUNCE_MS,
   SNAPSHOT_INTERVAL_MS,
   streamEvents,
@@ -55,6 +57,7 @@ export function App() {
   const [stale, setStale] = useState(false)
   const [live, setLive] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [oidcAuthenticated, setOidcAuthenticated] = useState(false)
 
   const goTo = (next: Page) => {
     setPage(next)
@@ -101,6 +104,9 @@ export function App() {
   }, [selectedNode])
 
   useEffect(() => {
+    void oidcStatus()
+      .then((status) => setOidcAuthenticated(status.authenticated))
+      .catch(() => setOidcAuthenticated(false))
     void refresh()
     const timer = window.setInterval(() => void refresh(), SNAPSHOT_INTERVAL_MS)
     // Live events arrive in bursts; coalesce them into one debounced snapshot
@@ -165,6 +171,16 @@ export function App() {
             <h2>{pageTitle}</h2>
           </div>
           <div className="actions">
+            {oidcAuthenticated && (
+              <button
+                onClick={() => {
+                  setOidcAuthenticated(false)
+                  void oidcLogout()
+                }}
+              >
+                Sign out
+              </button>
+            )}
             <span className={`connection ${live ? 'connected' : 'disconnected'}`}>
               {live ? 'Live events' : 'Snapshot mode'}
             </span>

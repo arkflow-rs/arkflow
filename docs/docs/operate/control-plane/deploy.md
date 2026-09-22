@@ -46,7 +46,12 @@ authorization/token endpoints at startup and serves a browser login flow:
   clears the cookie.
 
 Browser sessions participate in the same RBAC model as every other
-credential (the role comes from the role claim). Sessions live in memory:
+credential (the role comes from the role claim). The Console integrates
+automatically: it probes `GET /api/v1/auth/oidc/status` (a public endpoint
+reporting `login_enabled`, `authenticated`, and the principal), redirects
+to the login flow on a 401, and shows a sign-out control for
+authenticated sessions. `VITE_API_TOKEN` deployments keep working
+unchanged — with a static token configured the console never redirects. Sessions live in memory:
 restarting the Hub signs everyone out, and there is no revocation list —
 prefer short-lived tokens at the identity provider. Without the client
 variables the Hub stays bearer-only and the login routes are absent.

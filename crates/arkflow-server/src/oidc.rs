@@ -474,6 +474,8 @@ fn parse_scope(value: &str) -> Option<ResourceScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
     use serde_json::json;
     use jsonwebtoken::{encode, EncodingKey, Header};
 
@@ -933,6 +935,99 @@ mod tests {
             requests.iter().any(|(head, _)| head.starts_with("POST /token ")),
             "code exchange must hit the token endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_reflects_login_and_session_state() {
+        use crate::hub::Hub;
+        use crate::hub::HubConfig;
+
+        let idp = MockIdp::spawn();
+        let federation = OidcFederation::from_settings(OidcSettings {
+            issuer: format!("http://{}", idp.addr),
+            audience: AUDIENCE.to_string(),
+            jwks_url: Some(idp.jwks_url.clone()),
+            client_id: Some("arkflow-console".to_string()),
+            client_secret: Some("console-secret".to_string()),
+            redirect_uri: Some("http://console:3000/auth/callback".to_string()),
+            ..OidcSettings::default()
+        })
+        .await
+        .unwrap();
+        let hub = Hub::new(HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: 3_600_000,
+        })
+        .with_oidc(federation.clone());
+
+        // Enabled + no session yet.
+        let response = crate::hub_oidc_status(State(hub.clone()), HeaderMap::new()).await;
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["login_enabled"], true);
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["principal"], Value::Null);
+
+        // Log in via the flow, then the session must show as authenticated.
+        let login = crate::hub_oidc_login(State(hub.clone())).await;
+        let cookies = login
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let state = cookies
+            .split("; ")
+            .find_map(|cookie| cookie.strip_prefix("arkflow_oidc_state="))
+            .unwrap()
+            .to_string();
+        let mut callback_headers = axum::http::HeaderMap::new();
+        callback_headers.insert(
+            axum::http::header::COOKIE,
+            format!("arkflow_oidc_state={state}").parse().unwrap(),
+        );
+        let mut query = std::collections::HashMap::new();
+        query.insert("code".to_string(), "auth-code-2".to_string());
+        query.insert("state".to_string(), state);
+        let callback = crate::hub_oidc_callback(State(hub.clone()), axum::extract::Query(query), callback_headers)
+            .await;
+        let session_cookie = callback
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let session_id = session_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("arkflow_session=")
+            .to_string();
+
+        let mut authed_headers = HeaderMap::new();
+        authed_headers.insert(
+            axum::http::header::COOKIE,
+            format!("arkflow_session={session_id}").parse().unwrap(),
+        );
+        let response = crate::hub_oidc_status(State(hub), authed_headers).await;
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["principal"]["id"], "console-user");
+        assert_eq!(body["principal"]["roles"][0], "viewer");
     }
 
     #[tokio::test]

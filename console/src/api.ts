@@ -279,6 +279,9 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
+    if (response.status === 401 && !token) {
+      void redirectToOidcLogin()
+    }
     const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
     throw {
       code: body.code ?? 'request_failed',
@@ -484,4 +487,42 @@ export async function waitForOperation(id: string): Promise<Operation> {
     await new Promise((resolve) => window.setTimeout(resolve, 250))
   }
   throw new Error('Operation timed out')
+}
+
+// --- OIDC browser login integration -------------------------------------
+
+export interface OidcStatus {
+  login_enabled: boolean
+  authenticated: boolean
+  principal: { id: string; roles: string[] } | null
+}
+
+let oidcProbe: Promise<OidcStatus> | null = null
+
+/** Probes (once) whether the Hub offers the OIDC browser login flow and
+ * whether the current session cookie is still valid. */
+export function oidcStatus(): Promise<OidcStatus> {
+  oidcProbe ??= fetch(`${base}/auth/oidc/status`)
+    .then((response) => (response.ok ? response.json() : { login_enabled: false, authenticated: false, principal: null }))
+    .catch(() => ({ login_enabled: false, authenticated: false, principal: null })) as Promise<OidcStatus>
+  return oidcProbe
+}
+
+const REDIRECT_GUARD_MS = 10_000
+
+/** Redirects the browser to the Hub OIDC login endpoint, at most once per
+ * guard window so a misconfigured deployment cannot loop. */
+export function redirectToOidcLogin(): void {
+  const guard = 'arkflow_oidc_redirected_at'
+  const last = Number(sessionStorage.getItem(guard) ?? 0)
+  if (Date.now() - last < REDIRECT_GUARD_MS) return
+  sessionStorage.setItem(guard, String(Date.now()))
+  window.location.assign(`${base}/auth/oidc/login`)
+}
+
+/** Ends the browser session server-side and reloads the console. */
+export async function oidcLogout(): Promise<void> {
+  await fetch(`${base}/auth/oidc/logout`)
+  sessionStorage.removeItem('arkflow_oidc_redirected_at')
+  window.location.reload()
 }

@@ -566,6 +566,12 @@ impl Hub {
         federation.login_enabled().then(|| federation.clone())
     }
 
+    /// Resolves an `arkflow_session` cookie value to its principal.
+    pub fn oidc_session_principal(&self, session_id: &str) -> Option<OperatorPrincipal> {
+        let federation = self.oidc.as_ref()?;
+        federation.resolve_session(session_id)
+    }
+
     pub fn has_storage(&self) -> bool {
         self.storage.is_some()
     }
