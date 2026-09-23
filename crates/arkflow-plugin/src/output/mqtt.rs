@@ -242,7 +242,13 @@ pub fn init() -> Result<(), Error> {
                 "qos": {"type": "integer", "enum": [0, 1, 2], "default": 0, "description": "Quality of Service."},
                 "clean_session": {"type": "boolean", "default": true},
                 "keep_alive": {"type": "integer", "minimum": 1, "description": "Keep-alive interval in seconds."},
-                "retain": {"type": "boolean", "default": false, "description": "Whether to retain the message on the broker."}
+                "retain": {"type": "boolean", "default": false, "description": "Whether to retain the message on the broker."},
+                "tls": {"type": "object", "description": "TLS transport configuration.", "properties": {
+                    "enabled": {"type": "boolean", "default": true},
+                    "ca": {"type": "string", "description": "CA certificate file path."},
+                    "client_cert": {"type": "string", "description": "Client certificate file (mTLS)."},
+                    "client_key": {"type": "string", "description": "Client private key file (mTLS)."}
+                }}
             },
             "required": ["host", "port", "client_id", "topic"]
         }),
