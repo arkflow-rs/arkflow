@@ -248,7 +248,7 @@ A WAL backend MAY reclaim entries covered by the acknowledged cursor once their 
 
 ### Requirement: 优雅关闭时的 parked 确认 drain
 
-WAL 关闭触发时，仍在等待前序 in-flight 交付 settle 的 parked 确认 SHALL 获得一个有界 drain 窗口（15s）：窗口内前序交付 settle 使该确认变为可执行时，SHALL 正常完成其源提交并返回成功；窗口耗尽仍未能 settle 时，SHALL 返回既有的 `WAL closed while acknowledgement was pending` 错误（恢复时重放，at-least-once 语义不变）。已可执行的确认在 close 后 SHALL 照常完成其源提交。
+WAL 关闭触发时，仍在等待前序 in-flight 交付 settle 的 parked 确认 SHALL 在有界 drain 窗口（15s）内与截止时间竞速等待：前序交付 settle（通知唤醒）后 SHALL 正常完成其源提交并返回成功；计时器先到期 SHALL 返回 `WAL closed while acknowledgement was pending`（恢复时重放，at-least-once 不变）。等待期间若发现前序序列已记录源失败，SHALL 立即返回「被前序源失败阻塞」错误——该路径不经过 drain 窗口。已可执行的确认在 close 后 SHALL 照常完成其源提交。
 
 #### Scenario: 前序交付在窗口内 settle
 
@@ -259,3 +259,17 @@ WAL 关闭触发时，仍在等待前序 in-flight 交付 settle 的 parked 确�
 
 - **WHEN** drain 窗口耗尽时 parked 确认仍未 settle（前序源提交失败或长期阻塞）
 - **THEN** 返回 `WAL closed while acknowledgement was pending`，该确认在恢复时重放（at-least-once 不变）
+
+#### Scenario: 前序源失败立即阻塞报错
+
+- **WHEN** 序列 1 的源提交已失败并记录错误，序列 2 的确认变为 parked
+- **THEN** 序列 2 立即返回「被前序源失败阻塞」错误，不等待 drain 窗口
+
+### Requirement: 前序源失败立即阻塞报错
+
+等待中的 parked 确认在发现前序序列已记录源失败时，SHALL 立即返回「被前序源失败阻塞」错误——该路径不经过 drain 窗口，与 drain 超时的 `WAL closed while acknowledgement was pending` 错误可区分。
+
+#### Scenario: 前序源失败立即阻塞报错
+
+- **WHEN** 序列 1 的源提交已失败并记录错误，序列 2 的确认变为 parked
+- **THEN** 序列 2 立即返回「被前序源失败阻塞」错误，不等待 drain 窗口

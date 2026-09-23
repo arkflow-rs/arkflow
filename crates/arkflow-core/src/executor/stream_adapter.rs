@@ -819,23 +819,22 @@ mod wal_lifecycle_tests {
 
         struct GatedAck {
             gate: Arc<Notify>,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
             acked: std::sync::atomic::AtomicBool,
         }
 
         #[async_trait::async_trait]
         impl crate::input::Ack for GatedAck {
             async fn ack(&self) -> Result<(), Error> {
-                // Hold the WAL acknowledge in-flight until released. The
-                // release signal is OR-ed with an already-fired WAL close so
-                // the drain window still observes a settle even if the test
-                // races ahead.
-                let released = self.gate.clone();
-                tokio::select! {
-                    _ = released.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-                }
+                // Readiness signal: sequence 1's source commit is now
+                // in-flight (the WAL acknowledge is parked on the gate).
+                self.entered.notify_waiters();
+                // Hold in-flight until the test releases (after close).
+                self.release.notified().await;
                 self.acked
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.gate.notify_waiters();
                 Ok(())
             }
 
@@ -859,13 +858,18 @@ mod wal_lifecycle_tests {
         assert_eq!(seq2, 2);
 
         let gate = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let seq1_ack = Arc::new(GatedAck {
             gate: gate.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
             acked: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Sequence 1 enters the in-flight source commit and blocks on the
-        // gate; sequence 2 parks behind it.
+        // release gate. The `entered` signal proves it is parked in-flight
+        // before anything else happens.
         let wal_for_a = wal.clone();
         let wal_for_close = wal.clone();
         let ack_for_a = seq1_ack.clone();
@@ -875,11 +879,9 @@ mod wal_lifecycle_tests {
                 .await
                 .unwrap();
         });
-        // Let sequence 1 reach its in-flight source commit first.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        entered.notified().await;
 
-        // Close fires while sequence 2 is parked: the drain window opens.
-        let close_task = tokio::spawn(async move { wal_for_close.close().await });
+        // Sequence 2 parks behind the in-flight sequence 1.
         let wal_for_b = wal.clone();
         let task_b = tokio::spawn(async move {
             crate::wal::WalAck::new(wal_for_b, seq2, Arc::new(crate::input::NoopAck))
@@ -887,9 +889,13 @@ mod wal_lifecycle_tests {
                 .await
                 .is_ok()
         });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Close fires while sequence 2 is parked: the drain window opens.
+        let close_task = tokio::spawn(async move { wal_for_close.close().await });
 
         // Release sequence 1's source commit while the drain window is open.
-        gate.notify_waiters();
+        release.notify_waiters();
 
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let _ = tokio::join!(task_a, task_b);

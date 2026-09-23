@@ -576,16 +576,17 @@ impl Wal {
                             Some(Instant::now() + WAL_CLOSE_DRAIN);
                     }
                     if let Some(deadline) = drain_deadline {
-                        if Instant::now() >= deadline {
-                            return Err(Error::Process(
-                                "WAL closed while acknowledgement was pending".into(),
-                            ));
-                        }
-                        notified.await;
-                        if Instant::now() >= deadline {
-                            return Err(Error::Process(
-                                "WAL closed while acknowledgement was pending".into(),
-                            ));
+                        // Race the frontier notification against the drain
+                        // deadline: a hung earlier commit must not extend
+                        // the wait past the window.
+                        let wait = deadline.saturating_duration_since(Instant::now());
+                        tokio::select! {
+                            _ = notified => {}
+                            _ = tokio::time::sleep(wait) => {
+                                return Err(Error::Process(
+                                    "WAL closed while acknowledgement was pending".into(),
+                                ));
+                            }
                         }
                         continue;
                     }
