@@ -345,6 +345,8 @@ dependencies = [
  "redis",
  "reqwest 0.13.4",
  "rumqttc",
+ "rustls-native-certs 0.8.4",
+ "rustls-pemfile",
  "sasl2-sys",
  "serde",
  "serde_json",

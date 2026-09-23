@@ -40,8 +40,10 @@ input:
 ```
 
 `enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`
-用于校验 broker 证书;`client_cert`/`client_key` 启用 mTLS。省略 `tls` 块
-则保持明文 TCP。`client_id` 对每个连接必须唯一。
+用于校验 broker 证书;`client_cert`/`client_key` 启用 mTLS 且必须成对配置。
+`ca` 在 mTLS 下可省略:省略时 broker 证书由平台信任库校验(例如使用系统
+签发证书的公共 broker)。只配 `client_cert` 不配 `client_key`(或反之)
+属于配置错误。省略 `tls` 块则保持明文 TCP。`client_id` 对每个连接必须唯一。
 
 ## 示例
 

@@ -114,7 +114,6 @@ impl Input for PulsarInput {
                 builder = builder.with_tls_hostname_verification_enabled(enabled);
             }
         }
-        let tls_config = self.config.tls.clone();
         PulsarConfigValidator::validate_topic(&self.config.topic)?;
         PulsarConfigValidator::validate_subscription_name(&self.config.subscription_name)?;
 
@@ -127,10 +126,6 @@ impl Input for PulsarInput {
         }
 
         let _retry_config = self.config.retry_config.clone().unwrap_or_default();
-
-        // Use shared client builder with authentication
-        let builder =
-            PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
 
         // Connect to Pulsar
         let client = builder

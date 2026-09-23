@@ -52,6 +52,8 @@ flume = { workspace = true }
 dashmap = { workspace = true }
 tempfile = { workspace = true }
 rumqttc = "0.25.1"
+rustls-native-certs = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
