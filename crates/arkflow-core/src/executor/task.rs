@@ -1520,7 +1520,44 @@ pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
 /// Finish one aligned barrier before releasing post-barrier envelopes. EOS is
 /// allowed to be part of the released buffer when a bounded input ended while
 /// another input was still aligning the barrier.
+/// Build the `chain.barrier` span for one aligned barrier. When the barrier
+/// carries a remote trace context (cross-node propagation), the span parents
+/// to it so a trace continues across the hop instead of re-rooting per node.
+fn barrier_span(chain: &Chain, barrier: &crate::checkpoint::CheckpointBarrier) -> tracing::Span {
+    let span = tracing::info_span!(
+        "chain.barrier",
+        task = chain.entry_task_id(),
+        checkpoint_id = %barrier.checkpoint_id,
+        generation = barrier.generation,
+    );
+    if let Some(trace_context) = &barrier.trace_context {
+        if let Some(remote_context) = super::remote::extract_trace_context(trace_context) {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            span.set_parent(remote_context);
+        }
+    }
+    span
+}
+
 async fn handle_completed_barrier(
+    chain: &Chain,
+    hook: &CheckpointHook,
+    barrier: crate::checkpoint::CheckpointBarrier,
+    aligner: &mut super::barrier::Aligner,
+    ended_inputs: &mut BTreeSet<usize>,
+    pool: &mut Option<ProcessorWorkerPool>,
+    upstream_watermarks: &mut BTreeMap<usize, i64>,
+) -> Result<bool, Error> {
+    let span = barrier_span(chain, &barrier);
+    return async move {
+        handle_completed_barrier_inner(chain, hook, barrier, aligner, ended_inputs, pool, upstream_watermarks)
+            .await
+    }
+    .instrument(span)
+    .await;
+}
+
+async fn handle_completed_barrier_inner(
     chain: &Chain,
     hook: &CheckpointHook,
     barrier: crate::checkpoint::CheckpointBarrier,
@@ -1634,12 +1671,21 @@ async fn handle_envelope(
         }
         Envelope::Barrier(_) => {
             // Barrier handling lands with the checkpoint task; forward
-            // transparently so ordering is preserved.
-            if let Some(pool) = pool {
-                pool.flush().await?;
+            // transparently so ordering is preserved. The span keeps a
+            // passthrough barrier on the remote trace it arrived with.
+            let span = match &envelope {
+                Envelope::Barrier(barrier) => barrier_span(chain, barrier),
+                _ => tracing::Span::none(),
+            };
+            async {
+                if let Some(pool) = pool {
+                    pool.flush().await?;
+                }
+                send_downstream(chain, envelope).await?;
+                Ok(false)
             }
-            send_downstream(chain, envelope).await?;
-            Ok(false)
+            .instrument(span)
+            .await
         }
         Envelope::Watermark(watermark) => {
             upstream_watermarks.insert(input_index, watermark);
@@ -2659,6 +2705,20 @@ async fn send_downstream(chain: &Chain, envelope: Envelope) -> Result<(), Error>
     if matches!(envelope, Envelope::Data(_, _)) {
         return send_to_targets(chain.outputs.get(last_task), envelope, true).await;
     }
+
+    // Barriers carry the current trace context to the next hop. `capture`
+    // returns `None` without tracing (barrier bytes stay identical) and on
+    // an overwriting hop the captured context replaces the upstream one so
+    // the chain continues from this node's `chain.barrier` span.
+    let envelope = match envelope {
+        Envelope::Barrier(mut barrier) => {
+            if let Some(trace_context) = super::remote::capture_trace_context() {
+                barrier.trace_context = Some(trace_context);
+            }
+            Envelope::Barrier(barrier)
+        }
+        other => other,
+    };
 
     // Control envelopes belong to the whole graph, including an error side
     // sink. Successful data must stay off that side edge, but barriers and EOS

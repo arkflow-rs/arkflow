@@ -46,11 +46,29 @@ impl SourcePosition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBarrier {
     pub checkpoint_id: String,
     pub generation: u64,
+    /// W3C `traceparent` captured when the barrier left its originating
+    /// chain, carried across nodes so the downstream `chain.barrier` span can
+    /// parent to the remote trace. `serde(default)` keeps older senders
+    /// compatible; absent on the wire while unset, so tracing-off nodes
+    /// emit byte-identical barriers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_context: Option<String>,
 }
+
+// Barrier identity is (checkpoint_id, generation) only: the trace context is
+// observability metadata stamped by forwarding nodes and must never make a
+// valid barrier compare unequal (protocol matching compares against the
+// locally expected identity, which carries no trace context).
+impl PartialEq for CheckpointBarrier {
+    fn eq(&self, other: &Self) -> bool {
+        self.checkpoint_id == other.checkpoint_id && self.generation == other.generation
+    }
+}
+impl Eq for CheckpointBarrier {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCheckpointAck {
@@ -727,6 +745,7 @@ impl CheckpointCoordinator {
         let barrier = CheckpointBarrier {
             checkpoint_id: checkpoint_id.into(),
             generation: self.generation,
+            trace_context: None,
         };
         self.barrier = Some(barrier.clone());
         self.status = CheckpointStatus::InProgress;
@@ -1034,6 +1053,7 @@ mod tests {
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-1".into(),
                 generation: 1,
+                trace_context: None,
             },
             state_snapshots: vec![StateSnapshotRef {
                 task_id: "task-0".into(),
@@ -1137,6 +1157,7 @@ mod tests {
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-missing-state".into(),
                 generation: 1,
+                trace_context: None,
             },
             state_snapshots: vec![StateSnapshotRef {
                 task_id: "task-0".into(),
@@ -1182,6 +1203,7 @@ mod compatibility_tests {
             in_flight_barrier: CheckpointBarrier {
                 checkpoint_id: "cp-compat".into(),
                 generation: 1,
+                trace_context: None,
             },
             state_snapshots: vec![],
             format_version,

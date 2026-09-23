@@ -1543,6 +1543,7 @@ fn barrier(checkpoint_id: &str) -> Envelope {
     Envelope::Barrier(CheckpointBarrier {
         checkpoint_id: checkpoint_id.into(),
         generation: 1,
+        trace_context: None,
     })
 }
 
@@ -1724,6 +1725,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
             .send_async(Envelope::Barrier(CheckpointBarrier {
                 checkpoint_id: format!("cp-{round}"),
                 generation: 1,
+                trace_context: None,
             }))
             .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1761,6 +1763,7 @@ async fn coordinator_completes_only_after_all_participants() {
         barrier: CheckpointBarrier {
             checkpoint_id: checkpoint_id.into(),
             generation: 1,
+            trace_context: None,
         },
         cut_generation: 1,
         state: crate::state::StateSnapshot::new(1, vec![]),
@@ -4598,6 +4601,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         Envelope::Barrier(CheckpointBarrier {
             checkpoint_id: checkpoint.into(),
             generation: 3,
+            trace_context: None,
         })
     };
     let data = |value: i64, key: &str| {
@@ -5038,4 +5042,213 @@ async fn operator_failure_is_recorded_as_chain_batch_event() {
         .find(|kv| kv.key.as_str() == "operator")
         .expect("operator attribute on the failure event");
     assert_eq!(operator_attr.value.as_str(), task_id);
+}
+
+#[test]
+fn barrier_wire_json_is_backward_and_forward_compatible() {
+    // An older sender emits no trace_context field at all.
+    let legacy = r#"{"checkpoint_id":"c","generation":1}"#;
+    let barrier: CheckpointBarrier = serde_json::from_str(legacy).unwrap();
+    assert_eq!(barrier.trace_context, None);
+    // A tracing-off sender serializes without the field: byte-identical wire.
+    let json = serde_json::to_string(&barrier).unwrap();
+    assert!(!json.contains("trace_context"), "{json}");
+    // A tracing-on sender's value round-trips.
+    let mut stamped = barrier;
+    stamped.trace_context = Some("00-trace-span-01".to_string());
+    let json = serde_json::to_string(&stamped).unwrap();
+    assert!(json.contains("trace_context"), "{json}");
+    let back: CheckpointBarrier = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, stamped);
+}
+
+#[tokio::test]
+async fn trace_context_round_trips_to_a_remote_parent() {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let (exporter, provider) = span_test_tracing();
+    let root = tracing::info_span!("trace-root-7354");
+    let trace_context = {
+        let _guard = root.enter();
+        super::remote::capture_trace_context()
+    };
+    let Some(trace_context) = trace_context else {
+        panic!("capture must yield a traceparent under an active span");
+    };
+
+    let child = tracing::info_span!("barrier-child-7354");
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _guard = child.enter();
+        let remote = super::remote::extract_trace_context(&trace_context);
+        assert!(remote.is_some(), "extract must parse a captured value");
+        child.set_parent(remote.unwrap());
+    }
+    drop(root);
+    drop(child);
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let root_span = finished
+        .iter()
+        .find(|span| span.name.as_ref() == "trace-root-7354")
+        .expect("root exported");
+    let child_span = finished
+        .iter()
+        .find(|span| span.name.as_ref() == "barrier-child-7354")
+        .expect("child exported");
+    assert_eq!(
+        child_span.parent_span_id,
+        root_span.span_context.span_id(),
+        "extract+set_parent must restore the remote parent link"
+    );
+    assert_eq!(
+        child_span.span_context.trace_id(),
+        root_span.span_context.trace_id(),
+        "both spans share one trace"
+    );
+}
+
+#[tokio::test]
+async fn capture_is_none_without_an_active_span() {
+    // No entered span on this thread: capture must decline (this is the
+    // tracing-off path that keeps barrier bytes identical).
+    assert!(super::remote::capture_trace_context().is_none());
+}
+
+#[tokio::test]
+async fn barrier_carries_remote_trace_context_across_chains() {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let (exporter, provider) = span_test_tracing();
+
+    struct StreamInput {
+        sent: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for StreamInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let count = self.sent.fetch_add(1, Ordering::SeqCst);
+            if count >= 50 {
+                return Err(Error::EOF);
+            }
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                    count as i64,
+                    "a".into(),
+                )]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+                0,
+                self.sent.load(Ordering::SeqCst) as u64,
+            )])
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(StreamInput {
+        sent: AtomicUsize::new(0),
+    });
+    let adapter = Adapter {
+        input,
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
+    let (coordinator, report_tx) = crate::executor::BarrierCoordinator::new(
+        JobId::new("trace-barrier-job").unwrap(),
+        JobVersion(1),
+        1,
+        1,
+        ["source-0".to_string()],
+    );
+    let coordinator_cancellation = CancellationToken::new();
+    tokio::spawn(coordinator.run(coordinator_cancellation.clone()));
+
+    let mut hooks = std::collections::BTreeMap::new();
+    hooks.insert(
+        "source-0".to_string(),
+        CheckpointHook {
+            reporter: Some(report_tx),
+            failure_reporter: None,
+            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            state: None,
+            task_id: Some("source-0".to_string()),
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+            partition: Some(0),
+            metrics: None,
+            finished_reporter: None,
+        },
+    );
+
+    // Queue the barrier before the graph starts: the biased source loop
+    // picks it up before the first read, so delivery is deterministic.
+    barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-trace-7354".to_string(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await
+        .expect("send");
+    drop(barrier_tx);
+
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph_with_hooks(graph, cancellation.clone(), hooks));
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("graph completes")
+        .unwrap()
+        .unwrap();
+    coordinator_cancellation.cancel();
+    provider.force_flush().unwrap();
+
+    // The source chain stamped the barrier with its chain.run context at
+    // send_downstream; the interior chain's chain.barrier span must parent
+    // to exactly that span.
+    let finished = exporter.get_finished_spans().unwrap();
+    let barrier_span = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.barrier"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "checkpoint_id"
+                        && kv.value.as_str() == "cp-trace-7354"
+                })
+        })
+        .expect("chain.barrier span for the propagated barrier");
+    let upstream = finished
+        .iter()
+        .find(|span| span.span_context.span_id() == barrier_span.parent_span_id)
+        .expect("parent span exported");
+    assert_eq!(upstream.name.as_ref(), "chain.run");
+    assert!(
+        upstream
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == "source-0"),
+        "barrier span must parent to the forwarding chain, got {upstream:?}"
+    );
+    assert_eq!(
+        barrier_span.span_context.trace_id(),
+        upstream.span_context.trace_id()
+    );
 }

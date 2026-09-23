@@ -1173,6 +1173,43 @@ impl PendingReceipts {
     }
 }
 
+/// Capture the current span context as a W3C `traceparent` string, or `None`
+/// when the current context carries no valid span — including tracing being
+/// disabled entirely, which keeps barriers byte-identical on the wire.
+pub fn capture_trace_context() -> Option<String> {
+    use opentelemetry::propagation::Injector as _;
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let cx = tracing::Span::current().context();
+    if !cx.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .inject_context(&cx, &mut carrier);
+    carrier.get("traceparent").cloned()
+}
+
+/// Extract a remote parent context from a barrier's captured `traceparent`.
+/// Returns `None` for absent or unparsable values so a malformed hop can
+/// never detach a downstream span from its local parent.
+pub fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
+    use opentelemetry::propagation::Extractor as _;
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let mut carrier = std::collections::HashMap::new();
+    carrier.insert("traceparent".to_string(), trace_context.to_string());
+    let cx = opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&carrier);
+    if cx.span().span_context().is_valid() {
+        Some(cx)
+    } else {
+        None
+    }
+}
+
 /// Local end of a remote outbound edge. `graph.rs` places its sender into
 /// `EdgeTarget` channel vectors exactly like a local channel sender; the pump
 /// task on the receiver side encodes envelopes, sequences data frames, and
@@ -2537,10 +2574,12 @@ mod tests {
         let barrier = WireSignal::Barrier(CheckpointBarrier {
             checkpoint_id: "c-7".into(),
             generation: 9,
+            trace_context: None,
         });
         let envelope = Envelope::Barrier(CheckpointBarrier {
             checkpoint_id: "c-7".into(),
             generation: 9,
+            trace_context: None,
         });
         assert_eq!(WireSignal::from_envelope(&envelope), Some(barrier.clone()));
         match barrier.clone().into_envelope() {
@@ -2549,7 +2588,8 @@ mod tests {
                     rebuilt,
                     CheckpointBarrier {
                         checkpoint_id: "c-7".into(),
-                        generation: 9
+                        generation: 9,
+                        trace_context: None
                     }
                 );
             }
@@ -3039,6 +3079,7 @@ mod tests {
             .send_async(Envelope::Barrier(CheckpointBarrier {
                 checkpoint_id: "c-1".into(),
                 generation: 1,
+                trace_context: None,
             }))
             .await
             .expect("send barrier");

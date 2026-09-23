@@ -158,11 +158,15 @@ The v1 span model is a lifecycle skeleton per Job execution:
   chain (attributes `rows`, the batch row count, and `task`). An operator
   failure inside the batch is recorded as an event on this span with the
   failing `operator` id.
+- `chain.barrier` — one child per aligned checkpoint barrier (attributes
+  `task`, `checkpoint_id`, `generation`). When a barrier crosses a node
+  boundary it carries a W3C `traceparent`, so the receiving node's
+  `chain.barrier` span parents to the upstream trace instead of re-rooting;
+  nodes with tracing off forward the value untouched. Data frames do not
+  carry trace context.
 
 Known v1 boundaries: there are no worker-pool spans (pool context
-propagation is future work), and trace context is not propagated across
-nodes — each process roots its own traces for the Jobs it runs. Exporter
-failures never affect the data plane.
+propagation is future work). Exporter failures never affect the data plane.
 
 ## Operational status for dashboards
 

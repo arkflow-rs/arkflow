@@ -136,9 +136,12 @@ v1 的 span 模型是每次 Job 执行的生命周期骨架:
 - `chain.batch` —— `chain.run` 的子 span,链处理的每个批次一个
   (属性 `rows` 即批行数,`task` 即链入口任务 id)。批次内 operator
   失败会作为事件记录在该 span 上,带失败 `operator` id。
+- `chain.barrier` —— 每个对齐完成的 checkpoint barrier 一个子 span
+  (属性 `task`/`checkpoint_id`/`generation`)。barrier 跨节点时携带
+  W3C `traceparent`,接收节点的 `chain.barrier` span 以远端 trace 为父,
+  而非重新作为根;未开启追踪的节点原样透传。数据帧不携带 trace 上下文。
 
-已知的 v1 边界:没有 worker 池 span(池的上下文传播是后续工作),
-跨节点不传播 trace 上下文——每个进程为其运行的 Job 各自作为 trace 根。
+已知的 v1 边界:没有 worker 池 span(池的上下文传播是后续工作)。
 导出器故障绝不影响数据面。
 
 ## 面向仪表盘的运维状态
