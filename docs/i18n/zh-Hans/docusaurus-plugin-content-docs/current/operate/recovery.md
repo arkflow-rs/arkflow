@@ -93,6 +93,27 @@ in-flight 源提交之后而直接失败流:被阻塞的确认会获得一个有
 抛出 `WAL closed while acknowledgement was pending` 错误,重启后的常规
 WAL 重放会覆盖未确认的交付——两种情况下的 at-least-once 语义都不变。
 
+## TLS 支持矩阵
+
+全部网络组件的加密传输启用方式一览:
+
+| 组件 | TLS 启用方式 |
+|-----------|----------------|
+| kafka(input/output) | rdkafka `security.protocol` 配置 |
+| mqtt(input/output) | `tls` 配置块(`enabled`、`ca`、`client_cert`、`client_key`) |
+| nats(input/output) | `tls://` URL scheme(async-nats 原生协商) |
+| pulsar(input/output) | `pulsar+ssl://` URL scheme |
+| redis(input/output/temporary) | `rediss://` URL scheme |
+| sql(output) | sqlx TLS(连接串 `sslmode` / `ssl-mode`) |
+| mongodb(output) | `mongodb+srv` / `tls=true` 连接串 |
+| http(input/output) | `https://` URL(TLS 由 reqwest/hyper 终结) |
+| websocket(input) | `wss://` URL |
+| qdrant/milvus/pgvector 输出与 embedding/llm/vector_search/pgvector_search/milvus_search 处理器 | `https://` 端点(reqwest / sqlx TLS) |
+| secret 引用 | `${secret:NAME}` 在 Hub 分发时由 Hub 环境解析;`env:`/`file:` 在节点本地解析 |
+
+无网络能力的组件(memory、generate、drop、stdout 及 batch/json/sql/vrl/python
+处理器)不存在 TLS 面。
+
 ## WAL 后端
 
 默认使用本地文件系统存储。对于共享或远程持久化,`object_store` WAL 后端会写入 S3 兼容存储——设计与实测权衡参见

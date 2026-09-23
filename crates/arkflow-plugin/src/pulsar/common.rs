@@ -333,3 +333,23 @@ pub type PulsarClient = Pulsar<TokioExecutor>;
 pub type PulsarConsumer<T = Vec<u8>> = pulsar::Consumer<T, TokioExecutor>;
 pub type PulsarProducer = pulsar::Producer<TokioExecutor>;
 pub type PulsarMessage<T = Vec<u8>> = pulsar::consumer::Message<T>;
+
+#[cfg(test)]
+mod tls_url_tests {
+    use super::PulsarConfigValidator;
+
+    #[test]
+    fn pulsar_ssl_url_passes_validation() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar+ssl://broker.example.com:6651").is_ok());
+    }
+
+    #[test]
+    fn plain_pulsar_url_passes_validation() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar://broker.example.com:6650").is_ok());
+    }
+
+    #[test]
+    fn invalid_scheme_is_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("http://broker.example.com:6650").is_err());
+    }
+}

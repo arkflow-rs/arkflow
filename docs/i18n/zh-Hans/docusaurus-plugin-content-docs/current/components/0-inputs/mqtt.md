@@ -28,11 +28,15 @@ MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并�
 设置 `tls` 块以通过 TLS 连接(MQTT 通常为端口 8883):
 
 ```yaml validate=fragment wrap=input
-tls:
-  enabled: true
-  ca: "/etc/arkflow/certs/ca.pem"
-  client_cert: "/etc/arkflow/certs/client.pem"
-  client_key: "/etc/arkflow/certs/client.key"
+input:
+  type: "mqtt"
+  host: "localhost"
+  port: 8883
+  client_id: "tls-client"
+  topics: ["demo"]
+  tls:
+    enabled: true
+    ca: "/etc/arkflow/certs/ca.pem"
 ```
 
 `enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`

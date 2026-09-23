@@ -13,6 +13,10 @@
 ## 已知残留
 
 - `disconnect_aborts_pending_and_closes_edge` 在三重并行全量下仍复现一次（30s 整预算耗尽、零 abort）：根因为 `PendingReceipts::abort_all` 经 `tokio::spawn` 设置 abort 标志，极端负载下 spawn 的任务可被长期饥饿——产品行为正确（abort_all 本身同步执行、真实断连时 flush 立即失败），属测试环境调度饥饿属性；预算已提升至 30s 并记录，后续若再复现可考虑把 abort 标志改为同步原子设置。
+
+## 追踪记录（harden-wal-drain-followups 后）
+
+- `disconnect_aborts_pending_and_closes_edge` 在 30s 预算下于全量并行负载仍复现一次：根因为 tokio duplex 写半区对已关闭 peer 的写入静默成功（缓冲未满）导致 pump 永不退出——产品级边缘场景（TCP FIN 半关闭同样触发），修复需让 pump 在连接取消路径上 abort pending（涉及取消语义评审），已记为待办。测试等待顺序已改为先等 failure 广播再轮询 aborted 标志。
 - `example_equivalence::bounded_examples_run_to_completion_on_kernel` 在并行全量下复现一次（`WAL closed while acknowledgement was pending`，孤立 5/5 通过）：WAL 关闭与在途 ack 的关闭竞争，属 `input-durability` 领域的关闭排序行为变更，恢复语义已兜底（at-least-once），修复需专项 spec 评审。
 
 ## Capabilities

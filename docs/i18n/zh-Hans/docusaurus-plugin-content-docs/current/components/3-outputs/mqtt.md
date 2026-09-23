@@ -40,11 +40,17 @@ MQTT 输出(Output)将每条消息(Message)发布到 MQTT 代理(Broker)的主�
 设置 `tls` 块以通过 TLS 连接(MQTT 通常为端口 8883):
 
 ```yaml validate=fragment wrap=output
-tls:
-  enabled: true
-  ca: "/etc/arkflow/certs/ca.pem"
-  client_cert: "/etc/arkflow/certs/client.pem"
-  client_key: "/etc/arkflow/certs/client.key"
+output:
+  type: "mqtt"
+  host: "localhost"
+  port: 8883
+  client_id: "tls-publisher"
+  topic:
+    type: "value"
+    value: "demo"
+  tls:
+    enabled: true
+    ca: "/etc/arkflow/certs/ca.pem"
 ```
 
 `enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`
