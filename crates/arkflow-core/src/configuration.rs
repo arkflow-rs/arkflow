@@ -169,41 +169,17 @@ impl ConfigCandidate {
             path: "document".to_string(),
             message: error.to_string(),
         })?;
-        serde_json::from_value(value).map_err(|error| {
-            // Deserialization errors can echo the offending value, which is
-            // a secret reference here — redact reference-like fragments so
-            // neither the reference nor any resolved content leaks.
-            let message = error.to_string();
-            let message = redact_reference_fragments(&message);
+        serde_json::from_value(value).map_err(|_| {
+            // Deserialization failures after secret resolution must not echo
+            // the offending value: serde type errors can embed the resolved
+            // secret. Use a fixed, value-independent message.
             ConfigIssue {
                 path: "document".to_string(),
-                message,
+                message: "configuration content failed validation after secret resolution"
+                    .to_string(),
             }
         })
     }
-}
-
-/// Replaces `${...}`-shaped fragments in an error message with a
-/// placeholder so reference text (or anything echoing it) never leaks.
-fn redact_reference_fragments(message: &str) -> String {
-    let mut output = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(position) = rest.find("${") {
-        output.push_str(&rest[..position]);
-        rest = &rest[position..];
-        match rest.find('}') {
-            Some(end) => {
-                output.push_str("[secret reference]");
-                rest = &rest[end + 1..];
-            }
-            None => {
-                output.push_str(rest);
-                rest = "";
-            }
-        }
-    }
-    output.push_str(rest);
-    output
 }
 
 fn parse_error_at(path: String, error: impl std::fmt::Display) -> ConfigIssue {
