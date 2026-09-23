@@ -284,8 +284,6 @@ struct PendingWalAck {
 /// How long a parked WAL acknowledgement keeps waiting for an earlier
 /// in-flight delivery to settle after a close request fires, before the
 /// pending-error path takes over (recovery replays unsettled entries).
-const WAL_CLOSE_DRAIN: Duration = Duration::from_secs(30);
-
 impl Wal {
     /// Open (or create) a WAL.
     ///
@@ -451,9 +449,6 @@ impl Wal {
     /// are removed only once their source commit has succeeded. No later
     /// sequence is allowed to run while this one is in-flight.
     async fn acknowledge(&self, seq: u64, inner: Arc<dyn crate::input::Ack>) -> Result<(), Error> {
-        // Bounded graceful-drain window for parked acknowledgements once a
-        // close request fires.
-        let mut drain_deadline: Option<Instant> = None;
         {
             let mut acknowledgements = self.acknowledgements.lock().await;
             acknowledgements.entry(seq).or_insert(PendingWalAck {
@@ -566,38 +561,12 @@ impl Wal {
                 }
                 None => {
                     // A close request does not immediately fail a parked
-                    // acknowledgement: the earlier in-flight delivery gets a
-                    // bounded window to settle (its source commit notifies
-                    // every waiter), so a healthy graceful shutdown does not
-                    // fail the stream. At-least-once is preserved either way
-                    // — an unsettled acknowledgement replays on recovery.
-                    if self.close.is_cancelled() && drain_deadline.is_none() {
-                        drain_deadline =
-                            Some(Instant::now() + WAL_CLOSE_DRAIN);
-                    }
-                    if let Some(deadline) = drain_deadline {
-                        // Race the frontier notification against the drain
-                        // deadline: a hung earlier commit must not extend
-                        // the wait past the window.
-                        let wait = deadline.saturating_duration_since(Instant::now());
-                        tokio::select! {
-                            _ = notified => {}
-                            _ = tokio::time::sleep(wait) => {
-                                return Err(Error::Process(
-                                    "WAL closed while acknowledgement was pending".into(),
-                                ));
-                            }
-                        }
-                        continue;
-                    }
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = self.close.cancelled() => {
-                            drain_deadline =
-                                Some(Instant::now() + WAL_CLOSE_DRAIN);
-                            continue;
-                        }
-                    }
+                    // acknowledgement. The parked waiter simply waits for the
+                    // frontier to advance (the earlier in-flight delivery to
+                    // settle). At-least-once is preserved: if the process
+                    // shuts down, the unacknowledged delivery replays on
+                    // recovery.
+                    notified.await;
                 }
             }
         }
