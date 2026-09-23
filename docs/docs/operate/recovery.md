@@ -105,6 +105,17 @@ incompatible artifact is rejected before restore instead of corrupting state.
 | Checkpoint rounds keep failing | A task cannot snapshot or checksums mismatch | Check node disk/object-store health; the last valid checkpoint is still in force. |
 | Rollback rejected as incompatible | Savepoint belongs to another version or state format | Use an artifact from the compatible version history. |
 
+## Graceful shutdown
+
+On a graceful shutdown, a durability-enabled stream's WAL close no longer
+fails the stream just because an acknowledgement was parked behind an
+earlier in-flight source commit: the parked acknowledgement gets a bounded
+drain window (15 seconds) to settle once the earlier delivery completes.
+If the window expires without settling, the stream surfaces the
+`WAL closed while acknowledgement was pending` error and the usual WAL
+replay covers the unacknowledged delivery on restart — at-least-once
+semantics are unchanged either way.
+
 ## WAL backends
 
 The local filesystem store is the default. For shared or remote durability,

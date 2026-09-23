@@ -651,6 +651,7 @@ mod tests {
 #[cfg(test)]
 mod wal_lifecycle_tests {
     use super::*;
+    use crate::input::Ack as _;
     use crate::wal::{SyncPolicy, Wal, WalConfig};
     use std::sync::Mutex;
 
@@ -806,5 +807,107 @@ mod wal_lifecycle_tests {
             assert_eq!(reopened.read_after_cursor().await.unwrap().len(), 1);
             reopened.close().await.unwrap();
         }
+    }
+    /// Graceful shutdown drains a parked WAL acknowledgement: sequence 2
+    /// parks behind sequence 1's in-flight source commit; close fires mid-
+    /// park; once the commit settles within the drain window, sequence 2
+    /// completes normally instead of failing the stream. Deterministic: the
+    /// release is coordinated by a Notify, not sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_drains_parked_acknowledgement_after_in_flight_settles() {
+        use tokio::sync::Notify;
+
+        struct GatedAck {
+            gate: Arc<Notify>,
+            acked: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::input::Ack for GatedAck {
+            async fn ack(&self) -> Result<(), Error> {
+                // Hold the WAL acknowledge in-flight until released. The
+                // release signal is OR-ed with an already-fired WAL close so
+                // the drain window still observes a settle even if the test
+                // races ahead.
+                let released = self.gate.clone();
+                tokio::select! {
+                    _ = released.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                }
+                self.acked
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn mark_held(&self) {}
+            fn release_held(&self) {}
+            async fn undo(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let seq1 = wal.append(&trivial_batch()).await.unwrap();
+        let seq2 = wal.append(&trivial_batch()).await.unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+
+        let gate = Arc::new(Notify::new());
+        let seq1_ack = Arc::new(GatedAck {
+            gate: gate.clone(),
+            acked: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        // Sequence 1 enters the in-flight source commit and blocks on the
+        // gate; sequence 2 parks behind it.
+        let wal_for_a = wal.clone();
+        let wal_for_close = wal.clone();
+        let ack_for_a = seq1_ack.clone();
+        let task_a = tokio::spawn(async move {
+            crate::wal::WalAck::new(wal_for_a, seq1, ack_for_a)
+                .ack()
+                .await
+                .unwrap();
+        });
+        // Let sequence 1 reach its in-flight source commit first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Close fires while sequence 2 is parked: the drain window opens.
+        let close_task = tokio::spawn(async move { wal_for_close.close().await });
+        let wal_for_b = wal.clone();
+        let task_b = tokio::spawn(async move {
+            crate::wal::WalAck::new(wal_for_b, seq2, Arc::new(crate::input::NoopAck))
+                .ack()
+                .await
+                .is_ok()
+        });
+
+        // Release sequence 1's source commit while the drain window is open.
+        gate.notify_waiters();
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _ = tokio::join!(task_a, task_b);
+        })
+        .await
+        .expect("both acknowledgements settle within the drain window");
+
+        assert!(
+            seq1_ack
+                .acked
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "sequence 1 source commit completed"
+        );
+        assert_eq!(
+            wal.cursor().await.unwrap(),
+            2,
+            "both sequences committed through the drain"
+        );
+        let _ = close_task.await;
     }
 }
