@@ -22,6 +22,23 @@ MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并�
 | clean_session | boolean | no | — | 是否使用干净会话(clean session) |
 | keep_alive | integer | no | — | 保活间隔(秒) |
 
+
+## TLS
+
+设置 `tls` 块以通过 TLS 连接(MQTT 通常为端口 8883):
+
+```yaml validate=fragment wrap=input
+tls:
+  enabled: true
+  ca: "/etc/arkflow/certs/ca.pem"
+  client_cert: "/etc/arkflow/certs/client.pem"
+  client_key: "/etc/arkflow/certs/client.key"
+```
+
+`enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`
+用于校验 broker 证书;`client_cert`/`client_key` 启用 mTLS。省略 `tls` 块
+则保持明文 TCP。`client_id` 对每个连接必须唯一。
+
 ## 示例
 
 ```yaml validate=fragment wrap=input

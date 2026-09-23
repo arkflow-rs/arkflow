@@ -51,6 +51,9 @@ pub struct MqttInputConfig {
     pub clean_session: Option<bool>,
     /// Keep alive interval (in seconds)
     pub keep_alive: Option<u64>,
+    /// TLS transport configuration
+    #[serde(default)]
+    pub tls: Option<crate::mqtt_tls::MqttTlsConfig>,
 }
 
 /// MQTT input component
@@ -100,6 +103,9 @@ impl Input for MqttInput {
         // Set the authentication information
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             mqtt_options.set_credentials(username, password);
+        }
+        if let Some(tls) = &self.config.tls {
+            tls.apply(&mut mqtt_options)?;
         }
 
         // Set the keep-alive time

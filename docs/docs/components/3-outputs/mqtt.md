@@ -34,6 +34,29 @@ The MQTT output publishes each message to an MQTT broker topic. It supports QoS 
 | value | string | yes (`value`) | Static topic name. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
+## TLS
+
+Set the `tls` block to connect over TLS (MQTT over port 8883):
+
+```yaml validate=fragment wrap=output
+output:
+  type: "mqtt"
+  host: "localhost"
+  port: 8883
+  client_id: "tls-publisher"
+  topic:
+    type: "value"
+    value: "demo"
+  tls:
+    enabled: true
+    ca: "/etc/arkflow/certs/ca.pem"
+```
+
+`enabled` defaults to true when the block is present (set `enabled: false` to
+keep the block as documentation); `ca` verifies the broker certificate;
+`client_cert`/`client_key` enable mTLS. Omitting the `tls` block keeps plain
+TCP. The `client_id` must be unique per connection.
+
 ## Examples
 
 ### Static topic

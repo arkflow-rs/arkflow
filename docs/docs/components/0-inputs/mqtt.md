@@ -22,6 +22,27 @@ The MQTT input connects to an MQTT broker, subscribes to one or more topics, and
 | clean_session | boolean | no | — | Whether to use a clean session |
 | keep_alive | integer | no | — | Keep-alive interval (seconds) |
 
+## TLS
+
+Set the `tls` block to connect over TLS (MQTT over port 8883):
+
+```yaml validate=fragment wrap=input
+input:
+  type: "mqtt"
+  host: "localhost"
+  port: 8883
+  client_id: "tls-client"
+  topics: ["demo"]
+  tls:
+    enabled: true
+    ca: "/etc/arkflow/certs/ca.pem"
+```
+
+`enabled` defaults to true when the block is present (set `enabled: false` to
+keep the block as documentation); `ca` verifies the broker certificate;
+`client_cert`/`client_key` enable mTLS. Omitting the `tls` block keeps plain
+TCP. The `client_id` must be unique per connection.
+
 ## Examples
 
 ```yaml validate=fragment wrap=input

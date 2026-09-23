@@ -49,6 +49,9 @@ struct MqttOutputConfig {
     topic: Expr<String>,
     /// Quality of Service (0, 1, 2)
     qos: Option<u8>,
+    /// TLS transport configuration
+    #[serde(default)]
+    tls: Option<crate::mqtt_tls::MqttTlsConfig>,
     /// Whether to use clean session
     clean_session: Option<bool>,
     /// Keep alive interval (seconds)
@@ -91,6 +94,9 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         // Set the authentication information
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             mqtt_options.set_credentials(username, password);
+        }
+        if let Some(tls) = &self.config.tls {
+            tls.apply(&mut mqtt_options)?;
         }
 
         // Set the keep-alive time
@@ -364,6 +370,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             client_id: "test_client".to_string(),
+            tls: None,
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
             topic: Expr::Value {
@@ -387,6 +394,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             client_id: "test_client".to_string(),
+            tls: None,
             username: None,
             password: None,
             topic: Expr::Value {
@@ -410,6 +418,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             client_id: "test_client".to_string(),
+            tls: None,
             username: None,
             password: None,
             topic: Expr::Value {
@@ -444,6 +453,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             client_id: "test_client".to_string(),
+            tls: None,
             username: None,
             password: None,
             topic: Expr::Value {
@@ -473,6 +483,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             client_id: "test_client".to_string(),
+            tls: None,
             username: None,
             password: None,
             topic: Expr::Value {

@@ -34,6 +34,23 @@ MQTT 输出(Output)将每条消息(Message)发布到 MQTT 代理(Broker)的主�
 | value | string | yes (`value`) | 静态主题名称。 |
 | expr | string | yes (`expr`) | 对每条消息求值的 SQL 表达式。 |
 
+
+## TLS
+
+设置 `tls` 块以通过 TLS 连接(MQTT 通常为端口 8883):
+
+```yaml validate=fragment wrap=output
+tls:
+  enabled: true
+  ca: "/etc/arkflow/certs/ca.pem"
+  client_cert: "/etc/arkflow/certs/client.pem"
+  client_key: "/etc/arkflow/certs/client.key"
+```
+
+`enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`
+用于校验 broker 证书;`client_cert`/`client_key` 启用 mTLS。省略 `tls` 块
+则保持明文 TCP。`client_id` 对每个连接必须唯一。
+
 ## 示例
 
 ### 静态主题

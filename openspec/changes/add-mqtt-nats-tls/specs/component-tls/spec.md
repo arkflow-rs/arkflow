@@ -21,11 +21,11 @@ MQTT input 与 output SHALL 接受可选 `tls` 配置块：`enabled`（默认 tr
 - **WHEN** 不提供 `tls` 块
 - **THEN** 连接使用 TCP 传输，与既有行为一致
 
-### Requirement: NATS 组件 TLS 要求
+### Requirement: NATS 组件经 URL scheme 支持 TLS
 
-NATS input 与 output SHALL 接受可选 `tls_required` 布尔配置：true 时 SHALL 调用 `ConnectOptions::tls_required(true)` 要求服务端 TLS；连接 URL 的 `tls://` scheme SHALL 由 async-nats 原生处理。未配置时行为不变。
+NATS input 与 output SHALL 支持 `tls://` 连接 URL scheme（async-nat s 连接器原生协商 TLS），组件代码无需额外 TLS 配置字段；文档 SHALL 说明该用法。
 
-#### Scenario: 要求服务端 TLS
+#### Scenario: tls:// URL 原生协商
 
-- **WHEN** 配置 `tls_required: true`
-- **THEN** 连接选项要求服务端 TLS，明文连接被拒绝
+- **WHEN** 配置 `url: "tls://nats.example.com:4422"`
+- **THEN** 连接经 async-nats 连接器以 TLS 协商建立（原生支持，无组件级开关）
