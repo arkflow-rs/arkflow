@@ -50,7 +50,7 @@ const sidebars: SidebarsConfig = {
       'sql/special_functions', 'sql/udf',
     ]},
     {type: 'category', label: 'Operate', link: {type: 'doc', id: 'operate/overview'}, items: [
-      'operate/kubernetes', 'operate/rollout', 'operate/observability', 'operate/recovery',
+      'operate/kubernetes', 'operate/rollout', 'operate/observability', 'operate/recovery', 'operate/tls-matrix',
       {type: 'category', label: 'Control Plane', link: {type: 'doc', id: 'operate/control-plane'}, items: [
         'operate/control-plane/overview', 'operate/control-plane/deploy',
         'operate/control-plane/console', 'operate/control-plane/operations',
