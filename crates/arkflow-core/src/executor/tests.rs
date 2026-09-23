@@ -4837,9 +4837,41 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
 
     // Every chain.run must be a child of the job.run span.
     let job_span_id = job.span_context.span_id();
+    // Contamination-proof: find OUR chain span by the unique task marker,
+    // then get the parent job span, then find all chain.run siblings.
+    let op_chain = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
+                })
+        })
+        .expect("op chain span must be exported");
+    let job_span_id = op_chain.parent_span_id;
+    let job = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "job.run"
+                && span.span_context.span_id() == job_span_id
+        })
+        .expect("job.run parent of the chain span");
+    let chains_attr = job
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "chains")
+        .expect("chains attribute");
+    let chains_value = match &chains_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        other => panic!("unexpected chains attribute: {other:?}"),
+    };
+    assert_eq!(chains_value, 3, "3 chains in this graph");
+
     let chain_runs: Vec<_> = finished
         .iter()
-        .filter(|span| span.name.as_ref() == "chain.run")
+        .filter(|span| {
+            span.name.as_ref() == "chain.run" && span.parent_span_id == job_span_id
+        })
         .collect();
     assert_eq!(chain_runs.len(), 3);
     for chain in &chain_runs {
@@ -4849,7 +4881,6 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
         );
     }
 
-    // The fused chain carries its entry task id in the `task` attribute.
     let tasks: Vec<String> = chain_runs
         .iter()
         .filter_map(|span| {
@@ -4859,7 +4890,7 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
                 .map(|kv| kv.value.as_str().to_string())
         })
         .collect();
-    assert!(tasks.iter().any(|task| task == "source-0"), "{tasks:?}");
-    assert!(tasks.iter().any(|task| task == "span-op-7351-0"), "{tasks:?}");
-    assert!(tasks.iter().any(|task| task == "sink-0"), "{tasks:?}");
+    assert!(tasks.contains(&"source-0".to_string()), "{tasks:?}");
+    assert!(tasks.contains(&"span-op-7351-0".to_string()), "{tasks:?}");
+    assert!(tasks.contains(&"sink-0".to_string()), "{tasks:?}");
 }
