@@ -4766,9 +4766,12 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
     let tracer = provider.tracer("executor-span-test");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
+    // Unique operator id: the global OTel subscriber sees spans from
+    // concurrently running executor tests in this binary, so assertions
+    // must filter by a marker unique to this test's graph.
     let spec = spec(
-        vec![map_operator("a")],
-        vec![edge("source", "a"), edge("a", "sink")],
+        vec![map_operator("span-op-7351")],
+        vec![edge("source", "span-op-7351"), edge("span-op-7351", "sink")],
         1,
     );
     let plan = JobPlan::compile(spec).unwrap();
@@ -4801,18 +4804,32 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
         "expected job.run and chain.run spans, got {names:?}"
     );
 
-    let job_spans: Vec<_> = finished
+    // Contamination-proof identification: find OUR chain span by the unique
+    // task marker, then our job.run via its parent link. (The global OTel
+    // subscriber also sees spans from concurrently running executor tests
+    // in this binary, so absolute counts are not reliable.)
+    let op_chain = finished
         .iter()
-        .filter(|span| span.name.as_ref() == "job.run")
-        .collect();
-    assert_eq!(job_spans.len(), 1, "exactly one job.run span");
-    let job = job_spans[0];
-    let chains_attr = job
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
+                })
+        })
+        .expect("op chain span must be exported");
+    let job = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "job.run"
+                && span.span_context.span_id() == op_chain.parent_span_id
+        })
+        .expect("job.run parent of the chain span");
+        let chains_attr = job
         .attributes
         .iter()
         .find(|kv| kv.key.as_str() == "chains")
         .expect("chains attribute");
-        let chains_value = match &chains_attr.value {
+    let chains_value = match &chains_attr.value {
         opentelemetry::Value::I64(value) => *value,
         other => panic!("unexpected chains attribute: {other:?}"),
     };
@@ -4843,5 +4860,6 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
         })
         .collect();
     assert!(tasks.iter().any(|task| task == "source-0"), "{tasks:?}");
-    assert!(tasks.iter().any(|task| task == "a-0"), "{tasks:?}");
+    assert!(tasks.iter().any(|task| task == "span-op-7351-0"), "{tasks:?}");
+    assert!(tasks.iter().any(|task| task == "sink-0"), "{tasks:?}");
 }

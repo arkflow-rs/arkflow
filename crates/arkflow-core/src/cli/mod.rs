@@ -400,7 +400,7 @@ where
         return None;
     }
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::{HasExportConfig, WithExportConfig};
+    use opentelemetry_otlp::WithExportConfig;
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_export_config(opentelemetry_otlp::ExportConfig {

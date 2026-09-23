@@ -2498,13 +2498,34 @@ impl Hub {
         if !online {
             return Ok(None);
         }
-        let Some(attempt) = storage
+        let Some(mut attempt) = storage
             .claim_attempt(&outbox.intent_id.clone().unwrap_or_default())
             .await
             .map_err(HubError::from)?
         else {
             return Ok(None);
         };
+        // Transient secret pre-resolution: `${secret:...}` references in
+        // configuration payloads resolve against the HUB environment at
+        // dispatch time only. Storage keeps the verbatim reference (no
+        // plaintext at rest), and retries re-resolve, so secret rotation
+        // applies to later attempts. `env:`/`file:` references stay
+        // node-local and are left for the agent's own materialization.
+        if attempt.operation == "apply_configuration" {
+            if let Some(payload) = &attempt.payload_json {
+                if payload.contains("secret:") {
+                    match arkflow_core::secret::resolve_candidate_payload(payload.clone()) {
+                        Ok(Some(resolved)) => attempt.payload_json = Some(resolved),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(HubError::Invalid(format!(
+                                "configuration dispatch pre-resolution failed: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let operation = self.enqueue_attempt(attempt).await?;
         storage
             .mark_outbox_processed(outbox.outbox_id, now_ms())
@@ -4835,30 +4856,7 @@ impl Hub {
                             changes += 1;
                             continue;
                         };
-                        // Pre-resolve `${secret:...}` references against the
-                        // Hub environment so agents never need the secret
-                        // environment; `env:`/`file:` stay node-local.
-                        let payload_json = match arkflow_core::secret::resolve_candidate_payload(payload_json.clone()) {
-                            Ok(Some(resolved)) => resolved,
-                            Ok(None) => payload_json,
-                            Err(error) => {
-                                storage
-                                    .update_rollout_target(RolloutTargetUpdate {
-                                        rollout_id: rollout.rollout_id.clone(),
-                                        node_id: target.node_id.clone(),
-                                        state: "failed".into(),
-                                        attempt_id: None,
-                                        error: Some(error.to_string()),
-                                        observed_config_version: None,
-                                        updated_at_ms: now_ms(),
-                                    })
-                                    .await
-                                    .map_err(HubError::from)?;
-                                batch_failed = true;
-                                changes += 1;
-                                continue;
-                            }
-                        };
+
                         let expected_generation = storage
                             .get_desired(target.node_id.clone(), "__configuration__")
                             .await
@@ -6928,8 +6926,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollout_dispatch_fails_target_when_secret_missing() {
+    async fn rollout_dispatch_keeps_reference_when_secret_missing() {
+        // Reconcile itself does not resolve secrets: the dispatch-time
+        // pre-resolution happens later (at command delivery), and the
+        // version store keeps the verbatim reference.
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let assertion_store = store.clone();
         let candidate = serde_json::json!({
             "format": "yaml",
             "content": "health_check:\n  api_token: ${secret:never_set_x}\n"
@@ -6962,11 +6964,14 @@ mod tests {
             .unwrap();
         hub.reconcile_rollouts().await.unwrap();
         let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
-        assert_eq!(targets[0].state, "failed");
-        let error = targets[0].error.as_deref().unwrap_or("");
+        assert_eq!(targets[0].state, "applying");
+        let content = assertion_store
+            .get_config_version_content("cfg-missing".into())
+            .unwrap()
+            .expect("version content");
         assert!(
-            error.contains("ARKFLOW_SECRET_never_set_x"),
-            "unexpected target error: {error}"
+            content.contains("${secret:never_set_x}"),
+            "stored version must keep the reference: {content}"
         );
     }
 
@@ -7020,9 +7025,12 @@ mod tests {
             })
             .unwrap();
         let payload = payload.expect("apply_configuration intent payload");
-        assert!(payload.contains("s3cret"), "{payload}");
-        assert!(!payload.contains("${secret:"), "{payload}");
-        assert!(payload.contains("${env:HUB_HOST}"), "env refs stay node-local: {payload}");
+        // Storage keeps the verbatim reference: no plaintext at rest, and
+        // later delivery attempts re-resolve against fresh environment
+        // values. env refs stay node-local.
+        assert!(payload.contains("${secret:db_pass}"), "{payload}");
+        assert!(!payload.contains("s3cret"), "{payload}");
+        assert!(payload.contains("${env:HUB_HOST}"), "{payload}");
     }
 
     #[tokio::test]

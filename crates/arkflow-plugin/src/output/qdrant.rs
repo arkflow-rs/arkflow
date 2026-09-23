@@ -122,8 +122,17 @@ impl Output for QdrantOutput {
         let points: Vec<Value> = (0..rows)
             .map(|row| {
                 let mut point = Map::new();
-                if let Some(Some(id)) = ids.as_ref().map(|ids| ids.get(row)) {
-                    point.insert("id".to_string(), id.clone());
+                match ids.as_ref().and_then(|ids| ids.get(row)) {
+                    Some(id) => {
+                        point.insert("id".to_string(), id.clone());
+                    }
+                    // Qdrant requires every point to carry an id: generate a
+                    // UUID v4 per row so the request is valid (each retry
+                    // inserts a fresh point — prefer id_field for
+                    // at-least-once idempotency).
+                    None => {
+                        point.insert("id".to_string(), json!(random_uuid_v4()));
+                    }
                 }
                 point.insert("vector".to_string(), json!(vectors[row]));
                 if let Some(payload) = payloads.get(row) {
@@ -414,6 +423,24 @@ fn find_column<'a>(batch: &'a MessageBatchRef, field: &str) -> Result<&'a Arc<dy
         })
 }
 
+/// Formats a random UUID v4 (no uuid crate).
+fn random_uuid_v4() -> String {
+        let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&rand::random::<u64>().to_be_bytes());
+    bytes[8..16].copy_from_slice(&rand::random::<u64>().to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 fn truncate_body(body: &str) -> &str {
     match body.char_indices().nth(512) {
         Some((index, _)) => &body[..index],
@@ -622,13 +649,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omits_id_when_id_field_not_configured() {
+    async fn generates_uuid_ids_when_id_field_not_configured() {
         let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
         let output = build_output(base_config(mock.addr, serde_json::json!({})));
         output.write(sample_batch()).await.unwrap();
         let (_, body) = mock.last_request();
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["points"][0].get("id").is_none());
+        for point in parsed["points"].as_array().unwrap() {
+            let id = point["id"].as_str().expect("uuid string id");
+            assert_eq!(id.len(), 36, "uuid v4 shape: {id}");
+        }
     }
 
     #[tokio::test]

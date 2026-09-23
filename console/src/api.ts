@@ -499,6 +499,11 @@ export interface OidcStatus {
 
 let oidcProbe: Promise<OidcStatus> | null = null
 
+/** Test hook: clears the cached OIDC status probe. */
+export function resetOidcStatusCacheForTests(): void {
+  oidcProbe = null
+}
+
 /** Probes (once) whether the Hub offers the OIDC browser login flow and
  * whether the current session cookie is still valid. */
 export function oidcStatus(): Promise<OidcStatus> {
@@ -513,8 +518,11 @@ export function oidcStatus(): Promise<OidcStatus> {
 const REDIRECT_GUARD_MS = 10_000
 
 /** Redirects the browser to the Hub OIDC login endpoint, at most once per
- * guard window so a misconfigured deployment cannot loop. */
-export function redirectToOidcLogin(): void {
+ * guard window so a misconfigured deployment cannot loop. Never redirects
+ * when the Hub has no OIDC login flow configured. */
+export async function redirectToOidcLogin(): Promise<void> {
+  const status = await oidcStatus()
+  if (!status.login_enabled) return
   const guard = 'arkflow_oidc_redirected_at'
   const last = Number(sessionStorage.getItem(guard) ?? 0)
   if (Date.now() - last < REDIRECT_GUARD_MS) return

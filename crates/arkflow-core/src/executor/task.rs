@@ -19,6 +19,7 @@ use datafusion::arrow::array::{
     UInt8Array,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
+use tracing::Instrument;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -170,14 +171,31 @@ async fn run_graph_inner(
     sources_preconnected: bool,
     mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
-    // Root span for this graph execution. Chain spans are created inside
-    // this span's context (below) so they become its children; the entered
-    // guard must live for the whole function.
+    // Root span for this graph execution. The future is instrumented (never
+    // enter-guarded across await points), so every span and event created
+    // within becomes a child of job.run.
     let job_span = tracing::info_span!(
         "job.run",
         chains = graph.chains.len() as i64,
     );
-    let _job_guard = job_span.enter();
+    run_graph_inner_instrumented(
+        graph,
+        cancellation,
+        hooks,
+        sources_preconnected,
+        startup,
+    )
+    .instrument(job_span)
+    .await
+}
+
+async fn run_graph_inner_instrumented(
+    graph: ExecutionGraph,
+    cancellation: CancellationToken,
+    hooks: BTreeMap<String, CheckpointHook>,
+    sources_preconnected: bool,
+    mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), Error> {
     // Connect every resource in dependency order (temporary stores first,
     // then sources and sinks) before any task loop spawns: a processor's
     // first `get` cannot race a temporary's `connect`, and a partial startup
@@ -262,33 +280,37 @@ async fn run_graph_inner(
         // into the task and entered there.
         let chain_span =
             tracing::info_span!("chain.run", task = chain.entry_task_id());
-        tasks.push(tokio::spawn(async move {
-            let _chain_guard = chain_span.enter();
-            let edge_failures = chain.edge_failures.clone();
-            let Some(edge_failures) = edge_failures else {
-                return run_chain(chain, hook, token).await;
-            };
-            // Remote-edge failure watcher: an idle chain (blocked on input)
-            // never observes a dead edge on its own send path, so a manager
-            // failure cancels the chain and surfaces as its result. The chain
-            // still exits through its own cancellation path, closing every
-            // owned resource.
-            let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
-            let watcher_token = token.clone();
-            let watcher = tokio::spawn(async move {
-                if let Ok(error) = edge_failures.recv_async().await {
-                    watcher_token.cancel();
-                    let _ = failure_tx.send(error);
+        tasks.push(
+            tokio::spawn(
+                async move {
+                    let edge_failures = chain.edge_failures.clone();
+                    let Some(edge_failures) = edge_failures else {
+                        return run_chain(chain, hook, token).await;
+                    };
+                    // Remote-edge failure watcher: an idle chain (blocked on input)
+                    // never observes a dead edge on its own send path, so a manager
+                    // failure cancels the chain and surfaces as its result. The chain
+                    // still exits through its own cancellation path, closing every
+                    // owned resource.
+                    let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
+                    let watcher_token = token.clone();
+                    let watcher = tokio::spawn(async move {
+                        if let Ok(error) = edge_failures.recv_async().await {
+                            watcher_token.cancel();
+                            let _ = failure_tx.send(error);
+                        }
+                    });
+                    let result = run_chain(chain, hook, token).await;
+                    let result = match (result, failure_rx.try_recv()) {
+                        (Ok(()), Ok(error)) => Err(error),
+                        (result, _) => result,
+                    };
+                    watcher.abort();
+                    result
                 }
-            });
-            let result = run_chain(chain, hook, token).await;
-            let result = match (result, failure_rx.try_recv()) {
-                (Ok(()), Ok(error)) => Err(error),
-                (result, _) => result,
-            };
-            watcher.abort();
-            result
-        }));
+                .instrument(chain_span),
+            ),
+        );
     }
     // The chains own their source/sink close paths from here on.
     guard.hand_off_stream_resources();

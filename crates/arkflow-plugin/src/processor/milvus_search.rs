@@ -161,24 +161,38 @@ impl Processor for MilvusSearchProcessor {
 }
 
 impl MilvusSearchProcessor {
-    /// One batched request: the `data` array carries every row's query
-    /// vector and the response's `data[i]` maps back to input row i.
+    fn output_fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = Vec::with_capacity(2);
+        if let Some(id_field) = &self.config.id_field {
+            fields.push(id_field.clone());
+        }
+        if !self.config.payload_field.is_empty() {
+            fields.push(self.config.payload_field.clone());
+        }
+        fields
+    }
+
+    /// One request per row: Milvus 2.4's REST v2 search flattens multi-
+    /// vector responses, which loses per-query grouping, so each row issues
+    /// its own `data: [one-vector]` search and the responses map back in
+    /// row order.
     async fn search_all(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<String>, Error> {
+        let mut matches = Vec::with_capacity(vectors.len());
+        for vector in vectors {
+            matches.push(self.search(vector).await?);
+        }
+        Ok(matches)
+    }
+
+    async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {
         let url = format!(
             "{}/v2/vectordb/entities/search",
             self.config.url.trim_end_matches('/')
         );
-        let data: Vec<Value> = vectors.iter().map(|vector| json!({"vector": vector})).collect();
-        let mut output_fields: Vec<String> = Vec::with_capacity(2);
-        if let Some(id_field) = &self.config.id_field {
-            output_fields.push(id_field.clone());
-        }
-        if !self.config.payload_field.is_empty() {
-            output_fields.push(self.config.payload_field.clone());
-        }
+        let output_fields: Vec<String> = self.output_fields();
         let mut body = json!({
             "collectionName": self.config.collection,
-            "data": data,
+            "data": [{"vector": vector}],
             "limit": self.config.top_k,
             "searchParams": {"metricType": self.config.metric.as_str(), "params": {}},
         });
@@ -231,56 +245,41 @@ impl MilvusSearchProcessor {
             }
         }
 
-        let groups = parsed
+        // nq = 1: the response `data` is this row's flat hit list.
+        let hits = parsed
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 Error::Process("Milvus search response has no 'data' array".to_string())
             })?;
-        if groups.len() != vectors.len() {
-            return Err(Error::Process(format!(
-                "Milvus search returned {} result groups for {} input rows",
-                groups.len(),
-                vectors.len()
-            )));
-        }
-
-        groups
+        let normalized: Vec<Value> = hits
             .iter()
-            .map(|group| match_matches(group, &self.config))
-            .collect()
+            .map(|hit| match_match(hit, &self.config))
+            .collect::<Result<Vec<Value>, Error>>()?;
+        serde_json::to_string(&normalized)
+            .map_err(|e| Error::Process(format!("Milvus search serialization failed: {}", e)))
     }
 }
 
-/// Normalizes one row's matches: rename the configured collection fields to
-/// the canonical `id`/`distance`/`payload` keys used by the other search
+/// Normalizes one hit: rename the configured collection fields to the
+/// canonical `id`/`distance`/`payload` keys used by the other search
 /// processors, so downstream prompts and tooling stay backend-agnostic.
-fn match_matches(group: &Value, config: &MilvusSearchProcessorConfig) -> Result<String, Error> {
-    let hits = group.as_array().ok_or_else(|| {
-        Error::Process("Milvus search response group is not an array".to_string())
-    })?;
-    let normalized: Vec<Value> = hits
-        .iter()
-        .map(|hit| {
-            let mut object = Map::new();
-            if let Some(id_field) = &config.id_field {
-                if let Some(id) = hit.get(id_field.as_str()) {
-                    object.insert("id".to_string(), id.clone());
-                }
-            }
-            if let Some(distance) = hit.get("distance") {
-                object.insert("distance".to_string(), distance.clone());
-            }
-            if !config.payload_field.is_empty() {
-                if let Some(payload) = hit.get(config.payload_field.as_str()) {
-                    object.insert("payload".to_string(), payload.clone());
-                }
-            }
-            Value::Object(object)
-        })
-        .collect();
-    serde_json::to_string(&normalized)
-        .map_err(|e| Error::Process(format!("Milvus search serialization failed: {}", e)))
+fn match_match(hit: &Value, config: &MilvusSearchProcessorConfig) -> Result<Value, Error> {
+    let mut object = Map::new();
+    if let Some(id_field) = &config.id_field {
+        if let Some(id) = hit.get(id_field.as_str()) {
+            object.insert("id".to_string(), id.clone());
+        }
+    }
+    if let Some(distance) = hit.get("distance") {
+        object.insert("distance".to_string(), distance.clone());
+    }
+    if !config.payload_field.is_empty() {
+        if let Some(payload) = hit.get(config.payload_field.as_str()) {
+            object.insert("payload".to_string(), payload.clone());
+        }
+    }
+    Ok(Value::Object(object))
 }
 
 fn extract_vectors(batch: &MessageBatchRef, field: &str) -> Result<Vec<Vec<f32>>, Error> {
@@ -524,6 +523,10 @@ mod tests {
         fn last_request(&self) -> (String, String) {
             self.requests.lock().unwrap().last().cloned().unwrap()
         }
+
+        fn requests(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     fn build_processor(config: Value) -> Arc<dyn Processor> {
@@ -566,25 +569,25 @@ mod tests {
         config
     }
 
-    fn search_response() -> String {
+    /// nq = 1 response: `data` is this row's flat hit list.
+    fn hits_response(first_id: i64) -> String {
         json!({
             "code": 0,
             "data": [
-                [
-                    {"doc_id": 7, "distance": 0.1, "payload": {"text": "a"}},
-                    {"doc_id": 8, "distance": 0.4, "payload": {"text": "b"}}
-                ],
-                [
-                    {"doc_id": 9, "distance": 0.2, "payload": {"text": "c"}}
-                ]
+                {"doc_id": first_id, "distance": 0.1, "payload": {"text": "p1"}},
+                {"doc_id": first_id + 1, "distance": 0.4, "payload": {"text": "p2"}}
             ]
         })
         .to_string()
     }
 
     #[tokio::test]
-    async fn batched_search_maps_rows_in_order() {
-        let mock = MockMilvus::spawn(|_body| (200, search_response()));
+    async fn searches_each_row_in_order_with_normalized_matches() {
+        let mock = MockMilvus::spawn(|body| {
+            let parsed: Value = serde_json::from_str(body).unwrap();
+            let first = parsed["data"][0]["vector"][0].as_f64().unwrap() as i64;
+            (200, hits_response(first))
+        });
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
         let batch = vector_batch(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
 
@@ -601,19 +604,21 @@ mod tests {
 
         let row0: Vec<Value> = serde_json::from_str(matches.value(0)).unwrap();
         assert_eq!(row0.len(), 2);
-        assert_eq!(row0[0]["id"], 7);
+        assert_eq!(row0[0]["id"], 1);
         assert_eq!(row0[0]["distance"], 0.1);
-        assert_eq!(row0[0]["payload"]["text"], "a");
+        assert_eq!(row0[0]["payload"]["text"], "p1");
         let row1: Vec<Value> = serde_json::from_str(matches.value(1)).unwrap();
-        assert_eq!(row1[0]["id"], 9);
-        assert_eq!(row1[0]["payload"]["text"], "c");
+        assert_eq!(row1[0]["id"], 0);
+        assert_eq!(row1[0]["payload"]["text"], "p1");
 
-        let (head, body) = mock.last_request();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "one request per row");
+        let (head, body) = requests[0].clone();
         assert!(head.starts_with("POST /v2/vectordb/entities/search "), "{head}");
         assert!(head.contains("authorization: Bearer root:Milvus-pw"), "{head}");
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["collectionName"], "docs");
-        assert_eq!(parsed["data"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["data"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["data"][0]["vector"], serde_json::json!([1.0, 0.0]));
         assert_eq!(parsed["limit"], 5);
         assert_eq!(parsed["searchParams"]["metricType"], "COSINE");
@@ -625,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn auto_id_omits_id_from_output_fields_and_matches() {
         let mock = MockMilvus::spawn(|_body| {
-            (200, r#"{"code":0,"data":[[{"distance":0.3,"payload":{"text":"x"}}]]}"#.to_string())
+            (200, r#"{"code":0,"data":[{"distance":0.3,"payload":{"text":"x"}}]}"#.to_string())
         });
         let processor = build_processor(base_config(mock.addr, serde_json::json!({"id_field": ""})));
         let batch = vector_batch(vec![vec![1.0, 2.0]]);
@@ -685,18 +690,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("404"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn mismatched_result_groups_error() {
-        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":[[{"distance":0.1}]]}"#.to_string()));
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        let err = processor
-            .process(vector_batch(vec![vec![1.0], vec![2.0]]))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("1 result groups for 2 input rows"), "{err}");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ The `qdrant` output upserts each batch's rows as [Qdrant](https://qdrant.tech/) 
 | url | string | yes | — | Qdrant base URL (e.g. `http://localhost:6333`). |
 | collection | string | yes | — | Target collection name. |
 | vector_field | string | no | `embedding` | Column holding the vector. |
-| id_field | string | no | — | Column used as the point id (unsigned integer or string). When omitted, Qdrant generates ids. |
+| id_field | string | no | — | Column used as the point id (unsigned integer or string). When omitted, the console generates a random UUID v4 per row — redelivery inserts duplicates, so prefer an id column for at-least-once idempotency. |
 | payload_fields | array | no | all other columns | Columns included in the point payload. |
 | api_key | string | no | — | Sent as `Authorization: Bearer`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
@@ -25,7 +25,7 @@ The `qdrant` output upserts each batch's rows as [Qdrant](https://qdrant.tech/) 
 ## Semantics
 
 - Writes use `PUT /collections/{collection}/points?wait=true` — one request per batch.
-- Upserts are idempotent per point id: with an `id_field`, redelivery overwrites the same point (at-least-once friendly); without one, every attempt creates a new point.
+- Upserts are idempotent per point id: with an `id_field`, redelivery overwrites the same point (at-least-once friendly); without one, a fresh UUID is generated per row, so every attempt inserts a new point.
 - The vector's dimension must match the collection's; mismatches are returned by Qdrant as a 4xx and fail the batch (routed to `error_output` when configured).
 - Requests to loopback endpoints (a local Qdrant instance) always bypass the system proxy.
 

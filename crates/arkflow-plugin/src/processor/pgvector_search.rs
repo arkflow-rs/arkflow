@@ -203,12 +203,16 @@ impl PgVectorSearchProcessor {
 /// payload (when enabled) as text for parsing, keeping sqlx free of the
 /// json feature while staying parameterized.
 fn build_search_sql(config: &PgVectorSearchProcessorConfig) -> String {
+    // The payload column is always selected (as NULL text when disabled) so
+    // the row decode shape stays identical across configurations.
     let mut columns = vec![format!("\"{}\"::text AS \"id\"", config.id_column)];
     if !config.payload_column.is_empty() {
         columns.push(format!(
             "\"{}\"::text AS \"payload\"",
             config.payload_column
         ));
+    } else {
+        columns.push("NULL::text AS \"payload\"".to_string());
     }
     columns.push(format!(
         "\"{}\" {} $1::vector AS \"distance\"",
@@ -491,14 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn search_sql_without_payload_column() {
+    fn search_sql_without_payload_column_selects_null_placeholder() {
+        // The decode shape stays identical across configurations: the
+        // disabled payload is a NULL text column, not a missing column.
         let config = config_with(serde_json::json!({"payload_column": ""}));
         let sql = build_search_sql(&config);
         assert_eq!(
             sql,
-            "SELECT \"id\"::text AS \"id\", \"embedding\" <=> $1::vector AS \"distance\" FROM \"documents\" ORDER BY \"embedding\" <=> $1::vector LIMIT 5"
+            "SELECT \"id\"::text AS \"id\", NULL::text AS \"payload\", \"embedding\" <=> $1::vector AS \"distance\" FROM \"documents\" ORDER BY \"embedding\" <=> $1::vector LIMIT 5"
         );
-        assert!(!sql.contains("\"payload\""), "{sql}");
     }
 
     #[test]

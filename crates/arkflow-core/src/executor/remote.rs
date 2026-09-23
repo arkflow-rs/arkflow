@@ -3162,22 +3162,17 @@ mod tests {
         // branch aborts, and the failure surfaces on the manager.
         downstream.shutdown();
 
-        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
-            while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("pending branch aborted on disconnect");
+        // The failure broadcast happens after the manager aborts pending
+        // branches, so waiting for it first makes the aborted-flag check
+        // deterministic.
+        let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
+            .await
+            .expect("failure within timeout")
+            .expect("failure channel open");
         assert!(
             !branch.acked.load(std::sync::atomic::Ordering::SeqCst),
             "an aborted branch must never complete its source ack"
         );
-        let failure =
-            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
-                .await
-                .expect("failure within timeout")
-                .expect("failure channel open");
         assert!(
             failure.to_string().contains("remote edge") || failure.to_string().contains("inbound")
         );

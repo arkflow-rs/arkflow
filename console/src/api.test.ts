@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { oidcLogout, oidcStatus, redirectToOidcLogin, request, streamEvents } from './api'
+import {
+  oidcLogout,
+  oidcStatus,
+  redirectToOidcLogin,
+  request,
+  resetOidcStatusCacheForTests,
+  streamEvents,
+} from './api'
 
 describe('control-plane event stream', () => {
   afterEach(() => {
@@ -45,6 +52,7 @@ describe('OIDC console integration', () => {
 
   it('redirects a 401 to the OIDC login when the flow is enabled', async () => {
     sessionStorage.clear()
+    resetOidcStatusCacheForTests()
     const locations: string[] = []
     Object.defineProperty(window, 'location', {
       writable: true,
@@ -82,6 +90,7 @@ describe('OIDC console integration', () => {
 
   it('does not redirect when a static token is configured', async () => {
     sessionStorage.clear()
+    resetOidcStatusCacheForTests()
     const locations: string[] = []
     vi.stubEnv('VITE_API_TOKEN', 'static-token')
     const fetchMock = vi.fn((url: string | URL | Request) => {
@@ -110,6 +119,7 @@ describe('OIDC console integration', () => {
 
   it('probes the status endpoint once and caches the result', async () => {
     sessionStorage.clear()
+    resetOidcStatusCacheForTests()
     const fetchMock = vi.fn((url: string | URL | Request) => {
       expect(String(url)).toContain('/auth/oidc/status')
       return Promise.resolve({
