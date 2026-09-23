@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Vector Search
 
-The `vector_search` processor searches a [Qdrant](https://qdrant.tech/) collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. It is the retrieval step of an in-engine RAG pipeline: pair it with the [embedding processor](/docs/components/2-processors/embedding) (turn text into a query vector) and the [LLM processor](/docs/components/2-processors/llm) (generate over the matches).
+The `vector_search` processor searches a [Qdrant](https://qdrant.tech/) collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. It is the retrieval step of an in-engine RAG pipeline: pair it with the [embedding processor](/docs/components/processors/embedding) (turn text into a query vector) and the [LLM processor](/docs/components/processors/llm) (generate over the matches).
 
 ## Configuration
 
@@ -33,7 +33,7 @@ score, each preserving Qdrant's `id`, `score`, and `payload`:
 ```
 
 Each row is one search request (bounded by `concurrency`); the JSON text
-feeds directly into an [LLM processor](/docs/components/2-processors/llm)
+feeds directly into an [LLM processor](/docs/components/processors/llm)
 `prompt_template` via `{{value}}`-style composition over the column, or
 into any downstream JSON tooling.
 

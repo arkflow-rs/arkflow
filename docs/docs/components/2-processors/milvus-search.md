@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Milvus Search
 
-The `milvus_search` processor searches a [Milvus](https://milvus.io/) collection (2.4+, REST v2) for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Unlike the Qdrant and pgvector search processors (one request per row), Milvus accepts a **batched query array** — the whole batch is one request, with responses mapped back by position. Pair it with the [embedding processor](/docs/components/2-processors/embedding) and the [Milvus output](/docs/components/3-outputs/milvus), which writes the same field shape this processor reads.
+The `milvus_search` processor searches a [Milvus](https://milvus.io/) collection (2.4+, REST v2) for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Unlike the Qdrant and pgvector search processors (one request per row), Milvus accepts a **batched query array** — the whole batch is one request, with responses mapped back by position. Pair it with the [embedding processor](/docs/components/processors/embedding) and the [Milvus output](/docs/components/outputs/milvus), which writes the same field shape this processor reads.
 
 ## Configuration
 

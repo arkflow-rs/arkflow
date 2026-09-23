@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # pgvector
 
-The `pgvector` output upserts each batch's rows into a PostgreSQL table with the [pgvector](https://github.com/pgvector/pgvector) extension. It pairs with the [embedding processor](/docs/components/2-processors/embedding) so an existing Postgres becomes the vector store — no separate vector database deployment.
+The `pgvector` output upserts each batch's rows into a PostgreSQL table with the [pgvector](https://github.com/pgvector/pgvector) extension. It pairs with the [embedding processor](/docs/components/processors/embedding) so an existing Postgres becomes the vector store — no separate vector database deployment.
 
 ## Configuration
 

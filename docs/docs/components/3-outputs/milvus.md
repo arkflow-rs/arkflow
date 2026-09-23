@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Milvus
 
-The `milvus` output upserts each batch's rows into a [Milvus](https://milvus.io/) collection over the REST v2 vectordb API (Milvus **2.4+**). It pairs with the [embedding processor](/docs/components/2-processors/embedding): a Float32 list column becomes the vector, every remaining column packs into a JSON payload field, and an optional id column keys the row.
+The `milvus` output upserts each batch's rows into a [Milvus](https://milvus.io/) collection over the REST v2 vectordb API (Milvus **2.4+**). It pairs with the [embedding processor](/docs/components/processors/embedding): a Float32 list column becomes the vector, every remaining column packs into a JSON payload field, and an optional id column keys the row.
 
 ## Configuration
 

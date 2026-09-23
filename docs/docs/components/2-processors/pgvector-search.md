@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # pgvector Search
 
-The `pgvector_search` processor runs one nearest-neighbor SELECT per row against a PostgreSQL table with the [pgvector](https://github.com/pgvector/pgvector) extension and appends the matches as a JSON array text column. The table shape mirrors what the [pgvector output](/docs/components/3-outputs/pgvector) writes — `(id, embedding vector(n), payload jsonb)` — so ingestion and retrieval work on the same table out of the box.
+The `pgvector_search` processor runs one nearest-neighbor SELECT per row against a PostgreSQL table with the [pgvector](https://github.com/pgvector/pgvector) extension and appends the matches as a JSON array text column. The table shape mirrors what the [pgvector output](/docs/components/outputs/pgvector) writes — `(id, embedding vector(n), payload jsonb)` — so ingestion and retrieval work on the same table out of the box.
 
 ## Configuration
 
@@ -38,7 +38,7 @@ The `pgvector_search` processor runs one nearest-neighbor SELECT per row against
 
 Each match object carries `id` (as text), `distance`, and `payload` (the
 parsed jsonb object) — the JSON text feeds directly into an
-[LLM processor](/docs/components/2-processors/llm) prompt or downstream
+[LLM processor](/docs/components/processors/llm) prompt or downstream
 JSON tooling.
 
 :::note

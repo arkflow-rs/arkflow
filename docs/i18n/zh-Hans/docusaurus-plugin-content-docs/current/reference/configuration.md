@@ -88,7 +88,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 启用控制平面服务器时,`/ready` 与 `/live` 也会挂载在服务器地址上,与旧的 `/health`、`/readiness`、`/liveness` 端点并列(后者保持原有语义)。
 :::
 
-## Secret 引用
+## Secret 引用 {#secret-references}
 
 敏感值(密码、令牌、密钥材料)不必明文写进配置文件。任何**字符串值**都可以内嵌引用,在配置物化为 `EngineConfig` 时解析一次——文件配置(`--config`)、`--validate` 以及经控制平面下发的配置均是如此。存储/下发的配置内容保持引用原文;只有运行中的进程在内存里持有解析出的值。
 

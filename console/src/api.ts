@@ -503,7 +503,9 @@ let oidcProbe: Promise<OidcStatus> | null = null
  * whether the current session cookie is still valid. */
 export function oidcStatus(): Promise<OidcStatus> {
   oidcProbe ??= fetch(`${base}/auth/oidc/status`)
-    .then((response) => (response.ok ? response.json() : { login_enabled: false, authenticated: false, principal: null }))
+    .then((response) =>
+      response.ok ? response.json() : { login_enabled: false, authenticated: false, principal: null },
+    )
     .catch(() => ({ login_enabled: false, authenticated: false, principal: null })) as Promise<OidcStatus>
   return oidcProbe
 }

@@ -108,7 +108,7 @@ mounted on the server address next to the legacy `/health`, `/readiness`, and
 `/liveness` endpoints (which keep their original semantics).
 :::
 
-## Secret references
+## Secret references {#secret-references}
 
 Sensitive values (passwords, tokens, key material) do not have to be written
 into the configuration file. Any **string value** may embed a reference that

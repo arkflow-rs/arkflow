@@ -7,7 +7,7 @@ description: ArkFlow documentation page.
 
 The `llm` processor sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column. Use it for in-stream summarization, translation, rewriting, classification, or structured extraction. Any endpoint that speaks the OpenAI `/chat/completions` protocol works: OpenAI, Azure OpenAI (via `headers`), vLLM, or Ollama gateways.
 
-It pairs naturally with [SQL](/docs/components/2-processors/sql) (prepare the prompt column first) and the [embedding processor](embedding.md) (embed what the model produced).
+It pairs naturally with [SQL](/docs/components/processors/sql) (prepare the prompt column first) and the [embedding processor](embedding.md) (embed what the model produced).
 
 ## Configuration
 

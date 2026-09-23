@@ -60,7 +60,12 @@ describe('OIDC console integration', () => {
           json: () => Promise.resolve({ login_enabled: true, authenticated: false, principal: null }),
         })
       }
-      return Promise.resolve({ ok: false, status: 401, headers: new Headers(), json: () => Promise.resolve({}) })
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        headers: new Headers(),
+        json: () => Promise.resolve({}),
+      })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
@@ -88,7 +93,12 @@ describe('OIDC console integration', () => {
           json: () => Promise.resolve({ login_enabled: true, authenticated: false, principal: null }),
         })
       }
-      return Promise.resolve({ ok: false, status: 401, headers: new Headers(), json: () => Promise.resolve({}) })
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        headers: new Headers(),
+        json: () => Promise.resolve({}),
+      })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
@@ -105,13 +115,22 @@ describe('OIDC console integration', () => {
       return Promise.resolve({
         ok: true,
         status: 200,
-        json: () => Promise.resolve({ login_enabled: true, authenticated: true, principal: { id: 'u1', roles: ['viewer'] } }),
+        json: () =>
+          Promise.resolve({
+            login_enabled: true,
+            authenticated: true,
+            principal: { id: 'u1', roles: ['viewer'] },
+          }),
       })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
     const first = await oidcStatus()
     const second = await oidcStatus()
-    expect(first).toEqual({ login_enabled: true, authenticated: true, principal: { id: 'u1', roles: ['viewer'] } })
+    expect(first).toEqual({
+      login_enabled: true,
+      authenticated: true,
+      principal: { id: 'u1', roles: ['viewer'] },
+    })
     expect(second).toBe(first)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
