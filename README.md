@@ -162,6 +162,7 @@ ArkFlow provides multiple data processors:
 - **Vector Search** (`vector_search`): Search a Qdrant collection for top-k nearest neighbors of each row's vector and append matches as JSON
 - **Milvus Search** (`milvus_search`): Search a Milvus collection for top-k nearest neighbors of each row's vector with one batched request
 - **pgvector Search** (`pgvector_search`): Search a PostgreSQL table with the pgvector extension for top-k nearest neighbors of each row's vector
+- **WASM** (`wasm`): Run each row through a sandboxed WebAssembly module (wasmtime) with fuel and memory limits
 
 <!-- README_COMPONENTS:processor END -->
 

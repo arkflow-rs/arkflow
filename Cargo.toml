@@ -19,6 +19,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+wasmtime = { version = "24", default-features = false, features = ["cranelift", "wat", "runtime", "std"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }

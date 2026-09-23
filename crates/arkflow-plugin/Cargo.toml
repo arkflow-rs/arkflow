@@ -52,6 +52,7 @@ flume = { workspace = true }
 dashmap = { workspace = true }
 tempfile = { workspace = true }
 rumqttc = "0.25.1"
+wasmtime = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 
