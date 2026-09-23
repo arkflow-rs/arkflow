@@ -21,7 +21,7 @@
 //! never rescanned and never appear in error messages. `$${` escapes a
 //! literal `${`, and `${...}` forms with unknown schemes are left untouched.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::Error;
 
@@ -67,6 +67,121 @@ pub(crate) fn resolve_document(document: ConfigDocument<'_>) -> Result<Value, Er
 /// Keys, numbers, booleans and nulls are left untouched.
 pub fn resolve_value(value: &mut Value) -> Result<(), Error> {
     resolve_at(value, "")
+}
+
+/// Resolves only `${secret:...}` references inside a serialized
+/// ConfigCandidate payload (`{"format": ..., "content": ...}`). Used by the
+/// Hub when dispatching configurations: secrets live in the Hub process
+/// environment, while `env:`/`file:` references stay node-local and unknown
+/// schemes stay verbatim. Returns `None` when the content contains no
+/// `secret:` reference (payload dispatched verbatim); otherwise the content
+/// is re-serialized as JSON text with `format` set to `json`.
+pub fn resolve_candidate_payload(payload: String) -> Result<Option<String>, Error> {
+    let mut candidate: Value = serde_json::from_str(&payload)
+        .map_err(|e| Error::Config(format!("candidate payload parse failed: {}", e)))?;
+    let format = candidate
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+        .to_string();
+    // Not a candidate envelope (no content field): dispatch verbatim.
+    let Some(content) = candidate.get("content").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !content.contains("secret:") {
+        return Ok(None);
+    }
+
+    let mut value: Value = match format.as_str() {
+        "yaml" | "yml" => serde_yaml::from_str(&content)
+            .map_err(|e| Error::Config(format!("candidate content parse failed: {}", e)))?,
+        "json" => serde_json::from_str(&content)
+            .map_err(|e| Error::Config(format!("candidate content parse failed: {}", e)))?,
+        "toml" => toml::from_str(&content)
+            .map_err(|e| Error::Config(format!("candidate content parse failed: {}", e)))?,
+        other => {
+            return Err(Error::Config(format!(
+                "candidate payload has unknown format '{other}'"
+            )))
+        }
+    };
+    resolve_secret_only_at(&mut value, "")?;
+
+    candidate["content"] = json!(serde_json::to_string(&value).map_err(|e| {
+        Error::Config(format!("candidate content serialization failed: {}", e))
+    })?);
+    candidate["format"] = json!("json");
+    let serialized = serde_json::to_string(&candidate).map_err(|e| {
+        Error::Config(format!("candidate payload serialization failed: {}", e))
+    })?;
+    Ok(Some(serialized))
+}
+
+/// Walks a value tree resolving only `secret:` references; every other
+/// reference form stays literal for the node-local resolver.
+fn resolve_secret_only_at(value: &mut Value, path: &str) -> Result<(), Error> {
+    match value {
+        Value::String(text) => {
+            *text = resolve_secret_only_string(text, path)?;
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                resolve_secret_only_at(item, &format!("{path}[{index}]"))?;
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                resolve_secret_only_at(item, &child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_secret_only_string(text: &str, path: &str) -> Result<String, Error> {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(position) = rest.find('$') {
+        output.push_str(&rest[..position]);
+        rest = &rest[position..];
+        if let Some(after) = rest.strip_prefix("$${") {
+            // Preserve the escape: the node-side resolver turns it into a
+            // literal after this pass.
+            output.push_str("$${");
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("${") {
+            match after.find('}') {
+                Some(end) => {
+                    let inner = &after[..end];
+                    let token = format!("${{{}}}", inner);
+                    if let Some(spec) = inner.strip_prefix("secret:") {
+                        // Same namespace convention as the full resolver.
+                        let name = format!("ARKFLOW_SECRET_{spec}");
+                        output.push_str(&resolve_env(&name, &token, path)?);
+                    } else {
+                        // env:/file:/unknown stay literal for the node.
+                        output.push_str(&token);
+                    }
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    output.push_str(rest);
+                    rest = "";
+                }
+            }
+        } else {
+            output.push('$');
+            rest = &rest[1..];
+        }
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 fn resolve_at(value: &mut Value, path: &str) -> Result<(), Error> {
@@ -388,6 +503,72 @@ mod tests {
         assert!(message.contains("ARKFLOW_SECRET_missing"), "{message}");
         assert!(message.contains("streams[0].pw"), "{message}");
         clear_env("ARKFLOW_SECRET_empty");
+    }
+
+    #[test]
+    fn resolve_candidate_payload_resolves_only_secret_refs() {
+        let payload = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:db_pass}\n  host: ${env:HUB_HOST}\n  legacy: $${env:OLD}\n"
+        })
+        .to_string();
+        set_env("ARKFLOW_SECRET_db_pass", "s3cret");
+        let resolved = resolve_candidate_payload(payload).unwrap().unwrap();
+        clear_env("ARKFLOW_SECRET_db_pass");
+
+        let candidate: Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(candidate["format"], "json");
+        let content: Value = serde_json::from_str(candidate["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            content["health_check"]["api_token"], "s3cret",
+            "secret resolved at the hub"
+        );
+        assert_eq!(
+            content["health_check"]["host"], "${env:HUB_HOST}",
+            "env refs stay node-local"
+        );
+        assert_eq!(
+            content["health_check"]["legacy"], "$${env:OLD}",
+            "escapes stay literal"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_payload_returns_none_without_secret_refs() {
+        let payload = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${env:T}\n"
+        })
+        .to_string();
+        assert!(resolve_candidate_payload(payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_payload_missing_secret_errors() {
+        clear_env("ARKFLOW_SECRET_missing_x");
+        let payload = serde_json::json!({
+            "format": "yaml",
+            "content": "token: ${secret:missing_x}\n"
+        })
+        .to_string();
+        let err = resolve_candidate_payload(payload).unwrap_err().to_string();
+        assert!(err.contains("ARKFLOW_SECRET_missing_x"), "{err}");
+    }
+
+    #[test]
+    fn resolve_candidate_payload_handles_toml() {
+        let payload = serde_json::json!({
+            "format": "toml",
+            "content": "token = \"${secret:t}\"\n"
+        })
+        .to_string();
+        set_env("ARKFLOW_SECRET_t", "toml-secret");
+        let resolved = resolve_candidate_payload(payload).unwrap().unwrap();
+        clear_env("ARKFLOW_SECRET_t");
+        let candidate: Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(candidate["format"], "json");
+        let content: Value = serde_json::from_str(candidate["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["token"], "toml-secret");
     }
 
     #[test]

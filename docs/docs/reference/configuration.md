@@ -122,7 +122,7 @@ only the running process holds the resolved value in memory.
 | `${env:VAR}` | Value of environment variable `VAR`; error if unset. |
 | `${env:VAR:-default}` | Value of `VAR`, or `default` when unset **or empty** (`${env:VAR:-}` allows an explicit empty value). |
 | `${file:/path}` | Content of the file at `/path` with trailing newlines stripped (e.g. a mounted Kubernetes secret). |
-| `${secret:NAME}` | Value of environment variable `ARKFLOW_SECRET_<NAME>` (verbatim name) — a dedicated namespace for credentials. Supports `:-` defaults. |
+| `${secret:NAME}` | Value of environment variable `ARKFLOW_SECRET_<NAME>` (verbatim name) — a dedicated namespace for credentials. Supports `:-` defaults. In hub-dispatched deployments the Hub pre-resolves these references at rollout dispatch, so agents never need the secret environment. |
 | `$${` | Escape for a literal `${`. |
 
 Rules and guarantees:

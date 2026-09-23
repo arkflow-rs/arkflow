@@ -4835,6 +4835,30 @@ impl Hub {
                             changes += 1;
                             continue;
                         };
+                        // Pre-resolve `${secret:...}` references against the
+                        // Hub environment so agents never need the secret
+                        // environment; `env:`/`file:` stay node-local.
+                        let payload_json = match arkflow_core::secret::resolve_candidate_payload(payload_json.clone()) {
+                            Ok(Some(resolved)) => resolved,
+                            Ok(None) => payload_json,
+                            Err(error) => {
+                                storage
+                                    .update_rollout_target(RolloutTargetUpdate {
+                                        rollout_id: rollout.rollout_id.clone(),
+                                        node_id: target.node_id.clone(),
+                                        state: "failed".into(),
+                                        attempt_id: None,
+                                        error: Some(error.to_string()),
+                                        observed_config_version: None,
+                                        updated_at_ms: now_ms(),
+                                    })
+                                    .await
+                                    .map_err(HubError::from)?;
+                                batch_failed = true;
+                                changes += 1;
+                                continue;
+                            }
+                        };
                         let expected_generation = storage
                             .get_desired(target.node_id.clone(), "__configuration__")
                             .await
@@ -6901,6 +6925,104 @@ mod tests {
             2
         );
         assert_eq!(hub.audit(Some(&rollout.rollout_id)).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn rollout_dispatch_fails_target_when_secret_missing() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:never_set_x}\n"
+        })
+        .to_string();
+        std::env::remove_var("ARKFLOW_SECRET_never_set_x");
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-missing', 'digest', ?1, 'json', 1)",
+                    [&candidate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let rollout = hub
+            .create_rollout("cfg-missing".into(), vec!["node-a".into()], 1, None, None)
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "failed");
+        let error = targets[0].error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("ARKFLOW_SECRET_never_set_x"),
+            "unexpected target error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_dispatch_preresolves_secret_references() {
+        std::env::set_var("ARKFLOW_SECRET_db_pass", "s3cret");
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let assertion_store = store.clone();
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:db_pass}\n  host: ${env:HUB_HOST}\n"
+        })
+        .to_string();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-secret', 'digest', ?1, 'json', 1)",
+                    [&candidate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let rollout = hub
+            .create_rollout("cfg-secret".into(), vec!["node-a".into()], 1, None, None)
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+
+        std::env::remove_var("ARKFLOW_SECRET_db_pass");
+        // The dispatched intent payload carries the resolved value and no
+        // secret reference; env refs stay node-local.
+        let payload: Option<String> = assertion_store
+            .with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT payload_json FROM cp_intents WHERE intent_type = 'apply_configuration' ORDER BY created_at_ms DESC LIMIT 1")?;
+                let value: Option<String> = statement.query_row([], |row| row.get(0))?;
+                Ok(value)
+            })
+            .unwrap();
+        let payload = payload.expect("apply_configuration intent payload");
+        assert!(payload.contains("s3cret"), "{payload}");
+        assert!(!payload.contains("${secret:"), "{payload}");
+        assert!(payload.contains("${env:HUB_HOST}"), "env refs stay node-local: {payload}");
     }
 
     #[tokio::test]
