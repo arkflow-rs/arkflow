@@ -170,6 +170,24 @@ impl RetryUtils {
 }
 
 /// Configuration validation utilities
+/// TLS configuration for Pulsar connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulsarTlsConfig {
+    /// CA certificate file path (PEM format)
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Client certificate chain file path (PEM format, for mTLS)
+    #[serde(default)]
+    pub certificate_chain_file: Option<String>,
+    /// Whether to enable hostname verification (defaults to true)
+    #[serde(default = "default_hostname_verification")]
+    pub hostname_verification: Option<bool>,
+}
+
+fn default_hostname_verification() -> Option<bool> {
+    Some(true)
+}
+
 pub struct PulsarConfigValidator;
 
 impl PulsarConfigValidator {
