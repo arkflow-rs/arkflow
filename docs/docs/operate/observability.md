@@ -154,11 +154,15 @@ The v1 span model is a lifecycle skeleton per Job execution:
   attribute (number of chains).
 - `chain.run` — one child span per chain (attribute `task`, the chain's
   entry task id), covering startup through resource close.
+- `chain.batch` — one child of `chain.run` per batch processed through the
+  chain (attributes `rows`, the batch row count, and `task`). An operator
+  failure inside the batch is recorded as an event on this span with the
+  failing `operator` id.
 
-Known v1 boundaries: there are no per-batch or per-connector spans (worker
-pool context propagation is future work), and trace context is not
-propagated across nodes — each process roots its own traces for the Jobs it
-runs. Exporter failures never affect the data plane.
+Known v1 boundaries: there are no worker-pool spans (pool context
+propagation is future work), and trace context is not propagated across
+nodes — each process roots its own traces for the Jobs it runs. Exporter
+failures never affect the data plane.
 
 ## Operational status for dashboards
 

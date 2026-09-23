@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the OTel trace export for the unified-kernel data plane: the `observability.tracing` configuration (disabled by default), the `job.run`/`chain.run` lifecycle span model with parent linkage, OTLP http-json batch export, failure isolation, and the guarantees that existing logging/metrics behavior is unchanged. (Purpose derived from the `add-data-plane-tracing` change; refine as the capability evolves.)
+Define the OTel trace export for the unified-kernel data plane: the `observability.tracing` configuration (disabled by default), the `job.run`/`chain.run`/`chain.batch` lifecycle span model with parent linkage, OTLP http-json batch export, failure isolation, and the guarantees that existing logging/metrics behavior is unchanged. (Purpose derived from the `add-data-plane-tracing` change; refine as the capability evolves.)
 
 ## Requirements
 
@@ -47,3 +47,26 @@ Define the OTel trace export for the unified-kernel data plane: the `observabili
 
 - **WHEN** 追踪启停两种状态下分别以文件+JSON 与控制台+plain 配置运行
 - **THEN** 日志的落点、格式与级别过滤行为一致
+
+### Requirement: batch 级处理 span
+
+追踪启用时，统一内核 SHALL 为 source chain 中每个从 source 读取的 batch 创建 `chain.batch` 子 span（parent 为 chain.run），属性含 `rows`（batch 行数）和 `task`（链入口任务 id）。span SHALL 覆盖从 batch 进入 pipeline 到发送 downstream 的全程。关闭追踪时不产生任何额外开销。
+
+#### Scenario: batch span 包含 rows 和 task 属性
+
+- **WHEN** source chain 读取一个 10 行的 batch
+- **THEN** 导出的 chain.batch span 包含 `rows=10` 和 `task=<入口任务id>` 属性
+
+#### Scenario: 关闭追踪时零开销
+
+- **WHEN** OTel tracing 未启用
+- **THEN** batch 处理路径无 span 创建开销（tracing subscriber 丢弃 span）
+
+### Requirement: wire format span 评审级设计文档
+
+SHALL 产出评审级设计文档，覆盖 batch 级 span 切面、worker pool 上下文传播、跨节点 trace 传播的架构设计和实现计划。
+
+#### Scenario: 设计文档覆盖全部架构维度
+
+- **WHEN** 查阅 wire format span 设计文档
+- **THEN** 包含 batch span 切面、pool 传播方案、跨节点传播方案、性能评估、实施计划

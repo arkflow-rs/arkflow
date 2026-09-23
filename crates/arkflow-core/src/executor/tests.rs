@@ -4753,18 +4753,41 @@ async fn downstream_processing_failure_keeps_upstream_branch_pending() {
     downstream.shutdown();
 }
 
+/// Process-wide OTel test plumbing: `set_global_default` wins exactly once
+/// per process, so every span test must share one exporter and provider.
+/// Tests isolate themselves by filtering on unique task markers, not by
+/// exporter identity. A `OnceLock` guarantees the first span test to run
+/// installs the layer and every test observes the same finished spans.
+fn span_test_tracing()
+-> (
+    &'static opentelemetry_sdk::trace::InMemorySpanExporter,
+    &'static opentelemetry_sdk::trace::SdkTracerProvider,
+) {
+    use opentelemetry::trace::TracerProvider as _;
+    use std::sync::OnceLock;
+    static TRACING: OnceLock<(
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    )> = OnceLock::new();
+    let (exporter, provider) = TRACING.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("executor-span-test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(otel_layer),
+        );
+        (exporter, provider)
+    });
+    (exporter, provider)
+}
+
 #[tokio::test]
 async fn job_and_chain_spans_are_exported_with_parent_links() {
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let exporter =
-        opentelemetry_sdk::trace::InMemorySpanExporter::default();
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let tracer = provider.tracer("executor-span-test");
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let (exporter, provider) = span_test_tracing();
 
     // Unique operator id: the global OTel subscriber sees spans from
     // concurrently running executor tests in this binary, so assertions
@@ -4783,12 +4806,6 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
     let graph = ExecutionGraphBuilder::default()
         .build(&plan, &adapter, &resource())
         .unwrap();
-
-    // This test binary has no other global subscriber; installing the OTel
-    // subscriber globally covers the spawned chain tasks too.
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::registry().with(otel_layer),
-    );
 
     run_graph(graph, CancellationToken::new()).await.unwrap();
     provider.force_flush().unwrap();
@@ -4893,4 +4910,132 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
     assert!(tasks.contains(&"source-0".to_string()), "{tasks:?}");
     assert!(tasks.contains(&"span-op-7351-0".to_string()), "{tasks:?}");
     assert!(tasks.contains(&"sink-0".to_string()), "{tasks:?}");
+}
+
+#[tokio::test]
+async fn batch_span_carries_rows_and_task_with_chain_parent() {
+    let (exporter, provider) = span_test_tracing();
+
+    // Unique operator id: the global OTel subscriber sees spans from
+    // concurrently running executor tests in this binary, so assertions
+    // must filter by a marker unique to this test's graph.
+    let operator = "span-batch-7352";
+    let spec = spec(
+        vec![map_operator(operator)],
+        vec![edge("source", operator), edge(operator, "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let rows: Vec<(i64, String)> = (0..10).map(|i| (i, format!("r{i}"))).collect();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![rows])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let task_id = format!("{operator}-0");
+
+    let chain_run = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .expect("chain.run span for the operator chain")
+        .span_context
+        .span_id();
+
+    let batch_spans: Vec<_> = finished
+        .iter()
+        .filter(|span| {
+            span.name.as_ref() == "chain.batch"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .collect();
+    assert_eq!(batch_spans.len(), 1, "one batch → one chain.batch span");
+    let batch = batch_spans[0];
+    assert_eq!(
+        batch.parent_span_id, chain_run,
+        "chain.batch must be a child of chain.run"
+    );
+    let rows_attr = batch
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "rows")
+        .expect("rows attribute");
+    let rows_value = match &rows_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        opentelemetry::Value::String(value) => {
+            let text: String = value.clone().into();
+            text.parse::<i64>()
+                .unwrap_or_else(|_| panic!("rows attribute not numeric: {text}"))
+        }
+        other => panic!("unexpected rows attribute: {other:?}"),
+    };
+    assert_eq!(rows_value, 10, "rows attribute must be the batch row count");
+}
+
+#[tokio::test]
+async fn operator_failure_is_recorded_as_chain_batch_event() {
+    let (exporter, provider) = span_test_tracing();
+
+    let operator = "span-batch-fail-7353";
+    let spec = spec(
+        vec![map_operator(operator)],
+        vec![edge("source", operator), edge(operator, "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(FailingProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    // The failure has no error-output route, so the job fails — but the
+    // batch span still closes with the operator failure event attached.
+    let result = run_graph(graph, CancellationToken::new()).await;
+    assert!(result.is_err(), "failing operator must fail the job");
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let task_id = format!("{operator}-0");
+    let batch = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.batch"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .expect("chain.batch span exported even when the operator fails");
+
+    let event = batch
+        .events
+        .iter()
+        .find(|event| event.name == "operator processing failed; routing to error outputs")
+        .expect("operator failure event on the batch span");
+    let operator_attr = event
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "operator")
+        .expect("operator attribute on the failure event");
+    assert_eq!(operator_attr.value.as_str(), task_id);
 }

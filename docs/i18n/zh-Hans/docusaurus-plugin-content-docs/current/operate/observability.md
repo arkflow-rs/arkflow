@@ -133,10 +133,13 @@ v1 的 span 模型是每次 Job 执行的生命周期骨架:
 - `job.run` —— 一次图执行的根 span,带 `chains` 属性(链数)。
 - `chain.run` —— 每条链一个子 span(属性 `task`,链的入口任务 id),
   覆盖从启动到资源关闭的全程。
+- `chain.batch` —— `chain.run` 的子 span,链处理的每个批次一个
+  (属性 `rows` 即批行数,`task` 即链入口任务 id)。批次内 operator
+  失败会作为事件记录在该 span 上,带失败 `operator` id。
 
-已知的 v1 边界:没有 per-batch 或 per-connector span(worker 池的上下文
-传播是后续工作),跨节点不传播 trace 上下文——每个进程为其运行的 Job
-各自作为 trace 根。导出器故障绝不影响数据面。
+已知的 v1 边界:没有 worker 池 span(池的上下文传播是后续工作),
+跨节点不传播 trace 上下文——每个进程为其运行的 Job 各自作为 trace 根。
+导出器故障绝不影响数据面。
 
 ## 面向仪表盘的运维状态
 

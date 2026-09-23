@@ -2396,25 +2396,42 @@ async fn dispatch_data(
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = match process_chain(chain, batch, ack, metrics).await {
-        Ok(outputs) => flush_outputs(chain, outputs).await,
-        Err(ProcessChainError::Processor(failure)) => {
-            match chain.error_outputs.get(&failure.failed_task_id) {
-                None => Err(abort_processor_failure(failure).await),
-                Some(targets) => {
-                    let failure_message = failure.error.to_string();
-                    route_processor_failure(targets, failure)
-                        .await
-                        .map_err(|route_error| {
-                            Error::Process(format!(
-                                "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
-                            ))
-                        })
+    // Batch-level trace slice covering processing through downstream flush.
+    // `Instrument` keeps the span entered only while this dispatch polls; with
+    // tracing disabled the callsite is off and the span is never created.
+    let rows = batch.len();
+    let result = async {
+        match process_chain(chain, batch, ack, metrics).await {
+            Ok(outputs) => flush_outputs(chain, outputs).await,
+            Err(ProcessChainError::Processor(failure)) => {
+                tracing::info!(
+                    operator = %failure.failed_task_id,
+                    error = %failure.error,
+                    "operator processing failed; routing to error outputs"
+                );
+                match chain.error_outputs.get(&failure.failed_task_id) {
+                    None => Err(abort_processor_failure(failure).await),
+                    Some(targets) => {
+                        let failure_message = failure.error.to_string();
+                        route_processor_failure(targets, failure)
+                            .await
+                            .map_err(|route_error| {
+                                Error::Process(format!(
+                                    "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
+                                ))
+                            })
+                    }
                 }
             }
+            Err(ProcessChainError::Fatal(failure)) => Err(abort_fatal_failure(failure).await),
         }
-        Err(ProcessChainError::Fatal(failure)) => Err(abort_fatal_failure(failure).await),
-    };
+    }
+    .instrument(tracing::info_span!(
+        "chain.batch",
+        rows,
+        task = chain.entry_task_id(),
+    ))
+    .await;
     if let Some(chain_metrics) = &chain_metrics {
         chain_metrics
             .in_flight
