@@ -740,6 +740,7 @@ mod tests {
     }
 
     /// A full mock IdP: discovery + token + jwks endpoints, plus minting.
+    #[allow(dead_code)]
     struct MockIdp {
         addr: std::net::SocketAddr,
         jwks_url: String,

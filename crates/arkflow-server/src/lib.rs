@@ -2873,8 +2873,7 @@ pub(crate) async fn hub_oidc_callback(
     let Some(supplied_state) = params.get("state") else {
         return unauthorized();
     };
-    use subtle::ConstantTimeEq;
-    if !bool::from(
+        if !bool::from(
         expected_state.as_bytes().ct_eq(supplied_state.as_bytes()),
     ) {
         return unauthorized();

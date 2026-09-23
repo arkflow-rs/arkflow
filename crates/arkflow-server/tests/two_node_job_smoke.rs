@@ -186,7 +186,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let hub_cancel = CancellationToken::new();
     let server_hub = hub.clone();
     let server_cancel = hub_cancel.clone();
-    let mut hub_task = tokio::spawn(async move {
+    let hub_task = tokio::spawn(async move {
         axum::serve(
             listener,
             hub_router(server_hub, &ServerConfig::default()).into_make_service(),
@@ -197,7 +197,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let reconcile_cancel = CancellationToken::new();
     let reconcile_hub = hub.clone();
     let reconcile_stop = reconcile_cancel.clone();
-    let mut reconcile_task = tokio::spawn(async move {
+    let reconcile_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
@@ -448,7 +448,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let hub_cancel = CancellationToken::new();
     let server_hub = hub.clone();
     let server_cancel = hub_cancel.clone();
-    let mut hub_task = tokio::spawn(async move {
+    let hub_task = tokio::spawn(async move {
         axum::serve(
             listener,
             hub_router(server_hub, &ServerConfig::default()).into_make_service(),
@@ -459,7 +459,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let reconcile_cancel = CancellationToken::new();
     let reconcile_hub = hub.clone();
     let reconcile_stop = reconcile_cancel.clone();
-    let mut reconcile_task = tokio::spawn(async move {
+    let reconcile_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {

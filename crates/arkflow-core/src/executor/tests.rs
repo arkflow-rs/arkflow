@@ -4836,7 +4836,7 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
     assert_eq!(chains_value, 3, "3 chains in this graph");
 
     // Every chain.run must be a child of the job.run span.
-    let job_span_id = job.span_context.span_id();
+    let _job_span_id = job.span_context.span_id();
     // Contamination-proof: find OUR chain span by the unique task marker,
     // then get the parent job span, then find all chain.run siblings.
     let op_chain = finished

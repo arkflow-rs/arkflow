@@ -169,7 +169,7 @@ async fn run_graph_inner(
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
     sources_preconnected: bool,
-    mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
     // Root span for this graph execution. The future is instrumented (never
     // enter-guarded across await points), so every span and event created
