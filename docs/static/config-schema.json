@@ -1023,6 +1023,28 @@
               "type": "integer",
               "minimum": 1,
               "description": "Keep-alive interval in seconds."
+            },
+            "tls": {
+              "type": "object",
+              "description": "TLS transport configuration.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "ca": {
+                  "type": "string",
+                  "description": "CA certificate file path."
+                },
+                "client_cert": {
+                  "type": "string",
+                  "description": "Client certificate file (mTLS)."
+                },
+                "client_key": {
+                  "type": "string",
+                  "description": "Client private key file (mTLS)."
+                }
+              }
             }
           },
           "required": [
@@ -2809,6 +2831,28 @@
               "type": "boolean",
               "default": false,
               "description": "Whether to retain the message on the broker."
+            },
+            "tls": {
+              "type": "object",
+              "description": "TLS transport configuration.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "ca": {
+                  "type": "string",
+                  "description": "CA certificate file path."
+                },
+                "client_cert": {
+                  "type": "string",
+                  "description": "Client certificate file (mTLS)."
+                },
+                "client_key": {
+                  "type": "string",
+                  "description": "Client private key file (mTLS)."
+                }
+              }
             }
           },
           "required": [
