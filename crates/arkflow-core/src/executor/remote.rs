@@ -2433,9 +2433,10 @@ async fn pump_edge(
         }
     };
     let _ = writer.flush().await;
-    if result.is_err() {
-        pending.abort_all();
-    }
+    // Abort pendings on every exit path: once the pump is gone, no receipts
+    // can ever arrive for them, so leaving them alive would leak source acks
+    // indefinitely.
+    pending.abort_all();
     result
 }
 
