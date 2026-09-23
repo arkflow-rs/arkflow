@@ -34,3 +34,11 @@ NATS input 与 output SHALL 支持 `tls://` 连接 URL scheme（async-nat s 连�
 - **WHEN** 配置 `url: "tls://nats.example.com:4422"`
 - **THEN** 连接经 async-nats 连接器以 TLS 协商建立（原生支持，无组件级开关）
 
+### Requirement: pulsar TLS 传输文档
+
+pulsar 组件文档 SHALL 说明 `pulsar+ssl://` URL scheme 的 TLS 加密传输能力，使运维人员能够了解加密连接的启用方式。
+
+#### Scenario: pulsar ssl 文档存在
+
+- **WHEN** 查阅 pulsar 组件文档
+- **THEN** 包含 `pulsar+ssl://` URL scheme 的 TLS 说明
