@@ -47,29 +47,38 @@ impl MqttTlsConfig {
         if !self.enabled {
             return Ok(());
         }
-        let transport = match (&self.ca, (&self.client_cert, &self.client_key)) {
-            (Some(ca), (Some(cert), Some(key))) => {
-                let ca = std::fs::read(ca)
-                    .map_err(|e| Error::Config(format!("mqtt tls: failed to read CA file: {e}")))?;
-                let cert = std::fs::read(cert)
-                    .map_err(|e| Error::Config(format!("mqtt tls: failed to read client cert: {e}")))?;
-                let key = std::fs::read(key)
-                    .map_err(|e| Error::Config(format!("mqtt tls: failed to read client key: {e}")))?;
-                Transport::tls_with_config(TlsConfiguration::Simple {
-                    ca,
-                    alpn: None,
-                    client_auth: Some((cert, key)),
-                })
+        // An incomplete client-cert/key pair is a configuration error, not a
+        // silent downgrade to server-only TLS.
+        match (&self.client_cert, &self.client_key) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::Config(
+                    "mqtt tls: client_cert and client_key must be configured together"
+                        .to_string(),
+                ));
             }
-            (Some(ca), _) => {
-                let ca = std::fs::read(ca)
-                    .map_err(|e| Error::Config(format!("mqtt tls: failed to read CA file: {e}")))?;
-                Transport::tls_with_config(TlsConfiguration::Simple {
-                    ca,
-                    alpn: None,
-                    client_auth: None,
-                })
-            }
+            _ => {}
+        }
+        let load = |path: &str| -> Result<Vec<u8>, Error> {
+            std::fs::read(path).map_err(|e| {
+                Error::Config(format!("mqtt tls: failed to read file '{path}': {e}"))
+            })
+        };
+        let transport = match (&self.ca, &self.client_cert, &self.client_key) {
+            (Some(ca), Some(cert), Some(key)) => Transport::tls_with_config(TlsConfiguration::Simple {
+                ca: load(ca)?,
+                alpn: None,
+                client_auth: Some((load(cert)?, load(key)?)),
+            }),
+            (Some(ca), None, None) => Transport::tls_with_config(TlsConfiguration::Simple {
+                ca: load(ca)?,
+                alpn: None,
+                client_auth: None,
+            }),
+            (None, Some(cert), Some(key)) => Transport::tls_with_config(TlsConfiguration::Simple {
+                ca: load(cert)?,
+                alpn: None,
+                client_auth: Some((load(cert)?, load(key)?)),
+            }),
             _ => Transport::tls_with_default_config(),
         };
         options.set_transport(transport);

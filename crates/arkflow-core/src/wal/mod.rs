@@ -284,7 +284,7 @@ struct PendingWalAck {
 /// How long a parked WAL acknowledgement keeps waiting for an earlier
 /// in-flight delivery to settle after a close request fires, before the
 /// pending-error path takes over (recovery replays unsettled entries).
-const WAL_CLOSE_DRAIN: Duration = Duration::from_secs(15);
+const WAL_CLOSE_DRAIN: Duration = Duration::from_secs(30);
 
 impl Wal {
     /// Open (or create) a WAL.

@@ -881,7 +881,10 @@ mod wal_lifecycle_tests {
         });
         entered.notified().await;
 
-        // Sequence 2 parks behind the in-flight sequence 1.
+        // Sequence 2 parks behind the in-flight sequence 1. The 150ms sleep
+        // lets sequence 2 reach Wal::acknowledge's parked branch before the
+        // close fires; the drain window (15s) is far longer, so B stays
+        // parked until A settles.
         let wal_for_b = wal.clone();
         let task_b = tokio::spawn(async move {
             crate::wal::WalAck::new(wal_for_b, seq2, Arc::new(crate::input::NoopAck))
@@ -889,7 +892,7 @@ mod wal_lifecycle_tests {
                 .await
                 .is_ok()
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Close fires while sequence 2 is parked: the drain window opens.
         let close_task = tokio::spawn(async move { wal_for_close.close().await });
