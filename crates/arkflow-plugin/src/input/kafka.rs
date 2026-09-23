@@ -30,7 +30,7 @@ use crate::kafka_security::KafkaSecurityConfig;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::{Message as KafkaMessage, Timestamp};
+use rdkafka::message::{Headers as KafkaHeaders, Message as KafkaMessage, Timestamp};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -465,9 +465,23 @@ impl Input for KafkaInput {
                     let mut ext_metadata = HashMap::new();
                     ext_metadata.insert("topic".to_string(), topic);
 
-                    // Add headers if present
-                    // Note: rdkafka Headers API varies by version, skipping for now
-                    // TODO: Implement headers extraction based on rdkafka version
+                    // Extract Kafka message headers into extended metadata.
+                    // Each header key becomes `header_<key>` in the metadata
+                    // map, preserving the original key inside the value's key
+                    // namespace for downstream routing/filtering.
+                    if let Some(headers) = kafka_message.headers() {
+                        for i in 0..headers.count() {
+                            let header = headers.get(i);
+                            let value = header
+                                .value
+                                .and_then(|v| std::str::from_utf8(v).ok())
+                                .unwrap_or("");
+                            ext_metadata.insert(
+                                format!("header_{}", header.key),
+                                value.to_string(),
+                            );
+                        }
+                    }
 
                     record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
 
