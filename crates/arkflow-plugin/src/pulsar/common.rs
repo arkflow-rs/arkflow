@@ -352,4 +352,15 @@ mod tls_url_tests {
     fn invalid_scheme_is_rejected() {
         assert!(PulsarConfigValidator::validate_service_url("http://broker.example.com:6650").is_err());
     }
+
+    #[test]
+    fn ssl_prefix_without_host_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar+ssl://").is_err());
+    }
+
+    #[test]
+    fn empty_url_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("").is_err());
+    }
 }
+

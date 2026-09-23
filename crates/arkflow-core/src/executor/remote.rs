@@ -2447,7 +2447,7 @@ mod tests {
     /// several seconds; these waits only observe conditions that normally
     /// complete within a tick (~100ms), so a generous ceiling costs nothing
     /// when everything is healthy and keeps loaded CI stable.
-    const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
     use super::*;
     use crate::input::Ack as _;

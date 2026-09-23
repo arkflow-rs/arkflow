@@ -4002,7 +4002,7 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                     // in-flight window: under a loaded scheduler both sleeps
                     // stretch together, so this margin is what guarantees an
                     // idle window in which ticks can actually fire.
-                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    tokio::time::sleep(Duration::from_millis(2000)).await;
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -4016,7 +4016,7 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         }
     }
     let processor = Arc::new(TickMarkerProcessor {
-        first_process_delay: Duration::from_millis(400),
+        first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
     });
     let output = Arc::new(CollectOutput::default());

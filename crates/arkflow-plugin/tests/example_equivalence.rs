@@ -41,7 +41,7 @@ async fn run_example_on_kernel(path: &str, wal_path: &std::path::Path) -> usize 
             // WAL-durability example (per-entry fsync of 1000 entries) is
             // disk-bound and has been observed to exceed 60s when the whole
             // suite competes for disk and CPU, so budget accordingly.
-            Duration::from_secs(180),
+            Duration::from_secs(300),
             run_job(&spec, &adapter, &mut resource, CancellationToken::new()),
         )
         .await
