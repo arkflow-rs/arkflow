@@ -3960,31 +3960,53 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
 struct TickMarkerProcessor {
     first_process_delay: Duration,
     delayed: AtomicUsize,
-    /// Released when the first delivery has finished processing: the input
-    /// holds back the second batch until then, so the idle window in which
-    /// ticks fire is deterministic instead of wall-clock dependent.
+    started: std::sync::atomic::AtomicBool,
+    tick_seen: std::sync::atomic::AtomicBool,
+    /// Released once a tick has actually reached the chain after the first
+    /// delivery: the input then delivers the second batch, so the tick vs
+    /// data ordering exercised here is driven by engine sequencing rather
+    /// than wall-clock margins.
     gate: Arc<PublishGate>,
 }
 
 #[async_trait]
 impl Processor for TickMarkerProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        let first = self.delayed.fetch_add(1, Ordering::SeqCst) == 0;
-        if first {
+        if self.delayed.fetch_add(1, Ordering::SeqCst) == 0 {
             // Keep the delivery in flight long enough for idle ticks to fire
             // against the pool fence while it is being processed.
+            self.started.store(true, Ordering::SeqCst);
             tokio::time::sleep(self.first_process_delay).await;
-            self.gate.release().await;
         }
         Ok(ProcessResult::Single(batch))
     }
     async fn on_tick(&self) -> Result<ProcessResult, Error> {
-        Ok(ProcessResult::Single(Arc::new(MessageBatch::new_arrow(
-            int64_batch(vec![(-1, "tick".into())]),
-        ))))
+        if !self.started.load(Ordering::SeqCst) {
+            // Ticks before the first delivery are pure startup noise: suppress
+            // them so the leading-tick assertion stays load independent.
+            return Ok(ProcessResult::None);
+        }
+        // The first in-window tick output is held by the pool fence until the
+        // data publishes; the second one releases the input's second batch.
+        if !self.tick_seen.swap(true, Ordering::SeqCst) {
+            return Ok(self.tick_batch());
+        }
+        if !self.gate.released().await {
+            self.gate.release().await;
+        }
+        Ok(self.tick_batch())
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+impl TickMarkerProcessor {
+    fn tick_batch(&self) -> ProcessResult {
+        ProcessResult::Single(Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+            -1,
+            "tick".into(),
+        )]))))
     }
 }
 
@@ -3996,6 +4018,9 @@ struct PublishGate {
 }
 
 impl PublishGate {
+    async fn released(&self) -> bool {
+        *self.released.lock().await
+    }
     async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
@@ -4053,6 +4078,8 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     let processor = Arc::new(TickMarkerProcessor {
         first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
+        started: std::sync::atomic::AtomicBool::new(false),
+        tick_seen: std::sync::atomic::AtomicBool::new(false),
         gate: second_batch_gate.clone(),
     });
     let output = Arc::new(CollectOutput::default());
