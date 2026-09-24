@@ -47,3 +47,7 @@
 ### 进度 2026-09-24（续）
 
 - jobs 组（upsert_job / update_job_with_expected_generation / get_job / list_jobs）已实现并 live 验证：`ARKFLOW_TEST_POSTGRES_URL` 门控冒烟测试 `pg_store::live_tests::jobs_group_smoke` 覆盖 open→DDL→generation 递增→读取→列表→CAS 成功→过期 CAS 冲突。每方法手写时长约 5 分钟；余 39 方法按同法推进。要点：u64 绑定必须 `as i64`，解码 `row.try_get::<i64, usize>(N)? as u64`（sqlx PG 不实现 u64 编解码）；空参数桩无 `let _ = (...)` 行；桩尾三括号。
+### 进度 2026-09-24（续 2）
+
+- nodes/streams 组 9 方法全部实现（upsert_node/reset_observed_cursors/wake_node/get_node_maintenance/set_node_maintenance/set_desired 含幂等键与 supersede/get_desired/record_observed 含收敛与 fence/operational_aggregates）；intents 组 get_intent 已实现。live 冒烟扩展至 set_desired→幂等重放→收敛→维护→聚合，全绿。
+- 剩余 intents 组：list_intents、claim_attempt（含 attempt 创建）、mark_attempt_dispatched、complete_attempt（retry/supersede 分支）、expire_attempts、prune_terminal_attempts、recover_reconciliation；以及 outbox/events/audit/ops/rollouts/config 组共 ~39-5=39 个中的 33 个。sqlx 规则已成熟（u64 cast、try_get 泛型序、三括号）。

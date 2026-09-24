@@ -5,6 +5,7 @@
 //! storage actor still serialises commands, so ordering semantics match the
 //! SQLite backend exactly.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use sqlx::postgres::{PgPoolOptions, PgRow};
@@ -286,6 +287,70 @@ async fn pg_job_generation(conn: &mut sqlx::PgConnection, job_id: &str) -> Resul
 }
 
 
+
+#[allow(clippy::type_complexity)]
+fn pg_row_intent_with_observed(
+    row: &PgRow,
+) -> Result<(IntentRecord, Option<String>, Option<String>), StorageError> {
+    let record = IntentRecord {
+        intent_id: row.try_get(0)?,
+        node_id: row.try_get(1)?,
+        stream_id: row.try_get(2)?,
+        generation: row.try_get::<i64, usize>(3)? as u64,
+        state: row.try_get(4)?,
+        desired_state: row.try_get(5)?,
+        config_version_id: row.try_get(6)?,
+        action_id: row.try_get(7)?,
+        convergence_state: row.try_get(8)?,
+        retry_count: row.try_get::<i64, usize>(11)? as u32,
+        next_retry_at_ms: row.try_get::<Option<i64>, usize>(12)?.map(|v| v as u64),
+        failure_class: row.try_get(13)?,
+        superseded_by_intent_id: row.try_get(14)?,
+        superseded_generation: row.try_get::<Option<i64>, usize>(19)?.map(|v| v as u64),
+        created_at_ms: row.try_get::<i64, usize>(15)? as u64,
+        updated_at_ms: row.try_get::<i64, usize>(16)? as u64,
+        observed_generation: row.try_get::<Option<i64>, usize>(17)?.map(|v| v as u64),
+        observed_state: row.try_get(18)?,
+    };
+    Ok((record, row.try_get(9)?, row.try_get(10)?))
+}
+
+
+
+async fn pg_get_intent(conn: &mut sqlx::PgConnection, intent_id: &str) -> Result<Option<IntentRecord>, StorageError> {
+    let row = sqlx::query(
+        "SELECT i.intent_id, i.node_id, i.stream_id, i.generation, i.state, i.desired_state, i.config_version_id, i.action_id, i.convergence_state, i.retry_count, i.next_retry_at_ms, i.last_failure_class, i.superseded_by_intent_id, i.created_at_ms, i.updated_at_ms, o.observed_generation, o.observed_state, (SELECT generation FROM cp_intents s WHERE s.intent_id = i.superseded_by_intent_id) FROM cp_intents i LEFT JOIN cp_stream_observed o ON o.node_id = i.node_id AND o.stream_id = i.stream_id WHERE i.intent_id = $1",
+    )
+    .bind(intent_id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row
+        .map(|row| -> Result<IntentRecord, StorageError> {
+            Ok(IntentRecord {
+                intent_id: row.try_get(0)?,
+                node_id: row.try_get(1)?,
+                stream_id: row.try_get(2)?,
+                generation: row.try_get::<i64, usize>(3)? as u64,
+                state: row.try_get(4)?,
+                desired_state: row.try_get(5)?,
+                config_version_id: row.try_get(6)?,
+                action_id: row.try_get(7)?,
+                convergence_state: row.try_get(8)?,
+                retry_count: row.try_get::<i64, usize>(9)? as u32,
+                next_retry_at_ms: row.try_get::<Option<i64>, usize>(10)?.map(|v| v as u64),
+                failure_class: row.try_get(11)?,
+                superseded_by_intent_id: row.try_get(12)?,
+                superseded_generation: row.try_get::<Option<i64>, usize>(17)?.map(|v| v as u64),
+                created_at_ms: row.try_get::<i64, usize>(13)? as u64,
+                updated_at_ms: row.try_get::<i64, usize>(14)? as u64,
+                observed_generation: row.try_get::<Option<i64>, usize>(15)?.map(|v| v as u64),
+                observed_state: row.try_get(16)?,
+            })
+        })
+        .transpose()?)
+}
+
+
 impl PgStore {
     /// Connects, probes the server and creates the schema idempotently.
     /// A failure here fails Hub startup fast: a control plane without its
@@ -304,45 +369,289 @@ impl PgStore {
 
 
     pub async fn set_desired(&self, mutation: DesiredMutation) -> Result<IntentRecord, StorageError> {
-        let _ = (&mutation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: set_desired is not implemented yet"
-        )))
+        let now = crate::storage::now_ms();
+        let mut tx = self.pool.begin().await?;
+        let intent_type = mutation.intent_type.as_deref().unwrap_or_else(|| {
+            if mutation.action_id.is_some() { "restart" } else { "set_state" }
+        });
+        if let Some(idempotency_key) = mutation.idempotency_key.as_deref() {
+            let existing = sqlx::query(
+                "SELECT i.intent_id, i.node_id, i.stream_id, i.generation, i.state, i.desired_state, i.config_version_id, i.action_id, i.convergence_state, i.intent_type, i.payload_json, i.retry_count, i.next_retry_at_ms, i.last_failure_class, i.superseded_by_intent_id, i.created_at_ms, i.updated_at_ms, o.observed_generation, o.observed_state, (SELECT generation FROM cp_intents s WHERE s.intent_id = i.superseded_by_intent_id) FROM cp_intents i LEFT JOIN cp_stream_observed o ON o.node_id = i.node_id AND o.stream_id = i.stream_id WHERE i.node_id = $1 AND i.stream_id = $2 AND i.idempotency_key = $3",
+            )
+            .bind(&mutation.node_id)
+            .bind(&mutation.stream_id)
+            .bind(idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| pg_row_intent_with_observed(&row))
+            .transpose()?;
+            if let Some((existing, stored_intent_type, payload_json)) = existing {
+                let requested_intent_type = Some(intent_type.to_owned());
+                if existing.desired_state != mutation.desired_state
+                    || existing.config_version_id != mutation.config_version_id
+                    || existing.action_id != mutation.action_id
+                    || stored_intent_type != requested_intent_type
+                    || payload_json != mutation.payload_json
+                {
+                    return Err(StorageError::IdempotencyKeyReused);
+                }
+                tx.commit().await?;
+                return Ok(existing);
+            }
+        }
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM cp_stream_desired WHERE node_id = $1 AND stream_id = $2",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let current = current.unwrap_or(0) as u64;
+        if let Some(expected) = mutation.expected_generation {
+            if expected != current {
+                return Err(StorageError::GenerationConflict { expected, current });
+            }
+        }
+        let generation = current + 1;
+        let intent_id = format!("intent-{generation}-{}", crate::storage::NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        sqlx::query(
+            "INSERT INTO cp_stream_desired (node_id, stream_id, generation, desired_state, config_version_id, desired_action_id, updated_at_ms, updated_by, correlation_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT(node_id, stream_id) DO UPDATE SET generation = excluded.generation, desired_state = excluded.desired_state, config_version_id = excluded.config_version_id, desired_action_id = excluded.desired_action_id, updated_at_ms = excluded.updated_at_ms, updated_by = excluded.updated_by, correlation_id = excluded.correlation_id",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(generation as i64)
+        .bind(&mutation.desired_state)
+        .bind(&mutation.config_version_id)
+        .bind(&mutation.action_id)
+        .bind(now as i64)
+        .bind(&mutation.actor)
+        .bind(&mutation.correlation_id)
+        .execute(&mut *tx)
+        .await?;
+        if let (Some(config_version_id), Some(payload_json)) = (
+            mutation.config_version_id.as_deref(),
+            mutation.payload_json.as_deref(),
+        ) {
+            sqlx::query(
+                "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms, created_by, correlation_id) VALUES ($1, 'inline-json', $2, 'json', $3, $4, $5) ON CONFLICT DO NOTHING",
+            )
+            .bind(config_version_id)
+            .bind(payload_json)
+            .bind(now as i64)
+            .bind(&mutation.actor)
+            .bind(&mutation.correlation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO cp_intents (intent_id, node_id, stream_id, generation, intent_type, desired_state, config_version_id, action_id, payload_json, state, convergence_state, created_at_ms, updated_at_ms, actor, correlation_id, idempotency_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'accepted', 'pending', $10, $10, $11, $12, $13)",
+        )
+        .bind(&intent_id)
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(generation as i64)
+        .bind(intent_type)
+        .bind(&mutation.desired_state)
+        .bind(&mutation.config_version_id)
+        .bind(&mutation.action_id)
+        .bind(&mutation.payload_json)
+        .bind(now as i64)
+        .bind(&mutation.actor)
+        .bind(&mutation.correlation_id)
+        .bind(&mutation.idempotency_key)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE cp_intents SET state = 'superseded', convergence_state = 'pending', superseded_by_intent_id = $1, updated_at_ms = $2 WHERE node_id = $3 AND stream_id = $4 AND state IN ('accepted', 'converging', 'retrying') AND generation < $5",
+        )
+        .bind(&intent_id)
+        .bind(now as i64)
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(generation as i64)
+        .execute(&mut *tx)
+        .await?;
+        let event_key = format!("reconcile:{intent_id}:{generation}");
+        sqlx::query(
+            "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES ($1, 'reconcile_intent', $2, $3, $4, $5, $5)",
+        )
+        .bind(&event_key)
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(&intent_id)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO cp_events (node_id, stream_id, intent_id, event_type, outcome, generation, correlation_id, occurred_at_ms) VALUES ($1, $2, $3, 'intent_created', 'accepted', $4, $5, $6)",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(&intent_id)
+        .bind(generation as i64)
+        .bind(&mutation.correlation_id)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, occurred_at_ms) VALUES ($1, $2, 'stream', $3, $4, $5, $6, 'accepted', $7)",
+        )
+        .bind(&mutation.actor)
+        .bind(intent_type)
+        .bind(format!("{}:{}", mutation.node_id, mutation.stream_id))
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(&mutation.correlation_id)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(IntentRecord {
+            intent_id,
+            node_id: mutation.node_id,
+            stream_id: mutation.stream_id,
+            generation,
+            state: "accepted".into(),
+            desired_state: mutation.desired_state,
+            config_version_id: mutation.config_version_id,
+            action_id: mutation.action_id,
+            convergence_state: "pending".into(),
+            retry_count: 0,
+            next_retry_at_ms: None,
+            failure_class: None,
+            superseded_by_intent_id: None,
+            superseded_generation: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            observed_generation: None,
+            observed_state: None,
+        })
     }
 
     pub async fn upsert_node(&self, mutation: NodeMutation) -> Result<(), StorageError> {
-        let _ = (&mutation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: upsert_node is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_nodes (node_id, role, protocol_version, node_version, state, capabilities_json, boot_id, last_report_seq, last_seen_at_ms, lease_expires_at_ms, maintenance_state, maintenance_updated_at_ms, created_at_ms, updated_at_ms) VALUES ($1, 'compute', 'v1', $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'active'), $10, $7, $7) ON CONFLICT(node_id) DO UPDATE SET node_version = excluded.node_version, state = excluded.state, capabilities_json = excluded.capabilities_json, boot_id = excluded.boot_id, last_report_seq = excluded.last_report_seq, last_seen_at_ms = excluded.last_seen_at_ms, lease_expires_at_ms = excluded.lease_expires_at_ms, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.version)
+        .bind(&mutation.state)
+        .bind(&mutation.capabilities_json)
+        .bind(&mutation.boot_id)
+        .bind(mutation.report_seq.map(|value| value as i64))
+        .bind(mutation.last_seen_at_ms as i64)
+        .bind(mutation.lease_expires_at_ms as i64)
+        .bind(&mutation.maintenance_state)
+        .bind(mutation.maintenance_updated_at_ms.map(|value| value as i64))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
-        let _ = (&node_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: reset_observed_cursors is not implemented yet"
-        )))
+        sqlx::query("UPDATE cp_stream_observed SET report_seq = 0 WHERE node_id = $1")
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_node_maintenance(&self, mutation: NodeMaintenanceMutation, now_ms: u64) -> Result<bool, StorageError> {
-        let _ = (&mutation, &now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: set_node_maintenance is not implemented yet"
-        )))
+        let state = mutation.state.as_str();
+        if !matches!(state, "active" | "draining" | "maintenance") {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<(String,)> = sqlx::query_as(
+            "SELECT COALESCE(maintenance_state, 'active') FROM cp_nodes WHERE node_id = $1",
+        )
+        .bind(&mutation.node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(previous) = previous else { return Ok(false) };
+        let previous = previous.0;
+        if previous != state {
+            sqlx::query(
+                "UPDATE cp_nodes SET maintenance_state = $1, maintenance_updated_at_ms = $2, updated_at_ms = $2 WHERE node_id = $3",
+            )
+            .bind(state)
+            .bind(now_ms as i64)
+            .bind(&mutation.node_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ($1, 'node_maintenance_changed', 'succeeded', $2, $3, $4, $5)",
+            )
+            .bind(&mutation.node_id)
+            .bind(format!("{previous}->{state}"))
+            .bind(&mutation.correlation_id)
+            .bind(&mutation.actor)
+            .bind(now_ms as i64)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES ($1, 'node.maintenance', 'node', $2, $2, $3, 'accepted', $4, $5)",
+            )
+            .bind(&mutation.actor)
+            .bind(&mutation.node_id)
+            .bind(&mutation.correlation_id)
+            .bind(format!("{previous}->{state}"))
+            .bind(now_ms as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
-        let _ = (&node_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_node_maintenance is not implemented yet"
-        )))
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT COALESCE(maintenance_state, 'active') FROM cp_nodes WHERE node_id = $1")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(state,)| state))
     }
 
     pub async fn operational_aggregates(&self, now_ms: u64) -> Result<OperationalAggregates, StorageError> {
-        let _ = (&now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: operational_aggregates is not implemented yet"
-        )))
+        async fn grouped(
+            pool: &sqlx::PgPool,
+            sql: &str,
+        ) -> Result<Vec<(String, u64)>, StorageError> {
+            let rows: Vec<(String, i64)> = sqlx::query_as(sql).fetch_all(pool).await?;
+            Ok(rows.into_iter().map(|(name, count)| (name, count as u64)).collect())
+        }
+        async fn scalar(pool: &sqlx::PgPool, sql: &str) -> Result<u64, StorageError> {
+            let (count,): (i64,) = sqlx::query_as(sql).fetch_one(pool).await?;
+            Ok(count as u64)
+        }
+        let oldest: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT MIN(created_at_ms) FROM cp_outbox WHERE processed_at_ms IS NULL",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let oldest = oldest.and_then(|(created,)| created);
+        let stale_nodes: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM cp_nodes WHERE state = 'stale' OR lease_expires_at_ms <= $1",
+        )
+        .bind(now_ms as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(OperationalAggregates {
+            node_states: grouped(&self.pool, "SELECT state, COUNT(*) FROM cp_nodes GROUP BY state").await?,
+            maintenance_states: grouped(&self.pool, "SELECT COALESCE(maintenance_state, 'active'), COUNT(*) FROM cp_nodes GROUP BY COALESCE(maintenance_state, 'active')").await?,
+            intent_states: grouped(&self.pool, "SELECT state, COUNT(*) FROM cp_intents GROUP BY state").await?,
+            convergence_states: grouped(&self.pool, "SELECT convergence_state, COUNT(*) FROM cp_intents GROUP BY convergence_state").await?,
+            attempt_states: grouped(&self.pool, "SELECT state, COUNT(*) FROM cp_attempts GROUP BY state").await?,
+            failure_classes: grouped(&self.pool, "SELECT COALESCE(last_failure_class, 'none'), COUNT(*) FROM cp_intents GROUP BY COALESCE(last_failure_class, 'none')").await?,
+            outbox_pending: scalar(&self.pool, "SELECT COUNT(*) FROM cp_outbox WHERE processed_at_ms IS NULL").await?,
+            outbox_claimed: scalar(&self.pool, "SELECT COUNT(*) FROM cp_outbox WHERE processed_at_ms IS NULL AND claimed_at_ms IS NOT NULL").await?,
+            stale_nodes: stale_nodes.0 as u64,
+            active_attempts: scalar(&self.pool, "SELECT COUNT(*) FROM cp_attempts WHERE state IN ('queued','dispatched','acknowledged','running')").await?,
+            non_terminal_intents: scalar(&self.pool, "SELECT COUNT(*) FROM cp_intents WHERE state IN ('accepted','converging','retrying')").await?,
+            oldest_pending_age_seconds: oldest
+                .map(|created| now_ms.saturating_sub(created as u64) / 1000),
+        })
     }
 
     pub async fn claim_outbox(&self, worker_id: &str, now_ms: u64) -> Result<Option<OutboxRecord>, StorageError> {
@@ -353,17 +662,33 @@ impl PgStore {
     }
 
     pub async fn get_desired(&self, node_id: &str, stream_id: &str) -> Result<Option<DesiredRecord>, StorageError> {
-        let _ = (&node_id, &stream_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_desired is not implemented yet"
-        )))
+        let row = sqlx::query(
+            "SELECT node_id, stream_id, generation, desired_state, config_version_id, desired_action_id, correlation_id FROM cp_stream_desired WHERE node_id = $1 AND stream_id = $2",
+        )
+        .bind(node_id)
+        .bind(stream_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|row| -> Result<DesiredRecord, StorageError> {
+                Ok(DesiredRecord {
+                    node_id: row.try_get(0)?,
+                    stream_id: row.try_get(1)?,
+                    generation: row.try_get::<i64, usize>(2)? as u64,
+                    desired_state: row.try_get(3)?,
+                    config_version_id: row.try_get(4)?,
+                    action_id: row.try_get(5)?,
+                    correlation_id: row.try_get(6)?,
+                })
+            })
+            .transpose()?)
     }
 
     pub async fn get_intent(&self, intent_id: &str) -> Result<Option<IntentRecord>, StorageError> {
-        let _ = (&intent_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_intent is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let intent = pg_get_intent(&mut tx, intent_id).await?;
+        tx.commit().await?;
+        Ok(intent)
     }
 
     pub async fn list_intents(&self, node_id: Option<&str>) -> Result<Vec<IntentRecord>, StorageError> {
@@ -381,10 +706,14 @@ impl PgStore {
     }
 
     pub async fn wake_node(&self, node_id: &str, now_ms: u64) -> Result<(), StorageError> {
-        let _ = (&node_id, &now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: wake_node is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT 'reconcile:register:' || i.intent_id, 'reconcile_intent', i.node_id, i.stream_id, i.intent_id, $1, $1 FROM cp_intents i WHERE i.node_id = $2 AND i.state IN ('accepted', 'converging', 'retrying') AND (i.last_failure_class IS NULL OR i.last_failure_class <> 'ambiguous') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL) ON CONFLICT DO NOTHING",
+        )
+        .bind(now_ms as i64)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError> {
@@ -465,10 +794,164 @@ impl PgStore {
     }
 
     pub async fn record_observed(&self, mutation: ObservedMutation) -> Result<(), StorageError> {
-        let _ = (&mutation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: record_observed is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let current: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT boot_id, COALESCE(report_seq, 0) FROM cp_stream_observed WHERE node_id = $1 AND stream_id = $2",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((boot_id, report_seq)) = current {
+            let report_seq = report_seq as u64;
+            match (boot_id.as_deref(), mutation.boot_id.as_deref()) {
+                // Same fencible session: the sequence cursor rejects replays.
+                (Some(stored), Some(incoming)) if stored == incoming => {
+                    if mutation.report_seq <= report_seq {
+                        return Ok(());
+                    }
+                }
+                // Boot-less agents report seq 0 forever: accept the report and
+                // let convergence run on its content.
+                (None, None) => {}
+                // Session identity changed: the incoming report supersedes.
+                _ => {}
+            }
+        }
+        let now = crate::storage::now_ms();
+        sqlx::query(
+            "INSERT INTO cp_stream_observed (node_id, stream_id, boot_id, report_seq, observed_generation, observed_state, applied_config_version, last_action_id, last_error_code, last_error_message, snapshot_json, observed_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT(node_id, stream_id) DO UPDATE SET boot_id = excluded.boot_id, report_seq = excluded.report_seq, observed_generation = excluded.observed_generation, observed_state = excluded.observed_state, applied_config_version = excluded.applied_config_version, last_action_id = excluded.last_action_id, last_error_code = excluded.last_error_code, last_error_message = excluded.last_error_message, snapshot_json = excluded.snapshot_json, observed_at_ms = excluded.observed_at_ms",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(&mutation.boot_id)
+        .bind(mutation.report_seq as i64)
+        .bind(mutation.observed_generation.map(|value| value as i64))
+        .bind(&mutation.observed_state)
+        .bind(&mutation.config_version_id)
+        .bind(&mutation.action_id)
+        .bind(&mutation.last_error_code)
+        .bind(&mutation.last_error_message)
+        .bind(&mutation.snapshot_json)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO cp_events (node_id, stream_id, event_type, outcome, message, generation, occurred_at_ms) VALUES ($1, $2, 'observed_report', $3, $4, $5, $6)",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .bind(&mutation.observed_state)
+        .bind(&mutation.last_error_message)
+        .bind(mutation.observed_generation.map(|value| value as i64))
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        let desired: Option<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT generation, desired_state, config_version_id, desired_action_id FROM cp_stream_desired WHERE node_id = $1 AND stream_id = $2",
+        )
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((generation, desired_state, desired_config, desired_action_id)) = desired {
+            let generation = generation as u64;
+            let config_matches = desired_config
+                .as_deref()
+                .is_none_or(|version| Some(version) == mutation.config_version_id.as_deref());
+            let action_matches = desired_action_id
+                .as_deref()
+                .is_none_or(|action_id| Some(action_id) == mutation.action_id.as_deref());
+            let affected_streams_converged = if mutation.stream_id == "__configuration__" {
+                let blockers: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM cp_stream_desired d LEFT JOIN cp_stream_observed o ON o.node_id = d.node_id AND o.stream_id = d.stream_id WHERE d.node_id = $1 AND d.stream_id <> '__configuration__' AND (o.stream_id IS NULL OR o.observed_generation <> d.generation OR o.observed_state <> d.desired_state OR o.applied_config_version IS NULL OR o.applied_config_version <> $2)",
+                )
+                .bind(&mutation.node_id)
+                .bind(&mutation.config_version_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                blockers.0 == 0
+            } else {
+                true
+            };
+            if mutation.observed_generation == Some(generation)
+                && desired_state == mutation.observed_state
+                && config_matches
+                && action_matches
+                && affected_streams_converged
+            {
+                sqlx::query(
+                    "UPDATE cp_intents SET state = 'converged', convergence_state = 'in_sync', converged_at_ms = $1, updated_at_ms = $1 WHERE node_id = $2 AND stream_id = $3 AND generation = $4 AND state IN ('accepted', 'converging', 'retrying')",
+                )
+                .bind(now as i64)
+                .bind(&mutation.node_id)
+                .bind(&mutation.stream_id)
+                .bind(generation as i64)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE cp_attempts SET state = 'succeeded', finished_at_ms = $1 WHERE node_id = $2 AND stream_id = $3 AND generation = $4 AND state IN ('queued', 'dispatched', 'acknowledged', 'running')",
+                )
+                .bind(now as i64)
+                .bind(&mutation.node_id)
+                .bind(&mutation.stream_id)
+                .bind(generation as i64)
+                .execute(&mut *tx)
+                .await?;
+                let intent_id: Option<(String,)> = sqlx::query_as(
+                    "SELECT intent_id FROM cp_intents WHERE node_id = $1 AND stream_id = $2 AND generation = $3 ORDER BY created_at_ms DESC LIMIT 1",
+                )
+                .bind(&mutation.node_id)
+                .bind(&mutation.stream_id)
+                .bind(generation as i64)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let intent_id = intent_id.map(|(id,)| id);
+                sqlx::query(
+                    "INSERT INTO cp_events (node_id, stream_id, intent_id, event_type, outcome, generation, occurred_at_ms) VALUES ($1, $2, $3, 'intent_converged', 'converged', $4, $5)",
+                )
+                .bind(&mutation.node_id)
+                .bind(&mutation.stream_id)
+                .bind(&intent_id)
+                .bind(generation as i64)
+                .bind(now as i64)
+                .execute(&mut *tx)
+                .await?;
+            } else if mutation.stream_id == "__configuration__"
+                && mutation.observed_generation == Some(generation)
+                && desired_state == mutation.observed_state
+                && config_matches
+                && action_matches
+            {
+                sqlx::query(
+                    "UPDATE cp_intents SET state = 'converging', convergence_state = 'applying', updated_at_ms = $1 WHERE node_id = $2 AND stream_id = $3 AND generation = $4 AND state IN ('accepted', 'converging', 'retrying')",
+                )
+                .bind(now as i64)
+                .bind(&mutation.node_id)
+                .bind(&mutation.stream_id)
+                .bind(generation as i64)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        let wake_key = format!(
+            "reconcile:observed:{}:{}:{}:{}",
+            mutation.node_id,
+            mutation.stream_id,
+            mutation.boot_id.as_deref().unwrap_or("unknown"),
+            mutation.report_seq
+        );
+        sqlx::query(
+            "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT $1, 'reconcile_intent', d.node_id, d.stream_id, i.intent_id, $2, $2 FROM cp_stream_desired d JOIN cp_intents i ON i.node_id = d.node_id AND i.stream_id = d.stream_id AND i.generation = d.generation WHERE d.node_id = $3 AND d.stream_id = $4 AND i.state IN ('accepted', 'converging', 'retrying') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL) ON CONFLICT DO NOTHING",
+        )
+        .bind(&wake_key)
+        .bind(now as i64)
+        .bind(&mutation.node_id)
+        .bind(&mutation.stream_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError> {
@@ -733,6 +1216,35 @@ mod live_tests {
         Some(PgStore::open(&url).await.expect("pg open"))
     }
 
+    /// The live container keeps data across runs; the smoke owns it, so start
+    /// from a clean slate. NEXT_ID is process-local and would otherwise
+    /// collide with intents persisted by a previous run.
+    async fn clean_slate(store: &PgStore) {
+        for table in [
+            "cp_outbox",
+            "cp_attempts",
+            "cp_events",
+            "cp_audit_events",
+            "cp_rollout_targets",
+            "cp_rollouts",
+            "cp_operations",
+            "cp_intents",
+            "cp_stream_observed",
+            "cp_stream_desired",
+            "cp_config_versions",
+            "cp_job_checkpoints",
+            "cp_job_tasks",
+            "cp_job_versions",
+            "cp_jobs",
+            "cp_nodes",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&store.pool)
+                .await
+                .expect("clean slate");
+        }
+    }
+
     fn sample_job(job_id: &str) -> JobRecord {
         JobRecord {
             job_id: job_id.to_string(),
@@ -755,24 +1267,27 @@ mod live_tests {
             eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
             return;
         };
-        let job = sample_job("smoke-job");
+        clean_slate(&store).await;
+        // Unique per run: the live database keeps data across runs.
+        let job_id = format!("smoke-job-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let job = sample_job(&job_id);
         let stored = store.upsert_job(job).await.expect("upsert");
         assert_eq!(stored.generation, 1, "first write bumps generation to 1");
         assert_eq!(stored.node_ids, vec!["node-a".to_string()]);
 
         // Second upsert bumps generation again (reads 1, writes 2).
         let stored = store
-            .upsert_job(sample_job("smoke-job"))
+            .upsert_job(sample_job(&job_id))
             .await
             .expect("upsert 2");
         assert_eq!(stored.generation, 2);
 
-        let fetched = store.get_job("smoke-job").await.expect("get").expect("exists");
+        let fetched = store.get_job(&job_id).await.expect("get").expect("exists");
         assert_eq!(fetched.generation, 2);
         assert_eq!(fetched.desired_state, "running");
 
         let listed = store.list_jobs().await.expect("list");
-        assert!(listed.iter().any(|job| job.job_id == "smoke-job"));
+        assert!(listed.iter().any(|job| job.job_id == job_id));
 
         // CAS update with the correct expected generation succeeds and bumps.
         let mut cas = stored.clone();
@@ -792,5 +1307,92 @@ mod live_tests {
             .await
             .expect_err("stale generation must conflict");
         assert!(error.to_string().contains("generation conflict"), "{error}");
+
+        // ---- nodes / streams group ----
+        let node_id = format!(
+            "node-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let stream_id = format!(
+            "demo-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let mutation = DesiredMutation {
+            node_id: node_id.clone(),
+            stream_id: stream_id.clone(),
+            desired_state: "running".to_string(),
+            config_version_id: Some("cfg-1".to_string()),
+            action_id: Some("apply-1".to_string()),
+            payload_json: Some("{}".to_string()),
+            expected_generation: None,
+            intent_type: None,
+            idempotency_key: Some("idem-1".to_string()),
+            actor: Some("tester".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+        };
+        let intent = store.set_desired(mutation.clone()).await.expect("set_desired");
+        assert_eq!(intent.generation, 1);
+        assert_eq!(intent.state, "accepted");
+
+        // Idempotent replay returns the same intent.
+        let replay = store.set_desired(mutation.clone()).await.expect("replay");
+        assert_eq!(replay.intent_id, intent.intent_id);
+
+        let desired = store.get_desired(&node_id, &stream_id).await.expect("get").expect("exists");
+        assert_eq!(desired.generation, 1);
+        assert_eq!(desired.desired_state, "running");
+
+        // An observed report matching the desired state converges the intent.
+        store.record_observed(ObservedMutation {
+            node_id: node_id.clone(),
+            stream_id: stream_id.clone(),
+            boot_id: Some("boot-1".to_string()),
+            report_seq: 1,
+            observed_generation: Some(1),
+            observed_state: "running".to_string(),
+            config_version_id: Some("cfg-1".to_string()),
+            action_id: Some("apply-1".to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            snapshot_json: "{}".to_string(),
+        }).await.expect("record_observed");
+
+        let converged = store.get_intent(&intent.intent_id).await.expect("get").expect("exists");
+        assert_eq!(converged.state, "converged");
+
+        store.upsert_node(NodeMutation {
+            node_id: node_id.clone(),
+            version: "test".to_string(),
+            state: "online".to_string(),
+            capabilities_json: "[]".to_string(),
+            boot_id: Some("boot-1".to_string()),
+            report_seq: Some(1),
+            last_seen_at_ms: 1_000,
+            lease_expires_at_ms: 2_000,
+            maintenance_state: None,
+            maintenance_updated_at_ms: None,
+        }).await.expect("upsert_node");
+
+        let maintenance = store
+            .set_node_maintenance(
+                NodeMaintenanceMutation {
+                    node_id: node_id.clone(),
+                    state: "draining".to_string(),
+                    actor: Some("tester".to_string()),
+                    correlation_id: Some("corr-m".to_string()),
+                },
+                5_000,
+            )
+            .await
+            .expect("maintenance");
+        assert!(maintenance, "first transition applies");
+        let state = store.get_node_maintenance(&node_id).await.expect("get").expect("exists");
+        assert_eq!(state, "draining");
+
+        let aggregates = store.operational_aggregates(10_000).await.expect("aggregates");
+        assert!(aggregates.node_states.iter().any(|(state, _)| state == "online"));
+
+        store.reset_observed_cursors(&node_id).await.expect("reset");
+        store.wake_node(&node_id, 20_000).await.expect("wake");
     }
 }
