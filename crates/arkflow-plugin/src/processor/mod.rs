@@ -29,7 +29,6 @@ pub mod python;
 pub mod sql;
 pub mod vector_search;
 pub mod vrl;
-pub mod wasm;
 
 fn register_components() -> Result<(), Error> {
     batch::init()?;
@@ -39,7 +38,6 @@ fn register_components() -> Result<(), Error> {
     protobuf::init()?;
     sql::init()?;
     vrl::init()?;
-    wasm::init()?;
     python::init()?;
     embedding::init()?;
     vector_search::init()?;

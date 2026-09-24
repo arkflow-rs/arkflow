@@ -160,7 +160,6 @@ ArkFlow提供多种数据处理器：
 - **Vector Search** (`vector_search`)：在 Qdrant 集合中检索每行向量的 top-k 近邻并以 JSON 追加匹配结果
 - **Milvus Search** (`milvus_search`)：以单次批量请求在 Milvus 集合中检索每行向量的 top-k 近邻
 - **pgvector Search** (`pgvector_search`)：在启用了 pgvector 扩展的 PostgreSQL 表中检索每行向量的 top-k 近邻
-- **WASM** (`wasm`)：在带 fuel 与内存上限的沙箱中（wasmtime）逐行执行 WebAssembly 模块
 
 <!-- README_COMPONENTS:processor END -->
 
