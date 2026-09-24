@@ -247,6 +247,45 @@ pub struct PgStore {
     pool: sqlx::PgPool,
 }
 
+
+fn pg_row_to_job(row: &PgRow) -> Result<JobRecord, StorageError> {
+    let node_ids_json: String = row.try_get(7)?;
+    let node_ids = serde_json::from_str(&node_ids_json)
+        .map_err(|error| StorageError::Unsupported(format!("node_ids_json decode failed: {error}")))?;
+    Ok(JobRecord {
+        job_id: row.try_get(0)?,
+        version: row.try_get::<i64, usize>(1)? as u64,
+        spec_json: row.try_get(2)?,
+        desired_state: row.try_get(3)?,
+        observed_state: row.try_get(4)?,
+        convergence: row.try_get(5)?,
+        generation: row.try_get::<i64, usize>(6)? as u64,
+        node_ids,
+        checkpoint_id: row.try_get(8)?,
+        last_error: row.try_get(9)?,
+        updated_at_ms: row.try_get::<i64, usize>(10)? as u64,
+    })
+}
+
+const JOB_COLUMNS: &str = "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs";
+
+async fn pg_fetch_job(conn: &mut sqlx::PgConnection, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
+    let row = sqlx::query(&format!("{JOB_COLUMNS} WHERE job_id = $1"))
+        .bind(job_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(row.map(|row| pg_row_to_job(&row)).transpose()?)
+}
+
+async fn pg_job_generation(conn: &mut sqlx::PgConnection, job_id: &str) -> Result<Option<u64>, StorageError> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT generation FROM cp_jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(row.map(|(generation,)| generation as u64))
+}
+
+
 impl PgStore {
     /// Connects, probes the server and creates the schema idempotently.
     /// A failure here fails Hub startup fast: a control plane without its
@@ -543,24 +582,75 @@ impl PgStore {
     }
 
     pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
-        let _ = (&job);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: upsert_job is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let current_generation = pg_job_generation(&mut tx, &job.job_id).await?;
+        job.generation = current_generation
+            .map(|generation| generation.saturating_add(1))
+            .unwrap_or_else(|| job.generation.max(1));
+        let node_ids = serde_json::to_string(&job.node_ids)
+            .map_err(|error| StorageError::Unsupported(format!("node_ids encode failed: {error}")))?;
+        sqlx::query(
+            "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+        )
+        .bind(&job.job_id)
+        .bind(job.version as i64)
+        .bind(&job.spec_json)
+        .bind(&job.desired_state)
+        .bind(&job.observed_state)
+        .bind(&job.convergence)
+        .bind(job.generation as i64)
+        .bind(&node_ids)
+        .bind(&job.checkpoint_id)
+        .bind(&job.last_error)
+        .bind(job.updated_at_ms as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn update_job_with_expected_generation(&self, mut job: JobRecord, expected_generation: u64) -> Result<JobRecord, StorageError> {
-        let _ = (&job, &expected_generation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_job_with_expected_generation is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        job.generation = expected_generation.saturating_add(1);
+        let node_ids = serde_json::to_string(&job.node_ids)
+            .map_err(|error| StorageError::Unsupported(format!("node_ids encode failed: {error}")))?;
+        // The recovery pointer (checkpoint_id) is deliberately NOT in the SET
+        // list: it is owned by the checkpoint path and preserving it cannot
+        // regress recovery (same rationale as the SQLite implementation).
+        let changed = sqlx::query(
+            "UPDATE cp_jobs SET version=$1, spec_json=$2, desired_state=$3, observed_state=$4, convergence=$5, generation=$6, node_ids_json=$7, last_error=$8, updated_at_ms=$9 WHERE job_id=$10 AND generation=$11",
+        )
+        .bind(job.version as i64)
+        .bind(&job.spec_json)
+        .bind(&job.desired_state)
+        .bind(&job.observed_state)
+        .bind(&job.convergence)
+        .bind(job.generation as i64)
+        .bind(&node_ids)
+        .bind(&job.last_error)
+        .bind(job.updated_at_ms as i64)
+        .bind(&job.job_id)
+        .bind(expected_generation as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            let current = pg_job_generation(&mut tx, &job.job_id).await?;
+            return Err(StorageError::GenerationConflict {
+                expected: expected_generation,
+                current: current.unwrap_or(0),
+            });
+        }
+        let stored = pg_fetch_job(&mut tx, &job.job_id).await?;
+        tx.commit().await?;
+        Ok(stored.unwrap_or(job))
     }
 
     pub async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
-        let _ = (&job_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_job is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let job = pg_fetch_job(&mut tx, job_id).await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
@@ -578,9 +668,13 @@ impl PgStore {
     }
 
     pub async fn list_jobs(&self, ) -> Result<Vec<JobRecord>, StorageError> {
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_jobs is not implemented yet"
-        )))
+        let rows = sqlx::query(&format!("{JOB_COLUMNS} ORDER BY updated_at_ms DESC, job_id LIMIT 4096"))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| pg_row_to_job(&row))
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn update_job(&self, job_id: &str, desired_state: Option<&str>, observed_state: Option<&str>, convergence: Option<&str>, generation: Option<u64>, checkpoint_id: Option<&str>, last_error: Option<&str>) -> Result<Option<JobRecord>, StorageError> {
@@ -623,5 +717,80 @@ impl PgStore {
         Err(StorageError::Unsupported(format!(
             "postgres backend: delete_job_checkpoint is not implemented yet"
         )))
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    fn pg_url() -> Option<String> {
+        std::env::var("ARKFLOW_TEST_POSTGRES_URL").ok()
+    }
+
+    async fn open_or_skip() -> Option<PgStore> {
+        let url = pg_url()?;
+        Some(PgStore::open(&url).await.expect("pg open"))
+    }
+
+    fn sample_job(job_id: &str) -> JobRecord {
+        JobRecord {
+            job_id: job_id.to_string(),
+            version: 3,
+            spec_json: "{}".to_string(),
+            desired_state: "running".to_string(),
+            observed_state: "starting".to_string(),
+            convergence: "converging".to_string(),
+            generation: 0,
+            node_ids: vec!["node-a".to_string()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn jobs_group_smoke() {
+        let Some(store) = open_or_skip().await else {
+            eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let job = sample_job("smoke-job");
+        let stored = store.upsert_job(job).await.expect("upsert");
+        assert_eq!(stored.generation, 1, "first write bumps generation to 1");
+        assert_eq!(stored.node_ids, vec!["node-a".to_string()]);
+
+        // Second upsert bumps generation again (reads 1, writes 2).
+        let stored = store
+            .upsert_job(sample_job("smoke-job"))
+            .await
+            .expect("upsert 2");
+        assert_eq!(stored.generation, 2);
+
+        let fetched = store.get_job("smoke-job").await.expect("get").expect("exists");
+        assert_eq!(fetched.generation, 2);
+        assert_eq!(fetched.desired_state, "running");
+
+        let listed = store.list_jobs().await.expect("list");
+        assert!(listed.iter().any(|job| job.job_id == "smoke-job"));
+
+        // CAS update with the correct expected generation succeeds and bumps.
+        let mut cas = stored.clone();
+        cas.desired_state = "stopped".to_string();
+        let updated = store
+            .update_job_with_expected_generation(cas, 2)
+            .await
+            .expect("cas update");
+        assert_eq!(updated.generation, 3);
+        assert_eq!(updated.desired_state, "stopped");
+
+        // CAS with a stale generation conflicts.
+        let mut stale = stored;
+        stale.desired_state = "running".to_string();
+        let error = store
+            .update_job_with_expected_generation(stale, 2)
+            .await
+            .expect_err("stale generation must conflict");
+        assert!(error.to_string().contains("generation conflict"), "{error}");
     }
 }

@@ -44,3 +44,6 @@
 ### 实施方式决策（2026-09-24 修订）
 
 放弃正则转写器（方法体含类型化 let、元组行映射、嵌套控制流，规则覆盖不住），改为**逐方法手写**：以 `/tmp/method_bodies.txt` 的 SQLite 实现为蓝本，按组（jobs → nodes/streams → intents/attempts → outbox/events/audit/ops → rollouts/config）手写 52 个 sqlx 方法，每组完成后立即用 live PG（`ARKFLOW_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:15432/arkflow_cp`，容器 arkflow-pg-test 已运行）跑冒烟验证。行映射规则：rusqlite `row.get(N)?` → sqlx `row.try_get(N)?`；`params![..]` → 链式 `.bind(..)`；`?N`→`$N`；`INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`；`last_insert_rowid`（仅 record_audit）→ `RETURNING event_id`。
+### 进度 2026-09-24（续）
+
+- jobs 组（upsert_job / update_job_with_expected_generation / get_job / list_jobs）已实现并 live 验证：`ARKFLOW_TEST_POSTGRES_URL` 门控冒烟测试 `pg_store::live_tests::jobs_group_smoke` 覆盖 open→DDL→generation 递增→读取→列表→CAS 成功→过期 CAS 冲突。每方法手写时长约 5 分钟；余 39 方法按同法推进。要点：u64 绑定必须 `as i64`，解码 `row.try_get::<i64, usize>(N)? as u64`（sqlx PG 不实现 u64 编解码）；空参数桩无 `let _ = (...)` 行；桩尾三括号。
