@@ -393,21 +393,34 @@ mod tests {
             format!("Basic {}", credentials_wrong).parse().unwrap(),
         )]);
 
-        // 测试正确密码的时间
-        let start = Instant::now();
+        // 常量时间断言采用多次采样取中位数：单次采样包含调度与首次
+        // 初始化噪声，在负载高的 CI 上 10ms 阈值会偶发误报。
+        let sample_once = |header: HeaderMap| {
+            let auth = &auth;
+            async move {
+                let start = Instant::now();
+                let _ = validate_auth(&header, auth).await;
+                start.elapsed()
+            }
+        };
+        let mut valid_samples = Vec::new();
+        let mut wrong_samples = Vec::new();
+        for _ in 0..21 {
+            valid_samples.push(sample_once(auth_header_valid.clone()).await);
+            wrong_samples.push(sample_once(auth_header_wrong.clone()).await);
+        }
+        valid_samples.sort();
+        wrong_samples.sort();
+        let time_valid = valid_samples[10];
+        let time_wrong = wrong_samples[10];
+
         let result_valid = validate_auth(&auth_header_valid, &auth).await;
-        let time_valid = start.elapsed();
-
-        // 测试错误密码的时间
-        let start = Instant::now();
         let result_wrong = validate_auth(&auth_header_wrong, &auth).await;
-        let time_wrong = start.elapsed();
-
         // 验证结果正确性
         assert!(result_valid, "Valid credentials should pass");
         assert!(!result_wrong, "Wrong credentials should fail");
 
-        // 验证时间差异在合理范围内（<10ms）
+        // 验证时间差异在合理范围内（中位数差异 < 10ms）
         let time_diff = time_valid.abs_diff(time_wrong);
         assert!(
             time_diff.as_millis() < 10,
@@ -430,21 +443,33 @@ mod tests {
             "Bearer wrong_token_456".parse().unwrap(),
         )]);
 
-        // 测试正确token的时间
-        let start = Instant::now();
         let result_bearer_valid = validate_auth(&auth_header_bearer_valid, &bearer_auth).await;
-        let time_bearer_valid = start.elapsed();
-
-        // 测试错误token的时间
-        let start = Instant::now();
         let result_bearer_wrong = validate_auth(&auth_header_bearer_wrong, &bearer_auth).await;
-        let time_bearer_wrong = start.elapsed();
+
+        let sample_once_bearer = |header: HeaderMap| {
+            let auth = &bearer_auth;
+            async move {
+                let start = Instant::now();
+                let _ = validate_auth(&header, auth).await;
+                start.elapsed()
+            }
+        };
+        let mut bearer_valid_samples = Vec::new();
+        let mut bearer_wrong_samples = Vec::new();
+        for _ in 0..21 {
+            bearer_valid_samples.push(sample_once_bearer(auth_header_bearer_valid.clone()).await);
+            bearer_wrong_samples.push(sample_once_bearer(auth_header_bearer_wrong.clone()).await);
+        }
+        bearer_valid_samples.sort();
+        bearer_wrong_samples.sort();
+        let time_bearer_valid = bearer_valid_samples[10];
+        let time_bearer_wrong = bearer_wrong_samples[10];
 
         // 验证结果正确性
         assert!(result_bearer_valid, "Valid bearer token should pass");
         assert!(!result_bearer_wrong, "Wrong bearer token should fail");
 
-        // 验证时间差异在合理范围内（<10ms）
+        // 验证时间差异在合理范围内（中位数差异 < 10ms）
         let time_diff = time_bearer_valid.abs_diff(time_bearer_wrong);
         assert!(
             time_diff.as_millis() < 10,
