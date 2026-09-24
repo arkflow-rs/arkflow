@@ -3986,15 +3986,16 @@ impl Processor for TickMarkerProcessor {
             // them so the leading-tick assertion stays load independent.
             return Ok(ProcessResult::None);
         }
-        // The first in-window tick output is held by the pool fence until the
-        // data publishes; the second one releases the input's second batch.
-        if !self.tick_seen.swap(true, Ordering::SeqCst) {
-            return Ok(self.tick_batch());
-        }
-        if !self.gate.released().await {
+        let release = !self.tick_seen.swap(true, Ordering::SeqCst);
+        let output = self.tick_batch();
+        // Release the second batch only after this tick's output has been
+        // handed to the downstream publisher: on_tick and the data path share
+        // the chain task, so "b" cannot be received until a later select
+        // iteration and every tick published so far precedes it downstream.
+        if release {
             self.gate.release().await;
         }
-        Ok(self.tick_batch())
+        Ok(output)
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
