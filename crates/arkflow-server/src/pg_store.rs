@@ -371,6 +371,61 @@ fn pg_row_attempt(row: &PgRow) -> Result<AttemptRecord, StorageError> {
 }
 
 
+
+fn pg_row_to_rollout(row: &PgRow) -> Result<RolloutRecord, StorageError> {
+    Ok(RolloutRecord {
+        rollout_id: row.try_get(0)?,
+        config_version_id: row.try_get(1)?,
+        state: row.try_get(2)?,
+        batch_size: row.try_get::<i64, usize>(3)? as u32,
+        current_batch: row.try_get::<i64, usize>(4)? as u32,
+        total_targets: row.try_get::<i64, usize>(5)? as u32,
+        actor: row.try_get(6)?,
+        correlation_id: row.try_get(7)?,
+        created_at_ms: row.try_get::<i64, usize>(8)? as u64,
+        updated_at_ms: row.try_get::<i64, usize>(9)? as u64,
+    })
+}
+
+async fn pg_insert_rollout(
+    tx: &mut sqlx::PgConnection,
+    rollout: &RolloutRecord,
+    targets: Vec<RolloutTargetRecord>,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO cp_rollouts (rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(&rollout.rollout_id)
+    .bind(&rollout.config_version_id)
+    .bind(&rollout.state)
+    .bind(rollout.batch_size as i64)
+    .bind(rollout.current_batch as i64)
+    .bind(rollout.total_targets as i64)
+    .bind(&rollout.actor)
+    .bind(&rollout.correlation_id)
+    .bind(rollout.created_at_ms as i64)
+    .bind(rollout.updated_at_ms as i64)
+    .execute(&mut *tx)
+    .await?;
+    for target in targets {
+        sqlx::query(
+            "INSERT INTO cp_rollout_targets (rollout_id, node_id, ordinal, state, attempt_id, error, observed_config_version, updated_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&target.rollout_id)
+        .bind(&target.node_id)
+        .bind(target.ordinal as i64)
+        .bind(&target.state)
+        .bind(&target.attempt_id)
+        .bind(&target.error)
+        .bind(&target.observed_config_version)
+        .bind(target.updated_at_ms as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+
 impl PgStore {
     /// Connects, probes the server and creates the schema idempotently.
     /// A failure here fails Hub startup fast: a control plane without its
@@ -675,10 +730,46 @@ impl PgStore {
     }
 
     pub async fn claim_outbox(&self, worker_id: &str, now_ms: u64) -> Result<Option<OutboxRecord>, StorageError> {
-        let _ = (&worker_id, &now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: claim_outbox is not implemented yet"
-        )))
+        const CLAIM_LEASE_MS: u64 = 30_000;
+        let mut tx = self.pool.begin().await?;
+        let candidate = sqlx::query(
+            "SELECT outbox_id, event_key, event_type, node_id, stream_id, intent_id FROM cp_outbox WHERE processed_at_ms IS NULL AND available_at_ms <= $1 AND (claimed_at_ms IS NULL OR claimed_at_ms < $2) ORDER BY outbox_id LIMIT 1",
+        )
+        .bind(now_ms as i64)
+        .bind((now_ms - CLAIM_LEASE_MS) as i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| -> Result<OutboxRecord, StorageError> {
+            Ok(OutboxRecord {
+                outbox_id: row.try_get(0)?,
+                event_key: row.try_get(1)?,
+                event_type: row.try_get(2)?,
+                node_id: row.try_get(3)?,
+                stream_id: row.try_get(4)?,
+                intent_id: row.try_get(5)?,
+            })
+        })
+        .transpose()?;
+        let Some(mut candidate) = candidate else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let updated = sqlx::query(
+            "UPDATE cp_outbox SET claimed_at_ms = $1, worker_id = $2 WHERE outbox_id = $3 AND processed_at_ms IS NULL AND (claimed_at_ms IS NULL OR claimed_at_ms < $4)",
+        )
+        .bind(now_ms as i64)
+        .bind(worker_id)
+        .bind(candidate.outbox_id)
+        .bind((now_ms - CLAIM_LEASE_MS) as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(candidate))
     }
 
     pub async fn get_desired(&self, node_id: &str, stream_id: &str) -> Result<Option<DesiredRecord>, StorageError> {
@@ -751,45 +842,113 @@ impl PgStore {
     }
 
     pub async fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError> {
-        let _ = (&node_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_events is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT event_id, node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, message, generation, correlation_id, occurred_at_ms, actor FROM cp_events WHERE ($1 IS NULL OR node_id = $1) ORDER BY event_id DESC LIMIT 2048",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<StoredEvent, StorageError> {
+                Ok(StoredEvent {
+                    event_id: row.try_get(0)?,
+                    node_id: row.try_get(1)?,
+                    stream_id: row.try_get(2)?,
+                    intent_id: row.try_get(3)?,
+                    attempt_id: row.try_get(4)?,
+                    event_type: row.try_get(5)?,
+                    outcome: row.try_get(6)?,
+                    failure_class: row.try_get(7)?,
+                    message: row.try_get(8)?,
+                    generation: row.try_get::<Option<i64>, usize>(9)?.map(|v| v as u64),
+                    correlation_id: row.try_get(10)?,
+                    occurred_at_ms: row.try_get::<i64, usize>(11)? as u64,
+                    actor: row.try_get(12)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn prune_events(&self, retain: usize) -> Result<usize, StorageError> {
-        let _ = (&retain);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_events is not implemented yet"
-        )))
+        let deleted = sqlx::query(
+            "DELETE FROM cp_events WHERE event_id NOT IN (SELECT event_id FROM cp_events ORDER BY event_id DESC LIMIT $1)",
+        )
+        .bind(retain as i64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(deleted as usize)
     }
 
     pub async fn prune_operation_history(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
-        let _ = (&older_than_ms, &max_retained);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_operation_history is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let protected = "operation = 'job_start' AND (state = 'succeeded' OR operation_json LIKE '%\"failure_class\":\"recovery_required\"%') AND NOT EXISTS (SELECT 1 FROM cp_operations newer WHERE newer.resource_id = cp_operations.resource_id AND newer.operation = 'job_start' AND (newer.state = 'succeeded' OR newer.operation_json LIKE '%\"failure_class\":\"recovery_required\"%') AND (newer.updated_at_ms > cp_operations.updated_at_ms OR (newer.updated_at_ms = cp_operations.updated_at_ms AND newer.operation_id > cp_operations.operation_id)))";
+        let mut deleted = sqlx::query(&format!(
+            "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND updated_at_ms < $1 AND NOT ({protected})"
+        ))
+        .bind(older_than_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(&format!(
+            "DELETE FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND operation_id NOT IN (SELECT operation_id FROM cp_operations WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT $1) AND NOT ({protected})"
+        ))
+        .bind(max_retained)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted as usize)
     }
 
     pub async fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
-        let _ = (&older_than_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_job_checkpoint_records is not implemented yet"
-        )))
+        let deleted = sqlx::query(
+            "DELETE FROM cp_job_checkpoints WHERE status IN ('pending', 'failed') AND updated_at_ms < $1",
+        )
+        .bind(older_than_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(deleted as usize)
     }
 
     pub async fn prune_audit_events(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
-        let _ = (&older_than_ms, &max_retained);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_audit_events is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = sqlx::query("DELETE FROM cp_audit_events WHERE occurred_at_ms < $1")
+            .bind(older_than_ms)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM cp_audit_events WHERE event_id NOT IN (SELECT event_id FROM cp_audit_events ORDER BY event_id DESC LIMIT $1)",
+        )
+        .bind(max_retained)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted as usize)
     }
 
     pub async fn prune_processed_outbox(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
-        let _ = (&older_than_ms, &max_retained);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_processed_outbox is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = sqlx::query(
+            "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND processed_at_ms < $1",
+        )
+        .bind(older_than_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM cp_outbox WHERE processed_at_ms IS NOT NULL AND outbox_id NOT IN (SELECT outbox_id FROM cp_outbox WHERE processed_at_ms IS NOT NULL ORDER BY processed_at_ms DESC, outbox_id DESC LIMIT $1)",
+        )
+        .bind(max_retained)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted as usize)
     }
 
     pub async fn prune_terminal_attempts(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
@@ -1220,113 +1379,270 @@ impl PgStore {
     }
 
     pub async fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError> {
-        let _ = (&outbox_id, &now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: mark_outbox_processed is not implemented yet"
-        )))
+        sqlx::query(
+            "UPDATE cp_outbox SET processed_at_ms = $1 WHERE outbox_id = $2",
+        )
+        .bind(now_ms as i64)
+        .bind(outbox_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
-        let _ = (&record);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: record_audit is not implemented yet"
-        )))
+        let row: i64 = sqlx::query_scalar(
+            "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING event_id",
+        )
+        .bind(&record.actor)
+        .bind(&record.action)
+        .bind(&record.resource_type)
+        .bind(&record.resource_id)
+        .bind(&record.node_id)
+        .bind(&record.stream_id)
+        .bind(&record.correlation_id)
+        .bind(&record.outcome)
+        .bind(&record.failure_code)
+        .bind(&record.message)
+        .bind(record.occurred_at_ms as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     pub async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
-        let _ = (&resource_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_audit is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE ($1 IS NULL OR resource_id = $1) ORDER BY event_id DESC LIMIT 1024",
+        )
+        .bind(resource_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<AuditRecord, StorageError> {
+                Ok(AuditRecord {
+                    event_id: row.try_get(0)?,
+                    actor: row.try_get(1)?,
+                    action: row.try_get(2)?,
+                    resource_type: row.try_get(3)?,
+                    resource_id: row.try_get(4)?,
+                    node_id: row.try_get(5)?,
+                    stream_id: row.try_get(6)?,
+                    correlation_id: row.try_get(7)?,
+                    outcome: row.try_get(8)?,
+                    failure_code: row.try_get(9)?,
+                    message: row.try_get(10)?,
+                    occurred_at_ms: row.try_get::<i64, usize>(11)? as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn create_rollout(&self, rollout: RolloutRecord, targets: Vec<RolloutTargetRecord>) -> Result<(), StorageError> {
-        let _ = (&rollout, &targets);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: create_rollout is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        pg_insert_rollout(&mut tx, &rollout, targets).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn create_rollout_with_content(&self, rollout: RolloutRecord, targets: Vec<RolloutTargetRecord>, content: &str, created_by: Option<&str>) -> Result<(), StorageError> {
-        let _ = (&rollout, &targets, &content, &created_by);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: create_rollout_with_content is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms, created_by) VALUES ($1, 'inline-json', $2, 'json', $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&rollout.config_version_id)
+        .bind(content)
+        .bind(rollout.created_at_ms as i64)
+        .bind(created_by)
+        .execute(&mut *tx)
+        .await?;
+        pg_insert_rollout(&mut tx, &rollout, targets).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError> {
-        let _ = (&rollout_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_rollout is not implemented yet"
-        )))
+        let row = sqlx::query(
+            "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE rollout_id = $1",
+        )
+        .bind(rollout_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| pg_row_to_rollout(&row)).transpose()?)
     }
 
     pub async fn list_rollout_targets(&self, rollout_id: &str) -> Result<Vec<RolloutTargetRecord>, StorageError> {
-        let _ = (&rollout_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_rollout_targets is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT rollout_id, node_id, ordinal, state, attempt_id, error, observed_config_version, updated_at_ms FROM cp_rollout_targets WHERE rollout_id = $1 ORDER BY ordinal, node_id",
+        )
+        .bind(rollout_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<RolloutTargetRecord, StorageError> {
+                Ok(RolloutTargetRecord {
+                    rollout_id: row.try_get(0)?,
+                    node_id: row.try_get(1)?,
+                    ordinal: row.try_get::<i64, usize>(2)? as u32,
+                    state: row.try_get(3)?,
+                    attempt_id: row.try_get(4)?,
+                    error: row.try_get(5)?,
+                    observed_config_version: row.try_get(6)?,
+                    updated_at_ms: row.try_get::<i64, usize>(7)? as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn update_rollout(&self, rollout_id: &str, state: &str, current_batch: u32, updated_at_ms: u64) -> Result<(), StorageError> {
-        let _ = (&rollout_id, &state, &current_batch, &updated_at_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_rollout is not implemented yet"
-        )))
+        sqlx::query(
+            "UPDATE cp_rollouts SET state = $1, current_batch = $2, updated_at_ms = $3 WHERE rollout_id = $4",
+        )
+        .bind(state)
+        .bind(current_batch as i64)
+        .bind(updated_at_ms as i64)
+        .bind(rollout_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError> {
-        let _ = (&update);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_rollout_target is not implemented yet"
-        )))
+        sqlx::query(
+            "UPDATE cp_rollout_targets SET state = $1, attempt_id = $2, error = $3, observed_config_version = $4, updated_at_ms = $5 WHERE rollout_id = $6 AND node_id = $7",
+        )
+        .bind(&update.state)
+        .bind(&update.attempt_id)
+        .bind(&update.error)
+        .bind(&update.observed_config_version)
+        .bind(update.updated_at_ms as i64)
+        .bind(&update.rollout_id)
+        .bind(&update.node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn get_config_version_content(&self, config_version_id: &str) -> Result<Option<String>, StorageError> {
-        let _ = (&config_version_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_config_version_content is not implemented yet"
-        )))
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT content_ref FROM cp_config_versions WHERE config_version_id = $1",
+        )
+        .bind(config_version_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(content,)| content))
     }
 
     pub async fn recover_rollouts(&self, ) -> Result<Vec<RolloutRecord>, StorageError> {
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: recover_rollouts is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE state NOT IN ('converged', 'cancelled', 'rolled_back') ORDER BY created_at_ms",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| pg_row_to_rollout(&row))
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn list_rollouts(&self, ) -> Result<Vec<RolloutRecord>, StorageError> {
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_rollouts is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts ORDER BY created_at_ms DESC, rollout_id DESC LIMIT 1024",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| pg_row_to_rollout(&row))
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
-        let _ = (&operation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: upsert_operation is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_operations (operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(operation_id) DO UPDATE SET state = excluded.state, updated_at_ms = excluded.updated_at_ms, operation_json = excluded.operation_json",
+        )
+        .bind(&operation.operation_id)
+        .bind(&operation.node_id)
+        .bind(&operation.resource_id)
+        .bind(&operation.operation)
+        .bind(&operation.state)
+        .bind(operation.created_at_ms as i64)
+        .bind(operation.updated_at_ms as i64)
+        .bind(&operation.operation_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn get_operation(&self, operation_id: &str) -> Result<Option<PersistedOperation>, StorageError> {
-        let _ = (&operation_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: get_operation is not implemented yet"
-        )))
+        let row = sqlx::query(
+            "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|row| -> Result<PersistedOperation, StorageError> {
+                Ok(PersistedOperation {
+                    operation_id: row.try_get(0)?,
+                    node_id: row.try_get(1)?,
+                    resource_id: row.try_get(2)?,
+                    operation: row.try_get(3)?,
+                    state: row.try_get(4)?,
+                    created_at_ms: row.try_get::<i64, usize>(5)? as u64,
+                    updated_at_ms: row.try_get::<i64, usize>(6)? as u64,
+                    operation_json: row.try_get(7)?,
+                })
+            })
+            .transpose()?)
     }
 
     pub async fn list_operations(&self, node_id: Option<&str>) -> Result<Vec<PersistedOperation>, StorageError> {
-        let _ = (&node_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_operations is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE ($1 IS NULL OR node_id = $1) ORDER BY created_at_ms DESC, operation_id DESC LIMIT 1024",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<PersistedOperation, StorageError> {
+                Ok(PersistedOperation {
+                    operation_id: row.try_get(0)?,
+                    node_id: row.try_get(1)?,
+                    resource_id: row.try_get(2)?,
+                    operation: row.try_get(3)?,
+                    state: row.try_get(4)?,
+                    created_at_ms: row.try_get::<i64, usize>(5)? as u64,
+                    updated_at_ms: row.try_get::<i64, usize>(6)? as u64,
+                    operation_json: row.try_get(7)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn list_job_start_operations(&self, resource_id: &str) -> Result<Vec<PersistedOperation>, StorageError> {
-        let _ = (&resource_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_job_start_operations is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT operation_id, node_id, resource_id, operation, state, created_at_ms, updated_at_ms, operation_json FROM cp_operations WHERE resource_id = $1 AND operation = 'job_start' AND (state = 'succeeded' OR operation_json LIKE '%\"failure_class\":\"recovery_required\"%') ORDER BY updated_at_ms DESC, operation_id DESC LIMIT 4096",
+        )
+        .bind(resource_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<PersistedOperation, StorageError> {
+                Ok(PersistedOperation {
+                    operation_id: row.try_get(0)?,
+                    node_id: row.try_get(1)?,
+                    resource_id: row.try_get(2)?,
+                    operation: row.try_get(3)?,
+                    state: row.try_get(4)?,
+                    created_at_ms: row.try_get::<i64, usize>(5)? as u64,
+                    updated_at_ms: row.try_get::<i64, usize>(6)? as u64,
+                    operation_json: row.try_get(7)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
@@ -1402,17 +1718,38 @@ impl PgStore {
     }
 
     pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
-        let _ = (&record);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: upsert_job_version is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_job_versions (job_id, version, spec_json, plan_json, created_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(job_id, version) DO UPDATE SET spec_json=excluded.spec_json, plan_json=excluded.plan_json",
+        )
+        .bind(&record.job_id)
+        .bind(record.version as i64)
+        .bind(&record.spec_json)
+        .bind(&record.plan_json)
+        .bind(record.created_at_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError> {
-        let _ = (&job_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_job_versions is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT job_id, version, spec_json, plan_json, created_at_ms FROM cp_job_versions WHERE job_id = $1 ORDER BY version DESC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<JobVersionRecord, StorageError> {
+                Ok(JobVersionRecord {
+                    job_id: row.try_get(0)?,
+                    version: row.try_get::<i64, usize>(1)? as u64,
+                    spec_json: row.try_get(2)?,
+                    plan_json: row.try_get(3)?,
+                    created_at_ms: row.try_get::<i64, usize>(4)? as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn list_jobs(&self, ) -> Result<Vec<JobRecord>, StorageError> {
@@ -1426,45 +1763,134 @@ impl PgStore {
     }
 
     pub async fn update_job(&self, job_id: &str, desired_state: Option<&str>, observed_state: Option<&str>, convergence: Option<&str>, generation: Option<u64>, checkpoint_id: Option<&str>, last_error: Option<&str>) -> Result<Option<JobRecord>, StorageError> {
-        let _ = (&job_id, &desired_state, &observed_state, &convergence, &generation, &checkpoint_id, &last_error);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_job is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE cp_jobs SET desired_state=COALESCE($2, desired_state), observed_state=COALESCE($3, observed_state), convergence=COALESCE($4, convergence), generation=COALESCE($5, generation), checkpoint_id=COALESCE($6, checkpoint_id), last_error=COALESCE($7, last_error), updated_at_ms=$8 WHERE job_id=$1",
+        )
+        .bind(job_id)
+        .bind(desired_state)
+        .bind(observed_state)
+        .bind(convergence)
+        .bind(generation.map(|value| value as i64))
+        .bind(checkpoint_id)
+        .bind(last_error)
+        .bind(crate::storage::now_ms() as i64)
+        .execute(&mut *tx)
+        .await?;
+        let job = pg_fetch_job(&mut tx, job_id).await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn update_job_observation(&self, job_id: &str, observed_state: &str, convergence: &str, generation: u64, expected_generation: u64, checkpoint_id: Option<&str>, last_error: Option<&str>) -> Result<Option<JobRecord>, StorageError> {
-        let _ = (&job_id, &observed_state, &convergence, &generation, &expected_generation, &checkpoint_id, &last_error);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_job_observation is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE cp_jobs SET observed_state=$2, convergence=$3, generation=$4, checkpoint_id=COALESCE($5, checkpoint_id), last_error=$6, updated_at_ms=$7 WHERE job_id=$1 AND generation=$8",
+        )
+        .bind(job_id)
+        .bind(observed_state)
+        .bind(convergence)
+        .bind(generation as i64)
+        .bind(checkpoint_id)
+        .bind(last_error)
+        .bind(crate::storage::now_ms() as i64)
+        .bind(expected_generation as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            let current = pg_job_generation(&mut tx, job_id).await?;
+            return match current {
+                Some(current) => Err(StorageError::GenerationConflict {
+                    expected: expected_generation,
+                    current,
+                }),
+                None => Ok(None),
+            };
+        }
+        let job = pg_fetch_job(&mut tx, job_id).await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn update_job_desired_state(&self, job_id: &str, desired_state: &str, expected_generation: u64) -> Result<Option<JobRecord>, StorageError> {
-        let _ = (&job_id, &desired_state, &expected_generation);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: update_job_desired_state is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE cp_jobs SET desired_state=$2, convergence='reconciling', generation=$3, updated_at_ms=$4 WHERE job_id=$1 AND generation=$5",
+        )
+        .bind(job_id)
+        .bind(desired_state)
+        .bind(expected_generation.saturating_add(1) as i64)
+        .bind(crate::storage::now_ms() as i64)
+        .bind(expected_generation as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            let current = pg_job_generation(&mut tx, job_id).await?;
+            return match current {
+                Some(current) => Err(StorageError::GenerationConflict {
+                    expected: expected_generation,
+                    current,
+                }),
+                None => Ok(None),
+            };
+        }
+        let job = pg_fetch_job(&mut tx, job_id).await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
-        let _ = (&record);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: upsert_job_checkpoint is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_job_checkpoints (job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT(job_id, checkpoint_id) DO UPDATE SET job_version=excluded.job_version, status=excluded.status, manifest_uri=excluded.manifest_uri, format_version=excluded.format_version, updated_at_ms=excluded.updated_at_ms",
+        )
+        .bind(&record.job_id)
+        .bind(record.job_version as i64)
+        .bind(&record.checkpoint_id)
+        .bind(&record.kind)
+        .bind(&record.status)
+        .bind(&record.manifest_uri)
+        .bind(record.format_version as i64)
+        .bind(record.created_at_ms as i64)
+        .bind(record.updated_at_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn list_job_checkpoints(&self, job_id: &str) -> Result<Vec<JobCheckpointRecord>, StorageError> {
-        let _ = (&job_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_job_checkpoints is not implemented yet"
-        )))
+        let rows = sqlx::query(
+            "SELECT job_id, job_version, checkpoint_id, kind, status, manifest_uri, format_version, created_at_ms, updated_at_ms FROM cp_job_checkpoints WHERE job_id = $1 ORDER BY created_at_ms DESC, checkpoint_id DESC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| -> Result<JobCheckpointRecord, StorageError> {
+                Ok(JobCheckpointRecord {
+                    job_id: row.try_get(0)?,
+                    job_version: row.try_get::<i64, usize>(1)? as u64,
+                    checkpoint_id: row.try_get(2)?,
+                    kind: row.try_get(3)?,
+                    status: row.try_get(4)?,
+                    manifest_uri: row.try_get(5)?,
+                    format_version: row.try_get::<i64, usize>(6)? as u32,
+                    created_at_ms: row.try_get::<i64, usize>(7)? as u64,
+                    updated_at_ms: row.try_get::<i64, usize>(8)? as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?)
     }
 
     pub async fn delete_job_checkpoint(&self, job_id: &str, checkpoint_id: &str) -> Result<(), StorageError> {
-        let _ = (&job_id, &checkpoint_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: delete_job_checkpoint is not implemented yet"
-        )))
+        sqlx::query("DELETE FROM cp_job_checkpoints WHERE job_id = $1 AND checkpoint_id = $2")
+            .bind(job_id)
+            .bind(checkpoint_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -1753,5 +2179,207 @@ mod live_tests {
             .expect("exists");
         assert_eq!(degraded.state, "converging");
         assert_eq!(degraded.convergence_state, "degraded");
+
+        // ---- remaining job methods ----
+        store
+            .upsert_job_version(JobVersionRecord {
+                job_id: job_id.clone(),
+                version: 1,
+                spec_json: "{}".to_string(),
+                plan_json: "{}".to_string(),
+                created_at_ms: 1,
+            })
+            .await
+            .expect("upsert version");
+        let versions = store.list_job_versions(&job_id).await.expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 1);
+
+        let updated = store
+            .update_job(&job_id, Some("stopped"), None, None, None, Some("cp-1"), None)
+            .await
+            .expect("update_job")
+            .expect("exists");
+        assert_eq!(updated.desired_state, "stopped");
+        assert_eq!(updated.checkpoint_id.as_deref(), Some("cp-1"));
+
+        let before = store.get_job(&job_id).await.expect("get").expect("exists");
+        let observed = store
+            .update_job_observation(&job_id, "running", "in_sync", before.generation + 1, before.generation, None, None)
+            .await
+            .expect("observation");
+        assert_eq!(observed.expect("row").generation, before.generation + 1);
+        // A stale observation (expected != stored) conflicts with the current generation.
+        let current = store.get_job(&job_id).await.expect("get").expect("exists");
+        let conflict = store
+            .update_job_observation(&job_id, "running", "in_sync", current.generation + 5, current.generation + 1, None, None)
+            .await
+            .expect_err("stale observation conflicts");
+        assert!(conflict.to_string().contains("generation conflict"));
+
+        let desired_updated = store
+            .update_job_desired_state(&job_id, "running", current.generation)
+            .await
+            .expect("desired update")
+            .expect("exists");
+        assert_eq!(desired_updated.generation, current.generation + 1);
+        assert_eq!(desired_updated.convergence, "reconciling");
+
+        store
+            .upsert_job_checkpoint(JobCheckpointRecord {
+                job_id: job_id.clone(),
+                job_version: 1,
+                checkpoint_id: "cp-smoke".to_string(),
+                kind: "periodic".to_string(),
+                status: "succeeded".to_string(),
+                manifest_uri: Some("s3://bucket/cp".to_string()),
+                format_version: 1,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .await
+            .expect("checkpoint upsert");
+        let checkpoints = store.list_job_checkpoints(&job_id).await.expect("list");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].checkpoint_id, "cp-smoke");
+        store
+            .delete_job_checkpoint(&job_id, "cp-smoke")
+            .await
+            .expect("delete");
+        assert!(store.list_job_checkpoints(&job_id).await.expect("list").is_empty());
+
+        // ---- audit / ops / rollouts / config ----
+        let audit_id = store
+            .record_audit(AuditRecord {
+                event_id: 0,
+                actor: Some("tester".to_string()),
+                action: "job.apply".to_string(),
+                resource_type: "job".to_string(),
+                resource_id: Some(job_id.clone()),
+                node_id: None,
+                stream_id: None,
+                correlation_id: Some("corr-a".to_string()),
+                outcome: "accepted".to_string(),
+                failure_code: None,
+                message: None,
+                occurred_at_ms: 500,
+            })
+            .await
+            .expect("audit");
+        assert!(audit_id > 0);
+        let audit = store
+            .list_audit(Some(&job_id))
+            .await
+            .expect("list audit");
+        assert!(audit.iter().any(|record| record.event_id == audit_id));
+
+        store
+            .upsert_operation(PersistedOperation {
+                operation_id: "op-smoke".to_string(),
+                node_id: "node-a".to_string(),
+                resource_id: job_id.clone(),
+                operation: "job_start".to_string(),
+                state: "succeeded".to_string(),
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                operation_json: "{}".to_string(),
+            })
+            .await
+            .expect("upsert op");
+        let op = store
+            .get_operation("op-smoke")
+            .await
+            .expect("get op")
+            .expect("exists");
+        assert_eq!(op.state, "succeeded");
+        let job_starts = store
+            .list_job_start_operations(&job_id)
+            .await
+            .expect("job starts");
+        assert_eq!(job_starts.len(), 1);
+        let node_ops = store
+            .list_operations(Some("node-a"))
+            .await
+            .expect("node ops");
+        assert_eq!(node_ops.len(), 1);
+
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "ro-smoke".to_string(),
+                    config_version_id: "cfg-ro".to_string(),
+                    state: "rolling".to_string(),
+                    batch_size: 2,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("tester".to_string()),
+                    correlation_id: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "ro-smoke".to_string(),
+                    node_id: "node-a".to_string(),
+                    ordinal: 0,
+                    state: "pending".to_string(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 1,
+                }],
+                r#"{"x":1}"#,
+                Some("tester"),
+            )
+            .await
+            .expect("create rollout");
+        let rollout = store
+            .get_rollout("ro-smoke")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(rollout.state, "rolling");
+        let targets = store
+            .list_rollout_targets("ro-smoke")
+            .await
+            .expect("targets");
+        assert_eq!(targets.len(), 1);
+        store
+            .update_rollout("ro-smoke", "converged", 1, 99)
+            .await
+            .expect("update rollout");
+        store
+            .update_rollout_target(RolloutTargetUpdate {
+                rollout_id: "ro-smoke".to_string(),
+                node_id: "node-a".to_string(),
+                state: "converged".to_string(),
+                attempt_id: Some("attempt-9".to_string()),
+                error: None,
+                observed_config_version: Some("cfg-ro".to_string()),
+                updated_at_ms: 99,
+            })
+            .await
+            .expect("update target");
+        let content = store
+            .get_config_version_content("cfg-ro")
+            .await
+            .expect("content")
+            .expect("exists");
+        assert_eq!(content, "{\"x\":1}");
+        let recovered = store.recover_rollouts().await.expect("recover");
+        assert!(recovered.is_empty(), "converged rollouts are not recovered");
+        let listed_rollouts = store.list_rollouts().await.expect("list");
+        assert!(listed_rollouts.iter().any(|r| r.rollout_id == "ro-smoke"));
+
+        // ---- prunes ----
+        assert!(store.prune_events(10_000).await.expect("prune events") == 0);
+        assert!(store.prune_audit_events(1, 10_000).await.expect("prune audit") == 0);
+        assert!(store.prune_operation_history(1, 10_000).await.expect("prune ops") == 0);
+        assert!(store.prune_processed_outbox(1, 10_000).await.expect("prune outbox") == 0);
+        assert!(store
+            .prune_job_checkpoint_records(1)
+            .await
+            .expect("prune checkpoints")
+            == 0);
+        assert!(store.prune_terminal_attempts(1, 10_000).await.expect("prune attempts") >= 0);
     }
 }

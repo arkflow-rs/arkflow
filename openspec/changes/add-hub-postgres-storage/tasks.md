@@ -8,8 +8,8 @@
 ## 2. PostgreSQL 实现
 
 - [ ] 2.1 `pg_store.rs`：PG DDL（17 表幂等）+ PgStore 连接/探测
-- [ ] 2.2 52 个命令的 sqlx 实现（`$n` 占位、`ON CONFLICT DO NOTHING`、IDENTITY RETURNING）
-- [ ] 2.3 live PG 契约套件（覆盖每个方法；无 ARKFLOW_TEST_POSTGRES_URL 时 skip）
+- [x] 2.2 52 个命令的 sqlx 实现（`$n` 占位、`ON CONFLICT DO NOTHING`、IDENTITY RETURNING）
+- [x] 2.3 live PG 契约套件（覆盖每个方法；无 ARKFLOW_TEST_POSTGRES_URL 时 skip）——全量冒烟：jobs CAS、nodes/streams 收敛、set_desired 幂等、intents/attempts 全生命周期、outbox claim、audit/ops、rollouts、prunes
 
 ## 3. 迁移工具
 
