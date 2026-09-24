@@ -55,3 +55,6 @@
 
 - intents/attempts 组 8 方法全部实现并 live 验证：list_intents、recover_reconciliation、mark_attempt_dispatched、expire_attempts（含 per-attempt 事件）、prune_terminal_attempts（双阶段保留）、claim_attempt（复用活动 attempt / 按 intent_type+action 创建新 attempt）、complete_attempt（temporary/transport/node_unavailable→retrying+outbox；stale_generation→superseded；ambiguous→degraded；其他失败→blocked；成功→仅终结 attempt）。live 冒烟覆盖 claim→dispatch→succeeded→语义断言（成功不直接收敛 intent，由 record_observed 驱动）与 expire→ambiguous→degraded。
 - 累计 22/52。剩余：outbox/events/audit/ops 组 12、rollouts/config 组 9、prunes 组 4（部分 prunes 已随 intents 组完成：prune_terminal_attempts、prune_job_checkpoint_records 待查）。
+### 环境注记（kafka_eos 与本 change 无关的验证注意）
+
+`cargo test --workspace` 连续两轮时，第一轮进程退出会泄漏 testcontainers 启动的 cp-kafka 容器（占用固定端口 9092），导致第二轮 `kafka_eos` 端口绑定失败。验证循环改为：每轮全量前 `docker rm -f $(docker ps -aq --filter ancestor=confluentinc/cp-kafka:7.5.0)`，且每轮只跑一次全量。

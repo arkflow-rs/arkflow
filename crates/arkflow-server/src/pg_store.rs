@@ -2384,3 +2384,98 @@ mod live_tests {
         let _ = pruned;
     }
 }
+
+/// Tables in dependency order for the migration copy (FKs referenced before
+/// referencing; self-referencing cp_intents copies parents first via id order).
+pub const MIGRATION_TABLES: &[&str] = &[
+    "cp_nodes",
+    "cp_jobs",
+    "cp_job_versions",
+    "cp_job_tasks",
+    "cp_job_checkpoints",
+    "cp_config_versions",
+    "cp_intents",
+    "cp_stream_desired",
+    "cp_stream_observed",
+    "cp_attempts",
+    "cp_events",
+    "cp_audit_events",
+    "cp_rollouts",
+    "cp_rollout_targets",
+    "cp_operations",
+    "cp_outbox",
+];
+
+/// Identity columns whose sequences must be re-synced after a copy.
+const IDENTITY_COLUMNS: &[(&str, &str)] = &[
+    ("cp_events", "event_id"),
+    ("cp_audit_events", "event_id"),
+    ("cp_outbox", "outbox_id"),
+];
+
+impl PgStore {
+    /// Copies `rows` (raw SQLite storage classes: Null/Integer/Text) into
+    /// `table` in one transaction.
+    pub async fn import_table(
+        &self,
+        table: &str,
+        columns: &[String],
+        types: &[String],
+        rows: &[Vec<rusqlite::types::Value>],
+    ) -> Result<(), StorageError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let placeholders: Vec<String> =
+            (1..=columns.len()).map(|index| format!("${index}")).collect();
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+            columns.join(", "),
+            placeholders.join(", ")
+        );
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            let mut query = sqlx::query(&sql).persistent(false);
+            for (index, value) in row.iter().enumerate() {
+                let integer_column = types.get(index).map(|t| t.to_uppercase().contains("INT")).unwrap_or(false);
+                query = match value {
+                    rusqlite::types::Value::Null => {
+                        if integer_column {
+                            query.bind(None::<i64>)
+                        } else {
+                            query.bind(None::<String>)
+                        }
+                    }
+                    rusqlite::types::Value::Integer(value) => query.bind(*value),
+                    rusqlite::types::Value::Real(value) => query.bind(*value),
+                    rusqlite::types::Value::Text(value) => query.bind(value.clone()),
+                    rusqlite::types::Value::Blob(value) => query.bind(value.clone()),
+                };
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Re-syncs identity sequences after an explicit-id copy.
+    pub async fn reset_identity_sequences(&self) -> Result<(), StorageError> {
+        for (table, column) in IDENTITY_COLUMNS {
+            sqlx::query(&format!(
+                "SELECT setval(pg_get_serial_sequence('{table}', '{column}'), COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)"
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Exact row count of a table (migration reconciliation).
+    pub async fn table_row_count(&self, table: &str) -> Result<i64, StorageError> {
+        let (count,): (i64,) =
+            sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+}

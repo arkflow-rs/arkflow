@@ -2107,6 +2107,57 @@ impl ControlPlaneBackend {
 }
 
 impl ControlPlaneStore {
+    /// Generic table export for the SQLite->PostgreSQL migration tool:
+    /// returns the column names (in order) and every row as raw values.
+    pub fn export_table(
+        &self,
+        table: &str,
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<rusqlite::types::Value>>), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut columns = Vec::new();
+        let mut types = Vec::new();
+        {
+            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                columns.push(row.get::<_, String>(1)?);
+                types.push(row.get::<_, String>(2)?);
+            }
+        }
+        if columns.is_empty() {
+            return Err(StorageError::Unsupported(format!(
+                "migration: source table {table} does not exist"
+            )));
+        }
+        let column_list = columns.join(", ");
+        let mut statement = connection.prepare(&format!(
+            "SELECT {column_list} FROM {table} ORDER BY rowid"
+        ))?;
+        let column_count = columns.len();
+        let mut rows = Vec::new();
+        let mut rows_iter = statement.query([])?;
+        while let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                values.push(row.get::<_, Option<rusqlite::types::Value>>(index)?.unwrap_or(
+                    rusqlite::types::Value::Null,
+                ));
+            }
+            rows.push(values);
+        }
+        Ok((columns, types, rows))
+    }
+
+    /// Exact row count of a table (migration reconciliation).
+    pub fn table_row_count(&self, table: &str) -> Result<i64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+        Ok(count)
+    }
+}
+
+impl ControlPlaneStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
