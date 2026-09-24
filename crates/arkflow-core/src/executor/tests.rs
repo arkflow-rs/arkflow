@@ -3960,13 +3960,21 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
 struct TickMarkerProcessor {
     first_process_delay: Duration,
     delayed: AtomicUsize,
+    /// Released when the first delivery has finished processing: the input
+    /// holds back the second batch until then, so the idle window in which
+    /// ticks fire is deterministic instead of wall-clock dependent.
+    gate: Arc<PublishGate>,
 }
 
 #[async_trait]
 impl Processor for TickMarkerProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        if self.delayed.fetch_add(1, Ordering::SeqCst) == 0 {
+        let first = self.delayed.fetch_add(1, Ordering::SeqCst) == 0;
+        if first {
+            // Keep the delivery in flight long enough for idle ticks to fire
+            // against the pool fence while it is being processed.
             tokio::time::sleep(self.first_process_delay).await;
+            self.gate.release().await;
         }
         Ok(ProcessResult::Single(batch))
     }
@@ -3980,6 +3988,29 @@ impl Processor for TickMarkerProcessor {
     }
 }
 
+/// Deterministic one-shot release gate that cannot miss wakeups.
+#[derive(Default)]
+struct PublishGate {
+    released: tokio::sync::Mutex<bool>,
+    notify: tokio::sync::Notify,
+}
+
+impl PublishGate {
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if *self.released.lock().await {
+                return;
+            }
+            notified.await;
+        }
+    }
+    async fn release(&self) {
+        *self.released.lock().await = true;
+        self.notify.notify_waiters();
+    }
+}
+
 /// With `pipeline.thread_num > 1`, an idle tick that fires while an earlier
 /// delivery is still inside the worker pool must not publish its generated
 /// batch before that delivery (per-edge ordered delivery).
@@ -3987,6 +4018,7 @@ impl Processor for TickMarkerProcessor {
 async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     struct GatedInput {
         reads: AtomicUsize,
+        gate: Arc<PublishGate>,
     }
     #[async_trait]
     impl Input for GatedInput {
@@ -4001,11 +4033,10 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                     Arc::new(crate::input::NoopAck),
                 )),
                 1 => {
-                    // Keep the chain alive well past the first batch's 400ms
-                    // in-flight window: under a loaded scheduler both sleeps
-                    // stretch together, so this margin is what guarantees an
-                    // idle window in which ticks can actually fire.
-                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                    // Deliver the second batch only after the first one has
+                    // finished processing: the idle window in which ticks can
+                    // fire is then guaranteed, not wall-clock dependent.
+                    self.gate.wait().await;
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -4018,14 +4049,17 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
             Ok(())
         }
     }
+    let second_batch_gate = Arc::new(PublishGate::default());
     let processor = Arc::new(TickMarkerProcessor {
         first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
+        gate: second_batch_gate.clone(),
     });
     let output = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: Arc::new(GatedInput {
             reads: AtomicUsize::new(0),
+            gate: second_batch_gate.clone(),
         }),
         output: output.clone(),
         processor,
@@ -4069,8 +4103,8 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         "tick output must reach the sink"
     );
     let leading_ticks = keys.iter().take_while(|key| key.as_str() == "tick").count();
-    assert!(
-        leading_ticks <= 1,
+    assert_eq!(
+        leading_ticks, 0,
         "tick output overtook in-flight pooled data: {keys:?}"
     );
     assert_eq!(
