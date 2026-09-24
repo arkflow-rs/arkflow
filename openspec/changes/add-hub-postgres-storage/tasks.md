@@ -40,3 +40,7 @@
 10. `execute` 的 usize 返回（prune_*）→ `sqlx::query(...).execute(...).await? as usize`。
 
 注意：`?N` 的 SQL 常量在 `with_connection`/`immediate_transaction` 包装体内——转写器按上述 4/5/6/7 四种调用形态逐个匹配（`connection.prepare` 两步形态先折叠为单步）。
+
+### 实施方式决策（2026-09-24 修订）
+
+放弃正则转写器（方法体含类型化 let、元组行映射、嵌套控制流，规则覆盖不住），改为**逐方法手写**：以 `/tmp/method_bodies.txt` 的 SQLite 实现为蓝本，按组（jobs → nodes/streams → intents/attempts → outbox/events/audit/ops → rollouts/config）手写 52 个 sqlx 方法，每组完成后立即用 live PG（`ARKFLOW_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:15432/arkflow_cp`，容器 arkflow-pg-test 已运行）跑冒烟验证。行映射规则：rusqlite `row.get(N)?` → sqlx `row.try_get(N)?`；`params![..]` → 链式 `.bind(..)`；`?N`→`$N`；`INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`；`last_insert_rowid`（仅 record_audit）→ `RETURNING event_id`。
