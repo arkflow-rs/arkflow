@@ -20,10 +20,21 @@ pub(crate) mod window;
 
 use arkflow_core::Error;
 
-pub fn init() -> Result<(), Error> {
+fn register_components() -> Result<(), Error> {
     memory::init()?;
     tumbling_window::init()?;
     sliding_window::init()?;
     session_window::init()?;
+    Ok(())
+}
+
+/// Component registration is process-global, so `init()` is idempotent: the
+/// first call registers every builder and later calls (tests, multi-entry
+/// binaries) return immediately without touching the registries again.
+pub fn init() -> Result<(), Error> {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = register_components();
+    });
     Ok(())
 }

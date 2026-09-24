@@ -63,6 +63,7 @@ const sidebars: SidebarsConfig = {
     ]},
     {type: 'category', label: 'Develop', link: {type: 'doc', id: 'develop/index'}, items: [
       'develop/kernel', 'develop/plugins', 'develop/s3-wal-performance',
+      'develop/benchmark',
     ]},
     {type: 'category', label: 'Migration', items: ['migration/routes']},
     {type: 'category', label: 'About', link: {type: 'doc', id: 'about/logo'}, items: [

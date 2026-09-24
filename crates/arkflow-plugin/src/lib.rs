@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 
+pub mod benchmark;
 pub mod buffer;
 pub mod codec;
 pub mod component;
