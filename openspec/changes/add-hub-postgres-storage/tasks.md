@@ -51,3 +51,7 @@
 
 - nodes/streams 组 9 方法全部实现（upsert_node/reset_observed_cursors/wake_node/get_node_maintenance/set_node_maintenance/set_desired 含幂等键与 supersede/get_desired/record_observed 含收敛与 fence/operational_aggregates）；intents 组 get_intent 已实现。live 冒烟扩展至 set_desired→幂等重放→收敛→维护→聚合，全绿。
 - 剩余 intents 组：list_intents、claim_attempt（含 attempt 创建）、mark_attempt_dispatched、complete_attempt（retry/supersede 分支）、expire_attempts、prune_terminal_attempts、recover_reconciliation；以及 outbox/events/audit/ops/rollouts/config 组共 ~39-5=39 个中的 33 个。sqlx 规则已成熟（u64 cast、try_get 泛型序、三括号）。
+### 进度 2026-09-24（续 3）
+
+- intents/attempts 组 8 方法全部实现并 live 验证：list_intents、recover_reconciliation、mark_attempt_dispatched、expire_attempts（含 per-attempt 事件）、prune_terminal_attempts（双阶段保留）、claim_attempt（复用活动 attempt / 按 intent_type+action 创建新 attempt）、complete_attempt（temporary/transport/node_unavailable→retrying+outbox；stale_generation→superseded；ambiguous→degraded；其他失败→blocked；成功→仅终结 attempt）。live 冒烟覆盖 claim→dispatch→succeeded→语义断言（成功不直接收敛 intent，由 record_observed 驱动）与 expire→ambiguous→degraded。
+- 累计 22/52。剩余：outbox/events/audit/ops 组 12、rollouts/config 组 9、prunes 组 4（部分 prunes 已随 intents 组完成：prune_terminal_attempts、prune_job_checkpoint_records 待查）。

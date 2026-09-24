@@ -351,6 +351,26 @@ async fn pg_get_intent(conn: &mut sqlx::PgConnection, intent_id: &str) -> Result
 }
 
 
+
+#[allow(clippy::type_complexity)]
+fn pg_row_attempt(row: &PgRow) -> Result<AttemptRecord, StorageError> {
+    Ok(AttemptRecord {
+        attempt_id: row.try_get(0)?,
+        intent_id: row.try_get(1)?,
+        command_id: row.try_get(2)?,
+        state: row.try_get(3)?,
+        failure_class: row.try_get(4)?,
+        node_id: row.try_get(5)?,
+        stream_id: row.try_get(6)?,
+        generation: row.try_get::<i64, usize>(7)? as u64,
+        operation: row.try_get(8)?,
+        action_id: row.try_get(9)?,
+        config_version_id: row.try_get(10)?,
+        payload_json: row.try_get(12)?,
+    })
+}
+
+
 impl PgStore {
     /// Connects, probes the server and creates the schema idempotently.
     /// A failure here fails Hub startup fast: a control plane without its
@@ -692,17 +712,31 @@ impl PgStore {
     }
 
     pub async fn list_intents(&self, node_id: Option<&str>) -> Result<Vec<IntentRecord>, StorageError> {
-        let _ = (&node_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: list_intents is not implemented yet"
-        )))
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT intent_id FROM cp_intents WHERE ($1 IS NULL OR node_id = $1) ORDER BY created_at_ms DESC, intent_id DESC LIMIT 4096",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut tx = self.pool.begin().await?;
+        let mut intents = Vec::with_capacity(ids.len());
+        for (id,) in ids {
+            if let Some(intent) = pg_get_intent(&mut tx, &id).await? {
+                intents.push(intent);
+            }
+        }
+        tx.commit().await?;
+        Ok(intents)
     }
 
     pub async fn recover_reconciliation(&self, now_ms: u64) -> Result<(), StorageError> {
-        let _ = (&now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: recover_reconciliation is not implemented yet"
-        )))
+        sqlx::query(
+            "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT 'reconcile:recovery:' || i.intent_id || ':' || $1, 'reconcile_intent', i.node_id, i.stream_id, i.intent_id, $1, $1 FROM cp_intents i WHERE i.state IN ('accepted', 'converging', 'retrying') AND (i.last_failure_class IS NULL OR i.last_failure_class <> 'ambiguous') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL) ON CONFLICT DO NOTHING",
+        )
+        .bind(now_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn wake_node(&self, node_id: &str, now_ms: u64) -> Result<(), StorageError> {
@@ -759,38 +793,269 @@ impl PgStore {
     }
 
     pub async fn prune_terminal_attempts(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
-        let _ = (&older_than_ms, &max_retained);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: prune_terminal_attempts is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = sqlx::query(
+            "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND COALESCE(finished_at_ms, created_at_ms) < $1",
+        )
+        .bind(older_than_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') AND attempt_id NOT IN (SELECT attempt_id FROM cp_attempts WHERE state NOT IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY COALESCE(finished_at_ms, created_at_ms) DESC, attempt_id DESC LIMIT $1)",
+        )
+        .bind(max_retained)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted as usize)
     }
 
     pub async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
-        let _ = (&intent_id);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: claim_attempt is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT a.attempt_id, a.intent_id, a.command_id, a.state, a.failure_class, a.node_id, a.stream_id, a.generation, a.operation, i.action_id, i.config_version_id, i.intent_type, COALESCE(i.payload_json, cv.content_ref) FROM cp_attempts a JOIN cp_intents i ON i.intent_id = a.intent_id LEFT JOIN cp_config_versions cv ON cv.config_version_id = i.config_version_id WHERE a.intent_id = $1 AND a.state IN ('queued', 'dispatched', 'acknowledged', 'running') ORDER BY a.created_at_ms DESC LIMIT 1",
+        )
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| pg_row_attempt(&row));
+        if let Some(attempt) = existing {
+            tx.commit().await?;
+            return Ok(Some(attempt?));
+        }
+        let target: Option<(
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT i.node_id, i.stream_id, i.generation, COALESCE(i.desired_state, ''), i.action_id, i.config_version_id, i.intent_type, COALESCE(i.payload_json, cv.content_ref) FROM cp_intents i LEFT JOIN cp_config_versions cv ON cv.config_version_id = i.config_version_id WHERE i.intent_id = $1 AND i.state IN ('accepted', 'converging', 'retrying')",
+        )
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((
+            node_id,
+            stream_id,
+            generation,
+            desired_state,
+            action_id,
+            config_version_id,
+            intent_type,
+            payload_json,
+        )) = target
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let generation = generation as u64;
+        let operation = if intent_type == "apply_configuration" {
+            "apply_configuration"
+        } else if action_id.is_some() {
+            "restart"
+        } else if desired_state == "running" {
+            "start"
+        } else {
+            "stop"
+        };
+        let suffix = crate::storage::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let attempt_id = format!("attempt-{suffix}");
+        let command_id = format!("cmd-{suffix}");
+        let now = crate::storage::now_ms();
+        sqlx::query(
+            "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, created_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8)",
+        )
+        .bind(&attempt_id)
+        .bind(intent_id)
+        .bind(&command_id)
+        .bind(&node_id)
+        .bind(&stream_id)
+        .bind(generation as i64)
+        .bind(operation)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(AttemptRecord {
+            attempt_id,
+            intent_id: intent_id.to_string(),
+            command_id,
+            state: "queued".to_string(),
+            failure_class: None,
+            node_id,
+            stream_id,
+            generation,
+            operation: operation.to_string(),
+            action_id,
+            config_version_id,
+            payload_json,
+        }))
     }
 
     pub async fn complete_attempt(&self, attempt_id: &str, state: &str, failure_class: Option<&str>) -> Result<(), StorageError> {
-        let _ = (&attempt_id, &state, &failure_class);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: complete_attempt is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let attempt: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT intent_id, node_id, stream_id, generation FROM cp_attempts WHERE attempt_id = $1",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((intent_id, node_id, stream_id, generation)) = attempt else {
+            return Ok(());
+        };
+        let generation = generation as u64;
+        let ambiguous = state == "ambiguous" || failure_class == Some("ambiguous");
+        let terminal = ambiguous
+            || matches!(
+                state,
+                "succeeded" | "failed" | "timed_out" | "node_unavailable" | "cancelled" | "superseded"
+            );
+        sqlx::query(
+            "UPDATE cp_attempts SET state = $1, failure_class = $2, finished_at_ms = CASE WHEN $3 THEN $4 ELSE finished_at_ms END WHERE attempt_id = $5",
+        )
+        .bind(state)
+        .bind(failure_class)
+        .bind(terminal)
+        .bind(crate::storage::now_ms() as i64)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+        if terminal {
+            match failure_class {
+                Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
+                    let retry_at = crate::storage::now_ms() + 1_000;
+                    sqlx::query(
+                        "UPDATE cp_intents SET state = 'retrying', convergence_state = 'degraded', retry_count = retry_count + 1, next_retry_at_ms = $1, last_failure_class = $2, updated_at_ms = $1 WHERE intent_id = $3 AND state IN ('accepted', 'converging', 'retrying')",
+                    )
+                    .bind(retry_at as i64)
+                    .bind(failure_class)
+                    .bind(&intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let event_key = format!("reconcile:retry:{attempt_id}");
+                    sqlx::query(
+                        "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES ($1, 'retry_intent', $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&event_key)
+                    .bind(&node_id)
+                    .bind(&stream_id)
+                    .bind(&intent_id)
+                    .bind(retry_at as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Some("stale_generation") => {
+                    sqlx::query(
+                        "UPDATE cp_intents SET state = 'superseded', convergence_state = 'degraded', last_failure_class = $1, updated_at_ms = $2 WHERE intent_id = $3 AND state IN ('accepted', 'converging', 'retrying')",
+                    )
+                    .bind(failure_class)
+                    .bind(crate::storage::now_ms() as i64)
+                    .bind(&intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Some("ambiguous") => {
+                    sqlx::query(
+                        "UPDATE cp_intents SET state = 'converging', convergence_state = 'degraded', next_retry_at_ms = NULL, last_failure_class = $1, updated_at_ms = $2 WHERE intent_id = $3 AND state IN ('accepted', 'converging', 'retrying')",
+                    )
+                    .bind(failure_class)
+                    .bind(crate::storage::now_ms() as i64)
+                    .bind(&intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Some(_) if state != "succeeded" => {
+                    sqlx::query(
+                        "UPDATE cp_intents SET state = 'blocked', convergence_state = 'blocked', last_failure_class = $1, updated_at_ms = $2 WHERE intent_id = $3 AND state IN ('accepted', 'converging', 'retrying')",
+                    )
+                    .bind(failure_class)
+                    .bind(crate::storage::now_ms() as i64)
+                    .bind(&intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                None if state != "succeeded" => {
+                    sqlx::query(
+                        "UPDATE cp_intents SET state = 'blocked', convergence_state = 'blocked', updated_at_ms = $1 WHERE intent_id = $2 AND state IN ('accepted', 'converging', 'retrying')",
+                    )
+                    .bind(crate::storage::now_ms() as i64)
+                    .bind(&intent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+        sqlx::query(
+            "INSERT INTO cp_events (node_id, stream_id, intent_id, attempt_id, event_type, outcome, failure_class, generation, occurred_at_ms) VALUES ($1, $2, $3, $4, 'attempt_completed', $5, $6, $7, $8)",
+        )
+        .bind(&node_id)
+        .bind(&stream_id)
+        .bind(&intent_id)
+        .bind(attempt_id)
+        .bind(state)
+        .bind(failure_class)
+        .bind(generation as i64)
+        .bind(crate::storage::now_ms() as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn mark_attempt_dispatched(&self, attempt_id: &str, expires_at_ms: u64) -> Result<(), StorageError> {
-        let _ = (&attempt_id, &expires_at_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: mark_attempt_dispatched is not implemented yet"
-        )))
+        sqlx::query(
+            "UPDATE cp_attempts SET state = 'dispatched', dispatched_at_ms = $1, expires_at_ms = $2 WHERE attempt_id = $3 AND state = 'queued'",
+        )
+        .bind(crate::storage::now_ms() as i64)
+        .bind(expires_at_ms as i64)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError> {
-        let _ = (&now_ms);
-        Err(StorageError::Unsupported(format!(
-            "postgres backend: expire_attempts is not implemented yet"
-        )))
+        let mut tx = self.pool.begin().await?;
+        let expired: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT attempt_id, intent_id, node_id, stream_id FROM cp_attempts WHERE state IN ('queued', 'dispatched', 'acknowledged', 'running') AND expires_at_ms IS NOT NULL AND expires_at_ms <= $1",
+        )
+        .bind(now_ms as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (attempt_id, intent_id, node_id, stream_id) in &expired {
+            sqlx::query(
+                "UPDATE cp_attempts SET state = 'ambiguous', failure_class = 'ambiguous', finished_at_ms = $1 WHERE attempt_id = $2 AND state IN ('queued', 'dispatched', 'acknowledged', 'running')",
+            )
+            .bind(now_ms as i64)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE cp_intents SET state = 'converging', convergence_state = 'degraded', next_retry_at_ms = NULL, last_failure_class = 'ambiguous', updated_at_ms = $1 WHERE intent_id = $2 AND state IN ('accepted', 'converging', 'retrying')",
+            )
+            .bind(now_ms as i64)
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO cp_events (node_id, stream_id, intent_id, event_type, outcome, failure_class, message, occurred_at_ms) VALUES ($1, $2, $3, 'attempt_expired', 'ambiguous', 'ambiguous', 'Attempt lease expired; waiting for a fresh observed report', $4)",
+            )
+            .bind(node_id)
+            .bind(stream_id)
+            .bind(intent_id)
+            .bind(now_ms as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(expired.len())
     }
 
     pub async fn record_observed(&self, mutation: ObservedMutation) -> Result<(), StorageError> {
@@ -1394,5 +1659,99 @@ mod live_tests {
 
         store.reset_observed_cursors(&node_id).await.expect("reset");
         store.wake_node(&node_id, 20_000).await.expect("wake");
+
+        // ---- attempts group ----
+        let stream_id2 = format!(
+            "att-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let intent = store
+            .set_desired(DesiredMutation {
+                node_id: "att-node".to_string(),
+                stream_id: stream_id2.clone(),
+                desired_state: "running".to_string(),
+                config_version_id: None,
+                action_id: None,
+                payload_json: None,
+                expected_generation: None,
+                intent_type: None,
+                idempotency_key: None,
+                actor: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("set_desired");
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .expect("claim")
+            .expect("attempt created");
+        assert_eq!(attempt.state, "queued");
+        assert_eq!(attempt.operation, "start");
+        // Re-claim returns the same active attempt.
+        let again = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .expect("re-claim")
+            .expect("existing attempt");
+        assert_eq!(again.attempt_id, attempt.attempt_id);
+
+        store
+            .mark_attempt_dispatched(&attempt.attempt_id, 10_000)
+            .await
+            .expect("dispatch");
+
+        store
+            .complete_attempt(&attempt.attempt_id, "succeeded", None)
+            .await
+            .expect("complete");
+        // Completing the attempt terminates it; the intent itself converges
+        // through record_observed only - until that report arrives, a re-claim
+        // legitimately creates a fresh attempt (at-least-once control loop).
+        let after = store
+            .get_intent(&intent.intent_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            after.state, "accepted",
+            "a succeeded attempt alone does not converge the intent"
+        );
+
+        // Expired attempt becomes ambiguous and degrades the intent.
+        let intent2 = store
+            .set_desired(DesiredMutation {
+                node_id: "att-node".to_string(),
+                stream_id: format!("{stream_id2}-2"),
+                desired_state: "running".to_string(),
+                config_version_id: None,
+                action_id: None,
+                payload_json: None,
+                expected_generation: None,
+                intent_type: None,
+                idempotency_key: None,
+                actor: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("set_desired 2");
+        let attempt2 = store
+            .claim_attempt(&intent2.intent_id)
+            .await
+            .expect("claim")
+            .expect("attempt created");
+        store
+            .mark_attempt_dispatched(&attempt2.attempt_id, 1)
+            .await
+            .expect("dispatch 2");
+        let expired = store.expire_attempts(2).await.expect("expire");
+        assert!(expired >= 1, "expiry must catch the dispatched attempt");
+        let degraded = store
+            .get_intent(&intent2.intent_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(degraded.state, "converging");
+        assert_eq!(degraded.convergence_state, "degraded");
     }
 }
