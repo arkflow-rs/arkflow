@@ -4404,6 +4404,17 @@
                 "type": "string"
               },
               "description": "Extra HTTP headers."
+            },
+            "stream": {
+              "type": "boolean",
+              "description": "Request SSE streaming (`stream: true`) and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions."
+            },
+            "tools": {
+              "description": "OpenAI tools definition passed through verbatim to the request body for function calling."
+            },
+            "tool_calls_column": {
+              "type": "string",
+              "description": "When set, appends this column with the response's tool_calls as JSON text (empty string when the response has none). Streamed tool_call deltas are merged by index."
             }
           },
           "required": [

@@ -57,7 +57,10 @@ pub fn init() -> Result<(), Error> {
                 "max_tokens": {"type": "integer", "description": "Completion token cap; omitted from the request when unset."},
                 "concurrency": {"type": "integer", "description": "Maximum in-flight requests. Defaults to 4."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
-                "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."}
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."},
+                "stream": {"type": "boolean", "description": "Request SSE streaming (`stream: true`) and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions."},
+                "tools": {"description": "OpenAI tools definition passed through verbatim to the request body for function calling."},
+                "tool_calls_column": {"type": "string", "description": "When set, appends this column with the response's tool_calls as JSON text (empty string when the response has none). Streamed tool_call deltas are merged by index."}
             },
             "required": ["api_base", "model", "field"]
         }),
@@ -96,6 +99,12 @@ struct LlmProcessorConfig {
     timeout_ms: u64,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    tools: Option<Value>,
+    #[serde(default)]
+    tool_calls_column: Option<String>,
 }
 
 fn default_target_field() -> String {
@@ -126,6 +135,8 @@ struct Choice {
 #[derive(serde::Deserialize)]
 struct ChatMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Value>,
 }
 
 #[async_trait]
@@ -138,7 +149,24 @@ impl Processor for LlmProcessor {
 
         let texts = extract_string_column(&msg_batch, &self.config.field)?;
         let completions = self.complete_all(&texts).await?;
-        let batch = append_column(&msg_batch, &self.config.target_field, &completions)?;
+        let response_texts: Vec<String> = completions
+            .iter()
+            .map(|completion| completion.text.clone())
+            .collect();
+        let batch = append_column(&msg_batch, &self.config.target_field, &response_texts)?;
+        let batch = match &self.config.tool_calls_column {
+            None => batch,
+            Some(column) => {
+                let tool_call_texts: Vec<String> = completions
+                    .iter()
+                    .map(|completion| match &completion.tool_calls {
+                        Some(tool_calls) => tool_calls.to_string(),
+                        None => String::new(),
+                    })
+                    .collect();
+                append_column(&batch, column, &tool_call_texts)?
+            }
+        };
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -152,17 +180,17 @@ impl LlmProcessor {
     /// most `concurrency` requests are in flight. Requests already in
     /// flight complete even if an earlier row failed — the batch fails as
     /// a whole either way.
-    async fn complete_all(&self, texts: &[&str]) -> Result<Vec<String>, Error> {
+    async fn complete_all(&self, texts: &[&str]) -> Result<Vec<Completion>, Error> {
         let owned: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
         futures_util::stream::iter(owned.into_iter().map(|text| self.complete(text)))
             .buffered(self.config.concurrency)
-            .collect::<Vec<Result<String, Error>>>()
+            .collect::<Vec<Result<Completion, Error>>>()
             .await
             .into_iter()
             .collect()
     }
 
-    async fn complete(&self, text: String) -> Result<String, Error> {
+    async fn complete(&self, text: String) -> Result<Completion, Error> {
         let mut messages = Vec::new();
         if let Some(system_prompt) = &self.config.system_prompt {
             messages.push(json!({"role": "system", "content": system_prompt}));
@@ -179,6 +207,12 @@ impl LlmProcessor {
         }
         if let Some(max_tokens) = self.config.max_tokens {
             body["max_tokens"] = json!(max_tokens);
+        }
+        if self.config.stream {
+            body["stream"] = json!(true);
+        }
+        if let Some(tools) = &self.config.tools {
+            body["tools"] = tools.clone();
         }
 
         let url = format!(
@@ -212,18 +246,116 @@ impl LlmProcessor {
             )));
         }
 
+        if self.config.stream {
+            // SSE framing is parsed from the buffered response; the processor
+            // still emits one complete text per row.
+            let (text, tool_calls) = assemble_sse(&body)?;
+            return Ok(Completion { text, tool_calls });
+        }
+
         let parsed: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
             Error::Process(format!("LLM API response parse failed: {}", e))
         })?;
-        let content = parsed
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone())
-            .ok_or_else(|| {
-                Error::Process("LLM API response has no choice content".to_string())
-            })?;
-        Ok(content)
+        let choice = parsed.choices.first().ok_or_else(|| {
+            Error::Process("LLM API response has no choice content".to_string())
+        })?;
+        // A tool-calls-only response legitimately has `content: null`.
+        let text = choice.message.content.clone().unwrap_or_default();
+        if text.is_empty() && choice.message.tool_calls.is_none() {
+            return Err(Error::Process(
+                "LLM API response has no choice content".to_string(),
+            ));
+        }
+        Ok(Completion {
+            text,
+            tool_calls: choice.message.tool_calls.clone(),
+        })
     }
+}
+
+/// One row's completion: the assistant text plus any tool calls the model
+/// emitted (function calling).
+struct Completion {
+    text: String,
+    tool_calls: Option<Value>,
+}
+
+/// Assembles an OpenAI-compatible SSE body: `data: {json}` frames carry
+/// `choices[0].delta` increments, `data: [DONE]` ends the stream. Content
+/// deltas concatenate in arrival order; tool_call deltas merge by their
+/// `index` (first non-null id/name wins, argument strings concatenate).
+fn assemble_sse(body: &str) -> Result<(String, Option<Value>), Error> {
+    let mut content = String::new();
+    let mut calls: std::collections::BTreeMap<u64, (Option<String>, Option<String>, String)> =
+        std::collections::BTreeMap::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            break;
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(payload)
+            .map_err(|e| Error::Process(format!("LLM stream chunk parse failed: {e}")))?;
+        let Some(delta) = chunk
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("delta"))
+        else {
+            continue;
+        };
+        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+            content.push_str(text);
+        }
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+            for call in tool_calls {
+                let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let entry = calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                    if entry.0.is_none() {
+                        entry.0 = Some(id.to_string());
+                    }
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                        if entry.1.as_deref().unwrap_or("").is_empty() {
+                            entry.1 = Some(name.to_string());
+                        }
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+                        entry.2.push_str(arguments);
+                    }
+                }
+            }
+        }
+    }
+    let tool_calls = if calls.is_empty() {
+        None
+    } else {
+        let array: Vec<Value> = calls
+            .into_iter()
+            .map(|(index, (id, name, arguments))| {
+                let mut function = serde_json::Map::new();
+                if let Some(name) = name {
+                    function.insert("name".to_string(), json!(name));
+                }
+                function.insert("arguments".to_string(), json!(arguments));
+                let mut call = serde_json::Map::new();
+                call.insert("index".to_string(), json!(index));
+                if let Some(id) = id {
+                    call.insert("id".to_string(), json!(id));
+                }
+                call.insert("function".to_string(), Value::Object(function));
+                Value::Object(call)
+            })
+            .collect();
+        Some(Value::Array(array))
+    };
+    Ok((content, tool_calls))
 }
 
 struct LlmProcessorBuilder;
@@ -354,7 +486,7 @@ mod tests {
     use datafusion::arrow::array::{Int64Array, LargeStringArray};
     use std::cell::RefCell;
 
-    fn test_resource() -> Resource {
+    pub(crate) fn test_resource() -> Resource {
         Resource {
             temporary: Default::default(),
             input_names: RefCell::new(Default::default()),
@@ -363,14 +495,14 @@ mod tests {
 
     /// Minimal in-process HTTP server: one request per connection, canned
     /// status/body per request, logs every request.
-    struct MockApi {
-        addr: std::net::SocketAddr,
+    pub(crate) struct MockApi {
+        pub(crate) addr: std::net::SocketAddr,
         requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockApi {
-        fn spawn<F>(handler: F) -> Self
+        pub(crate) fn spawn<F>(handler: F) -> Self
         where
             F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
         {
@@ -445,7 +577,7 @@ mod tests {
             }
         }
 
-        fn requests(&self) -> Vec<(String, String)> {
+        pub(crate) fn requests(&self) -> Vec<(String, String)> {
             self.requests.lock().unwrap().clone()
         }
 
@@ -467,7 +599,7 @@ mod tests {
             .unwrap()
     }
 
-    fn text_batch(texts: Vec<Option<&str>>) -> MessageBatchRef {
+    pub(crate) fn text_batch(texts: Vec<Option<&str>>) -> MessageBatchRef {
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
         let array = Arc::new(StringArray::from(texts));
         Arc::new(MessageBatch::new_arrow(
@@ -757,5 +889,185 @@ mod tests {
                 "config must be rejected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use super::tests::{text_batch, test_resource, MockApi};
+    use serde_json::json;
+
+    fn build(config_extra: Value, addr: std::net::SocketAddr) -> Arc<dyn Processor> {
+        let mut config = json!({
+            "api_base": format!("http://{addr}/v1"),
+            "model": "test-model",
+            "field": "text",
+            "concurrency": 2
+        });
+        for (key, value) in config_extra.as_object().expect("object") {
+            config[key.as_str()] = value.clone();
+        }
+        LlmProcessorBuilder
+            .build(None, &Some(config), &test_resource())
+            .unwrap()
+    }
+
+    fn sse_body(frames: &[Value]) -> String {
+        let mut body = String::new();
+        for frame in frames {
+            body.push_str(&format!("data: {}\n\n", frame));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    #[tokio::test]
+    async fn stream_mode_assembles_content_deltas() {
+        let api = MockApi::spawn(|_body| {
+            let payload = sse_body(&[
+                json!({"choices": [{"delta": {"content": "Hel"}}]}),
+                json!({"choices": [{"delta": {"content": "lo "}}]}),
+                json!({"choices": [{"delta": {"content": "world"}}]}),
+            ]);
+            (200, payload)
+        });
+        let processor = build(json!({"stream": true}), api.addr);
+        let result = processor
+            .process(text_batch(vec![Some("prompt")]))
+            .await
+            .unwrap();
+        let ProcessResult::Single(batch) = result else {
+            panic!("expected a single batch");
+        };
+        let column = batch
+            .column(batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(column.value(0), "Hello world");
+        // The request must have opted into streaming.
+        let (head, body) = &api.requests()[0];
+        assert!(body.contains("\"stream\":true"), "{body}");
+        assert!(head.contains("POST"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn tools_passthrough_and_non_stream_tool_calls_land_in_column() {
+        let tools = json!([{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+        let api = MockApi::spawn(|_body| {
+            let response = json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call-1", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]
+                }}]
+            });
+            (200, response.to_string())
+        });
+        let processor = build(
+            json!({"tools": tools, "tool_calls_column": "calls"}),
+            api.addr,
+        );
+        let result = processor
+            .process(text_batch(vec![Some("weather?")]))
+            .await
+            .unwrap();
+        let ProcessResult::Single(batch) = result else {
+            panic!("expected a single batch");
+        };
+        assert_eq!(batch.num_columns(), 3, "text + response + calls");
+        let calls = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let calls: Value = serde_json::from_str(calls.value(0)).unwrap();
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+        // Tools must reach the request body verbatim.
+        let (_, body) = &api.requests()[0];
+        assert!(body.contains("\"tools\""), "{body}");
+        assert!(body.contains("get_weather"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_call_fragments_merge_by_index() {
+        let api = MockApi::spawn(|_body| {
+            let payload = sse_body(&[
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-9",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}}]}),
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
+                    "function": {"arguments": "\"Oslo\"}"}}]}}]}),
+            ]);
+            (200, payload)
+        });
+        let processor = build(
+            json!({"stream": true, "tool_calls_column": "calls"}),
+            api.addr,
+        );
+        let result = processor
+            .process(text_batch(vec![Some("weather?")]))
+            .await
+            .unwrap();
+        let ProcessResult::Single(batch) = result else {
+            panic!("expected a single batch");
+        };
+        let calls = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let calls: Value = serde_json::from_str(calls.value(0)).unwrap();
+        assert_eq!(calls[0]["id"], "call-9");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Oslo\"}");
+    }
+
+    #[tokio::test]
+    async fn stream_without_done_marker_still_assembles() {
+        let api = MockApi::spawn(|_body| {
+            let mut payload = String::new();
+            payload.push_str("data: {\"choices\": [{\"delta\": {\"content\": \"abc\"}}]}\n\n");
+            // No [DONE] terminator: the end of the body ends the stream.
+            (200, payload)
+        });
+        let processor = build(json!({"stream": true}), api.addr);
+        let result = processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
+        let ProcessResult::Single(batch) = result else {
+            panic!("expected a single batch");
+        };
+        let column = batch
+            .column(batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(column.value(0), "abc");
+    }
+
+    #[tokio::test]
+    async fn tool_calls_column_absent_keeps_schema_unchanged() {
+        let api = MockApi::spawn(|_body| {
+            let response = json!({
+                "choices": [{"message": {"role": "assistant", "content": "hi",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}}]}}]
+            });
+            (200, response.to_string())
+        });
+        let processor = build(json!({}), api.addr);
+        let result = processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
+        let ProcessResult::Single(batch) = result else {
+            panic!("expected a single batch");
+        };
+        assert_eq!(batch.num_columns(), 2, "no calls column without config");
     }
 }

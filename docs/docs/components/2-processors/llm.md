@@ -26,6 +26,9 @@ It pairs naturally with [SQL](/docs/components/processors/sql) (prepare the prom
 | api_key | string | no | — | Sent as `Authorization: Bearer`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
 | headers | map | no | — | Extra HTTP headers (e.g. Azure's `api-key`). |
+| stream | boolean | no | `false` | Request SSE streaming and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions. The processor still emits one complete text per row. |
+| tools | array | no | — | OpenAI [tools definition](https://platform.openai.com/docs/guides/function-calling) passed through verbatim for function calling. |
+| tool_calls_column | string | no | — | When set, appends this column with the response's tool calls as JSON text (empty string when there are none). Streamed tool-call deltas are merged by index. |
 
 :::note
 Each row is one request (the chat protocol has no batch form). Requests
