@@ -2,7 +2,7 @@ use arkflow_server::{
     hub::{Hub, HubConfig},
     oidc::OidcFederation,
     serve_hub,
-    storage::{ControlPlaneStore, StorageActor},
+    storage::{ControlPlaneBackend, ControlPlaneStore, StorageActor},
     ServerConfig,
 };
 use tokio_util::sync::CancellationToken;
@@ -32,9 +32,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         poll_interval_ms: config.poll_interval_ms,
         session_ttl_ms: config.session_ttl_ms,
     };
-    let mut hub = if let Some(path) = config.hub_storage.as_deref() {
-        let store = ControlPlaneStore::open(path)?;
-        Hub::with_storage(hub_config, StorageActor::start(store, 128))
+    let mut hub = if let Some(spec) = config.hub_storage.as_deref() {
+        // `postgres://`/`postgresql://` URLs select the PostgreSQL backend;
+        // anything else remains a path to the SQLite database file.
+        let backend = if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            ControlPlaneBackend::Postgres(arkflow_server::pg_store::PgStore::open(spec).await?)
+        } else {
+            ControlPlaneBackend::Sqlite(ControlPlaneStore::open(spec)?)
+        };
+        Hub::with_storage(hub_config, StorageActor::start(backend, 128))
     } else {
         Hub::new(hub_config)
     };

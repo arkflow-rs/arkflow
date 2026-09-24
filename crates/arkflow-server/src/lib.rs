@@ -8,6 +8,7 @@ pub mod api_contract;
 pub mod hub;
 pub mod metrics;
 pub mod oidc;
+pub mod pg_store;
 pub mod storage;
 
 use crate::api_contract::{
@@ -3825,7 +3826,7 @@ mod tests {
                 poll_interval_ms: 10,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store.clone(), 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store.clone()),  8),
         );
         assert!(secure
             .validate_hub_startup(&missing_credentials)
@@ -3842,7 +3843,7 @@ mod tests {
                 poll_interval_ms: 10,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store, 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8),
         );
         assert!(secure.validate_hub_startup(&valid_hub).is_ok());
     }
@@ -4355,7 +4356,7 @@ mod tests {
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store, 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8),
         );
         hub.register(hub::RegisterRequest {
             data_address: None,
@@ -4476,7 +4477,7 @@ mod tests {
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store, 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8),
         );
         let app = hub_router(hub, &ServerConfig::default());
         let response = app
@@ -4531,7 +4532,7 @@ mod tests {
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store, 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8),
         );
         let response = hub_router(hub, &ServerConfig::default())
             .oneshot(
@@ -4567,7 +4568,7 @@ mod tests {
                 poll_interval_ms: 100,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(store, 8),
+            storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8),
         );
         let app = hub_router(hub, &ServerConfig::default());
         let response = app
@@ -4769,7 +4770,7 @@ mod tests {
     #[tokio::test]
     async fn configuration_apply_persists_target_and_reconciles_offline_write() {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = storage::StorageActor::start(store, 8);
+        let storage = storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = hub::Hub::with_storage(
             hub::HubConfig {
                 operator_token: Some("operator".into()),
@@ -4882,7 +4883,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let storage = storage::StorageActor::start(store, 8);
+        let storage = storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = hub::Hub::with_storage(
             hub::HubConfig {
                 operator_token: Some("operator".into()),
@@ -4926,7 +4927,7 @@ mod tests {
     #[tokio::test]
     async fn operation_resource_exposes_retry_superseded_and_blocked_states() {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = storage::StorageActor::start(store, 8);
+        let storage = storage::StorageActor::start(storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = hub::Hub::with_storage(
             hub::HubConfig {
                 operator_token: Some("operator".into()),
