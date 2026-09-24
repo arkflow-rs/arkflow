@@ -2443,37 +2443,6 @@
       }
     },
     {
-      "kind": "processor",
-      "name": "wasm",
-      "description": "Runs each row through a sandboxed WebAssembly module (wasmtime) using the raw memory ABI.",
-      "config_optional": false,
-      "config_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Path to the WebAssembly module (.wasm binary or .wat text). The module must export memory, alloc(len)->ptr, dealloc(ptr,len) and the transform function."
-          },
-          "function": {
-            "type": "string",
-            "description": "Name of the exported transform function. Defaults to 'transform'."
-          },
-          "fuel": {
-            "type": "integer",
-            "description": "Per-row fuel budget for wasmtime's metering. Defaults to 10000000."
-          }
-        },
-        "required": [
-          "path"
-        ]
-      },
-      "config_example": {
-        "path": "./transforms/filter.wasm",
-        "function": "transform"
-      }
-    },
-    {
       "kind": "buffer",
       "name": "memory",
       "description": "In-memory buffer that releases a batch when it reaches capacity or after a timeout.",

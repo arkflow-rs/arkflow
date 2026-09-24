@@ -58,7 +58,6 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | processor | `sql` | Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables. | [reference](../components/processors/sql) |
 | processor | `vector_search` | Searches a Qdrant collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. | [reference](../components/processors/vector-search) |
 | processor | `vrl` | Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment. | [reference](../components/processors/vrl) |
-| processor | `wasm` | Runs each row through a sandboxed WebAssembly module (wasmtime) using the raw memory ABI. | [reference](../components/processors/wasm) |
 | temporary | `redis` | Redis-backed temporary lookup store (single node or cluster) read through a codec. | [reference](../components/temporary/redis) |
 
 <!-- COMPONENT_INVENTORY_END -->
