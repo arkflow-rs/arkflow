@@ -2380,6 +2380,7 @@ mod live_tests {
             .await
             .expect("prune checkpoints")
             == 0);
-        assert!(store.prune_terminal_attempts(1, 10_000).await.expect("prune attempts") >= 0);
+        let pruned = store.prune_terminal_attempts(1, 10_000).await.expect("prune attempts");
+        let _ = pruned;
     }
 }
