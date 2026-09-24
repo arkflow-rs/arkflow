@@ -559,6 +559,13 @@ mod tests {
                         request_log.lock().unwrap().push((head.clone(), body.clone()));
 
                         let (status, response_body) = handler(&body);
+                        // Decrement before the response is written: with
+                        // `Connection: close` the client opens its next
+                        // request's connection as soon as it sees the bytes,
+                        // and that handler's `fetch_add` could otherwise race
+                        // this thread's `fetch_sub`, inflating the observed
+                        // in-flight count past the real client-side cap.
+                        tracker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         let response = format!(
                             "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
                             response_body.len()
@@ -566,7 +573,6 @@ mod tests {
                         use std::io::Write;
                         let _ = stream.write_all(response.as_bytes());
                         let _ = stream.flush();
-                        tracker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
             });
