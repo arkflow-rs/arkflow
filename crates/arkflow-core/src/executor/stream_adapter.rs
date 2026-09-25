@@ -883,7 +883,7 @@ mod wal_lifecycle_tests {
 
         // Sequence 2 parks behind the in-flight sequence 1. The 150ms sleep
         // lets sequence 2 reach Wal::acknowledge's parked branch before the
-        // close fires; the drain window (15s) is far longer, so B stays
+        // close fires; the drain window (30s) is far longer, so B stays
         // parked until A settles.
         let wal_for_b = wal.clone();
         let task_b = tokio::spawn(async move {
@@ -917,6 +917,100 @@ mod wal_lifecycle_tests {
             2,
             "both sequences committed through the drain"
         );
+        let _ = close_task.await;
+    }
+
+    /// The drain window is bounded: when the earlier in-flight delivery
+    /// never settles after a close request, the parked acknowledgement
+    /// fails with the pending-error message instead of parking forever
+    /// (which would leak the `Arc<Wal>` and hold the redb file lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_drain_window_expiry_fails_the_parked_acknowledgement() {
+        use tokio::sync::Notify;
+
+        struct GatedAck {
+            release: Arc<Notify>,
+            entered: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::input::Ack for GatedAck {
+            async fn ack(&self) -> Result<(), Error> {
+                self.entered.notify_waiters();
+                // Never settles until the test explicitly releases.
+                self.release.notified().await;
+                Ok(())
+            }
+
+            fn mark_held(&self) {}
+            fn release_held(&self) {}
+            async fn undo(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        wal.override_ack_drain_window_for_tests(std::time::Duration::from_millis(200));
+        let seq1 = wal.append(&trivial_batch()).await.unwrap();
+        let seq2 = wal.append(&trivial_batch()).await.unwrap();
+        assert_eq!((seq1, seq2), (1, 2));
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let seq1_ack = Arc::new(GatedAck {
+            release: release.clone(),
+            entered: entered.clone(),
+        });
+
+        // Sequence 1 enters its in-flight source commit and blocks.
+        let wal_for_a = wal.clone();
+        let ack_for_a = seq1_ack.clone();
+        let task_a = tokio::spawn(async move {
+            crate::wal::WalAck::new(wal_for_a, seq1, ack_for_a)
+                .ack()
+                .await
+                .unwrap();
+        });
+        entered.notified().await;
+
+        // Sequence 2 parks behind the in-flight sequence 1.
+        let wal_for_b = wal.clone();
+        let task_b = tokio::spawn(async move {
+            crate::wal::WalAck::new(wal_for_b, seq2, Arc::new(crate::input::NoopAck))
+                .ack()
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Close fires and sequence 1 never settles: the shortened drain
+        // window must expire and fail the parked acknowledgement.
+        let wal_for_close = wal.clone();
+        let close_task = tokio::spawn(async move { wal_for_close.close().await });
+
+        let seq2_result = tokio::time::timeout(std::time::Duration::from_secs(30), task_b)
+            .await
+            .expect("parked acknowledgement settles within the test budget")
+            .unwrap();
+        let error = seq2_result.expect_err("window expiry fails the parked acknowledgement");
+        assert!(
+            error
+                .to_string()
+                .contains("WAL closed while acknowledgement was pending"),
+            "unexpected error: {error}"
+        );
+
+        // Let sequence 1 settle so the test's tasks all complete.
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task_a)
+            .await
+            .expect("sequence 1 settles after release")
+            .unwrap();
         let _ = close_task.await;
     }
 }

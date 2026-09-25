@@ -255,6 +255,9 @@ pub struct Wal {
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
+    /// Close drain window in milliseconds; kept mutable so tests can shrink
+    /// it without waiting the production window.
+    ack_drain_window_ms: AtomicU64,
     policy: SyncPolicy,
     // --- staging for group-commit / periodic ---
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
@@ -284,6 +287,8 @@ struct PendingWalAck {
 /// How long a parked WAL acknowledgement keeps waiting for an earlier
 /// in-flight delivery to settle after a close request fires, before the
 /// pending-error path takes over (recovery replays unsettled entries).
+const WAL_ACK_DRAIN_WINDOW: Duration = Duration::from_secs(30);
+
 impl Wal {
     /// Open (or create) a WAL.
     ///
@@ -329,6 +334,7 @@ impl Wal {
             frontier,
             acknowledgements: Mutex::new(BTreeMap::new()),
             next_seq: AtomicU64::new(next_seq),
+            ack_drain_window_ms: AtomicU64::new(WAL_ACK_DRAIN_WINDOW.as_millis() as u64),
             policy: sync_policy,
             pending: Mutex::new(Vec::new()),
             pending_notify: Notify::new(),
@@ -459,7 +465,9 @@ impl Wal {
         }
 
         loop {
-            let notified = self.ack_notify.notified();
+            // Pinned once per iteration so the parked branch can keep polling
+            // the same future across both stages of the close drain window.
+            let mut notified = std::pin::pin!(self.ack_notify.notified());
             let work = {
                 let mut acknowledgements = self.acknowledgements.lock().await;
                 let first_seq = acknowledgements.keys().next().copied();
@@ -561,12 +569,27 @@ impl Wal {
                 }
                 None => {
                     // A close request does not immediately fail a parked
-                    // acknowledgement. The parked waiter simply waits for the
-                    // frontier to advance (the earlier in-flight delivery to
-                    // settle). At-least-once is preserved: if the process
-                    // shuts down, the unacknowledged delivery replays on
-                    // recovery.
-                    notified.await;
+                    // acknowledgement: the earlier in-flight delivery gets a
+                    // bounded drain window to settle, and the parked waiter
+                    // completes normally when it does. Once the window
+                    // expires, the pending-error path takes over and recovery
+                    // replays the unsettled delivery (at-least-once holds).
+                    tokio::select! {
+                        _ = notified.as_mut() => {}
+                        _ = self.close.cancelled() => {
+                            let window = Duration::from_millis(
+                                self.ack_drain_window_ms.load(Ordering::Acquire),
+                            );
+                            tokio::select! {
+                                _ = notified.as_mut() => {}
+                                _ = tokio::time::sleep(window) => {
+                                    return Err(Error::Process(
+                                        "WAL closed while acknowledgement was pending".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -774,6 +797,14 @@ impl Wal {
         // a torn-write / disk failure is not silently lost on graceful shutdown.
         self.flush_pending().await?;
         self.store.close()
+    }
+
+    /// Shrinks the close drain window so tests can exercise window expiry
+    /// without waiting the production 30s.
+    #[cfg(test)]
+    pub(crate) fn override_ack_drain_window_for_tests(&self, window: Duration) {
+        self.ack_drain_window_ms
+            .store(window.as_millis() as u64, Ordering::Release);
     }
 }
 
