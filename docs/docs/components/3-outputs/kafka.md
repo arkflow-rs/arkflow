@@ -38,7 +38,12 @@ The `security` block is identical for the Kafka input and output. The effective 
 | tls.insecure_skip_verify | boolean | `true` disables broker certificate verification — development/testing only |
 
 :::warning
-`sasl.username`, `sasl.password`, and `tls.*` values are stored as plain text in the configuration. Guard the configuration file and any control-plane storage accordingly.
+When written literally, `sasl.username`, `sasl.password`, and `tls.*` values
+are stored as plain text in the configuration. Prefer
+[secret references](../../reference/configuration.md#secret-references)
+(`${env:KAFKA_PASSWORD}`, `${file:...}`) so credentials stay out of the
+config file; guard the configuration file and any control-plane storage
+accordingly.
 :::
 
 Inconsistent blocks fail fast at configuration validation time (before any stream starts): a `sasl_*` protocol without a `sasl` block, missing SCRAM credentials, or an explicit `plaintext` protocol alongside a `sasl`/`tls` block are all rejected.

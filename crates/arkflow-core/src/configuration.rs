@@ -126,6 +126,9 @@ pub enum ConfigFormat {
 
 impl ConfigCandidate {
     pub fn parse(&self) -> Result<EngineConfig, ConfigIssue> {
+        if crate::secret::contains_reference(&self.content) {
+            return self.parse_with_secret_references();
+        }
         match self.format {
             ConfigFormat::Yaml => serde_yaml::from_str(&self.content).map_err(|error| {
                 let path = error
@@ -150,6 +153,32 @@ impl ConfigCandidate {
                 parse_error_at(path, error)
             }),
         }
+    }
+
+    /// Resolution path for documents containing secret references: parse to
+    /// a value tree, resolve, then deserialize. Syntax errors keep the same
+    /// location mapping as the direct path; type errors report "document"
+    /// (the documented trade-off of the value channel).
+    fn parse_with_secret_references(&self) -> Result<EngineConfig, ConfigIssue> {
+        let document = match self.format {
+            ConfigFormat::Yaml => crate::secret::ConfigDocument::Yaml(&self.content),
+            ConfigFormat::Json => crate::secret::ConfigDocument::Json(&self.content),
+            ConfigFormat::Toml => crate::secret::ConfigDocument::Toml(&self.content),
+        };
+        let value = crate::secret::resolve_document(document).map_err(|error| ConfigIssue {
+            path: "document".to_string(),
+            message: error.to_string(),
+        })?;
+        serde_json::from_value(value).map_err(|_| {
+            // Deserialization failures after secret resolution must not echo
+            // the offending value: serde type errors can embed the resolved
+            // secret. Use a fixed, value-independent message.
+            ConfigIssue {
+                path: "document".to_string(),
+                message: "configuration content failed validation after secret resolution"
+                    .to_string(),
+            }
+        })
     }
 }
 
@@ -338,6 +367,47 @@ mod tests {
         assert_eq!(redacted["auth"]["token"], "******");
         assert_eq!(redacted["nested"][0]["enabled"], true);
         assert_eq!(redacted["nested"][0]["api_key"], "******");
+    }
+
+    #[test]
+    fn parse_resolves_secret_references() {
+        std::env::set_var("ARKFLOW_CP_TEST_TOKEN", "from-env");
+        let candidate = ConfigCandidate {
+            format: ConfigFormat::Yaml,
+            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_TOKEN}\"\n"
+                .to_string(),
+        };
+        let config = candidate.parse().unwrap();
+        std::env::remove_var("ARKFLOW_CP_TEST_TOKEN");
+        assert_eq!(config.health_check.api_token.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn parse_reports_unresolved_reference_with_path_in_message() {
+        std::env::remove_var("ARKFLOW_CP_TEST_UNSET");
+        let candidate = ConfigCandidate {
+            format: ConfigFormat::Yaml,
+            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_UNSET}\"\n"
+                .to_string(),
+        };
+        let issue = candidate.parse().unwrap_err();
+        assert!(
+            issue.message.contains("${env:ARKFLOW_CP_TEST_UNSET}"),
+            "{}",
+            issue.message
+        );
+        assert!(issue.message.contains("health_check.api_token"), "{}", issue.message);
+    }
+
+    #[test]
+    fn parse_without_references_keeps_line_numbers() {
+        let candidate = ConfigCandidate {
+            format: ConfigFormat::Yaml,
+            content: "logging:\n  level: debug\nhealth_check:\n  api_token: [1, 2]\n"
+                .to_string(),
+        };
+        let issue = candidate.parse().unwrap_err();
+        assert!(issue.path.starts_with("line "), "{}", issue.path);
     }
 
     #[test]

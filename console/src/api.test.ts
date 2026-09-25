@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { streamEvents } from './api'
+import {
+  oidcLogout,
+  oidcStatus,
+  redirectToOidcLogin,
+  request,
+  resetOidcStatusCacheForTests,
+  streamEvents,
+} from './api'
 
 describe('control-plane event stream', () => {
   afterEach(() => {
@@ -35,3 +42,110 @@ describe('control-plane event stream', () => {
     expect(events[0]).toMatchObject({ event_type: 'stream_changed' })
   })
 })
+
+describe('OIDC console integration', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    sessionStorage.clear()
+    delete (globalThis as Record<string, unknown>).fetch
+  })
+
+  it('redirects a 401 to the OIDC login when the flow is enabled', async () => {
+    sessionStorage.clear()
+    resetOidcStatusCacheForTests()
+    const locations: string[] = []
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { assign: (value: string) => locations.push(value) },
+    })
+    vi.stubEnv('VITE_API_TOKEN', '')
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const path = String(url)
+      if (path.endsWith('/auth/oidc/status')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ login_enabled: true, authenticated: false, principal: null }),
+        })
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        headers: new Headers(),
+        json: () => Promise.resolve({}),
+      })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    await expect(request('/system')).rejects.toMatchObject({ status: 401 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(locations).toEqual(['/api/v1/auth/oidc/login'])
+
+    // The redirect guard must prevent an immediate loop.
+    await expect(request('/system')).rejects.toMatchObject({ status: 401 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(locations).toEqual(['/api/v1/auth/oidc/login'])
+    vi.unstubAllEnvs()
+  })
+
+  it('does not redirect when a static token is configured', async () => {
+    sessionStorage.clear()
+    resetOidcStatusCacheForTests()
+    const locations: string[] = []
+    vi.stubEnv('VITE_API_TOKEN', 'static-token')
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const path = String(url)
+      if (path.endsWith('/auth/oidc/status')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ login_enabled: true, authenticated: false, principal: null }),
+        })
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        headers: new Headers(),
+        json: () => Promise.resolve({}),
+      })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    await expect(request('/system')).rejects.toMatchObject({ status: 401 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(locations).toEqual([])
+    vi.unstubAllEnvs()
+  })
+
+  it('probes the status endpoint once and caches the result', async () => {
+    sessionStorage.clear()
+    resetOidcStatusCacheForTests()
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      expect(String(url)).toContain('/auth/oidc/status')
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            login_enabled: true,
+            authenticated: true,
+            principal: { id: 'u1', roles: ['viewer'] },
+          }),
+      })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const first = await oidcStatus()
+    const second = await oidcStatus()
+    expect(first).toEqual({
+      login_enabled: true,
+      authenticated: true,
+      principal: { id: 'u1', roles: ['viewer'] },
+    })
+    expect(second).toBe(first)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+function locations_missing(): boolean {
+  return true
+}

@@ -386,6 +386,9 @@ pub struct Hub {
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     command_metrics: Arc<CommandMetrics>,
+    /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
+    /// operator credentials keep priority when both are configured.
+    oidc: Option<Arc<crate::oidc::OidcFederation>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -540,6 +543,7 @@ impl Hub {
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
+            oidc: None,
         }
     }
 
@@ -547,6 +551,25 @@ impl Hub {
         let mut hub = Self::new(config);
         hub.storage = Some(storage);
         hub
+    }
+
+    /// Enables OIDC JWT bearer principals and (when client credentials are
+    /// configured) the browser login flow. See `crate::oidc`.
+    pub fn with_oidc(mut self, oidc: Arc<crate::oidc::OidcFederation>) -> Self {
+        self.oidc = Some(oidc);
+        self
+    }
+
+    /// The federation when the browser login flow is enabled.
+    pub fn oidc_login(&self) -> Option<Arc<crate::oidc::OidcFederation>> {
+        let federation = self.oidc.as_ref()?;
+        federation.login_enabled().then(|| federation.clone())
+    }
+
+    /// Resolves an `arkflow_session` cookie value to its principal.
+    pub fn oidc_session_principal(&self, session_id: &str) -> Option<OperatorPrincipal> {
+        let federation = self.oidc.as_ref()?;
+        federation.resolve_session(session_id)
     }
 
     pub fn has_storage(&self) -> bool {
@@ -2475,13 +2498,34 @@ impl Hub {
         if !online {
             return Ok(None);
         }
-        let Some(attempt) = storage
+        let Some(mut attempt) = storage
             .claim_attempt(&outbox.intent_id.clone().unwrap_or_default())
             .await
             .map_err(HubError::from)?
         else {
             return Ok(None);
         };
+        // Transient secret pre-resolution: `${secret:...}` references in
+        // configuration payloads resolve against the HUB environment at
+        // dispatch time only. Storage keeps the verbatim reference (no
+        // plaintext at rest), and retries re-resolve, so secret rotation
+        // applies to later attempts. `env:`/`file:` references stay
+        // node-local and are left for the agent's own materialization.
+        if attempt.operation == "apply_configuration" {
+            if let Some(payload) = &attempt.payload_json {
+                if payload.contains("secret:") {
+                    match arkflow_core::secret::resolve_candidate_payload(payload.clone()) {
+                        Ok(Some(resolved)) => attempt.payload_json = Some(resolved),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(HubError::Invalid(format!(
+                                "configuration dispatch pre-resolution failed: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let operation = self.enqueue_attempt(attempt).await?;
         storage
             .mark_outbox_processed(outbox.outbox_id, now_ms())
@@ -2490,38 +2534,50 @@ impl Hub {
         Ok(Some(operation))
     }
 
-    pub fn operator_authorized(&self, supplied: Option<&str>) -> bool {
-        self.operator_principal(supplied).is_some()
+    pub async fn operator_authorized(&self, supplied: Option<&str>) -> bool {
+        self.operator_principal(supplied).await.is_some()
     }
 
-    pub fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
-        let Some(expected) = self.config.operator_token.as_deref() else {
-            return self
-                .config
-                .insecure_local
-                .then(OperatorPrincipal::legacy_operator);
-        };
-        if expected.trim().is_empty() {
-            return None;
+    pub async fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
+        if let Some(expected) = self.config.operator_token.as_deref() {
+            if !expected.trim().is_empty() {
+                if let Some(supplied) = supplied {
+                    let (id, role, secret, scopes) = parse_operator_credential(expected);
+                    if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
+                        return Some(OperatorPrincipal {
+                            id: id.to_owned(),
+                            roles: vec![role],
+                            scopes,
+                        });
+                    }
+                    // A bearer that is not the static credential falls
+                    // through to OIDC below (JWTs never ct_eq-match).
+                } else {
+                    return None;
+                }
+            }
+        } else if self.config.insecure_local {
+            return Some(OperatorPrincipal::legacy_operator());
         }
-        let (id, role, secret, scopes) = parse_operator_credential(expected);
-        let supplied = supplied?;
-        if !bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
-            return None;
+
+        // Static credentials did not match (or are absent); fall back to
+        // browser session cookies and OIDC JWT validation when federation
+        // is configured.
+        let federation = self.oidc.as_ref()?;
+        let token = supplied?;
+        if let Some(session_id) = token.strip_prefix("session:") {
+            return federation.resolve_session(session_id);
         }
-        Some(OperatorPrincipal {
-            id: id.to_owned(),
-            roles: vec![role],
-            scopes,
-        })
+        federation.authenticate(token).await
     }
 
-    pub fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
+    pub async fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
         self.operator_principal(supplied)
+            .await
             .is_some_and(|principal| principal.can(action))
     }
 
-    pub fn operator_can_scope(
+    pub async fn operator_can_scope(
         &self,
         supplied: Option<&str>,
         action: OperatorAction,
@@ -2529,6 +2585,7 @@ impl Hub {
         resource_id: Option<&str>,
     ) -> bool {
         self.operator_principal(supplied)
+            .await
             .is_some_and(|principal| principal.can_scope(action, resource_type, resource_id))
     }
 
@@ -4799,6 +4856,7 @@ impl Hub {
                             changes += 1;
                             continue;
                         };
+
                         let expected_generation = storage
                             .get_desired(target.node_id.clone(), "__configuration__")
                             .await
@@ -6485,7 +6543,7 @@ mod tests {
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
         });
-        assert!(!hub.operator_authorized(None));
+        assert!(!hub.operator_authorized(None).await);
         let result = hub
             .register(RegisterRequest {
                 node_id: "unauthorized-node".into(),
@@ -6642,20 +6700,20 @@ mod tests {
         assert_eq!(capabilities, vec!["configuration"]);
     }
 
-    #[test]
-    fn compatibility_token_can_be_scoped_to_a_role() {
+    #[tokio::test]
+    async fn compatibility_token_can_be_scoped_to_a_role() {
         let hub = Hub::new(HubConfig {
             operator_token: Some("readonly|viewer|viewer-secret".into()),
             ..config()
         });
-        assert!(hub.operator_authorized(Some("viewer-secret")));
-        assert!(hub.operator_can(Some("viewer-secret"), OperatorAction::Read));
-        assert!(!hub.operator_can(Some("viewer-secret"), OperatorAction::Operate));
-        assert!(!hub.operator_authorized(Some("operator")));
+        assert!(hub.operator_authorized(Some("viewer-secret")).await);
+        assert!(hub.operator_can(Some("viewer-secret"), OperatorAction::Read).await);
+        assert!(!hub.operator_can(Some("viewer-secret"), OperatorAction::Operate).await);
+        assert!(!hub.operator_authorized(Some("operator")).await);
     }
 
-    #[test]
-    fn operator_credential_can_limit_resource_scope() {
+    #[tokio::test]
+    async fn operator_credential_can_limit_resource_scope() {
         let hub = Hub::new(HubConfig {
             operator_token: Some("ops|operator|operator-secret|node=node-a,rollout=".into()),
             ..config()
@@ -6665,19 +6723,19 @@ mod tests {
             OperatorAction::Operate,
             "node",
             Some("node-a")
-        ));
+        ).await);
         assert!(!hub.operator_can_scope(
             Some("operator-secret"),
             OperatorAction::Operate,
             "node",
             Some("node-b")
-        ));
+        ).await);
         assert!(hub.operator_can_scope(
             Some("operator-secret"),
             OperatorAction::ManageRollouts,
             "rollout",
             Some("rollout-1")
-        ));
+        ).await);
     }
 
     #[test]
@@ -6865,6 +6923,114 @@ mod tests {
             2
         );
         assert_eq!(hub.audit(Some(&rollout.rollout_id)).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn rollout_dispatch_keeps_reference_when_secret_missing() {
+        // Reconcile itself does not resolve secrets: the dispatch-time
+        // pre-resolution happens later (at command delivery), and the
+        // version store keeps the verbatim reference.
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let assertion_store = store.clone();
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:never_set_x}\n"
+        })
+        .to_string();
+        std::env::remove_var("ARKFLOW_SECRET_never_set_x");
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-missing', 'digest', ?1, 'json', 1)",
+                    [&candidate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let rollout = hub
+            .create_rollout("cfg-missing".into(), vec!["node-a".into()], 1, None, None)
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+        let content = assertion_store
+            .get_config_version_content("cfg-missing".into())
+            .unwrap()
+            .expect("version content");
+        assert!(
+            content.contains("${secret:never_set_x}"),
+            "stored version must keep the reference: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_dispatch_preresolves_secret_references() {
+        std::env::set_var("ARKFLOW_SECRET_db_pass", "s3cret");
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let assertion_store = store.clone();
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:db_pass}\n  host: ${env:HUB_HOST}\n"
+        })
+        .to_string();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-secret', 'digest', ?1, 'json', 1)",
+                    [&candidate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let rollout = hub
+            .create_rollout("cfg-secret".into(), vec!["node-a".into()], 1, None, None)
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+
+        std::env::remove_var("ARKFLOW_SECRET_db_pass");
+        // The dispatched intent payload carries the resolved value and no
+        // secret reference; env refs stay node-local.
+        let payload: Option<String> = assertion_store
+            .with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT payload_json FROM cp_intents WHERE intent_type = 'apply_configuration' ORDER BY created_at_ms DESC LIMIT 1")?;
+                let value: Option<String> = statement.query_row([], |row| row.get(0))?;
+                Ok(value)
+            })
+            .unwrap();
+        let payload = payload.expect("apply_configuration intent payload");
+        // Storage keeps the verbatim reference: no plaintext at rest, and
+        // later delivery attempts re-resolve against fresh environment
+        // values. env refs stay node-local.
+        assert!(payload.contains("${secret:db_pass}"), "{payload}");
+        assert!(!payload.contains("s3cret"), "{payload}");
+        assert!(payload.contains("${env:HUB_HOST}"), "{payload}");
     }
 
     #[tokio::test]

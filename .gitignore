@@ -17,3 +17,5 @@ console/dist/
 *.tsbuildinfo
 data/
 .zcode/
+__pycache__/
+*.pyc

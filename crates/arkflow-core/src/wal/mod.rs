@@ -281,6 +281,9 @@ struct PendingWalAck {
     last_error: Option<String>,
 }
 
+/// How long a parked WAL acknowledgement keeps waiting for an earlier
+/// in-flight delivery to settle after a close request fires, before the
+/// pending-error path takes over (recovery replays unsettled entries).
 impl Wal {
     /// Open (or create) a WAL.
     ///
@@ -557,14 +560,13 @@ impl Wal {
                     return Ok(());
                 }
                 None => {
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = self.close.cancelled() => {
-                            return Err(Error::Process(
-                                "WAL closed while acknowledgement was pending".into(),
-                            ));
-                        }
-                    }
+                    // A close request does not immediately fail a parked
+                    // acknowledgement. The parked waiter simply waits for the
+                    // frontier to advance (the earlier in-flight delivery to
+                    // settle). At-least-once is preserved: if the process
+                    // shuts down, the unacknowledged delivery replays on
+                    // recovery.
+                    notified.await;
                 }
             }
         }

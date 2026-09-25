@@ -65,3 +65,10 @@ input:
   auth:
     token: "my_token"
 ```
+
+## TLS
+
+Use a `tls://` URL scheme to connect over TLS (for example
+`tls://nats.example.com:4422`); async-nats negotiates TLS natively for
+`tls://` URLs and requires the server to support TLS.
+

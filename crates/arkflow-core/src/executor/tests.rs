@@ -1543,6 +1543,7 @@ fn barrier(checkpoint_id: &str) -> Envelope {
     Envelope::Barrier(CheckpointBarrier {
         checkpoint_id: checkpoint_id.into(),
         generation: 1,
+        trace_context: None,
     })
 }
 
@@ -1724,6 +1725,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
             .send_async(Envelope::Barrier(CheckpointBarrier {
                 checkpoint_id: format!("cp-{round}"),
                 generation: 1,
+                trace_context: None,
             }))
             .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1761,6 +1763,7 @@ async fn coordinator_completes_only_after_all_participants() {
         barrier: CheckpointBarrier {
             checkpoint_id: checkpoint_id.into(),
             generation: 1,
+            trace_context: None,
         },
         cut_generation: 1,
         state: crate::state::StateSnapshot::new(1, vec![]),
@@ -3957,23 +3960,80 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
 struct TickMarkerProcessor {
     first_process_delay: Duration,
     delayed: AtomicUsize,
+    started: std::sync::atomic::AtomicBool,
+    tick_seen: std::sync::atomic::AtomicBool,
+    /// Released once a tick has actually reached the chain after the first
+    /// delivery: the input then delivers the second batch, so the tick vs
+    /// data ordering exercised here is driven by engine sequencing rather
+    /// than wall-clock margins.
+    gate: Arc<PublishGate>,
 }
 
 #[async_trait]
 impl Processor for TickMarkerProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         if self.delayed.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Keep the delivery in flight long enough for idle ticks to fire
+            // against the pool fence while it is being processed.
+            self.started.store(true, Ordering::SeqCst);
             tokio::time::sleep(self.first_process_delay).await;
         }
         Ok(ProcessResult::Single(batch))
     }
     async fn on_tick(&self) -> Result<ProcessResult, Error> {
-        Ok(ProcessResult::Single(Arc::new(MessageBatch::new_arrow(
-            int64_batch(vec![(-1, "tick".into())]),
-        ))))
+        if !self.started.load(Ordering::SeqCst) {
+            // Ticks before the first delivery are pure startup noise: suppress
+            // them so the leading-tick assertion stays load independent.
+            return Ok(ProcessResult::None);
+        }
+        let release = !self.tick_seen.swap(true, Ordering::SeqCst);
+        let output = self.tick_batch();
+        // Release the second batch only after this tick's output has been
+        // handed to the downstream publisher: on_tick and the data path share
+        // the chain task, so "b" cannot be received until a later select
+        // iteration and every tick published so far precedes it downstream.
+        if release {
+            self.gate.release().await;
+        }
+        Ok(output)
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+impl TickMarkerProcessor {
+    fn tick_batch(&self) -> ProcessResult {
+        ProcessResult::Single(Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+            -1,
+            "tick".into(),
+        )]))))
+    }
+}
+
+/// Deterministic one-shot release gate that cannot miss wakeups.
+#[derive(Default)]
+struct PublishGate {
+    released: tokio::sync::Mutex<bool>,
+    notify: tokio::sync::Notify,
+}
+
+impl PublishGate {
+    async fn released(&self) -> bool {
+        *self.released.lock().await
+    }
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if *self.released.lock().await {
+                return;
+            }
+            notified.await;
+        }
+    }
+    async fn release(&self) {
+        *self.released.lock().await = true;
+        self.notify.notify_waiters();
     }
 }
 
@@ -3984,6 +4044,7 @@ impl Processor for TickMarkerProcessor {
 async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     struct GatedInput {
         reads: AtomicUsize,
+        gate: Arc<PublishGate>,
     }
     #[async_trait]
     impl Input for GatedInput {
@@ -3998,8 +4059,10 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
                     Arc::new(crate::input::NoopAck),
                 )),
                 1 => {
-                    // Keep the chain alive past the first 100ms ticks.
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    // Deliver the second batch only after the first one has
+                    // finished processing: the idle window in which ticks can
+                    // fire is then guaranteed, not wall-clock dependent.
+                    self.gate.wait().await;
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -4012,14 +4075,19 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
             Ok(())
         }
     }
+    let second_batch_gate = Arc::new(PublishGate::default());
     let processor = Arc::new(TickMarkerProcessor {
-        first_process_delay: Duration::from_millis(400),
+        first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
+        started: std::sync::atomic::AtomicBool::new(false),
+        tick_seen: std::sync::atomic::AtomicBool::new(false),
+        gate: second_batch_gate.clone(),
     });
     let output = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: Arc::new(GatedInput {
             reads: AtomicUsize::new(0),
+            gate: second_batch_gate.clone(),
         }),
         output: output.clone(),
         processor,
@@ -4063,8 +4131,8 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         "tick output must reach the sink"
     );
     let leading_ticks = keys.iter().take_while(|key| key.as_str() == "tick").count();
-    assert!(
-        leading_ticks <= 1,
+    assert_eq!(
+        leading_ticks, 0,
         "tick output overtook in-flight pooled data: {keys:?}"
     );
     assert_eq!(
@@ -4595,6 +4663,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         Envelope::Barrier(CheckpointBarrier {
             checkpoint_id: checkpoint.into(),
             generation: 3,
+            trace_context: None,
         })
     };
     let data = |value: i64, key: &str| {
@@ -4748,4 +4817,500 @@ async fn downstream_processing_failure_keeps_upstream_branch_pending() {
 
     upstream.shutdown();
     downstream.shutdown();
+}
+
+/// Process-wide OTel test plumbing: `set_global_default` wins exactly once
+/// per process, so every span test must share one exporter and provider.
+/// Tests isolate themselves by filtering on unique task markers, not by
+/// exporter identity. A `OnceLock` guarantees the first span test to run
+/// installs the layer and every test observes the same finished spans.
+fn span_test_tracing()
+-> (
+    &'static opentelemetry_sdk::trace::InMemorySpanExporter,
+    &'static opentelemetry_sdk::trace::SdkTracerProvider,
+) {
+    use opentelemetry::trace::TracerProvider as _;
+    use std::sync::OnceLock;
+    static TRACING: OnceLock<(
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    )> = OnceLock::new();
+    let (exporter, provider) = TRACING.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("executor-span-test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(otel_layer),
+        );
+        (exporter, provider)
+    });
+    (exporter, provider)
+}
+
+#[tokio::test]
+async fn job_and_chain_spans_are_exported_with_parent_links() {
+    let (exporter, provider) = span_test_tracing();
+
+    // Unique operator id: the global OTel subscriber sees spans from
+    // concurrently running executor tests in this binary, so assertions
+    // must filter by a marker unique to this test's graph.
+    let spec = spec(
+        vec![map_operator("span-op-7351")],
+        vec![edge("source", "span-op-7351"), edge("span-op-7351", "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let names: Vec<&str> = finished
+        .iter()
+        .map(|span| span.name.as_ref())
+        .filter(|name| *name == "job.run" || *name == "chain.run")
+        .collect();
+    assert!(
+        names.contains(&"job.run") && names.contains(&"chain.run"),
+        "expected job.run and chain.run spans, got {names:?}"
+    );
+
+    // Contamination-proof identification: find OUR chain span by the unique
+    // task marker, then our job.run via its parent link. (The global OTel
+    // subscriber also sees spans from concurrently running executor tests
+    // in this binary, so absolute counts are not reliable.)
+    let op_chain = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
+                })
+        })
+        .expect("op chain span must be exported");
+    let job = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "job.run"
+                && span.span_context.span_id() == op_chain.parent_span_id
+        })
+        .expect("job.run parent of the chain span");
+        let chains_attr = job
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "chains")
+        .expect("chains attribute");
+    let chains_value = match &chains_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        other => panic!("unexpected chains attribute: {other:?}"),
+    };
+    assert_eq!(chains_value, 3, "3 chains in this graph");
+
+    // Every chain.run must be a child of the job.run span.
+    let _job_span_id = job.span_context.span_id();
+    // Contamination-proof: find OUR chain span by the unique task marker,
+    // then get the parent job span, then find all chain.run siblings.
+    let op_chain = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
+                })
+        })
+        .expect("op chain span must be exported");
+    let job_span_id = op_chain.parent_span_id;
+    let job = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "job.run"
+                && span.span_context.span_id() == job_span_id
+        })
+        .expect("job.run parent of the chain span");
+    let chains_attr = job
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "chains")
+        .expect("chains attribute");
+    let chains_value = match &chains_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        other => panic!("unexpected chains attribute: {other:?}"),
+    };
+    assert_eq!(chains_value, 3, "3 chains in this graph");
+
+    let chain_runs: Vec<_> = finished
+        .iter()
+        .filter(|span| {
+            span.name.as_ref() == "chain.run" && span.parent_span_id == job_span_id
+        })
+        .collect();
+    assert_eq!(chain_runs.len(), 3);
+    for chain in &chain_runs {
+        assert_eq!(
+            chain.parent_span_id, job_span_id,
+            "chain.run must be a child of job.run"
+        );
+    }
+
+    let tasks: Vec<String> = chain_runs
+        .iter()
+        .filter_map(|span| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == "task")
+                .map(|kv| kv.value.as_str().to_string())
+        })
+        .collect();
+    assert!(tasks.contains(&"source-0".to_string()), "{tasks:?}");
+    assert!(tasks.contains(&"span-op-7351-0".to_string()), "{tasks:?}");
+    assert!(tasks.contains(&"sink-0".to_string()), "{tasks:?}");
+}
+
+#[tokio::test]
+async fn batch_span_carries_rows_and_task_with_chain_parent() {
+    let (exporter, provider) = span_test_tracing();
+
+    // Unique operator id: the global OTel subscriber sees spans from
+    // concurrently running executor tests in this binary, so assertions
+    // must filter by a marker unique to this test's graph.
+    let operator = "span-batch-7352";
+    let spec = spec(
+        vec![map_operator(operator)],
+        vec![edge("source", operator), edge(operator, "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let rows: Vec<(i64, String)> = (0..10).map(|i| (i, format!("r{i}"))).collect();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![rows])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let task_id = format!("{operator}-0");
+
+    let chain_run = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.run"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .expect("chain.run span for the operator chain")
+        .span_context
+        .span_id();
+
+    let batch_spans: Vec<_> = finished
+        .iter()
+        .filter(|span| {
+            span.name.as_ref() == "chain.batch"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .collect();
+    assert_eq!(batch_spans.len(), 1, "one batch → one chain.batch span");
+    let batch = batch_spans[0];
+    assert_eq!(
+        batch.parent_span_id, chain_run,
+        "chain.batch must be a child of chain.run"
+    );
+    let rows_attr = batch
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "rows")
+        .expect("rows attribute");
+    let rows_value = match &rows_attr.value {
+        opentelemetry::Value::I64(value) => *value,
+        opentelemetry::Value::String(value) => {
+            let text: String = value.clone().into();
+            text.parse::<i64>()
+                .unwrap_or_else(|_| panic!("rows attribute not numeric: {text}"))
+        }
+        other => panic!("unexpected rows attribute: {other:?}"),
+    };
+    assert_eq!(rows_value, 10, "rows attribute must be the batch row count");
+}
+
+#[tokio::test]
+async fn operator_failure_is_recorded_as_chain_batch_event() {
+    let (exporter, provider) = span_test_tracing();
+
+    let operator = "span-batch-fail-7353";
+    let spec = spec(
+        vec![map_operator(operator)],
+        vec![edge("source", operator), edge(operator, "sink")],
+        1,
+    );
+    let plan = JobPlan::compile(spec).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(FailingProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    // The failure has no error-output route, so the job fails — but the
+    // batch span still closes with the operator failure event attached.
+    let result = run_graph(graph, CancellationToken::new()).await;
+    assert!(result.is_err(), "failing operator must fail the job");
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let task_id = format!("{operator}-0");
+    let batch = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.batch"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == task_id)
+        })
+        .expect("chain.batch span exported even when the operator fails");
+
+    let event = batch
+        .events
+        .iter()
+        .find(|event| event.name == "operator processing failed; routing to error outputs")
+        .expect("operator failure event on the batch span");
+    let operator_attr = event
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "operator")
+        .expect("operator attribute on the failure event");
+    assert_eq!(operator_attr.value.as_str(), task_id);
+}
+
+#[test]
+fn barrier_wire_json_is_backward_and_forward_compatible() {
+    // An older sender emits no trace_context field at all.
+    let legacy = r#"{"checkpoint_id":"c","generation":1}"#;
+    let barrier: CheckpointBarrier = serde_json::from_str(legacy).unwrap();
+    assert_eq!(barrier.trace_context, None);
+    // A tracing-off sender serializes without the field: byte-identical wire.
+    let json = serde_json::to_string(&barrier).unwrap();
+    assert!(!json.contains("trace_context"), "{json}");
+    // A tracing-on sender's value round-trips.
+    let mut stamped = barrier;
+    stamped.trace_context = Some("00-trace-span-01".to_string());
+    let json = serde_json::to_string(&stamped).unwrap();
+    assert!(json.contains("trace_context"), "{json}");
+    let back: CheckpointBarrier = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, stamped);
+}
+
+#[tokio::test]
+async fn trace_context_round_trips_to_a_remote_parent() {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let (exporter, provider) = span_test_tracing();
+    let root = tracing::info_span!("trace-root-7354");
+    let trace_context = {
+        let _guard = root.enter();
+        super::remote::capture_trace_context()
+    };
+    let Some(trace_context) = trace_context else {
+        panic!("capture must yield a traceparent under an active span");
+    };
+
+    let child = tracing::info_span!("barrier-child-7354");
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _guard = child.enter();
+        let remote = super::remote::extract_trace_context(&trace_context);
+        assert!(remote.is_some(), "extract must parse a captured value");
+        child.set_parent(remote.unwrap());
+    }
+    drop(root);
+    drop(child);
+    provider.force_flush().unwrap();
+
+    let finished = exporter.get_finished_spans().unwrap();
+    let root_span = finished
+        .iter()
+        .find(|span| span.name.as_ref() == "trace-root-7354")
+        .expect("root exported");
+    let child_span = finished
+        .iter()
+        .find(|span| span.name.as_ref() == "barrier-child-7354")
+        .expect("child exported");
+    assert_eq!(
+        child_span.parent_span_id,
+        root_span.span_context.span_id(),
+        "extract+set_parent must restore the remote parent link"
+    );
+    assert_eq!(
+        child_span.span_context.trace_id(),
+        root_span.span_context.trace_id(),
+        "both spans share one trace"
+    );
+}
+
+#[tokio::test]
+async fn capture_is_none_without_an_active_span() {
+    // No entered span on this thread: capture must decline (this is the
+    // tracing-off path that keeps barrier bytes identical).
+    assert!(super::remote::capture_trace_context().is_none());
+}
+
+#[tokio::test]
+async fn barrier_carries_remote_trace_context_across_chains() {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let (exporter, provider) = span_test_tracing();
+
+    struct StreamInput {
+        sent: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for StreamInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let count = self.sent.fetch_add(1, Ordering::SeqCst);
+            if count >= 50 {
+                return Err(Error::EOF);
+            }
+            Ok((
+                Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                    count as i64,
+                    "a".into(),
+                )]))),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            Ok(vec![crate::checkpoint::SourcePosition::for_partition(
+                0,
+                self.sent.load(Ordering::SeqCst) as u64,
+            )])
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(StreamInput {
+        sent: AtomicUsize::new(0),
+    });
+    let adapter = Adapter {
+        input,
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
+    let (coordinator, report_tx) = crate::executor::BarrierCoordinator::new(
+        JobId::new("trace-barrier-job").unwrap(),
+        JobVersion(1),
+        1,
+        1,
+        ["source-0".to_string()],
+    );
+    let coordinator_cancellation = CancellationToken::new();
+    tokio::spawn(coordinator.run(coordinator_cancellation.clone()));
+
+    let mut hooks = std::collections::BTreeMap::new();
+    hooks.insert(
+        "source-0".to_string(),
+        CheckpointHook {
+            reporter: Some(report_tx),
+            failure_reporter: None,
+            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            state: None,
+            task_id: Some("source-0".to_string()),
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+            partition: Some(0),
+            metrics: None,
+            finished_reporter: None,
+        },
+    );
+
+    // Queue the barrier before the graph starts: the biased source loop
+    // picks it up before the first read, so delivery is deterministic.
+    barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-trace-7354".to_string(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await
+        .expect("send");
+    drop(barrier_tx);
+
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph_with_hooks(graph, cancellation.clone(), hooks));
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("graph completes")
+        .unwrap()
+        .unwrap();
+    coordinator_cancellation.cancel();
+    provider.force_flush().unwrap();
+
+    // The source chain stamped the barrier with its chain.run context at
+    // send_downstream; the interior chain's chain.barrier span must parent
+    // to exactly that span.
+    let finished = exporter.get_finished_spans().unwrap();
+    let barrier_span = finished
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "chain.barrier"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "checkpoint_id"
+                        && kv.value.as_str() == "cp-trace-7354"
+                })
+        })
+        .expect("chain.barrier span for the propagated barrier");
+    let upstream = finished
+        .iter()
+        .find(|span| span.span_context.span_id() == barrier_span.parent_span_id)
+        .expect("parent span exported");
+    assert_eq!(upstream.name.as_ref(), "chain.run");
+    assert!(
+        upstream
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == "source-0"),
+        "barrier span must parent to the forwarding chain, got {upstream:?}"
+    );
+    assert_eq!(
+        barrier_span.span_context.trace_id(),
+        upstream.span_context.trace_id()
+    );
 }

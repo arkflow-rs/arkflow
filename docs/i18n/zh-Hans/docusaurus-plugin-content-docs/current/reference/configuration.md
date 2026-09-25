@@ -88,6 +88,41 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 启用控制平面服务器时,`/ready` 与 `/live` 也会挂载在服务器地址上,与旧的 `/health`、`/readiness`、`/liveness` 端点并列(后者保持原有语义)。
 :::
 
+## Secret 引用 {#secret-references}
+
+敏感值(密码、令牌、密钥材料)不必明文写进配置文件。任何**字符串值**都可以内嵌引用,在配置物化为 `EngineConfig` 时解析一次——文件配置(`--config`)、`--validate` 以及经控制平面下发的配置均是如此。存储/下发的配置内容保持引用原文;只有运行中的进程在内存里持有解析出的值。
+
+| 语法 | 含义 |
+|--------|---------|
+| `${env:VAR}` | 环境变量 `VAR` 的值;未设置则报错。 |
+| `${env:VAR:-default}` | `VAR` 的值;未设置**或为空**时使用 `default`(`${env:VAR:-}` 允许显式空值)。 |
+| `${file:/path}` | 读取 `/path` 文件内容并剥离尾部换行(例如挂载的 Kubernetes Secret)。 |
+| `${secret:NAME}` | 环境变量 `ARKFLOW_SECRET_<NAME>` 的值(名字逐字映射)——为凭据提供独立命名空间。支持 `:-` 默认值。在 Hub 分发部署中,Hub 会在 rollout 分发时预解析这些引用,Agent 无需持有密钥环境。 |
+| `$${` | 字面 `${` 的转义。 |
+
+规则与保证:
+
+- 引用可以出现在字符串值的任意位置,包括嵌套 map/array(`host=${env:HOST};port=${env:PORT}` 可行)。
+- 未知 scheme 的 `${...}` 原样保留(向前兼容);键名与非字符串值绝不会被改动。
+- 解析结果不会被重扫:密钥值里若含 `${...}` 保持字面(防注入)。
+- 解析错误只会指明配置路径与引用本身——绝不会包含密钥值。
+
+```yaml validate=full
+logging:
+  level: info
+
+health_check:
+  api_token: "${env:ARKFLOW_API_TOKEN:-}"
+
+streams: []
+```
+
+若 `ARKFLOW_API_TOKEN` 未设置,进程会在启动时失败,错误形如 `Failed to resolve secret reference at health_check.api_token: environment variable 'ARKFLOW_API_TOKEN' is not set (reference: ${env:ARKFLOW_API_TOKEN})`。
+
+:::note
+引用在所有配置物化处都是严格解析的。在 Hub–Agent 部署中,引用节点本地密钥的配置必须在密钥可解析的位置校验/应用(独立单进程部署不受影响)。中心化密钥存储将在后续 Hub 版本中提供。
+:::
+
 ## stream
 
 `streams` 中的每个条目都是一条独立的处理管道。流字段的深入文档见[组件](./component-inventory.md)一节;其结构为:

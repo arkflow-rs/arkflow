@@ -49,6 +49,9 @@ pub struct PulsarInputConfig {
     pub auth: Option<PulsarAuth>,
     /// Retry configuration (optional)
     pub retry_config: Option<RetryConfig>,
+    /// TLS configuration (optional)
+    #[serde(default)]
+    pub tls: Option<crate::pulsar::common::PulsarTlsConfig>,
 }
 
 /// Pulsar message type for async processing
@@ -99,6 +102,18 @@ impl Input for PulsarInput {
     async fn connect(&self) -> Result<(), Error> {
         // Validate configuration before connecting
         PulsarConfigValidator::validate_service_url(&self.config.service_url)?;
+        let mut builder =
+            PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
+        if let Some(tls) = &self.config.tls {
+            if let Some(chain_file) = &tls.certificate_chain_file {
+                builder = builder.with_certificate_chain_file(chain_file).map_err(|e| {
+                    Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
+                })?;
+            }
+            if let Some(enabled) = tls.hostname_verification {
+                builder = builder.with_tls_hostname_verification_enabled(enabled);
+            }
+        }
         PulsarConfigValidator::validate_topic(&self.config.topic)?;
         PulsarConfigValidator::validate_subscription_name(&self.config.subscription_name)?;
 
@@ -111,10 +126,6 @@ impl Input for PulsarInput {
         }
 
         let _retry_config = self.config.retry_config.clone().unwrap_or_default();
-
-        // Use shared client builder with authentication
-        let builder =
-            PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
 
         // Connect to Pulsar
         let client = builder

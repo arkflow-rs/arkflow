@@ -19,18 +19,39 @@
 use arkflow_core::Error;
 
 pub mod batch;
+pub mod embedding;
 pub mod json;
+pub mod llm;
+pub mod milvus_search;
+pub mod pgvector_search;
 pub mod protobuf;
 pub mod python;
 pub mod sql;
+pub mod vector_search;
 pub mod vrl;
 
-pub fn init() -> Result<(), Error> {
+fn register_components() -> Result<(), Error> {
     batch::init()?;
     json::init()?;
+    llm::init()?;
+    pgvector_search::init()?;
     protobuf::init()?;
     sql::init()?;
     vrl::init()?;
     python::init()?;
+    embedding::init()?;
+    vector_search::init()?;
+    milvus_search::init()?;
+    Ok(())
+}
+
+/// Component registration is process-global, so `init()` is idempotent: the
+/// first call registers every builder and later calls (tests, multi-entry
+/// binaries) return immediately without touching the registries again.
+pub fn init() -> Result<(), Error> {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = register_components();
+    });
     Ok(())
 }

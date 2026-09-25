@@ -33,7 +33,7 @@ pub mod redis;
 pub mod sql;
 pub mod websocket;
 
-pub fn init() -> Result<(), Error> {
+fn register_components() -> Result<(), Error> {
     generate::init()?;
     http::init()?;
     kafka::init()?;
@@ -47,5 +47,16 @@ pub fn init() -> Result<(), Error> {
     multiple_inputs::init()?;
     modbus::init()?;
     file::init()?;
+    Ok(())
+}
+
+/// Component registration is process-global, so `init()` is idempotent: the
+/// first call registers every builder and later calls (tests, multi-entry
+/// binaries) return immediately without touching the registries again.
+pub fn init() -> Result<(), Error> {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = register_components();
+    });
     Ok(())
 }

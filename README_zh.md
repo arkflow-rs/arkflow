@@ -155,6 +155,11 @@ ArkFlow提供多种数据处理器：
 - **批处理** (`batch`)：将消息批量处理
 - **VRL** (`vrl`)：使用[VRL](https://vector.dev/docs/reference/vrl/)进行处理数据
 - **Python** (`python`)：对每个批次运行用户自定义的 Python 函数
+- **Embedding** (`embedding`)：通过 OpenAI 兼容 API 批量向量化文本列并追加向量列
+- **LLM** (`llm`)：以有界并发将每行文本发送到 OpenAI 兼容对话补全 API 并追加补全列
+- **Vector Search** (`vector_search`)：在 Qdrant 集合中检索每行向量的 top-k 近邻并以 JSON 追加匹配结果
+- **Milvus Search** (`milvus_search`)：以单次批量请求在 Milvus 集合中检索每行向量的 top-k 近邻
+- **pgvector Search** (`pgvector_search`)：在启用了 pgvector 扩展的 PostgreSQL 表中检索每行向量的 top-k 近邻
 
 <!-- README_COMPONENTS:processor END -->
 
@@ -186,6 +191,9 @@ ArkFlow支持多种输出目标：
 - **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL），支持批量插入与 UPSERT
 - **标准输出** (`stdout`)：将数据输出到控制台
 - **Drop** (`drop`)：丢弃数据
+- **Qdrant** (`qdrant`)：将向量与负载写入 Qdrant 集合
+- **pgvector** (`pgvector`)：将向量与 JSON 负载写入启用了 pgvector 扩展的 PostgreSQL 表
+- **Milvus** (`milvus`)：通过 REST v2 API 将向量与 JSON 负载写入 Milvus 集合
 
 <!-- README_COMPONENTS:output END -->
 

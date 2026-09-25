@@ -42,6 +42,9 @@ pub struct PulsarOutputConfig {
     pub topic: Expr<String>,
     /// Authentication (optional)
     pub auth: Option<PulsarAuth>,
+    /// TLS configuration (optional)
+    #[serde(default)]
+    pub tls: Option<crate::pulsar::common::PulsarTlsConfig>,
     /// Value field to use for message payload
     pub value_field: Option<String>,
 }
@@ -76,9 +79,19 @@ impl Output for PulsarOutput {
             PulsarConfigValidator::validate_auth_config(auth)?;
         }
 
-        // Use shared client builder with authentication
-        let builder =
+        // Use shared client builder with authentication and optional TLS
+        let mut builder =
             PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
+        if let Some(tls) = &self.config.tls {
+            if let Some(chain_file) = &tls.certificate_chain_file {
+                builder = builder.with_certificate_chain_file(chain_file).map_err(|e| {
+                    Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
+                })?;
+            }
+            if let Some(enabled) = tls.hostname_verification {
+                builder = builder.with_tls_hostname_verification_enabled(enabled);
+            }
+        }
 
         // Connect to Pulsar
         let client = builder

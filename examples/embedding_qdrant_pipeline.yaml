@@ -1,0 +1,32 @@
+# Streaming RAG ingestion: fetch documents, embed them through an
+# OpenAI-compatible API, and upsert the vectors plus payload into Qdrant.
+# The embedding api_key uses a secret reference — never commit real keys.
+logging:
+  level: info
+streams:
+  - id: rag-ingestion
+    input:
+      type: memory
+      payload: |
+        [
+          {"doc_id": 1, "text": "ArkFlow is a stream processing engine."},
+          {"doc_id": 2, "text": "Vectors enable semantic search."}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+          batch_size: 32
+
+    output:
+      type: qdrant
+      url: "http://localhost:6333"
+      collection: documents
+      vector_field: embedding
+      id_field: doc_id

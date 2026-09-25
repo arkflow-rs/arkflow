@@ -2,6 +2,10 @@
 //! retired; the original migration comparison measured kernel 528ms vs legacy
 //! 559ms on this workload — 6% faster). Run with
 //! `cargo test -p arkflow-plugin --test kernel_perf_baseline -- --ignored --nocapture`.
+//!
+//! For a fuller, publicly runnable benchmark suite (more scenarios, warmup,
+//! markdown/JSON reports) use `cargo run -p arkflow --release --example
+//! benchmark` — see docs/docs/develop/benchmark.md.
 
 use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;

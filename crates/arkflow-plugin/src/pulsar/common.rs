@@ -170,6 +170,24 @@ impl RetryUtils {
 }
 
 /// Configuration validation utilities
+/// TLS configuration for Pulsar connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulsarTlsConfig {
+    /// CA certificate file path (PEM format)
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Client certificate chain file path (PEM format, for mTLS)
+    #[serde(default)]
+    pub certificate_chain_file: Option<String>,
+    /// Whether to enable hostname verification (defaults to true)
+    #[serde(default = "default_hostname_verification")]
+    pub hostname_verification: Option<bool>,
+}
+
+fn default_hostname_verification() -> Option<bool> {
+    Some(true)
+}
+
 pub struct PulsarConfigValidator;
 
 impl PulsarConfigValidator {
@@ -333,3 +351,34 @@ pub type PulsarClient = Pulsar<TokioExecutor>;
 pub type PulsarConsumer<T = Vec<u8>> = pulsar::Consumer<T, TokioExecutor>;
 pub type PulsarProducer = pulsar::Producer<TokioExecutor>;
 pub type PulsarMessage<T = Vec<u8>> = pulsar::consumer::Message<T>;
+
+#[cfg(test)]
+mod tls_url_tests {
+    use super::PulsarConfigValidator;
+
+    #[test]
+    fn pulsar_ssl_url_passes_validation() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar+ssl://broker.example.com:6651").is_ok());
+    }
+
+    #[test]
+    fn plain_pulsar_url_passes_validation() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar://broker.example.com:6650").is_ok());
+    }
+
+    #[test]
+    fn invalid_scheme_is_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("http://broker.example.com:6650").is_err());
+    }
+
+    #[test]
+    fn ssl_prefix_without_host_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar+ssl://").is_err());
+    }
+
+    #[test]
+    fn empty_url_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("").is_err());
+    }
+}
+

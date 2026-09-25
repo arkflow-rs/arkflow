@@ -1,0 +1,28 @@
+# Batch-embed a text column through an OpenAI-compatible embeddings API.
+# The vectors are appended as an `embedding` FixedSizeList(Float32) column
+# and printed as JSON. Point `api_base` at OpenAI, vLLM, Ollama or TEI.
+logging:
+  level: info
+streams:
+  - id: embed-and-print
+    input:
+      type: memory
+      payload: |
+        [
+          {"text": "ArkFlow is a stream processing engine."},
+          {"text": "Vectors enable semantic search."}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+        - type: arrow_to_json
+
+    output:
+      type: stdout

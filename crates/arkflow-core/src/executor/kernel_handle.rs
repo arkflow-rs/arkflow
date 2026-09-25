@@ -155,6 +155,7 @@ impl KernelJobHandle {
         let barrier = crate::checkpoint::CheckpointBarrier {
             checkpoint_id,
             generation,
+            trace_context: None,
         };
         // Split placement: a node hosting no source tasks receives its
         // barriers from upstream nodes over the data plane. Skip local

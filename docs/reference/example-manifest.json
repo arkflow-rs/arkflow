@@ -1,212 +1,257 @@
 {
-  "version": 1,
-  "examples": [
-    {
-      "name": "quickstart",
-      "path": "../examples/generate_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "kafka-input",
-      "path": "../examples/kafka_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "sql-output",
-      "path": "../examples/sql_output_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "sql-input",
-      "path": "../examples/sql_input_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability",
-      "path": "../examples/durability_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability-s3",
-      "path": "../examples/durability_example_s3.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability-aggressive",
-      "path": "../examples/durability_example_aggressive.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability-compressed",
-      "path": "../examples/durability_example_compressed.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability-parallel",
-      "path": "../examples/durability_example_parallel.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "durability-smoke",
-      "path": "../examples/durability_smoke_test.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "control-plane",
-      "path": "../examples/control_plane_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "control-plane-hub",
-      "path": "../examples/control_plane_hub.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "control-plane-node",
-      "path": "../examples/control_plane_node.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "control-plane-smoke",
-      "path": "../examples/control_plane_smoke.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "jobs-local",
-      "path": "../examples/jobs_local.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "cdc-debezium",
-      "path": "../examples/cdc_debezium.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "eos-kafka",
-      "path": "../examples/eos-kafka.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "case-order-stream-sql",
-      "path": "../examples/case_order_stream_sql.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "case-telemetry-windows",
-      "path": "../examples/case_telemetry_windows.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "case-webhook-durable",
-      "path": "../examples/case_webhook_durable.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "howto-cdc-schema-registry",
-      "path": "../examples/howto_cdc_schema_registry.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "sql-output-upsert",
-      "path": "../examples/sql_output_upsert.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "schema-registry-avro",
-      "path": "../examples/schema_registry_avro.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "schema-registry",
-      "path": "../examples/schema_registry.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "http-client",
-      "path": "../examples/http_client_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "http-server",
-      "path": "../examples/http_server_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "mqtt",
-      "path": "../examples/mqtt_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "nats-input",
-      "path": "../examples/nats_input_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "nats-output",
-      "path": "../examples/nats_output_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "websocket-input",
-      "path": "../examples/websocket_input_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "redis-input",
-      "path": "../examples/redis_input_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "redis-output",
-      "path": "../examples/redis_output_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "redis-temporary",
-      "path": "../examples/redis_temporary_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "mongodb-output",
-      "path": "../examples/mongodb_output_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "drop-output",
-      "path": "../examples/drop_output_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "protobuf",
-      "path": "../examples/protobuf_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "python-processor",
-      "path": "../examples/python_processor_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "vrl",
-      "path": "../examples/vrl_example.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "join-buffer",
-      "path": "../examples/join_buffer_example.yaml",
-      "kind": "yaml",
-      "validate": false,
-      "reason": "The legacy join buffer cannot compile to the unified kernel by design; the file is kept as a migration reference pointing to the Job DAG join operator."
-    },
-    {
-      "name": "kafka-input-sasl-ssl",
-      "path": "../examples/kafka_input_sasl_ssl.yaml",
-      "kind": "yaml"
-    },
-    {
-      "name": "kafka-output-sasl-ssl",
-      "path": "../examples/kafka_output_sasl_ssl.yaml",
-      "kind": "yaml"
-    }
-  ]
+ "version": 1,
+ "examples": [
+  {
+   "name": "quickstart",
+   "path": "../examples/generate_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "kafka-input",
+   "path": "../examples/kafka_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "sql-output",
+   "path": "../examples/sql_output_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "sql-input",
+   "path": "../examples/sql_input_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability",
+   "path": "../examples/durability_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability-s3",
+   "path": "../examples/durability_example_s3.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability-aggressive",
+   "path": "../examples/durability_example_aggressive.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability-compressed",
+   "path": "../examples/durability_example_compressed.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability-parallel",
+   "path": "../examples/durability_example_parallel.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "durability-smoke",
+   "path": "../examples/durability_smoke_test.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "control-plane",
+   "path": "../examples/control_plane_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "control-plane-hub",
+   "path": "../examples/control_plane_hub.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "control-plane-node",
+   "path": "../examples/control_plane_node.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "control-plane-smoke",
+   "path": "../examples/control_plane_smoke.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "jobs-local",
+   "path": "../examples/jobs_local.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "cdc-debezium",
+   "path": "../examples/cdc_debezium.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "eos-kafka",
+   "path": "../examples/eos-kafka.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "case-order-stream-sql",
+   "path": "../examples/case_order_stream_sql.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "case-telemetry-windows",
+   "path": "../examples/case_telemetry_windows.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "case-webhook-durable",
+   "path": "../examples/case_webhook_durable.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "howto-cdc-schema-registry",
+   "path": "../examples/howto_cdc_schema_registry.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "sql-output-upsert",
+   "path": "../examples/sql_output_upsert.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "schema-registry-avro",
+   "path": "../examples/schema_registry_avro.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "schema-registry",
+   "path": "../examples/schema_registry.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "http-client",
+   "path": "../examples/http_client_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "http-server",
+   "path": "../examples/http_server_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "mqtt",
+   "path": "../examples/mqtt_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "nats-input",
+   "path": "../examples/nats_input_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "nats-output",
+   "path": "../examples/nats_output_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "websocket-input",
+   "path": "../examples/websocket_input_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "redis-input",
+   "path": "../examples/redis_input_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "redis-output",
+   "path": "../examples/redis_output_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "redis-temporary",
+   "path": "../examples/redis_temporary_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "mongodb-output",
+   "path": "../examples/mongodb_output_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "drop-output",
+   "path": "../examples/drop_output_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "protobuf",
+   "path": "../examples/protobuf_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "python-processor",
+   "path": "../examples/python_processor_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "vrl",
+   "path": "../examples/vrl_example.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "join-buffer",
+   "path": "../examples/join_buffer_example.yaml",
+   "kind": "yaml",
+   "validate": false,
+   "reason": "The legacy join buffer cannot compile to the unified kernel by design; the file is kept as a migration reference pointing to the Job DAG join operator."
+  },
+  {
+   "name": "kafka-input-sasl-ssl",
+   "path": "../examples/kafka_input_sasl_ssl.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "kafka-output-sasl-ssl",
+   "path": "../examples/kafka_output_sasl_ssl.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "kafka-input-sasl-ssl-secrets",
+   "path": "../examples/kafka_input_sasl_ssl_secrets.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "embedding-qdrant-pipeline",
+   "path": "../examples/embedding_qdrant_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "embedding-processor",
+   "path": "../examples/embedding_processor.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "llm-rewrite-pipeline",
+   "path": "../examples/llm_rewrite_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "embedding-pgvector-pipeline",
+   "path": "../examples/embedding_pgvector_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "rag-query-pipeline",
+   "path": "../examples/rag_query_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "embedding-milvus-pipeline",
+   "path": "../examples/embedding_milvus_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "pgvector-rag-query-pipeline",
+   "path": "../examples/pgvector_rag_query_pipeline.yaml",
+   "kind": "yaml"
+  },
+  {
+   "name": "milvus-rag-query-pipeline",
+   "path": "../examples/milvus_rag_query_pipeline.yaml",
+   "kind": "yaml"
+  }
+ ]
 }

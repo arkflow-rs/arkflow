@@ -19,6 +19,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7.18"
 async-trait = "0.1"
@@ -48,6 +50,11 @@ lazy_static = "1.4"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
+jsonwebtoken = "9"
+opentelemetry = "0.28"
+opentelemetry-otlp = { version = "0.28", features = ["http-json", "reqwest-client"] }
+opentelemetry_sdk = "0.28"
+tracing-opentelemetry = "0.29"
 reqwest = { version = "0.13", features = ["json", "query"] }
 percent-encoding = "2.3"
 clap = { version = "4.5", features = ["derive"] }

@@ -133,6 +133,41 @@ logging:
 `plain` is for interactive debugging. When `file_path` cannot be opened the
 engine falls back to stdout logging and says so on stderr.
 
+## Tracing
+
+Enable OTel trace export under `health_check.observability.tracing`. Spans
+are exported over OTLP HTTP-JSON with a batch exporter; turning the section
+off (the default) changes nothing.
+
+```yaml validate=fragment wrap=engine
+health_check:
+  observability:
+    tracing:
+      enabled: true
+      endpoint: "http://localhost:4318/v1/traces"
+      service_name: "arkflow"
+```
+
+The v1 span model is a lifecycle skeleton per Job execution:
+
+- `job.run` — the root span for one graph execution, with a `chains`
+  attribute (number of chains).
+- `chain.run` — one child span per chain (attribute `task`, the chain's
+  entry task id), covering startup through resource close.
+- `chain.batch` — one child of `chain.run` per batch processed through the
+  chain (attributes `rows`, the batch row count, and `task`). An operator
+  failure inside the batch is recorded as an event on this span with the
+  failing `operator` id.
+- `chain.barrier` — one child per aligned checkpoint barrier (attributes
+  `task`, `checkpoint_id`, `generation`). When a barrier crosses a node
+  boundary it carries a W3C `traceparent`, so the receiving node's
+  `chain.barrier` span parents to the upstream trace instead of re-rooting;
+  nodes with tracing off forward the value untouched. Data frames do not
+  carry trace context.
+
+Known v1 boundaries: there are no worker-pool spans (pool context
+propagation is future work). Exporter failures never affect the data plane.
+
 ## Operational status for dashboards
 
 `GET /api/v1/operations/status` returns a bounded summary designed for

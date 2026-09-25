@@ -16,6 +16,27 @@
 //! [`super::envelope`]). Backpressure is inherited from the bounded local
 //! queues on both ends plus TCP's own window. Receipt control frames use their
 //! own bounded queue and overflow is reported as a connection failure.
+//!
+//! # Pump cancellation semantics ("void writes")
+//!
+//! The outbound pump registers a branch acknowledgement before its frame is
+//! written, so a delivery may end up "written into the void": encoded and
+//! dispatched, but with no receipt that can ever come back. Every pump exit
+//! path therefore guarantees:
+//!
+//! - a branch whose receipt cannot arrive is **aborted, never acknowledged**;
+//!   at-least-once is preserved and the upstream re-delivers (duplicates
+//!   downstream are allowed);
+//! - already-encoded frames are flushed best-effort **before** the abort
+//!   sweep runs, so an in-flight delivery still reaches the wire when the
+//!   connection is alive;
+//! - a wire write failure fails the pump (`Err`), aborting everything still
+//!   registered; cancellation is a clean exit (`Ok`) with the same abort
+//!   sweep.
+//!
+//! The failure modes live in [`pump_edge`] (write error / shutdown / channel
+//! close all funnel into `PendingReceipts::abort_all`) and are pinned by the
+//! `pump_cancel_tests`.
 
 use crate::checkpoint::CheckpointBarrier;
 use crate::executor::envelope::Envelope;
@@ -1149,6 +1170,43 @@ impl PendingReceipts {
                 let _ = branch.abort().await;
             });
         }
+    }
+}
+
+/// Capture the current span context as a W3C `traceparent` string, or `None`
+/// when the current context carries no valid span — including tracing being
+/// disabled entirely, which keeps barriers byte-identical on the wire.
+pub fn capture_trace_context() -> Option<String> {
+    use opentelemetry::propagation::Injector as _;
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let cx = tracing::Span::current().context();
+    if !cx.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .inject_context(&cx, &mut carrier);
+    carrier.get("traceparent").cloned()
+}
+
+/// Extract a remote parent context from a barrier's captured `traceparent`.
+/// Returns `None` for absent or unparsable values so a malformed hop can
+/// never detach a downstream span from its local parent.
+pub fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
+    use opentelemetry::propagation::Extractor as _;
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let mut carrier = std::collections::HashMap::new();
+    carrier.insert("traceparent".to_string(), trace_context.to_string());
+    let cx = opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&carrier);
+    if cx.span().span_context().is_valid() {
+        Some(cx)
+    } else {
+        None
     }
 }
 
@@ -2433,14 +2491,22 @@ async fn pump_edge(
         }
     };
     let _ = writer.flush().await;
-    if result.is_err() {
-        pending.abort_all();
-    }
+    // Abort pendings on every exit path: once the pump is gone, no receipts
+    // can ever arrive for them, so leaving them alive would leak source acks
+    // indefinitely.
+    pending.abort_all();
     result
 }
 
 #[cfg(test)]
 mod tests {
+    /// Polling budgets for asynchronous disconnect/abort propagation.
+    /// Under a fully parallel workspace test run, tokio timers can lag
+    /// several seconds; these waits only observe conditions that normally
+    /// complete within a tick (~100ms), so a generous ceiling costs nothing
+    /// when everything is healthy and keeps loaded CI stable.
+    const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
     use super::*;
     use crate::input::Ack as _;
     use datafusion::arrow::array::{DictionaryArray, Int64Array};
@@ -2508,10 +2574,12 @@ mod tests {
         let barrier = WireSignal::Barrier(CheckpointBarrier {
             checkpoint_id: "c-7".into(),
             generation: 9,
+            trace_context: None,
         });
         let envelope = Envelope::Barrier(CheckpointBarrier {
             checkpoint_id: "c-7".into(),
             generation: 9,
+            trace_context: None,
         });
         assert_eq!(WireSignal::from_envelope(&envelope), Some(barrier.clone()));
         match barrier.clone().into_envelope() {
@@ -2520,7 +2588,8 @@ mod tests {
                     rebuilt,
                     CheckpointBarrier {
                         checkpoint_id: "c-7".into(),
-                        generation: 9
+                        generation: 9,
+                        trace_context: None
                     }
                 );
             }
@@ -2695,7 +2764,7 @@ mod tests {
     }
 
     async fn next_envelope(rx: &flume::Receiver<Envelope>) -> Envelope {
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, rx.recv_async())
             .await
             .expect("envelope within timeout")
             .expect("channel open")
@@ -2739,7 +2808,7 @@ mod tests {
         };
         assert_eq!(batch.get_input_name(), Some("authenticated".into()));
         ack.ack().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -2997,7 +3066,7 @@ mod tests {
         // Downstream processes: acking the RemoteAck mirrors the receipt back
         // and completes the upstream branch.
         ack.ack().await.expect("remote ack");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3010,6 +3079,7 @@ mod tests {
             .send_async(Envelope::Barrier(CheckpointBarrier {
                 checkpoint_id: "c-1".into(),
                 generation: 1,
+                trace_context: None,
             }))
             .await
             .expect("send barrier");
@@ -3047,7 +3117,7 @@ mod tests {
         };
         ack2.mark_held();
         ack2.release_held();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch2.held.load(std::sync::atomic::Ordering::SeqCst)
                 || !branch2.released.load(std::sync::atomic::Ordering::SeqCst)
             {
@@ -3100,14 +3170,14 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !rejected.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("the batch rejected by the pending limit must be aborted");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !first.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -3115,7 +3185,7 @@ mod tests {
         .await
         .expect("the already pending batch must be aborted with the edge");
         let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
                 .await
                 .expect("pending limit failure within timeout")
                 .unwrap();
@@ -3155,7 +3225,14 @@ mod tests {
         // branch aborts, and the failure surfaces on the manager.
         downstream.shutdown();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // The failure broadcast happens after the manager aborts pending
+        // branches, but abort_all only *spawns* the abort tasks - poll the
+        // flag explicitly rather than assuming it is already set.
+        let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
+            .await
+            .expect("failure within timeout")
+            .expect("failure channel open");
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3166,17 +3243,12 @@ mod tests {
             !branch.acked.load(std::sync::atomic::Ordering::SeqCst),
             "an aborted branch must never complete its source ack"
         );
-        let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
-                .await
-                .expect("failure within timeout")
-                .expect("failure channel open");
         assert!(
             failure.to_string().contains("remote edge") || failure.to_string().contains("inbound")
         );
 
         // The edge channel sender fails for new sends after the pump exits.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             loop {
                 let branch_retry = std::sync::Arc::new(RecordingAck::default());
                 if edge
@@ -3259,7 +3331,7 @@ mod tests {
         // Draining the consumer releases the pressure: the pending send
         // completes once the downstream channel accepts frames again.
         let mut received = 0;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while received < 1 {
                 if input_rx.try_recv().is_ok() {
                     received += 1;
@@ -3376,7 +3448,7 @@ mod tests {
         upstream.shutdown();
 
         let failure =
-            tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv_async())
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
                 .await
                 .expect("failure within timeout")
                 .expect("failure channel open");
@@ -3449,7 +3521,7 @@ mod tests {
         };
         assert_eq!(batch.get_input_name(), Some("tcp".to_owned()));
         ack.ack().await.expect("ack");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3467,6 +3539,212 @@ mod tests {
         assert!(
             refused.is_err(),
             "data-plane listener still accepts after shutdown"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pump_cancel_tests {
+    //! Pins the outbound pump's cancellation ("void write") semantics: a
+    //! branch whose receipt can never arrive is aborted on every exit path —
+    //! never falsely acked — and the exit flush precedes the abort sweep.
+
+    use super::*;
+    use crate::input::Ack;
+    use datafusion::arrow::array::{ArrayRef, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc as StdArc;
+
+    struct SpyAck {
+        acked: AtomicBool,
+        aborted: AtomicBool,
+    }
+
+    impl SpyAck {
+        fn new() -> StdArc<Self> {
+            StdArc::new(Self {
+                acked: AtomicBool::new(false),
+                aborted: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Ack for SpyAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn int64_batch(values: Vec<i64>) -> crate::MessageBatchRef {
+        let schema = StdArc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let columns: Vec<ArrayRef> = vec![StdArc::new(Int64Array::from(values))];
+        let batch =
+            datafusion::arrow::record_batch::RecordBatch::try_new(schema, columns)
+                .expect("batch");
+        StdArc::new(crate::MessageBatch::new_arrow(batch))
+    }
+
+    fn pump_config() -> NetworkManagerConfig {
+        NetworkManagerConfig::default()
+    }
+
+    async fn wait_for(flag: &AtomicBool, what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wire_write_failure_aborts_the_registered_branch() {
+        let quad = Quad {
+            src_op: 1,
+            src_subtask: 0,
+            dst_op: 2,
+            dst_subtask: 0,
+        };
+        let pending = Arc::new(PendingReceipts::new(64));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        // The reader is gone, so once the 64 KiB BufWriter overflows the
+        // write must hit the closed connection.
+        let (writer, _reader) = tokio::io::duplex(1024);
+        drop(_reader);
+        let (tx, rx) = flume::bounded::<Envelope>(1);
+
+        // Large enough that the encoded frame cannot fit in the BufWriter.
+        let batch = int64_batch((0..50_000).collect());
+        let ack = SpyAck::new();
+        tx.send_async(Envelope::Data(batch, ack.clone()))
+            .await
+            .expect("send");
+        drop(tx);
+
+        let result = pump_edge(
+            rx,
+            writer,
+            quad,
+            pending,
+            shutdown,
+            pump_config(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "pump must fail on a wire write error");
+        wait_for(&ack.aborted, "branch abort on wire failure").await;
+        assert!(
+            !ack.acked.load(Ordering::SeqCst),
+            "a void write must never be acknowledged"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_aborts_unreceipted_branches_after_flushing() {
+        let quad = Quad {
+            src_op: 1,
+            src_subtask: 0,
+            dst_op: 2,
+            dst_subtask: 0,
+        };
+        let pending = Arc::new(PendingReceipts::new(64));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
+        let (tx, rx) = flume::bounded::<Envelope>(1);
+
+        // Larger than duplex + BufWriter capacity: the pump parks inside
+        // write_all after registering, so "registered" is observable.
+        let batch = int64_batch((0..50_000).collect());
+        let ack = SpyAck::new();
+        tx.send_async(Envelope::Data(batch, ack.clone()))
+            .await
+            .expect("send");
+        drop(tx);
+
+        let pump = tokio::spawn(pump_edge(
+            rx,
+            writer,
+            quad,
+            pending.clone(),
+            shutdown.clone(),
+            pump_config(),
+            None,
+        ));
+
+        // Deterministic readiness: the branch is registered before the frame
+        // is written, so a non-empty pending map proves registration happened.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pump never registered the branch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Consume the frame so the blocked write completes: the delivery is
+        // now on the wire, but no receipt will ever be sent back for it.
+        let (header, _payload) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
+                .await
+                .expect("frame arrives")
+                .expect("frame decodes");
+        assert_eq!(header.kind, FrameKind::Data);
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), pump)
+            .await
+            .expect("pump exits after cancellation")
+            .expect("join");
+        assert!(result.is_ok(), "cancellation is a clean pump exit");
+
+        wait_for(&ack.aborted, "branch abort on shutdown").await;
+        assert!(
+            !ack.acked.load(Ordering::SeqCst),
+            "an unacknowledged delivery must never complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn acked_receipt_completes_the_branch_and_clears_pending() {
+        let pending = Arc::new(PendingReceipts::new(64));
+        let spy = SpyAck::new();
+        let ack: StdArc<dyn Ack> = spy.clone();
+        let seq = pending.register(&ack, 1).expect("register within limits");
+        let (failures_tx, _failures_rx) = flume::bounded::<Error>(8);
+
+        pending.apply(ReceiptFrame { kind: ReceiptKind::Acked, seq }, &failures_tx);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !spy.acked.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "branch was never acknowledged"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            pending.is_empty(),
+            "completed receipts leave no pending entries"
+        );
+        assert!(
+            !spy.aborted.load(Ordering::SeqCst),
+            "an acknowledged branch must not be aborted"
         );
     }
 }

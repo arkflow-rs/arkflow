@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 
+pub mod benchmark;
 pub mod buffer;
 pub mod codec;
 pub mod component;
@@ -19,6 +20,7 @@ pub mod context_pool;
 pub mod expr;
 pub mod input;
 pub mod kafka_security;
+pub mod mqtt_tls;
 pub mod output;
 pub mod processor;
 pub mod pulsar;

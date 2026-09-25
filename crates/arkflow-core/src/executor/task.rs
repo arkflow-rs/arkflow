@@ -19,6 +19,7 @@ use datafusion::arrow::array::{
     UInt8Array,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
+use tracing::Instrument;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -168,6 +169,31 @@ async fn run_graph_inner(
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
     sources_preconnected: bool,
+    startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), Error> {
+    // Root span for this graph execution. The future is instrumented (never
+    // enter-guarded across await points), so every span and event created
+    // within becomes a child of job.run.
+    let job_span = tracing::info_span!(
+        "job.run",
+        chains = graph.chains.len() as i64,
+    );
+    run_graph_inner_instrumented(
+        graph,
+        cancellation,
+        hooks,
+        sources_preconnected,
+        startup,
+    )
+    .instrument(job_span)
+    .await
+}
+
+async fn run_graph_inner_instrumented(
+    graph: ExecutionGraph,
+    cancellation: CancellationToken,
+    hooks: BTreeMap<String, CheckpointHook>,
+    sources_preconnected: bool,
     mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
     // Connect every resource in dependency order (temporary stores first,
@@ -249,32 +275,42 @@ async fn run_graph_inner(
             .get(chain.entry_task_id())
             .cloned()
             .unwrap_or_default();
-        tasks.push(tokio::spawn(async move {
-            let edge_failures = chain.edge_failures.clone();
-            let Some(edge_failures) = edge_failures else {
-                return run_chain(chain, hook, token).await;
-            };
-            // Remote-edge failure watcher: an idle chain (blocked on input)
-            // never observes a dead edge on its own send path, so a manager
-            // failure cancels the chain and surfaces as its result. The chain
-            // still exits through its own cancellation path, closing every
-            // owned resource.
-            let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
-            let watcher_token = token.clone();
-            let watcher = tokio::spawn(async move {
-                if let Ok(error) = edge_failures.recv_async().await {
-                    watcher_token.cancel();
-                    let _ = failure_tx.send(error);
+        // Created while the job span is entered, so this span is its child.
+        // tokio child tasks do not inherit span context: the span is moved
+        // into the task and entered there.
+        let chain_span =
+            tracing::info_span!("chain.run", task = chain.entry_task_id());
+        tasks.push(
+            tokio::spawn(
+                async move {
+                    let edge_failures = chain.edge_failures.clone();
+                    let Some(edge_failures) = edge_failures else {
+                        return run_chain(chain, hook, token).await;
+                    };
+                    // Remote-edge failure watcher: an idle chain (blocked on input)
+                    // never observes a dead edge on its own send path, so a manager
+                    // failure cancels the chain and surfaces as its result. The chain
+                    // still exits through its own cancellation path, closing every
+                    // owned resource.
+                    let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
+                    let watcher_token = token.clone();
+                    let watcher = tokio::spawn(async move {
+                        if let Ok(error) = edge_failures.recv_async().await {
+                            watcher_token.cancel();
+                            let _ = failure_tx.send(error);
+                        }
+                    });
+                    let result = run_chain(chain, hook, token).await;
+                    let result = match (result, failure_rx.try_recv()) {
+                        (Ok(()), Ok(error)) => Err(error),
+                        (result, _) => result,
+                    };
+                    watcher.abort();
+                    result
                 }
-            });
-            let result = run_chain(chain, hook, token).await;
-            let result = match (result, failure_rx.try_recv()) {
-                (Ok(()), Ok(error)) => Err(error),
-                (result, _) => result,
-            };
-            watcher.abort();
-            result
-        }));
+                .instrument(chain_span),
+            ),
+        );
     }
     // The chains own their source/sink close paths from here on.
     guard.hand_off_stream_resources();
@@ -1484,7 +1520,44 @@ pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
 /// Finish one aligned barrier before releasing post-barrier envelopes. EOS is
 /// allowed to be part of the released buffer when a bounded input ended while
 /// another input was still aligning the barrier.
+/// Build the `chain.barrier` span for one aligned barrier. When the barrier
+/// carries a remote trace context (cross-node propagation), the span parents
+/// to it so a trace continues across the hop instead of re-rooting per node.
+fn barrier_span(chain: &Chain, barrier: &crate::checkpoint::CheckpointBarrier) -> tracing::Span {
+    let span = tracing::info_span!(
+        "chain.barrier",
+        task = chain.entry_task_id(),
+        checkpoint_id = %barrier.checkpoint_id,
+        generation = barrier.generation,
+    );
+    if let Some(trace_context) = &barrier.trace_context {
+        if let Some(remote_context) = super::remote::extract_trace_context(trace_context) {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            span.set_parent(remote_context);
+        }
+    }
+    span
+}
+
 async fn handle_completed_barrier(
+    chain: &Chain,
+    hook: &CheckpointHook,
+    barrier: crate::checkpoint::CheckpointBarrier,
+    aligner: &mut super::barrier::Aligner,
+    ended_inputs: &mut BTreeSet<usize>,
+    pool: &mut Option<ProcessorWorkerPool>,
+    upstream_watermarks: &mut BTreeMap<usize, i64>,
+) -> Result<bool, Error> {
+    let span = barrier_span(chain, &barrier);
+    return async move {
+        handle_completed_barrier_inner(chain, hook, barrier, aligner, ended_inputs, pool, upstream_watermarks)
+            .await
+    }
+    .instrument(span)
+    .await;
+}
+
+async fn handle_completed_barrier_inner(
     chain: &Chain,
     hook: &CheckpointHook,
     barrier: crate::checkpoint::CheckpointBarrier,
@@ -1598,12 +1671,21 @@ async fn handle_envelope(
         }
         Envelope::Barrier(_) => {
             // Barrier handling lands with the checkpoint task; forward
-            // transparently so ordering is preserved.
-            if let Some(pool) = pool {
-                pool.flush().await?;
+            // transparently so ordering is preserved. The span keeps a
+            // passthrough barrier on the remote trace it arrived with.
+            let span = match &envelope {
+                Envelope::Barrier(barrier) => barrier_span(chain, barrier),
+                _ => tracing::Span::none(),
+            };
+            async {
+                if let Some(pool) = pool {
+                    pool.flush().await?;
+                }
+                send_downstream(chain, envelope).await?;
+                Ok(false)
             }
-            send_downstream(chain, envelope).await?;
-            Ok(false)
+            .instrument(span)
+            .await
         }
         Envelope::Watermark(watermark) => {
             upstream_watermarks.insert(input_index, watermark);
@@ -2360,25 +2442,42 @@ async fn dispatch_data(
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = match process_chain(chain, batch, ack, metrics).await {
-        Ok(outputs) => flush_outputs(chain, outputs).await,
-        Err(ProcessChainError::Processor(failure)) => {
-            match chain.error_outputs.get(&failure.failed_task_id) {
-                None => Err(abort_processor_failure(failure).await),
-                Some(targets) => {
-                    let failure_message = failure.error.to_string();
-                    route_processor_failure(targets, failure)
-                        .await
-                        .map_err(|route_error| {
-                            Error::Process(format!(
-                                "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
-                            ))
-                        })
+    // Batch-level trace slice covering processing through downstream flush.
+    // `Instrument` keeps the span entered only while this dispatch polls; with
+    // tracing disabled the callsite is off and the span is never created.
+    let rows = batch.len();
+    let result = async {
+        match process_chain(chain, batch, ack, metrics).await {
+            Ok(outputs) => flush_outputs(chain, outputs).await,
+            Err(ProcessChainError::Processor(failure)) => {
+                tracing::info!(
+                    operator = %failure.failed_task_id,
+                    error = %failure.error,
+                    "operator processing failed; routing to error outputs"
+                );
+                match chain.error_outputs.get(&failure.failed_task_id) {
+                    None => Err(abort_processor_failure(failure).await),
+                    Some(targets) => {
+                        let failure_message = failure.error.to_string();
+                        route_processor_failure(targets, failure)
+                            .await
+                            .map_err(|route_error| {
+                                Error::Process(format!(
+                                    "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
+                                ))
+                            })
+                    }
                 }
             }
+            Err(ProcessChainError::Fatal(failure)) => Err(abort_fatal_failure(failure).await),
         }
-        Err(ProcessChainError::Fatal(failure)) => Err(abort_fatal_failure(failure).await),
-    };
+    }
+    .instrument(tracing::info_span!(
+        "chain.batch",
+        rows,
+        task = chain.entry_task_id(),
+    ))
+    .await;
     if let Some(chain_metrics) = &chain_metrics {
         chain_metrics
             .in_flight
@@ -2606,6 +2705,20 @@ async fn send_downstream(chain: &Chain, envelope: Envelope) -> Result<(), Error>
     if matches!(envelope, Envelope::Data(_, _)) {
         return send_to_targets(chain.outputs.get(last_task), envelope, true).await;
     }
+
+    // Barriers carry the current trace context to the next hop. `capture`
+    // returns `None` without tracing (barrier bytes stay identical) and on
+    // an overwriting hop the captured context replaces the upstream one so
+    // the chain continues from this node's `chain.barrier` span.
+    let envelope = match envelope {
+        Envelope::Barrier(mut barrier) => {
+            if let Some(trace_context) = super::remote::capture_trace_context() {
+                barrier.trace_context = Some(trace_context);
+            }
+            Envelope::Barrier(barrier)
+        }
+        other => other,
+    };
 
     // Control envelopes belong to the whole graph, including an error side
     // sink. Successful data must stay off that side edge, but barriers and EOS

@@ -105,6 +105,38 @@ incompatible artifact is rejected before restore instead of corrupting state.
 | Checkpoint rounds keep failing | A task cannot snapshot or checksums mismatch | Check node disk/object-store health; the last valid checkpoint is still in force. |
 | Rollback rejected as incompatible | Savepoint belongs to another version or state format | Use an artifact from the compatible version history. |
 
+## Graceful shutdown
+
+On a graceful shutdown, a durability-enabled stream's WAL close no longer
+fails the stream just because an acknowledgement was parked behind an
+earlier in-flight source commit: the parked acknowledgement gets a bounded
+drain window (15 seconds) to settle once the earlier delivery completes.
+If the window expires without settling, the stream surfaces the
+`WAL closed while acknowledgement was pending` error and the usual WAL
+replay covers the unacknowledged delivery on restart — at-least-once
+semantics are unchanged either way.
+
+## TLS support matrix
+
+Every network component's encrypted-transport enablement, in one place:
+
+| Component | TLS enablement |
+|-----------|----------------|
+| kafka (input/output) | rdkafka `security.protocol` / `security.protocol` config |
+| mqtt (input/output) | `tls` block (`enabled`, `ca`, `client_cert`, `client_key`) |
+| nats (input/output) | `tls://` URL scheme (negotiated natively by async-nats) |
+| pulsar (input/output) | `pulsar+ssl://` URL scheme |
+| redis (input/output/temporary) | `rediss://` URL scheme |
+| sql (output) | sqlx TLS (Postgres `sslmode`, MySQL `ssl-mode`) via connection string |
+| mongodb (output) | `mongodb+srv` / `tls=true` connection string |
+| http (input/output) | `https://` URL (TLS terminated by reqwest/hyper) |
+| websocket (input) | `wss://` URL |
+| qdrant / milvus / pgvector / sql (outputs) and embedding / llm / vector_search / pgvector_search / milvus_search (processors) | `https://` endpoint (reqwest / sqlx TLS) |
+| secret references | `${secret:NAME}` resolved from the Hub environment at dispatch; `env:`/`file:` resolve node-local |
+
+Components without network capability (memory, generate, drop, stdout,
+batch/json/sql/vrl/python processors) have no TLS surface.
+
 ## WAL backends
 
 The local filesystem store is the default. For shared or remote durability,

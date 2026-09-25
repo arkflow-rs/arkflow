@@ -9,6 +9,10 @@ homepage.workspace = true
 license.workspace = true
 
 [dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
@@ -37,6 +41,7 @@ redb = { workspace = true }
 num_cpus = "1.17.0"
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only `#[tokio::test(start_paused = true)]` needs the paused clock; keeping the
 # feature out of the workspace dependency keeps it out of production builds.
 tokio = { workspace = true, features = ["test-util"] }

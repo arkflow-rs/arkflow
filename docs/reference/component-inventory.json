@@ -429,6 +429,28 @@
             "type": "integer",
             "minimum": 1,
             "description": "Keep-alive interval in seconds."
+          },
+          "tls": {
+            "type": "object",
+            "description": "TLS transport configuration.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "ca": {
+                "type": "string",
+                "description": "CA certificate file path."
+              },
+              "client_cert": {
+                "type": "string",
+                "description": "Client certificate file (mTLS)."
+              },
+              "client_key": {
+                "type": "string",
+                "description": "Client private key file (mTLS)."
+              }
+            }
           }
         },
         "required": [
@@ -1187,6 +1209,64 @@
     },
     {
       "kind": "output",
+      "name": "milvus",
+      "description": "Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Milvus base URL, e.g. http://localhost:19530."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Target collection name (schema must already exist)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector field (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Field carrying the row id (integer or string). When omitted the id key is left out (auto-id collections)."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "JSON field receiving every remaining column as a per-row object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:19530",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id",
+        "api_key": "${env:MILVUS_CREDENTIALS}"
+      }
+    },
+    {
+      "kind": "output",
       "name": "mongodb",
       "description": "Writes Arrow rows to MongoDB as BSON documents.",
       "config_optional": false,
@@ -1277,6 +1357,28 @@
             "type": "boolean",
             "default": false,
             "description": "Whether to retain the message on the broker."
+          },
+          "tls": {
+            "type": "object",
+            "description": "TLS transport configuration.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "ca": {
+                "type": "string",
+                "description": "CA certificate file path."
+              },
+              "client_cert": {
+                "type": "string",
+                "description": "Client certificate file (mTLS)."
+              },
+              "client_key": {
+                "type": "string",
+                "description": "Client private key file (mTLS)."
+              }
+            }
           }
         },
         "required": [
@@ -1368,6 +1470,56 @@
     },
     {
       "kind": "output",
+      "name": "pgvector",
+      "description": "Upserts batch rows into a PostgreSQL table with the pgvector extension: a Float32 list column becomes the vector, other columns are packed into a jsonb payload, and an optional id column keys ON CONFLICT upserts.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Postgres connection string, e.g. postgres://user:pass@host:5432/db; supports secret references."
+          },
+          "table": {
+            "type": "string",
+            "description": "Target table (must already exist with a matching vector column)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Column used as the upsert conflict key (integer or string). When omitted, plain INSERTs are written."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "jsonb column receiving every remaining column as a per-row JSON object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "max_connections": {
+            "type": "integer",
+            "description": "Connection pool size. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Pool acquire/connect timeout in milliseconds. Defaults to 30000."
+          }
+        },
+        "required": [
+          "url",
+          "table"
+        ]
+      },
+      "config_example": {
+        "url": "postgres://postgres:postgres@localhost:5432/vectors",
+        "table": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id"
+      }
+    },
+    {
+      "kind": "output",
       "name": "pulsar",
       "description": "Produces messages to an Apache Pulsar topic.",
       "config_optional": false,
@@ -1400,6 +1552,70 @@
       "config_example": {
         "service_url": "pulsar://localhost:6650",
         "topic": "persistent://public/default/events"
+      }
+    },
+    {
+      "kind": "output",
+      "name": "qdrant",
+      "description": "Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Qdrant base URL, e.g. http://localhost:6333."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Target collection name."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Column used as the point id (unsigned integer or string). When omitted, Qdrant generates ids."
+          },
+          "payload_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Columns to include in the point payload. Defaults to every column except the vector and id columns."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "retry_count": {
+            "type": "integer",
+            "description": "Retry attempts for connection errors and 5xx responses. Defaults to 3."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:6333",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id"
       }
     },
     {
@@ -1694,6 +1910,65 @@
     },
     {
       "kind": "processor",
+      "name": "embedding",
+      "description": "Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_base": {
+            "type": "string",
+            "description": "Base URL of the embeddings API, e.g. https://api.openai.com/v1 (the request path is {api_base}/embeddings)."
+          },
+          "model": {
+            "type": "string",
+            "description": "Embedding model name, e.g. text-embedding-3-small."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references. Omit for unauthenticated endpoints."
+          },
+          "field": {
+            "type": "string",
+            "description": "Name of the input UTF-8 column to embed."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended vector column. Defaults to 'embedding'."
+          },
+          "batch_size": {
+            "type": "integer",
+            "description": "Maximum rows per HTTP request. Defaults to 32."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers, e.g. Azure's 'api-key'."
+          }
+        },
+        "required": [
+          "api_base",
+          "model",
+          "field"
+        ]
+      },
+      "config_example": {
+        "api_base": "https://api.openai.com/v1",
+        "model": "text-embedding-3-small",
+        "api_key": "${env:OPENAI_API_KEY}",
+        "field": "text",
+        "batch_size": 32
+      }
+    },
+    {
+      "kind": "processor",
       "name": "json_to_arrow",
       "description": "Parses JSON byte payloads into an Arrow RecordBatch with inferred schema.",
       "config_optional": true,
@@ -1707,6 +1982,243 @@
             "description": "Rows per output batch."
           }
         }
+      }
+    },
+    {
+      "kind": "processor",
+      "name": "llm",
+      "description": "Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_base": {
+            "type": "string",
+            "description": "Base URL of the API, e.g. https://api.openai.com/v1 (the request path is {api_base}/chat/completions)."
+          },
+          "model": {
+            "type": "string",
+            "description": "Chat model name, e.g. gpt-4o-mini."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references. Omit for unauthenticated endpoints."
+          },
+          "field": {
+            "type": "string",
+            "description": "Name of the input UTF-8 column to send."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended completion column. Defaults to 'response'."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Optional system message prepended to each request."
+          },
+          "prompt_template": {
+            "type": "string",
+            "description": "Optional user-message template; '{{value}}' is replaced with the row text. When omitted the row text is the user message."
+          },
+          "temperature": {
+            "type": "number",
+            "description": "Sampling temperature; omitted from the request when unset."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "description": "Completion token cap; omitted from the request when unset."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight requests. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Request SSE streaming (`stream: true`) and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions."
+          },
+          "tools": {
+            "description": "OpenAI tools definition passed through verbatim to the request body for function calling."
+          },
+          "tool_calls_column": {
+            "type": "string",
+            "description": "When set, appends this column with the response's tool_calls as JSON text (empty string when the response has none). Streamed tool_call deltas are merged by index."
+          }
+        },
+        "required": [
+          "api_base",
+          "model",
+          "field"
+        ]
+      },
+      "config_example": {
+        "api_base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "api_key": "${env:OPENAI_API_KEY}",
+        "field": "text",
+        "system_prompt": "You classify support tickets with one word.",
+        "concurrency": 4
+      }
+    },
+    {
+      "kind": "processor",
+      "name": "milvus_search",
+      "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Milvus base URL, e.g. http://localhost:19530."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Collection to search."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "id_field": {
+            "type": "string",
+            "description": "Collection field returned as the match id. When omitted the id key is left out (auto-id collections)."
+          },
+          "payload_field": {
+            "type": "string",
+            "description": "Collection field included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "COSINE",
+              "L2",
+              "IP"
+            ],
+            "description": "Metric type; must match the collection schema. Defaults to COSINE."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:19530",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "id_field": "doc_id",
+        "top_k": 5
+      }
+    },
+    {
+      "kind": "processor",
+      "name": "pgvector_search",
+      "description": "Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Postgres connection string; supports secret references."
+          },
+          "table": {
+            "type": "string",
+            "description": "Table to search (must already exist with a pgvector column)."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "id_column": {
+            "type": "string",
+            "description": "Table column returned as the match id (as text). Defaults to 'id'."
+          },
+          "vector_column": {
+            "type": "string",
+            "description": "Table column holding the stored vectors. Defaults to 'embedding'."
+          },
+          "payload_column": {
+            "type": "string",
+            "description": "jsonb column included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "l2",
+              "inner_product"
+            ],
+            "description": "Distance operator: <=> (cosine, default), <-> (l2), <#> (inner product, negative)."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight queries. Defaults to 4."
+          },
+          "max_connections": {
+            "type": "integer",
+            "description": "Connection pool size. Defaults to 4."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Pool acquire timeout in milliseconds. Defaults to 30000."
+          }
+        },
+        "required": [
+          "url",
+          "table"
+        ]
+      },
+      "config_example": {
+        "url": "postgres://postgres:postgres@localhost:5432/vectors",
+        "table": "documents",
+        "metric": "cosine",
+        "top_k": 5
       }
     },
     {
@@ -1837,6 +2349,71 @@
       },
       "config_example": {
         "query": "SELECT *, __meta_source AS source FROM flow"
+      }
+    },
+    {
+      "kind": "processor",
+      "name": "vector_search",
+      "description": "Searches a Qdrant collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Qdrant base URL, e.g. http://localhost:6333."
+          },
+          "collection": {
+            "type": "string",
+            "description": "Collection to search."
+          },
+          "vector_field": {
+            "type": "string",
+            "description": "Name of the query vector column (FixedSizeList/List of Float32). Defaults to 'embedding'."
+          },
+          "target_field": {
+            "type": "string",
+            "description": "Name of the appended matches column (JSON array text). Defaults to 'matches'."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of neighbors per row. Defaults to 5."
+          },
+          "score_threshold": {
+            "type": "number",
+            "description": "Minimum similarity score; omitted from the request when unset."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight requests. Defaults to 4."
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API key sent as 'Authorization: Bearer'; supports secret references."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra HTTP headers."
+          }
+        },
+        "required": [
+          "url",
+          "collection"
+        ]
+      },
+      "config_example": {
+        "url": "http://localhost:6333",
+        "collection": "documents",
+        "vector_field": "embedding",
+        "top_k": 5
       }
     },
     {

@@ -35,20 +35,28 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
 | output | `influxdb` | Writes time-series data to InfluxDB v2.x using the Line Protocol. | [reference](../components/outputs/influxdb) |
 | output | `kafka` | Produces messages to Apache Kafka. Supports key-based partitioning and compression. | [reference](../components/outputs/kafka) |
+| output | `milvus` | Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row. | [reference](../components/outputs/milvus) |
 | output | `mongodb` | Writes Arrow rows to MongoDB as BSON documents. | [reference](../components/outputs/mongodb) |
 | output | `mqtt` | Publishes messages to an MQTT broker topic. | [reference](../components/outputs/mqtt) |
 | output | `nats` | Publishes to NATS, either to a regular subject or a JetStream stream. | [reference](../components/outputs/nats) |
+| output | `pgvector` | Upserts batch rows into a PostgreSQL table with the pgvector extension: a Float32 list column becomes the vector, other columns are packed into a jsonb payload, and an optional id column keys ON CONFLICT upserts. | [reference](../components/outputs/pgvector) |
 | output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
+| output | `qdrant` | Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload. | [reference](../components/outputs/qdrant) |
 | output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |
 | output | `sql` | Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes. | [reference](../components/outputs/sql) |
 | output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
 | processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
 | processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
 | processor | `batch` | Batches messages by count, size, or time interval before forwarding. | [reference](../components/processors/batch) |
+| processor | `embedding` | Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column. | [reference](../components/processors/embedding) |
 | processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
+| processor | `llm` | Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency. | [reference](../components/processors/llm) |
+| processor | `milvus_search` | Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column. | [reference](../components/processors/milvus-search) |
+| processor | `pgvector_search` | Searches a PostgreSQL table with the pgvector extension for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. | [reference](../components/processors/pgvector-search) |
 | processor | `protobuf_to_arrow` | Decodes Protobuf wire-format bytes into Arrow RecordBatches. | [reference](../components/processors/protobuf) |
 | processor | `python` | Runs a user-defined Python function (with PyArrow) against each batch. | [reference](../components/processors/python) |
 | processor | `sql` | Runs a DataFusion SQL query against each batch. Supports window functions and joins against temporary tables. | [reference](../components/processors/sql) |
+| processor | `vector_search` | Searches a Qdrant collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. | [reference](../components/processors/vector-search) |
 | processor | `vrl` | Runs a Vector Remap Language (VRL) program against each batch for safe transformation and enrichment. | [reference](../components/processors/vrl) |
 | temporary | `redis` | Redis-backed temporary lookup store (single node or cluster) read through a codec. | [reference](../components/temporary/redis) |
 

@@ -1,0 +1,35 @@
+# RAG ingestion into Milvus: fetch documents, embed them through an
+# OpenAI-compatible API, and upsert vectors + JSON payloads into a
+# Milvus 2.4+ collection (REST v2). Create the collection first, e.g.:
+#   curl -s http://localhost:19530/v2/vectordb/collections/create \
+#     -d '{"collectionName": "documents", "dimension": 1536}'
+logging:
+  level: info
+streams:
+  - id: rag-to-milvus
+    input:
+      type: memory
+      payload: |
+        [
+          {"doc_id": 1, "text": "ArkFlow is a stream processing engine."},
+          {"doc_id": 2, "text": "Vectors enable semantic search."}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+          batch_size: 32
+
+    output:
+      type: milvus
+      url: "http://localhost:19530"
+      collection: documents
+      vector_field: embedding
+      id_field: doc_id
+      api_key: "${env:MILVUS_CREDENTIALS:-}"

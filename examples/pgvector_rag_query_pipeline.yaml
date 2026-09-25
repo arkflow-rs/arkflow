@@ -1,0 +1,33 @@
+# RAG query against Postgres: embed the incoming question, retrieve the
+# top-k nearest documents from a pgvector-enabled table (same shape the
+# embedding_pgvector_pipeline example writes), and print the matches.
+logging:
+  level: info
+streams:
+  - id: pgvector-rag-query
+    input:
+      type: memory
+      payload: |
+        [
+          {"text": "What is ArkFlow?"}
+        ]
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: embedding
+          api_base: "http://localhost:9997/v1"
+          model: "text-embedding-3-small"
+          api_key: "${env:EMBEDDING_API_KEY:-}"
+          field: "text"
+        - type: pgvector_search
+          url: "postgres://postgres:${env:PG_PASSWORD:-}@localhost:5432/vectors"
+          table: documents
+          vector_field: embedding
+          metric: cosine
+          top_k: 5
+        - type: arrow_to_json
+
+    output:
+      type: stdout

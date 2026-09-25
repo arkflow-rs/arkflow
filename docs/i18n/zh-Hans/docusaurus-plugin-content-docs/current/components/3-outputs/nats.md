@@ -77,3 +77,9 @@ output:
   auth:
     token: "secret-token"
 ```
+
+## TLS
+
+使用 `tls://` URL scheme 以 TLS 连接(例如 `tls://nats.example.com:4422`);
+async-nats 对 `tls://` URL 原生协商 TLS,并要求服务端支持 TLS。
+
