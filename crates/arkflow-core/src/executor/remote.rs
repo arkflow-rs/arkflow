@@ -429,12 +429,16 @@ impl WireSignal {
 /// edge writer. `Acked` completes the mirrored fan-out branch once every
 /// replica of the batch reported it; `Held`/`Released` relay the buffering
 /// operator's hold so the upstream source excludes the acknowledgement from
-/// checkpoint barrier draining exactly as it would for a local window.
+/// checkpoint barrier draining exactly as it would for a local window;
+/// `Failed` reports that the receiving side aborted the delivery (processor
+/// failure), letting the upstream abort the branch immediately instead of
+/// waiting for the barrier-drain timeout.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiptKind {
     Acked,
     Held,
     Released,
+    Failed,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1028,6 +1032,22 @@ impl crate::input::Ack for RemoteAck {
             .map_err(|_| Error::Process("remote edge receipt channel closed".into()))
     }
 
+    async fn abort(&self) -> Result<(), Error> {
+        // Mirror the abort to the upstream pending map as a Failed receipt so
+        // the branch acknowledgement aborts immediately; the barrier-drain
+        // timeout stays only as the fallback for a lost frame.
+        self.outbox
+            .send_async((
+                self.quad,
+                ReceiptFrame {
+                    kind: ReceiptKind::Failed,
+                    seq: self.seq,
+                },
+            ))
+            .await
+            .map_err(|_| Error::Process("remote edge receipt channel closed".into()))
+    }
+
     fn mark_held(&self) {
         // Synchronous by trait contract (called from the Aligner's sync
         // context).  A full failure queue must apply backpressure here rather
@@ -1160,6 +1180,21 @@ impl PendingReceipts {
                 if pending.held_replicas == 0 {
                     pending.branch.release_held();
                 }
+            }
+            ReceiptKind::Failed => {
+                let PendingBatch { branch, .. } = map.remove(&receipt.seq).expect("checked");
+                // Abort off the read loop: branch compensation may block on
+                // journal/WAL undo, and the connection must keep draining.
+                let failures = failures.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = branch.abort().await {
+                        let _ = failures
+                            .send_async(Error::Process(format!(
+                                "remote edge branch abort failed: {error}"
+                            )))
+                            .await;
+                    }
+                });
             }
         }
     }
@@ -2641,7 +2676,12 @@ mod tests {
             assert_eq!(decoded, signal);
         }
 
-        for kind in [ReceiptKind::Acked, ReceiptKind::Held, ReceiptKind::Released] {
+        for kind in [
+            ReceiptKind::Acked,
+            ReceiptKind::Held,
+            ReceiptKind::Released,
+            ReceiptKind::Failed,
+        ] {
             let receipt = ReceiptFrame { kind, seq: 42 };
             let bytes = serde_json::to_vec(&receipt).expect("serialize");
             let decoded: ReceiptFrame = serde_json::from_slice(&bytes).expect("deserialize");
@@ -3644,6 +3684,41 @@ mod pump_cancel_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn failed_receipt_aborts_the_pending_branch() {
+        // A downstream processing failure mirrors back as a Failed receipt;
+        // the upstream aborts the branch without waiting for the barrier
+        // drain timeout.
+        let pending = PendingReceipts::new(64);
+        let spy = SpyAck::new();
+        let ack: StdArc<dyn Ack> = spy.clone();
+        let seq = pending.register(&ack, 2).expect("register");
+        let (failures_tx, failures_rx) = flume::unbounded::<Error>();
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Failed,
+                seq,
+            },
+            &failures_tx,
+        );
+        wait_for(&spy.aborted, "branch abort on Failed receipt").await;
+        assert!(
+            !spy.acked.load(Ordering::SeqCst),
+            "a Failed receipt must never acknowledge"
+        );
+        assert!(failures_rx.is_empty(), "no failure expected");
+        // The aborted sequence left the pending map: a duplicate Failed is a
+        // no-op, not an error.
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Failed,
+                seq,
+            },
+            &failures_tx,
+        );
+        assert!(failures_rx.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
