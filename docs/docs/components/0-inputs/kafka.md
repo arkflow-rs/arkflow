@@ -138,4 +138,5 @@ input:
 ## Notes
 
 - Messages automatically carry metadata columns such as `__meta_source`, `__meta_partition`, `__meta_offset`, `__meta_key`, `__meta_timestamp`, and `__meta_ingest_time`, plus the extended `__meta_ext.topic`.
+- Each Kafka record header becomes a `header_<key>` entry inside the `__meta_ext` map. Duplicate header keys keep every value: the first occurrence uses the plain `header_<key>` name and later occurrences get positional suffixes (`header_<key>_2`, `header_<key>_3`, …). Values are decoded as UTF-8 with invalid bytes replaced by U+FFFD; headers without a value map to an empty string.
 - Offsets are advanced via `store_offset` only when `ack()` is called (after a successful downstream write), combined with periodic auto-commit to achieve at-least-once delivery.
