@@ -119,6 +119,7 @@ impl arkflow_core::job::JobComponentAdapter for FixtureAdapter {
 async fn agent_kernel_job_snapshots_and_stops() {
     let spec = JobSpec {
         rebalance: None,
+rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("kernel-agent-job").unwrap(),
         version: JobVersion(1),
@@ -469,6 +470,7 @@ async fn recovery_restores_positions_before_new_reads() {
 fn kernel_job_spec() -> JobSpec {
     JobSpec {
         rebalance: None,
+rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("fault-injection").unwrap(),
         version: JobVersion(1),

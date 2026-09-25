@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐（见 8.5 进度）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐及三项延后子项二轮补齐（见 8.5 进度）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -493,4 +493,12 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 
 **验证**：`cargo test --workspace --all-targets` 全绿、clippy 无新增告警、`pnpm docs:check` 通过（138 页/49 组件）、examples 清单与 snippets 校验通过、join 示例实跑验证。
 
-**剩余边界（诚实记录）**：远程边透明重连与去重、真 key 重分布 rescale、Kafka L3、temporal/outer join、Hub 阶段 2（选主）。
+**二轮补齐（2026-09-25 同日，三项延后子项全部交付）**：
+
+| 子项 | 交付 change | 状态 | 备注 |
+| --- | --- | --- | --- |
+| 远程边透明重连 + seq 去重 | `add-remote-transparent-reconnect` | ✅ 归档 | 预算内重拨（默认 5 次）+ 未回执帧原 seq 重放；接收端投递级去重（重复帧丢弃并镜像补发 Acked）——重连路径 effectively-once；接收端丢连宽限（10s）内重注册抑制失败；`reconnect_attempts=0` 保留逐位旧的立即 fail-closed |
+| 真 key 重分布 rescale | `add-job-rescale` | ✅ 归档 | `JobSpec.rescale` 显式声明后跨任务集恢复：按状态键编码白名单还原路由哈希输入（窗口剥 window_start / Stateful 剥类型前缀），key-group 归属重写命名空间；未声明仍走守卫 fail-closed；不可解码键显式失败 |
+| Kafka L3 | `add-kafka-l3-transactional-offsets` | ✅ 归档 | 进程内组注册表交接 ConsumerGroupMetadata；输入 transactional_offsets 停用本地 store；输出 offset_commit_group 从批次元数据推导位点，send_offsets_to_transaction 折入事务；真实 broker 端到端验证（同组零重投递，kafka_eos 5/5） |
+
+**剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。

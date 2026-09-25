@@ -146,6 +146,7 @@ fn fleet_job(
     };
     JobSpec {
         rebalance: None,
+rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new(job_id).unwrap(),
         version: JobVersion(1),

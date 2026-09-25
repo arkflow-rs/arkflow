@@ -37,6 +37,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
     };
     JobSpec {
         rebalance: None,
+rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id,
         version: JobVersion(1),
