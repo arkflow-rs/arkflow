@@ -211,6 +211,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
     }
 
     let spec = JobSpec {
+        rescale: false,
         rebalance: None,
         id: job_id,
         version: JobVersion(1),

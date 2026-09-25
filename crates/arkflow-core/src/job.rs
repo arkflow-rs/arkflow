@@ -406,6 +406,13 @@ pub struct JobSpec {
     pub checkpoint: Option<CheckpointSpec>,
     #[serde(default)]
     pub recovery: RecoveryPolicy,
+    /// Explicit opt-in for rescaling recovery: when the recovery artifact was
+    /// written under a different parallelism (or task set), keyed state is
+    /// redistributed across the new tasks by key-group ownership instead of
+    /// failing closed. Defaults to false — an undeclared topology change
+    /// still fails with the rescale guard's actionable error.
+    #[serde(default)]
+    pub rescale: bool,
     /// Task placement across compute nodes. Defaults to the historical
     /// co-location contract.
     #[serde(default)]
@@ -1419,6 +1426,7 @@ mod tests {
 
     pub(super) fn base_job() -> JobSpec {
         JobSpec {
+            rescale: false,
             rebalance: None,
             placement: PlacementStrategy::Colocated,
             id: JobId::new("orders").unwrap(),

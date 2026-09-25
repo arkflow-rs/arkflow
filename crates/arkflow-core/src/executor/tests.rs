@@ -308,6 +308,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
         });
     }
     JobSpec {
+        rescale: false,
         rebalance: None,
         id: JobId::new("test-job").unwrap(),
         version: JobVersion(1),
@@ -600,6 +601,7 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
+        rescale: false,
     })
     .unwrap();
     let graph = ExecutionGraphBuilder::default()
@@ -708,6 +710,7 @@ async fn multi_input_chain_preserves_every_upstream_channel() {
         processor: Arc::new(PassThroughProcessor),
     };
     let job = JobSpec {
+        rescale: false,
         rebalance: None,
         id: JobId::new("multi-input-job").unwrap(),
         version: JobVersion(1),
@@ -875,6 +878,7 @@ async fn multi_input_watermark_uses_the_slowest_upstream() {
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
+        rescale: false,
     };
     let plan = JobPlan::compile(job).unwrap();
     let graph = ExecutionGraphBuilder::default()
@@ -907,6 +911,7 @@ async fn processor_failure_uses_error_output_without_receiving_successes() {
         processor: Arc::new(FailingProcessor),
     };
     let job = JobSpec {
+        rescale: false,
         rebalance: None,
         id: JobId::new("error-route-job").unwrap(),
         version: JobVersion(1),
@@ -2859,6 +2864,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
+        rescale: false,
     };
     job.operators[0] = map_source_operator("left-source");
     job.operators[1] = map_source_operator("right-source");
@@ -3867,6 +3873,7 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
         processor: Arc::new(PassThroughProcessor),
     };
     let job = JobSpec {
+        rescale: false,
         rebalance: None,
         id: JobId::new("test-job").unwrap(),
         version: JobVersion(1),
@@ -4345,6 +4352,7 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
         checkpoint: None,
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
+        rescale: false,
         ..spec(vec![], vec![], 2)
     };
     crate::job::JobPlan::compile(spec).unwrap()
