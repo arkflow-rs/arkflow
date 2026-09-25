@@ -573,7 +573,11 @@ impl JobSpec {
             }
             if operator.kind == OperatorKind::Join {
                 return Err(Error::Config(format!(
-                    "Join operator '{}' is not supported by the distributed runtime; use a supported single-input operator or a dedicated multi-input Join runtime",
+                    "Join operator '{}' is rejected: stream-stream join is not yet supported \
+                     anywhere in the engine (Stream 'join' buffers are rejected with the same \
+                     guidance); use the SQL processor's per-batch joins against temporary tables, \
+                     or co-locate both flows onto one stream via an external repartitioning system \
+                     such as Kafka",
                     operator.id
                 )));
             }
@@ -1483,7 +1487,13 @@ mod tests {
             config: serde_json::json!({}),
         });
         let error = job.validate().unwrap_err().to_string();
-        assert!(error.contains("Join operator 'join' is not supported"), "{error}");
+        assert!(
+            error.contains("stream-stream join is not yet supported"),
+            "{error}"
+        );
+        // The guidance must stay consistent with the Stream compiler's
+        // `join` buffer rejection and never defer to a nonexistent runtime.
+        assert!(!error.contains("dedicated multi-input"), "{error}");
     }
 
     #[test]

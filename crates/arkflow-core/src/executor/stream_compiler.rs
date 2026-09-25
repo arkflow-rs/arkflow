@@ -114,8 +114,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
             }
             "join" => {
                 return Err(Error::Config(
-                    "buffer type 'join' cannot compile to the unified kernel; declare a Job DAG \
-                     with an explicit join operator instead (see the Job API documentation)"
+                    "buffer type 'join' cannot compile: stream-stream join is not yet supported \
+                     anywhere in the engine; use the SQL processor's per-batch joins against \
+                     temporary tables, or co-locate both flows onto one stream via an external \
+                     repartitioning system such as Kafka"
                         .into(),
                 ));
             }
@@ -309,8 +311,10 @@ fn window_config(
     let config = buffer.config.clone().unwrap_or(json!({}));
     if matches!(buffer_type, "tumbling_window" | "session_window") && config.get("join").is_some() {
         return Err(Error::Config(
-            "legacy window buffers with 'join' cannot compile to the unified kernel; declare a Job \
-             DAG with an explicit join operator instead (see the Job API documentation)"
+            "legacy window buffers with 'join' cannot compile: stream-stream join is not yet \
+             supported anywhere in the engine; use the SQL processor's per-batch joins against \
+             temporary tables, or co-locate both flows onto one stream via an external \
+             repartitioning system such as Kafka"
                 .into(),
         ));
     }
@@ -515,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn join_buffer_rejected_with_migration_message() {
+    fn join_buffer_rejected_with_honest_message() {
         let mut stream = minimal_stream();
         stream.buffer = Some(crate::buffer::BufferConfig {
             buffer_type: "join".into(),
@@ -524,8 +528,31 @@ mod tests {
         });
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("join"), "{message}");
-        assert!(message.contains("Job"), "{message}");
+        assert!(
+            message.contains("stream-stream join is not yet supported"),
+            "{message}"
+        );
+        assert!(message.contains("SQL processor"), "{message}");
+        // The guidance must not point at the Job DAG join operator: that
+        // entry point does not exist and rejects the same construct.
+        assert!(!message.contains("Job DAG"), "{message}");
+    }
+
+    #[test]
+    fn legacy_window_join_field_rejected_with_same_guidance() {
+        let mut stream = minimal_stream();
+        stream.buffer = Some(crate::buffer::BufferConfig {
+            buffer_type: "tumbling_window".into(),
+            name: None,
+            config: Some(json!({"size": "1s", "join": {}})),
+        });
+        let error = compile_stream(&stream, 0).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("stream-stream join is not yet supported"),
+            "{message}"
+        );
+        assert!(!message.contains("Job DAG"), "{message}");
     }
 
     #[test]

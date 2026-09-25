@@ -280,6 +280,23 @@ Temporary resources, sources, and sinks are connected in dependency order
 before any task loop starts, and a partial startup closes the connected
 resources in reverse order.
 
+### Stream-stream join boundary
+
+Stream-stream join is not yet supported anywhere in the engine. The Job DAG
+rejects `Join` operators at validation time, and legacy Stream `join` buffers
+(including window buffers with a legacy `join` field) fail compilation with the
+same guidance — neither rejection points at an entry point that exists. Until a
+native join operator lands, use one of these workarounds:
+
+- **Per-batch SQL joins against temporary tables**: feed one side through the
+  SQL processor and register the other side as a temporary table. This joins
+  each in-flight batch against table data; it does not maintain cross-stream
+  state.
+- **External co-location**: repartition both flows onto the same key through an
+  external system (for example, a Kafka topic keyed by the join key) and
+  process them as one stream, correlating records with a keyed processor or
+  window.
+
 ## API examples
 
 ```http
