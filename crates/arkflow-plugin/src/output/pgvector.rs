@@ -162,11 +162,20 @@ impl Output for PgVectorOutput {
             })
             .collect();
 
-        build_insert(&self.config, &point_rows)
-            .build()
-            .execute(pool)
-            .await
-            .map_err(|e| Error::Process(format!("pgvector output: insert failed: {}", e)))?;
+        // Postgres caps a statement at 65,535 bind parameters; chunk the rows
+        // so each INSERT stays under it. Slices preserve row order and a
+        // chunk failure stops the rest (at-least-once redelivery re-writes
+        // the batch; the upsert clause keeps re-writes idempotent).
+        let binds_per_row =
+            usize::from(self.config.id_field.is_some()) + 1 + usize::from(!self.config.payload_field.is_empty());
+        let rows_per_chunk = (65_000 / binds_per_row).max(1);
+        for chunk in point_rows.chunks(rows_per_chunk) {
+            build_insert(&self.config, chunk)
+                .build()
+                .execute(pool)
+                .await
+                .map_err(|e| Error::Process(format!("pgvector output: insert failed: {}", e)))?;
+        }
         Ok(())
     }
 
@@ -192,12 +201,12 @@ fn build_insert(config: &PgVectorOutputConfig, rows: &[PointRow]) -> QueryBuilde
     }
     let column_list: Vec<String> = columns
         .iter()
-        .map(|column| format!("\"{column}\""))
+        .map(|column| crate::vector_util::escape_identifier(column))
         .collect();
 
     let mut query_builder = QueryBuilder::<sqlx::Postgres>::new(format!(
-        "INSERT INTO \"{}\" ({})",
-        config.table,
+        "INSERT INTO {} ({})",
+        crate::vector_util::escape_identifier(&config.table),
         column_list.join(", ")
     ));
     query_builder.push(" VALUES ");
@@ -229,15 +238,13 @@ fn build_insert(config: &PgVectorOutputConfig, rows: &[PointRow]) -> QueryBuilde
     }
 
     if let Some(id_field) = &config.id_field {
-        let mut assignments = vec![format!(
-            "\"{}\" = EXCLUDED.\"{}\"",
-            config.vector_field, config.vector_field
-        )];
+        let excluded = |column: &str| {
+            let quoted = crate::vector_util::escape_identifier(column);
+            format!("{quoted} = EXCLUDED.{quoted}")
+        };
+        let mut assignments = vec![excluded(&config.vector_field)];
         if payload_enabled {
-            assignments.push(format!(
-                "\"{}\" = EXCLUDED.\"{}\"",
-                config.payload_field, config.payload_field
-            ));
+            assignments.push(excluded(&config.payload_field));
         }
         query_builder.push(format!(
             " ON CONFLICT (\"{id_field}\") DO UPDATE SET {}",
@@ -631,6 +638,50 @@ mod tests {
             sql,
             "INSERT INTO \"documents\" (\"doc_id\", \"embedding\") VALUES ($1, $2::vector) ON CONFLICT (\"doc_id\") DO UPDATE SET \"embedding\" = EXCLUDED.\"embedding\""
         );
+    }
+
+    #[test]
+    fn identifiers_with_embedded_quotes_are_escaped() {
+        let config = config_with(serde_json::json!({
+            "table": "odd\"table",
+            "vector_field": "em\"bedding",
+        }));
+        let rows = vec![PointRow {
+            id: None,
+            vector: "[1.0,2.0]".to_string(),
+            payload: None,
+        }];
+        let sql = build_insert(&config, &rows).sql().to_string();
+        assert!(sql.contains(r#"INSERT INTO "odd""table""#), "{sql}");
+        assert!(sql.contains(r#""em""bedding""#), "{sql}");
+    }
+
+    #[test]
+    fn chunking_keeps_statements_under_the_bind_parameter_limit() {
+        // 3 binds per row (id + vector + payload): 30,000 rows must split
+        // into chunks of at most 65_000/3 = 21,666 rows.
+        let config = config_with(serde_json::json!({}));
+        let binds_per_row = 3usize;
+        let rows_per_chunk = (65_000 / binds_per_row).max(1);
+        let rows: Vec<PointRow> = (0..30_000usize)
+            .map(|index| PointRow {
+                id: Some(IdValue::Int(index as i64)),
+                vector: "[1.0,2.0]".to_string(),
+                payload: Some(r#"{"text":"a"}"#.to_string()),
+            })
+            .collect();
+        let mut statement_binds = Vec::new();
+        for chunk in rows.chunks(rows_per_chunk) {
+            let sql = build_insert(&config, chunk).sql().to_string();
+            let placeholders = sql.matches('$').count();
+            statement_binds.push(placeholders);
+            assert!(
+                placeholders <= 65_535,
+                "statement exceeded the bind limit: {placeholders}"
+            );
+        }
+        assert!(statement_binds.len() >= 2, "30k rows must split");
+        assert_eq!(statement_binds[0], rows_per_chunk * binds_per_row);
     }
 
     #[test]

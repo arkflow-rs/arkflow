@@ -378,7 +378,8 @@ pub fn init_logging(config: &EngineConfig) {
             }
         };
 
-    let otel_layer = build_otel_layer(&config.health_check.observability.tracing);
+    let otel_layer = build_otel_layer(&config.health_check.observability.tracing)
+        .map(|layer| layer.with_filter(level_filter));
 
     tracing_subscriber::registry()
         .with(fmt_layer)
@@ -428,6 +429,25 @@ where
         )
         .build();
     let tracer = provider.tracer("arkflow");
-    let _ = opentelemetry::global::set_tracer_provider(provider);
+    let _ = opentelemetry::global::set_tracer_provider(provider.clone());
+    // Keep a handle so graceful shutdown can flush buffered spans (see
+    // [`shutdown_otel_tracing`]); the global provider itself holds a clone.
+    let _ = OTEL_PROVIDER.set(provider);
     Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
+}
+
+/// Handle to the process-global OTel tracer provider, kept so buffered spans
+/// can be flushed on graceful shutdown (the global registry holds a clone).
+static OTEL_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
+    std::sync::OnceLock::new();
+
+/// Flushes and shuts down the OTel tracer provider installed by
+/// [`init_logging`]. Export failures are logged and swallowed: shutdown
+/// must proceed. A no-op when tracing was never enabled.
+pub fn shutdown_otel_tracing() {
+    if let Some(provider) = OTEL_PROVIDER.get() {
+        if let Err(error) = provider.shutdown() {
+            eprintln!("Failed to shut down the OTel tracer provider cleanly: {error}");
+        }
+    }
 }

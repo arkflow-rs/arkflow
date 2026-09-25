@@ -52,7 +52,7 @@ impl MqttTlsConfig {
     /// `Simple` and `tls_with_default_config` paths resolve the rustls
     /// `CryptoProvider` lazily and panic when the crate graph enables both
     /// `ring` and `aws-lc-rs`, which this workspace does.
-    pub fn apply(&self, options: &mut rumqttc::MqttOptions) -> Result<(), Error> {
+    pub async fn apply(&self, options: &mut rumqttc::MqttOptions) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
@@ -67,18 +67,35 @@ impl MqttTlsConfig {
             }
             _ => {}
         }
-        let load = |path: &str| -> Result<Vec<u8>, Error> {
+
+        // PEM files are read on a blocking thread: connect() runs on the
+        // async executor and re-reads on every reconnect.
+        fn read(path: &str) -> Result<Vec<u8>, Error> {
             std::fs::read(path).map_err(|e| {
                 Error::Config(format!("mqtt tls: failed to read file '{path}': {e}"))
             })
-        };
+        }
+        let (ca, client_cert, client_key) = (
+            self.ca.clone(),
+            self.client_cert.clone(),
+            self.client_key.clone(),
+        );
+        let (ca_pem, cert_pem, key_pem) = tokio::task::spawn_blocking(move || {
+            Result::<_, Error>::Ok((
+                ca.as_deref().map(read).transpose()?,
+                client_cert.as_deref().map(read).transpose()?,
+                client_key.as_deref().map(read).transpose()?,
+            ))
+        })
+        .await
+        .map_err(|e| Error::Process(format!("mqtt tls: PEM read task failed: {e}")))??
+;
 
         // Broker trust roots: the configured CA if present, otherwise the
         // platform trust store.
         let mut roots = RootCertStore::empty();
-        if let Some(ca) = &self.ca {
-            let ca_pem = load(ca)?;
-            let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(ca_pem)))
+        if let Some(ca_pem) = &ca_pem {
+            let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(ca_pem.clone())))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
                     Error::Config(format!("mqtt tls: failed to parse CA certificate: {error}"))
@@ -101,11 +118,10 @@ impl MqttTlsConfig {
         }
 
         // Client identity: the configured cert/key pair if present.
-        let client_auth = match (&self.client_cert, &self.client_key) {
+        let client_auth = match (&cert_pem, &key_pem) {
             (None, None) => None,
-            (Some(cert), Some(key)) => {
-                let cert_pem = load(cert)?;
-                let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(cert_pem)))
+            (Some(cert_pem), Some(key_pem)) => {
+                let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(cert_pem.clone())))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
                         Error::Config(format!(
@@ -117,8 +133,7 @@ impl MqttTlsConfig {
                         "mqtt tls: no valid certificate in client_cert".to_string(),
                     ));
                 }
-                let key_pem = load(key)?;
-                let key = rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(key_pem)))
+                let key = rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(key_pem.clone())))
                     .map_err(|error| {
                         Error::Config(format!("mqtt tls: failed to parse client key: {error}"))
                     })?
@@ -184,20 +199,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disabled_tls_is_a_no_op() {
+    #[tokio::test]
+    async fn disabled_tls_is_a_no_op() {
         let mut options = mqtt_options();
         config(None, None, None)
-            .apply(&mut options)
+            .apply(&mut options).await
             .expect("disabled tls applies cleanly");
     }
 
-    #[test]
-    fn incomplete_client_pair_is_rejected() {
+    #[tokio::test]
+    async fn incomplete_client_pair_is_rejected() {
         let cert = write_temp_file("only-cert.pem", b"unused");
         let mut options = mqtt_options();
         let error = config(None, Some(cert.to_string_lossy().into()), None)
-            .apply(&mut options)
+            .apply(&mut options).await
             .expect_err("half a client pair must fail");
         assert!(
             error.to_string().contains("client_cert and client_key"),
@@ -205,8 +220,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_pair_without_ca_builds_rustls_transport() {
+    #[tokio::test]
+    async fn client_pair_without_ca_builds_rustls_transport() {
         // A real (self-signed) matching pair: the success path parses the
         // PEMs, seeds the root store from the platform, and hands rustls a
         // consistent cert/key pair.
@@ -218,12 +233,12 @@ mod tests {
             Some(cert_path.to_string_lossy().into()),
             Some(key_path.to_string_lossy().into()),
         )
-        .apply(&mut options)
+        .apply(&mut options).await
         .expect("client pair without ca must build a rustls transport");
     }
 
-    #[test]
-    fn client_pair_with_garbage_key_is_rejected() {
+    #[tokio::test]
+    async fn client_pair_with_garbage_key_is_rejected() {
         let cert_path = write_temp_file("bad-cert.pem", TEST_CLIENT_CERT.as_bytes());
         let key_path = write_temp_file("bad-key.pem", b"not a pem key");
         let mut options = mqtt_options();
@@ -232,7 +247,7 @@ mod tests {
             Some(cert_path.to_string_lossy().into()),
             Some(key_path.to_string_lossy().into()),
         )
-        .apply(&mut options)
+        .apply(&mut options).await
         .expect_err("unparseable client key must fail");
         assert!(
             error.to_string().contains("client_key"),
@@ -240,12 +255,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ca_only_builds_simple_transport() {
+    #[tokio::test]
+    async fn ca_only_builds_simple_transport() {
         let ca_path = write_temp_file("ca.pem", TEST_CLIENT_CERT.as_bytes());
         let mut options = mqtt_options();
         config(Some(ca_path.to_string_lossy().into()), None, None)
-            .apply(&mut options)
+            .apply(&mut options).await
             .expect("ca-only must build a simple transport");
     }
 

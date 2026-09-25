@@ -19,6 +19,7 @@ The `milvus` output upserts each batch's rows into a [Milvus](https://milvus.io/
 | payload_field | string | no | `payload` | JSON field receiving every remaining column as a per-row object. Set to `""` to disable. |
 | api_key | string | no | — | Sent as `Authorization: Bearer`; Milvus convention is `<user>:<password>`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| retry_count | integer | no | `0` | Retry attempts for connection errors and 5xx responses (exponential backoff starting at 100ms). Batches above 1000 rows are split into multiple requests regardless. |
 | headers | map | no | — | Extra HTTP headers. |
 
 ## Collection schema

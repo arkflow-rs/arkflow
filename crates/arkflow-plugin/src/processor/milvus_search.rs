@@ -15,27 +15,26 @@
 //! Milvus similarity search processor
 //!
 //! Reads a Float32 list column from the batch (typically produced by the
-//! `embedding` processor), searches a Milvus collection with one batched
-//! REST v2 request (`POST /v2/vectordb/entities/search` — the `data`
-//! array carries every row's query vector), and appends the matches as a
-//! JSON array text column keyed by position. Failure semantics follow the
-//! `milvus` output: HTTP 200 with a non-zero `code` is an error. The
-//! `api_key` supports secret references (`${env:...}`).
+//! `embedding` processor), searches a Milvus collection, and appends the
+//! matches as a JSON array text column keyed by position. Each row issues
+//! its own `POST /v2/vectordb/entities/search` with `data: [one-vector]` —
+//! Milvus 2.4's REST v2 search flattens multi-vector responses, which loses
+//! per-query grouping — and rows run with bounded, order-preserving
+//! concurrency. Failure semantics follow the `milvus` output: HTTP 200 with
+//! a non-zero `code` is an error. The `api_key` supports secret references
+//! (`${env:...}`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
+use crate::vector_util;
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+use arkflow_core::{Error, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -45,7 +44,7 @@ pub fn init() -> Result<(), Error> {
     register_processor_builder("milvus_search", Arc::new(MilvusSearchProcessorBuilder))?;
     register_processor_metadata(ComponentMetadata::with_schema(
         "milvus_search",
-        "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column.",
+        "Searches a Milvus collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Rows are searched with bounded, order-preserving concurrency.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -91,6 +90,8 @@ struct MilvusSearchProcessorConfig {
     metric: Metric,
     #[serde(default = "default_top_k")]
     top_k: usize,
+    #[serde(default = "default_concurrency")]
+    concurrency: usize,
     #[serde(default)]
     api_key: Option<String>,
     #[serde(default = "default_timeout_ms")]
@@ -110,6 +111,9 @@ fn default_payload_field() -> String {
 }
 fn default_top_k() -> usize {
     5
+}
+fn default_concurrency() -> usize {
+    4
 }
 fn default_timeout_ms() -> u64 {
     30000
@@ -149,9 +153,10 @@ impl Processor for MilvusSearchProcessor {
             return Ok(ProcessResult::None);
         }
 
-        let vectors = extract_vectors(&msg_batch, &self.config.vector_field)?;
+        let vectors =
+            vector_util::extract_vectors("milvus_search processor", &msg_batch, &self.config.vector_field)?;
         let matches = self.search_all(vectors).await?;
-        let batch = append_column(&msg_batch, &self.config.target_field, &matches)?;
+        let batch = vector_util::append_column("milvus_search processor", &msg_batch, &self.config.target_field, &matches)?;
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -174,14 +179,14 @@ impl MilvusSearchProcessor {
 
     /// One request per row: Milvus 2.4's REST v2 search flattens multi-
     /// vector responses, which loses per-query grouping, so each row issues
-    /// its own `data: [one-vector]` search and the responses map back in
-    /// row order.
+    /// its own `data: [one-vector]` search. Rows run with bounded
+    /// concurrency and results map back in row order; the first row failure
+    /// short-circuits (in-flight requests are dropped rather than awaited).
     async fn search_all(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<String>, Error> {
-        let mut matches = Vec::with_capacity(vectors.len());
-        for vector in vectors {
-            matches.push(self.search(vector).await?);
-        }
-        Ok(matches)
+        futures_util::stream::iter(vectors.into_iter().map(|vector| self.search(vector)))
+            .buffered(self.config.concurrency)
+            .try_collect()
+            .await
     }
 
     async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {
@@ -223,7 +228,7 @@ impl MilvusSearchProcessor {
             return Err(Error::Process(format!(
                 "Milvus search returned {}: {}",
                 status,
-                truncate_body(&body)
+                vector_util::truncate_body(&body)
             )));
         }
 
@@ -240,7 +245,7 @@ impl MilvusSearchProcessor {
                 return Err(Error::Process(format!(
                     "Milvus search failed with code {}: {}",
                     code,
-                    truncate_body(message)
+                    vector_util::truncate_body(message)
                 )));
             }
         }
@@ -282,122 +287,6 @@ fn match_match(hit: &Value, config: &MilvusSearchProcessorConfig) -> Result<Valu
     Ok(Value::Object(object))
 }
 
-fn extract_vectors(batch: &MessageBatchRef, field: &str) -> Result<Vec<Vec<f32>>, Error> {
-    let column = batch
-        .schema()
-        .fields()
-        .iter()
-        .position(|f| f.name() == field)
-        .map(|index| batch.column(index))
-        .ok_or_else(|| {
-            Error::Process(format!(
-                "milvus_search processor: input column '{}' not found",
-                field
-            ))
-        })?;
-    let rows = column.len();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(rows);
-    match column.data_type() {
-        DataType::FixedSizeList(_, dim) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let start = row as i64 * *dim as i64;
-                vectors.push(
-                    (start..start + *dim as i64)
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        DataType::List(_) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let offsets = list.value_offsets();
-                vectors.push(
-                    (offsets[row]..offsets[row + 1])
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        other => {
-            return Err(Error::Process(format!(
-                "milvus_search processor: column '{}' must be FixedSizeList(Float32) or List(Float32), got {:?}",
-                field, other
-            )));
-        }
-    }
-    if let Some((row, _)) = vectors.iter().enumerate().find(|(_, v)| v.is_empty()) {
-        return Err(Error::Process(format!(
-            "milvus_search processor: column '{}' has an empty vector at row {row}",
-            field
-        )));
-    }
-    Ok(vectors)
-}
-
-fn not_a_vector_error(field: &str) -> Error {
-    Error::Process(format!(
-        "milvus_search processor: column '{}' is not a Float32 vector list",
-        field
-    ))
-}
-
-fn null_vector_error(field: &str, row: usize) -> Error {
-    Error::Process(format!(
-        "milvus_search processor: column '{}' has a null vector at row {row}",
-        field
-    ))
-}
-
-fn append_column(
-    batch: &MessageBatch,
-    target_field: &str,
-    matches: &[String],
-) -> Result<MessageBatch, Error> {
-    let schema = batch.schema();
-    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(target_field, DataType::Utf8, true)));
-    let mut columns: Vec<ArrayRef> = (0..batch.num_columns())
-        .map(|index| batch.column(index).clone())
-        .collect();
-    columns.push(Arc::new(StringArray::from(matches.to_vec())));
-
-    let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(
-        |e| Error::Process(format!("milvus_search processor: batch rebuild failed: {e}")),
-    )?;
-    Ok(MessageBatch::new_arrow(record_batch))
-}
-
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
-}
-
 struct MilvusSearchProcessorBuilder;
 impl ProcessorBuilder for MilvusSearchProcessorBuilder {
     fn build(
@@ -424,20 +313,12 @@ impl ProcessorBuilder for MilvusSearchProcessorBuilder {
             ));
         }
         config.id_field = config.id_field.filter(|field| !field.trim().is_empty());
-        // Loopback endpoints (local Milvus dev instances, tests) bypass a
-        // system proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-            .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
+        if config.concurrency == 0 {
+            return Err(Error::Config(
+                "milvus_search processor: 'concurrency' must be at least 1".to_string(),
+            ));
         }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = vector_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(MilvusSearchProcessor { config, client }))
     }
 }
@@ -445,7 +326,12 @@ impl ProcessorBuilder for MilvusSearchProcessorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::{Field, Schema};
+    use crate::vector_util::test_support::MockApi as MockMilvus;
+    use arkflow_core::MessageBatch;
+    use datafusion::arrow::array::{
+        Array, FixedSizeListArray, Float32Array, StringArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
 
@@ -453,79 +339,6 @@ mod tests {
         Resource {
             temporary: Default::default(),
             input_names: RefCell::new(Default::default()),
-        }
-    }
-
-    struct MockMilvus {
-        addr: std::net::SocketAddr,
-        requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    }
-
-    impl MockMilvus {
-        fn spawn<F>(handler: F) -> Self
-        where
-            F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
-        {
-            let handler = Arc::new(handler);
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let request_log = requests.clone();
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let mut stream = match stream {
-                        Ok(stream) => stream,
-                        Err(_) => break,
-                    };
-                    let handler = handler.clone();
-                    let request_log = request_log.clone();
-                    let mut buffer = Vec::new();
-                    let mut byte = [0u8; 1];
-                    loop {
-                        use std::io::Read;
-                        if stream.read_exact(&mut byte).is_err() {
-                            break;
-                        }
-                        buffer.push(byte[0]);
-                        if buffer.ends_with(b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&buffer).to_string();
-                    let content_length = head
-                        .to_ascii_lowercase()
-                        .split("content-length:")
-                        .nth(1)
-                        .and_then(|rest| rest.split("\r\n").next())
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    let mut body_bytes = vec![0u8; content_length];
-                    if content_length > 0 {
-                        use std::io::Read;
-                        let _ = stream.read_exact(&mut body_bytes);
-                    }
-                    let body = String::from_utf8_lossy(&body_bytes).to_string();
-                    request_log.lock().unwrap().push((head.clone(), body.clone()));
-
-                    let (status, response_body) = handler(&body);
-                    let response = format!(
-                        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                        response_body.len()
-                    );
-                    use std::io::Write;
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                }
-            });
-            Self { addr, requests }
-        }
-
-        fn last_request(&self) -> (String, String) {
-            self.requests.lock().unwrap().last().cloned().unwrap()
-        }
-
-        fn requests(&self) -> Vec<(String, String)> {
-            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -588,7 +401,7 @@ mod tests {
             let first = parsed["data"][0]["vector"][0].as_f64().unwrap() as i64;
             (200, hits_response(first))
         });
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let batch = vector_batch(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
 
         let result = processor.process(batch).await.unwrap();
@@ -632,7 +445,7 @@ mod tests {
         let mock = MockMilvus::spawn(|_body| {
             (200, r#"{"code":0,"data":[{"distance":0.3,"payload":{"text":"x"}}]}"#.to_string())
         });
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({"id_field": ""})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({"id_field": ""})));
         let batch = vector_batch(vec![vec![1.0, 2.0]]);
         let result = processor.process(batch).await.unwrap();
         let ProcessResult::Single(output) = result else {
@@ -658,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn metric_type_is_configurable() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":[[{"distance":1.0}]]}"#.to_string()));
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({"metric": "IP"})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({"metric": "IP"})));
         processor.process(vector_batch(vec![vec![1.0]])).await.unwrap();
         let (_, body) = mock.last_request();
         let parsed: Value = serde_json::from_str(&body).unwrap();
@@ -670,7 +483,7 @@ mod tests {
         let mock = MockMilvus::spawn(|_body| {
             (200, r#"{"code":100,"message":"collection not found"}"#.to_string())
         });
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let err = processor
             .process(vector_batch(vec![vec![1.0]]))
             .await
@@ -683,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn http_error_is_surfaced() {
         let mock = MockMilvus::spawn(|_body| (404, "no route".to_string()));
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let err = processor
             .process(vector_batch(vec![vec![1.0]]))
             .await
@@ -695,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn null_vector_row_errors_without_request() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let dim = 2i32;
         let with_null = FixedSizeListArray::from_iter_primitive::<
             datafusion::arrow::datatypes::Float32Type,
@@ -717,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn empty_batch_short_circuits_without_request() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let schema = Arc::new(Schema::new(vec![Field::new("embedding", DataType::Utf8, true)]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(

@@ -29,9 +29,7 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Array, FixedSizeListArray, Float32Array, LargeStringArray, ListArray, StringArray,
-};
+use datafusion::arrow::array::{Array, LargeStringArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -99,6 +97,10 @@ fn default_retry_count() -> u32 {
     3
 }
 
+/// Points per upsert request: keeps each JSON body well below REST request
+/// size limits. Batches at or below this size stay a single request.
+const QDRANT_POINTS_PER_REQUEST: usize = 1000;
+
 struct QdrantOutput {
     config: QdrantOutputConfig,
     client: Client,
@@ -115,7 +117,7 @@ impl Output for QdrantOutput {
         if rows == 0 {
             return Ok(());
         }
-        let vectors = extract_vectors(&msg, &self.config.vector_field)?;
+        let vectors = crate::vector_util::extract_vectors("qdrant output", &msg, &self.config.vector_field)?;
         let ids = extract_ids(&msg, &self.config.id_field)?;
         let payloads = extract_payloads(&msg, &self.config)?;
 
@@ -126,10 +128,11 @@ impl Output for QdrantOutput {
                     Some(id) => {
                         point.insert("id".to_string(), id.clone());
                     }
-                    // Qdrant requires every point to carry an id: generate a
-                    // UUID v4 per row so the request is valid (each retry
-                    // inserts a fresh point — prefer id_field for
-                    // at-least-once idempotency).
+                    // Qdrant requires every point to carry an id: generate
+                    // a UUID v4 per row so the request is valid. The id is
+                    // generated once per row before the retry loop, so
+                    // retries reuse it — prefer id_field for strong
+                    // at-least-once idempotency.
                     None => {
                         point.insert("id".to_string(), json!(random_uuid_v4()));
                     }
@@ -142,7 +145,13 @@ impl Output for QdrantOutput {
             })
             .collect();
 
-        self.upsert(&points).await
+        // Large batches are split into bounded requests so a single JSON
+        // body cannot exceed REST request size limits; slices preserve row
+        // order.
+        for chunk in points.chunks(QDRANT_POINTS_PER_REQUEST) {
+            self.upsert(chunk).await?;
+        }
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -184,16 +193,16 @@ impl QdrantOutput {
                         return Err(Error::Process(format!(
                             "Qdrant returned {}: {}",
                             status,
-                            truncate_body(&body)
+                            crate::vector_util::truncate_body(&body)
                         )));
                     }
-                    error!("Qdrant upsert attempt {} failed: {} {}", attempt + 1, status, truncate_body(&body));
+                    error!("Qdrant upsert attempt {} failed: {} {}", attempt + 1, status, crate::vector_util::truncate_body(&body));
                     if attempt >= self.config.retry_count {
                         return Err(Error::Process(format!(
                             "Qdrant returned {} after {} attempts: {}",
                             status,
                             attempt + 1,
-                            truncate_body(&body)
+                            crate::vector_util::truncate_body(&body)
                         )));
                     }
                 }
@@ -207,86 +216,6 @@ impl QdrantOutput {
             tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
         }
     }
-}
-
-fn extract_vectors(batch: &MessageBatchRef, field: &str) -> Result<Vec<Vec<f32>>, Error> {
-    let column = find_column(batch, field)?;
-    let rows = column.len();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(rows);
-    match column.data_type() {
-        DataType::FixedSizeList(_, dim) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| missing_vector_type(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| missing_vector_type(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let start = row as i64 * *dim as i64;
-                vectors.push(
-                    (start..start + *dim as i64)
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        DataType::List(_) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| missing_vector_type(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| missing_vector_type(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let offsets = list.value_offsets();
-                vectors.push(
-                    (offsets[row]..offsets[row + 1])
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        other => {
-            return Err(Error::Process(format!(
-                "qdrant output: column '{}' must be FixedSizeList(Float32) or List(Float32), got {:?}",
-                field, other
-            )));
-        }
-    }
-    if let Some((row, empty)) = vectors.iter().enumerate().find(|(_, v)| v.is_empty()) {
-        let _ = empty;
-        return Err(Error::Process(format!(
-            "qdrant output: column '{}' has an empty vector at row {row}",
-            field
-        )));
-    }
-    Ok(vectors)
-}
-
-fn missing_vector_type(field: &str) -> Error {
-    Error::Process(format!(
-        "qdrant output: column '{}' is not a Float32 vector list",
-        field
-    ))
-}
-
-fn null_vector_error(field: &str, row: usize) -> Error {
-    Error::Process(format!(
-        "qdrant output: column '{}' has a null vector at row {row}",
-        field
-    ))
 }
 
 fn extract_ids(batch: &MessageBatchRef, field: &Option<String>) -> Result<Option<Vec<Value>>, Error> {
@@ -441,12 +370,6 @@ fn random_uuid_v4() -> String {
     )
 }
 
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
-}
 
 struct QdrantOutputBuilder;
 impl OutputBuilder for QdrantOutputBuilder {
@@ -468,20 +391,7 @@ impl OutputBuilder for QdrantOutputBuilder {
                 "qdrant output: 'collection' must not be empty".to_string(),
             ));
         }
-        // Loopback endpoints (local Qdrant dev instances, tests) bypass a
-        // system proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&config.url)
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-            .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = crate::vector_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(QdrantOutput { config, client }))
     }
 }
@@ -489,6 +399,7 @@ impl OutputBuilder for QdrantOutputBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use arkflow_core::MessageBatch;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
