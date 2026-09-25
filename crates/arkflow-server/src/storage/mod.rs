@@ -1,5 +1,6 @@
 //! Hub control-plane storage: records, the FIFO storage actor, and the
 //! backend contract dispatching between SQLite (default) and PostgreSQL.
+pub mod migrate_tool;
 pub mod postgres;
 pub mod sqlite;
 
