@@ -39,7 +39,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 apache-avro = { version = "0.22", default-features = false }
 datafusion = { version = "54.1", features = ["avro"] }
 datafusion-functions-json = "0.54.2"
-arrow-json = "58.4"
+arrow-json = "59.1"
 arrow-pyarrow = "58.4"
 prost-reflect = "0.16.3"
 prost-types = "0.14.3"
