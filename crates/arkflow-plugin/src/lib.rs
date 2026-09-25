@@ -28,6 +28,7 @@ pub mod rate_limiter;
 pub mod temporary;
 pub mod time;
 pub mod udf;
+pub mod vector_util;
 pub mod wal;
 
 use arkflow_core::Error;
