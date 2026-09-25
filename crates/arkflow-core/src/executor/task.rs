@@ -1672,6 +1672,7 @@ async fn handle_envelope(
 ) -> Result<bool, Error> {
     match envelope {
         Envelope::Data(batch, ack) => {
+            eprintln!("T6 handle_envelope data on chain {}", chain.entry_task_id());
             // Join chains consume multiple inbound edges through one
             // processor; tag the batch with its input index (0 = left,
             // 1 = right) so the join operator can tell the sides apart.
