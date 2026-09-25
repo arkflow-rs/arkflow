@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         session_ttl_ms: config.session_ttl_ms,
     };
     let mut hub = if let Some(path) = config.hub_storage.as_deref() {
-        let store = ControlPlaneStore::open(path)?;
+        let store = ControlPlaneStore::open(path).await?;
         Hub::with_storage(hub_config, StorageActor::start(store, 128))
     } else {
         Hub::new(hub_config)
