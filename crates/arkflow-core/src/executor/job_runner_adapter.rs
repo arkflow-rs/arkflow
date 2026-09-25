@@ -104,6 +104,9 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     } else {
         None
     };
+    if let Some(manifest) = recovery_manifest.as_ref() {
+        validate_manifest_task_compatibility(manifest, &plan)?;
+    }
     let state = local_state_backend(&plan)?;
     let builder = match state.clone() {
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
@@ -625,6 +628,36 @@ async fn close_inputs(inputs: &[Arc<dyn crate::input::Input>]) {
     }
 }
 
+/// Fail closed when a recovery artifact was written under a different task
+/// set than the current plan: keyed state namespaces embed task ids, so a
+/// parallelism (or operator-topology) change would silently strand the old
+/// state behind renamed namespaces while source positions still restore.
+/// Until key redistribution lands, the operator must keep the parallelism
+/// fixed or reset state with a fresh checkpoint/savepoint.
+fn validate_manifest_task_compatibility(
+    manifest: &crate::checkpoint::CheckpointManifest,
+    plan: &JobPlan,
+) -> Result<(), Error> {
+    let plan_tasks: BTreeSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    let manifest_tasks: BTreeSet<&str> = manifest
+        .task_attempts
+        .iter()
+        .map(|attempt| attempt.task_id.as_str())
+        .collect();
+    if plan_tasks != manifest_tasks {
+        let removed: Vec<&str> = manifest_tasks.difference(&plan_tasks).copied().collect();
+        let added: Vec<&str> = plan_tasks.difference(&manifest_tasks).copied().collect();
+        return Err(Error::Config(format!(
+            "recovery artifact '{}' was written under a different task set than the current plan \
+             (parallelism or operator topology changed; removed tasks {:?}, added tasks {:?}); \
+             keyed state cannot yet redistribute across a parallelism change — restore the original \
+             parallelism or reset state with a fresh checkpoint/savepoint",
+            manifest.checkpoint_id, removed, added
+        )));
+    }
+    Ok(())
+}
+
 fn latest_local_checkpoint(
     root: &std::path::Path,
     plan: &JobPlan,
@@ -1009,6 +1042,107 @@ pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+
+    #[test]
+    fn rescale_across_parallelism_fails_closed_on_recovery() {
+        let mut spec = crate::job::JobSpec {
+            rebalance: None,
+            placement: crate::job::PlacementStrategy::Colocated,
+            id: JobId::new("rescale-guard").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 8,
+            parallelism: 1,
+            operators: vec![
+                OperatorSpec {
+                    id: "source".into(),
+                    kind: OperatorKind::Source,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
+                    id: "sink".into(),
+                    kind: OperatorKind::Sink,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![crate::job::EdgeSpec {
+                id: "edge".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }],
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: "vec".into(),
+                codec: None,
+                config: serde_json::json!({}),
+                time: crate::job::TimeSpec {
+                    mode: crate::job::TimeMode::ProcessingTime,
+                    timestamp_field: None,
+                    watermark: None,
+                    allowed_lateness_ms: 0,
+                    late_event_policy: Default::default(),
+                    late_event_route: None,
+                },
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "collect".into(),
+                codec: None,
+                config: serde_json::json!({}),
+            }],
+            state: None,
+            checkpoint: None,
+            recovery: Default::default(),
+        };
+        let manifest = crate::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-1".into(),
+            job_id: spec.id.clone(),
+            job_version: spec.version,
+            generation: 1,
+            task_attempts: vec![
+                crate::checkpoint::TaskAttemptSnapshot {
+                    task_id: "source-0".into(),
+                    attempt_id: "source-0:n1:0".into(),
+                    node_id: "n1".into(),
+                },
+                crate::checkpoint::TaskAttemptSnapshot {
+                    task_id: "sink-0".into(),
+                    attempt_id: "sink-0:n1:0".into(),
+                    node_id: "n1".into(),
+                },
+            ],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-1".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: Vec::new(),
+            format_version: 1,
+            checksum: 0,
+        };
+        // Same parallelism: compatible.
+        let same = JobPlan::compile(spec.clone()).unwrap();
+        assert!(validate_manifest_task_compatibility(&manifest, &same).is_ok());
+        // Parallelism change: fail closed with an actionable error.
+        spec.parallelism = 2;
+        let rescaled = JobPlan::compile(spec).unwrap();
+        let error = validate_manifest_task_compatibility(&manifest, &rescaled)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("parallelism or operator topology changed"),
+            "{error}"
+        );
+        assert!(error.contains("fresh checkpoint"), "{error}");
+    }
+
     use crate::job::{
         CheckpointSpec, JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec,
         StateDurability, StateSpec, TimeMode, TimeSpec,
