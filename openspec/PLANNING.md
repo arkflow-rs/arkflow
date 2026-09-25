@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -377,6 +377,8 @@ v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为
 - **没有跨节点 network shuffle**：单算子中间数据不出节点，跨节点数据交换走外部系统（如 Kafka 重分区）；
 - 适用：多分区并行消费、独立子任务、多节点 IoT 就近采集；不适用：需要 shuffle 的重型有状态聚合/join——与 1.3 节「避开 RisingWave/Arroyo 主场」的定位自洽。
 
+> **2026-09-25 修订**：本节「没有跨节点 network shuffle」已过时——`add-network-shuffle-data-plane`（含认证、Ack 三态回执、key-group 路由）连同 `split-placement`/`split-side-edge-placement` 已合入（spec `network-shuffle-data-plane`，实现 `crates/arkflow-core/src/executor/remote.rs`）。colocated 仍是默认放置，split placement 为 opt-in；「重型有状态 join」的空白依旧存在，但成因已从「无数据面」变为「join 算子未实现」（见第八节）。
+
 ### 7.3 候选方向与推荐优先序
 
 | 序 | 方向 | 要点 |
@@ -395,3 +397,83 @@ v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为
 - `docs/docs/configuration/1-top-level.md` 补 `jobs` 字段与 JobSpec 文档（此前零覆盖）；
 - `docs/docs/control-plane/http-api-v1.md` 补 Job API 路由（此前零覆盖）；
 - `docs/docs/concepts/7-distributed-jobs.md` 显式声明 7.2 节的链共置/无 shuffle 边界。
+
+---
+
+## 八、能力完备性评估与补齐计划（2026-09-25）
+
+> 源起：以「分布式能力是否完备」为题的系统性评估——对照 Flink 作业模型，逐项核实代码与 `openspec/specs/`。本节沉淀评估结论与补齐 roadmap，避免重复调研；各 change 立项后细节仍由 OpenSpec `changes/` 与归档 specs 承载。
+
+### 8.1 评估结论
+
+**总体：不完备，但缺口是「已知且被规格诚实记录」的，不是烂尾。数据面原语、容错语义、工程化质量接近一线水平；核心空白集中在流-流 join、控制面高可用、自动扩缩容三处。** 当前适用画像：单集群、作业级并行、无双流关联的管道场景（ETL/清洗/enrichment/向量管道）；尚不能替代通用流计算平台承担双流关联类核心业务。
+
+已完备部分（规格 + 实现 + 测试三重覆盖）：
+
+- 事件时间：分区级 watermark、窗口迟到行为显式定义、滑动窗口覆盖所有包含窗口、迟到事件专门路由边、非法时间戳不无限持有（`event-time-processing`）。
+- 状态与容错：keyed state 后端、版本化状态格式、state journal 版本围栏、checkpoint 恢复（源位置 + 全部分区 watermark 一并还原）、WAL（含 S3）、端到端有界背压（含跨节点边沿 TCP 反压）。
+- 投递语义：Kafka L2 事务 exactly-once（`read_committed` 原子可见、zombie producer 围栏、事务 id 稳定性契约）+ 诚实边界声明（事务提交后、offset 提交前崩溃的残留重复需下游幂等吸收，L3 未做）。
+- 分布式运行时：代数围栏（exactly one live runner）、资源感知放置、opt-in 压力再均衡（带冷却防抖）、网络 shuffle（key-group 路由稳定、Ack 三态镜像回执、fail-closed）。
+- 运维面：savepoint、Hub 生命周期 API、OIDC/RBAC、节点资源上报、Web 控制台、benchmark 套件。
+
+缺口清单（按严重程度，均已核实）：
+
+1. **流-流 join 完全缺失**：`OperatorKind::Join` 在 Job DAG 校验中被直接拒绝（`crates/arkflow-core/src/job.rs:574` "Join operator is not supported by the distributed runtime"）；而 stream 编译器拒绝 legacy join buffer 时却引导用户「declare a Job DAG with an explicit join operator」（`stream_compiler.rs:117`）——**两条报错互相打架，指引是死路**。SQL processor 仅支持批内对临时表 join；v1 时代的 `streaming_sql.rs` 已随内核重建消失。
+2. **Hub 无 HA**：单实例 SQLite 单写者、无故障转移；阶段 1 设计文档已产出（`openspec/specs/hub-ha/postgres-storage-design.md`），实施未启动。
+3. **无自动扩缩容**：全仓库无 rescale/autoscale 命中；唯一手段是 opt-in 压力再均衡——整作业粗粒度迁移，并行度不变，无 key 状态重分布。
+4. **跨节点链路体验粗糙**：远程边 fail-closed、无透明重连（断链 = 作业失败重放置，网络抖动即恢复风暴）、失败发现延迟一个 drain 超时（无主动 Failed 回执）、at-least-once（下游需容忍重复）。
+5. 次要：exactly-once 仅覆盖 Kafka sink（其他输出靠 `write_batch` 原子性约定 + 重放）；split placement 需显式开启（默认整作业落单节点、靠源分区并行）。
+
+### 8.2 补齐 Roadmap（价值优先序）
+
+```
+P0  fix-join-error-guidance        修复自相矛盾的 join 报错指引      独立，半天级
+P1  add-hub-postgres-storage       Hub HA 阶段 1（存储迁移）         设计已产出，周级
+P1  add-stream-join-operator       双流 keyed join（内核算子）        最重；与上行可并行
+P2  harden-shuffle-recovery        网络 shuffle 恢复体验             依赖 shuffle 现状稳定
+P2  add-job-rescale                并行度变更 + key 状态重分布        建议 join 之后
+P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独立，随时可插
+```
+
+### 8.3 各项要点
+
+#### P0 — fix-join-error-guidance（立即，小 change）
+
+- **Why**：报错指引互相矛盾且是死路（见 8.1-1），用户撞墙时得到错误导航。
+- **What**：两条报错统一为诚实表述——双流 join 暂不支持，给出可行替代（SQL processor 临时表 join / 借 Kafka 重分区共置）；`docs/docs/concepts/7-distributed-jobs.md` 同步声明边界。
+- **Impact**：`stream_compiler.rs:117`、`job.rs:574` 错误文案 + 分布式文档边界声明。
+
+#### P1 — add-hub-postgres-storage（设计已就绪，唯一「设计完成待实施」项）
+
+- **Why**：控制面单点是生产化最大阻塞；评审级设计已归档（StorageBackend async trait + actor FIFO 保持、17 表映射、scheme 分派、migrate 子命令契约、双后端契约测试、六步实施分解）。
+- **What**：按 `openspec/specs/hub-ha/postgres-storage-design.md` 实施；完成后再评估阶段 2（DB 租约选主、自动接管）。
+- **Capabilities**：修改 `hub-ha`。
+
+#### P1 — add-stream-join-operator（最重）
+
+- **Why**：双流 join 缺席是最重的能力短板，也是「轻量错位」叙事下用户最先撞到的墙（enrichment / 实时合并）。地基已齐：keyed state、watermark、事件时间门控、barrier checkpoint 全部就绪，只缺算子本体。
+- **What**：统一内核实现 keyed equi-join——watermark 驱动的 windowed/interval join 语义，双侧 keyed buffer + 迟到清理，状态走 keyed-state-backend 并参与屏障快照；Job DAG 放开 `OperatorKind::Join` 的同时 Stream 侧提供声明式入口。
+- **Non-goals**：temporal join（维表 lookup）、非 equi-join、跨节点 shuffle join（后续）。
+- **Capabilities**：新增 `stream-join-operator`；修改 `stream-config-compilation`。
+- **战略注记**：与 1.3 节「避开 RisingWave/Arroyo 主场」存在张力——界定为「keyed 窗口 join 的够用实现」而非对标 Flink join 家族；temporal/lookup 形态留 backlog。
+
+#### P2 — harden-shuffle-recovery
+
+- **What**：① 有界窗口内有限次透明重连（幂等握手）；② 主动 Failed 回执，把失败发现从一个 drain 超时缩短到即时；③ 远程边 dedup（借 checkpoint seq），把 at-least-once 收敛到 effectively-once。
+- **Capabilities**：修改 `network-shuffle-data-plane`。
+
+#### P2 — add-job-rescale
+
+- **What**：savepoint → 变更 `parallelism` → 从 savepoint 恢复（key-group 重映射 + 状态重分布）；与既有再均衡策略衔接。
+- **Capabilities**：新增 `job-rescale`。
+
+#### P3 — eos-l3-and-transactional-sinks
+
+- **What**：Kafka→Kafka `send_offsets_to_transaction`（源 offset 进 producer 事务，消灭「提交后-偏移提交前」残留重复，闭环 L3）；sql output 按方言的事务批次。
+- **Capabilities**：修改 `exactly-once-output`。
+
+### 8.4 与既有路线的关系
+
+- P1（Postgres）即 7.3 序 5 已排的 HA 路线，本节确认其优先级与前置关系不变。
+- P1（join）为本次评估**新增项**，7.3 未收录——1.1 节「SQL 处理支持 Join」指批内临时表 join，此前掩盖了双流 join 的真实空缺。
+- 其余项（EOS L3、shuffle 体验）在既有 backlog 中已有踪迹，本节按完备性视角重排优先级。
