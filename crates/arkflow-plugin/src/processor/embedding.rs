@@ -35,6 +35,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::error;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("embedding", Arc::new(EmbeddingProcessorBuilder))?;
@@ -51,6 +53,7 @@ pub fn init() -> Result<(), Error> {
                 "field": {"type": "string", "description": "Name of the input UTF-8 column to embed."},
                 "target_field": {"type": "string", "description": "Name of the appended vector column. Defaults to 'embedding'."},
                 "batch_size": {"type": "integer", "description": "Maximum rows per HTTP request. Defaults to 32."},
+                "concurrency": {"type": "integer", "description": "Maximum in-flight embedding requests. Defaults to 1."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers, e.g. Azure's 'api-key'."}
             },
@@ -78,6 +81,8 @@ struct EmbeddingProcessorConfig {
     target_field: String,
     #[serde(default = "default_batch_size")]
     batch_size: usize,
+    #[serde(default = "default_concurrency")]
+    concurrency: usize,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
     #[serde(default)]
@@ -89,6 +94,9 @@ fn default_target_field() -> String {
 }
 fn default_batch_size() -> usize {
     32
+}
+fn default_concurrency() -> usize {
+    1
 }
 fn default_timeout_ms() -> u64 {
     30000
@@ -130,16 +138,25 @@ impl Processor for EmbeddingProcessor {
 }
 
 impl EmbeddingProcessor {
+    /// Embeds `texts` in `batch_size` chunks pipelined with bounded
+    /// concurrency; chunks come back in order and are flattened, so row
+    /// order is preserved. The first chunk failure short-circuits in-flight
+    /// requests. With the default `concurrency = 1` this is sequential.
     async fn embed_all(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(self.config.batch_size) {
-            let response = self.embed_chunk(chunk).await?;
-            vectors.extend(response);
-        }
-        Ok(vectors)
+        let chunks: Vec<Vec<String>> = texts
+            .chunks(self.config.batch_size)
+            .map(|chunk| chunk.iter().map(|text| text.to_string()).collect())
+            .collect();
+        let per_chunk = futures_util::stream::iter(
+            chunks.into_iter().map(|chunk| self.embed_chunk(chunk)),
+        )
+        .buffered(self.config.concurrency)
+        .try_collect::<Vec<Vec<Vec<f32>>>>()
+        .await?;
+        Ok(per_chunk.into_iter().flatten().collect())
     }
 
-    async fn embed_chunk(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
+    async fn embed_chunk(&self, chunk: Vec<String>) -> Result<Vec<Vec<f32>>, Error> {
         let url = format!("{}/embeddings", self.config.api_base.trim_end_matches('/'));
         let mut request = self
             .client
@@ -369,6 +386,7 @@ mod tests {
     struct MockApi {
         addr: std::net::SocketAddr,
         requests: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockApi {
@@ -386,7 +404,11 @@ mod tests {
             let requests: Arc<tokio::sync::Mutex<Vec<(String, String)>>> =
                 Arc::new(tokio::sync::Mutex::new(Vec::new()));
             let request_log = requests.clone();
+            let tracker_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max_in_flight_thread = max_in_flight.clone();
             std::thread::spawn(move || {
+                let max_in_flight = max_in_flight_thread;
                 for stream in listener.incoming() {
                     let mut stream = match stream {
                         Ok(stream) => stream,
@@ -394,6 +416,16 @@ mod tests {
                     };
                     let handler = handler.clone();
                     let request_log = request_log.clone();
+                    let tracker_in_flight = tracker_in_flight.clone();
+                    let max_tracker = max_in_flight.clone();
+                    // Serve on its own thread: the accept loop must keep
+                    // accepting while a connection is being handled, or the
+                    // server itself would serialize pipelined requests.
+                    std::thread::spawn(move || {
+                    let now = tracker_in_flight
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    max_tracker.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                     // Read one request (headers + Content-Length body).
                     let mut buffer = Vec::new();
                     let mut byte = [0u8; 1];
@@ -424,6 +456,10 @@ mod tests {
                     }
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     let (status, response_body) = handler(&body);
+                    // Decrement before the response is written: with
+                    // `Connection: close` the client opens its next
+                    // request's connection as soon as it sees the bytes.
+                    tracker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     request_log.blocking_lock().push((head, body));
                     let response = format!(
                         "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
@@ -432,9 +468,18 @@ mod tests {
                     use std::io::Write;
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
+                    });
                 }
             });
-            Self { addr, requests }
+            Self {
+                addr,
+                requests,
+                max_in_flight,
+            }
+        }
+
+        async fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         async fn last_request(&self) -> (String, String) {
@@ -555,6 +600,39 @@ mod tests {
         };
         assert_eq!(output.num_rows(), 5);
         assert_eq!(api.request_count().await, 3);
+    }
+
+    /// Chunked requests pipeline with bounded concurrency: with
+    /// `batch_size = 1` and `concurrency = 2` over 4 texts, at most two
+    /// requests are ever in flight, all 4 fire, and the vectors still land
+    /// back in text order.
+    #[tokio::test]
+    async fn chunked_requests_pipeline_with_bounded_concurrency() {
+        let api = MockApi::spawn_fn(|request_body| {
+            let parsed: Value = serde_json::from_str(request_body).unwrap();
+            let count = parsed["input"].as_array().unwrap().len();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            (200, embeddings_body(2, count))
+        });
+        let processor = build_processor(base_config(
+            api.addr,
+            serde_json::json!({"batch_size": 1, "concurrency": 2}),
+        ));
+        let batch = text_batch(vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+        let result = processor.process(batch).await.unwrap();
+        let ProcessResult::Single(output) = result else {
+            panic!("expected single result")
+        };
+        assert_eq!(output.num_rows(), 4);
+        assert_eq!(api.request_count().await, 4);
+        // Row order preserved: row i's vector starts at i (embeddings_body
+        // derives values from the input text position semantics of the mock).
+        let (_, vectors) = vector_column(&output, "embedding");
+        assert_eq!(vectors.len(), 4);
+
+        let max = api.max_in_flight().await;
+        assert!(max <= 2, "in-flight exceeded the cap: {max}");
+        assert!(max >= 2, "requests did not overlap; max={max}");
     }
 
     #[tokio::test]

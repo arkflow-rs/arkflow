@@ -4174,6 +4174,10 @@
               "type": "integer",
               "description": "Maximum rows per HTTP request. Defaults to 32."
             },
+            "concurrency": {
+              "type": "integer",
+              "description": "Maximum in-flight embedding requests. Defaults to 1."
+            },
             "timeout_ms": {
               "type": "integer",
               "description": "HTTP request timeout in milliseconds. Defaults to 30000."
