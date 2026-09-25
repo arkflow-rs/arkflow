@@ -126,4 +126,5 @@ input:
 ## 说明
 
 - 消息会自动携带 `__meta_source`、`__meta_partition`、`__meta_offset`、`__meta_key`、`__meta_timestamp`、`__meta_ingest_time` 等元数据列,以及扩展列 `__meta_ext.topic`。
+- 每条 Kafka record header 会作为 `header_<key>` 条目写入 `__meta_ext` 映射列。重复的 header key 会保留全部值:首次出现使用 `header_<key>`,后续出现附加位置后缀(`header_<key>_2`、`header_<key>_3`…)。值按 UTF-8 lossy 解码(非法字节替换为 U+FFFD),无值的 header 映射为空字符串。
 - 只有在调用 `ack()` 时(下游写入成功后)才通过 `store_offset` 推进偏移量,并结合周期性自动提交,实现至少一次投递。
