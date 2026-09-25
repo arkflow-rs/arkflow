@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐（见 8.5 进度）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -477,3 +477,20 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 - P1（Postgres）即 7.3 序 5 已排的 HA 路线，本节确认其优先级与前置关系不变。
 - P1（join）为本次评估**新增项**，7.3 未收录——1.1 节「SQL 处理支持 Join」指批内临时表 join，此前掩盖了双流 join 的真实空缺。
 - 其余项（EOS L3、shuffle 体验）在既有 backlog 中已有踪迹，本节按完备性视角重排优先级。
+
+### 8.5 补齐进度（2026-09-25 全部闭环，分支 capability-completion-plan）
+
+全部六项以 openspec 全流程（propose → apply → verify → archive）在同一分支交付：
+
+| 计划项 | 交付 change | 状态 | 备注 |
+| --- | --- | --- | --- |
+| P0 fix-join-error-guidance | `fix-join-error-guidance` | ✅ 归档 | 两条报错统一为诚实指引；specs（stream-config-compilation MODIFIED、streaming-job-api ADDED）同步 |
+| P1 add-hub-postgres-storage | `add-hub-postgres-storage` | ✅ 归档 | 按既有评审级设计全量实施：StorageBackend trait（52 方法）、PostgresBackend（sqlx，?N→$N 运行时重写共享 SQL 文本）、scheme 分派、`arkflow-server migrate` 子命令、PG 门控契约测试（`ARKFLOW_TEST_POSTGRES_URL`）；SQLite 行为零变化（184 server 测试绿） |
+| P1 add-stream-join-operator | `add-stream-join-operator` | ✅ 归档 | 统一内核 keyed interval join：`executor/join.rs`（watermark/容量双界、`l_*`/`r_*`/`join_key` 输出、重放重建状态）；侧别按生产者声明（`left_from`/`right_from`）——通道顺序是内核内部细节；8 单测 + E2E + 实跑验证（examples/job_join.yaml 真实输出）。附带修复：Job SourceSpec/SinkSpec 一等 `codec` 字段（修复 jobs_local 既有运行时缺口）。新 capability spec `stream-join-operator` |
+| P2 harden-shuffle-recovery | `add-remote-failed-receipt` | ✅ 归档（第一增量） | Ack 回执扩展四态（+Failed）：下游处理失败即时中止上游分支，drain 超时降级为丢帧兜底；fail-closed 不变。透明重连与远程边去重仍留 backlog（协议状态机工程） |
+| P2 add-job-rescale | `add-job-rescale-guard` | ✅ 归档（正确性守卫） | 调研结论：keyed 状态命名空间内嵌 task id，并行度变更=静默状态失联；真 key 重分布需逐算子状态键解码（窗口键内嵌 window_start），独立立项。本变更交付恢复侧任务集兼容性守卫（显式失败替代静默空状态） |
+| P3 eos-l3-and-transactional-sinks | `add-sql-transactional-batch` | ✅ 归档（SQL 增量） | SQL output `write_batch` 单事务原子（双方言）；Kafka L3 明确延后——`send_offsets_to_transaction` 需输入侧 cgm 经 ack 链交接（跨组件协议改造），理由入档 exactly-once-output spec |
+
+**验证**：`cargo test --workspace --all-targets` 全绿、clippy 无新增告警、`pnpm docs:check` 通过（138 页/49 组件）、examples 清单与 snippets 校验通过、join 示例实跑验证。
+
+**剩余边界（诚实记录）**：远程边透明重连与去重、真 key 重分布 rescale、Kafka L3、temporal/outer join、Hub 阶段 2（选主）。

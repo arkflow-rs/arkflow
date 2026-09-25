@@ -174,6 +174,7 @@ fn fleet_job(
             partitioned: false,
         }],
         sources: vec![SourceSpec {
+            codec: None,
             operator_id: "source-a".into(),
             input_type: "generate".into(),
             config: serde_json::json!({
@@ -184,6 +185,7 @@ fn fleet_job(
             time: processing_time(),
         }],
         sinks: vec![SinkSpec {
+            codec: None,
             operator_id: "sink-a".into(),
             output_type: "drop".into(),
             config: serde_json::json!({}),

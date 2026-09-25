@@ -289,20 +289,67 @@ kernel-internal detail). The config carries `left_key`/`right_key`,
 `window_ms`, and optional `left_timestamp`/`right_timestamp` (default
 `__meta_timestamp`), `ttl_ms`, and `max_per_key`:
 
-```yaml
-operators:
-  - id: join-orders
-    kind: join
-    config:
-      left_from: orders
-      right_from: profiles
-      left_key: customer_id
-      right_key: customer_id
-      window_ms: 5000
-edges:
-  - { id: left, from: orders, to: join-orders }
-  - { id: right, from: profiles, to: join-orders }
-  - { id: out, from: join-orders, to: sink }
+```yaml validate=fragment wrap=engine
+jobs:
+  - id: join-orders-profiles
+    version: 1
+    parallelism: 1
+    max_parallelism: 128
+    operators:
+      - id: orders
+        kind: source
+      - id: profiles
+        kind: source
+      - id: join-orders
+        kind: join
+        config:
+          left_from: orders
+          right_from: profiles
+          left_key: customer_id
+          right_key: customer_id
+          window_ms: 5000
+      - id: sink
+        kind: sink
+    edges:
+      - { id: left, from: orders, to: join-orders }
+      - { id: right, from: profiles, to: join-orders }
+      - { id: out, from: join-orders, to: sink }
+    sources:
+      - operator_id: orders
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "amount": 42, "ts": 1757000000000 }'
+          interval: 500ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+      - operator_id: profiles
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "tier": "gold", "ts": 1757000000000 }'
+          interval: 700ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+    sinks:
+      - operator_id: sink
+        output_type: stdout
 ```
 
 Semantics and boundaries:

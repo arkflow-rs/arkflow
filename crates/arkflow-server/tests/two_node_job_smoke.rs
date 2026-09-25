@@ -88,6 +88,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
         ],
         sources: vec![
             SourceSpec {
+                codec: None,
                 operator_id: "source-a".into(),
                 input_type: "generate".into(),
                 config: serde_json::json!({
@@ -99,6 +100,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             },
             SourceSpec {
                 operator_id: "source-b".into(),
+                codec: None,
                 input_type: "generate".into(),
                 config: serde_json::json!({
                     "context": "node-b",
@@ -112,11 +114,13 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             SinkSpec {
                 operator_id: "sink-a".into(),
                 output_type: "drop".into(),
+                codec: None,
                 config: serde_json::json!({}),
             },
             SinkSpec {
                 operator_id: "sink-b".into(),
                 output_type: "drop".into(),
+                codec: None,
                 config: serde_json::json!({}),
             },
         ],
