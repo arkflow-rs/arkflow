@@ -271,8 +271,14 @@ fn parse_engine_config(content: &str, format: ConfigFormat) -> Result<EngineConf
             ConfigFormat::TOML => crate::secret::ConfigDocument::Toml(content),
         };
         let value = crate::secret::resolve_document(document)?;
-        return serde_json::from_value(value)
-            .map_err(|e| Error::Config(format!("Configuration error: {}", e)));
+        return serde_json::from_value(value).map_err(|_| {
+            // Deserialization failures after secret resolution must not echo
+            // the offending value: serde type errors embed the resolved
+            // secret. Use a fixed, value-independent message.
+            Error::Config(
+                "Configuration error: validation failed after secret resolution".to_string(),
+            )
+        });
     }
     match format {
         ConfigFormat::YAML => serde_yaml::from_str(content)
@@ -380,6 +386,29 @@ mod tests {
     use std::env;
     use std::fs::{self, File};
     use std::io::Write;
+
+    /// A type error after secret resolution must not echo the resolved
+    /// value: serde type errors embed the offending string, which would
+    /// leak the secret into the CLI error output.
+    #[test]
+    fn parse_error_after_secret_resolution_does_not_leak_the_resolved_value() {
+        let name = "ARKFLOW_TEST_LEAK_PROBE";
+        env::set_var(name, "sup3r-s3cret-value");
+        // `health_check.enabled` is a bool; the resolved secret lands there
+        // as a string, so deserialization fails after resolution succeeds.
+        let content = format!("health_check:\n  enabled: ${{env:{name}}}\n");
+        let error = parse_engine_config(&content, ConfigFormat::YAML)
+            .expect_err("type mismatch must fail materialization");
+        let message = error.to_string();
+        assert!(
+            message.contains("validation failed after secret resolution"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("sup3r-s3cret-value"),
+            "resolved secret leaked into the error: {message}"
+        );
+    }
 
     #[test]
     fn test_default_log_format() {

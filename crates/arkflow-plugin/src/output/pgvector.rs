@@ -138,9 +138,17 @@ impl Output for PgVectorOutput {
         if rows == 0 {
             return Ok(());
         }
-        if !self.connected.load(Ordering::SeqCst) || self.pool.lock().await.is_none() {
+        if !self.connected.load(Ordering::SeqCst) {
             return Err(Error::Connection("The output is not connected".to_string()));
         }
+        // Hold the pool lock from the connectivity check through the insert:
+        // releasing between the two would let a concurrent `close()` swap the
+        // pool to `None` and turn the lookup below into a panic instead of a
+        // retryable connection error.
+        let pool = self.pool.lock().await;
+        let Some(pool) = pool.as_ref() else {
+            return Err(Error::Connection("The output is not connected".to_string()));
+        };
 
         let vectors = extract_vectors(&msg, &self.config.vector_field)?;
         let ids = extract_ids(&msg, &self.config.id_field)?;
@@ -154,8 +162,6 @@ impl Output for PgVectorOutput {
             })
             .collect();
 
-        let pool = self.pool.lock().await;
-        let pool = pool.as_ref().expect("pool checked above");
         build_insert(&self.config, &point_rows)
             .build()
             .execute(pool)

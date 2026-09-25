@@ -2518,9 +2518,30 @@ impl Hub {
                         Ok(Some(resolved)) => attempt.payload_json = Some(resolved),
                         Ok(None) => {}
                         Err(error) => {
-                            return Err(HubError::Invalid(format!(
-                                "configuration dispatch pre-resolution failed: {error}"
-                            )));
+                            // A missing secret is a permanent misconfiguration,
+                            // not a transient dispatch failure: routing it
+                            // through the attempt/intent failure machinery
+                            // blocks the intent (rollout target -> failed)
+                            // instead of leaving the outbox lease to expire
+                            // and re-claim the identical payload forever.
+                            tracing::warn!(
+                                attempt_id = %attempt.attempt_id,
+                                %error,
+                                "configuration dispatch pre-resolution failed"
+                            );
+                            storage
+                                .complete_attempt(
+                                    &attempt.attempt_id,
+                                    "failed",
+                                    Some("invalid_config".into()),
+                                )
+                                .await
+                                .map_err(HubError::from)?;
+                            storage
+                                .mark_outbox_processed(outbox.outbox_id, now_ms())
+                                .await
+                                .map_err(HubError::from)?;
+                            return Ok(None);
                         }
                     }
                 }
@@ -7031,6 +7052,98 @@ mod tests {
         assert!(payload.contains("${secret:db_pass}"), "{payload}");
         assert!(!payload.contains("s3cret"), "{payload}");
         assert!(payload.contains("${env:HUB_HOST}"), "{payload}");
+    }
+
+    /// A dispatch-time pre-resolution failure is permanent, so it must land
+    /// in the attempt/intent failure machinery (intent blocked, rollout
+    /// target failed, outbox row consumed) instead of returning an error
+    /// that leaves the lease to expire and re-claim the identical payload
+    /// forever.
+    #[tokio::test]
+    async fn reconcile_once_pre_resolution_failure_blocks_the_intent() {
+        let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+        let assertion_store = store.clone();
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:never_set_y}\n"
+        })
+        .to_string();
+        std::env::remove_var("ARKFLOW_SECRET_never_set_y");
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-block', 'digest', ?1, 'json', 1)",
+                    [&candidate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        hub.register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["configuration".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+        let rollout = hub
+            .create_rollout("cfg-block".into(), vec!["node-a".into()], 1, None, None)
+            .await
+            .unwrap();
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "applying");
+
+        // Dispatch consumes the outbox row, fails the attempt, and returns
+        // no command — no half-resolved configuration reaches the Agent.
+        let dispatched = hub.reconcile_once("worker-1").await.unwrap();
+        assert!(dispatched.is_none(), "no command may be dispatched");
+
+        let (intent_state, failure_class) = assertion_store
+            .with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT state, COALESCE(last_failure_class, '') FROM cp_intents WHERE intent_type = 'apply_configuration'")?;
+                let row = statement.query_row([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(intent_state, "blocked");
+        assert_eq!(failure_class, "invalid_config");
+
+        let (attempt_state, attempt_class) = assertion_store
+            .with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT state, COALESCE(failure_class, '') FROM cp_attempts")?;
+                let row = statement.query_row([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(attempt_state, "failed");
+        assert_eq!(attempt_class, "invalid_config");
+
+        let unprocessed: i64 = assertion_store
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM cp_outbox WHERE processed_at_ms IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(unprocessed, 0, "the outbox row must be consumed");
+
+        // The blocked intent rolls the rollout target forward to failed, so
+        // the rollout no longer reports applying forever.
+        hub.reconcile_rollouts().await.unwrap();
+        let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
+        assert_eq!(targets[0].state, "failed");
     }
 
     #[tokio::test]

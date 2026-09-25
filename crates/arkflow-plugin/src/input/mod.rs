@@ -52,11 +52,14 @@ fn register_components() -> Result<(), Error> {
 
 /// Component registration is process-global, so `init()` is idempotent: the
 /// first call registers every builder and later calls (tests, multi-entry
-/// binaries) return immediately without touching the registries again.
+/// binaries) return the first result without touching the registries again.
+/// A registration failure is stored and re-returned, so the process cannot
+/// end up with a silently partial registry that still reports successful
+/// initialization.
 pub fn init() -> Result<(), Error> {
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| {
-        let _ = register_components();
-    });
-    Ok(())
+    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    match INIT.get_or_init(|| register_components().map_err(|error| error.to_string())) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Error::Config(error.clone())),
+    }
 }

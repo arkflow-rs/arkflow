@@ -21,22 +21,25 @@
 //!
 //! The outbound pump registers a branch acknowledgement before its frame is
 //! written, so a delivery may end up "written into the void": encoded and
-//! dispatched, but with no receipt that can ever come back. Every pump exit
-//! path therefore guarantees:
+//! dispatched, but with no receipt that can ever come back. The exit paths
+//! split by whether the connection survives the exit:
 //!
-//! - a branch whose receipt cannot arrive is **aborted, never acknowledged**;
-//!   at-least-once is preserved and the upstream re-delivers (duplicates
-//!   downstream are allowed);
-//! - already-encoded frames are flushed best-effort **before** the abort
-//!   sweep runs, so an in-flight delivery still reaches the wire when the
-//!   connection is alive;
-//! - a wire write failure fails the pump (`Err`), aborting everything still
-//!   registered; cancellation is a clean exit (`Ok`) with the same abort
-//!   sweep.
+//! - **wire failure, shutdown, registration failure** tear the connection
+//!   down. The pump aborts everything still registered (a branch whose
+//!   receipt cannot arrive is **aborted, never acknowledged**; at-least-once
+//!   is preserved and the upstream re-delivers — duplicates downstream are
+//!   allowed) after flushing already-encoded frames best-effort, so an
+//!   in-flight delivery still reaches the wire when the connection is alive.
+//!   A wire write failure additionally fails the pump (`Err`).
+//! - **upstream channel close** is a clean drain: only the send half ends,
+//!   and the receipt read loop on the same connection stays alive. The pump
+//!   leaves registered branches alone so late receipts for flushed frames
+//!   keep applying; that read loop owns the final abort sweep once the peer
+//!   closes or the read idle timeout fires with receipts still outstanding.
 //!
-//! The failure modes live in [`pump_edge`] (write error / shutdown / channel
-//! close all funnel into `PendingReceipts::abort_all`) and are pinned by the
-//! `pump_cancel_tests`.
+//! The failure modes live in [`pump_edge`] (write error / shutdown funnel
+//! into `PendingReceipts::abort_all`; the drained path defers to the receipt
+//! read loop) and are pinned by the `pump_cancel_tests`.
 
 use crate::checkpoint::CheckpointBarrier;
 use crate::executor::envelope::Envelope;
@@ -2415,16 +2418,32 @@ async fn pump_edge(
             Error::Process(format!("remote edge handshake flush failed: {error}"))
         })?;
     }
-    let result: Result<(), Error> = loop {
+    let result: Result<(), Error>;
+    // A drained channel (upstream dropped the sender) is the one clean exit
+    // where the connection stays alive: the receipt read loop on the same
+    // connection keeps applying late receipts and owns the final abort
+    // sweep. Every other exit — wire failure, shutdown, registration
+    // failure — tears the connection down, so no receipt can arrive and the
+    // pump must abort everything still registered itself.
+    let mut drained = false;
+    loop {
         tokio::select! {
-            _ = shutdown.cancelled() => break Ok(()),
+            _ = shutdown.cancelled() => {
+                result = Ok(());
+                break;
+            }
             _ = flush_tick.tick() => {
                 if writer.flush().await.is_err() {
-                    break Err(Error::Process("remote edge flush failed".into()));
+                    result = Err(Error::Process("remote edge flush failed".into()));
+                    break;
                 }
             }
             envelope = receiver.recv_async() => {
-                let Ok(envelope) = envelope else { break Ok(()) };
+                let Ok(envelope) = envelope else {
+                    drained = true;
+                    result = Ok(());
+                    break;
+                };
                 match envelope {
                     Envelope::Data(batch, branch) => {
                         // Register before writing so a concurrent receipt can
@@ -2435,16 +2454,21 @@ async fn pump_edge(
                             Err(error) => {
                                 let abort_error = branch.abort().await.err();
                                 if let Some(abort_error) = abort_error {
-                                    break Err(Error::Process(format!(
+                                    result = Err(Error::Process(format!(
                                         "{error}; failed to abort batch rejected by pending receipt limit: {abort_error}"
                                     )));
+                                    break;
                                 }
-                                break Err(error);
+                                result = Err(error);
+                                break;
                             }
                         };
                         let payload = match encoder.encode(&batch, seq) {
                             Ok(payload) => payload,
-                            Err(error) => break Err(error),
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
                         };
                         if let Err(error) = write_frame_with_limit(
                             &mut writer,
@@ -2455,9 +2479,10 @@ async fn pump_edge(
                         )
                         .await
                         {
-                            break Err(Error::Process(format!(
+                            result = Err(Error::Process(format!(
                                 "remote edge data write failed: {error}"
                             )));
+                            break;
                         }
                     }
                     other => {
@@ -2466,9 +2491,12 @@ async fn pump_edge(
                         };
                         let payload = match serde_json::to_vec(&signal) {
                             Ok(bytes) => bytes,
-                            Err(error) => break Err(Error::Process(format!(
-                                "signal frame encode failed: {error}"
-                            ))),
+                            Err(error) => {
+                                result = Err(Error::Process(format!(
+                                    "signal frame encode failed: {error}"
+                                )));
+                                break;
+                            }
                         };
                         // Control elements broadcast on every quad of the edge;
                         // each pump owns exactly one quad, so one frame each.
@@ -2481,20 +2509,27 @@ async fn pump_edge(
                         )
                         .await
                         {
-                            break Err(Error::Process(format!(
+                            result = Err(Error::Process(format!(
                                 "remote edge signal write failed: {error}"
                             )));
+                            break;
                         }
                     }
                 }
             }
         }
-    };
+    }
     let _ = writer.flush().await;
-    // Abort pendings on every exit path: once the pump is gone, no receipts
-    // can ever arrive for them, so leaving them alive would leak source acks
-    // indefinitely.
-    pending.abort_all();
+    // Abort pendings only on failure or forced shutdown: those paths tear
+    // the connection down, so no receipt can ever arrive and leaving the
+    // branches registered would leak source acks indefinitely. A drained
+    // channel is the opposite case — the receipt read loop on the same
+    // connection is still running, late receipts for flushed frames must
+    // keep applying, and that loop owns the final abort sweep once the peer
+    // closes or the read idle timeout fires.
+    if result.is_err() || !drained {
+        pending.abort_all();
+    }
     result
 }
 
@@ -3674,7 +3709,10 @@ mod pump_cancel_tests {
         tx.send_async(Envelope::Data(batch, ack.clone()))
             .await
             .expect("send");
-        drop(tx);
+        // Keep the sender alive for the whole test: with it dropped the pump
+        // would exit through the drained-channel path (which defers the
+        // abort sweep to the connection's receipt read loop), and this test
+        // drives `pump_edge` standalone, pinning the shutdown exit instead.
 
         let pump = tokio::spawn(pump_edge(
             rx,
@@ -3744,6 +3782,85 @@ mod pump_cancel_tests {
         );
         assert!(
             !spy.aborted.load(Ordering::SeqCst),
+            "an acknowledged branch must not be aborted"
+        );
+    }
+
+    /// A drained channel is a clean exit where the connection survives: the
+    /// pump must leave registered branches alone so a late receipt arriving
+    /// through the (still running) receipt read loop acks them normally
+    /// instead of replaying already-delivered frames.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drained_channel_exit_keeps_pending_for_late_receipts() {
+        let quad = Quad {
+            src_op: 1,
+            src_subtask: 0,
+            dst_op: 2,
+            dst_subtask: 0,
+        };
+        let pending = Arc::new(PendingReceipts::new(64));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
+        let (tx, rx) = flume::bounded::<Envelope>(1);
+
+        let batch = int64_batch((0..100).collect());
+        let ack = SpyAck::new();
+        tx.send_async(Envelope::Data(batch, ack.clone()))
+            .await
+            .expect("send");
+        drop(tx);
+
+        let pending_for_pump = pending.clone();
+        let pump = tokio::spawn(pump_edge(
+            rx,
+            writer,
+            quad,
+            pending_for_pump,
+            shutdown,
+            pump_config(),
+            None,
+        ));
+
+        // The pump registers the branch, writes the frame, then observes the
+        // sender drop and exits cleanly with the branch still registered.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), pump)
+            .await
+            .expect("pump exits after drain")
+            .expect("join");
+        assert!(result.is_ok(), "a drained channel is a clean pump exit");
+        assert!(
+            !pending.is_empty(),
+            "a drained exit must not abort registered branches"
+        );
+        assert!(
+            !ack.aborted.load(Ordering::SeqCst),
+            "the branch must stay live for a late receipt"
+        );
+
+        // The frame did reach the wire: read it back and confirm the branch
+        // was registered before the frame was written (FIFO per quad).
+        let (header, _payload) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
+                .await
+                .expect("frame arrives")
+                .expect("frame decodes");
+        assert_eq!(header.kind, FrameKind::Data);
+        drop(reader);
+
+        // A late receipt through the still-registered pending map acks the
+        // delivery instead of replaying it. This map is fresh, so the single
+        // registration took sequence 0.
+        let (failures_tx, _failures_rx) = flume::bounded::<Error>(8);
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq: 0,
+            },
+            &failures_tx,
+        );
+        wait_for(&ack.acked, "late receipt acks the drained branch").await;
+        assert!(
+            !ack.aborted.load(Ordering::SeqCst),
             "an acknowledged branch must not be aborted"
         );
     }

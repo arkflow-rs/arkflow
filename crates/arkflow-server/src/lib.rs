@@ -3291,7 +3291,22 @@ async fn configuration_diff(
     Json(serde_json::json!({"from": query.from, "to": query.to, "changed": from.content != to.content, "from_format": from.format, "to_format": to.format})).into_response()
 }
 
-async fn validate_configuration(Json(candidate): Json<ConfigCandidate>) -> Response {
+async fn validate_configuration(
+    State(cp): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(candidate): Json<ConfigCandidate>,
+) -> Response {
+    // Validation parses and resolves secret references and constructs every
+    // component in the candidate, so it needs the same authorization as the
+    // apply path: an open endpoint would hand unauthenticated callers a
+    // node-local env/file oracle and a per-request construction load.
+    if !authorized(&cp, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid Bearer token is required".into(),
+        );
+    }
     match parse_and_validate(&candidate) {
         Ok(report) => Json(report).into_response(),
         Err(issue) => Json(arkflow_core::configuration::ConfigValidationReport {
@@ -3616,6 +3631,56 @@ mod tests {
         assert!(components.iter().any(|item| item["kind"] == "input"));
         assert!(components.iter().any(|item| item["kind"] == "output"));
         assert!(components.iter().any(|item| item["kind"] == "processor"));
+    }
+
+    #[tokio::test]
+    async fn configuration_validation_requires_the_operator_token() {
+        // The validate endpoint resolves secret references and constructs
+        // every component in the candidate, so it must be as guarded as
+        // apply: an open endpoint would hand unauthenticated callers a
+        // node-local env/file oracle and a per-request construction load.
+        let engine = Engine::new(EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig {
+                api_token: Some("op-token".into()),
+                ..HealthCheckConfig::default()
+            },
+        });
+        let cp = engine.control_plane();
+        let app = router(cp, &ServerConfig::default());
+        let candidate = serde_json::json!({
+            "format": "yaml",
+            "content": "not: [a valid config"
+        });
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::post("/api/v1/configuration/validate")
+                        .header(axum::http::header::AUTHORIZATION, "Bearer wrong")
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(candidate.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.oneshot(
+                axum::http::Request::post("/api/v1/configuration/validate")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer op-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(candidate.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -4070,6 +4135,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::post("/api/v1/configuration/validate")
+                    .header("authorization", auth)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::json!({"format":"json","content":"not-json"}).to_string(),
@@ -4101,6 +4167,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::post("/api/v1/config/validate")
+                    .header("authorization", auth)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::json!({"format":"json","content":"{\"streams\":[]}"})
