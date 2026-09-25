@@ -353,6 +353,10 @@ pub enum StorageError {
     GenerationConflict { expected: u64, current: u64 },
     #[error("idempotency key was already used for a different mutation")]
     IdempotencyKeyReused,
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] sqlx::Error),
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 #[derive(Clone)]
@@ -609,13 +613,14 @@ pub struct StorageActor {
 }
 
 impl StorageActor {
-    pub fn start(store: ControlPlaneStore, capacity: usize) -> Self {
+    pub fn start(backend: ControlPlaneBackend, capacity: usize) -> Self {
         let (sender, mut receiver) = mpsc::channel(capacity.max(1));
         tokio::spawn(async move {
+            let backend = backend;
             while let Some(command) = receiver.recv().await {
                 match command {
                     StorageCommand::UpsertJob { job, response } => {
-                        let _ = response.send(store.upsert_job(job));
+                        let _ = response.send(backend.upsert_job(job).await);
                     }
                     StorageCommand::UpdateJobWithExpectedGeneration {
                         job,
@@ -623,20 +628,20 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response.send(
-                            store.update_job_with_expected_generation(job, expected_generation),
+                            backend.update_job_with_expected_generation(job, expected_generation).await,
                         );
                     }
                     StorageCommand::GetJob { job_id, response } => {
-                        let _ = response.send(store.get_job(&job_id));
+                        let _ = response.send(backend.get_job(&job_id).await);
                     }
                     StorageCommand::ListJobs { response } => {
-                        let _ = response.send(store.list_jobs());
+                        let _ = response.send(backend.list_jobs().await);
                     }
                     StorageCommand::UpsertJobVersion { record, response } => {
-                        let _ = response.send(store.upsert_job_version(record));
+                        let _ = response.send(backend.upsert_job_version(record).await);
                     }
                     StorageCommand::ListJobVersions { job_id, response } => {
-                        let _ = response.send(store.list_job_versions(&job_id));
+                        let _ = response.send(backend.list_job_versions(&job_id).await);
                     }
                     StorageCommand::UpdateJob {
                         job_id,
@@ -648,7 +653,7 @@ impl StorageActor {
                         last_error,
                         response,
                     } => {
-                        let _ = response.send(store.update_job(
+                        let _ = response.send(backend.update_job(
                             &job_id,
                             desired_state.as_deref(),
                             observed_state.as_deref(),
@@ -656,7 +661,7 @@ impl StorageActor {
                             generation,
                             checkpoint_id.as_deref(),
                             last_error.as_deref(),
-                        ));
+                        ).await);
                     }
                     StorageCommand::UpdateJobObservation {
                         job_id,
@@ -668,7 +673,7 @@ impl StorageActor {
                         last_error,
                         response,
                     } => {
-                        let _ = response.send(store.update_job_observation(
+                        let _ = response.send(backend.update_job_observation(
                             &job_id,
                             &observed_state,
                             &convergence,
@@ -676,7 +681,7 @@ impl StorageActor {
                             expected_generation,
                             checkpoint_id.as_deref(),
                             last_error.as_deref(),
-                        ));
+                        ).await);
                     }
                     StorageCommand::UpdateJobDesiredState {
                         job_id,
@@ -684,65 +689,65 @@ impl StorageActor {
                         expected_generation,
                         response,
                     } => {
-                        let _ = response.send(store.update_job_desired_state(
+                        let _ = response.send(backend.update_job_desired_state(
                             &job_id,
                             &desired_state,
                             expected_generation,
-                        ));
+                        ).await);
                     }
                     StorageCommand::UpsertJobCheckpoint { record, response } => {
-                        let _ = response.send(store.upsert_job_checkpoint(record));
+                        let _ = response.send(backend.upsert_job_checkpoint(record).await);
                     }
                     StorageCommand::ListJobCheckpoints { job_id, response } => {
-                        let _ = response.send(store.list_job_checkpoints(&job_id));
+                        let _ = response.send(backend.list_job_checkpoints(&job_id).await);
                     }
                     StorageCommand::DeleteJobCheckpoint {
                         job_id,
                         checkpoint_id,
                         response,
                     } => {
-                        let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id));
+                        let _ = response.send(backend.delete_job_checkpoint(&job_id, &checkpoint_id).await);
                     }
                     StorageCommand::UpsertNode { mutation, response } => {
-                        let _ = response.send(store.upsert_node(mutation));
+                        let _ = response.send(backend.upsert_node(mutation).await);
                     }
                     StorageCommand::ResetObservedCursors { node_id, response } => {
-                        let _ = response.send(store.reset_observed_cursors(&node_id));
+                        let _ = response.send(backend.reset_observed_cursors(&node_id).await);
                     }
                     StorageCommand::SetDesired { mutation, response } => {
-                        let _ = response.send(store.set_desired(mutation));
+                        let _ = response.send(backend.set_desired(mutation).await);
                     }
                     StorageCommand::GetDesired {
                         node_id,
                         stream_id,
                         response,
                     } => {
-                        let _ = response.send(store.get_desired(&node_id, &stream_id));
+                        let _ = response.send(backend.get_desired(&node_id, &stream_id).await);
                     }
                     StorageCommand::GetIntent {
                         intent_id,
                         response,
                     } => {
-                        let _ = response.send(store.get_intent(&intent_id));
+                        let _ = response.send(backend.get_intent(&intent_id).await);
                     }
                     StorageCommand::ListIntents { node_id, response } => {
-                        let _ = response.send(store.list_intents(node_id.as_deref()));
+                        let _ = response.send(backend.list_intents(node_id.as_deref()).await);
                     }
                     StorageCommand::RecoverReconciliation { now_ms, response } => {
-                        let _ = response.send(store.recover_reconciliation(now_ms));
+                        let _ = response.send(backend.recover_reconciliation(now_ms).await);
                     }
                     StorageCommand::WakeNode {
                         node_id,
                         now_ms,
                         response,
                     } => {
-                        let _ = response.send(store.wake_node(&node_id, now_ms));
+                        let _ = response.send(backend.wake_node(&node_id, now_ms).await);
                     }
                     StorageCommand::ListEvents { node_id, response } => {
-                        let _ = response.send(store.list_events(node_id.as_deref()));
+                        let _ = response.send(backend.list_events(node_id.as_deref()).await);
                     }
                     StorageCommand::PruneEvents { retain, response } => {
-                        let _ = response.send(store.prune_events(retain));
+                        let _ = response.send(backend.prune_events(retain).await);
                     }
                     StorageCommand::PruneOperationHistory {
                         older_than_ms,
@@ -750,13 +755,13 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response
-                            .send(store.prune_operation_history(older_than_ms, max_retained));
+                            .send(backend.prune_operation_history(older_than_ms, max_retained).await);
                     }
                     StorageCommand::PruneJobCheckpointRecords {
                         older_than_ms,
                         response,
                     } => {
-                        let _ = response.send(store.prune_job_checkpoint_records(older_than_ms));
+                        let _ = response.send(backend.prune_job_checkpoint_records(older_than_ms).await);
                     }
                     StorageCommand::PruneAuditEvents {
                         older_than_ms,
@@ -764,7 +769,7 @@ impl StorageActor {
                         response,
                     } => {
                         let _ =
-                            response.send(store.prune_audit_events(older_than_ms, max_retained));
+                            response.send(backend.prune_audit_events(older_than_ms, max_retained).await);
                     }
                     StorageCommand::PruneProcessedOutbox {
                         older_than_ms,
@@ -772,7 +777,7 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response
-                            .send(store.prune_processed_outbox(older_than_ms, max_retained));
+                            .send(backend.prune_processed_outbox(older_than_ms, max_retained).await);
                     }
                     StorageCommand::PruneTerminalAttempts {
                         older_than_ms,
@@ -780,13 +785,13 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response
-                            .send(store.prune_terminal_attempts(older_than_ms, max_retained));
+                            .send(backend.prune_terminal_attempts(older_than_ms, max_retained).await);
                     }
                     StorageCommand::ClaimAttempt {
                         intent_id,
                         response,
                     } => {
-                        let _ = response.send(store.claim_attempt(&intent_id));
+                        let _ = response.send(backend.claim_attempt(&intent_id).await);
                     }
                     StorageCommand::MarkAttemptDispatched {
                         attempt_id,
@@ -794,10 +799,10 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response
-                            .send(store.mark_attempt_dispatched(&attempt_id, expires_at_ms));
+                            .send(backend.mark_attempt_dispatched(&attempt_id, expires_at_ms).await);
                     }
                     StorageCommand::ExpireAttempts { now_ms, response } => {
-                        let _ = response.send(store.expire_attempts(now_ms));
+                        let _ = response.send(backend.expire_attempts(now_ms).await);
                     }
                     StorageCommand::CompleteAttempt {
                         attempt_id,
@@ -805,57 +810,57 @@ impl StorageActor {
                         failure_class,
                         response,
                     } => {
-                        let _ = response.send(store.complete_attempt(
+                        let _ = response.send(backend.complete_attempt(
                             &attempt_id,
                             &state,
                             failure_class.as_deref(),
-                        ));
+                        ).await);
                     }
                     StorageCommand::RecordObserved { mutation, response } => {
-                        let _ = response.send(store.record_observed(mutation));
+                        let _ = response.send(backend.record_observed(mutation).await);
                     }
                     StorageCommand::ClaimOutbox {
                         worker_id,
                         now_ms,
                         response,
                     } => {
-                        let _ = response.send(store.claim_outbox(&worker_id, now_ms));
+                        let _ = response.send(backend.claim_outbox(&worker_id, now_ms).await);
                     }
                     StorageCommand::MarkOutboxProcessed {
                         outbox_id,
                         now_ms,
                         response,
                     } => {
-                        let _ = response.send(store.mark_outbox_processed(outbox_id, now_ms));
+                        let _ = response.send(backend.mark_outbox_processed(outbox_id, now_ms).await);
                     }
                     StorageCommand::SetNodeMaintenance {
                         mutation,
                         now_ms,
                         response,
                     } => {
-                        let _ = response.send(store.set_node_maintenance(mutation, now_ms));
+                        let _ = response.send(backend.set_node_maintenance(mutation, now_ms).await);
                     }
                     StorageCommand::GetNodeMaintenance { node_id, response } => {
-                        let _ = response.send(store.get_node_maintenance(&node_id));
+                        let _ = response.send(backend.get_node_maintenance(&node_id).await);
                     }
                     StorageCommand::OperationalAggregates { now_ms, response } => {
-                        let _ = response.send(store.operational_aggregates(now_ms));
+                        let _ = response.send(backend.operational_aggregates(now_ms).await);
                     }
                     StorageCommand::RecordAudit { record, response } => {
-                        let _ = response.send(store.record_audit(record));
+                        let _ = response.send(backend.record_audit(record).await);
                     }
                     StorageCommand::ListAudit {
                         resource_id,
                         response,
                     } => {
-                        let _ = response.send(store.list_audit(resource_id.as_deref()));
+                        let _ = response.send(backend.list_audit(resource_id.as_deref()).await);
                     }
                     StorageCommand::CreateRollout {
                         rollout,
                         targets,
                         response,
                     } => {
-                        let _ = response.send(store.create_rollout(rollout, targets));
+                        let _ = response.send(backend.create_rollout(rollout, targets).await);
                     }
                     StorageCommand::CreateRolloutWithContent {
                         rollout,
@@ -864,24 +869,24 @@ impl StorageActor {
                         created_by,
                         response,
                     } => {
-                        let _ = response.send(store.create_rollout_with_content(
+                        let _ = response.send(backend.create_rollout_with_content(
                             rollout,
                             targets,
                             &content,
                             created_by.as_deref(),
-                        ));
+                        ).await);
                     }
                     StorageCommand::GetRollout {
                         rollout_id,
                         response,
                     } => {
-                        let _ = response.send(store.get_rollout(&rollout_id));
+                        let _ = response.send(backend.get_rollout(&rollout_id).await);
                     }
                     StorageCommand::ListRolloutTargets {
                         rollout_id,
                         response,
                     } => {
-                        let _ = response.send(store.list_rollout_targets(&rollout_id));
+                        let _ = response.send(backend.list_rollout_targets(&rollout_id).await);
                     }
                     StorageCommand::UpdateRollout {
                         rollout_id,
@@ -890,48 +895,48 @@ impl StorageActor {
                         updated_at_ms,
                         response,
                     } => {
-                        let _ = response.send(store.update_rollout(
+                        let _ = response.send(backend.update_rollout(
                             &rollout_id,
                             &state,
                             current_batch,
                             updated_at_ms,
-                        ));
+                        ).await);
                     }
                     StorageCommand::UpdateRolloutTarget { update, response } => {
-                        let _ = response.send(store.update_rollout_target(update));
+                        let _ = response.send(backend.update_rollout_target(update).await);
                     }
                     StorageCommand::GetConfigVersionContent {
                         config_version_id,
                         response,
                     } => {
-                        let _ = response.send(store.get_config_version_content(&config_version_id));
+                        let _ = response.send(backend.get_config_version_content(&config_version_id).await);
                     }
                     StorageCommand::RecoverRollouts { response } => {
-                        let _ = response.send(store.recover_rollouts());
+                        let _ = response.send(backend.recover_rollouts().await);
                     }
                     StorageCommand::ListRollouts { response } => {
-                        let _ = response.send(store.list_rollouts());
+                        let _ = response.send(backend.list_rollouts().await);
                     }
                     StorageCommand::UpsertOperation {
                         operation,
                         response,
                     } => {
-                        let _ = response.send(store.upsert_operation(operation));
+                        let _ = response.send(backend.upsert_operation(operation).await);
                     }
                     StorageCommand::GetOperation {
                         operation_id,
                         response,
                     } => {
-                        let _ = response.send(store.get_operation(&operation_id));
+                        let _ = response.send(backend.get_operation(&operation_id).await);
                     }
                     StorageCommand::ListOperations { node_id, response } => {
-                        let _ = response.send(store.list_operations(node_id.as_deref()));
+                        let _ = response.send(backend.list_operations(node_id.as_deref()).await);
                     }
                     StorageCommand::ListJobStartOperations {
                         resource_id,
                         response,
                     } => {
-                        let _ = response.send(store.list_job_start_operations(&resource_id));
+                        let _ = response.send(backend.list_job_start_operations(&resource_id).await);
                     }
                 }
             }
@@ -1723,6 +1728,432 @@ impl StorageActor {
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+}
+
+
+/// Serialised access to the control-plane storage. The storage actor consumes
+/// commands strictly in arrival order and awaits this backend per command, so
+/// both variants observe identical FIFO ordering regardless of engine.
+pub enum ControlPlaneBackend {
+    Sqlite(ControlPlaneStore),
+    Postgres(crate::pg_store::PgStore),
+}
+
+impl ControlPlaneBackend {
+    pub async fn set_desired(&self, mutation: DesiredMutation) -> Result<IntentRecord, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.set_desired(mutation),
+            Self::Postgres(store) => store.set_desired(mutation).await,
+        }
+    }
+
+    pub async fn upsert_node(&self, mutation: NodeMutation) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.upsert_node(mutation),
+            Self::Postgres(store) => store.upsert_node(mutation).await,
+        }
+    }
+
+    pub async fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.reset_observed_cursors(node_id),
+            Self::Postgres(store) => store.reset_observed_cursors(node_id).await,
+        }
+    }
+
+    pub async fn set_node_maintenance(&self, mutation: NodeMaintenanceMutation, now_ms: u64) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.set_node_maintenance(mutation, now_ms),
+            Self::Postgres(store) => store.set_node_maintenance(mutation, now_ms).await,
+        }
+    }
+
+    pub async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_node_maintenance(node_id),
+            Self::Postgres(store) => store.get_node_maintenance(node_id).await,
+        }
+    }
+
+    pub async fn operational_aggregates(&self, now_ms: u64) -> Result<OperationalAggregates, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.operational_aggregates(now_ms),
+            Self::Postgres(store) => store.operational_aggregates(now_ms).await,
+        }
+    }
+
+    pub async fn claim_outbox(&self, worker_id: &str, now_ms: u64) -> Result<Option<OutboxRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.claim_outbox(worker_id, now_ms),
+            Self::Postgres(store) => store.claim_outbox(worker_id, now_ms).await,
+        }
+    }
+
+    pub async fn get_desired(&self, node_id: &str, stream_id: &str) -> Result<Option<DesiredRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_desired(node_id, stream_id),
+            Self::Postgres(store) => store.get_desired(node_id, stream_id).await,
+        }
+    }
+
+    pub async fn get_intent(&self, intent_id: &str) -> Result<Option<IntentRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_intent(intent_id),
+            Self::Postgres(store) => store.get_intent(intent_id).await,
+        }
+    }
+
+    pub async fn list_intents(&self, node_id: Option<&str>) -> Result<Vec<IntentRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_intents(node_id),
+            Self::Postgres(store) => store.list_intents(node_id).await,
+        }
+    }
+
+    pub async fn recover_reconciliation(&self, now_ms: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.recover_reconciliation(now_ms),
+            Self::Postgres(store) => store.recover_reconciliation(now_ms).await,
+        }
+    }
+
+    pub async fn wake_node(&self, node_id: &str, now_ms: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.wake_node(node_id, now_ms),
+            Self::Postgres(store) => store.wake_node(node_id, now_ms).await,
+        }
+    }
+
+    pub async fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_events(node_id),
+            Self::Postgres(store) => store.list_events(node_id).await,
+        }
+    }
+
+    pub async fn prune_events(&self, retain: usize) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_events(retain),
+            Self::Postgres(store) => store.prune_events(retain).await,
+        }
+    }
+
+    pub async fn prune_operation_history(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_operation_history(older_than_ms, max_retained),
+            Self::Postgres(store) => store.prune_operation_history(older_than_ms, max_retained).await,
+        }
+    }
+
+    pub async fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_job_checkpoint_records(older_than_ms),
+            Self::Postgres(store) => store.prune_job_checkpoint_records(older_than_ms).await,
+        }
+    }
+
+    pub async fn prune_audit_events(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_audit_events(older_than_ms, max_retained),
+            Self::Postgres(store) => store.prune_audit_events(older_than_ms, max_retained).await,
+        }
+    }
+
+    pub async fn prune_processed_outbox(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_processed_outbox(older_than_ms, max_retained),
+            Self::Postgres(store) => store.prune_processed_outbox(older_than_ms, max_retained).await,
+        }
+    }
+
+    pub async fn prune_terminal_attempts(&self, older_than_ms: i64, max_retained: i64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.prune_terminal_attempts(older_than_ms, max_retained),
+            Self::Postgres(store) => store.prune_terminal_attempts(older_than_ms, max_retained).await,
+        }
+    }
+
+    pub async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.claim_attempt(intent_id),
+            Self::Postgres(store) => store.claim_attempt(intent_id).await,
+        }
+    }
+
+    pub async fn complete_attempt(&self, attempt_id: &str, state: &str, failure_class: Option<&str>) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.complete_attempt(attempt_id, state, failure_class),
+            Self::Postgres(store) => store.complete_attempt(attempt_id, state, failure_class).await,
+        }
+    }
+
+    pub async fn mark_attempt_dispatched(&self, attempt_id: &str, expires_at_ms: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.mark_attempt_dispatched(attempt_id, expires_at_ms),
+            Self::Postgres(store) => store.mark_attempt_dispatched(attempt_id, expires_at_ms).await,
+        }
+    }
+
+    pub async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.expire_attempts(now_ms),
+            Self::Postgres(store) => store.expire_attempts(now_ms).await,
+        }
+    }
+
+    pub async fn record_observed(&self, mutation: ObservedMutation) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.record_observed(mutation),
+            Self::Postgres(store) => store.record_observed(mutation).await,
+        }
+    }
+
+    pub async fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.mark_outbox_processed(outbox_id, now_ms),
+            Self::Postgres(store) => store.mark_outbox_processed(outbox_id, now_ms).await,
+        }
+    }
+
+    pub async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.record_audit(record),
+            Self::Postgres(store) => store.record_audit(record).await,
+        }
+    }
+
+    pub async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_audit(resource_id),
+            Self::Postgres(store) => store.list_audit(resource_id).await,
+        }
+    }
+
+    pub async fn create_rollout(&self, rollout: RolloutRecord, targets: Vec<RolloutTargetRecord>) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.create_rollout(rollout, targets),
+            Self::Postgres(store) => store.create_rollout(rollout, targets).await,
+        }
+    }
+
+    pub async fn create_rollout_with_content(&self, rollout: RolloutRecord, targets: Vec<RolloutTargetRecord>, content: &str, created_by: Option<&str>) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.create_rollout_with_content(rollout, targets, content, created_by),
+            Self::Postgres(store) => store.create_rollout_with_content(rollout, targets, content, created_by).await,
+        }
+    }
+
+    pub async fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_rollout(rollout_id),
+            Self::Postgres(store) => store.get_rollout(rollout_id).await,
+        }
+    }
+
+    pub async fn list_rollout_targets(&self, rollout_id: &str) -> Result<Vec<RolloutTargetRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_rollout_targets(rollout_id),
+            Self::Postgres(store) => store.list_rollout_targets(rollout_id).await,
+        }
+    }
+
+    pub async fn update_rollout(&self, rollout_id: &str, state: &str, current_batch: u32, updated_at_ms: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_rollout(rollout_id, state, current_batch, updated_at_ms),
+            Self::Postgres(store) => store.update_rollout(rollout_id, state, current_batch, updated_at_ms).await,
+        }
+    }
+
+    pub async fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_rollout_target(update),
+            Self::Postgres(store) => store.update_rollout_target(update).await,
+        }
+    }
+
+    pub async fn get_config_version_content(&self, config_version_id: &str) -> Result<Option<String>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_config_version_content(config_version_id),
+            Self::Postgres(store) => store.get_config_version_content(config_version_id).await,
+        }
+    }
+
+    pub async fn recover_rollouts(&self, ) -> Result<Vec<RolloutRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.recover_rollouts(),
+            Self::Postgres(store) => store.recover_rollouts().await,
+        }
+    }
+
+    pub async fn list_rollouts(&self, ) -> Result<Vec<RolloutRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_rollouts(),
+            Self::Postgres(store) => store.list_rollouts().await,
+        }
+    }
+
+    pub async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.upsert_operation(operation),
+            Self::Postgres(store) => store.upsert_operation(operation).await,
+        }
+    }
+
+    pub async fn get_operation(&self, operation_id: &str) -> Result<Option<PersistedOperation>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_operation(operation_id),
+            Self::Postgres(store) => store.get_operation(operation_id).await,
+        }
+    }
+
+    pub async fn list_operations(&self, node_id: Option<&str>) -> Result<Vec<PersistedOperation>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_operations(node_id),
+            Self::Postgres(store) => store.list_operations(node_id).await,
+        }
+    }
+
+    pub async fn list_job_start_operations(&self, resource_id: &str) -> Result<Vec<PersistedOperation>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_job_start_operations(resource_id),
+            Self::Postgres(store) => store.list_job_start_operations(resource_id).await,
+        }
+    }
+
+    pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.upsert_job(job),
+            Self::Postgres(store) => store.upsert_job(job).await,
+        }
+    }
+
+    pub async fn update_job_with_expected_generation(&self, mut job: JobRecord, expected_generation: u64) -> Result<JobRecord, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_job_with_expected_generation(job, expected_generation),
+            Self::Postgres(store) => store.update_job_with_expected_generation(job, expected_generation).await,
+        }
+    }
+
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.get_job(job_id),
+            Self::Postgres(store) => store.get_job(job_id).await,
+        }
+    }
+
+    pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.upsert_job_version(record),
+            Self::Postgres(store) => store.upsert_job_version(record).await,
+        }
+    }
+
+    pub async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_job_versions(job_id),
+            Self::Postgres(store) => store.list_job_versions(job_id).await,
+        }
+    }
+
+    pub async fn list_jobs(&self, ) -> Result<Vec<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_jobs(),
+            Self::Postgres(store) => store.list_jobs().await,
+        }
+    }
+
+    pub async fn update_job(&self, job_id: &str, desired_state: Option<&str>, observed_state: Option<&str>, convergence: Option<&str>, generation: Option<u64>, checkpoint_id: Option<&str>, last_error: Option<&str>) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_job(job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error),
+            Self::Postgres(store) => store.update_job(job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error).await,
+        }
+    }
+
+    pub async fn update_job_observation(&self, job_id: &str, observed_state: &str, convergence: &str, generation: u64, expected_generation: u64, checkpoint_id: Option<&str>, last_error: Option<&str>) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_job_observation(job_id, observed_state, convergence, generation, expected_generation, checkpoint_id, last_error),
+            Self::Postgres(store) => store.update_job_observation(job_id, observed_state, convergence, generation, expected_generation, checkpoint_id, last_error).await,
+        }
+    }
+
+    pub async fn update_job_desired_state(&self, job_id: &str, desired_state: &str, expected_generation: u64) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.update_job_desired_state(job_id, desired_state, expected_generation),
+            Self::Postgres(store) => store.update_job_desired_state(job_id, desired_state, expected_generation).await,
+        }
+    }
+
+    pub async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.upsert_job_checkpoint(record),
+            Self::Postgres(store) => store.upsert_job_checkpoint(record).await,
+        }
+    }
+
+    pub async fn list_job_checkpoints(&self, job_id: &str) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        match self {
+            Self::Sqlite(store) => store.list_job_checkpoints(job_id),
+            Self::Postgres(store) => store.list_job_checkpoints(job_id).await,
+        }
+    }
+
+    pub async fn delete_job_checkpoint(&self, job_id: &str, checkpoint_id: &str) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(store) => store.delete_job_checkpoint(job_id, checkpoint_id),
+            Self::Postgres(store) => store.delete_job_checkpoint(job_id, checkpoint_id).await,
+        }
+    }
+}
+
+impl ControlPlaneStore {
+    /// Generic table export for the SQLite->PostgreSQL migration tool:
+    /// returns the column names (in order) and every row as raw values.
+    pub fn export_table(
+        &self,
+        table: &str,
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<rusqlite::types::Value>>), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut columns = Vec::new();
+        let mut types = Vec::new();
+        {
+            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                columns.push(row.get::<_, String>(1)?);
+                types.push(row.get::<_, String>(2)?);
+            }
+        }
+        if columns.is_empty() {
+            return Err(StorageError::Unsupported(format!(
+                "migration: source table {table} does not exist"
+            )));
+        }
+        let column_list = columns.join(", ");
+        let mut statement = connection.prepare(&format!(
+            "SELECT {column_list} FROM {table} ORDER BY rowid"
+        ))?;
+        let column_count = columns.len();
+        let mut rows = Vec::new();
+        let mut rows_iter = statement.query([])?;
+        while let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                values.push(row.get::<_, Option<rusqlite::types::Value>>(index)?.unwrap_or(
+                    rusqlite::types::Value::Null,
+                ));
+            }
+            rows.push(values);
+        }
+        Ok((columns, types, rows))
+    }
+
+    /// Exact row count of a table (migration reconciliation).
+    pub fn table_row_count(&self, table: &str) -> Result<i64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+        Ok(count)
     }
 }
 
@@ -4415,7 +4846,7 @@ mod tests {
     #[tokio::test]
     async fn storage_actor_serializes_desired_mutations() {
         let store = ControlPlaneStore::in_memory().unwrap();
-        let actor = StorageActor::start(store, 8);
+        let actor = StorageActor::start(ControlPlaneBackend::Sqlite(store),  8);
         let first = actor
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -5053,9 +5484,9 @@ mod tests {
     }
 }
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

@@ -105,3 +105,33 @@ session TTL (`health_check.agent_session_ttl_ms`, one hour by default) bounds
 how long a leaked session credential can authenticate; Agents re-register
 transparently when it elapses, so keep it comfortably above the longest
 expected command (for example a long checkpoint) to avoid result resubmission.
+
+### Hub storage backends
+
+The Hub's control-plane storage is selected by `ARKFLOW_HUB_STORAGE`:
+
+- a **filesystem path** (default, e.g. `/var/lib/arkflow/hub.sqlite`) uses the
+  embedded SQLite store in WAL mode;
+- a **`postgres://` or `postgresql://` URL** uses PostgreSQL through sqlx.
+  The schema is created idempotently at startup; a connection failure fails
+  the Hub fast instead of starting in a degraded state.
+
+PostgreSQL is the recommended backend for production and the prerequisite
+for multi-Hub deployments (leader election over a database lease is planned
+as the next phase). Pool sizing is fixed at 8 connections with a 5 second
+acquire timeout.
+
+#### Migrating SQLite data to PostgreSQL
+
+Stop the Hub, then run the one-shot migration with the binary itself:
+
+```bash
+arkflow-server migrate \
+  --from sqlite:/var/lib/arkflow/hub.sqlite \
+  --to postgres://user:password@db.example.com:5432/arkflow
+```
+
+The command copies every control-plane table in dependency order inside
+chunked transactions, re-synchronises the identity sequences and reconciles
+row counts (a mismatch exits non-zero). Re-point `ARKFLOW_HUB_STORAGE` at the
+PostgreSQL URL afterwards and start the Hub.

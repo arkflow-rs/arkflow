@@ -73,3 +73,24 @@ Hub,再升级任何 Agent。Agent 重连使用随机化退避,因此 Hub 重启�
 Hub 会话 TTL(`health_check.agent_session_ttl_ms`,默认一小时)限制了泄露的会话凭据可认证的时长;
 TTL 到期后 Agent 会透明地重新注册,因此请把它保持在最长预期命令(例如一次耗时的检查点)之上并留有余量,
 以避免结果重复提交。
+
+### Hub 存储后端
+
+Hub 的控制面存储由 `ARKFLOW_HUB_STORAGE` 选择:
+
+- **文件系统路径**(默认,如 `/var/lib/arkflow/hub.sqlite`)使用内嵌 SQLite(WAL 模式);
+- **`postgres://` 或 `postgresql://` URL** 通过 sqlx 使用 PostgreSQL。schema 在启动时幂等创建;连接失败会让 Hub 快速启动失败,而不是以降级状态运行。
+
+PostgreSQL 是生产环境推荐后端,也是多 Hub 部署的前置(下一阶段为数据库租约选主)。连接池固定为 8 连接、5 秒获取超时。
+
+#### 将 SQLite 数据迁移到 PostgreSQL
+
+先停 Hub,然后用二进制自带的一次性迁移命令:
+
+```bash
+arkflow-server migrate \
+  --from sqlite:/var/lib/arkflow/hub.sqlite \
+  --to postgres://user:password@db.example.com:5432/arkflow
+```
+
+命令按依赖序在分块事务内拷贝全部控制面表、重置 IDENTITY 序列并对账行数(不一致即非零退出)。之后将 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并启动 Hub。

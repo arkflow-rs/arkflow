@@ -5518,7 +5518,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_completion_after_hub_restart_preserves_metadata() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = crate::storage::StorageActor::start(store, 8);
+        let storage = crate::storage::StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         let hub2 = Hub::with_storage(config(), storage);
         let spec_json = serde_json::json!({
@@ -5636,7 +5636,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage.clone());
         let session = hub
             .register(RegisterRequest {
@@ -5727,7 +5727,7 @@ mod tests {
     #[tokio::test]
     async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let hub1 = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store.clone()),  8));
         let session = hub1
             .register(RegisterRequest {
                 data_address: None,
@@ -5791,7 +5791,7 @@ mod tests {
         // persisted its own bookkeeping rows (checkpoint triggers), so the
         // restore brings back more than the start operation — assert on the
         // semantics, not on an exact count.
-        let hub2 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let hub2 = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store.clone()),  8));
         let restored = hub2.restore_persisted_operations().await.unwrap();
         assert!(restored >= 1, "at least the succeeded start is restored");
         assert!(hub2.operations(None).await.iter().any(|operation| {
@@ -6035,7 +6035,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage);
         let session = hub
             .register(RegisterRequest {
@@ -6207,7 +6207,7 @@ mod tests {
     #[tokio::test]
     async fn stale_operation_and_checkpoint_records_are_reclaimed() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage);
         hub.upsert_job(JobRecord {
             job_id: "orders".into(),
@@ -6303,7 +6303,7 @@ mod tests {
     #[tokio::test]
     async fn stale_job_observation_cannot_rollback_generation() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let spec_json = serde_json::json!({
             "id": "orders",
             "version": 1,
@@ -6646,7 +6646,7 @@ mod tests {
     #[tokio::test]
     async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = crate::storage::StorageActor::start(store, 8);
+        let storage = crate::storage::StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         register_and_report_resources(&hub1, 1).await;
         assert!(
@@ -6816,7 +6816,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_intent_survives_hub_restart_before_dispatch() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         let intent = hub1
             .set_desired_state(DesiredMutation {
@@ -6866,7 +6866,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage);
         let rollout = hub
             .create_rollout(
@@ -6947,7 +6947,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         hub.register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
@@ -6994,7 +6994,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         hub.register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
@@ -7045,7 +7045,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         for node_id in ["node-a", "node-b"] {
             hub.register(RegisterRequest {
                 data_address: None,
@@ -7095,7 +7095,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         let session = hub
             .register(RegisterRequest {
                 data_address: None,
@@ -7167,7 +7167,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage.clone());
         let node_a = hub
             .register(RegisterRequest {
@@ -7363,7 +7363,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         let mut sessions = Vec::new();
         for node_id in ["agent-a", "agent-b"] {
             let session = hub
@@ -7452,7 +7452,7 @@ mod tests {
     #[tokio::test]
     async fn dispatched_attempt_waits_for_fresh_report_after_hub_restart() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = StorageActor::start(store, 8);
+        let storage = StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         let session1 = hub1
             .register(RegisterRequest {
@@ -7852,7 +7852,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_capability_is_rejected_before_dispatch() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let storage = crate::storage::StorageActor::start(store, 8);
+        let storage = crate::storage::StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8);
         let hub = Hub::with_storage(config(), storage.clone());
         assert!(matches!(
             hub.register(RegisterRequest {
@@ -7957,7 +7957,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_dispatches_persisted_intent_with_generation() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let hub = Hub::with_storage(config(), crate::storage::StorageActor::start(store, 8));
+        let hub = Hub::with_storage(config(), crate::storage::StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         let session = hub
             .register(RegisterRequest {
                 data_address: None,
@@ -8543,7 +8543,7 @@ mod tests {
     async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_peer_degradation()
     {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         let node_a = hub
             .register(RegisterRequest {
@@ -8751,7 +8751,7 @@ mod tests {
     #[tokio::test]
     async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         let node_a = hub
             .register(RegisterRequest {
@@ -8876,7 +8876,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_job_reconciliation_retries_a_failed_runtime() {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         let registration = hub
             .register(RegisterRequest {
@@ -8969,7 +8969,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery() {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub1 = Hub::with_storage(config(), storage.clone());
         hub1.register(RegisterRequest {
             data_address: None,
@@ -9044,7 +9044,7 @@ mod tests {
     /// records never echo configuration bodies.
     async fn audited_job_hub(secret_marker: &str) -> (Hub, crate::hub::RegisterResponse) {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         let session = hub
             .register(RegisterRequest {
@@ -9321,7 +9321,7 @@ mod tests {
         // operator triggers; only the latter is a mutation and may appear in
         // the audit trail.
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         hub.register(RegisterRequest {
             data_address: None,
@@ -9382,7 +9382,7 @@ mod tests {
     #[tokio::test]
     async fn audit_history_prunes_old_records_but_keeps_recent() {
         let storage =
-            StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+            StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()),  8);
         let hub = Hub::with_storage(config(), storage);
         let now = now_ms() as i64;
         let day_ms = 24 * 60 * 60 * 1000;
@@ -9459,8 +9459,7 @@ mod session_report_tests {
     async fn registered_hub() -> (Hub, crate::hub::RegisterResponse) {
         let hub = Hub::with_storage(
             config(),
-            crate::storage::StorageActor::start(
-                crate::storage::ControlPlaneStore::in_memory().unwrap(),
+            crate::storage::StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(crate::storage::ControlPlaneStore::in_memory().unwrap()), 
                 4,
             ),
         );
@@ -9663,7 +9662,7 @@ mod session_report_tests {
         let mut hub_config = config();
         hub_config.lease_ttl_ms = 1_000; // command lease duration
         hub_config.session_ttl_ms = 80; // expires long before the command lease
-        let hub = Hub::with_storage(hub_config, StorageActor::start(store, 8));
+        let hub = Hub::with_storage(hub_config, StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store),  8));
         let registration = hub
             .register(RegisterRequest {
                 data_address: None,
@@ -9818,7 +9817,7 @@ mod session_report_tests {
     #[tokio::test]
     async fn outbox_and_attempt_history_prunes_converge_through_the_hub() {
         let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
-        let hub = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+        let hub = Hub::with_storage(config(), StorageActor::start(crate::storage::ControlPlaneBackend::Sqlite(store.clone()),  8));
         let now = now_ms() as i64;
         store
             .immediate_transaction(|transaction| -> Result<(), crate::storage::StorageError> {

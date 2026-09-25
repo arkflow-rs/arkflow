@@ -29,7 +29,7 @@ use arkflow_core::job::{
 use arkflow_core::runtime::RuntimeManager;
 use arkflow_server::agent::{self, NodeAgentConfig};
 use arkflow_server::hub::{Hub, HubConfig, HubOperationState};
-use arkflow_server::storage::{ControlPlaneStore, JobRecord, StorageActor};
+use arkflow_server::storage::{ControlPlaneBackend, ControlPlaneStore, JobRecord, StorageActor};
 use arkflow_server::{serve_hub, ServerConfig};
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -262,7 +262,7 @@ async fn start_hub(
     serve_generation(
         Hub::with_storage(
             hub_config(session_ttl_ms),
-            StorageActor::start(store.clone(), 128),
+            StorageActor::start(ControlPlaneBackend::Sqlite(store.clone()),  128),
         ),
         address,
     )
@@ -309,7 +309,7 @@ async fn restart_hub(
     *live = serve_generation(
         Hub::with_storage(
             hub_config(session_ttl_ms),
-            StorageActor::start(store.clone(), 128),
+            StorageActor::start(ControlPlaneBackend::Sqlite(store.clone()),  128),
         ),
         address,
     )
