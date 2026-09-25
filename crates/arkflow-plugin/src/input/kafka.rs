@@ -470,16 +470,8 @@ impl Input for KafkaInput {
                     // map, preserving the original key inside the value's key
                     // namespace for downstream routing/filtering.
                     if let Some(headers) = kafka_message.headers() {
-                        for i in 0..headers.count() {
-                            let header = headers.get(i);
-                            let value = header
-                                .value
-                                .and_then(|v| std::str::from_utf8(v).ok())
-                                .unwrap_or("");
-                            ext_metadata.insert(
-                                format!("header_{}", header.key),
-                                value.to_string(),
-                            );
+                        for (key, value) in header_metadata(headers) {
+                            ext_metadata.insert(key, value);
                         }
                     }
 
@@ -1049,9 +1041,67 @@ pub fn init() -> Result<(), Error> {
     })))
 }
 
+/// Maps Kafka record headers into `__meta_`-prefixed metadata entries:
+/// each header becomes `header_<key>`. Duplicate keys get a positional
+/// suffix (`header_<key>_2`, `_3`, …) instead of silently overwriting each
+/// other, and binary values are lossy-decoded rather than dropped.
+fn header_metadata(headers: &impl KafkaHeaders) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(headers.count());
+    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    for i in 0..headers.count() {
+        let header = headers.get(i);
+        let value = header
+            .value
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default();
+        let count = key_counts
+            .entry(header.key.to_string())
+            .and_modify(|count| *count += 1)
+            .or_insert(0);
+        let key = if *count == 0 {
+            format!("header_{}", header.key)
+        } else {
+            format!("header_{}_{}", header.key, *count + 1)
+        };
+        entries.push((key, value));
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Header metadata mapping: duplicate keys keep every value (positional
+    /// suffix) and binary values are lossy-decoded instead of dropped.
+    #[test]
+    fn header_metadata_handles_duplicates_and_binary() {
+        use rdkafka::message::OwnedHeaders;
+
+        let headers = OwnedHeaders::new()
+            .insert(rdkafka::message::Header {
+                key: "trace",
+                value: Some(&b"abc"[..]),
+            })
+            .insert(rdkafka::message::Header {
+                key: "trace",
+                value: Some(&[0xffu8, 0x00][..]),
+            })
+            .insert(rdkafka::message::Header {
+                key: "trace",
+                value: Some(&b""[..]),
+            });
+
+        let entries = super::header_metadata(&headers);
+        assert_eq!(
+            entries,
+            vec![
+                ("header_trace".to_string(), "abc".to_string()),
+                ("header_trace_2".to_string(), "\u{fffd}\u{0}".to_string()),
+                ("header_trace_3".to_string(), String::new()),
+            ]
+        );
+    }
+
 
     /// Regression: `wait_for_assignment` used to run inside the per-input
     /// acknowledgement lock and its consumer read guard, so one partition

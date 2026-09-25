@@ -71,9 +71,16 @@ impl ConfigVersionStore {
             format: candidate.format,
             parent_id,
         };
+        // Hub-dispatched payloads carry the pre-resolution text: persist the
+        // references, not the resolved plaintext.
+        let stored_content = candidate
+            .content_verbatim
+            .as_ref()
+            .unwrap_or(&candidate.content)
+            .clone();
         let stored = StoredConfigVersion {
             metadata: metadata.clone(),
-            content: candidate.content.clone(),
+            content: stored_content,
         };
         let target = self.root.join(format!("{id}.json"));
         let temporary = self.root.join(format!(".{id}.tmp"));
@@ -100,13 +107,35 @@ impl ConfigVersionStore {
     }
 
     pub fn load(&self, id: &str) -> Result<ConfigCandidate, Error> {
+        validate_version_id(id)?;
         let path = self.root.join(format!("{id}.json"));
         let stored: StoredConfigVersion = serde_json::from_slice(&fs::read(path)?)?;
         Ok(ConfigCandidate {
             format: stored.metadata.format,
             content: stored.content,
+            content_verbatim: None,
         })
     }
+}
+
+/// Version identifiers end up in filesystem paths, so caller-supplied ids are
+/// validated against the shape the store itself generates (`<ms>-<seq>`):
+/// non-empty, bounded, and free of separators or `..` sequences. Rejections
+/// use the not-found error class so they read like any other unknown id.
+fn validate_version_id(id: &str) -> Result<(), Error> {
+    fn invalid(id: &str) -> Error {
+        Error::Config(format!("unknown configuration version '{id}'"))
+    }
+    if id.is_empty() || id.len() > 128 || id.contains("..") {
+        return Err(invalid(id));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(invalid(id));
+    }
+    Ok(())
 }
 
 /// Request body accepted by the configuration validation endpoint.
@@ -114,6 +143,11 @@ impl ConfigVersionStore {
 pub struct ConfigCandidate {
     pub format: ConfigFormat,
     pub content: String,
+    /// Pre-resolution content carried by Hub dispatch payloads: version
+    /// storage persists THIS text (secret references stay verbatim, no
+    /// plaintext at rest) while `content` — already resolved — is what runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_verbatim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -299,8 +333,48 @@ pub fn redact_secrets(value: &Value) -> Value {
             Value::Object(redacted)
         }
         Value::Array(values) => Value::Array(values.iter().map(redact_secrets).collect()),
+        Value::String(text) => match redact_url_password(text) {
+            Some(redacted) => Value::String(redacted),
+            None => Value::String(text.clone()),
+        },
         other => other.clone(),
     }
+}
+
+/// Masks the password of a URL userinfo component (`scheme://user:pass@…`)
+/// so connection strings keep their scheme/user/host readable without
+/// leaking the credential. Returns `None` when the value carries no
+/// userinfo password.
+fn redact_url_password(text: &str) -> Option<String> {
+    let (scheme, rest) = text.split_once("://")?;
+    if scheme.is_empty() || scheme.contains(['/', '@', ':']) {
+        return None;
+    }
+    // The authority ends at the first '/', '?' or '#'; a userinfo component
+    // is everything before the last '@' inside it (usernames may contain
+    // none, but passwords may contain '@'-adjacent quirks — take the LAST
+    // '@' so an '@' inside the password still splits correctly... the
+    // password itself follows the ':' inside the userinfo).
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // The userinfo is everything before the LAST '@' of the authority (the
+    // password itself may contain '@'); its password follows the last ':'.
+    let at = authority.rfind('@')?;
+    let userinfo = &authority[..at];
+    let colon = userinfo.rfind(':')?;
+    if colon == userinfo.len() - 1 {
+        // Empty password segment: nothing to redact.
+        return None;
+    }
+    let mut redacted =
+        String::with_capacity(text.len() + 4);
+    redacted.push_str(scheme);
+    redacted.push_str("://");
+    redacted.push_str(&authority[..colon]);
+    redacted.push_str(":******");
+    redacted.push_str(&authority[at..]);
+    redacted.push_str(&rest[authority_end..]);
+    Some(redacted)
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -335,16 +409,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn versions_persist_verbatim_content_when_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigVersionStore::new(directory.path());
+        let candidate = ConfigCandidate {
+            format: ConfigFormat::Yaml,
+            content: "health_check:\n  api_token: plain-value\n".to_string(),
+            content_verbatim: Some("health_check:\n  api_token: ${secret:db_pass}\n".to_string()),
+        };
+        let version = store.save(&candidate).unwrap();
+        let stored = store.load(&version.id).unwrap();
+        assert_eq!(
+            stored.content,
+            "health_check:\n  api_token: ${secret:db_pass}\n",
+            "the verbatim reference must be persisted, not the resolved plaintext"
+        );
+
+        // Without the field the payload content is stored as-is (old hubs /
+        // local API keep today's behavior).
+        let plain = ConfigCandidate {
+            format: ConfigFormat::Yaml,
+            content: "streams: []".to_string(),
+            content_verbatim: None,
+        };
+        let version = store.save(&plain).unwrap();
+        assert_eq!(store.load(&version.id).unwrap().content, "streams: []");
+    }
+
+    #[test]
+    fn version_ids_reject_traversal_and_bad_shapes() {
+        let store = ConfigVersionStore::new(".arkflow/config-history-test");
+        for bad in [
+            "",
+            "..",
+            "../../etc/passwd",
+            "a/b",
+            "a\\b",
+            "id with space",
+            "id<span>",
+            &"a".repeat(129),
+        ] {
+            let err = store.load(bad).unwrap_err().to_string();
+            assert!(err.contains("unknown configuration version"), "{bad}: {err}");
+        }
+        // A well-shaped id simply reports not found via the same class.
+        let err = store.load("1737500000000-0").unwrap_err().to_string();
+        assert!(err.contains("unknown configuration version") || err.contains("No such file"), "{err}");
+    }
+
+    #[test]
+    fn url_userinfo_passwords_are_masked_in_redaction() {
+        let value = serde_json::json!({
+            "pg_url": "postgres://admin:hunter2@db.internal:5432/vectors",
+            "plain_url": "http://qdrant.internal:6333",
+            "user_only_url": "postgres://admin@db.internal/vectors",
+            "nested": {
+                "url": "mysql://root:s3cret@localhost/app"
+            },
+            "name": "not a url"
+        });
+        let redacted = redact_secrets(&value);
+        assert_eq!(
+            redacted["pg_url"],
+            "postgres://admin:******@db.internal:5432/vectors"
+        );
+        assert_eq!(redacted["plain_url"], "http://qdrant.internal:6333");
+        assert_eq!(redacted["user_only_url"], "postgres://admin@db.internal/vectors");
+        assert_eq!(redacted["nested"]["url"], "mysql://root:******@localhost/app");
+        assert_eq!(redacted["name"], "not a url");
+    }
+
+
+    #[test]
     fn candidate_parses_json_and_reports_syntax_errors() {
         let valid = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: r#"{"streams":[]}"#.to_string(),
+            content: r#"{"streams":[]}"#.to_string(), content_verbatim: None,
         };
         assert!(valid.parse().is_ok());
 
         let invalid = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: "not-json".to_string(),
+            content: "not-json".to_string(), content_verbatim: None,
         };
         assert!(invalid
             .parse()
@@ -375,7 +521,7 @@ mod tests {
         let candidate = ConfigCandidate {
             format: ConfigFormat::Yaml,
             content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_TOKEN}\"\n"
-                .to_string(),
+                .to_string(), content_verbatim: None,
         };
         let config = candidate.parse().unwrap();
         std::env::remove_var("ARKFLOW_CP_TEST_TOKEN");
@@ -388,7 +534,7 @@ mod tests {
         let candidate = ConfigCandidate {
             format: ConfigFormat::Yaml,
             content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_UNSET}\"\n"
-                .to_string(),
+                .to_string(), content_verbatim: None,
         };
         let issue = candidate.parse().unwrap_err();
         assert!(
@@ -405,6 +551,7 @@ mod tests {
             format: ConfigFormat::Yaml,
             content: "logging:\n  level: debug\nhealth_check:\n  api_token: [1, 2]\n"
                 .to_string(),
+            content_verbatim: None,
         };
         let issue = candidate.parse().unwrap_err();
         assert!(issue.path.starts_with("line "), "{}", issue.path);
@@ -420,7 +567,7 @@ mod tests {
         let store = ConfigVersionStore::new(&root);
         let candidate = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: r#"{"streams":[]}"#.to_string(),
+            content: r#"{"streams":[]}"#.to_string(), content_verbatim: None,
         };
         let version = store.save(&candidate).unwrap();
         assert_eq!(store.list().unwrap().len(), 1);

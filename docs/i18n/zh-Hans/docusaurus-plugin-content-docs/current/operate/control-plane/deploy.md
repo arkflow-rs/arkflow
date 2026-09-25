@@ -31,10 +31,12 @@ sidebar_position: 2
 授权/令牌端点,并提供浏览器登录流:
 
 - `GET /api/v1/auth/oidc/login` —— 302 跳转到身份提供方,携带绑定
-  HttpOnly cookie 的随机 `state`。
-- `GET /api/v1/auth/oidc/callback?code&state` —— 用 code 换取 id_token,
-  沿用与 bearer JWT 相同的验证管线,创建 8 小时服务端会话,并写入
-  HttpOnly 的 `arkflow_session` cookie。
+  HttpOnly cookie 的随机 `state`、PKCE S256 `code_challenge` 与 `nonce`。
+  IdP 需支持 PKCE(RFC 7636,`S256`)并在 id_token 中回传 `nonce` claim。
+- `GET /api/v1/auth/oidc/callback?code&state` —— 用 code(附带 PKCE
+  verifier)换取 id_token,校验 `nonce` claim 后沿用与 bearer JWT 相同的
+  验证管线,创建 8 小时服务端会话,并写入 HttpOnly 的 `arkflow_session`
+  cookie(redirect URI 为 https 时附加 `Secure`)。
 - `GET /api/v1/auth/oidc/logout` —— 删除服务端会话并清除 cookie。
 
 浏览器会话与其他凭据走同一套 RBAC 模型(角色来自角色 claim)。Console

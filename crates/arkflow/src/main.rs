@@ -75,5 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
     }
     engine_result?;
+    // Flush buffered OTel spans before the process exits so the tail of the
+    // trace is not lost.
+    arkflow_core::cli::shutdown_otel_tracing();
     Ok(())
 }

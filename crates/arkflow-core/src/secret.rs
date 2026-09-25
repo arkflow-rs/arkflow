@@ -85,7 +85,11 @@ pub fn resolve_candidate_payload(payload: String) -> Result<Option<String>, Erro
         .unwrap_or("json")
         .to_string();
     // Not a candidate envelope (no content field): dispatch verbatim.
-    let Some(content) = candidate.get("content").and_then(Value::as_str) else {
+    let Some(content) = candidate
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return Ok(None);
     };
     if !content.contains("secret:") {
@@ -110,6 +114,10 @@ pub fn resolve_candidate_payload(payload: String) -> Result<Option<String>, Erro
     candidate["content"] = json!(serde_json::to_string(&value).map_err(|e| {
         Error::Config(format!("candidate content serialization failed: {}", e))
     })?);
+    // Carry the verbatim (pre-resolution) content alongside the resolved one:
+    // the node persists THIS text as its config version, keeping the dispatch
+    // path free of plaintext at rest. `serde` adds the field only when set.
+    candidate["content_verbatim"] = json!(content);
     candidate["format"] = json!("json");
     let serialized = serde_json::to_string(&candidate).map_err(|e| {
         Error::Config(format!("candidate payload serialization failed: {}", e))
@@ -163,7 +171,12 @@ fn resolve_secret_only_string(text: &str, path: &str) -> Result<String, Error> {
                     if let Some(spec) = inner.strip_prefix("secret:") {
                         // Same namespace convention as the full resolver.
                         let name = format!("ARKFLOW_SECRET_{spec}");
-                        output.push_str(&resolve_env(&name, &token, path)?);
+                        let resolved = resolve_env(&name, &token, path)?;
+                        // The resolved value must never be re-scanned by the
+                        // node-side resolver (the dispatch payload is re-parsed
+                        // as a document there): escape `${` so a secret whose
+                        // text looks like a reference stays literal.
+                        output.push_str(&resolved.replace("${", "$${"));
                     } else {
                         // env:/file:/unknown stay literal for the node.
                         output.push_str(&token);
@@ -327,6 +340,65 @@ fn secret_error(path: &str, reference: &str, reason: String) -> Error {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Hub dispatch resolves `${secret:...}` in place; the resolved text must
+    /// not be re-scanned by the node-side resolver even when the secret's
+    /// value itself looks like a reference.
+    #[test]
+    fn dispatched_secret_values_are_escaped_against_rescanning() {
+        let name = "ARKFLOW_SECRET_INJECTED_REF";
+        set_env(name, "${env:TOTALLY_UNSET_VAR}");
+
+        let payload = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:INJECTED_REF}\n"
+        })
+        .to_string();
+        let resolved =
+            resolve_candidate_payload(payload).expect("resolution succeeds").expect("changed");
+        let content: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        let content = content["content"].as_str().unwrap();
+        assert!(
+            content.contains("$${env:TOTALLY_UNSET_VAR}"),
+            "resolved value must be escaped: {content}"
+        );
+
+        // The node-side resolver turns the escape back into the literal.
+        let mut tree: serde_json::Value = serde_yaml::from_str(content).unwrap();
+        resolve_value(&mut tree).unwrap();
+        assert_eq!(
+            tree["health_check"]["api_token"],
+            "${env:TOTALLY_UNSET_VAR}",
+            "the value must land as a literal, never re-expanded"
+        );
+    }
+
+    /// The dispatch payload carries the verbatim (pre-resolution) content so
+    /// nodes can persist references instead of plaintext.
+    #[test]
+    fn dispatch_payload_carries_verbatim_content() {
+        let name = "ARKFLOW_SECRET_VERBATIM_PROBE";
+        set_env(name, "plain-value");
+        let payload = serde_json::json!({
+            "format": "yaml",
+            "content": "health_check:\n  api_token: ${secret:VERBATIM_PROBE}\n"
+        })
+        .to_string();
+        let resolved =
+            resolve_candidate_payload(payload).expect("resolution succeeds").expect("changed");
+        let envelope: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(envelope["format"], "json");
+        assert!(
+            !envelope["content"].as_str().unwrap().contains("${secret:VERBATIM_PROBE}"),
+            "dispatched content must be resolved"
+        );
+        assert_eq!(
+            envelope["content_verbatim"].as_str().unwrap(),
+            "health_check:\n  api_token: ${secret:VERBATIM_PROBE}\n",
+            "verbatim content must keep the reference"
+        );
+    }
+
 
     /// Unique per-test env var names: cargo runs tests in parallel threads
     /// sharing one process environment.

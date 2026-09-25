@@ -32,6 +32,7 @@ use datafusion::arrow::array::{Array, ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -177,17 +178,14 @@ impl Processor for LlmProcessor {
 
 impl LlmProcessor {
     /// One request per row; results are collected in row order while at
-    /// most `concurrency` requests are in flight. Requests already in
-    /// flight complete even if an earlier row failed — the batch fails as
-    /// a whole either way.
+    /// most `concurrency` requests are in flight. The first row failure
+    /// short-circuits: in-flight requests are dropped rather than awaited.
     async fn complete_all(&self, texts: &[&str]) -> Result<Vec<Completion>, Error> {
         let owned: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
         futures_util::stream::iter(owned.into_iter().map(|text| self.complete(text)))
             .buffered(self.config.concurrency)
-            .collect::<Vec<Result<Completion, Error>>>()
+            .try_collect()
             .await
-            .into_iter()
-            .collect()
     }
 
     async fn complete(&self, text: String) -> Result<Completion, Error> {

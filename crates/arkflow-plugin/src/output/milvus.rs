@@ -32,10 +32,7 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray, ListArray,
-    StringArray,
-};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, LargeStringArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::json::LineDelimitedWriter;
 use reqwest::Client;
@@ -59,6 +56,7 @@ pub fn init() -> Result<(), Error> {
                 "payload_field": {"type": "string", "description": "JSON field receiving every remaining column as a per-row object. Defaults to 'payload'; set to an empty string to disable."},
                 "api_key": {"type": "string", "description": "Sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
+                "retry_count": {"type": "integer", "description": "Retry attempts for connection errors and 5xx responses. Defaults to 0."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."}
             },
             "required": ["url", "collection"]
@@ -88,6 +86,8 @@ struct MilvusOutputConfig {
     api_key: Option<String>,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    #[serde(default = "default_retry_count")]
+    retry_count: u32,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
 }
@@ -101,6 +101,13 @@ fn default_payload_field() -> String {
 fn default_timeout_ms() -> u64 {
     30000
 }
+fn default_retry_count() -> u32 {
+    0
+}
+
+/// Rows per upsert request: keeps each JSON body well below REST request
+/// size limits. Batches at or below this size stay a single request.
+const MILVUS_ROWS_PER_REQUEST: usize = 1000;
 
 struct MilvusOutput {
     config: MilvusOutputConfig,
@@ -118,7 +125,7 @@ impl Output for MilvusOutput {
         if rows == 0 {
             return Ok(());
         }
-        let vectors = extract_vectors(&msg, &self.config.vector_field)?;
+        let vectors = crate::vector_util::extract_vectors("milvus output", &msg, &self.config.vector_field)?;
         let ids = extract_ids(&msg, &self.config.id_field)?;
         let payloads = extract_payloads(&msg, &self.config)?;
 
@@ -136,7 +143,13 @@ impl Output for MilvusOutput {
             })
             .collect();
 
-        self.upsert(data).await
+        // Large batches are split into bounded requests so a single JSON
+        // body cannot exceed the REST request size limits; slices preserve
+        // row order.
+        for chunk in data.chunks(MILVUS_ROWS_PER_REQUEST) {
+            self.upsert(chunk).await?;
+        }
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -145,7 +158,7 @@ impl Output for MilvusOutput {
 }
 
 impl MilvusOutput {
-    async fn upsert(&self, data: Vec<Value>) -> Result<(), Error> {
+    async fn upsert(&self, data: &[Value]) -> Result<(), Error> {
         let url = format!(
             "{}/v2/vectordb/entities/upsert",
             self.config.url.trim_end_matches('/')
@@ -163,121 +176,72 @@ impl MilvusOutput {
             }
         }
 
-        let response = request.send().await.map_err(|e| {
-            error!("Milvus request failed: {}", e);
-            Error::Process(format!("Milvus request failed: {}", e))
-        })?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Process(format!("Milvus response read failed: {}", e)))?;
-        if !status.is_success() {
-            return Err(Error::Process(format!(
-                "Milvus returned {}: {}",
-                status,
-                truncate_body(&body)
-            )));
-        }
-
-        // Milvus reports failures as HTTP 200 with a non-zero `code`.
-        let parsed: Value = serde_json::from_str(&body)
-            .map_err(|e| Error::Process(format!("Milvus response parse failed: {}", e)))?;
-        match parsed.get("code") {
-            None => Ok(()), // Lenient with older builds that omit the code.
-            Some(code) if code.as_i64() == Some(0) => Ok(()),
-            Some(code) => {
-                let message = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<no message>");
-                Err(Error::Process(format!(
-                    "Milvus upsert failed with code {}: {}",
-                    code,
-                    truncate_body(message)
-                )))
-            }
-        }
-    }
-}
-
-fn extract_vectors(batch: &MessageBatchRef, field: &str) -> Result<Vec<Vec<f32>>, Error> {
-    let column = find_column(batch, field)?;
-    let rows = column.len();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(rows);
-    match column.data_type() {
-        DataType::FixedSizeList(_, dim) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
+        let mut attempt = 0u32;
+        loop {
+            match request.try_clone().expect("request body is JSON").send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<unreadable body>".to_string());
+                    if status.is_success() {
+                        // Milvus reports failures as HTTP 200 with a
+                        // non-zero `code`; those are deterministic, so no
+                        // retry.
+                        let parsed: Value = serde_json::from_str(&body).map_err(|e| {
+                            Error::Process(format!("Milvus response parse failed: {}", e))
+                        })?;
+                        match parsed.get("code") {
+                            None => return Ok(()), // Lenient with older builds that omit the code.
+                            Some(code) if code.as_i64() == Some(0) => return Ok(()),
+                            Some(code) => {
+                                let message = parsed
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("<no message>");
+                                return Err(Error::Process(format!(
+                                    "Milvus upsert failed with code {}: {}",
+                                    code,
+                                    crate::vector_util::truncate_body(message)
+                                )));
+                            }
+                        }
+                    }
+                    // Client errors are deterministic: retrying cannot help.
+                    if status.is_client_error() {
+                        return Err(Error::Process(format!(
+                            "Milvus returned {}: {}",
+                            status,
+                            crate::vector_util::truncate_body(&body)
+                        )));
+                    }
+                    error!(
+                        "Milvus upsert attempt {} failed: {} {}",
+                        attempt + 1,
+                        status,
+                        crate::vector_util::truncate_body(&body)
+                    );
+                    if attempt >= self.config.retry_count {
+                        return Err(Error::Process(format!(
+                            "Milvus returned {} after {} attempts: {}",
+                            status,
+                            attempt + 1,
+                            crate::vector_util::truncate_body(&body)
+                        )));
+                    }
                 }
-                let start = row as i64 * *dim as i64;
-                vectors.push(
-                    (start..start + *dim as i64)
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        DataType::List(_) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
+                Err(e) => {
+                    error!("Milvus request failed: {}", e);
+                    if attempt >= self.config.retry_count {
+                        return Err(Error::Connection(format!("Milvus request failed: {}", e)));
+                    }
                 }
-                let offsets = list.value_offsets();
-                vectors.push(
-                    (offsets[row]..offsets[row + 1])
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
             }
-        }
-        other => {
-            return Err(Error::Process(format!(
-                "milvus output: column '{}' must be FixedSizeList(Float32) or List(Float32), got {:?}",
-                field, other
-            )));
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
         }
     }
-    if let Some((row, _)) = vectors.iter().enumerate().find(|(_, v)| v.is_empty()) {
-        return Err(Error::Process(format!(
-            "milvus output: column '{}' has an empty vector at row {row}",
-            field
-        )));
-    }
-    Ok(vectors)
-}
-
-fn not_a_vector_error(field: &str) -> Error {
-    Error::Process(format!(
-        "milvus output: column '{}' is not a Float32 vector list",
-        field
-    ))
-}
-
-fn null_vector_error(field: &str, row: usize) -> Error {
-    Error::Process(format!(
-        "milvus output: column '{}' has a null vector at row {row}",
-        field
-    ))
 }
 
 fn extract_ids(
@@ -402,13 +366,6 @@ fn find_column<'a>(
         .ok_or_else(|| Error::Process(format!("milvus output: column '{}' not found", field)))
 }
 
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
-}
-
 struct MilvusOutputBuilder;
 impl OutputBuilder for MilvusOutputBuilder {
     fn build(
@@ -451,7 +408,9 @@ impl OutputBuilder for MilvusOutputBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector_util::test_support::MockApi as MockMilvus;
     use arkflow_core::MessageBatch;
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use datafusion::arrow::array::{ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -461,75 +420,6 @@ mod tests {
         Resource {
             temporary: Default::default(),
             input_names: RefCell::new(Default::default()),
-        }
-    }
-
-    struct MockMilvus {
-        addr: std::net::SocketAddr,
-        requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    }
-
-    impl MockMilvus {
-        fn spawn<F>(handler: F) -> Self
-        where
-            F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
-        {
-            let handler = Arc::new(handler);
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let request_log = requests.clone();
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let mut stream = match stream {
-                        Ok(stream) => stream,
-                        Err(_) => break,
-                    };
-                    let handler = handler.clone();
-                    let request_log = request_log.clone();
-                    let mut buffer = Vec::new();
-                    let mut byte = [0u8; 1];
-                    loop {
-                        use std::io::Read;
-                        if stream.read_exact(&mut byte).is_err() {
-                            break;
-                        }
-                        buffer.push(byte[0]);
-                        if buffer.ends_with(b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&buffer).to_string();
-                    let content_length = head
-                        .to_ascii_lowercase()
-                        .split("content-length:")
-                        .nth(1)
-                        .and_then(|rest| rest.split("\r\n").next())
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    let mut body_bytes = vec![0u8; content_length];
-                    if content_length > 0 {
-                        use std::io::Read;
-                        let _ = stream.read_exact(&mut body_bytes);
-                    }
-                    let body = String::from_utf8_lossy(&body_bytes).to_string();
-                    request_log.lock().unwrap().push((head.clone(), body.clone()));
-
-                    let (status, response_body) = handler(&body);
-                    let response = format!(
-                        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                        response_body.len()
-                    );
-                    use std::io::Write;
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                }
-            });
-            Self { addr, requests }
-        }
-
-        fn last_request(&self) -> (String, String) {
-            self.requests.lock().unwrap().last().cloned().unwrap()
         }
     }
 
@@ -576,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn upserts_rows_with_vector_payload_and_id() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":2}}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         output.write(sample_batch()).await.unwrap();
 
         let (head, body) = mock.last_request();
@@ -601,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn omits_id_when_id_field_not_configured() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": ""})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({"id_field": ""})));
         output.write(sample_batch()).await.unwrap();
         let (_, body) = mock.last_request();
         let parsed: Value = serde_json::from_str(&body).unwrap();
@@ -614,7 +504,7 @@ mod tests {
     async fn payload_field_can_be_disabled() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
         let output = build_output(base_config(
-            mock.addr,
+            mock.addr(),
             serde_json::json!({"payload_field": ""}),
         ));
         output.write(sample_batch()).await.unwrap();
@@ -631,7 +521,7 @@ mod tests {
         let mock = MockMilvus::spawn(|_body| {
             (200, r#"{"code":100,"message":"collection not found"}"#.to_string())
         });
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         let err = output.write(sample_batch()).await.unwrap_err().to_string();
         assert!(err.contains("100"), "{err}");
         assert!(err.contains("collection not found"), "{err}");
@@ -640,21 +530,21 @@ mod tests {
     #[tokio::test]
     async fn http_200_with_zero_code_succeeds() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{}}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         assert!(output.write(sample_batch()).await.is_ok());
     }
 
     #[tokio::test]
     async fn http_200_without_code_is_lenient() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"status":"ok"}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         assert!(output.write(sample_batch()).await.is_ok());
     }
 
     #[tokio::test]
     async fn non_2xx_is_surfaced_with_status_and_body() {
         let mock = MockMilvus::spawn(|_body| (401, "unauthorized".to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         let err = output.write(sample_batch()).await.unwrap_err().to_string();
         assert!(err.contains("401"), "{err}");
         assert!(err.contains("unauthorized"), "{err}");
@@ -664,7 +554,7 @@ mod tests {
     async fn no_api_key_sends_no_auth_header() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
         let output = build_output(serde_json::json!({
-            "url": format!("http://{}", mock.addr),
+            "url": format!("http://{}", mock.addr()),
             "collection": "docs",
         }));
         output.write(sample_batch()).await.unwrap();
@@ -675,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn null_vector_row_errors_without_request() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         let dim = 2i32;
         let with_null = FixedSizeListArray::from_iter_primitive::<
             datafusion::arrow::datatypes::Float32Type,
@@ -697,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn empty_batch_short_circuits_without_request() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(
@@ -723,5 +613,86 @@ mod tests {
                 "config must be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transient_5xx_is_retried_with_backoff() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let mock = MockMilvus::spawn(move |_body| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                (503, r#"{"message":"overloaded"}"#.to_string())
+            } else {
+                (200, r#"{"code":0,"data":{"upsertCount":1}}"#.to_string())
+            }
+        });
+        let output = build_output(base_config(mock.addr(), serde_json::json!({"retry_count": 2})));
+        output.write(sample_batch()).await.unwrap();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two 503s then success"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_errors_are_not_retried() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let mock = MockMilvus::spawn(move |_body| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (400, r#"{"message":"bad request"}"#.to_string())
+        });
+        let output = build_output(base_config(mock.addr(), serde_json::json!({"retry_count": 3})));
+        let err = output
+            .write(sample_batch())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("400"), "{err}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn large_batches_are_split_into_bounded_requests() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":1}}"#.to_string()));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
+        output.write(sample_batch_rows(2500)).await.unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3, "2500 rows -> 3 requests");
+        let sizes: Vec<usize> = requests
+            .iter()
+            .map(|(_, body)| {
+                let parsed: Value = serde_json::from_str(body).unwrap();
+                parsed["data"].as_array().unwrap().len()
+            })
+            .collect();
+        assert_eq!(sizes, vec![1000, 1000, 500], "slices must preserve row order");
+    }
+
+    /// Builds a batch with `rows` rows: an id column, a 2-dim vector column,
+    /// and a text column packed into the payload.
+    fn sample_batch_rows(rows: usize) -> MessageBatchRef {
+        use datafusion::arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field as F};
+        let ids = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+        let flat = Float32Array::from((0..rows as i64).flat_map(|i| vec![i as f32, 1.0]).collect::<Vec<_>>());
+        let item_field = Arc::new(F::new("item", DataType::Float32, true));
+        let vectors = FixedSizeListArray::new(item_field, 2, Arc::new(flat), None);
+        let texts = StringArray::from(vec!["t"; rows]);
+        let schema = Arc::new(Schema::new(vec![
+            F::new("doc_id", DataType::Int64, false),
+            F::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(F::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+            F::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(vectors), Arc::new(texts)])
+            .unwrap();
+        Arc::new(MessageBatch::new_arrow(batch))
     }
 }
