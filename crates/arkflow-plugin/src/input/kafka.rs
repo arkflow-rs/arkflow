@@ -63,6 +63,15 @@ pub struct KafkaInputConfig {
     /// SASL authentication and TLS settings (optional; absent means
     /// plaintext, exactly as before this field existed)
     pub security: Option<KafkaSecurityConfig>,
+    /// L3 exactly-once: delegate broker offset commits to a transactional
+    /// Kafka output's `send_offsets_to_transaction` (the output declares
+    /// `offset_commit_group` naming this consumer group). The input still
+    /// advances its in-memory frontier and publishes its consumer-group
+    /// metadata for the output's transactions, but suppresses its own
+    /// `store_offset` calls so the broker's committed position only ever
+    /// advances inside an output transaction.
+    #[serde(default)]
+    pub transactional_offsets: bool,
 }
 
 /// Kafka input component
@@ -86,6 +95,10 @@ pub struct KafkaInput {
     /// Cancels frontier waiters before the consumer is torn down.
     close: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// L3 bridge slot: when `transactional_offsets` is enabled, the live
+    /// consumer-group metadata lands here for transactional outputs to
+    /// commit offsets inside their producer transactions.
+    txn_metadata: Option<crate::kafka_txn::SharedMetadata>,
 }
 
 impl KafkaInput {
@@ -106,6 +119,14 @@ impl KafkaInput {
         config: KafkaInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
+        let txn_metadata = if config.transactional_offsets {
+            Some(crate::kafka_txn::register_group(
+                &config.consumer_group,
+                config.topics.clone(),
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             input_name: name.cloned(),
             config,
@@ -116,6 +137,7 @@ impl KafkaInput {
             ack_notify: Arc::new(Notify::new()),
             close: CancellationToken::new(),
             codec,
+            txn_metadata,
         })
     }
 
@@ -344,6 +366,31 @@ impl Input for KafkaInput {
         let mut consumer_guard = consumer_arc.write().await;
         *consumer_guard = Some(consumer);
 
+        // L3 bridge: publish the live group metadata for transactional
+        // outputs. Group metadata is only meaningful once the consumer has
+        // joined the group, which `create` + subscribe/assign initiates; the
+        // broker accepts the metadata carried in the transaction regardless
+        // of join timing on the same client instance.
+        if self.config.transactional_offsets {
+            let slot = self
+                .txn_metadata
+                .clone()
+                .expect("transactional_offsets implies a registered slot");
+            if let Some(consumer) = consumer_guard.as_ref() {
+                match consumer.group_metadata() {
+                    Some(metadata) => {
+                        *slot.write().await = Some(std::sync::Arc::new(metadata));
+                    }
+                    None => {
+                        return Err(Error::Connection(
+                            "Kafka consumer group metadata unavailable for transactional offsets"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -385,6 +432,7 @@ impl Input for KafkaInput {
                             topic: kafka_message.topic().to_string(),
                             partition: kafka_message.partition(),
                             offset: kafka_message.offset(),
+                            transactional_offsets: self.config.transactional_offsets,
                         };
                         self.frontier.anchor_delivery(&SourcePosition {
                             topic: Some(kafka_message.topic().to_string()),
@@ -491,7 +539,8 @@ impl Input for KafkaInput {
                         topic: kafka_message.topic().to_string(),
                         partition,
                         offset,
-                    };
+                            transactional_offsets: self.config.transactional_offsets,
+                        };
 
                     return Ok((Arc::new(msg_batch), Arc::new(ack)));
                 }
@@ -596,7 +645,8 @@ impl Input for KafkaInput {
             topic,
             partition: position.partition as i32,
             offset,
-        })))
+                            transactional_offsets: self.config.transactional_offsets,
+                        })))
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
@@ -743,6 +793,9 @@ pub struct KafkaAck {
     topic: String,
     partition: i32,
     offset: i64,
+    /// L3: the broker offset commit rides the transactional output's
+    /// producer transaction instead of this consumer's `store_offset`.
+    transactional_offsets: bool,
 }
 
 /// How long an in-flight acknowledgement waits for the consumer to (re)gain
@@ -764,7 +817,6 @@ impl KafkaAck {
             })
             .unwrap_or(false)
     }
-
 }
 
 #[async_trait]
@@ -875,6 +927,15 @@ impl Ack for KafkaAck {
                         // librdkafka stores the next offset to consume, not
                         // the offset of the last message.  `next_offset` is
                         // already the exclusive contiguous frontier.
+                        if self.transactional_offsets {
+                            // L3: the transactional output commits the
+                            // covered offsets inside its producer
+                            // transaction; a local store here could advance
+                            // the group past a transaction that still rolls
+                            // back.
+                            self.ack_notify.notify_waiters();
+                            return Ok(());
+                        }
                         let store_offset_value = i64::try_from(next_offset)
                             .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
                         // The assignment was checked (and waited for) before
@@ -1162,6 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn test_kafka_input_new() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1188,6 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn test_kafka_input_read_not_connected() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1215,6 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn test_kafka_ack() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1238,7 +1302,8 @@ mod tests {
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
-        };
+                            transactional_offsets: false,
+                        };
 
         // Acknowledging without a live consumer must fail; treating this as
         // success would advance the in-memory frontier while no broker offset
@@ -1257,6 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn out_of_order_acknowledgements_wait_for_the_gap() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1310,6 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn restored_positions_seed_the_checkpoint_cursor() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1343,7 +1410,8 @@ mod tests {
             topic: "test-topic".to_string(),
             partition: 3,
             offset: 42,
-        };
+                            transactional_offsets: false,
+                        };
         assert!(ack.ack().await.is_err());
         assert_eq!(input.current_positions().await.unwrap()[0].offset, 42);
     }
@@ -1355,6 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_assignment_uses_the_acknowledged_frontier() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1396,6 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn first_connect_keeps_configured_start_semantics() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1585,6 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn closing_kafka_wakes_a_frontier_gap_waiter() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1611,7 +1682,8 @@ mod tests {
             topic: "test-topic".into(),
             partition: 0,
             offset: 1,
-        };
+                            transactional_offsets: false,
+                        };
         let waiter = tokio::spawn(async move { ack.ack().await });
         tokio::task::yield_now().await;
         input.close().await.unwrap();
@@ -1628,6 +1700,7 @@ mod tests {
         // the downstream output confirms the write), never on `recv()`. Verify
         // the consumer config disables rdkafka's automatic offset store.
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1654,6 +1727,7 @@ mod tests {
     #[test]
     fn test_kafka_input_without_security_sets_no_security_properties() {
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1683,6 +1757,7 @@ mod tests {
     fn test_kafka_input_assembles_sasl_ssl_properties() {
         let ca_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
         let config = KafkaInputConfig {
+            transactional_offsets: false,
             brokers: vec!["localhost:9092".to_string()],
             topics: vec!["test-topic".to_string()],
             consumer_group: "test-group".to_string(),
@@ -1772,6 +1847,7 @@ mod tests {
 
         fn cfg(brokers: &str, topics: &str, group: &str) -> KafkaInputConfig {
             KafkaInputConfig {
+                transactional_offsets: false,
                 brokers: vec![brokers.to_string()],
                 topics: vec![topics.to_string()],
                 consumer_group: group.to_string(),
