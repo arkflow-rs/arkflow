@@ -280,22 +280,52 @@ Temporary resources, sources, and sinks are connected in dependency order
 before any task loop starts, and a partial startup closes the connected
 resources in reverse order.
 
-### Stream-stream join boundary
+### Stream-stream join
 
-Stream-stream join is not yet supported anywhere in the engine. The Job DAG
-rejects `Join` operators at validation time, and legacy Stream `join` buffers
-(including window buffers with a legacy `join` field) fail compilation with the
-same guidance — neither rejection points at an entry point that exists. Until a
-native join operator lands, use one of these workarounds:
+The Job DAG supports a keyed interval join operator. A `Join` operator
+declares exactly two inbound edges and names its sides by producer
+(`left_from`/`right_from` upstream operator ids — channel order is a
+kernel-internal detail). The config carries `left_key`/`right_key`,
+`window_ms`, and optional `left_timestamp`/`right_timestamp` (default
+`__meta_timestamp`), `ttl_ms`, and `max_per_key`:
 
-- **Per-batch SQL joins against temporary tables**: feed one side through the
-  SQL processor and register the other side as a temporary table. This joins
-  each in-flight batch against table data; it does not maintain cross-stream
-  state.
-- **External co-location**: repartition both flows onto the same key through an
-  external system (for example, a Kafka topic keyed by the join key) and
-  process them as one stream, correlating records with a keyed processor or
-  window.
+```yaml
+operators:
+  - id: join-orders
+    kind: join
+    config:
+      left_from: orders
+      right_from: profiles
+      left_key: customer_id
+      right_key: customer_id
+      window_ms: 5000
+edges:
+  - { id: left, from: orders, to: join-orders }
+  - { id: right, from: profiles, to: join-orders }
+  - { id: out, from: join-orders, to: sink }
+```
+
+Semantics and boundaries:
+
+- A left row and a right row match when their keys are equal and their event
+  timestamps differ by at most `window_ms`. Matches emit immediately (inner
+  join, at-least-once — downstream must tolerate replays after recovery).
+- Output columns are the original left columns prefixed `l_`, the right
+  columns prefixed `r_`, plus `join_key`.
+- State is bounded: rows are evicted once the watermark passes
+  `timestamp + window_ms + ttl_ms`, and each key holds at most `max_per_key`
+  rows per side (oldest first). Processing-time sources without watermarks
+  rely on the capacity bound — prefer event-time sources for joins.
+- Recovery rebuilds the buffers from checkpoint replay; there is no separate
+  join snapshot.
+- Each side's schema must stay stable for the stream's lifetime.
+- Not supported: temporal (lookup) joins, non-equi joins, outer joins, and
+  cross-node shuffle joins (the join operator and both its upstream edges
+  stay co-located on one node).
+
+Legacy Stream `join` buffers (including window buffers with a legacy `join`
+field) still fail compilation, with guidance pointing at the Job DAG join
+operator.
 
 ## API examples
 

@@ -318,6 +318,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
         sources: vec![SourceSpec {
             operator_id: "source".into(),
             input_type: "vec".into(),
+            codec: None,
             config: serde_json::json!({}),
             time: TimeSpec {
                 mode: TimeMode::ProcessingTime,
@@ -331,6 +332,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
         sinks: vec![SinkSpec {
             operator_id: "sink".into(),
             output_type: "collect".into(),
+            codec: None,
             config: serde_json::json!({}),
         }],
         state: has_window.then_some(crate::job::StateSpec {
@@ -370,6 +372,7 @@ fn edge(from: &str, to: &str) -> EdgeSpec {
 
 fn source_spec(operator_id: &str) -> SourceSpec {
     SourceSpec {
+        codec: None,
         operator_id: operator_id.into(),
         input_type: "vec".into(),
         config: serde_json::json!({}),
@@ -581,6 +584,7 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
         sinks: vec![SinkSpec {
             operator_id: "sink".into(),
             output_type: "collect".into(),
+            codec: None,
             config: serde_json::json!({}),
         }],
         state: Some(crate::job::StateSpec {
@@ -736,6 +740,7 @@ async fn multi_input_chain_preserves_every_upstream_channel() {
         sinks: vec![SinkSpec {
             operator_id: "sink".into(),
             output_type: "collect".into(),
+            codec: None,
             config: serde_json::json!({}),
         }],
         state: None,
@@ -846,12 +851,14 @@ async fn multi_input_watermark_uses_the_slowest_upstream() {
         ],
         sources: vec![
             SourceSpec {
+                codec: None,
                 operator_id: "left-source".into(),
                 input_type: "vec".into(),
                 config: serde_json::json!({}),
                 time: event_time(),
             },
             SourceSpec {
+                codec: None,
                 operator_id: "right-source".into(),
                 input_type: "vec".into(),
                 config: serde_json::json!({}),
@@ -861,6 +868,7 @@ async fn multi_input_watermark_uses_the_slowest_upstream() {
         sinks: vec![SinkSpec {
             operator_id: "sink".into(),
             output_type: "collect".into(),
+            codec: None,
             config: serde_json::json!({}),
         }],
         state: None,
@@ -924,11 +932,13 @@ async fn processor_failure_uses_error_output_without_receiving_successes() {
         sources: vec![source_spec("source")],
         sinks: vec![
             SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: "collect".into(),
                 config: serde_json::json!({}),
             },
             SinkSpec {
+                codec: None,
                 operator_id: "error-sink".into(),
                 output_type: "collect".into(),
                 config: serde_json::json!({}),
@@ -962,6 +972,7 @@ fn pooled_failure_job_spec(parallelism: u64, with_error_sink: bool) -> JobSpec {
     let mut job = spec(operators, edges, 1);
     if with_error_sink {
         job.sinks.push(SinkSpec {
+            codec: None,
             operator_id: "error-sink".into(),
             output_type: "collect".into(),
             config: serde_json::json!({}),
@@ -1212,6 +1223,7 @@ async fn pool_processor_failure_routes_sibling_outputs_to_error_output() {
         1,
     );
     job.sinks.push(SinkSpec {
+        codec: None,
         operator_id: "error-sink".into(),
         output_type: "collect".into(),
         config: serde_json::json!({}),
@@ -2151,6 +2163,7 @@ async fn late_route_is_a_real_side_branch_and_does_not_update_window() {
         1,
     );
     job.sinks.push(SinkSpec {
+        codec: None,
         operator_id: "late-sink".into(),
         output_type: "collect".into(),
         config: serde_json::json!({}),
@@ -2830,6 +2843,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
         sinks: vec![SinkSpec {
             operator_id: "sink".into(),
             output_type: "collect".into(),
+            codec: None,
             config: serde_json::json!({}),
         }],
         state: Some(crate::job::StateSpec {
@@ -3887,11 +3901,13 @@ async fn bounded_source_drain_keeps_checkpoints_running() {
         sources: vec![source_spec("source-a"), source_spec("source-b")],
         sinks: vec![
             SinkSpec {
+                codec: None,
                 operator_id: "sink-a".into(),
                 output_type: "collect".into(),
                 config: serde_json::json!({}),
             },
             SinkSpec {
+                codec: None,
                 operator_id: "sink-b".into(),
                 output_type: "collect".into(),
                 config: serde_json::json!({}),
@@ -4306,6 +4322,7 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
             edge("map", "sink"),
         ],
         sources: vec![crate::job::SourceSpec {
+            codec: None,
             operator_id: "source".into(),
             input_type: "vec".into(),
             config: serde_json::json!({}),
@@ -4319,6 +4336,7 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
             },
         }],
         sinks: vec![crate::job::SinkSpec {
+            codec: None,
             operator_id: "sink".into(),
             output_type: "collect".into(),
             config: serde_json::json!({}),
@@ -5313,4 +5331,143 @@ async fn barrier_carries_remote_trace_context_across_chains() {
         barrier_span.span_context.trace_id(),
         upstream.span_context.trace_id()
     );
+}
+
+// ---------- stream-stream join operator (end to end) ----------
+
+#[tokio::test]
+async fn two_input_join_emits_matched_pairs_end_to_end() {
+    let join = OperatorSpec {
+        id: "join".into(),
+        kind: OperatorKind::Join,
+        stateful: false,
+        key_field: None,
+        config: serde_json::json!({
+            "left_key": "key",
+            "right_key": "key",
+            "left_timestamp": "ts",
+            "right_timestamp": "ts",
+            "window_ms": 5_000
+        }),
+    };
+    let mut job = spec(vec![join], vec![], 1);
+    // Replace the single auto-generated source with two named sources feeding
+    // the join's two inbound edges (edge declaration order fixes left/right).
+    job.operators.retain(|operator| operator.id != "source");
+    job.sources.clear();
+    job.sources.push(SourceSpec {
+        codec: None,
+        operator_id: "left_source".into(),
+        input_type: "vec".into(),
+        config: serde_json::json!({}),
+        time: TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        },
+    });
+    job.sources.push(SourceSpec {
+        codec: None,
+        operator_id: "right_source".into(),
+        input_type: "vec".into(),
+        config: serde_json::json!({}),
+        time: TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        },
+    });
+    job.operators.insert(
+        0,
+        OperatorSpec {
+            id: "left_source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.operators.insert(
+        1,
+        OperatorSpec {
+            id: "right_source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.edges = vec![
+        EdgeSpec {
+            id: "left-edge".into(),
+            from: "left_source".into(),
+            to: "join".into(),
+            partitioned: false,
+        },
+        EdgeSpec {
+            id: "right-edge".into(),
+            from: "right_source".into(),
+            to: "join".into(),
+            partitioned: false,
+        },
+        EdgeSpec {
+            id: "join-sink".into(),
+            from: "join".into(),
+            to: "sink".into(),
+            partitioned: false,
+        },
+    ];
+    let plan = JobPlan::compile(job).unwrap();
+    let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+    let left: Arc<dyn crate::input::Input> =
+        Arc::new(VecInput::new(vec![vec![(100, "a".into())]]));
+    let right: Arc<dyn crate::input::Input> =
+        Arc::new(VecInput::new(vec![vec![(5_100, "a".into())]]));
+    let output = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: [
+            ("left_source".to_string(), left),
+            ("right_source".to_string(), right),
+        ]
+        .into_iter()
+        .collect(),
+        outputs: [("sink".to_string(), output.clone())].into_iter().collect(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build_subgraph(&plan, &task_ids, &adapter, &resource(), None)
+        .unwrap_or_else(|error| panic!("build failed: {error}"));
+    // The join chain consumes two inbound channels and tags input identity.
+    let join_chain = graph
+        .chains
+        .iter()
+        .find(|chain| {
+            chain
+                .task_ids
+                .iter()
+                .any(|id| id.starts_with("join-"))
+        })
+        .expect("join chain");
+    assert_eq!(join_chain.inputs.len(), 2);
+    assert!(join_chain.tags_input_index);
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    let joined = output.written.lock().unwrap().clone();
+    let total: usize = joined.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total, 1, "expected exactly one matched pair");
+    let batch = &joined[0];
+    let names: Vec<String> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    assert!(names.contains(&"l_key".to_string()), "{names:?}");
+    assert!(names.contains(&"r_key".to_string()), "{names:?}");
+    assert!(names.contains(&"join_key".to_string()), "{names:?}");
 }

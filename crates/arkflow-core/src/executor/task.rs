@@ -1629,6 +1629,38 @@ async fn handle_completed_barrier_inner(
     Ok(false)
 }
 
+
+/// Append the join input-side tag column (`__meta_input_index`) to a batch.
+fn tag_input_index(
+    batch: datafusion::arrow::record_batch::RecordBatch,
+    input_index: u32,
+) -> Result<datafusion::arrow::record_batch::RecordBatch, Error> {
+    use datafusion::arrow::array::UInt32Array;
+    let schema = batch.schema();
+    if schema.index_of(crate::executor::join::META_INPUT_INDEX).is_ok() {
+        return Ok(batch);
+    }
+    let mut fields: Vec<datafusion::arrow::datatypes::Field> =
+        schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(datafusion::arrow::datatypes::Field::new(
+        crate::executor::join::META_INPUT_INDEX,
+        datafusion::arrow::datatypes::DataType::UInt32,
+        false,
+    ));
+    let mut columns = batch.columns().to_vec();
+    columns.push(std::sync::Arc::new(UInt32Array::from(vec![
+        input_index;
+        batch.num_rows()
+    ])));
+    datafusion::arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+        columns,
+    )
+    .map_err(|error| {
+        Error::Process(format!("failed to tag join input index: {error}"))
+    })
+}
+
 async fn handle_envelope(
     chain: &Chain,
     hook: &CheckpointHook,
@@ -1640,6 +1672,19 @@ async fn handle_envelope(
 ) -> Result<bool, Error> {
     match envelope {
         Envelope::Data(batch, ack) => {
+            // Join chains consume multiple inbound edges through one
+            // processor; tag the batch with its input index (0 = left,
+            // 1 = right) so the join operator can tell the sides apart.
+            let batch = if chain.tags_input_index {
+                std::sync::Arc::new(
+                    crate::MessageBatch::new_arrow(tag_input_index(
+                        batch.record_batch().clone(),
+                        input_index as u32,
+                    )?),
+                )
+            } else {
+                batch
+            };
             if let Some(pool) = pool {
                 // The pool owns this delivery's processing; ordering and
                 // backpressure are the pool's contract.

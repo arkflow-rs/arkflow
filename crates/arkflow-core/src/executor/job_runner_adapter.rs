@@ -1044,6 +1044,7 @@ mod validation_tests {
                 partitioned: false,
             }],
             sources: vec![SourceSpec {
+                codec: None,
                 operator_id: "source".into(),
                 input_type: input_type.into(),
                 config: serde_json::json!({}),
@@ -1057,6 +1058,7 @@ mod validation_tests {
                 },
             }],
             sinks: vec![SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: output_type.into(),
                 config: serde_json::json!({}),
@@ -1295,6 +1297,7 @@ mod metrics_registry_tests {
                 partitioned: false,
             }],
             sources: vec![SourceSpec {
+                codec: None,
                 operator_id: "source".into(),
                 input_type: "registry-test-input".into(),
                 config: serde_json::json!({}),
@@ -1308,6 +1311,7 @@ mod metrics_registry_tests {
                 },
             }],
             sinks: vec![SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: "registry-test-output".into(),
                 config: serde_json::json!({}),

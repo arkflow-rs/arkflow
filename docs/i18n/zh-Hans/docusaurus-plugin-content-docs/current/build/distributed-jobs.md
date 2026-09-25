@@ -144,12 +144,36 @@ jobs:
 
 每个校验入口(`--validate`、配置 API、YAML 中声明的本地作业以及编译后的流)都执行与真实启动相同的无副作用深度构建:未知组件、不支持的状态后端与非法图边在校验期失败,而不是在运行时。dry run 打开的 WAL 会在其返回前关闭,同一 redb 路径可以立即被真实运行时重新打开。进入 `Starting` 之后,dry run、图构建或资源连接失败的运行时会在错误返回前转换为 `Failed`;本地作业构建失败会让引擎启动失败,而不是在损坏状态下宣告就绪。临时资源、源与 sink 按依赖顺序在任何任务循环启动之前连接,部分启动则以相反顺序关闭已连接的资源。
 
-### 双流 join 边界
+### 双流 join
 
-引擎当前在任何入口都不支持双流 join:Job DAG 在校验期拒绝 `Join` 算子,流式配置的 legacy `join` buffer(含带 legacy `join` 字段的窗口 buffer)以同样的指引编译失败——两条拒绝路径都不会指向不存在的入口。在原生 join 算子落地之前,可使用以下替代:
+Job DAG 支持 keyed interval join 算子。`Join` 算子声明恰好两条入边,并以生产者声明侧别(`left_from`/`right_from` 上游算子 id——通道顺序是内核内部细节)。配置含 `left_key`/`right_key`、`window_ms`,可选 `left_timestamp`/`right_timestamp`(默认 `__meta_timestamp`)、`ttl_ms`、`max_per_key`:
 
-- **SQL processor 对临时表的批内 join**:一侧走 SQL processor,另一侧注册为临时表。每个在途批次与表数据 join,不维护跨流状态。
-- **外部共置**:通过外部系统(例如按 join key 重分区的 Kafka 主题)把两个流共置到同一 key 上,作为单流处理,再用 keyed processor 或窗口做关联。
+```yaml
+operators:
+  - id: join-orders
+    kind: join
+    config:
+      left_from: orders
+      right_from: profiles
+      left_key: customer_id
+      right_key: customer_id
+      window_ms: 5000
+edges:
+  - { id: left, from: orders, to: join-orders }
+  - { id: right, from: profiles, to: join-orders }
+  - { id: out, from: join-orders, to: sink }
+```
+
+语义与边界:
+
+- 左右行在 key 相等且事件时间差 ≤ `window_ms` 时匹配。匹配即时发射(inner join、at-least-once——恢复后重放要求下游容忍重复)。
+- 输出列为原始左列加前缀 `l_`、右列加前缀 `r_`,外加 `join_key`。
+- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。
+- 恢复时缓冲由 checkpoint 重放重建,无独立 join 快照。
+- 每侧 schema 必须在流生命周期内保持稳定。
+- 不支持:temporal(维表)join、非 equi-join、outer join、跨节点 shuffle join(join 算子与两条上游边共置单节点)。
+
+流式配置的 legacy `join` buffer(含带 legacy `join` 字段的窗口 buffer)仍编译失败,指引指向 Job DAG join 算子。
 
 ## API 示例
 

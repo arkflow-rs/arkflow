@@ -59,6 +59,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         operator_id: source_operator_id.clone(),
         input_type: stream.input.input_type.clone(),
         config: input_config_payload(stream),
+        codec: stream.input.codec.clone(),
         time: TimeSpec {
             mode: TimeMode::ProcessingTime,
             timestamp_field: None,
@@ -114,10 +115,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
             }
             "join" => {
                 return Err(Error::Config(
-                    "buffer type 'join' cannot compile: stream-stream join is not yet supported \
-                     anywhere in the engine; use the SQL processor's per-batch joins against \
-                     temporary tables, or co-locate both flows onto one stream via an external \
-                     repartitioning system such as Kafka"
+                    "buffer type 'join' cannot compile: the unified kernel expresses \
+                     stream-stream join as a Job DAG join operator with exactly two inbound \
+                     edges; declare a local Job with a join operator instead of a Stream join \
+                     buffer"
                         .into(),
                 ));
             }
@@ -163,6 +164,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
     sinks.push(SinkSpec {
         operator_id: sink_operator_id.clone(),
         output_type: stream.output.output_type.clone(),
+        codec: stream.output.codec.clone(),
         config: output_config_payload(&stream.output),
     });
     edges.push(EdgeSpec {
@@ -203,6 +205,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         sinks.push(SinkSpec {
             operator_id: error_operator_id,
             output_type: error_output.output_type.clone(),
+            codec: error_output.codec.clone(),
             config: output_config_payload(error_output),
         });
     }
@@ -311,10 +314,9 @@ fn window_config(
     let config = buffer.config.clone().unwrap_or(json!({}));
     if matches!(buffer_type, "tumbling_window" | "session_window") && config.get("join").is_some() {
         return Err(Error::Config(
-            "legacy window buffers with 'join' cannot compile: stream-stream join is not yet \
-             supported anywhere in the engine; use the SQL processor's per-batch joins against \
-             temporary tables, or co-locate both flows onto one stream via an external \
-             repartitioning system such as Kafka"
+            "legacy window buffers with 'join' cannot compile: the unified kernel expresses \
+             stream-stream join as a Job DAG join operator with exactly two inbound edges; \
+             declare a local Job with a join operator instead of a Stream join buffer"
                 .into(),
         ));
     }
@@ -529,13 +531,10 @@ mod tests {
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("stream-stream join is not yet supported"),
+            message.contains("Job DAG join operator"),
             "{message}"
         );
-        assert!(message.contains("SQL processor"), "{message}");
-        // The guidance must not point at the Job DAG join operator: that
-        // entry point does not exist and rejects the same construct.
-        assert!(!message.contains("Job DAG"), "{message}");
+        assert!(message.contains("two inbound edges"), "{message}");
     }
 
     #[test]
@@ -549,10 +548,9 @@ mod tests {
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("stream-stream join is not yet supported"),
+            message.contains("Job DAG join operator"),
             "{message}"
         );
-        assert!(!message.contains("Job DAG"), "{message}");
     }
 
     #[test]
