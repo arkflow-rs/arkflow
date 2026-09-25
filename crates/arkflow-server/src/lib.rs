@@ -2830,19 +2830,51 @@ pub(crate) async fn hub_oidc_login(State(hub): State<hub::Hub>) -> Response {
             "OIDC login is not enabled".into(),
         );
     };
-    use rand::TryRngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .expect("OS randomness");
-    let state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let location = federation.authorization_redirect(&state);
+    fn random_hex() -> Option<String> {
+        use rand::TryRngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.try_fill_bytes(&mut bytes).ok()?;
+        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+    let Some(state) = random_hex() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc_random_unavailable",
+            "OS random source is unavailable; login cannot start".into(),
+        );
+    };
+    // PKCE S256 verifier + OIDC nonce, round-tripped inside the state cookie
+    // (state.verifier.nonce — hex segments, '.'-separated).
+    let Some(verifier) = random_hex() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc_random_unavailable",
+            "OS random source is unavailable; login cannot start".into(),
+        );
+    };
+    let Some(nonce) = random_hex() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc_random_unavailable",
+            "OS random source is unavailable; login cannot start".into(),
+        );
+    };
+    use sha2::{Digest, Sha256};
+    let challenge: String = {
+        let digest = Sha256::digest(verifier.as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let location = federation.authorization_redirect(&state, &challenge, &nonce);
+    let cookie_value = format!("{state}.{verifier}.{nonce}");
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, location)
         .header(
             header::SET_COOKIE,
-            format!("arkflow_oidc_state={state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600"),
+            format!(
+                "arkflow_oidc_state={cookie_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{}",
+                if federation.login_is_secure() { "; Secure" } else { "" }
+            ),
         )
         .body(axum::body::Body::empty())
         .unwrap()
@@ -2873,28 +2905,51 @@ pub(crate) async fn hub_oidc_callback(
     let Some(supplied_state) = params.get("state") else {
         return unauthorized();
     };
-        if !bool::from(
-        expected_state.as_bytes().ct_eq(supplied_state.as_bytes()),
-    ) {
+    // The state cookie packs `state.verifier.nonce` (PKCE S256 + OIDC nonce
+    // round-trip).
+    let mut cookie_parts = expected_state.split('.');
+    let (expected_state, code_verifier, expected_nonce) =
+        (cookie_parts.next(), cookie_parts.next(), cookie_parts.next());
+    let (Some(expected_state), Some(code_verifier), Some(expected_nonce)) =
+        (expected_state, code_verifier, expected_nonce)
+    else {
+        return unauthorized();
+    };
+    if !bool::from(expected_state.as_bytes().ct_eq(supplied_state.as_bytes())) {
         return unauthorized();
     }
     let Some(code) = params.get("code") else {
         return unauthorized();
     };
-    let Some(id_token) = federation.exchange_code(code).await else {
+    let Some(id_token) = federation.exchange_code(code, code_verifier).await else {
         return unauthorized();
     };
+    // Nonce pre-check (raw claim read); signature/iss/aud validation happens
+    // in `authenticate` below.
+    if oidc::OidcFederation::nonce_claim(&id_token).is_none_or(|claim| {
+        !bool::from(claim.as_bytes().ct_eq(expected_nonce.as_bytes()))
+    }) {
+        return unauthorized();
+    }
     let Some(principal) = federation.authenticate(&id_token).await else {
         return unauthorized();
     };
-    let session_id = federation.create_session(principal);
+    let Some(session_id) = federation.create_session(principal) else {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_create_failed",
+            "OS random source is unavailable; session cannot be created".into(),
+        );
+    };
+    let max_age = oidc::session_ttl_secs();
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, "/")
         .header(
             header::SET_COOKIE,
             format!(
-                "arkflow_session={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800"
+                "arkflow_session={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{}",
+                if federation.login_is_secure() { "; Secure" } else { "" }
             ),
         )
         .body(axum::body::Body::empty())

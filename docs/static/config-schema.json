@@ -2589,6 +2589,10 @@
               "type": "integer",
               "description": "HTTP request timeout in milliseconds. Defaults to 30000."
             },
+            "retry_count": {
+              "type": "integer",
+              "description": "Retry attempts for connection errors and 5xx responses. Defaults to 0."
+            },
             "headers": {
               "type": "object",
               "additionalProperties": {
@@ -4433,12 +4437,12 @@
         {
           "type": "object",
           "title": "milvus_search",
-          "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column.",
+          "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Rows are searched with bounded, order-preserving concurrency.",
           "properties": {
             "type": {
               "type": "string",
               "const": "milvus_search",
-              "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector with one batched REST v2 request and appends the matches as a JSON array text column."
+              "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Rows are searched with bounded, order-preserving concurrency."
             },
             "name": {
               "type": "string",

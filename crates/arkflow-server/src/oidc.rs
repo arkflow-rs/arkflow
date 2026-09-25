@@ -51,6 +51,9 @@ pub struct OidcAuthenticator {
     scopes_claim: String,
     client: reqwest::Client,
     cache: Arc<Mutex<Option<CachedJwks>>>,
+    /// Deduplicates concurrent JWKS refetches so only one network request
+    /// runs at a time (the cache lock is never held across it).
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
     refresh_throttle: Duration,
 }
 
@@ -77,6 +80,7 @@ impl OidcAuthenticator {
                 .build()
                 .expect("OIDC HTTP client must build"),
             cache: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refresh_throttle: JWKS_REFRESH_THROTTLE,
         }
     }
@@ -113,20 +117,42 @@ impl OidcAuthenticator {
 
     /// Known kids are served from cache even past the TTL (a provider key
     /// rotation must not take the Hub down); unknown kids trigger one
-    /// refetch, throttled so garbage kids cannot hammer the provider.
+    /// refetch, throttled so garbage kids cannot hammer the provider. The
+    /// refetch runs OUTSIDE the cache lock: cache hits answer immediately
+    /// while a refresh is in flight, and concurrent misses are deduplicated
+    /// (losers fail this request; the winner's result serves their retry).
     async fn decoding_key(&self, kid: &str) -> Option<DecodingKey> {
-        let mut cache = self.cache.lock().await;
-        if let Some(cached) = cache.as_ref() {
-            if let Some(key) = cached.keys.get(kid) {
-                return Some(key.clone());
-            }
-            if cached.fetched_at.elapsed() < self.refresh_throttle {
-                return None;
+        {
+            let cache = self.cache.lock().await;
+            if let Some(cached) = cache.as_ref() {
+                if let Some(key) = cached.keys.get(kid) {
+                    return Some(key.clone());
+                }
+                if cached.fetched_at.elapsed() < self.refresh_throttle {
+                    return None;
+                }
             }
         }
-        let fetched = self.fetch_keys().await?;
+        // One refresher at a time; everyone else is throttled out above or
+        // below and the winning fetch populates the cache for their retry.
+        if self
+            .refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let fetched = self.fetch_keys().await;
+        self.refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let fetched = fetched?;
         let key = fetched.keys.get(kid).cloned();
-        *cache = Some(fetched);
+        *self.cache.lock().await = Some(fetched);
         key
     }
 
@@ -194,6 +220,12 @@ pub struct OidcSettings {
 
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 
+/// Session cookie `Max-Age`, derived from [`SESSION_TTL`] so the two cannot
+/// drift apart.
+pub fn session_ttl_secs() -> u64 {
+    SESSION_TTL.as_secs()
+}
+
 impl OidcFederation {
     /// Reads the standard `ARKFLOW_OIDC_*` environment variables. Returns
     /// `None` when issuer/audience are absent (no federation, no routes).
@@ -242,7 +274,7 @@ impl OidcFederation {
                         token_endpoint,
                     }),
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "OIDC discovery failed (login disabled, bearer federation kept): {error}"
                         );
                         None
@@ -302,22 +334,56 @@ impl OidcFederation {
         self.authenticator.authenticate(token).await
     }
 
-    /// The IdP redirect for starting a login: random state, authorization
-    /// endpoint, code flow, openid scope.
-    pub fn authorization_redirect(&self, state: &str) -> String {
+    /// The IdP redirect for starting a login: random state, PKCE S256
+    /// challenge, nonce, authorization endpoint, code flow, openid scope.
+    pub fn authorization_redirect(
+        &self,
+        state: &str,
+        code_challenge: &str,
+        nonce: &str,
+    ) -> String {
         let login = self.login.as_ref().expect("login enabled");
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}\
+&code_challenge={}&code_challenge_method=S256&nonce={}",
             login.authorization_endpoint,
             urlencode(&login.client_id),
             urlencode(&login.redirect_uri),
             urlencode(state),
+            urlencode(code_challenge),
+            urlencode(nonce),
         )
     }
 
+    /// Whether the login flow's cookies should carry the `Secure` attribute:
+    /// yes whenever the redirect URI is https.
+    pub fn login_is_secure(&self) -> bool {
+        self.login
+            .as_ref()
+            .map(|login| login.redirect_uri.starts_with("https://"))
+            .unwrap_or(false)
+    }
+
+    /// Extracts the raw `nonce` claim from an id_token WITHOUT signature
+    /// verification. This is only a pre-check for the login flow's nonce
+    /// round-trip; signature/iss/aud/exp validation still happens in
+    /// `authenticate`.
+    pub fn nonce_claim(id_token: &str) -> Option<String> {
+        use base64::Engine as _;
+        // Middle JWT segment: base64url(claims). Signature verification is
+        // NOT done here — this is a pre-check; `authenticate` fully validates.
+        let payload = id_token.split('.').nth(1)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        claims.get("nonce")?.as_str().map(str::to_owned)
+    }
+
     /// Exchanges an authorization code for an id_token via the token
-    /// endpoint (form-encoded POST with the client credentials).
-    pub async fn exchange_code(&self, code: &str) -> Option<String> {
+    /// endpoint (form-encoded POST with the client credentials and the
+    /// PKCE code_verifier).
+    pub async fn exchange_code(&self, code: &str, code_verifier: &str) -> Option<String> {
         let login = self.login.as_ref()?;
         let form = [
             ("grant_type", "authorization_code"),
@@ -325,6 +391,7 @@ impl OidcFederation {
             ("redirect_uri", login.redirect_uri.as_str()),
             ("client_id", login.client_id.as_str()),
             ("client_secret", login.client_secret.as_str()),
+            ("code_verifier", code_verifier),
         ];
         let encoded: Vec<String> = form
             .iter()
@@ -346,16 +413,17 @@ impl OidcFederation {
     }
 
     /// Creates an 8-hour session for the principal and returns the random
-    /// session id (the cookie value).
-    pub fn create_session(&self, principal: OperatorPrincipal) -> String {
+    /// session id (the cookie value). `None` means the OS random source is
+    /// unavailable — callers must fail the request, never fall back.
+    pub fn create_session(&self, principal: OperatorPrincipal) -> Option<String> {
         use rand::TryRngCore;
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.try_fill_bytes(&mut bytes).expect("OS randomness");
+        rand::rngs::OsRng.try_fill_bytes(&mut bytes).ok()?;
         let sid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, (_, created)| created.elapsed() < SESSION_TTL);
         sessions.insert(sid.clone(), (principal, Instant::now()));
-        sid
+        Some(sid)
     }
 
     /// Resolves a session id to its principal, dropping expired entries.
@@ -743,6 +811,7 @@ mod tests {
     #[allow(dead_code)]
     struct MockIdp {
         addr: std::net::SocketAddr,
+        nonce_slot: Arc<std::sync::Mutex<Option<String>>>,
         jwks_url: String,
         discovery_url: String,
         token_url: String,
@@ -755,8 +824,11 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let request_log = requests.clone();
+            let nonce_slot = Arc::new(std::sync::Mutex::new(None::<String>));
             let base = format!("http://{addr}");
+            let nonce_slot_thread = nonce_slot.clone();
             std::thread::spawn(move || {
+                let nonce_slot = nonce_slot_thread;
                 for stream in listener.incoming() {
                     let mut stream = match stream {
                         Ok(stream) => stream,
@@ -764,6 +836,7 @@ mod tests {
                     };
                     let request_log = request_log.clone();
                     let base = base.clone();
+                    let nonce_slot = nonce_slot.clone();
                     std::thread::spawn(move || {
                         let mut buffer = Vec::new();
                         let mut byte = [0u8; 1];
@@ -802,10 +875,20 @@ mod tests {
                             jwks_body(&[TEST_KID])
                         } else {
                             // token endpoint: mint an id_token whose iss is
-                            // this provider (the Hub validates it).
+                            // this provider (the Hub validates it). The
+                            // nonce from the authorization request
+                            // round-trips through the token request form.
+                            let nonce = nonce_slot
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or_default();
                             let mut token_claims =
                                 claims("console-user", json!(["viewer"]), 600);
                             token_claims["iss"] = json!(base);
+                            if !nonce.is_empty() {
+                                token_claims["nonce"] = json!(nonce);
+                            }
                             let id_token = mint(token_claims, Some(TEST_KID));
                             format!(r#"{{"code":0,"id_token":"{id_token}"}}"#)
                         };
@@ -821,6 +904,7 @@ mod tests {
             });
             Self {
                 addr,
+                nonce_slot,
                 jwks_url: format!("http://{addr}/jwks"),
                 discovery_url: format!("http://{addr}/discovery"),
                 token_url: format!("http://{addr}/token"),
@@ -845,7 +929,7 @@ mod tests {
             jwks_url: Some(idp.jwks_url.clone()),
             client_id: Some("arkflow-console".to_string()),
             client_secret: Some("console-secret".to_string()),
-            redirect_uri: Some(format!("http://console:3000/auth/callback")),
+            redirect_uri: Some("http://console:3000/auth/callback".to_string()),
             ..OidcSettings::default()
         })
         .await
@@ -883,6 +967,10 @@ mod tests {
             cookies.contains("HttpOnly") && cookies.contains("SameSite=Lax"),
             "state cookie must be HttpOnly/SameSite=Lax: {cookies}"
         );
+        // The cookie packs state.verifier.nonce: feed the nonce to the mock
+        // IdP the way a real provider would have learned it at /authorize.
+        let nonce = state.split('.').nth(2).expect("nonce segment").to_string();
+        *idp.nonce_slot.lock().unwrap() = Some(nonce);
 
         // 2. callback: code + matching state -> session cookie.
         let code = "auth-code-1";
@@ -893,7 +981,9 @@ mod tests {
         );
         let mut query = StdMap::new();
         query.insert("code".to_string(), code.to_string());
-        query.insert("state".to_string(), state.clone());
+        // The IdP echoes back only the state segment (what the authorize URL
+        // carried), not the whole cookie value.
+        query.insert("state".to_string(), state.split('.').next().unwrap().to_string());
         let response = crate::hub_oidc_callback(
             State(hub.clone()),
             axum::extract::Query(query),
@@ -991,6 +1081,10 @@ mod tests {
             .find_map(|cookie| cookie.strip_prefix("arkflow_oidc_state="))
             .unwrap()
             .to_string();
+        // state.verifier.nonce — feed the mock IdP the nonce (a real
+        // provider learns it from the authorize request).
+        let nonce = state.split('.').nth(2).expect("nonce segment").to_string();
+        *idp.nonce_slot.lock().unwrap() = Some(nonce);
         let mut callback_headers = axum::http::HeaderMap::new();
         callback_headers.insert(
             axum::http::header::COOKIE,
@@ -998,7 +1092,7 @@ mod tests {
         );
         let mut query = std::collections::HashMap::new();
         query.insert("code".to_string(), "auth-code-2".to_string());
-        query.insert("state".to_string(), state);
+        query.insert("state".to_string(), state.split('.').next().unwrap().to_string());
         let callback = crate::hub_oidc_callback(State(hub.clone()), axum::extract::Query(query), callback_headers)
             .await;
         let session_cookie = callback
@@ -1151,5 +1245,43 @@ mod tests {
 
         let token = mint(claims("u9", json!(["viewer"]), 600), None);
         assert!(auth.authenticate(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn nonce_claim_extracts_the_round_trip_value() {
+        let token = mint(
+            {
+                let mut claims = claims("u9", json!(["viewer"]), 600);
+                claims["nonce"] = json!("nonce-abc-123");
+                claims
+            },
+            Some(TEST_KID),
+        );
+        assert_eq!(OidcFederation::nonce_claim(&token).as_deref(), Some("nonce-abc-123"));
+
+        let without_nonce = mint(claims("u9", json!(["viewer"]), 600), Some(TEST_KID));
+        assert_eq!(OidcFederation::nonce_claim(&without_nonce), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_refreshes_dedupe_and_known_kid_still_validates() {
+        let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
+        let auth = Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
+        let token = mint(claims("u10", json!(["viewer"]), 600), Some(TEST_KID));
+
+        // A burst of unknown-kid tokens (each may trigger a refetch) followed
+        // by a known-kid lookup: with the refresh dedup the burst cannot
+        // wedge or serially block the cache; the known kid must still pass.
+        let mut handles = Vec::new();
+        for index in 0..4 {
+            let auth = auth.clone();
+            let bogus = mint(claims("ghost", json!(["viewer"]), 600), Some(&format!("kid-{index}")));
+            handles.push(tokio::spawn(async move { auth.authenticate(&bogus).await }));
+        }
+        for handle in handles {
+            assert!(handle.await.unwrap().is_none(), "unknown kids must fail");
+        }
+        let principal = auth.authenticate(&token).await.expect("known kid validates");
+        assert_eq!(principal.id, "u10");
     }
 }

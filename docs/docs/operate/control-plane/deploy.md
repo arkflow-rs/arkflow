@@ -37,11 +37,14 @@ When the three client variables are configured, the Hub discovers the IdP's
 authorization/token endpoints at startup and serves a browser login flow:
 
 - `GET /api/v1/auth/oidc/login` — redirects to the identity provider with a
-  random `state` bound to an HttpOnly cookie.
-- `GET /api/v1/auth/oidc/callback?code&state` — exchanges the code for an
-  id_token, validates it through the same pipeline as bearer JWTs, creates
-  an 8-hour server-side session, and sets an HttpOnly `arkflow_session`
-  cookie.
+  random `state`, a PKCE S256 `code_challenge`, and an `nonce`, all bound to
+  an HttpOnly cookie. The IdP must support PKCE (RFC 7636, `S256`) and echo
+  the `nonce` claim in the id_token.
+- `GET /api/v1/auth/oidc/callback?code&state` — exchanges the code (with the
+  PKCE verifier) for an id_token, checks the `nonce` claim, validates the
+  token through the same pipeline as bearer JWTs, creates an 8-hour
+  server-side session, and sets an HttpOnly `arkflow_session` cookie
+  (`Secure` is added when the redirect URI is https).
 - `GET /api/v1/auth/oidc/logout` — deletes the server-side session and
   clears the cookie.
 

@@ -105,7 +105,7 @@ impl Input for MqttInput {
             mqtt_options.set_credentials(username, password);
         }
         if let Some(tls) = &self.config.tls {
-            tls.apply(&mut mqtt_options)?;
+            tls.apply(&mut mqtt_options).await?;
         }
 
         // Set the keep-alive time

@@ -22,6 +22,7 @@ The `milvus_search` processor searches a [Milvus](https://milvus.io/) collection
 | top_k | integer | no | `5` | Number of neighbors per row. |
 | api_key | string | no | — | Sent as `Authorization: Bearer` (Milvus convention: `<user>:<password>`). Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| concurrency | integer | no | `4` | Maximum in-flight search requests. |
 | headers | map | no | — | Extra HTTP headers. |
 
 ## Result shape

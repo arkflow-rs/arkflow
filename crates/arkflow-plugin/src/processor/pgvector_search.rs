@@ -26,15 +26,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::vector_util;
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+use arkflow_core::{Error, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
 use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -162,9 +161,11 @@ impl Processor for PgVectorSearchProcessor {
             return Ok(ProcessResult::None);
         }
 
-        let vectors = extract_vectors(&msg_batch, &self.config.vector_field)?;
+        let vectors =
+            vector_util::extract_vectors("pgvector_search processor", &msg_batch, &self.config.vector_field)?;
         let matches = self.search_all(&vectors).await?;
-        let batch = append_column(&msg_batch, &self.config.target_field, &matches)?;
+        let batch =
+            vector_util::append_column("pgvector_search processor", &msg_batch, &self.config.target_field, &matches)?;
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -181,10 +182,8 @@ impl PgVectorSearchProcessor {
         let owned: Vec<String> = vectors.iter().map(|v| vector_to_pgvector_text(v)).collect();
         futures_util::stream::iter(owned.into_iter().map(|text| self.search_row(&sql, text)))
             .buffered(self.config.concurrency)
-            .collect::<Vec<Result<String, Error>>>()
+            .try_collect()
             .await
-            .into_iter()
-            .collect()
     }
 
     async fn search_row(&self, sql: &str, vector_text: String) -> Result<String, Error> {
@@ -204,26 +203,26 @@ impl PgVectorSearchProcessor {
 /// json feature while staying parameterized.
 fn build_search_sql(config: &PgVectorSearchProcessorConfig) -> String {
     // The payload column is always selected (as NULL text when disabled) so
-    // the row decode shape stays identical across configurations.
-    let mut columns = vec![format!("\"{}\"::text AS \"id\"", config.id_column)];
+    // the row decode shape stays identical across configurations. Identifiers
+    // are quoted with embedded `"` escaped so names cannot break the quoting.
+    let quoted = |name: &str| crate::vector_util::escape_identifier(name);
+    let mut columns = vec![format!("{}::text AS {}", quoted(&config.id_column), quoted("id"))];
     if !config.payload_column.is_empty() {
-        columns.push(format!(
-            "\"{}\"::text AS \"payload\"",
-            config.payload_column
-        ));
+        columns.push(format!("{}::text AS {}", quoted(&config.payload_column), quoted("payload")));
     } else {
-        columns.push("NULL::text AS \"payload\"".to_string());
+        columns.push(format!("NULL::text AS {}", quoted("payload")));
     }
     columns.push(format!(
-        "\"{}\" {} $1::vector AS \"distance\"",
-        config.vector_column,
-        config.metric.operator()
+        "{} {} $1::vector AS {}",
+        quoted(&config.vector_column),
+        config.metric.operator(),
+        quoted("distance")
     ));
     format!(
-        "SELECT {} FROM \"{}\" ORDER BY \"{}\" {} $1::vector LIMIT {}",
+        "SELECT {} FROM {} ORDER BY {} {} $1::vector LIMIT {}",
         columns.join(", "),
-        config.table,
-        config.vector_column,
+        quoted(&config.table),
+        quoted(&config.vector_column),
         config.metric.operator(),
         config.top_k
     )
@@ -306,82 +305,6 @@ impl ProcessorBuilder for PgVectorSearchProcessorBuilder {
     }
 }
 
-fn extract_vectors(batch: &MessageBatchRef, field: &str) -> Result<Vec<Vec<f32>>, Error> {
-    let column = batch
-        .schema()
-        .fields()
-        .iter()
-        .position(|f| f.name() == field)
-        .map(|index| batch.column(index))
-        .ok_or_else(|| {
-            Error::Process(format!(
-                "pgvector_search processor: input column '{}' not found",
-                field
-            ))
-        })?;
-    let rows = column.len();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(rows);
-    match column.data_type() {
-        DataType::FixedSizeList(_, dim) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let start = row as i64 * *dim as i64;
-                vectors.push(
-                    (start..start + *dim as i64)
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        DataType::List(_) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| not_a_vector_error(field))?;
-            for row in 0..rows {
-                if list.is_null(row) {
-                    return Err(null_vector_error(field, row));
-                }
-                let offsets = list.value_offsets();
-                vectors.push(
-                    (offsets[row]..offsets[row + 1])
-                        .map(|i| values.value(i as usize))
-                        .collect(),
-                );
-            }
-        }
-        other => {
-            return Err(Error::Process(format!(
-                "pgvector_search processor: column '{}' must be FixedSizeList(Float32) or List(Float32), got {:?}",
-                field, other
-            )));
-        }
-    }
-    if let Some((row, _)) = vectors.iter().enumerate().find(|(_, v)| v.is_empty()) {
-        return Err(Error::Process(format!(
-            "pgvector_search processor: column '{}' has an empty vector at row {row}",
-            field
-        )));
-    }
-    Ok(vectors)
-}
-
 fn vector_to_pgvector_text(vector: &[f32]) -> String {
     let parts: Vec<String> = vector
         .iter()
@@ -396,43 +319,15 @@ fn vector_to_pgvector_text(vector: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
-fn not_a_vector_error(field: &str) -> Error {
-    Error::Process(format!(
-        "pgvector_search processor: column '{}' is not a Float32 vector list",
-        field
-    ))
-}
-
-fn null_vector_error(field: &str, row: usize) -> Error {
-    Error::Process(format!(
-        "pgvector_search processor: column '{}' has a null vector at row {row}",
-        field
-    ))
-}
-
-fn append_column(
-    batch: &MessageBatch,
-    target_field: &str,
-    matches: &[String],
-) -> Result<MessageBatch, Error> {
-    let schema = batch.schema();
-    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(target_field, DataType::Utf8, true)));
-    let mut columns: Vec<ArrayRef> = (0..batch.num_columns())
-        .map(|index| batch.column(index).clone())
-        .collect();
-    columns.push(Arc::new(StringArray::from(matches.to_vec())));
-
-    let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(
-        |e| Error::Process(format!("pgvector_search processor: batch rebuild failed: {e}")),
-    )?;
-    Ok(MessageBatch::new_arrow(record_batch))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::LargeStringArray;
+    use arkflow_core::MessageBatch;
+    use datafusion::arrow::array::{
+        Array, FixedSizeListArray, Float32Array, LargeStringArray, StringArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
 
     fn test_resource() -> Resource {
@@ -559,7 +454,9 @@ mod tests {
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![Arc::new(with_null)]).unwrap(),
         ));
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = vector_util::extract_vectors("pgvector_search processor", &batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("null vector at row 1"), "{err}");
     }
 
