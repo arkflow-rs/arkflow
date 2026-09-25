@@ -194,6 +194,25 @@ pub(crate) fn escape_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Percent-encodes a collection name as a single RFC 3986 path segment:
+/// unreserved characters (ALPHA / DIGIT / `-` / `.` / `_` / `~`) pass
+/// through byte-for-byte, everything else becomes an uppercase `%XX`
+/// sequence. This keeps ordinary names' URLs identical while names
+/// containing `/`, `?`, `#`, spaces, etc. still address the same
+/// collection instead of corrupting the request path.
+pub(crate) fn encode_path_segment(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Arc;

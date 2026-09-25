@@ -164,7 +164,7 @@ impl QdrantOutput {
         let url = format!(
             "{}/collections/{}/points?wait=true",
             self.config.url.trim_end_matches('/'),
-            self.config.collection
+            crate::vector_util::encode_path_segment(&self.config.collection)
         );
         let mut request = self.client.put(&url).json(&json!({ "points": points }));
         if let Some(key) = &self.config.api_key {
@@ -354,7 +354,7 @@ fn find_column<'a>(batch: &'a MessageBatchRef, field: &str) -> Result<&'a Arc<dy
 
 /// Formats a random UUID v4 (no uuid crate).
 fn random_uuid_v4() -> String {
-        let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 16];
     bytes[0..8].copy_from_slice(&rand::random::<u64>().to_be_bytes());
     bytes[8..16].copy_from_slice(&rand::random::<u64>().to_be_bytes());
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4

@@ -145,7 +145,7 @@ impl VectorSearchProcessor {
         let url = format!(
             "{}/collections/{}/points/search",
             self.config.url.trim_end_matches('/'),
-            self.config.collection
+            vector_util::encode_path_segment(&self.config.collection)
         );
         let mut body = json!({
             "vector": vector,
@@ -434,6 +434,45 @@ mod tests {
         let max = mock.max_in_flight();
         assert!(max <= 2, "in-flight requests exceeded the cap: {max}");
         assert!(max >= 2, "requests did not overlap; expected pipelining, max={max}");
+    }
+
+    /// Ordinary collection names keep their URL byte-for-byte; names with
+    /// path-hostile characters are percent-encoded as one segment so the
+    /// request still addresses the same collection.
+    #[test]
+    fn collection_names_are_encoded_as_a_single_path_segment() {
+        assert_eq!(
+            vector_util::encode_path_segment("documents-2.x"),
+            "documents-2.x",
+            "unreserved characters must pass through unchanged"
+        );
+        assert_eq!(
+            vector_util::encode_path_segment("docs/2024?x y#f"),
+            "docs%2F2024%3Fx%20y%23f"
+        );
+        assert_eq!(vector_util::encode_path_segment("a~b_c-d.e"), "a~b_c-d.e");
+
+        // End-to-end: the encoded name lands in the request line.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mock = MockApi::spawn(|_body| (200, search_body("x")));
+            let processor = build_processor(base_config(
+                mock.addr(),
+                serde_json::json!({"collection": "eu/docs 1"}),
+            ));
+            processor
+                .process(vector_batch(vec![vec![1.0]]))
+                .await
+                .unwrap();
+            let (head, _) = mock.requests().remove(0);
+            assert!(
+                head.starts_with("POST /collections/eu%2Fdocs%201/points/search "),
+                "{head}"
+            );
+        });
     }
 
     #[tokio::test]

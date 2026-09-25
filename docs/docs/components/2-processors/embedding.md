@@ -20,6 +20,7 @@ It pairs with the [Qdrant output](../3-outputs/qdrant.md) to form a streaming RA
 | field | string | yes | — | Input UTF-8 column to embed. Rows must be non-null. |
 | target_field | string | no | `embedding` | Name of the appended vector column. |
 | batch_size | integer | no | `32` | Maximum rows per HTTP request. |
+| concurrency | integer | no | `1` | Maximum in-flight embedding requests (chunks pipelined in text order). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
 | headers | map | no | — | Extra HTTP headers (e.g. Azure's `api-key`). |
 

@@ -187,14 +187,18 @@ impl PgVectorSearchProcessor {
     }
 
     async fn search_row(&self, sql: &str, vector_text: String) -> Result<String, Error> {
-        let rows: Vec<(String, Option<String>, f64)> = sqlx::query_as(sql)
+        let rows: Vec<(Option<String>, Option<String>, f64)> = sqlx::query_as(sql)
             .bind(vector_text)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 Error::Process(format!("pgvector_search processor: query failed: {}", e))
             })?;
-        rows_to_matches(rows, !self.config.payload_column.is_empty())
+        rows_to_matches(
+            rows,
+            &self.config.id_column,
+            !self.config.payload_column.is_empty(),
+        )
     }
 }
 
@@ -230,10 +234,20 @@ fn build_search_sql(config: &PgVectorSearchProcessorConfig) -> String {
 
 /// Maps fetched rows (id, payload text, distance) into the compact JSON
 /// matches array for one input row.
-fn rows_to_matches(rows: Vec<(String, Option<String>, f64)>, include_payload: bool) -> Result<String, Error> {
+fn rows_to_matches(
+    rows: Vec<(Option<String>, Option<String>, f64)>,
+    id_column: &str,
+    include_payload: bool,
+) -> Result<String, Error> {
     let items: Vec<Value> = rows
         .into_iter()
         .map(|(id, payload, distance)| {
+            let id = id.ok_or_else(|| {
+                Error::Process(format!(
+                    "pgvector_search processor: id column '{}' is NULL for a matched row",
+                    id_column
+                ))
+            })?;
             let mut object = Map::new();
             object.insert("id".to_string(), json!(id));
             object.insert("distance".to_string(), json!(distance));
@@ -405,9 +419,10 @@ mod tests {
     fn fetched_rows_map_to_match_json() {
         let matches = rows_to_matches(
             vec![
-                ("42".to_string(), Some(r#"{"text":"a"}"#.to_string()), 0.1),
-                ("7".to_string(), None, 0.4),
+                (Some("42".to_string()), Some(r#"{"text":"a"}"#.to_string()), 0.1),
+                (Some("7".to_string()), None, 0.4),
             ],
+            "doc_id",
             true,
         )
         .unwrap();
@@ -421,9 +436,22 @@ mod tests {
     }
 
     #[test]
+    fn null_id_reports_the_column_instead_of_a_decode_error() {
+        let err = rows_to_matches(
+            vec![(None, Some(r#"{"text":"a"}"#.to_string()), 0.1)],
+            "doc_id",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("id column 'doc_id' is NULL"), "{err}");
+    }
+
+    #[test]
     fn payload_disabled_matches_carry_no_payload_key() {
         let matches = rows_to_matches(
-            vec![("42".to_string(), Some(r#"{"text":"a"}"#.to_string()), 0.1)],
+            vec![(Some("42".to_string()), Some(r#"{"text":"a"}"#.to_string()), 0.1)],
+            "doc_id",
             false,
         )
         .unwrap();

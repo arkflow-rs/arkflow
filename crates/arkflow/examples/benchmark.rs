@@ -25,6 +25,12 @@
 
 use arkflow_plugin::benchmark::{json_report, markdown_report, run_suite};
 
+const USAGE: &str = "usage: benchmark [--count <rows>] [--runs <n>] [--warmup <n>] [--json]";
+
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count: usize = 200_000;
@@ -34,11 +40,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--count" => count = args.next().expect("--count needs a value").parse()?,
-            "--runs" => runs = args.next().expect("--runs needs a value").parse()?,
-            "--warmup" => warmup = args.next().expect("--warmup needs a value").parse()?,
+            "--count" => {
+                count = next_value(&mut args, "--count")?.parse().map_err(|_| {
+                    format!("--count needs a number\n{USAGE}")
+                })?
+            }
+            "--runs" => {
+                runs = next_value(&mut args, "--runs")?
+                    .parse()
+                    .map_err(|_| format!("--runs needs a number\n{USAGE}"))?
+            }
+            "--warmup" => {
+                warmup = next_value(&mut args, "--warmup")?
+                    .parse()
+                    .map_err(|_| format!("--warmup needs a number\n{USAGE}"))?
+            }
             "--json" => json = true,
-            other => eprintln!("unknown argument: {other}"),
+            other => {
+                eprintln!("unknown argument: {other}\n{USAGE}");
+                std::process::exit(2);
+            }
         }
     }
 

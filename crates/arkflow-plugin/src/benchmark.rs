@@ -54,12 +54,13 @@ impl ScenarioResult {
     }
 }
 
-fn setup_plugins() {
-    let _ = crate::input::init();
-    let _ = crate::output::init();
-    let _ = crate::processor::init();
-    let _ = crate::buffer::init();
-    let _ = crate::codec::init();
+fn setup_plugins() -> Result<(), Error> {
+    crate::input::init()?;
+    crate::output::init()?;
+    crate::processor::init()?;
+    crate::buffer::init()?;
+    crate::codec::init()?;
+    Ok(())
 }
 
 fn stream_workload(count: usize, query: &str) -> String {
@@ -194,16 +195,23 @@ async fn state_backend(count: usize) -> Result<ScenarioResult, Error> {
     let operations = (count / 50).clamp(200, 4_000);
     let dir = tempfile::tempdir()?;
     let backend = RedbStateBackend::open(dir.path(), 1)?;
-    let started = Instant::now();
-    for index in 0..operations as u64 {
-        let key = index.to_be_bytes();
-        backend.put("benchmark", &key, &index.to_be_bytes())?;
-    }
-    for index in 0..operations as u64 {
-        let key = index.to_be_bytes();
-        assert!(backend.get("benchmark", &key)?.is_some());
-    }
-    let wall = started.elapsed();
+    // Each `put` commits (fsyncs); the loop is synchronous redb work, so run
+    // it on a blocking thread instead of stalling the async worker for the
+    // whole scenario.
+    let wall = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let started = Instant::now();
+        for index in 0..operations as u64 {
+            let key = index.to_be_bytes();
+            backend.put("benchmark", &key, &index.to_be_bytes())?;
+        }
+        for index in 0..operations as u64 {
+            let key = index.to_be_bytes();
+            assert!(backend.get("benchmark", &key)?.is_some());
+        }
+        Ok(started.elapsed())
+    })
+    .await
+    .map_err(|e| Error::Process(format!("benchmark state-backend task failed: {e}")))??;
     Ok(ScenarioResult {
         name: "state-backend",
         description: "redb state backend durable put + get (per-write commit)",
@@ -231,8 +239,13 @@ pub async fn run_suite(
     warmup: usize,
     runs: usize,
 ) -> Result<Vec<ScenarioResult>, Error> {
-    assert!(runs >= 1, "at least one measured run is required");
-    setup_plugins();
+    if count == 0 {
+        return Err(Error::Config("--count must be at least 1".to_string()));
+    }
+    if runs == 0 {
+        return Err(Error::Config("--runs must be at least 1".to_string()));
+    }
+    setup_plugins()?;
     for _ in 0..warmup {
         run_each(count).await?;
     }
@@ -250,7 +263,8 @@ pub async fn run_suite(
             }
         });
     }
-    Ok(best.expect("runs >= 1"))
+    // `runs == 0` is rejected above, so at least one measured pass ran.
+    Ok(best.unwrap_or_default())
 }
 
 /// Human-readable markdown report.
@@ -308,6 +322,19 @@ mod tests {
 
     /// CI-safe smoke: tiny workload, single measured run, asserting only
     /// completion and positive throughput — never performance values.
+    /// Invalid arguments return a configuration error instead of panicking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_runs_returns_a_config_error() {
+        let error = run_suite(2_000, 0, 0).await.unwrap_err();
+        assert!(error.to_string().contains("--runs"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_count_returns_a_config_error() {
+        let error = run_suite(0, 0, 1).await.unwrap_err();
+        assert!(error.to_string().contains("--count"), "{error}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn tiny_suite_completes_with_positive_throughput() {
         let results = run_suite(2_000, 0, 1).await.expect("suite completes");
