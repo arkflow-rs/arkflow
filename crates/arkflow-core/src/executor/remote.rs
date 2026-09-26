@@ -1317,6 +1317,13 @@ pub struct NetworkManager {
     /// identity on the wire.  Keep it explicitly single-Job so two graphs
     /// cannot overwrite one another's quad routes.
     legacy_job: std::sync::RwLock<Option<JobSessionKey>>,
+    /// Session-scoped receipt routing: RemoteAcks hand their receipts to a
+    /// queue owned by the SESSION, not the connection, so an acknowledgement
+    /// started on one connection still completes after a transparent
+    /// reconnect swaps the wire underneath it. A forwarder task drains the
+    /// queue into whichever connection is currently serving the session.
+    session_receipts:
+        std::sync::Mutex<BTreeMap<EdgeSessionKey, SessionReceiptRoute>>,
     /// Delivery-level dedup state per session key: the highest data-frame
     /// sequence number already routed into the local channel. A transparent
     /// reconnect replays every frame the upstream has not receipted, so the
@@ -1333,6 +1340,120 @@ pub struct NetworkManager {
     config: NetworkManagerConfig,
     active_connections: std::sync::atomic::AtomicUsize,
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// One session's receipt route: the queue RemoteAcks send into, plus the
+/// connection-swappable writer slot the forwarder drains toward.
+struct SessionReceiptRoute {
+    queue: flume::Sender<(Quad, ReceiptFrame)>,
+    current: std::sync::RwLock<Option<flume::Sender<(Quad, ReceiptFrame)>>>,
+    forwarder: tokio_util::sync::CancellationToken,
+}
+
+impl NetworkManager {
+    /// Look up (creating on first use) the session-scoped receipt route.
+    /// The bounded queue applies backpressure to acknowledgements when the
+    /// peer stops draining, and the forwarder retries failed connection
+    /// writes until the next connection takes the slot.
+    fn session_receipt_route(
+        self: &Arc<Self>,
+        key: &EdgeSessionKey,
+    ) -> flume::Sender<(Quad, ReceiptFrame)> {
+        let mut routes = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock");
+        if let Some(route) = routes.get(key) {
+            return route.queue.clone();
+        }
+        let (queue_tx, queue_rx) = flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let route = SessionReceiptRoute {
+            queue: queue_tx.clone(),
+            current: std::sync::RwLock::new(None),
+            forwarder: cancel.clone(),
+        };
+        routes.insert(key.clone(), route);
+        let manager = self.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    item = queue_rx.recv_async() => {
+                        let Ok(item) = item else { break };
+                        // Forward to the current connection's writer; a dead
+                        // slot (connection swapped or gone) retries until a
+                        // live one appears or the session is torn down.
+                        loop {
+                            if manager.shutdown.is_cancelled() || cancel.is_cancelled() {
+                                break;
+                            }
+                            let target = {
+                                let routes = manager
+                                    .session_receipts
+                                    .lock()
+                                    .expect("session receipt lock");
+                                routes
+                                    .get(&key)
+                                    .and_then(|route| {
+                                        route
+                                            .current
+                                            .read()
+                                            .expect("session receipt slot lock")
+                                            .clone()
+                                    })
+                            };
+                            let Some(target) = target else {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                continue;
+                            };
+                            match target.send_async(item).await {
+                                Ok(()) => break,
+                                // Writer gone: retry on the next slot.
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        queue_tx
+    }
+
+    /// Install `sender` as the live writer for a session's receipts (called
+    /// by each connection that starts serving the key; cleared when it ends).
+    fn set_session_receipt_writer(
+        &self,
+        key: &EdgeSessionKey,
+        sender: Option<flume::Sender<(Quad, ReceiptFrame)>>,
+    ) {
+        let routes = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock");
+        if let Some(route) = routes.get(key) {
+            *route
+                .current
+                .write()
+                .expect("session receipt slot lock") = sender;
+        }
+    }
+
+    /// Tear a session's receipt route down (session loss confirmed or job
+    /// removed): queued acknowledgements no longer have a destination.
+    fn remove_session_receipt_route(&self, key: &EdgeSessionKey) {
+        let route = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock")
+            .remove(key);
+        if let Some(route) = route {
+            route.forwarder.cancel();
+        }
+    }
 }
 
 impl NetworkManager {
@@ -1357,6 +1478,7 @@ impl NetworkManager {
             failure_channels: std::sync::RwLock::new(BTreeMap::new()),
             handshake_nonces: std::sync::Mutex::new(BTreeMap::new()),
             legacy_job: std::sync::RwLock::new(None),
+            session_receipts: std::sync::Mutex::new(BTreeMap::new()),
             delivered_seq: std::sync::Mutex::new(BTreeMap::new()),
             session_registrations: std::sync::Mutex::new(BTreeMap::new()),
             accepted,
@@ -1537,6 +1659,16 @@ impl NetworkManager {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        self.session_receipts
+            .lock()
+            .expect("session receipt lock")
+            .retain(|key, route| {
+                let keep = key.job() != Some(&job) && !(legacy_owned && key.job().is_none());
+                if !keep {
+                    route.forwarder.cancel();
+                }
+                keep
+            });
         self.delivered_seq
             .lock()
             .expect("delivered seq lock")
@@ -2277,6 +2409,10 @@ impl NetworkManager {
                     if registered_keys.insert(route_key.clone()) {
                         self.bump_session_registration(&route_key);
                     }
+                    // This connection now serves the session's receipts:
+                    // create the route (idempotent) and take the writer slot.
+                    let _ = self.session_receipt_route(&route_key);
+                    self.set_session_receipt_writer(&route_key, Some(receipt_tx.clone()));
                     match header.kind {
                         FrameKind::Data => {
                             let (batch, seq) = match decoder.decode(&payload) {
@@ -2290,37 +2426,43 @@ impl NetworkManager {
                             // Delivery-level dedup: a transparent reconnect
                             // replays every frame the upstream has not
                             // receipted. A sequence at or below the last one
-                            // routed into the local channel was already
-                            // delivered — drop it and mirror the Acked
-                            // receipt (the original receipt may have been
-                            // lost with the broken connection; the upstream
-                            // applies receipts idempotently).
+                            // DELIVERED (recorded only after the local
+                            // channel accepted it) is dropped silently: its
+                            // original acknowledgement is still in flight
+                            // through the session-scoped receipt route, which
+                            // survives the connection swap. No mirror-ack —
+                            // completing the upstream branch before the local
+                            // chain finishes processing would let source
+                            // offsets advance past unprocessed data.
                             let duplicate = {
-                                let mut delivered = self
+                                let delivered = self
                                     .delivered_seq
                                     .lock()
                                     .expect("delivered seq lock");
-                                let dup = match delivered.get(&route_key) {
+                                match delivered.get(&route_key) {
                                     Some(last) => seq <= *last,
                                     None => false,
-                                };
-                                dup
+                                }
                             };
                             if duplicate {
-                                if receipt_tx
-                                    .send_async((
-                                        header.quad,
-                                        ReceiptFrame {
-                                            kind: ReceiptKind::Acked,
-                                            seq,
-                                        },
-                                    ))
-                                    .await
-                                    .is_err()
-                                {
-                                    break Ok(());
-                                }
                                 continue;
+                            }
+                            // Session-scoped receipts: the ack hands its
+                            // receipt to the session queue, so it completes
+                            // on whichever connection serves the session by
+                            // the time processing finishes.
+                            let outbox = self.session_receipt_route(&route_key);
+                            let envelope = Envelope::Data(
+                                Arc::new(batch),
+                                Arc::new(RemoteAck {
+                                    outbox,
+                                    quad: header.quad,
+                                    seq,
+                                    failures: failure_sender.clone(),
+                                }),
+                            );
+                            if sender.send_async(envelope).await.is_err() {
+                                break Ok(()); // local chain gone; close the edge
                             }
                             {
                                 let mut delivered = self
@@ -2328,19 +2470,6 @@ impl NetworkManager {
                                     .lock()
                                     .expect("delivered seq lock");
                                 delivered.insert(route_key.clone(), seq);
-                            }
-                            let envelope = Envelope::Data(
-                                Arc::new(batch),
-                                Arc::new(RemoteAck {
-                                    outbox: receipt_tx.clone(),
-                                    quad: header.quad,
-                                    seq,
-                                    failures: failure_sender.clone(),
-                                }),
-                            );
-                            let send_result = sender.send_async(envelope).await;
-                            if send_result.is_err() {
-                                break Ok(()); // local chain gone; close the edge
                             }
                         }
                         FrameKind::Signal => {
@@ -2410,6 +2539,7 @@ impl NetworkManager {
                 }
                 // Confirmed loss: the registration kept for the redialing
                 // peer is now stale and must not leak into later jobs.
+                manager.remove_session_receipt_route(&key);
                 manager
                     .inbound
                     .write()
@@ -2473,6 +2603,12 @@ impl NetworkManager {
         }
 
         // Dropping the served quads' senders closes the chains' input channels.
+        // Release every session writer slot this connection held; the
+        // forwarder retries queued receipts against the next connection.
+        for key in served_quads.keys() {
+            self.set_session_receipt_writer(key, None);
+        }
+
         // Only entries this connection inserted are removed; a reconnecting
         // upstream re-registers through the graph anyway. A loss under the
         // reconnect grace keeps the registration so the peer's redialing
@@ -2889,7 +3025,11 @@ async fn pump_edge(
                         // Register before writing so a concurrent receipt can
                         // never race the pending map; the wire is strict FIFO
                         // per quad, so receipts cannot precede their frame.
-                        let seq = match pending.register(&branch, 1, Some(batch.clone())) {
+                        let seq = match pending.register(
+                            &branch,
+                            1,
+                            reconnectable.then(|| batch.clone()),
+                        ) {
                             Ok(seq) => seq,
                             Err(error) => {
                                 let abort_error = branch.abort().await.err();
@@ -3945,23 +4085,41 @@ mod tests {
             ))
             .await
             .unwrap();
-        // The downstream chain receives the frame (delivered, never acked).
-        let _ = next_envelope(&input_rx).await;
+        // The downstream chain receives the frame: delivered, not yet acked.
+        let delivered_envelope = next_envelope(&input_rx).await;
+        let delivered_ack = match &delivered_envelope {
+            Envelope::Data(_, ack) => ack.clone(),
+            _ => panic!("expected a data envelope"),
+        };
         // Break the connection: killing the shared server half resets the
         // connection from both ends mid-stream.
         kill1.kill();
 
-        // The transparent reconnect dials client2 and replays the
-        // unreceipted frame; the receiver dedups the duplicate (already
-        // delivered) and mirror-acks it — the branch completes without the
-        // downstream chain ever acking.
+        // The transparent reconnect dials client2 and replays seq 0; the
+        // receiver drops the duplicate silently (no re-delivery).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                next_envelope(&input_rx)
+            )
+            .await
+            .is_err(),
+            "replayed duplicate must not re-deliver to the local chain"
+        );
+        // The ORIGINAL acknowledgement still completes — through the
+        // session-scoped receipt route on the new connection. Only after
+        // the downstream acknowledges processing does the upstream branch
+        // settle (no mirror-ack: offsets never advance past unprocessed
+        // data).
+        delivered_ack.ack().await.expect("original ack completes");
         tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("branch acked through replay dedup mirror-ack");
+        .expect("branch acked through the session receipt route");
         assert!(
             !branch.aborted.load(std::sync::atomic::Ordering::SeqCst),
             "transparent recovery must not abort the branch"

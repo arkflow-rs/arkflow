@@ -13,10 +13,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::RwLock;
 
 pub(crate) type SharedMetadata = Arc<RwLock<Option<Arc<ConsumerGroupMetadata>>>>;
+pub(crate) type WeakShared = Weak<RwLock<Option<Arc<ConsumerGroupMetadata>>>>;
 
 #[derive(Clone)]
 pub(crate) struct GroupRegistration {
-    pub(crate) metadata: Arc<RwLock<Option<Arc<ConsumerGroupMetadata>>>>,
+    pub(crate) metadata: WeakShared,
     /// Subscribed topics of the input; the transactional offset commit maps
     /// batch partitions back to topics through this list. L3 supports
     /// single-topic inputs: a partition alone cannot name its topic in the
@@ -41,7 +42,7 @@ pub(crate) fn register_group(group_id: &str, topics: Vec<String>) -> SharedMetad
         .insert(
             group_id.to_owned(),
             GroupRegistration {
-                metadata: slot.clone(),
+                metadata: Arc::downgrade(&slot),
                 topics,
             },
         );
@@ -50,17 +51,21 @@ pub(crate) fn register_group(group_id: &str, topics: Vec<String>) -> SharedMetad
 
 /// Look up the live group metadata for a consumer group, if its input is
 /// still running in this process.
-pub(crate) fn group_metadata(
+pub(crate) async fn group_metadata(
     group_id: &str,
 ) -> Option<Arc<ConsumerGroupMetadata>> {
-    registry()
+    let weak = registry()
         .lock()
         .expect("kafka txn registry lock")
         .get(group_id)?
         .metadata
-        .try_read()
-        .ok()?
-        .clone()
+        .clone();
+    // Weak upgrade: a dropped input's registration dies with it — the
+    // output then fails closed with the explicit "no live input" error
+    // instead of committing against a dead consumer's group metadata.
+    let shared = weak.upgrade()?;
+    let metadata = shared.read().await.clone();
+    metadata
 }
 
 /// The single subscribed topic of a group, when the input declares exactly

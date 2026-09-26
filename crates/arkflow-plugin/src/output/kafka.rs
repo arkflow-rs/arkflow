@@ -427,7 +427,9 @@ impl KafkaOutput {
             let (offsets, covered) =
                 transactional_offsets_for_batches(msgs, Some(group_topic.as_str()))?;
             if covered {
-                let metadata = crate::kafka_txn::group_metadata(group).ok_or_else(|| {
+                let metadata = crate::kafka_txn::group_metadata(group)
+                .await
+                .ok_or_else(|| {
                     Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input in this process; \
                          the paired Kafka input must declare transactional_offsets"
