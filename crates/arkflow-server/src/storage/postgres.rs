@@ -731,21 +731,28 @@ mod tests {
             node_id: "pg-node".into(),
             stream_id: "pg-stream".into(),
             desired_state: "running".into(),
+            idempotency_key: Some("pg-key-1".into()),
             ..Default::default()
         };
         let first = storage.set_desired(mutation.clone()).await.unwrap();
         let second = storage.set_desired(mutation).await.unwrap();
         assert_eq!(first.intent_id, second.intent_id);
 
-        // A different desired state creates a new generation/intent.
+        // Same key + different payload is the domain reuse error.
         let conflict = DesiredMutation {
             node_id: "pg-node".into(),
             stream_id: "pg-stream".into(),
             desired_state: "stopped".into(),
+            idempotency_key: Some("pg-key-1".into()),
             ..Default::default()
         };
-        let conflict_record = storage.set_desired(conflict).await.unwrap();
-        assert_ne!(first.intent_id, conflict_record.intent_id);
+        let conflict_error = storage.set_desired(conflict).await.unwrap_err();
+        assert!(
+            matches!(conflict_error, StorageError::IdempotencyKeyReused),
+            "{conflict_error:?}"
+        );
+
+
 
         // Job round-trip preserves the record and bumps generation.
         let job = storage
@@ -764,9 +771,28 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(job.generation, 0);
+        // A brand-new job starts at generation 1 (max(passed, 1)) in both backends.
+        assert_eq!(job.generation, 1);
         let loaded = storage.get_job("pg-job").await.unwrap().unwrap();
         assert_eq!(loaded.node_ids, vec!["pg-node".to_string()]);
+
+        // Optimistic concurrency: matching expectation bumps the generation,
+        // a stale one conflicts.
+        let mut updated = loaded.clone();
+        updated.generation += 1;
+        let bumped = storage
+            .update_job_with_expected_generation(updated, loaded.generation)
+            .await
+            .unwrap();
+        assert_eq!(bumped.generation, loaded.generation + 1);
+        let stale = storage
+            .update_job_with_expected_generation(bumped.clone(), loaded.generation)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stale, StorageError::GenerationConflict { .. }),
+            "{stale:?}"
+        );
 
         // Audit append allocates identity ids.
         let audit_id = storage
@@ -789,9 +815,9 @@ mod tests {
         assert!(audit_id > 0);
 
         // Outbox claim is exclusive and observable through aggregates.
-        let claimed = storage.claim_outbox("worker-pg", 100).await.unwrap();
+        let claimed = storage.claim_outbox("worker-pg", 4_102_444_800_000).await.unwrap();
         assert!(claimed.is_some());
-        let aggregates = storage.operational_aggregates(200).await.unwrap();
+        let aggregates = storage.operational_aggregates(4_102_444_800_000).await.unwrap();
         assert!(aggregates.outbox_pending >= 1);
     }
 }

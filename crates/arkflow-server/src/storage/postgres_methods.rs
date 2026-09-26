@@ -1057,26 +1057,26 @@ impl StorageBackend for PostgresBackend {
         {
             let mut transaction = self.begin().await?;
             let __ret = async {
-            transaction.execute(
-                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                binds![
-                    record.actor,
-                    record.action,
-                    record.resource_type,
-                    record.resource_id,
-                    record.node_id,
-                    record.stream_id,
-                    record.correlation_id,
-                    record.outcome,
-                    record.failure_code,
-                    record.message,
-                    record.occurred_at_ms,
-                ],
-            ).await?;
+            // PostgreSQL reads the identity directly from the insert
+            // (SQLite keeps its last_insert_rowid body): a post-hoc SELECT
+            // has no unique predicate — NULL node ids never match and
+            // concurrent-shape rows could alias.
             let event_id = transaction
                 .query_row(
-                    "SELECT event_id FROM cp_events WHERE node_id = ?1 AND occurred_at_ms = ?2 ORDER BY event_id DESC LIMIT 1",
-                    binds![record.node_id, record.occurred_at_ms],
+                    "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) RETURNING event_id",
+                    binds![
+                        record.actor,
+                        record.action,
+                        record.resource_type,
+                        record.resource_id,
+                        record.node_id,
+                        record.stream_id,
+                        record.correlation_id,
+                        record.outcome,
+                        record.failure_code,
+                        record.message,
+                        record.occurred_at_ms,
+                    ],
                     |row| row.get::<i64>(0),
                 )
                 .await
@@ -1577,7 +1577,7 @@ impl StorageBackend for PostgresBackend {
             // format, so preserving the newest pointer is both safe and the
             // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=? WHERE job_id=? AND generation=?",
+                "UPDATE cp_jobs SET version=?1, spec_json=?2, desired_state=?3, observed_state=?4, convergence=?5, generation=?6, node_ids_json=?7, last_error=?8, updated_at_ms=?9 WHERE job_id=?10 AND generation=?11",
                 binds![
                     job.version,
                     job.spec_json,
