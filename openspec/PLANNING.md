@@ -501,4 +501,6 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 | 真 key 重分布 rescale | `add-job-rescale` | ✅ 归档 | `JobSpec.rescale` 显式声明后跨任务集恢复：按状态键编码白名单还原路由哈希输入（窗口剥 window_start / Stateful 剥类型前缀），key-group 归属重写命名空间；未声明仍走守卫 fail-closed；不可解码键显式失败 |
 | Kafka L3 | `add-kafka-l3-transactional-offsets` | ✅ 归档 | 进程内组注册表交接 ConsumerGroupMetadata；输入 transactional_offsets 停用本地 store；输出 offset_commit_group 从批次元数据推导位点，send_offsets_to_transaction 折入事务；真实 broker 端到端验证（同组零重投递，kafka_eos 5/5） |
 
+**三轮 CR 修复（2026-09-25 同日）**：深度 CR + 活库实证后修复四项——PG `record_audit` 错表/NULL 匹配（改 `RETURNING`）与裸 `?` 占位符穿透方言改写（乐观并发路径）两个 P1（门控套件首次对真库运行时实证，套件自身的三处断言笔误一并修复并补乐观并发/幂等复用用例）；重放去重镜像回执违反处理门控不变量（改会话级回执路由，镜像整体删除，`fix-remote-replay-ack-semantics`）；L3 注册表强 Arc 与规格相悖（改 Weak + async 读，`fix-l3-registry-lifecycle`）。顺修 P2 两项（try_read 假性失败、重放保留无门控）。
+
 **剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。
