@@ -104,6 +104,20 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     } else {
         None
     };
+    let mut rescale_context = None;
+    if let Some(manifest) = recovery_manifest.as_ref() {
+        match validate_manifest_task_compatibility(manifest, &plan) {
+            Ok(()) => {}
+            Err(error) if plan.spec.rescale => {
+                rescale_context = Some(RescaleContext::from_plan(&plan)?);
+                tracing::info!(
+                    job = %plan.spec.id,
+                    "rescale recovery: redistributing keyed state across the new task set ({error})"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let state = local_state_backend(&plan)?;
     let builder = match state.clone() {
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
@@ -142,7 +156,7 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         );
         let namespace_prefix =
             crate::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
-        restore_local_snapshot(&repository, manifest, state, &namespace_prefix)?;
+        restore_local_snapshot(&repository, manifest, state, &namespace_prefix, rescale_context.as_ref())?;
         for input in &inputs {
             if let Err(error) = input.connect().await {
                 close_inputs(&inputs).await;
@@ -625,6 +639,36 @@ async fn close_inputs(inputs: &[Arc<dyn crate::input::Input>]) {
     }
 }
 
+/// Fail closed when a recovery artifact was written under a different task
+/// set than the current plan: keyed state namespaces embed task ids, so a
+/// parallelism (or operator-topology) change would silently strand the old
+/// state behind renamed namespaces while source positions still restore.
+/// Until key redistribution lands, the operator must keep the parallelism
+/// fixed or reset state with a fresh checkpoint/savepoint.
+fn validate_manifest_task_compatibility(
+    manifest: &crate::checkpoint::CheckpointManifest,
+    plan: &JobPlan,
+) -> Result<(), Error> {
+    let plan_tasks: BTreeSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    let manifest_tasks: BTreeSet<&str> = manifest
+        .task_attempts
+        .iter()
+        .map(|attempt| attempt.task_id.as_str())
+        .collect();
+    if plan_tasks != manifest_tasks {
+        let removed: Vec<&str> = manifest_tasks.difference(&plan_tasks).copied().collect();
+        let added: Vec<&str> = plan_tasks.difference(&manifest_tasks).copied().collect();
+        return Err(Error::Config(format!(
+            "recovery artifact '{}' was written under a different task set than the current plan \
+             (parallelism or operator topology changed; removed tasks {:?}, added tasks {:?}); \
+             keyed state cannot yet redistribute across a parallelism change — restore the original \
+             parallelism or reset state with a fresh checkpoint/savepoint",
+            manifest.checkpoint_id, removed, added
+        )));
+    }
+    Ok(())
+}
+
 fn latest_local_checkpoint(
     root: &std::path::Path,
     plan: &JobPlan,
@@ -756,11 +800,125 @@ fn latest_local_checkpoint(
     Ok(None)
 }
 
+/// Redistributes keyed state entries across a rescaled task set: each
+/// entry's user key is recovered from its operator-specific state-key
+/// encoding, hashed with the same normalization the routing path uses, and
+/// the entry is rewritten under the new owning task's namespace.
+pub(crate) struct RescaleContext {
+    plan: JobPlan,
+}
+
+impl RescaleContext {
+    fn from_plan(plan: &JobPlan) -> Result<Self, Error> {
+        Ok(Self { plan: plan.clone() })
+    }
+
+    /// The routing-hash input for one state entry: the user key in the exact
+    /// byte form `hash_column`/`task_for_key` hash.
+    fn routing_key_bytes(
+        &self,
+        namespace: &str,
+        key: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let operator_id = namespace_operator(namespace)?;
+        let is_window = self
+            .plan
+            .spec
+            .operators
+            .iter()
+            .any(|operator| operator.id == operator_id && operator.kind == crate::job::OperatorKind::Window);
+        if is_window {
+            // Window state key = window_start (8-byte BE) + utf8 user key.
+            let user_key = key
+                .get(8..)
+                .ok_or_else(|| Error::Process("corrupt window state key during rescale".into()))?;
+            return Ok(user_key.to_vec());
+        }
+        // StatefulOperator state key = "<tag>:" + value encoding, where the
+        // post-tag bytes are exactly the routing hash input; the null
+        // sentinels ("null:<tag>") hash as-is.
+        if let Some(rest) = key.strip_prefix(b"utf8:") {
+            return Ok(rest.to_vec());
+        }
+        for tag in [
+            &b"binary:"[..],
+            b"i8:",
+            b"i16:",
+            b"i32:",
+            b"i64:",
+            b"u8:",
+            b"u16:",
+            b"u32:",
+            b"u64:",
+        ] {
+            if let Some(rest) = key.strip_prefix(tag) {
+                return Ok(rest.to_vec());
+            }
+        }
+        if key.starts_with(b"null:") {
+            return Ok(key.to_vec());
+        }
+        Err(Error::Process(format!(
+            "state entry for operator '{operator_id}' uses an unrecognized key encoding;              rescale redistribution cannot derive its routing key"
+        )))
+    }
+
+    fn redistribute(
+        &self,
+        entry: crate::state::StateEntry,
+    ) -> Result<crate::state::StateEntry, Error> {
+        let operator_id = namespace_operator(&entry.namespace)?;
+        let routing_key = self.routing_key_bytes(&entry.namespace, &entry.key)?;
+        let group = crate::job::key_group_for_key(&routing_key, self.plan.spec.max_parallelism)?;
+        let owner = self
+            .plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == operator_id
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(group))
+            })
+            .ok_or_else(|| {
+                Error::Process(format!(
+                    "rescale found no owner task for key group {group} of operator '{operator_id}'"
+                ))
+            })?;
+        let new_namespace = crate::job::effective_state_namespace(
+            &self.plan.spec.id,
+            self.plan.spec.state.as_ref(),
+            &operator_id,
+            &owner.id,
+        );
+        Ok(crate::state::StateEntry {
+            namespace: new_namespace,
+            ..entry
+        })
+    }
+}
+
+/// Extract the operator-id segment from a state namespace built by
+/// `effective_state_namespace` (`...:operator:<id>:task:<id>` with
+/// percent-encoded components).
+fn namespace_operator(namespace: &str) -> Result<String, Error> {
+    let marker = ":operator:";
+    let start = namespace
+        .find(marker)
+        .ok_or_else(|| Error::Process("state namespace lacks an operator segment".into()))?
+        + marker.len();
+    let rest = &namespace[start..];
+    let end = rest.find(":task:").unwrap_or(rest.len());
+    Ok(rest[..end].replace("%3A", ":").replace("%25", "%"))
+}
+
 fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(
     repository: &crate::checkpoint::CheckpointRepository<S>,
     manifest: &crate::checkpoint::CheckpointManifest,
     state: &Arc<dyn crate::state::StateBackend>,
     namespace_prefix: &str,
+    rescale: Option<&RescaleContext>,
 ) -> Result<(), Error> {
     let mut entries = BTreeMap::<(String, Vec<u8>), crate::state::StateEntry>::new();
     for snapshot_ref in &manifest.state_snapshots {
@@ -775,6 +933,10 @@ fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(
             )));
         }
         for entry in snapshot.entries {
+            let entry = match rescale {
+                Some(context) => context.redistribute(entry)?,
+                None => entry,
+            };
             entries.insert((entry.namespace.clone(), entry.key.clone()), entry);
         }
     }
@@ -1009,6 +1171,302 @@ pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+
+    #[test]
+    fn rescale_across_parallelism_fails_closed_on_recovery() {
+        let mut spec = crate::job::JobSpec {
+            rescale: false,
+            rebalance: None,
+            placement: crate::job::PlacementStrategy::Colocated,
+            id: JobId::new("rescale-guard").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 8,
+            parallelism: 1,
+            operators: vec![
+                OperatorSpec {
+                    id: "source".into(),
+                    kind: OperatorKind::Source,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
+                    id: "sink".into(),
+                    kind: OperatorKind::Sink,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![crate::job::EdgeSpec {
+                id: "edge".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }],
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: "vec".into(),
+                codec: None,
+                config: serde_json::json!({}),
+                time: crate::job::TimeSpec {
+                    mode: crate::job::TimeMode::ProcessingTime,
+                    timestamp_field: None,
+                    watermark: None,
+                    allowed_lateness_ms: 0,
+                    late_event_policy: Default::default(),
+                    late_event_route: None,
+                },
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "collect".into(),
+                codec: None,
+                config: serde_json::json!({}),
+            }],
+            state: None,
+            checkpoint: None,
+            recovery: Default::default(),
+        };
+        let manifest = crate::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-1".into(),
+            job_id: spec.id.clone(),
+            job_version: spec.version,
+            generation: 1,
+            task_attempts: vec![
+                crate::checkpoint::TaskAttemptSnapshot {
+                    task_id: "source-0".into(),
+                    attempt_id: "source-0:n1:0".into(),
+                    node_id: "n1".into(),
+                },
+                crate::checkpoint::TaskAttemptSnapshot {
+                    task_id: "sink-0".into(),
+                    attempt_id: "sink-0:n1:0".into(),
+                    node_id: "n1".into(),
+                },
+            ],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-1".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: Vec::new(),
+            format_version: 1,
+            checksum: 0,
+        };
+        // Same parallelism: compatible.
+        let same = JobPlan::compile(spec.clone()).unwrap();
+        assert!(validate_manifest_task_compatibility(&manifest, &same).is_ok());
+        // Parallelism change: fail closed with an actionable error.
+        spec.parallelism = 2;
+        let rescaled = JobPlan::compile(spec).unwrap();
+        let error = validate_manifest_task_compatibility(&manifest, &rescaled)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("parallelism or operator topology changed"),
+            "{error}"
+        );
+        assert!(error.contains("fresh checkpoint"), "{error}");
+    }
+
+    fn rescale_job_spec(parallelism: u32) -> JobSpec {
+        let mut spec = local_spec("vec", "collect");
+        spec.id = JobId::new("rescale-job").unwrap();
+        spec.max_parallelism = 16;
+        spec.parallelism = parallelism;
+        spec.state = Some(StateSpec {
+            backend: "embedded_kv".into(),
+            durability: StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        });
+        spec.operators = vec![
+            OperatorSpec {
+                id: "source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+            OperatorSpec {
+                id: "agg".into(),
+                kind: OperatorKind::Aggregate,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({}),
+            },
+            OperatorSpec {
+                id: "sink".into(),
+                kind: OperatorKind::Sink,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            },
+        ];
+        spec.edges = vec![
+            crate::job::EdgeSpec {
+                id: "e1".into(),
+                from: "source".into(),
+                to: "agg".into(),
+                partitioned: true,
+            },
+            crate::job::EdgeSpec {
+                id: "e2".into(),
+                from: "agg".into(),
+                to: "sink".into(),
+                partitioned: false,
+            },
+        ];
+        spec
+    }
+
+    #[test]
+    fn rescale_redistributes_stateful_entries_by_key_group() {
+        // Snapshot written under parallelism 1; restart under parallelism 4:
+        // every entry must land on the task that owns its key group.
+        let old_spec = rescale_job_spec(1);
+        let old_plan = JobPlan::compile(old_spec).unwrap();
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace = crate::job::effective_state_namespace(
+            &old_plan.spec.id,
+            None,
+            "agg",
+            &old_task.id,
+        );
+        for user_key in ["alpha", "beta", "gamma", "delta"] {
+            let state_key = format!("utf8:{user_key}").into_bytes();
+            let entry = crate::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: state_key.clone(),
+                value: b"42".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            // The new namespace must belong to the new owning task.
+            let group = crate::job::key_group_for_key(user_key.as_bytes(), 16).unwrap();
+            let owner = new_plan
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.operator_id == "agg"
+                        && task
+                            .partitions
+                            .iter()
+                            .any(|partition| partition.key_group.contains(group))
+                })
+                .unwrap();
+            let expected = crate::job::effective_state_namespace(
+                &new_plan.spec.id,
+                None,
+                "agg",
+                &owner.id,
+            );
+            assert_eq!(moved.namespace, expected, "key {user_key}");
+            assert_eq!(moved.key, state_key);
+            assert_eq!(moved.value, b"42".to_vec());
+        }
+    }
+
+    #[test]
+    fn rescale_redistributes_window_entries_stripping_window_start() {
+        let old_plan = JobPlan::compile(rescale_job_spec(2)).unwrap();
+        let mut window_spec = rescale_job_spec(4);
+        // Turn the aggregate into a window operator so the window key layout
+        // (window_start + utf8 key) applies.
+        window_spec
+            .operators
+            .retain(|operator| operator.id != "agg");
+        window_spec.operators.push(OperatorSpec {
+            id: "agg".into(),
+            kind: OperatorKind::Window,
+            stateful: true,
+            key_field: Some("key".into()),
+            config: serde_json::json!({
+                "trigger": "watermark",
+                "kind": "tumbling",
+                "size_ms": 1000,
+                "key_field": "key",
+                "timestamp_field": "ts",
+                "value_fields": ["value"]
+            }),
+        });
+        let new_plan = JobPlan::compile(window_spec).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace =
+            crate::job::effective_state_namespace(&old_plan.spec.id, None, "agg", &old_task.id);
+        // Window state key: 8-byte BE window_start + utf8 user key.
+        let mut state_key = 5_000i64.to_be_bytes().to_vec();
+        state_key.extend_from_slice(b"omega");
+        let entry = crate::state::StateEntry {
+            namespace: old_namespace,
+            key: state_key.clone(),
+            value: b"7".to_vec(),
+            expires_at_ms: None,
+        };
+        let moved = context.redistribute(entry).unwrap();
+        let group = crate::job::key_group_for_key(b"omega", 16).unwrap();
+        let owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(group))
+            })
+            .unwrap();
+        let expected =
+            crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &owner.id);
+        assert_eq!(moved.namespace, expected);
+        assert_eq!(moved.key, state_key);
+    }
+
+    #[test]
+    fn rescale_rejects_unknown_key_encoding() {
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let entry = crate::state::StateEntry {
+            namespace: crate::job::effective_state_namespace(
+                &old_plan.spec.id,
+                None,
+                "agg",
+                &old_task.id,
+            ),
+            key: b"no-known-prefix".to_vec(),
+            value: Vec::new(),
+            expires_at_ms: None,
+        };
+        assert!(context.redistribute(entry).is_err());
+    }
+
     use crate::job::{
         CheckpointSpec, JobId, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec,
         StateDurability, StateSpec, TimeMode, TimeSpec,
@@ -1044,6 +1502,7 @@ mod validation_tests {
                 partitioned: false,
             }],
             sources: vec![SourceSpec {
+                codec: None,
                 operator_id: "source".into(),
                 input_type: input_type.into(),
                 config: serde_json::json!({}),
@@ -1057,6 +1516,7 @@ mod validation_tests {
                 },
             }],
             sinks: vec![SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: output_type.into(),
                 config: serde_json::json!({}),
@@ -1065,6 +1525,7 @@ mod validation_tests {
             checkpoint: None,
             placement: crate::job::PlacementStrategy::Colocated,
             recovery: Default::default(),
+            rescale: false,
         }
     }
 
@@ -1295,6 +1756,7 @@ mod metrics_registry_tests {
                 partitioned: false,
             }],
             sources: vec![SourceSpec {
+                codec: None,
                 operator_id: "source".into(),
                 input_type: "registry-test-input".into(),
                 config: serde_json::json!({}),
@@ -1308,6 +1770,7 @@ mod metrics_registry_tests {
                 },
             }],
             sinks: vec![SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: "registry-test-output".into(),
                 config: serde_json::json!({}),
@@ -1316,6 +1779,7 @@ mod metrics_registry_tests {
             checkpoint: None,
             placement: crate::job::PlacementStrategy::Colocated,
             recovery: Default::default(),
+            rescale: false,
         }
     }
 

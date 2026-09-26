@@ -12,17 +12,17 @@ The SQL-first API SHALL support declaring sources, sinks, schemas, keys, timesta
 
 ### Requirement: Job validation SHALL precede deployment
 
-The API SHALL validate SQL syntax, connector options, schema compatibility, time semantics, state requirements, namespace and state-budget configuration, and unsupported plan constructs before creating a running task attempt. Every validation entry point SHALL perform the same deep component/backend build checks as deployment, and unsupported legacy window joins or distributed multi-input Join operators SHALL be rejected explicitly rather than silently dropped or built through a single-input processor.
-
-#### Scenario: SQL uses an unsupported stateful construct
-
-- **WHEN** validation finds a construct without a supported runtime or state implementation
-- **THEN** the API rejects the Job with an actionable validation error and does not mutate running tasks
+The API SHALL validate SQL syntax, connector options, schema compatibility, time semantics, state requirements, namespace and state-budget configuration, and unsupported plan constructs before creating a running task attempt. Every validation entry point SHALL perform the same deep component/backend build checks as deployment. A `Join` operator SHALL be accepted when its configuration passes `JoinOperatorConfig::validate` and it declares exactly two inbound edges (edge declaration order fixes left = input 0, right = input 1); any other inbound arity SHALL be rejected with an error naming the required arity. Legacy window joins that have no equivalent compiled graph node remain rejected.
 
 #### Scenario: Job uses an unsupported distributed Join
 
-- **WHEN** a Job declares a Join operator without a dedicated multi-input runtime
-- **THEN** validation rejects the Job before it is persisted or deployed
+- **WHEN** a Job declares a Join operator whose inbound edge count is not two
+- **THEN** validation rejects the Job before it is persisted or deployed with an error naming the two-edge requirement
+
+#### Scenario: Job declares a well-formed Join
+
+- **WHEN** a Job declares a Join operator with a valid config (left/right keys, window_ms) and exactly two inbound edges
+- **THEN** validation accepts the Job and the join chain executes single-threaded with input-side tagging
 
 #### Scenario: Validation uses an unknown component
 
@@ -33,6 +33,7 @@ The API SHALL validate SQL syntax, connector options, schema compatibility, time
 
 - **WHEN** a legacy tumbling or session window configures a join that has no equivalent compiled graph node
 - **THEN** validation rejects the configuration with an explicit migration error
+
 
 ### Requirement: Plans SHALL be explainable
 The API SHALL expose the logical and physical Job plan, parallelism, partitioning, stateful operators, checkpoint policy, and connector assignments before deployment.
@@ -90,4 +91,5 @@ When a stream has a window and an error output, processor failures before the wi
 
 - **WHEN** a pre-window processor rejects one delivery in a stream with `error_output`
 - **THEN** the failed delivery reaches the error output and the main stream remains able to process subsequent deliveries
+
 

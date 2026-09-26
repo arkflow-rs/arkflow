@@ -3935,7 +3935,7 @@ mod tests {
             .contains("durable storage"));
 
         let temp = tempfile::tempdir().unwrap();
-        let store = storage::ControlPlaneStore::open(temp.path().join("hub.sqlite")).unwrap();
+        let store = storage::ControlPlaneStore::open(temp.path().join("hub.sqlite").to_str().unwrap()).await.unwrap();
         let missing_credentials = hub::Hub::with_storage(
             hub::HubConfig {
                 operator_token: None,

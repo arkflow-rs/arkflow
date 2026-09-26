@@ -16,6 +16,39 @@ may be a raw token (admin) or `principal|role|secret`, for example
 `readonly|viewer|viewer-secret`; viewer credentials can read resources and
 audit history but cannot mutate Streams, nodes, or rollouts.
 
+### Storage backends
+
+The Hub persists its control-plane state (nodes, jobs, intents, operations,
+audit history) in SQLite by default. `ARKFLOW_HUB_STORAGE` selects the backend
+by scheme:
+
+- A filesystem path (or unset) opens the SQLite store — WAL journal,
+  `synchronous=NORMAL`, `busy_timeout=5s` — with zero additional setup.
+- A URL starting with `postgres://` or `postgresql://` opens the PostgreSQL
+  backend: a sqlx pool (8 connections, 5s acquire timeout) that probes
+  connectivity and applies the idempotent `cp_*` DDL at startup, so an empty
+  database converges on first boot. A unreachable database fails Hub startup
+  rather than surfacing on the first command.
+
+Both backends implement the same storage contract behind one FIFO actor, so
+reconciliation, rollout, and outbox ordering semantics are backend-independent.
+PostgreSQL is the storage step of the Hub HA roadmap (leader election is not
+part of it — the Hub remains single-instance).
+
+To move an existing SQLite deployment onto PostgreSQL, stop the Hub first
+(migration requires the source to be quiescent), then run:
+
+```bash
+arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
+                       --to postgres://user:pass@db/hub
+```
+
+The tool copies every `cp_*` table in foreign-key order in 1000-row
+transactions, resets identity sequences above the migrated max ids, and exits
+non-zero on any row-count mismatch. Point `ARKFLOW_HUB_STORAGE` at the
+PostgreSQL URL and restart the Hub only after a successful migration. Fresh
+PostgreSQL deployments never need the tool — startup DDL creates the schema.
+
 ### OIDC JWT federation
 
 Instead of (or alongside) the static operator credential, the Hub accepts

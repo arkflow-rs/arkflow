@@ -146,6 +146,7 @@ fn fleet_job(
     };
     JobSpec {
         rebalance: None,
+rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new(job_id).unwrap(),
         version: JobVersion(1),
@@ -174,6 +175,7 @@ fn fleet_job(
             partitioned: false,
         }],
         sources: vec![SourceSpec {
+            codec: None,
             operator_id: "source-a".into(),
             input_type: "generate".into(),
             config: serde_json::json!({
@@ -184,6 +186,7 @@ fn fleet_job(
             time: processing_time(),
         }],
         sinks: vec![SinkSpec {
+            codec: None,
             operator_id: "sink-a".into(),
             output_type: "drop".into(),
             config: serde_json::json!({}),

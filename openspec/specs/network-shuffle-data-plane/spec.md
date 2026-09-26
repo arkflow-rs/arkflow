@@ -33,35 +33,53 @@ Cross-node execution-edge transport for the unified execution kernel: wire frame
 - **THEN** 新连接被关闭并记录 bounded-resource failure，现有连接和已接收 Envelope 不受影响
 
 ### Requirement: Ack 三态镜像回执
-数据 Envelope 跨远程边传输时，其源 ack SHALL 延迟到**所有**下游副本的回执齐备后才完成；下游的持有语义 SHALL 忠实镜像回上游。上游聚合 SHALL 复用既有 fan-out 分支 ack 机制（分支计数、防重复、abort/undo 补偿），不得引入第二套聚合状态机。
+
+数据 Envelope 跨远程边传输时，其源 ack SHALL 延迟到**所有**下游副本的回执齐备后才完成；下游的持有语义 SHALL 忠实镜像回上游。上游聚合 SHALL 复用既有 fan-out 分支 ack 机制（分支计数、防重复、abort/undo 补偿），不得引入第二套聚合状态机。下游处理失败 abort 该交付时，接收端 SHALL 回发 `Failed(seq)` 回执；上游收到后 SHALL 立即移除对应 pending 条目并 abort 该分支（补偿），而不等待 barrier drain 超时——超时路径降级为 Failed 帧丢失时的兜底。重复 `Failed` 回执 SHALL 幂等（未知 seq 丢弃）。
 
 #### Scenario: 全副本回执后源 ack 完成
+
 - **WHEN** 一条远程边 fan-out 到 2 个下游 subtask，两个副本各自完成本地处理后回发 Acked(seq)
 - **THEN** 上游在收到两个 Acked(seq) 后才完成对应 fan-out 分支，源偏移随之推进
 
 #### Scenario: 窗口持有排除出 drain 等待
+
 - **WHEN** 下游因事件时间窗口持有某批次并回发 Held(seq)
 - **THEN** 上游对该 ack 调用 mark_held，源链的 barrier drain 等待不包含它；窗口触发后下游回发 Released(seq)，上游调用 release_held 使其回到在途集合
 
+#### Scenario: 处理失败即时中止分支
+
+- **WHEN** 下游 chain 处理某批次失败并 abort 其远程回执
+- **THEN** 上游收到 Failed(seq) 后立即移除该 pending 条目并 abort 对应分支，无需等待 barrier drain 超时；本轮 checkpoint 仍按 fail-closed 处理
+
 #### Scenario: Held 控制帧丢失安全降级
+
 - **WHEN** 下游发出的 Held(seq) 因同步投递路径失败而丢失
 - **THEN** 上游该 ack 保持在 drain 等待集合，本轮 barrier drain 超时后 checkpoint fail-closed，不产生数据丢失或偏移错推
 
 #### Scenario: 下游崩溃不产生已 ack 丢失
+
 - **WHEN** 下游节点在处理完批次但回执发出前崩溃，或回执在网络中丢失
 - **THEN** 上游对应 ack 永不完成，barrier drain 超时使本轮 checkpoint 失败（fail-closed），恢复后从上个 sealed cut 重放（at-least-once）
 
-#### Scenario: 下游处理失败靠超时发现
-- **WHEN** 下游 chain 处理某批次失败（非连接断开），失败走下游本地 error 上报
-- **THEN** 上游对应分支在 barrier drain 超时前保持未完成，超时后本轮 checkpoint 失败（fail-closed）；v1 无主动 Failed 回执，失败发现延迟一个 drain 超时属预期行为
 
 ### Requirement: 远程边失败 fail-closed
-远程边连接断开、协议校验失败、认证失败、资源上限溢出或对端不可达时，内核 SHALL 使受影响的 Job attempt 失败并清理该边两端资源，MUST NOT 让链路停留在半开状态继续产出或丢弃数据。透明 reconnect 不属于本版本语义。
+
+远程边连接断开、协议校验失败、认证失败、资源上限溢出或对端不可达时，内核 SHALL 使受影响的 Job attempt 失败并清理该边两端资源，MUST NOT 让链路停留在半开状态继续产出或丢弃数据——**但在重连预算内除外**：配置了 `reconnect_attempts > 0` 时，流级失败（任一半程的传输错误）SHALL 在预算次数内以退避重拨并重放全部未回执数据帧；预算耗尽、会话已移除或全局关停 SHALL 走 fail-closed 路径。确定性协议错误（非法帧、认证失败）重放必然复现，按预算耗尽处理。`reconnect_attempts = 0` SHALL 逐位保持立即 fail-closed 行为。
 
 #### Scenario: 断链失败传播
 
-- **WHEN** 一条已建立的远程边 TCP 连接中断
+- **WHEN** 一条已建立的远程边 TCP 连接中断且重连预算为零
 - **THEN** 双方对应链路以错误终止（同一 TCP 连接双向同时失败），attempt 进入失败上报，由既有 generation fencing 重新放置
+
+#### Scenario: 预算内透明恢复
+
+- **WHEN** 一条已建立的远程边因网络瞬断中断且重连预算未耗尽
+- **THEN** 上游重拨并对端去重后恢复投递，未回执帧重放，双方不产生失败上报，作业不中断
+
+#### Scenario: 预算耗尽 fail-closed
+
+- **WHEN** 重连尝试全部失败
+- **THEN** 分支经中止路径结算，失败上报，attempt 按围栏重放置
 
 #### Scenario: 非法或未认证帧到达
 
@@ -72,6 +90,7 @@ Cross-node execution-edge transport for the unified execution kernel: wire frame
 
 - **WHEN** Job kernel 因重新放置或停止被取消
 - **THEN** 其建立的远程边出站连接与入站 listener 会话全部关闭，无残留 socket、registry 与悬持 ack
+
 
 ### Requirement: 线协议帧编解码
 跨节点传输 SHALL 使用定长帧头（src/dst 四元组、长度、类型）+ Arrow IPC 数据负载 + serde 控制负载的线格式；数据帧 MUST 能在接收端还原为等值 RecordBatch（含字典编码列）。接收端 SHALL 在任何 Flatbuffer 或 Arrow body 切片前验证 piece、消息和 body 的边界。
@@ -116,3 +135,48 @@ outbound pump 在任何退出路径（wire 写失败、shutdown 取消、上游�
 
 - **WHEN** 对端回执 Acked 到达且副本计数归零
 - **THEN** 分支被 ack 并从 pending 移除
+
+
+
+### Requirement: 重放帧按投递级去重
+
+接收端 SHALL 按会话键记忆已投递到本地通道的最大数据帧 seq（仅在本地通道成功接收后推进）；重放帧 seq ≤ 该值时 SHALL 静默丢弃——不向本地通道重投递，也**不得**补发任何回执：上游分支只由原始投递经处理完成后的真实回执结算。seq 大于该值的帧正常投递并推进记录。会话随 Job 移除或确认丢失时记录与回执路由同步清除。
+
+#### Scenario: 重放的去重帧被静默丢弃
+
+- **WHEN** 透明重连重放了一个接收端已投递的帧
+- **THEN** 本地通道不收到重复交付，且不产生镜像回执——上游等待原始投递的处理完成回执
+
+#### Scenario: 首投帧正常通过
+
+- **WHEN** 一个 seq 大于已投递记录的新帧到达
+- **THEN** 帧投递到本地通道，接收成功后推进该会话的去重记录
+
+
+### Requirement: 接收端丢连在宽限期内挂起失败
+
+配置重连时，连接以 EOF-无-Eos 结束 SHALL 把失败报告延迟 `reconnect_grace`；宽限内同会话键被新连接重新注册即抑制报告并保留路由注册，超时未恢复才报告失败并清除注册。协议级错误不延迟。宽限观察以注册代数为準，不依赖时钟比较。
+
+#### Scenario: 宽限内重注册抑制失败
+
+- **WHEN** 连接丢失后对端在宽限期内重拨并重新注册同一会话键
+- **THEN** 不产生失败上报，新连接即刻复用既有路由
+
+#### Scenario: 宽限超时确认丢失
+
+- **WHEN** 宽限期满仍无同键重注册
+- **THEN** 失败上报发出，路由注册与认证期望被清除
+
+### Requirement: 回执经会话级路由跨越连接更替
+
+回执 SHALL 发往按会话键存在的有界会话队列，由常驻转发任务写往当前服务该会话的连接；连接更替时写失败的原条目 SHALL 原样重试直至新连接接槽，不得丢弃。RemoteAck SHALL 持会话队列而非连接通道。确认丢失与 Job 会话移除 SHALL 撤销路由并取消转发任务。
+
+#### Scenario: 原 ack 跨重连完成
+
+- **WHEN** 一帧投递后连接透明重连，随后本地链处理完成并回执
+- **THEN** 回执经会话路由在新连接上送达，上游分支结算，源位点仅在处理后推进
+
+#### Scenario: 转发失败重试不丢回执
+
+- **WHEN** 转发任务向已失效的连接写入回执失败
+- **THEN** 该回执保留并重试，直到新连接接槽送达

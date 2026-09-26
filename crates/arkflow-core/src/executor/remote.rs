@@ -429,12 +429,16 @@ impl WireSignal {
 /// edge writer. `Acked` completes the mirrored fan-out branch once every
 /// replica of the batch reported it; `Held`/`Released` relay the buffering
 /// operator's hold so the upstream source excludes the acknowledgement from
-/// checkpoint barrier draining exactly as it would for a local window.
+/// checkpoint barrier draining exactly as it would for a local window;
+/// `Failed` reports that the receiving side aborted the delivery (processor
+/// failure), letting the upstream abort the branch immediately instead of
+/// waiting for the barrier-drain timeout.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiptKind {
     Acked,
     Held,
     Released,
+    Failed,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -943,6 +947,14 @@ pub struct NetworkManagerConfig {
     pub max_failure_queue: usize,
     pub max_frame_len: u32,
     pub read_idle_timeout: std::time::Duration,
+    /// Bounded transparent reconnect: how many times an upstream edge
+    /// redials the peer after a stream failure before failing the edge
+    /// closed. 0 disables reconnect and preserves the immediate fail-closed
+    /// behavior byte for byte.
+    pub reconnect_attempts: usize,
+    /// How long the downstream side waits for a re-registering connection
+    /// after losing one without Eos before reporting the loss as a failure.
+    pub reconnect_grace: std::time::Duration,
     pub registration_grace: std::time::Duration,
     /// How long a successfully authenticated client nonce remains rejected.
     /// The cache closes the replay window without retaining handshake state
@@ -961,6 +973,8 @@ impl Default for NetworkManagerConfig {
             max_failure_queue: 1024,
             max_frame_len: MAX_FRAME_LEN,
             read_idle_timeout: std::time::Duration::from_secs(30),
+            reconnect_attempts: 5,
+            reconnect_grace: std::time::Duration::from_secs(10),
             registration_grace: std::time::Duration::from_secs(10),
             handshake_replay_ttl: std::time::Duration::from_secs(10 * 60),
             credentials: None,
@@ -977,6 +991,7 @@ impl NetworkManagerConfig {
             || self.max_failure_queue == 0
             || self.max_frame_len == 0
             || self.read_idle_timeout.is_zero()
+            || self.reconnect_grace.is_zero()
             || self.registration_grace.is_zero()
             || self.handshake_replay_ttl.is_zero()
         {
@@ -1016,11 +1031,28 @@ pub struct RemoteAck {
 #[async_trait::async_trait]
 impl crate::input::Ack for RemoteAck {
     async fn ack(&self) -> Result<(), Error> {
-        self.outbox
+        let result = self
+            .outbox
             .send_async((
                 self.quad,
                 ReceiptFrame {
                     kind: ReceiptKind::Acked,
+                    seq: self.seq,
+                },
+            ))
+            .await;
+        result.map_err(|_| Error::Process("remote edge receipt channel closed".into()))
+    }
+
+    async fn abort(&self) -> Result<(), Error> {
+        // Mirror the abort to the upstream pending map as a Failed receipt so
+        // the branch acknowledgement aborts immediately; the barrier-drain
+        // timeout stays only as the fallback for a lost frame.
+        self.outbox
+            .send_async((
+                self.quad,
+                ReceiptFrame {
+                    kind: ReceiptKind::Failed,
                     seq: self.seq,
                 },
             ))
@@ -1073,6 +1105,10 @@ impl crate::input::Ack for RemoteAck {
 /// One in-flight batch awaiting its replicas' receipts on a quad.
 struct PendingBatch {
     branch: Arc<dyn crate::input::Ack>,
+    /// Retained for transparent-reconnect replay until the acknowledgement
+    /// completes; entries leave the map on completion, so an acknowledged
+    /// frame never replays.
+    replay: Option<crate::MessageBatchRef>,
     remaining_replicas: usize,
     held_replicas: usize,
 }
@@ -1094,7 +1130,12 @@ impl PendingReceipts {
         }
     }
 
-    fn register(&self, branch: &Arc<dyn crate::input::Ack>, replicas: usize) -> Result<u64, Error> {
+    fn register(
+        &self,
+        branch: &Arc<dyn crate::input::Ack>,
+        replicas: usize,
+        replay: Option<crate::MessageBatchRef>,
+    ) -> Result<u64, Error> {
         let mut map = self.map.lock().expect("pending receipts lock");
         if map.len() >= self.max_entries {
             return Err(Error::Process(format!(
@@ -1109,6 +1150,7 @@ impl PendingReceipts {
             seq,
             PendingBatch {
                 branch: branch.clone(),
+                replay,
                 remaining_replicas: replicas,
                 held_replicas: 0,
             },
@@ -1118,6 +1160,21 @@ impl PendingReceipts {
 
     fn is_empty(&self) -> bool {
         self.map.lock().expect("pending receipts lock").is_empty()
+    }
+
+    /// Every unacknowledged batch in sequence order, for replay after a
+    /// transparent reconnect. Entries leave the map when their acknowledgement
+    /// completes, so this is exactly the set the peer may not have processed.
+    fn replay_snapshot(&self) -> Vec<(u64, crate::MessageBatchRef)> {
+        let map = self.map.lock().expect("pending receipts lock");
+        map.iter()
+            .filter_map(|(seq, pending)| {
+                pending
+                    .replay
+                    .clone()
+                    .map(|batch| (*seq, batch))
+            })
+            .collect()
     }
 
     fn apply(&self, receipt: ReceiptFrame, failures: &flume::Sender<Error>) {
@@ -1160,6 +1217,21 @@ impl PendingReceipts {
                 if pending.held_replicas == 0 {
                     pending.branch.release_held();
                 }
+            }
+            ReceiptKind::Failed => {
+                let PendingBatch { branch, .. } = map.remove(&receipt.seq).expect("checked");
+                // Abort off the read loop: branch compensation may block on
+                // journal/WAL undo, and the connection must keep draining.
+                let failures = failures.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = branch.abort().await {
+                        let _ = failures
+                            .send_async(Error::Process(format!(
+                                "remote edge branch abort failed: {error}"
+                            )))
+                            .await;
+                    }
+                });
             }
         }
     }
@@ -1245,11 +1317,143 @@ pub struct NetworkManager {
     /// identity on the wire.  Keep it explicitly single-Job so two graphs
     /// cannot overwrite one another's quad routes.
     legacy_job: std::sync::RwLock<Option<JobSessionKey>>,
+    /// Session-scoped receipt routing: RemoteAcks hand their receipts to a
+    /// queue owned by the SESSION, not the connection, so an acknowledgement
+    /// started on one connection still completes after a transparent
+    /// reconnect swaps the wire underneath it. A forwarder task drains the
+    /// queue into whichever connection is currently serving the session.
+    session_receipts:
+        std::sync::Mutex<BTreeMap<EdgeSessionKey, SessionReceiptRoute>>,
+    /// Delivery-level dedup state per session key: the highest data-frame
+    /// sequence number already routed into the local channel. A transparent
+    /// reconnect replays every frame the upstream has not receipted, so the
+    /// receiver drops (and mirror-acks) sequences at or below this mark
+    /// instead of double-delivering them.
+    delivered_seq: std::sync::Mutex<BTreeMap<EdgeSessionKey, u64>>,
+    /// Registration generation per session key, bumped whenever a connection
+    /// successfully (re)routes the key. The reconnect grace watcher compares
+    /// its snapshot against the current generation to decide whether the
+    /// upstream came back.
+    session_registrations: std::sync::Mutex<BTreeMap<EdgeSessionKey, u64>>,
     /// Accepted streams feed this queue so serving works over any transport.
     accepted: AcceptedQueue,
     config: NetworkManagerConfig,
     active_connections: std::sync::atomic::AtomicUsize,
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// One session's receipt route: the queue RemoteAcks send into, plus the
+/// connection-swappable writer slot the forwarder drains toward.
+struct SessionReceiptRoute {
+    queue: flume::Sender<(Quad, ReceiptFrame)>,
+    current: std::sync::RwLock<Option<flume::Sender<(Quad, ReceiptFrame)>>>,
+    forwarder: tokio_util::sync::CancellationToken,
+}
+
+impl NetworkManager {
+    /// Look up (creating on first use) the session-scoped receipt route.
+    /// The bounded queue applies backpressure to acknowledgements when the
+    /// peer stops draining, and the forwarder retries failed connection
+    /// writes until the next connection takes the slot.
+    fn session_receipt_route(
+        self: &Arc<Self>,
+        key: &EdgeSessionKey,
+    ) -> flume::Sender<(Quad, ReceiptFrame)> {
+        let mut routes = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock");
+        if let Some(route) = routes.get(key) {
+            return route.queue.clone();
+        }
+        let (queue_tx, queue_rx) = flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let route = SessionReceiptRoute {
+            queue: queue_tx.clone(),
+            current: std::sync::RwLock::new(None),
+            forwarder: cancel.clone(),
+        };
+        routes.insert(key.clone(), route);
+        let manager = self.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    item = queue_rx.recv_async() => {
+                        let Ok(item) = item else { break };
+                        // Forward to the current connection's writer; a dead
+                        // slot (connection swapped or gone) retries until a
+                        // live one appears or the session is torn down.
+                        loop {
+                            if manager.shutdown.is_cancelled() || cancel.is_cancelled() {
+                                break;
+                            }
+                            let target = {
+                                let routes = manager
+                                    .session_receipts
+                                    .lock()
+                                    .expect("session receipt lock");
+                                routes
+                                    .get(&key)
+                                    .and_then(|route| {
+                                        route
+                                            .current
+                                            .read()
+                                            .expect("session receipt slot lock")
+                                            .clone()
+                                    })
+                            };
+                            let Some(target) = target else {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                continue;
+                            };
+                            match target.send_async(item).await {
+                                Ok(()) => break,
+                                // Writer gone: retry on the next slot.
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        queue_tx
+    }
+
+    /// Install `sender` as the live writer for a session's receipts (called
+    /// by each connection that starts serving the key; cleared when it ends).
+    fn set_session_receipt_writer(
+        &self,
+        key: &EdgeSessionKey,
+        sender: Option<flume::Sender<(Quad, ReceiptFrame)>>,
+    ) {
+        let routes = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock");
+        if let Some(route) = routes.get(key) {
+            *route
+                .current
+                .write()
+                .expect("session receipt slot lock") = sender;
+        }
+    }
+
+    /// Tear a session's receipt route down (session loss confirmed or job
+    /// removed): queued acknowledgements no longer have a destination.
+    fn remove_session_receipt_route(&self, key: &EdgeSessionKey) {
+        let route = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock")
+            .remove(key);
+        if let Some(route) = route {
+            route.forwarder.cancel();
+        }
+    }
 }
 
 impl NetworkManager {
@@ -1274,6 +1478,9 @@ impl NetworkManager {
             failure_channels: std::sync::RwLock::new(BTreeMap::new()),
             handshake_nonces: std::sync::Mutex::new(BTreeMap::new()),
             legacy_job: std::sync::RwLock::new(None),
+            session_receipts: std::sync::Mutex::new(BTreeMap::new()),
+            delivered_seq: std::sync::Mutex::new(BTreeMap::new()),
+            session_registrations: std::sync::Mutex::new(BTreeMap::new()),
             accepted,
             active_connections: std::sync::atomic::AtomicUsize::new(0),
             config,
@@ -1452,6 +1659,24 @@ impl NetworkManager {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        self.session_receipts
+            .lock()
+            .expect("session receipt lock")
+            .retain(|key, route| {
+                let keep = key.job() != Some(&job) && !(legacy_owned && key.job().is_none());
+                if !keep {
+                    route.forwarder.cancel();
+                }
+                keep
+            });
+        self.delivered_seq
+            .lock()
+            .expect("delivered seq lock")
+            .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
+        self.session_registrations
+            .lock()
+            .expect("session registration lock")
+            .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
         self.inbound
             .write()
             .expect("inbound registry lock")
@@ -1704,13 +1929,14 @@ impl NetworkManager {
         tokio::spawn(async move {
             match transport.connect(quad).await {
                 Ok(stream) => {
-                    manager.attach_stream(
+                    manager.attach_stream_with_redial(
                         stream,
                         quad,
                         receiver,
                         pending,
                         auth,
                         session_key.clone(),
+                        Some(transport),
                     );
                 }
                 Err(error) => {
@@ -1777,6 +2003,32 @@ impl NetworkManager {
             })
     }
 
+    /// Records a session loss and returns the registration generation the
+    /// grace watcher should compare against. The generation is set BELOW the
+    /// next registration so the first (re)registration after the loss makes
+    /// the comparison mismatch and suppresses the deferred failure.
+    fn bump_session_loss(&self, key: &EdgeSessionKey) -> u64 {
+        let mut registrations = self
+            .session_registrations
+            .lock()
+            .expect("session registration lock");
+        let next = registrations.get(key).copied().unwrap_or(0) + 1;
+        // Ensure any re-registration strictly exceeds this snapshot.
+        registrations.insert(key.clone(), next);
+        next
+    }
+
+    /// Marks a session key as (re)registered by a live connection, advancing
+    /// its generation so pending loss watchers observe the recovery.
+    fn bump_session_registration(&self, key: &EdgeSessionKey) {
+        let mut registrations = self
+            .session_registrations
+            .lock()
+            .expect("session registration lock");
+        let next = registrations.get(key).copied().unwrap_or(0) + 1;
+        registrations.insert(key.clone(), next);
+    }
+
     fn report_failure(&self, error: Error) {
         // This path is synchronous because it is also used by the listener
         // and Ack callbacks. A blocking send preserves the bounded queue's
@@ -1796,6 +2048,34 @@ impl NetworkManager {
         auth: Option<SessionAuth>,
         session_key: EdgeSessionKey,
     ) {
+        self.attach_stream_with_redial(
+            stream,
+            quad,
+            receiver,
+            pending,
+            auth,
+            session_key,
+            None,
+        );
+    }
+
+    /// [`Self::attach_stream`] with a redial handle: when the transport is
+    /// provided, a stream-level failure transparently reconnects within the
+    /// configured attempt budget, replaying every unacknowledged data frame
+    /// (the receiver dedups by sequence number). Budget exhaustion, shutdown,
+    /// or a session removed mid-recovery fails the edge closed exactly as a
+    /// stream failure does without reconnect.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_stream_with_redial(
+        self: &Arc<Self>,
+        stream: Box<dyn RemoteStream>,
+        quad: Quad,
+        receiver: flume::Receiver<super::envelope::Envelope>,
+        pending: Arc<PendingReceipts>,
+        auth: Option<SessionAuth>,
+        session_key: EdgeSessionKey,
+        redial: Option<Arc<dyn EdgeTransport>>,
+    ) {
         // A deferred connect can finish after its Job has been stopped.  Do
         // not attach that late stream or recreate the failure channel that
         // `remove_job_session` deliberately dropped.
@@ -1808,118 +2088,103 @@ impl NetworkManager {
             pending.abort_all();
             return;
         }
-        let (reader, writer) = tokio::io::split(stream);
         let failures = self.failure_sender_for_key(&session_key);
-        let connection_cancel = self.shutdown.child_token();
         let config = self.config.clone();
-        let outbound_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Receipt read loop: routes receipts to this quad's pending map.
-        let receipt_pending = pending.clone();
-        let receipt_failures = failures.clone();
-        let receipt_auth = auth.clone();
-        let receipt_manager = self.clone();
-        let receipt_session_key = session_key.clone();
-        let receipt_cancel = connection_cancel.clone();
-        let receipt_outbound_closed = outbound_closed.clone();
+        let manager = self.clone();
+        let reconnectable = redial.is_some() && config.reconnect_attempts > 0;
         tokio::spawn(async move {
-            let mut reader = reader;
-            let cancelled = receipt_cancel.clone();
-            let mut first_frame = true;
-            let mut failure = None;
-            loop {
-                tokio::select! {
-                    _ = cancelled.cancelled() => break,
-                    frame = read_frame_with_limits(&mut reader, config.max_frame_len, Some(config.read_idle_timeout)) => match frame {
-                        Ok((header, payload)) if first_frame && receipt_auth.is_some() => {
-                            first_frame = false;
-                            let Some(auth) = receipt_auth.as_ref() else { unreachable!() };
-                            let result = if header.kind == FrameKind::Handshake && header.quad == auth.quad {
-                                serde_json::from_slice::<HandshakePayload>(&payload)
-                                    .map_err(|error| Error::Process(format!("remote edge handshake acknowledgement malformed: {error}")))
-                                    .and_then(|payload| auth.verify_server_ack(&payload))
-                            } else {
-                                Err(Error::Process("remote edge receipt arrived before handshake acknowledgement".into()))
-                            };
-                            if let Err(error) = result {
-                                failure = Some(error);
+            let mut attempts_left = config.reconnect_attempts;
+            let mut current = Some(stream);
+            let mut final_error: Option<Error> = None;
+            let mut clean_exit = false;
+            while let Some(stream) = current.take() {
+                let (pump_result, read_result) = run_edge_connection(
+                    stream,
+                    quad,
+                    receiver.clone(),
+                    pending.clone(),
+                    config.clone(),
+                    auth.clone(),
+                    reconnectable,
+                    failures.clone(),
+                    &manager.shutdown,
+                )
+                .await;
+                // Clean requires BOTH halves to end cleanly: the read loop
+                // already classifies a post-drain peer close as Ok, so any Err
+                // on either half is a stream-level failure.
+                let error = pump_result
+                    .err()
+                    .or(read_result.err());
+                match error {
+                    None => {
+                        clean_exit = true;
+                        break;
+                    }
+                    Some(error) => {
+                        // Either the pump hit a wire failure or the read half
+                        // dropped the connection; both are stream-level. Retry
+                        // within the budget when a redial handle exists and the
+                        // session is still live.
+                        let retry = reconnectable
+                            && attempts_left > 0
+                            && !manager.shutdown.is_cancelled()
+                            && manager
+                                .outbound
+                                .read()
+                                .expect("outbound registry lock")
+                                .contains_key(&session_key);
+                        if !retry {
+                            final_error = Some(error);
+                            break;
+                        }
+                        attempts_left -= 1;
+                        tracing::warn!(
+                            attempts_left,
+                            quad = ?quad,
+                            "remote edge stream failed; transparently reconnecting"
+                        );
+                        tokio::time::sleep(connect_backoff(
+                            config.reconnect_attempts - attempts_left,
+                        ))
+                        .await;
+                        let redial = redial.clone().expect("retry implies redial");
+                        match redial.connect(quad).await {
+                            Ok(mut stream) => {
+                                if let Err(error) = replay_pending(
+                                    &mut stream,
+                                    quad,
+                                    &pending,
+                                    &auth,
+                                    &config,
+                                )
+                                .await
+                                {
+                                    final_error = Some(error);
+                                    break;
+                                }
+                                current = Some(stream);
+                            }
+                            Err(error) => {
+                                final_error = Some(Error::Process(format!(
+                                    "remote edge reconnect for quad {quad:?} failed: {error}"
+                                )));
                                 break;
                             }
                         }
-                        Ok((header, payload)) if header.kind == FrameKind::Receipt => {
-                            first_frame = false;
-                            if let Ok(receipt) = serde_json::from_slice::<ReceiptFrame>(&payload) {
-                                receipt_pending.apply(receipt, &receipt_failures);
-                            } else {
-                                failure = Some(Error::Process(
-                                    "remote edge receipt frame malformed".into(),
-                                ));
-                                break;
-                            }
-                        }
-                        Ok((header, _)) => {
-                            failure = Some(Error::Process(format!(
-                                "unexpected {:?} frame on a receipt channel",
-                                header.kind
-                            )));
-                            break;
-                        }
-                        Err(error) => {
-                            // A normal outbound close drops the writer half
-                            // after the local edge has drained.  In that case
-                            // the peer may close its half with no more frames;
-                            // only treat it as clean when no receipt can still
-                            // be outstanding.  An idle reader must otherwise
-                            // fail the Job even if the pump has no new data to
-                            // write and therefore cannot observe the socket
-                            // failure itself.
-                            if !receipt_outbound_closed.load(std::sync::atomic::Ordering::Acquire)
-                                || !receipt_pending.is_empty()
-                            {
-                                failure = Some(error);
-                            }
-                            break;
-                        }
-                    },
+                    }
                 }
             }
-            if let Some(error) = failure {
-                cancelled.cancel();
-                let _ = receipt_failures.send_async(error).await;
+            let failed = final_error.is_some();
+            if let Some(error) = final_error {
+                let _ = failures.send_async(error).await;
             }
-            receipt_pending.abort_all();
-            self_remove_outbound(&receipt_manager, &receipt_session_key);
-        });
-
-        // Outbound pump: drains the edge channel onto the wire.
-        let pump_pending = pending.clone();
-        let pump_failures = failures.clone();
-        let pump_cancel = connection_cancel.clone();
-        let pump_config = self.config.clone();
-        let pump_manager = self.clone();
-        let pump_session_key = session_key;
-        let pump_outbound_closed = outbound_closed;
-        tokio::spawn(async move {
-            let result = pump_edge(
-                receiver,
-                writer,
-                quad,
-                pump_pending,
-                pump_cancel.clone(),
-                pump_config,
-                auth,
-            )
-            .await;
-            match result {
-                Ok(()) => {
-                    pump_outbound_closed.store(true, std::sync::atomic::Ordering::Release);
-                }
-                Err(error) => {
-                    pump_cancel.cancel();
-                    let _ = pump_failures.send_async(error).await;
-                }
+            if !clean_exit || failed {
+                // The connection is gone and no receipt can arrive: settle
+                // every still-registered branch through the abort path.
+                pending.abort_all();
             }
-            self_remove_outbound(&pump_manager, &pump_session_key);
+            self_remove_outbound(&manager, &session_key);
         });
     }
 
@@ -1952,6 +2217,8 @@ impl NetworkManager {
         self: &Arc<Self>,
         stream: Box<dyn RemoteStream>,
     ) -> Result<(), ConnectionFailure> {
+        static SERVE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serve_id = SERVE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (receipt_tx, receipt_rx) =
             flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
@@ -1959,6 +2226,9 @@ impl NetworkManager {
         let mut served_quads: BTreeMap<EdgeSessionKey, flume::Sender<super::envelope::Envelope>> =
             BTreeMap::new();
         let mut eos_seen: BTreeSet<EdgeSessionKey> = BTreeSet::new();
+        // Session keys this connection registered, advanced once per key so a
+        // reconnecting connection marks recovery for pending loss watchers.
+        let mut registered_keys: BTreeSet<EdgeSessionKey> = BTreeSet::new();
         let mut authenticated_session = None;
         let mut failure_sender = self.failures.clone();
         let connection_cancel = self.shutdown.child_token();
@@ -2045,7 +2315,9 @@ impl NetworkManager {
             let mut writer = tokio::io::BufWriter::with_capacity(16 * 1024, writer);
             let result: Result<(), Error> = loop {
                 let send = tokio::select! {
-                    _ = receipt_cancel.cancelled() => break Ok(()),
+                    _ = receipt_cancel.cancelled() => {
+                        break Ok(());
+                    }
                     next = receipt_rx.recv_async() => next,
                 };
                 let Ok((quad, receipt)) = send else {
@@ -2134,6 +2406,13 @@ impl NetworkManager {
                             )))
                         }
                     };
+                    if registered_keys.insert(route_key.clone()) {
+                        self.bump_session_registration(&route_key);
+                    }
+                    // This connection now serves the session's receipts:
+                    // create the route (idempotent) and take the writer slot.
+                    let _ = self.session_receipt_route(&route_key);
+                    self.set_session_receipt_writer(&route_key, Some(receipt_tx.clone()));
                     match header.kind {
                         FrameKind::Data => {
                             let (batch, seq) = match decoder.decode(&payload) {
@@ -2144,10 +2423,39 @@ impl NetworkManager {
                                     )))
                                 }
                             };
+                            // Delivery-level dedup: a transparent reconnect
+                            // replays every frame the upstream has not
+                            // receipted. A sequence at or below the last one
+                            // DELIVERED (recorded only after the local
+                            // channel accepted it) is dropped silently: its
+                            // original acknowledgement is still in flight
+                            // through the session-scoped receipt route, which
+                            // survives the connection swap. No mirror-ack —
+                            // completing the upstream branch before the local
+                            // chain finishes processing would let source
+                            // offsets advance past unprocessed data.
+                            let duplicate = {
+                                let delivered = self
+                                    .delivered_seq
+                                    .lock()
+                                    .expect("delivered seq lock");
+                                match delivered.get(&route_key) {
+                                    Some(last) => seq <= *last,
+                                    None => false,
+                                }
+                            };
+                            if duplicate {
+                                continue;
+                            }
+                            // Session-scoped receipts: the ack hands its
+                            // receipt to the session queue, so it completes
+                            // on whichever connection serves the session by
+                            // the time processing finishes.
+                            let outbox = self.session_receipt_route(&route_key);
                             let envelope = Envelope::Data(
                                 Arc::new(batch),
                                 Arc::new(RemoteAck {
-                                    outbox: receipt_tx.clone(),
+                                    outbox,
                                     quad: header.quad,
                                     seq,
                                     failures: failure_sender.clone(),
@@ -2155,6 +2463,13 @@ impl NetworkManager {
                             );
                             if sender.send_async(envelope).await.is_err() {
                                 break Ok(()); // local chain gone; close the edge
+                            }
+                            {
+                                let mut delivered = self
+                                    .delivered_seq
+                                    .lock()
+                                    .expect("delivered seq lock");
+                                delivered.insert(route_key.clone(), seq);
                             }
                         }
                         FrameKind::Signal => {
@@ -2181,23 +2496,80 @@ impl NetworkManager {
                         FrameKind::Handshake => unreachable!("handled before frame dispatch"),
                     }
                 }
-                Err(error) => break Err(error),
+                Err(error) => {
+                    break Err(error);
+                }
             }
         };
 
         connection_cancel.cancel();
 
+        // Session-loss reporting: with transparent reconnect enabled, a lost
+        // connection without Eos defers its failure by the reconnect grace —
+        // a re-registering upstream within the window suppresses it (the
+        // supervisor on the peer redials and replays unacknowledged frames).
+        // Protocol-level errors fail immediately: they recur deterministically.
+        let reconnect_enabled = self.config.reconnect_attempts > 0;
+        let report = |key: EdgeSessionKey, message: String| {
+            if !reconnect_enabled {
+                let sender = failure_sender.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send_async(Error::Process(message)).await;
+                });
+                return;
+            }
+            let generation = self.bump_session_loss(&key);
+            let manager = self.clone();
+            let sender = failure_sender.clone();
+            let grace = self.config.reconnect_grace;
+            tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                if manager.shutdown.is_cancelled() {
+                    return;
+                }
+                let current = manager
+                    .session_registrations
+                    .lock()
+                    .expect("session registration lock")
+                    .get(&key)
+                    .copied();
+                if current.is_some() && current != Some(generation) {
+                    // The upstream re-registered: the loss was recovered.
+                    return;
+                }
+                // Confirmed loss: the registration kept for the redialing
+                // peer is now stale and must not leak into later jobs.
+                manager.remove_session_receipt_route(&key);
+                manager
+                    .inbound
+                    .write()
+                    .expect("inbound registry lock")
+                    .remove(&key);
+                manager
+                    .inbound_auth
+                    .write()
+                    .expect("inbound auth registry lock")
+                    .remove(&key);
+                let _ = sender.send_async(Error::Process(message)).await;
+            });
+        };
+
         if let Err(error) = failure_reason {
             let mut reported_without_eos = false;
+            let defer_loss = is_unexpected_eof(&error);
             for key in served_quads.keys() {
                 if !eos_seen.contains(key) {
                     reported_without_eos = true;
-                    let _ = failure_sender
-                        .send_async(Error::Process(format!(
-                            "remote edge for quad {:?} ended without Eos: {error}",
-                            key.quad
-                        )))
-                        .await;
+                    let message = format!(
+                        "remote edge for quad {:?} ended without Eos: {error}",
+                        key.quad
+                    );
+                    if defer_loss {
+                        report(key.clone(), message);
+                    } else {
+                        let sender = failure_sender.clone();
+                        let _ = sender.send_async(Error::Process(message)).await;
+                    }
                 }
             }
             // A peer that forwarded Eos for every served quad is allowed to
@@ -2218,21 +2590,36 @@ impl NetworkManager {
             // is an upstream death mid-stream, not a clean finish.
             for (key, sender) in &served_quads {
                 if !eos_seen.contains(key) {
-                    let _ = failure_sender
-                        .send_async(Error::Process(format!(
+                    report(
+                        key.clone(),
+                        format!(
                             "remote edge for quad {:?} ended without Eos; upstream likely died mid-stream",
                             key.quad
-                        )))
-                        .await;
+                        ),
+                    );
                     let _ = sender;
                 }
             }
         }
 
         // Dropping the served quads' senders closes the chains' input channels.
+        // Release every session writer slot this connection held; the
+        // forwarder retries queued receipts against the next connection.
+        for key in served_quads.keys() {
+            self.set_session_receipt_writer(key, None);
+        }
+
         // Only entries this connection inserted are removed; a reconnecting
-        // upstream re-registers through the graph anyway.
+        // upstream re-registers through the graph anyway. A loss under the
+        // reconnect grace keeps the registration so the peer's redialing
+        // connection can re-route immediately: the confirmed-loss watcher
+        // removes it instead when the grace expires without recovery.
         for (key, sender) in served_quads {
+            let loss_deferred =
+                reconnect_enabled && !eos_seen.contains(&key) && !self.shutdown.is_cancelled();
+            if loss_deferred {
+                continue;
+            }
             let mut registry = self.inbound.write().expect("inbound registry lock");
             if registry
                 .get(&key)
@@ -2388,6 +2775,194 @@ async fn wait_for_route(
 /// Drains one quad's edge channel onto its connection, stamping sequences and
 /// registering pending receipts. Exits when the channel closes (drained) or
 /// the connection fails; failures abort all pending branch acknowledgements.
+/// Runs one connection's receipt read loop and outbound pump to completion,
+/// returning both results. A failure on either half cancels the shared token,
+/// so the other half exits promptly; the caller decides whether to reconnect
+/// (replaying unacknowledged frames) or fail the edge closed. With
+/// `reconnectable`, the pump defers its failure-path branch aborts to the
+/// supervisor: the branches must stay registered so a reconnect can replay
+/// them, and the supervisor aborts them if recovery does not succeed.
+async fn run_edge_connection(
+    stream: Box<dyn RemoteStream>,
+    quad: Quad,
+    receiver: flume::Receiver<super::envelope::Envelope>,
+    pending: Arc<PendingReceipts>,
+    config: NetworkManagerConfig,
+    auth: Option<SessionAuth>,
+    reconnectable: bool,
+    failures: flume::Sender<Error>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> (
+    Result<(), Error>,
+    Result<(), Error>,
+) {
+    let (reader, writer) = tokio::io::split(stream);
+    let connection_cancel = shutdown.child_token();
+    let outbound_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Receipt read loop: routes receipts to the pending map. Errors cancel
+    // the connection; classification (clean EOF after drain, late-failure
+    // sweep) is left to the supervisor.
+    let receipt_pending = pending.clone();
+    let receipt_cancel = connection_cancel.clone();
+    let receipt_outbound_closed = outbound_closed.clone();
+    let receipt_failures = failures.clone();
+    let receipt_auth = auth.clone();
+    let read_task = tokio::spawn(async move {
+        let mut reader = reader;
+        let cancelled = receipt_cancel.clone();
+        let mut first_frame = true;
+        let mut failure: Option<Error> = None;
+        loop {
+            tokio::select! {
+                _ = cancelled.cancelled() => break,
+                frame = read_frame_with_limits(&mut reader, config.max_frame_len, Some(config.read_idle_timeout)) => match frame {
+                    Ok((header, payload)) if first_frame && receipt_auth.is_some() => {
+                        first_frame = false;
+                        let Some(auth) = receipt_auth.as_ref() else { unreachable!() };
+                        let result = if header.kind == FrameKind::Handshake && header.quad == auth.quad {
+                            serde_json::from_slice::<HandshakePayload>(&payload)
+                                .map_err(|error| Error::Process(format!("remote edge handshake acknowledgement malformed: {error}")))
+                                .and_then(|payload| auth.verify_server_ack(&payload))
+                        } else {
+                            Err(Error::Process("remote edge receipt arrived before handshake acknowledgement".into()))
+                        };
+                        if let Err(error) = result {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                    Ok((header, payload)) if header.kind == FrameKind::Receipt => {
+                        first_frame = false;
+                        if let Ok(receipt) = serde_json::from_slice::<ReceiptFrame>(&payload) {
+                            receipt_pending.apply(receipt, &receipt_failures);
+                        } else {
+                            failure = Some(Error::Process(
+                                "remote edge receipt frame malformed".into(),
+                            ));
+                            break;
+                        }
+                    }
+                    Ok((header, _)) => {
+                        failure = Some(Error::Process(format!(
+                            "unexpected {:?} frame on a receipt channel",
+                            header.kind
+                        )));
+                        break;
+                    }
+                    Err(error) => {
+                        // A normal outbound close drops the writer half after
+                        // the local edge has drained; the peer may then close
+                        // its half with no more frames. Only treat that as
+                        // clean when no receipt can still be outstanding.
+                        if !receipt_outbound_closed.load(std::sync::atomic::Ordering::Acquire)
+                            || !receipt_pending.is_empty()
+                        {
+                            failure = Some(error);
+                        }
+                        break;
+                    }
+                },
+            }
+        }
+        match failure {
+            Some(error) => {
+                cancelled.cancel();
+                Err(error)
+            }
+            None => Ok(()),
+        }
+    });
+
+    let pump_pending = pending.clone();
+    let pump_cancel = connection_cancel.clone();
+    let pump_outbound_closed = outbound_closed.clone();
+    let pump_task = tokio::spawn(async move {
+        let result = pump_edge(
+            receiver,
+            writer,
+            quad,
+            pump_pending,
+            pump_cancel.clone(),
+            config,
+            auth,
+            reconnectable,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                pump_outbound_closed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(_) => {
+                pump_cancel.cancel();
+            }
+        }
+        result
+    });
+
+    let pump_result = pump_task
+        .await
+        .unwrap_or_else(|error| Err(Error::Process(format!("remote edge pump task failed: {error}"))));
+    if pump_result.is_err() {
+        // A failed pump tears the connection down: no receipt can complete a
+        // frame that never reached the wire, and the supervisor decides on
+        // reconnect. A cleanly drained pump is the opposite case — the read
+        // half stays alive to apply the peers' late receipts, exactly as the
+        // unsupervised pump did, and ends on its own (peer close, idle
+        // timeout, or the manager's shutdown).
+        connection_cancel.cancel();
+    }
+    let read_result = read_task
+        .await
+        .unwrap_or_else(|error| Err(Error::Process(format!("remote edge read task failed: {error}"))));
+    (pump_result, read_result)
+}
+
+/// Replays the session preamble on a freshly reconnected stream: the
+/// authenticated handshake plus every unacknowledged data frame in sequence
+/// order, reusing each frame's original sequence number so the receiver's
+/// delivery-level dedup can drop the ones it already routed.
+async fn replay_pending(
+    stream: &mut Box<dyn RemoteStream>,
+    quad: Quad,
+    pending: &Arc<PendingReceipts>,
+    auth: &Option<SessionAuth>,
+    config: &NetworkManagerConfig,
+) -> Result<(), Error> {
+    use tokio::io::AsyncWriteExt;
+    let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, &mut **stream);
+    if let Some(auth) = auth {
+        let handshake = auth.client_handshake()?;
+        let payload = serde_json::to_vec(&handshake).map_err(|error| {
+            Error::Process(format!("remote edge handshake encode failed: {error}"))
+        })?;
+        write_frame_with_limit(
+            &mut writer,
+            quad,
+            FrameKind::Handshake,
+            &payload,
+            config.max_frame_len,
+        )
+        .await?;
+    }
+    let mut encoder = DataEncoder::new();
+    for (seq, batch) in pending.replay_snapshot() {
+        let payload = encoder.encode(&batch, seq)?;
+        write_frame_with_limit(
+            &mut writer,
+            quad,
+            FrameKind::Data,
+            &payload,
+            config.max_frame_len,
+        )
+        .await?;
+    }
+    writer.flush().await.map_err(|error| {
+        Error::Process(format!("remote edge replay flush failed: {error}"))
+    })?;
+    Ok(())
+}
+
 async fn pump_edge(
     receiver: flume::Receiver<super::envelope::Envelope>,
     writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -2396,6 +2971,7 @@ async fn pump_edge(
     shutdown: tokio_util::sync::CancellationToken,
     config: NetworkManagerConfig,
     auth: Option<SessionAuth>,
+    reconnectable: bool,
 ) -> Result<(), Error> {
     let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, writer);
     let mut encoder = DataEncoder::new();
@@ -2449,7 +3025,11 @@ async fn pump_edge(
                         // Register before writing so a concurrent receipt can
                         // never race the pending map; the wire is strict FIFO
                         // per quad, so receipts cannot precede their frame.
-                        let seq = match pending.register(&branch, 1) {
+                        let seq = match pending.register(
+                            &branch,
+                            1,
+                            reconnectable.then(|| batch.clone()),
+                        ) {
                             Ok(seq) => seq,
                             Err(error) => {
                                 let abort_error = branch.abort().await.err();
@@ -2527,6 +3107,14 @@ async fn pump_edge(
     // connection is still running, late receipts for flushed frames must
     // keep applying, and that loop owns the final abort sweep once the peer
     // closes or the read idle timeout fires.
+    if reconnectable && (result.is_err() || !drained) {
+        // A supervisor owns recovery: the branches stay registered so a
+        // transparent reconnect can replay them, and the supervisor aborts
+        // them if the reconnect budget is exhausted. This includes exits
+        // driven by the connection token (a read-half failure cancelling the
+        // pump mid-stream): aborting here would erase the replay set.
+        return result;
+    }
     if result.is_err() || !drained {
         pending.abort_all();
     }
@@ -2641,7 +3229,12 @@ mod tests {
             assert_eq!(decoded, signal);
         }
 
-        for kind in [ReceiptKind::Acked, ReceiptKind::Held, ReceiptKind::Released] {
+        for kind in [
+            ReceiptKind::Acked,
+            ReceiptKind::Held,
+            ReceiptKind::Released,
+            ReceiptKind::Failed,
+        ] {
             let receipt = ReceiptFrame { kind, seq: 42 };
             let bytes = serde_json::to_vec(&receipt).expect("serialize");
             let decoded: ReceiptFrame = serde_json::from_slice(&bytes).expect("deserialize");
@@ -2778,6 +3371,222 @@ mod tests {
             self.aborted
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Logs every successful write.
+    struct WriteProbe {
+        inner: Box<dyn RemoteStream>,
+        label: &'static str,
+    }
+
+    impl AsyncRead for WriteProbe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for WriteProbe {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let std::task::Poll::Ready(Ok(n)) = &result {
+            }
+            result
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Logs every successful read so tests can see exactly which wrapped
+    /// half receives bytes.
+    struct ReadProbe {
+        inner: Box<dyn RemoteStream>,
+        label: &'static str,
+    }
+
+    impl AsyncRead for ReadProbe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl AsyncWrite for ReadProbe {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Shared kill state: the flag plus the currently registered reader
+    /// waker, so `kill()` wakes a read parked inside the inner stream.
+    #[derive(Default)]
+    struct KillState {
+        killed: std::sync::atomic::AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    impl KillState {
+        fn kill(&self) {
+            self.killed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Handle side for tests: break the wrapped stream half.
+    #[derive(Clone, Default)]
+    struct KillHandle(Arc<KillState>);
+
+    impl KillHandle {
+        fn kill(&self) {
+            self.0.kill();
+        }
+    }
+
+    /// Wraps a stream half so the test can "break the connection" after the
+    /// manager has taken ownership: once killed, pending reads wake and fail
+    /// (like a reset connection) and writes fail with BrokenPipe.
+    struct KillableStream {
+        inner: Box<dyn RemoteStream>,
+        state: Arc<KillState>,
+    }
+
+    impl AsyncRead for KillableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.state.killed.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "killed",
+                )));
+            }
+            *self.state.waker.lock().unwrap() = Some(cx.waker().clone());
+            let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            if result.is_pending() {
+                // Keep the waker registered for a kill() wake.
+            } else {
+                *self.state.waker.lock().unwrap() = None;
+            }
+            result
+        }
+    }
+
+    impl AsyncWrite for KillableStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.state.killed.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "killed",
+                )));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Hands out pre-made stream halves in order: each `connect` pops the
+    /// next queued client half, letting tests break a connection by dropping
+    /// its server half and observe the transparent reconnect onto the
+    /// following one.
+    struct QueuedTransport {
+        streams: std::sync::Mutex<Vec<Box<dyn RemoteStream>>>,
+        fail_after: Option<usize>,
+    }
+
+    impl QueuedTransport {
+        fn of(streams: Vec<Box<dyn RemoteStream>>) -> Arc<Self> {
+            Arc::new(Self {
+                streams: std::sync::Mutex::new(streams),
+                fail_after: None,
+            })
+        }
+
+        fn failing_after(streams: Vec<Box<dyn RemoteStream>>, fail_after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                streams: std::sync::Mutex::new(streams),
+                fail_after: Some(fail_after),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeTransport for QueuedTransport {
+        async fn connect(&self, _quad: Quad) -> Result<Box<dyn RemoteStream>, Error> {
+            let mut streams = self.streams.lock().unwrap();
+            if let Some(limit) = self.fail_after {
+                if streams.len() <= limit {
+                    return Err(Error::Process("test transport exhausted".into()));
+                }
+            }
+            if streams.is_empty() {
+                return Err(Error::Process("test transport exhausted".into()));
+            }
+            Ok(streams.remove(0))
         }
     }
 
@@ -3172,6 +3981,7 @@ mod tests {
         let upstream_config = NetworkManagerConfig {
             channel_capacity: 8,
             max_pending_receipts: 1,
+            reconnect_attempts: 0,
             ..NetworkManagerConfig::default()
         };
         let upstream = NetworkManager::with_config(upstream_config).unwrap();
@@ -3234,10 +4044,170 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn transparent_reconnect_replays_unreceipted_frames() {
+        let quad = quad_a_to_b();
+        let reconnect = NetworkManagerConfig {
+            reconnect_attempts: 3,
+            reconnect_grace: std::time::Duration::from_secs(5),
+            ..NetworkManagerConfig::default()
+        };
+        let upstream = NetworkManager::with_config(reconnect.clone()).unwrap();
+        let downstream = NetworkManager::with_config(reconnect).unwrap();
+        upstream.spawn();
+        downstream.spawn();
+        let failures = upstream.failure_receiver();
+
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream.register_inbound(quad, input_tx);
+
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        let (client2, server2) = tokio::io::duplex(64 * 1024);
+        // Kill the DOWNSTREAM-owned half: the serve loop's read errors and
+        // unwinds, which closes the real duplex and EOFs the upstream's read
+        // immediately — exactly like a peer process dying mid-stream.
+        let kill1 = KillHandle::default();
+        let kill_state = kill1.0.clone();
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server1),
+            state: kill_state,
+        }));
+        downstream.accept_stream(Box::new(server2));
+        let transport = QueuedTransport::of(vec![Box::new(client1), Box::new(client2)]);
+        let edge = upstream.open_edge_deferred(transport.clone(), quad);
+        // First connection: the deferred open dials client1.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let branch = Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                branch.clone(),
+            ))
+            .await
+            .unwrap();
+        // The downstream chain receives the frame: delivered, not yet acked.
+        let delivered_envelope = next_envelope(&input_rx).await;
+        let delivered_ack = match &delivered_envelope {
+            Envelope::Data(_, ack) => ack.clone(),
+            _ => panic!("expected a data envelope"),
+        };
+        // Break the connection: killing the shared server half resets the
+        // connection from both ends mid-stream.
+        kill1.kill();
+
+        // The transparent reconnect dials client2 and replays seq 0; the
+        // receiver drops the duplicate silently (no re-delivery).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                next_envelope(&input_rx)
+            )
+            .await
+            .is_err(),
+            "replayed duplicate must not re-deliver to the local chain"
+        );
+        // The ORIGINAL acknowledgement still completes — through the
+        // session-scoped receipt route on the new connection. Only after
+        // the downstream acknowledges processing does the upstream branch
+        // settle (no mirror-ack: offsets never advance past unprocessed
+        // data).
+        delivered_ack.ack().await.expect("original ack completes");
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("branch acked through the session receipt route");
+        assert!(
+            !branch.aborted.load(std::sync::atomic::Ordering::SeqCst),
+            "transparent recovery must not abort the branch"
+        );
+        // No edge failure surfaced: the reconnect healed the loss.
+        if let Ok(failure) = tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async()).await {
+            panic!("unexpected failure: {failure:?}");
+        }
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_budget_exhaustion_fails_closed() {
+        let quad = quad_a_to_b();
+        let reconnect = NetworkManagerConfig {
+            reconnect_attempts: 2,
+            reconnect_grace: std::time::Duration::from_millis(200),
+            ..NetworkManagerConfig::default()
+        };
+        let upstream = NetworkManager::with_config(reconnect.clone()).unwrap();
+        let downstream = NetworkManager::with_config(reconnect).unwrap();
+        upstream.spawn();
+        downstream.spawn();
+        let failures = upstream.failure_receiver();
+
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream.register_inbound(quad, input_tx);
+
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        let kill1 = KillHandle::default();
+        let kill_state = kill1.0.clone();
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server1),
+            state: kill_state,
+        }));
+        // One stream only: after the first break, every redial fails.
+        let transport = QueuedTransport::failing_after(vec![Box::new(client1)], 0);
+        let edge = upstream.open_edge_deferred(transport, quad);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let branch = Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                branch.clone(),
+            ))
+            .await
+            .unwrap();
+        let _ = next_envelope(&input_rx).await;
+        kill1.kill();
+
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("budget exhaustion must abort the branch");
+        let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
+            .await
+            .expect("budget exhaustion must report the edge failure")
+            .unwrap();
+        assert!(
+            failure.to_string().contains("reconnect"),
+            "{failure}"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_aborts_pending_and_closes_edge() {
         let quad = quad_a_to_b();
-        let upstream = NetworkManager::new(64);
-        let downstream = NetworkManager::new(64);
+        // Reconnect disabled: this test pins the immediate fail-closed
+        // behavior that a zero reconnect budget preserves.
+        let offline = NetworkManagerConfig {
+            reconnect_attempts: 0,
+            ..NetworkManagerConfig::default()
+        };
+        let upstream = NetworkManager::with_config(offline).unwrap();
+        let downstream = NetworkManager::with_config(
+            NetworkManagerConfig {
+                reconnect_attempts: 0,
+                ..NetworkManagerConfig::default()
+            },
+        )
+        .unwrap();
         upstream.spawn();
         downstream.spawn();
         let failures = upstream.failure_receiver();
@@ -3646,6 +4616,41 @@ mod pump_cancel_tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_receipt_aborts_the_pending_branch() {
+        // A downstream processing failure mirrors back as a Failed receipt;
+        // the upstream aborts the branch without waiting for the barrier
+        // drain timeout.
+        let pending = PendingReceipts::new(64);
+        let spy = SpyAck::new();
+        let ack: StdArc<dyn Ack> = spy.clone();
+        let seq = pending.register(&ack, 2, None).expect("register");
+        let (failures_tx, failures_rx) = flume::unbounded::<Error>();
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Failed,
+                seq,
+            },
+            &failures_tx,
+        );
+        wait_for(&spy.aborted, "branch abort on Failed receipt").await;
+        assert!(
+            !spy.acked.load(Ordering::SeqCst),
+            "a Failed receipt must never acknowledge"
+        );
+        assert!(failures_rx.is_empty(), "no failure expected");
+        // The aborted sequence left the pending map: a duplicate Failed is a
+        // no-op, not an error.
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Failed,
+                seq,
+            },
+            &failures_tx,
+        );
+        assert!(failures_rx.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn wire_write_failure_aborts_the_registered_branch() {
         let quad = Quad {
@@ -3678,6 +4683,7 @@ mod pump_cancel_tests {
             shutdown,
             pump_config(),
             None,
+            false,
         )
         .await;
 
@@ -3722,6 +4728,7 @@ mod pump_cancel_tests {
             shutdown.clone(),
             pump_config(),
             None,
+            false,
         ));
 
         // Deterministic readiness: the branch is registered before the frame
@@ -3763,7 +4770,7 @@ mod pump_cancel_tests {
         let pending = Arc::new(PendingReceipts::new(64));
         let spy = SpyAck::new();
         let ack: StdArc<dyn Ack> = spy.clone();
-        let seq = pending.register(&ack, 1).expect("register within limits");
+        let seq = pending.register(&ack, 1, None).expect("register within limits");
         let (failures_tx, _failures_rx) = flume::bounded::<Error>(8);
 
         pending.apply(ReceiptFrame { kind: ReceiptKind::Acked, seq }, &failures_tx);
@@ -3819,6 +4826,7 @@ mod pump_cancel_tests {
             shutdown,
             pump_config(),
             None,
+            false,
         ));
 
         // The pump registers the branch, writes the frame, then observes the
