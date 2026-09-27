@@ -109,11 +109,40 @@ impl TableProvider for SwapBatchTable {
     }
 }
 
+/// Built-in functions the logical optimizer folds to a literal using the
+/// session's query execution start time. A cached optimized plan would freeze
+/// them at cache time, so queries using them re-optimize every batch.
+const TIME_FOLDING_FUNCTIONS: [&str; 4] = ["now", "current_date", "current_time", "current_timestamp"];
+
+fn expr_folds_time(expr: &LogicalExpr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = expr.apply(&mut |e: &LogicalExpr| {
+        if let LogicalExpr::ScalarFunction(func) = e {
+            if TIME_FOLDING_FUNCTIONS.contains(&func.name().as_ref()) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn plan_folds_time(plan: &LogicalPlan) -> bool {
+    plan.expressions().iter().any(expr_folds_time) || plan.inputs().iter().any(|p| plan_folds_time(p))
+}
+
 /// Per pooled-context fast-path state: the swap table registered under the
-/// configured table name plus the optimized plan cached for its schema.
+/// configured table name plus the plans cached for its schema.
 struct ContextPlanCache {
     table: Arc<SwapBatchTable>,
-    cached: Option<(SchemaRef, Arc<LogicalPlan>)>,
+    /// Analyzed plan; analysis never folds time expressions, so it is always
+    /// safe to reuse while the schema is unchanged.
+    analyzed: Option<(SchemaRef, Arc<LogicalPlan>)>,
+    /// Optimized plan; reused only when the query has no time-folding
+    /// functions, which the optimizer would otherwise freeze at cache time.
+    optimized: Option<(SchemaRef, Arc<LogicalPlan>)>,
 }
 
 /// SQL processor component
@@ -126,6 +155,9 @@ struct SqlProcessor {
     /// Keyed by pooled context address; a context is used by one caller at a
     /// time, so entries are never accessed concurrently for the same key.
     context_caches: std::sync::Mutex<HashMap<usize, ContextPlanCache>>,
+    /// Set once from the first analyzed plan; queries that fold time
+    /// expressions must re-optimize every batch to keep now() fresh.
+    time_dependent: std::sync::OnceLock<bool>,
 }
 
 impl SqlProcessor {
@@ -164,6 +196,7 @@ impl SqlProcessor {
             temporary,
             context_pool,
             context_caches: std::sync::Mutex::new(HashMap::new()),
+            time_dependent: std::sync::OnceLock::new(),
         })
     }
 
@@ -230,8 +263,11 @@ impl SqlProcessor {
     }
 
     /// Fast path without temporary tables: swap the batch into a provider
-    /// registered on the context and reuse the cached optimized plan whenever
-    /// the batch schema is unchanged; only the physical stage re-plans.
+    /// registered on the context and reuse cached plans whenever the batch
+    /// schema is unchanged. The analyzed plan is always cached; the optimized
+    /// plan is cached only when the query cannot fold time expressions into
+    /// the plan (now/current_date/current_time), which would otherwise freeze
+    /// the first batch's timestamp.
     async fn execute_with_cached_plan(
         &self,
         ctx: &Arc<SessionContext>,
@@ -254,7 +290,8 @@ impl SqlProcessor {
                         key,
                         ContextPlanCache {
                             table: table.clone(),
-                            cached: None,
+                            analyzed: None,
+                            optimized: None,
                         },
                     );
                     table
@@ -263,19 +300,22 @@ impl SqlProcessor {
         };
 
         let schema = table.schema();
-        let cached_plan = {
+        let cached_analyzed = {
             let caches = self.context_caches.lock().unwrap();
             caches
                 .get(&key)
-                .and_then(|cache| cache.cached.as_ref())
+                .and_then(|cache| cache.analyzed.as_ref())
                 .filter(|(cached_schema, _)| *cached_schema == schema)
                 .map(|(_, plan)| plan.clone())
         };
 
-        let plan = match cached_plan {
+        // `ctx.state()` refreshes the query execution start time per call, so
+        // optimization below sees the current batch's time, not a stale one.
+        let state = ctx.state();
+
+        let analyzed = match cached_analyzed {
             Some(plan) => plan,
             None => {
-                let state = ctx.state();
                 let plan = state
                     .statement_to_plan(self.statement.clone())
                     .await
@@ -283,20 +323,46 @@ impl SqlProcessor {
                 Self::sql_options()
                     .verify_plan(&plan)
                     .map_err(|e| Error::Process(format!("SQL verification error: {}", e)))?;
-                let optimized = Arc::new(
-                    state
-                        .optimize(&plan)
-                        .map_err(|e| Error::Process(format!("SQL optimize error: {}", e)))?,
-                );
+                let _ = self.time_dependent.set(plan_folds_time(&plan));
+                let plan = Arc::new(plan);
                 let mut caches = self.context_caches.lock().unwrap();
                 if let Some(cache) = caches.get_mut(&key) {
-                    cache.cached = Some((schema, optimized.clone()));
+                    cache.analyzed = Some((schema.clone(), plan.clone()));
+                }
+                plan
+            }
+        };
+
+        let time_dependent = self.time_dependent.get().copied().unwrap_or(false);
+        let cached_optimized = if time_dependent {
+            None
+        } else {
+            let caches = self.context_caches.lock().unwrap();
+            caches
+                .get(&key)
+                .and_then(|cache| cache.optimized.as_ref())
+                .filter(|(cached_schema, _)| *cached_schema == schema)
+                .map(|(_, plan)| plan.clone())
+        };
+
+        let plan = match cached_optimized {
+            Some(plan) => plan,
+            None => {
+                let optimized = Arc::new(
+                    state
+                        .optimize(&analyzed)
+                        .map_err(|e| Error::Process(format!("SQL optimize error: {}", e)))?,
+                );
+                if !time_dependent {
+                    let mut caches = self.context_caches.lock().unwrap();
+                    if let Some(cache) = caches.get_mut(&key) {
+                        cache.optimized = Some((schema, optimized.clone()));
+                    }
                 }
                 optimized
             }
         };
 
-        let state = ctx.state();
         let physical = state
             .query_planner()
             .create_physical_plan(&plan, &state)
@@ -872,6 +938,57 @@ mod tests {
                 _ => panic!("Expected single result"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_now_advances_across_batches() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT now() as ts FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let ts_of = || async {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            match processor
+                .process(Arc::new(MessageBatch::new_arrow(batch)))
+                .await
+                .unwrap()
+            {
+                ProcessResult::Single(batch) => batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(0),
+                _ => panic!("Expected single result"),
+            }
+        };
+
+        let first = ts_of().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = ts_of().await;
+        // A cached optimized plan must not freeze now() at cache time.
+        assert!(
+            second - first >= 40_000_000,
+            "now() did not advance across batches: {first} -> {second}"
+        );
     }
 
     #[tokio::test]
