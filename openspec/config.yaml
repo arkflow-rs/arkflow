@@ -32,3 +32,4 @@ rules:
   tasks:
     - Group by phase (one top-level section per phase).
     - Each sub-task should be ≤ 2 hours and verifiable (a test, clippy, or a command check).
+    - A change with a user-visible surface (new config field, new component, changed semantics) MUST include docs tasks covering docs/docs/ and the zh-Hans counterpart before archiving.

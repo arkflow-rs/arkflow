@@ -91,14 +91,73 @@ rows.
 business-level idempotency, or an idempotent sink (e.g. UPSERT). Design your
 downstream consumers accordingly.
 
-True end-to-end exactly-once that closes this window — committing the source
-offset *inside* the producer transaction via `send_offsets_to_transaction`
-(Kafka → Kafka only) — is **future work (L3)** and not provided today.
+That residual window — a crash between producer commit and source offset
+commit — is what **L3** closes. Configure the paired Kafka input and output to
+commit the source offset *inside* the producer transaction via
+`send_offsets_to_transaction`:
+
+```yaml validate=fragment wrap=input
+input:
+  type: kafka
+  brokers:
+    - localhost:9092
+  topics:
+    - orders
+  consumer_group: orders-copy-group
+  start_from_latest: false
+  transactional_offsets: true
+```
+
+```yaml validate=fragment wrap=output
+output:
+  type: kafka
+  brokers:
+    - localhost:9092
+  topic:
+    type: value
+    value: orders-copy
+  exactly_once: true
+  transactional_id: arkflow-orders-copy-0
+  offset_commit_group: orders-copy-group   # must name the input's consumer_group
+```
+
+- **Input `transactional_offsets: true`** registers the consumer group's
+  metadata in a process-internal registry and changes `ack()` to advance only
+  the in-memory frontier — the input no longer commits offsets itself; broker
+  group offsets advance only with output transactions.
+- **Output `offset_commit_group`** (requires `exactly_once: true`) derives the
+  covered offsets from each batch's `__meta_partition`/`__meta_offset` columns
+  (max offset + 1 per partition) and folds them into the same transaction as
+  the writes, so a `read_committed` consumer of the source group observes
+  writes and offset advances atomically. A rolled-back transaction leaves the
+  group offsets unchanged and the range is replayed.
+
+L3 boundaries, enforced by explicit errors rather than silent degradation:
+
+- **Process-internal pairing** — the output resolves the named group through
+  the in-process registry; the input and output must run in the same ArkFlow
+  process. Distributed jobs that split input and output across nodes are not
+  covered (independent change). An `offset_commit_group` naming a group with no
+  live `transactional_offsets` input fails the write.
+- **Single input topic** — batch metadata carries partitions without topics, so
+  the registry routes by the input's topic list; a multi-topic subscription is
+  rejected.
+- **Kafka → Kafka only** — a batch without Kafka source metadata columns
+  contributes no offsets (the writes still proceed); non-Kafka sources cannot
+  pair with the transactional output.
+
+A complete runnable L3 example is in
+[`examples/eos-kafka-l3.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/eos-kafka-l3.yaml)
+(`examples/eos-kafka.yaml` shows the L2-only variant).
 
 ## Requirements summary
 
 - `exactly_once: true` requires a non-empty `transactional_id`; validation fails
   with a clear error otherwise.
+- `offset_commit_group` requires `exactly_once: true`; the builder rejects the
+  configuration otherwise. The named group must have a same-process Kafka input
+  with `transactional_offsets: true`, or the write fails with a configuration
+  error.
 - The WAL's object-store `node_id` and the Kafka `transactional_id` are
   **independent** configuration values — neither is derived from the other.
 - Outputs other than the transactional Kafka output keep today's default

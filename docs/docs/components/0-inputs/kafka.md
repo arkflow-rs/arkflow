@@ -22,6 +22,7 @@ The Kafka input consumes messages from one or more Apache Kafka topics using a c
 | fetch_max_partition_bytes | integer | no | — | Maximum bytes returned per partition in a single fetch |
 | fetch_wait_max_ms | integer | no | — | Maximum time (ms) the broker waits for enough data to accumulate before responding |
 | security | object | no | — | SASL authentication and TLS settings; omit entirely for plaintext. See [Security](#security) |
+| transactional_offsets | boolean | no | `false` | L3 exactly-once: register this consumer group for in-transaction offset commits by a paired Kafka output's `offset_commit_group`. `ack()` then advances only the in-memory frontier — broker group offsets advance exclusively inside the output's producer transactions. |
 
 ## Security
 
@@ -140,3 +141,4 @@ input:
 - Messages automatically carry metadata columns such as `__meta_source`, `__meta_partition`, `__meta_offset`, `__meta_key`, `__meta_timestamp`, and `__meta_ingest_time`, plus the extended `__meta_ext.topic`.
 - Each Kafka record header becomes a `header_<key>` entry inside the `__meta_ext` map. Duplicate header keys keep every value: the first occurrence uses the plain `header_<key>` name and later occurrences get positional suffixes (`header_<key>_2`, `header_<key>_3`, …). Values are decoded as UTF-8 with invalid bytes replaced by U+FFFD; headers without a value map to an empty string.
 - Offsets are advanced via `store_offset` only when `ack()` is called (after a successful downstream write), combined with periodic auto-commit to achieve at-least-once delivery.
+- With `transactional_offsets: true`, `ack()` advances the in-memory frontier only and skips `store_offset`: broker group offsets commit inside the paired transactional Kafka output's transactions (`offset_commit_group` naming this input's `consumer_group`), eliminating the commit-then-crash duplicate window. The pairing is process-internal and expects a single-topic subscription — see [Exactly-once processing](../../build/exactly-once.md).

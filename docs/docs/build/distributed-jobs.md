@@ -155,6 +155,70 @@ a newer Job version is allowed when the state format matches** (a newer
 version can restore an older savepoint); downgrades and format changes have no
 migration path and are rejected on both sides.
 
+### Rescaling on recovery
+
+Recovery validates the recovery artifact's recorded task set against the
+currently compiled plan **before** restoring state. A mismatch — a changed
+`parallelism` or operator topology — fails closed with a configuration error
+that names the task-set difference (removed/added tasks) and offers two ways
+out: restore the original parallelism, or reset state with a fresh
+checkpoint/savepoint. Nothing silently continues with empty state. Stateless
+jobs have no artifact to compare and simply compile under the new
+parallelism.
+
+Declaring `rescale: true` on the JobSpec opts into redistribution instead:
+
+```yaml validate=fragment wrap=engine
+jobs:
+  - id: orders-rollup
+    version: 1
+    rescale: true
+    parallelism: 4        # was 1 when the checkpoint was written
+    max_parallelism: 128  # keep unchanged so key-group ownership stays stable
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: e1
+        from: source
+        to: sink
+        partitioned: true
+    sources:
+      - operator_id: source
+        input_type: kafka
+        config:
+          type: kafka
+          brokers: ["localhost:9092"]
+          topics: ["orders"]
+          consumer_group: orders-rollup
+          start_from_latest: false
+        codec:
+          type: json
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+    state:
+      backend: embedded_kv
+      format_version: 1
+    recovery: latest_checkpoint
+```
+
+With `rescale: true`, keyed state entries from the artifact are redistributed
+across the new task set: the routing key is recovered from each entry's
+encoded key (window entries skip the 8-byte window start; stateful-operator
+entries strip the type prefix), ownership is computed as
+`key_group_for_key(key, max_parallelism)`, and the entry is rewritten into the
+namespace of the task that owns that key group in the new plan. Keys and
+values are preserved byte-for-byte; an entry whose key encoding cannot be
+recognized fails recovery explicitly rather than being assigned by guesswork.
+Rescaling is a recovery-time operation — it takes effect on the restore path,
+not on a topology change of a running job (use
+[placement rebalance](#resource-aware-placement-and-rebalancing) for that).
+
 ## Control plane and compatibility
 
 The Hub persists jobs, versions, task assignments, and recovery records, and
@@ -279,6 +343,32 @@ failure fails engine startup instead of announcing readiness while broken.
 Temporary resources, sources, and sinks are connected in dependency order
 before any task loop starts, and a partial startup closes the connected
 resources in reverse order.
+
+### Network edges: transparent reconnect and fail-closed
+
+Cross-node (network shuffle) edges are fail-closed by contract: a lost
+connection, a protocol or authentication failure, or a resource-limit overflow
+fails the affected Job attempt and cleans up both ends of the edge — the
+attempt is then re-placed under generation fencing, never left half-open to
+produce or drop data.
+
+Transient network failures are absorbed first. Within a bounded redial budget
+(5 attempts with backoff by default), the upstream side redials the peer and
+replays every not-yet-acknowledged data frame; the receiving side de-duplicates
+by delivery sequence (a replayed frame at or below the highest delivered seq is
+dropped and re-acked, which is idempotent on both sides), so the job continues
+without a failure report. When the budget is exhausted — or the error is
+deterministic and would replay identically, such as an illegal frame or failed
+authentication — the edge fails closed instead.
+
+Acknowledgement mirrors across remote edges: a source ack completes only after
+**all** downstream copies acknowledge, and a downstream processing failure
+sends a `Failed` receipt that aborts the upstream fan-out branch immediately
+(via the same compensation path as local branches) rather than waiting for a
+barrier-drain timeout. If a receipt is lost entirely — the downstream node
+crashes between processing and acknowledging — the pending ack never
+completes, that checkpoint fails closed, and recovery replays from the last
+sealed cut (at-least-once).
 
 ### Stream-stream join
 

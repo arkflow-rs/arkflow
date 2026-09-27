@@ -96,6 +96,10 @@ Key points:
   rejected until a dedicated distributed multi-input runtime exists.
 - Event-time sources declare `mode`, a `timestamp_field`, watermark
   parameters, and a late-event policy (`drop`, `route`, or `update`).
+- `rescale: true` (default `false`) opts into rescaling recovery: a restart
+  under a changed `parallelism` (or task set) redistributes keyed state by
+  key-group ownership instead of failing closed. See
+  [Distributed Jobs → Rescaling on recovery](distributed-jobs.md#rescaling-on-recovery).
 
 ### Validate and run
 

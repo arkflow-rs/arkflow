@@ -22,32 +22,22 @@ Define the configuration, SQL generation and upsert semantics, vector/payload co
 
 ### Requirement: SQL 生成与 upsert 语义
 
-output SHALL 以 `sqlx::QueryBuilder<Postgres>` 生成参数化 INSERT：列布局为 `[id_field?, vector_field, payload_field?]`，向量占位符后跟 `::vector` cast、payload 占位符后跟 `::jsonb` cast，标识符双引号包裹。配置 `id_field` 时 SHALL 追加 `ON CONFLICT ("<id>") DO UPDATE SET` 更新全部非键列（`EXCLUDED` 形式）；未配置则只 INSERT。向量 SHALL 接受 FixedSizeList(Float32)/List(Float32) 并序列化为 pgvector 文本格式 `[v1,v2,...]`；payload SHALL 为除向量/ID 列外所有列按行打包的 JSON 对象（字段名=列名），禁用时省略该列。
+INSERT 语句 SHALL 按参数化绑定生成（id/vector/payload 各占一个绑定），并 SHALL 按行分块使单条语句的绑定参数总数不超过 Postgres 的 65,535 上限（按当前列组合计算每行绑定数，块内行数取不超过上限的最大值）；各块顺序执行，任一块失败 SHALL 停止并返回错误。SQL 标识符（表名与列名）SHALL 以双引号引用且将标识符内的 `"` 转义为 `""`，含引号的标识符 SHALL NOT 破坏语句结构或改变目标对象。
 
-#### Scenario: 全列 INSERT 语句形状
+#### Scenario: 大批量按绑定上限分块
 
-- **WHEN** 配置 `table: documents`、`id_field: doc_id`，输入含向量列（2 维）与 `text` 列
-- **THEN** 生成 SQL 为 `INSERT INTO "documents" ("doc_id", "embedding", "payload") VALUES ($1, $2::vector, $3::jsonb)` 形状，绑定值依次为 id、`[1.0,2.0]` 形式的向量文本、含 `"text"` 键的 JSON 对象
+- **WHEN** 配置 id_field 与 payload_field（每行 3 个绑定）且输入 batch 含 30,000 行
+- **THEN** 生成的每条 INSERT 语句绑定数不超过 65,535，语句按行序顺序执行，全部成功时输出成功返回
 
-#### Scenario: 未配置 id_field 时仅 INSERT
+#### Scenario: 单小批仍为单语句
 
-- **WHEN** 未配置 `id_field`
-- **THEN** 生成 SQL 不含 `ON CONFLICT`，列布局为 `[embedding, payload]`
+- **WHEN** 输入 batch 含 2 行且配置 id_field 与 payload_field
+- **THEN** 单条 INSERT 语句含 6 个绑定参数
 
-#### Scenario: 禁用 payload 列
+#### Scenario: 标识符内嵌引号被转义
 
-- **WHEN** 配置 `payload_field: ""`
-- **THEN** 生成 SQL 只含 id 与向量两列，无 `::jsonb` cast
-
-#### Scenario: upsert 冲突子句更新全部非键列
-
-- **WHEN** 配置 `id_field: doc_id`
-- **THEN** `ON CONFLICT ("doc_id") DO UPDATE SET "embedding" = EXCLUDED."embedding", "payload" = EXCLUDED."payload"`
-
-#### Scenario: 批量多行一次执行
-
-- **WHEN** 输入 batch 含 3 行
-- **THEN** 生成一条含 3 组 VALUES 元组的 INSERT 并单次执行
+- **WHEN** 配置 `table: odd"table`、`vector_field: em"bedding`
+- **THEN** 生成 SQL 中标识符以 `"odd""table"`、`"em""bedding"` 形式引用，语句可被 Postgres 解析为对应对象
 
 ### Requirement: 输入校验与错误语义
 

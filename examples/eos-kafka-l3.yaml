@@ -1,0 +1,58 @@
+# End-to-end exactly-once with in-transaction source-offset commit (L3): Kafka → Kafka.
+#
+# L3 closes the residual L2 window (crash between producer commit and source
+# offset auto-commit) by folding the source offsets into the same producer
+# transaction via send_offsets_to_transaction:
+#
+#   input  -> transactional_offsets: true  (ack advances the in-memory frontier
+#             only; broker group offsets advance exclusively via the output)
+#   output -> offset_commit_group: <group>  (requires exactly_once; commits the
+#             offsets derived from __meta_partition/__meta_offset inside the
+#             transaction)
+#
+# Both sides MUST run in the same ArkFlow process and reference the same
+# consumer group; the input subscribes to a single topic. After an L3
+# transaction commits, a new consumer in the same group does not re-receive
+# the committed range; a rolled-back transaction leaves group offsets
+# unchanged and the range is replayed.
+#
+# `durability:` still persists input messages to a WAL so a crash between
+# read and output does not lose data.
+#
+# See examples/eos-kafka.yaml for the L2 (transactional output only) variant.
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topics:
+        - orders
+      consumer_group: arkflow-eos-l3
+      start_from_latest: false
+      transactional_offsets: true
+
+    durability:
+      enabled: true
+      path: "./data/wal-eos-l3"
+      sync: group_commit
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: arrow_to_json
+
+    output:
+      type: kafka
+      brokers:
+        - localhost:9092
+      topic:
+        type: value
+        value: orders-copy
+      exactly_once: true
+      transactional_id: arkflow-orders-copy-l3-0   # stable across restarts; unique per producer
+      offset_commit_group: arkflow-eos-l3          # must equal the input's consumer_group
