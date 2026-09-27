@@ -13,7 +13,7 @@
 # Honest L2 boundary: a crash AFTER the producer commits but BEFORE the source
 # offset auto-commits can still duplicate (window bounded by the auto-commit
 # interval). A downstream dedup key is recommended for duplicate-intolerant
-# consumers; true end-to-end EOS (L3, send_offsets_to_transaction) is future work.
+# consumers; closing that window entirely is L3 — see eos-kafka-l3.yaml.
 #
 # `durability:` persists input messages to a WAL so a crash between read and
 # output does not lose data.

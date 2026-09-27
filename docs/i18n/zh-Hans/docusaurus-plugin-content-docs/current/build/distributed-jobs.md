@@ -89,6 +89,53 @@ Kafka 检查点位置是每个 topic-partition 的**最高连续已确认偏移�
 
 只有携带完整计划任务集的 manifest 才会封存为 Completed:缺失、重复或多余的任务条目都会被拒绝,而节点离线期间会保留最后一个有效恢复点。**状态格式匹配时允许升级到更新的作业版本**(新版本可以恢复旧的 savepoint);降级与格式变更没有迁移路径,双方都会拒绝。
 
+#### 恢复期扩缩容
+
+恢复会在还原状态**之前**校验恢复工件记录的任务集与当前编译计划的任务集。不一致——变更了 `parallelism` 或算子拓扑——会保守失败,给出指明任务集差异(移除/新增任务)的配置错误,并提供两条出路:恢复原并行度,或用新的 checkpoint/savepoint 重置状态。绝不会带着空状态静默继续。无状态作业完全不产出恢复工件——manifest 封存校验拒绝空状态快照,本地恢复选择也仅作用于带持久状态的计划——因此无状态作业直接按新并行度编译运行。
+
+在 JobSpec 上声明 `rescale: true` 即选择重分布而非失败——仅支持保存状态中涉及的算子在新计划中全部保留的任务集变更(并行度调整符合;移除有状态算子不符合,会显式失败):
+
+```yaml validate=fragment wrap=engine
+jobs:
+  - id: orders-rollup
+    version: 1
+    rescale: true
+    parallelism: 4        # was 1 when the checkpoint was written
+    max_parallelism: 128  # keep unchanged so key-group ownership stays stable
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: e1
+        from: source
+        to: sink
+        partitioned: true
+    sources:
+      - operator_id: source
+        input_type: kafka
+        config:
+          type: kafka
+          brokers: ["localhost:9092"]
+          topics: ["orders"]
+          consumer_group: orders-rollup
+          start_from_latest: false
+        codec:
+          type: json
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+    state:
+      backend: embedded_kv
+      format_version: 1
+    recovery: latest_checkpoint
+```
+
+`rescale: true` 时,工件中的 keyed 状态条目跨新任务集重分布:路由键从每个条目的编码键还原(窗口条目跳过 8 字节窗口起点;有状态算子条目剥除类型前缀),归属按 `key_group_for_key(key, max_parallelism)` 计算,条目被改写进新计划中拥有该键组的任务的命名空间。键与值逐字节保留;键编码无法识别的条目会让恢复显式失败,而不是猜测性归属。扩缩容是恢复期操作——只在恢复路径上生效,不作用于运行中作业的拓扑变更(那要用[资源感知再均衡](#资源感知放置与再均衡))。
+
 ## 控制平面与兼容性
 
 Hub 持久化作业、版本、任务分配与恢复记录,并使用 generation 防止陈旧的任务报告覆盖更新的意图。Agent 通过能力声明确认作业运行时、状态后端与检查点协议版本。旧式 `Stream` YAML API 既不转换也不移除,继续在原有路径上运行。
@@ -143,6 +190,14 @@ jobs:
 ### 失败与就绪语义
 
 每个校验入口(`--validate`、配置 API、YAML 中声明的本地作业以及编译后的流)都执行与真实启动相同的无副作用深度构建:未知组件、不支持的状态后端与非法图边在校验期失败,而不是在运行时。dry run 打开的 WAL 会在其返回前关闭,同一 redb 路径可以立即被真实运行时重新打开。进入 `Starting` 之后,dry run、图构建或资源连接失败的运行时会在错误返回前转换为 `Failed`;本地作业构建失败会让引擎启动失败,而不是在损坏状态下宣告就绪。临时资源、源与 sink 按依赖顺序在任何任务循环启动之前连接,部分启动则以相反顺序关闭已连接的资源。
+
+### 网络边:透明重连与保守失败
+
+跨节点(网络 shuffle)边按契约保守失败(fail-closed):连接断开、协议或认证失败、资源上限溢出都会使受影响的作业 attempt 失败并清理边的两端——attempt 随后在世代围栏(generation fencing)下被重新放置,绝不会停留在半开状态继续产出或丢弃数据。
+
+瞬时网络故障会先被吸收。在有界重拨预算内(默认 5 次、带退避),上游侧重拨对端并重放全部尚未回执的数据帧;接收侧按投递序号去重(序号不大于已投递最大 seq 的重放帧被丢弃并补发 Acked,两侧均为幂等),因此作业继续运行而不产生失败上报。确定性错误(非法帧、认证失败)在预算内同样会被重拨——重放必然复现,因此它们只是消耗预算,耗尽后该边才转为保守失败。
+
+确认(ack)跨远程边镜像:源 ack 只有在**所有**下游副本回执齐备后才完成;下游处理失败会回发 `Failed` 回执,上游立即中止对应的 fan-out 分支(走与本地分支相同的补偿路径),而不是等待屏障排空超时。若回执彻底丢失——下游节点在处理完成与回执发出之间崩溃——挂起的 ack 永不完成,该轮检查点保守失败,恢复时从上一个封存切面重放(至少一次)。
 
 ### 双流 join
 

@@ -82,6 +82,7 @@ jobs:
 - `partitioned: true` 按键组归属路由,因此同一个 key 总会到达同一个下游任务,无论它来自哪个源分区或上游子任务。
 - 算子 `kind` 是 `source`、`map`、`filter`、`aggregate`、`window`、`sink` 或 `udf` 之一。`join` 在公开结构中保留,但在专门的分布式多输入运行时出现之前会被拒绝。
 - 事件时间源需声明 `mode`、`timestamp_field`、水位线参数与迟到事件策略(`drop`、`route` 或 `update`)。
+- `rescale: true`(默认 `false`)显式选择扩缩容恢复:在变更了 `parallelism`(或保存状态中的算子在新计划中全部保留的任务集)的情况下重启,按键组归属重分布 keyed 状态,而不是保守失败。参见[分布式 Job → 恢复期扩缩容](/zh-Hans/docs/build/distributed-jobs#恢复期扩缩容)。
 
 ### 校验并运行
 

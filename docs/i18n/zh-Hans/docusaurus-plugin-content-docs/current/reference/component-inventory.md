@@ -35,20 +35,28 @@ description: 供文档检查使用的受支持组件清单(inventory)。
 | output | `http` | 把每个批次 POST 到一个 HTTP 端点。支持自定义头部、重试与认证。 | [参考](/zh-Hans/docs/components/outputs/http) |
 | output | `influxdb` | 使用 Line Protocol 把时间序列数据写入 InfluxDB v2.x。 | [参考](/zh-Hans/docs/components/outputs/influxdb) |
 | output | `kafka` | 向 Apache Kafka 生产消息。支持按键分区与压缩。 | [参考](/zh-Hans/docs/components/outputs/kafka) |
+| output | `milvus` | 经 REST v2 vectordb API 把批次行 upsert 进 Milvus 集合:Float32 列表列作为向量,其余列打包为 JSON payload 字段,可选的 id 列作为行键。 | [参考](/zh-Hans/docs/components/outputs/milvus) |
 | output | `mongodb` | 把 Arrow 行以 BSON 文档写入 MongoDB。 | [参考](/zh-Hans/docs/components/outputs/mongodb) |
 | output | `mqtt` | 向 MQTT broker 主题发布消息。 | [参考](/zh-Hans/docs/components/outputs/mqtt) |
 | output | `nats` | 发布到 NATS:普通 subject 或 JetStream 流。 | [参考](/zh-Hans/docs/components/outputs/nats) |
+| output | `pgvector` | 把批次行 upsert 进启用 pgvector 扩展的 PostgreSQL 表:Float32 列表列作为向量,其余列打包为 jsonb payload,可选的 id 列作为 ON CONFLICT upsert 的键。 | [参考](/zh-Hans/docs/components/outputs/pgvector) |
 | output | `pulsar` | 向 Apache Pulsar 主题生产消息。 | [参考](/zh-Hans/docs/components/outputs/pulsar) |
+| output | `qdrant` | 经 REST API 把批次行作为 Qdrant 点(point)upsert:一个向量列、可选的 id 列,其余全部列作为 payload。 | [参考](/zh-Hans/docs/components/outputs/qdrant) |
 | output | `redis` | 把消息写入 Redis:stream、list 或 pub/sub 通道。 | [参考](/zh-Hans/docs/components/outputs/redis) |
 | output | `sql` | 把记录批量插入 MySQL 或 PostgreSQL 数据库,支持可选的 upsert(ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE)以实现幂等写入。 | [参考](/zh-Hans/docs/components/outputs/sql) |
 | output | `stdout` | 把每条消息写到控制台。适用于调试与演示。 | [参考](/zh-Hans/docs/components/outputs/stdout) |
 | processor | `arrow_to_json` | 把 Arrow RecordBatch 转换为 JSON 字节负载(每行一个)。 | [参考](/zh-Hans/docs/components/processors/json) |
 | processor | `arrow_to_protobuf` | 把 Arrow RecordBatch 序列化为 Protobuf 线路格式字节。 | [参考](/zh-Hans/docs/components/processors/protobuf) |
 | processor | `batch` | 在转发前按条数、大小或时间间隔对消息分批。 | [参考](/zh-Hans/docs/components/processors/batch) |
+| processor | `embedding` | 通过 OpenAI 兼容的 embeddings API 对文本列做批量向量化,并把向量追加为 FixedSizeList(Float32) 列。 | [参考](/zh-Hans/docs/components/processors/embedding) |
 | processor | `json_to_arrow` | 把 JSON 字节负载解析为推断出 schema 的 Arrow RecordBatch。 | [参考](/zh-Hans/docs/components/processors/json) |
+| processor | `llm` | 把文本列的每一行发送到 OpenAI 兼容的 chat completions API,并把补全结果追加为 Utf8 列,采用有界且保序的并发。 | [参考](/zh-Hans/docs/components/processors/llm) |
+| processor | `milvus_search` | 在 Milvus 集合中检索每行向量的 top-k 最近邻,并把匹配结果追加为 JSON 数组文本列。逐行检索采用有界、保序的并发。 | [参考](/zh-Hans/docs/components/processors/milvus-search) |
+| processor | `pgvector_search` | 在启用 pgvector 扩展的 PostgreSQL 表中检索每行向量的 top-k 最近邻,并把匹配结果追加为 JSON 数组文本列。 | [参考](/zh-Hans/docs/components/processors/pgvector-search) |
 | processor | `protobuf_to_arrow` | 把 Protobuf 线路格式字节解码为 Arrow RecordBatch。 | [参考](/zh-Hans/docs/components/processors/protobuf) |
 | processor | `python` | 对每个批次运行用户自定义的 Python 函数(带 PyArrow)。 | [参考](/zh-Hans/docs/components/processors/python) |
 | processor | `sql` | 对每个批次运行 DataFusion SQL 查询。支持窗口函数以及与临时表的 join。 | [参考](/zh-Hans/docs/components/processors/sql) |
+| processor | `vector_search` | 在 Qdrant 集合中检索每行向量的 top-k 最近邻,并把匹配结果追加为 JSON 数组文本列。 | [参考](/zh-Hans/docs/components/processors/vector-search) |
 | processor | `vrl` | 对每个批次运行 Vector Remap Language(VRL)程序,实现安全的变换与富化。 | [参考](/zh-Hans/docs/components/processors/vrl) |
 | temporary | `redis` | 以 Redis 为后端的临时查找存储(单节点或集群),通过 codec 读取。 | [参考](/zh-Hans/docs/components/temporary/redis) |
 

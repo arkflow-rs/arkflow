@@ -22,9 +22,9 @@ Each completed checkpoint SHALL identify the Job version, task assignments, comp
 - **WHEN** adjacent stateless processors are represented by one execution chain and local recovery persists a checkpoint
 - **THEN** the manifest records every logical planned task through the chain mapping and the checkpoint passes exact task-set validation after restart
 
-#### Scenario: A stateless Job uses a non-default state format
+#### Scenario: A stateful Job with empty task state entries uses a non-default state format
 
-- **WHEN** local recovery is enabled for a Job configured with state format `N` greater than 1 but no task has state entries
+- **WHEN** local recovery is enabled for a stateful Job configured with state format `N` greater than 1 but no task has state entries (each task still contributes a snapshot reference, so the manifest is not stateless-empty)
 - **THEN** the checkpoint manifest records format `N` rather than the empty-snapshot default format 1
 
 ### Requirement: Incomplete checkpoints SHALL NOT be recoverable
@@ -107,7 +107,7 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 ### Requirement: 恢复工件的任务集兼容性 SHALL 在恢复前校验
 
-带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致；无状态作业无恢复工件可比对，不受影响。
+带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致。无状态作业不产出可恢复工件：封存校验拒绝无状态快照的 manifest，本地恢复选择也仅作用于带持久状态的计划，因此无状态作业不触发该校验，变更并行度后按新并行度直接编译运行。
 
 #### Scenario: 变更并行度后恢复显式失败
 
@@ -122,11 +122,11 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 #### Scenario: 无状态作业变更并行度
 
 - **WHEN** 一个无状态作业变更并行度重启
-- **THEN** 不触发该校验，作业按新并行度正常编译运行
+- **THEN** 不触发该校验（无状态作业不产出可恢复工件），作业按新并行度正常编译运行
 
 ### Requirement: 声明 rescale 的恢复 SHALL 按 key-group 重分布 keyed 状态
 
-`rescale: true` 的 Job 在恢复工件任务集与当前计划不一致时 SHALL 重分布快照条目：从条目命名空间解析算子，从状态键按算子编码白名单（窗口：跳过 8 字节 window_start 取 utf8 键；StatefulOperator：剥类型前缀，整数大端/utf8/binary 原样；`null:<tag>` 哨兵整条）还原**路由哈希输入**，以 `key_group_for_key(输入, max_parallelism)` 计算归属，把条目命名空间重写为新 plan 中拥有该 key-group 的任务。键与值逐字节保留。无法识别的键编码 SHALL 显式失败。
+`rescale: true` 的 Job 在恢复工件任务集与当前计划不一致时 SHALL 重分布快照条目：从条目命名空间解析算子，从状态键按算子编码白名单（窗口：跳过 8 字节 window_start 取 utf8 键；StatefulOperator：剥类型前缀，整数大端/utf8/binary 原样；`null:<tag>` 哨兵整条）还原**路由哈希输入**，以 `key_group_for_key(输入, max_parallelism)` 计算归属，把条目命名空间重写为新 plan 中拥有该 key-group 的任务。键与值逐字节保留。无法识别的键编码、或条目所属算子不存在于新计划时，SHALL 显式失败（重分布仅支持保留原有状态算子的任务集变更，如并行度调整）。
 
 #### Scenario: stateful 条目按新归属落位
 

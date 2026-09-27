@@ -4,7 +4,7 @@
 TBD - created by archiving change add-control-plane. Update Purpose after archive.
 ## Requirements
 ### Requirement: Configuration validation
-The system SHALL validate candidate configuration syntax, Stream and Job identity constraints, component configuration, state backend construction, and Stream/Job graph construction before applying it. Validation SHALL not merely call `JobSpec::validate`; it SHALL exercise the same side-effect-free deep-build path used before runtime startup.
+The system SHALL validate candidate configuration syntax, Stream and Job identity constraints, component configuration, state backend construction, and Stream/Job graph construction before applying it. Validation SHALL not merely call `JobSpec::validate`; it SHALL exercise the same side-effect-free deep-build path used before runtime startup. The validation endpoint SHALL require the same operator authorization as configuration application: an unauthenticated request SHALL be rejected with 401 and SHALL NOT trigger secret-reference resolution, component construction, or any other validation work on the submitted content.
 
 #### Scenario: Valid candidate
 - **WHEN** a client submits a syntactically valid configuration whose Streams, Jobs, components, and local backends can be built
@@ -13,6 +13,10 @@ The system SHALL validate candidate configuration syntax, Stream and Job identit
 #### Scenario: Invalid candidate
 - **WHEN** a candidate has malformed configuration, duplicate Stream or Job ID, an unknown component, an unsupported backend, an invalid graph, or invalid WAL settings
 - **THEN** validation returns structured errors and does not change the running configuration
+
+#### Scenario: Unauthenticated validation is rejected
+- **WHEN** a client submits a candidate to the validation endpoint without a valid operator credential while the control plane requires authorization
+- **THEN** the endpoint returns 401 and performs no parsing, secret-reference resolution, or component construction on the submitted content
 
 ### Requirement: Versioned configuration application
 The system SHALL persist successful configuration versions and SHALL apply only the Streams affected by a configuration change.
@@ -44,11 +48,19 @@ The system SHALL allow an operator to select a previously successful configurati
 - **THEN** the selected version is validated and applied, and a new current-version record identifies the rollback operation
 
 ### Requirement: Secret redaction
-Configuration read APIs and diagnostic responses SHALL redact configured credential, token, password, and secret fields by default.
+Configuration read APIs and diagnostic responses SHALL redact configured credential, token, password, and secret fields by default. Redaction SHALL additionally cover credentials embedded in URL-shaped string values: for a value of the form `scheme://user:password@host/...`, the password segment SHALL be replaced by the redaction marker while scheme, user, and host remain readable. URLs without an embedded userinfo component SHALL NOT be altered.
 
 #### Scenario: Read sensitive configuration
 - **WHEN** a client requests the current configuration
 - **THEN** sensitive values are replaced by a redaction marker and are not returned in plaintext
+
+#### Scenario: URL with embedded credentials is masked
+- **WHEN** the configuration contains a field whose value is `postgres://admin:hunter2@db.internal:5432/vectors` and the field is returned by a read API
+- **THEN** the response contains `postgres://admin:******@db.internal:5432/vectors` and the literal password never appears
+
+#### Scenario: Plain URL passes through untouched
+- **WHEN** the configuration contains a field whose value is `http://qdrant.internal:6333`
+- **THEN** the value is returned unchanged
 
 ### Requirement: Validation resources SHALL be released before real startup
 The configuration validator SHALL close any temporary WAL, temporary component, state backend, and connector handle created during deep validation before the candidate is rebuilt for actual execution.
@@ -56,4 +68,15 @@ The configuration validator SHALL close any temporary WAL, temporary component, 
 #### Scenario: Durable candidate is validated and started
 - **WHEN** a durability-enabled candidate passes dry-run validation and is immediately started
 - **THEN** the validation WAL has been flushed and closed, the real runtime can reopen the same path, and no exclusive-lock failure is caused by the validator
+
+### Requirement: Version identifiers SHALL be validated
+The configuration version store SHALL validate caller-supplied version identifiers before using them in filesystem paths: an identifier SHALL be rejected (not-found error class) when it is empty, longer than 128 characters, contains characters outside `[A-Za-z0-9._-]`, or contains a `..` sequence. Generated identifiers (timestamp-sequence) SHALL satisfy the same constraint.
+
+#### Scenario: Traversal identifier is rejected
+- **WHEN** a client requests a configuration diff or rollback with a version id containing a path separator or `..` (e.g. `../../secrets`)
+- **THEN** the request fails with a not-found class error and no file outside the version store root is read or written
+
+#### Scenario: Legitimate identifier resolves
+- **WHEN** a client requests a previously stored version by its generated id (e.g. `1737500000000-0`)
+- **THEN** the stored version is returned
 

@@ -32,7 +32,7 @@ CREATE TABLE documents (
 );
 ```
 
-Each batch produces one parameterized statement; vectors are bound as text
+Batches produce parameterized INSERT statements chunked so each stays under the Postgres 65,535-bind limit; vectors are bound as text
 with an explicit `::vector` cast and the payload as `::jsonb`:
 
 ```sql

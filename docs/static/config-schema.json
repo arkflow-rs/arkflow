@@ -2579,7 +2579,7 @@
             },
             "id_field": {
               "type": "string",
-              "description": "Field carrying the row id (integer or string). When omitted the id key is left out (auto-id collections)."
+              "description": "Field carrying the row id (integer or string). Required: the upsert API needs a primary key per row (auto-id collections are not supported)."
             },
             "payload_field": {
               "type": "string",

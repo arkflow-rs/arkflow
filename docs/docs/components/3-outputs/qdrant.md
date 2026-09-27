@@ -24,7 +24,7 @@ The `qdrant` output upserts each batch's rows as [Qdrant](https://qdrant.tech/) 
 
 ## Semantics
 
-- Writes use `PUT /collections/{collection}/points?wait=true` — one request per batch.
+- Writes use `PUT /collections/{collection}/points?wait=true` — one bounded request per slice of at most 1,000 points; larger batches are split sequentially.
 - Upserts are idempotent per point id: with an `id_field`, redelivery overwrites the same point (at-least-once friendly); without one, a fresh UUID is generated per row, so every attempt inserts a new point.
 - The vector's dimension must match the collection's; mismatches are returned by Qdrant as a 4xx and fail the batch (routed to `error_output` when configured).
 - Requests to loopback endpoints (a local Qdrant instance) always bypass the system proxy.

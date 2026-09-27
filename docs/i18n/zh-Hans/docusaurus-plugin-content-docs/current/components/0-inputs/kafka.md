@@ -22,6 +22,7 @@ Kafka 输入(Input)使用消费者组(consumer group)从一个或多个 Apache K
 | fetch_max_partition_bytes | integer | no | — | 单次拉取中每个分区返回的最大字节数 |
 | fetch_wait_max_ms | integer | no | — | broker 在响应前等待足够数据累积的最长时间(毫秒) |
 | security | object | no | — | SASL 认证与 TLS 设置;完全省略即为明文。见[安全配置](#安全配置) |
+| transactional_offsets | boolean | no | `false` | L3 精确一次:为配对 Kafka 输出的 `offset_commit_group` 注册本消费者组以在事务内提交位点。此时 `ack()` 只推进内存 frontier——broker 组位点仅随输出的事务前进。 |
 
 ## 安全配置
 
@@ -128,3 +129,4 @@ input:
 - 消息会自动携带 `__meta_source`、`__meta_partition`、`__meta_offset`、`__meta_key`、`__meta_timestamp`、`__meta_ingest_time` 等元数据列,以及扩展列 `__meta_ext.topic`。
 - 每条 Kafka record header 会作为 `header_<key>` 条目写入 `__meta_ext` 映射列。重复的 header key 会保留全部值:首次出现使用 `header_<key>`,后续出现附加位置后缀(`header_<key>_2`、`header_<key>_3`…)。值按 UTF-8 lossy 解码(非法字节替换为 U+FFFD),无值的 header 映射为空字符串。
 - 只有在调用 `ack()` 时(下游写入成功后)才通过 `store_offset` 推进偏移量,并结合周期性自动提交,实现至少一次投递。
+- 声明 `transactional_offsets: true` 后,`ack()` 只推进内存 frontier 并跳过 `store_offset`:broker 组位点折入配对事务性 Kafka 输出的事务内提交(`offset_commit_group` 指名本输入的 `consumer_group`),消除「提交后崩溃」的重复窗口。配对是进程内的,且要求单主题订阅——参见[精确一次处理](/zh-Hans/docs/build/exactly-once)。

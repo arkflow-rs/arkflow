@@ -25,5 +25,9 @@ mod s3;
 mod segment;
 
 pub fn init() -> Result<(), arkflow_core::Error> {
-    s3::register()
+    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    match INIT.get_or_init(|| s3::register().map_err(|error| error.to_string())) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(arkflow_core::Error::Config(error.clone())),
+    }
 }

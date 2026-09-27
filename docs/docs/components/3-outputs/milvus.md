@@ -15,7 +15,7 @@ The `milvus` output upserts each batch's rows into a [Milvus](https://milvus.io/
 | url | string | yes | — | Milvus base URL (e.g. `http://localhost:19530`). |
 | collection | string | yes | — | Target collection (schema must already exist). |
 | vector_field | string | no | `embedding` | Field carrying the vector (`FixedSizeList`/`List` of Float32). |
-| id_field | string | no | — | Field carrying the row id (integer or string). When omitted the id key is left out — use an auto-id collection. |
+| id_field | string | yes | — | Field carrying the row id (integer or string). Required: the REST v2 upsert API needs a primary key on every row, so auto-id collections are not supported (the builder rejects a missing `id_field`). |
 | payload_field | string | no | `payload` | JSON field receiving every remaining column as a per-row object. Set to `""` to disable. |
 | api_key | string | no | — | Sent as `Authorization: Bearer`; Milvus convention is `<user>:<password>`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
@@ -35,7 +35,7 @@ curl -s http://localhost:19530/v2/vectordb/collections/create -d '{
 }'
 ```
 
-Each batch produces one upsert request carrying all rows:
+Each batch of up to 1,000 rows produces one upsert request; larger batches are split into sequential 1,000-row requests:
 
 ```json
 {"collectionName": "documents", "data": [

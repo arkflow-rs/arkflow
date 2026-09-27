@@ -21,6 +21,7 @@ The Kafka output produces messages to an Apache Kafka topic using librdkafka. It
 | value_field | string | no | — | Record field used as the message payload. |
 | exactly_once | boolean | no | `false` | Enable exactly-once transactional production (L2). |
 | transactional_id | string | no | — | Stable transactional id; required when `exactly_once` is `true`. |
+| offset_commit_group | string | no | — | L3 exactly-once: consumer group of a paired same-process Kafka input (with `transactional_offsets: true`) whose source offsets commit inside this output's producer transactions. Requires `exactly_once`. |
 | security | object | no | — | SASL authentication and TLS settings; omit entirely for plaintext. See [Security](#security). |
 
 ### Security
@@ -127,8 +128,29 @@ output:
   acks: "all"
 ```
 
+### Exactly-once with in-transaction source-offset commit (L3)
+
+Pair `offset_commit_group` with a same-process Kafka input that declares
+`transactional_offsets: true` on the same consumer group (see the
+[Kafka input](../0-inputs/kafka.md)):
+
+```yaml validate=fragment wrap=output
+output:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topic:
+    type: "value"
+    value: "orders-copy"
+  exactly_once: true
+  transactional_id: "arkflow-orders-copy-0"
+  offset_commit_group: "orders-copy-group"
+  acks: "all"
+```
+
 ## Notes
 
 - When `exactly_once: true`, `transactional_id` must be a non-empty value that is stable across restarts so the broker can fence stale producer epochs (zombie fencing). The builder rejects the configuration otherwise.
 - With exactly-once enabled, each acknowledged message batch is produced inside one Kafka transaction (begin → send → commit). On failure the transaction is aborted and the batch is replayed.
+- With `offset_commit_group`, source offsets derived from the batches' `__meta_partition`/`__meta_offset` columns are committed inside the same transaction (`send_offsets_to_transaction`), closing the residual commit-then-crash duplicate window. The pairing is process-internal: the named group must have a live same-process Kafka input with `transactional_offsets: true`. A multi-topic input cannot pair (the builder rejects it); a metadata-free batch — one whose `__meta_partition`/`__meta_offset` columns were dropped by a rebuilding processor — simply contributes no offsets: the writes proceed, but those records sit outside the L3 guarantee and can be replayed (duplicated) after a restart because the transactional input no longer commits offsets itself.
 - See [Exactly-once processing](../../build/exactly-once.md) for the end-to-end delivery-semantics contract.

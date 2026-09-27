@@ -426,7 +426,16 @@ mod tests {
 
         let requests = mock.requests();
         assert_eq!(requests.len(), 2, "one request per row");
-        let (head, body) = requests[0].clone();
+        // Requests reach the mock in any order (buffered concurrency only
+        // guarantees ordered results); locate row 0's request by its vector.
+        let (head, body) = requests
+            .iter()
+            .find(|(_, body)| {
+                serde_json::from_str::<Value>(body).unwrap()["data"][0]["vector"]
+                    == serde_json::json!([1.0, 0.0])
+            })
+            .expect("row 0's request carries the [1.0, 0.0] vector")
+            .clone();
         assert!(head.starts_with("POST /v2/vectordb/entities/search "), "{head}");
         assert!(head.contains("authorization: Bearer root:Milvus-pw"), "{head}");
         let parsed: Value = serde_json::from_str(&body).unwrap();
