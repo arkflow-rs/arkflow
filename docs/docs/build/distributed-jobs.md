@@ -163,11 +163,9 @@ currently compiled plan **before** restoring state. A mismatch — a changed
 that names the task-set difference (removed/added tasks) and offers two ways
 out: restore the original parallelism, or reset state with a fresh
 checkpoint/savepoint. Nothing silently continues with empty state. Stateless
-jobs still produce recovery artifacts (an empty state snapshot, but the
-manifest keeps source positions and watermarks, which recovery restores);
-the task-set check runs before positions are restored, so a parallelism
-change fails closed the same way (an empty-state redistribution passes with
-`rescale: true`).
+jobs do not produce recovery artifacts at all — manifest sealing rejects an
+empty state snapshot, and local recovery selection applies only to plans
+with durable state — so they simply compile under the new parallelism.
 
 Declaring `rescale: true` on the JobSpec opts into redistribution instead —
 supported for task-set changes that keep every operator represented in the

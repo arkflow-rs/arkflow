@@ -59,7 +59,7 @@ pub fn init() -> Result<(), Error> {
                 "retry_count": {"type": "integer", "description": "Retry attempts for connection errors and 5xx responses. Defaults to 0."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."}
             },
-            "required": ["url", "collection"]
+            "required": ["url", "collection", "id_field"]
         }),
     )
     .with_example(serde_json::json!({

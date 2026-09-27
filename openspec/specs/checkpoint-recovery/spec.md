@@ -107,7 +107,7 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 ### Requirement: 恢复工件的任务集兼容性 SHALL 在恢复前校验
 
-带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致。无状态作业同样产出恢复工件（状态快照为空，但 manifest 保留源位置与水位线，恢复时还原）；任务集校验在还原位置之前执行，因此无状态作业变更并行度同样按上述校验失败（声明 `rescale: true` 时按空状态重分布通过）。
+带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致。无状态作业不产出可恢复工件：封存校验拒绝无状态快照的 manifest，本地恢复选择也仅作用于带持久状态的计划，因此无状态作业不触发该校验，变更并行度后按新并行度直接编译运行。
 
 #### Scenario: 变更并行度后恢复显式失败
 
@@ -121,8 +121,8 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 #### Scenario: 无状态作业变更并行度
 
-- **WHEN** 一个无状态作业（曾产出检查点，manifest 含源位置但状态为空）变更并行度重启且未声明 rescale
-- **THEN** 恢复在还原位置前以同样的任务集校验失败，错误给出恢复原并行度或重置状态两条出路
+- **WHEN** 一个无状态作业变更并行度重启
+- **THEN** 不触发该校验（无状态作业不产出可恢复工件），作业按新并行度正常编译运行
 
 ### Requirement: 声明 rescale 的恢复 SHALL 按 key-group 重分布 keyed 状态
 

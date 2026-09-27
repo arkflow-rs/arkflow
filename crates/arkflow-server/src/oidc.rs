@@ -67,6 +67,21 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+/// Releases JWKS refresh ownership on drop: clears the flag and wakes
+/// waiters, so a cancelled winning request cannot strand concurrent misses.
+struct RefreshRelease<'a> {
+    refreshing: &'a std::sync::atomic::AtomicBool,
+    done: &'a tokio::sync::Notify,
+}
+
+impl Drop for RefreshRelease<'_> {
+    fn drop(&mut self) {
+        self.refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.done.notify_waiters();
+    }
+}
+
 impl OidcAuthenticator {
     /// Builds an authenticator from the standard environment variables.
     /// `Some` only when both `ARKFLOW_OIDC_ISSUER` and
@@ -152,22 +167,33 @@ impl OidcAuthenticator {
             )
             .is_ok()
         {
+            // Ownership is released by drop, so cancellation (this future
+            // dropped mid-fetch) still clears the flag and wakes waiters
+            // instead of stranding them.
+            let _release = RefreshRelease {
+                refreshing: &self.refreshing,
+                done: &self.refresh_done,
+            };
+            // A refresh may have completed between our unlocked cache check
+            // and winning ownership: re-check under the lock before paying
+            // for another fetch.
+            {
+                let cache = self.cache.lock().await;
+                if let Some(cached) = cache.as_ref() {
+                    if let Some(key) = cached.keys.get(kid) {
+                        return Some(key.clone());
+                    }
+                }
+            }
             let fetched = match self.fetch_keys().await {
                 Some(fetched) => fetched,
-                None => {
-                    self.refreshing
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    self.refresh_done.notify_waiters();
-                    return None;
-                }
+                None => return None,
             };
             let key = fetched.keys.get(kid).cloned();
-            // Populate the cache BEFORE clearing the refresh flag and waking
-            // losers, so a woken re-check always observes the fresh keys.
+            // Populate the cache BEFORE the release guard drops (clearing
+            // the flag and waking losers), so a woken re-check always
+            // observes the fresh keys.
             *self.cache.lock().await = Some(fetched);
-            self.refreshing
-                .store(false, std::sync::atomic::Ordering::Release);
-            self.refresh_done.notify_waiters();
             key
         } else {
             let notified = self.refresh_done.notified();
@@ -785,6 +811,24 @@ mod tests {
         header.kid = Some(TEST_KID.to_string());
         let hmac = encode(&header, &claims("u7", json!(["admin"]), 600), &hmac_key).unwrap();
         assert!(auth.authenticate(&hmac).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_releases_ownership_for_later_requests() {
+        // The winning request is dropped mid-fetch: refresh ownership must
+        // be released so a later request refreshes instead of awaiting a
+        // flag that no one will ever clear.
+        let mock = MockJwks::spawn_with_delay(jwks_body(&[TEST_KID]), Duration::from_millis(300));
+        let auth = std::sync::Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
+        let token = mint(claims("u11", json!(["viewer"]), 600), Some(TEST_KID));
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), auth.authenticate(&token)).await;
+        assert!(cancelled.is_err(), "the request must still be in-flight when cancelled");
+        let principal = tokio::time::timeout(Duration::from_secs(5), auth.authenticate(&token))
+            .await
+            .expect("must not hang on a stranded refresh flag")
+            .expect("refresh after cancellation validates");
+        assert_eq!(principal.id, "u11");
     }
 
     #[tokio::test]
