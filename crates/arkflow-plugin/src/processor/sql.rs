@@ -23,18 +23,23 @@ use arkflow_core::temporary::Temporary;
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::TableType;
 use datafusion::logical_expr::ColumnarValue;
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
 use datafusion::optimizer::OptimizerConfig;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::parser::Statement;
 use expr::Expr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 const DEFAULT_TABLE_NAME: &str = "flow";
 /// SQL processor configuration
@@ -56,6 +61,61 @@ struct TemporaryConfig {
     key: Expr<String>,
 }
 
+/// In-memory table whose contents are swapped before every batch execution.
+///
+/// The SQL statement is fixed per processor, so its analyzed and optimized
+/// logical plan only depends on the batch schema. Caching that plan removes
+/// per-batch re-analysis and re-optimization; the cached plan's table scans
+/// resolve back to this provider, so execution always reads the freshly
+/// swapped batch.
+#[derive(Debug)]
+struct SwapBatchTable {
+    current: RwLock<RecordBatch>,
+}
+
+impl SwapBatchTable {
+    fn new(batch: RecordBatch) -> Self {
+        Self {
+            current: RwLock::new(batch),
+        }
+    }
+
+    fn swap(&self, batch: RecordBatch) {
+        *self.current.write().unwrap() = batch;
+    }
+}
+
+#[async_trait]
+impl TableProvider for SwapBatchTable {
+    fn schema(&self) -> SchemaRef {
+        self.current.read().unwrap().schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[LogicalExpr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let batch = self.current.read().unwrap().clone();
+        let exec: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], self.schema(), projection.cloned())?;
+        Ok(exec)
+    }
+}
+
+/// Per pooled-context fast-path state: the swap table registered under the
+/// configured table name plus the optimized plan cached for its schema.
+struct ContextPlanCache {
+    table: Arc<SwapBatchTable>,
+    cached: Option<(SchemaRef, Arc<LogicalPlan>)>,
+}
+
 /// SQL processor component
 struct SqlProcessor {
     config: SqlProcessorConfig,
@@ -63,6 +123,9 @@ struct SqlProcessor {
     #[allow(clippy::type_complexity)]
     temporary: Option<HashMap<String, (Arc<dyn Temporary>, TemporaryConfig)>>,
     context_pool: Arc<SessionContextPool>,
+    /// Keyed by pooled context address; a context is used by one caller at a
+    /// time, so entries are never accessed concurrently for the same key.
+    context_caches: std::sync::Mutex<HashMap<usize, ContextPlanCache>>,
 }
 
 impl SqlProcessor {
@@ -100,6 +163,7 @@ impl SqlProcessor {
             statement,
             temporary,
             context_pool,
+            context_caches: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -113,22 +177,35 @@ impl SqlProcessor {
             .table_name
             .as_deref()
             .unwrap_or(DEFAULT_TABLE_NAME);
-        self.get_temporary_message_batch(&ctx_arc, &batch).await?;
-        ctx_arc
-            .register_batch(table_name, batch.clone().into())
-            .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
-        // Execute the SQL query and collect the results.
-        let df = self
-            .execute_query_with_statement(&ctx_arc)
-            .await
-            .map_err(|e| Error::Process(format!("Execution query error: {}", e)))?;
-        let result_batches = df
-            .collect()
-            .await
-            .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?;
+        let record: RecordBatch = batch.into();
 
-        // Deregister the table to clean up before returning context to pool
-        let _ = ctx_arc.deregister_table(table_name);
+        let result_batches = if self.temporary.is_some() {
+            // Temporary tables vary per batch, so every batch re-plans.
+            self.get_temporary_message_batch(&ctx_arc, &record).await?;
+            ctx_arc
+                .register_batch(table_name, record)
+                .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
+            let df = self
+                .execute_query_with_statement(&ctx_arc)
+                .await
+                .map_err(|e| Error::Process(format!("Execution query error: {}", e)))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?;
+            let _ = ctx_arc.deregister_table(table_name);
+            // Temporary tables are re-registered on every batch; leaving one
+            // behind would fail the next registration on this pooled context.
+            if let Some(temporary) = self.temporary.as_ref() {
+                for (_, (_, config)) in temporary.iter() {
+                    let _ = ctx_arc.deregister_table(&config.table_name);
+                }
+            }
+            batches
+        } else {
+            self.execute_with_cached_plan(&ctx_arc, table_name, record)
+                .await?
+        };
 
         // Release the context back to the pool
         self.context_pool.release_context(ctx_arc).await;
@@ -143,6 +220,91 @@ impl SqlProcessor {
 
         arrow::compute::concat_batches(&result_batches[0].schema(), &result_batches)
             .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))
+    }
+
+    fn sql_options() -> SQLOptions {
+        SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false)
+    }
+
+    /// Fast path without temporary tables: swap the batch into a provider
+    /// registered on the context and reuse the cached optimized plan whenever
+    /// the batch schema is unchanged; only the physical stage re-plans.
+    async fn execute_with_cached_plan(
+        &self,
+        ctx: &Arc<SessionContext>,
+        table_name: &str,
+        record: RecordBatch,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let key = Arc::as_ptr(ctx) as usize;
+        let table = {
+            let mut caches = self.context_caches.lock().unwrap();
+            match caches.get_mut(&key) {
+                Some(cache) => {
+                    cache.table.swap(record);
+                    cache.table.clone()
+                }
+                None => {
+                    let table = Arc::new(SwapBatchTable::new(record));
+                    ctx.register_table(table_name, table.clone())
+                        .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
+                    caches.insert(
+                        key,
+                        ContextPlanCache {
+                            table: table.clone(),
+                            cached: None,
+                        },
+                    );
+                    table
+                }
+            }
+        };
+
+        let schema = table.schema();
+        let cached_plan = {
+            let caches = self.context_caches.lock().unwrap();
+            caches
+                .get(&key)
+                .and_then(|cache| cache.cached.as_ref())
+                .filter(|(cached_schema, _)| *cached_schema == schema)
+                .map(|(_, plan)| plan.clone())
+        };
+
+        let plan = match cached_plan {
+            Some(plan) => plan,
+            None => {
+                let state = ctx.state();
+                let plan = state
+                    .statement_to_plan(self.statement.clone())
+                    .await
+                    .map_err(|e| Error::Process(format!("SQL planning error: {}", e)))?;
+                Self::sql_options()
+                    .verify_plan(&plan)
+                    .map_err(|e| Error::Process(format!("SQL verification error: {}", e)))?;
+                let optimized = Arc::new(
+                    state
+                        .optimize(&plan)
+                        .map_err(|e| Error::Process(format!("SQL optimize error: {}", e)))?,
+                );
+                let mut caches = self.context_caches.lock().unwrap();
+                if let Some(cache) = caches.get_mut(&key) {
+                    cache.cached = Some((schema, optimized.clone()));
+                }
+                optimized
+            }
+        };
+
+        let state = ctx.state();
+        let physical = state
+            .query_planner()
+            .create_physical_plan(&plan, &state)
+            .await
+            .map_err(|e| Error::Process(format!("Physical planning error: {}", e)))?;
+        datafusion::physical_plan::collect(physical, ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))
     }
 
     async fn get_temporary_message_batch(
@@ -186,10 +348,7 @@ impl SqlProcessor {
         &self,
         ctx: &Arc<SessionContext>,
     ) -> Result<DataFrame, DataFusionError> {
-        let sql_options = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
+        let sql_options = Self::sql_options();
 
         let plan = ctx
             .state()
@@ -396,6 +555,322 @@ mod tests {
                 assert_eq!(batch.len(), 1);
             }
             _ => panic!("Expected single result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_plan_cache_reflects_each_batch() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT sum(id) as total FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let sum_of = |values: Vec<i64>| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+            .unwrap();
+            async {
+                match processor
+                    .process(Arc::new(MessageBatch::new_arrow(batch)))
+                    .await
+                    .unwrap()
+                {
+                    ProcessResult::Single(batch) => batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    _ => panic!("Expected single result"),
+                }
+            }
+        };
+
+        assert_eq!(sum_of(vec![1, 2, 3, 4, 5]).await, 15);
+        // A cached plan must not serve the previous batch's data.
+        assert_eq!(sum_of(vec![10, 11]).await, 21);
+        assert_eq!(sum_of(vec![100]).await, 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_plan_cache_schema_drift_replans() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT sum(value) as total FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let int_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let int_batch = RecordBatch::try_new(
+            int_schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(int_batch)))
+            .await
+            .unwrap();
+        match result {
+            ProcessResult::Single(batch) => assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                3
+            ),
+            _ => panic!("Expected single result"),
+        }
+
+        // A schema change must invalidate the cached plan, not fail on it.
+        let float_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let float_batch = RecordBatch::try_new(
+            float_schema,
+            vec![Arc::new(datafusion::arrow::array::Float64Array::from(vec![
+                1.5, 2.5,
+            ]))],
+        )
+        .unwrap();
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(float_batch)))
+            .await
+            .unwrap();
+        match result {
+            ProcessResult::Single(batch) => assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                    .unwrap()
+                    .value(0),
+                4.0
+            ),
+            _ => panic!("Expected single result"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sql_processor_plan_cache_concurrent_batches() {
+        let processor = Arc::new(
+            SqlProcessor::new(
+                SqlProcessorConfig {
+                    query: "SELECT min(id) as lo, max(id) as hi FROM flow".to_string(),
+                    table_name: None,
+                    temporary_list: None,
+                },
+                &Resource {
+                    temporary: Default::default(),
+                    input_names: RefCell::new(Default::default()),
+                },
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let mut handles = Vec::new();
+        for task in 0..4i64 {
+            let processor = processor.clone();
+            let schema = schema.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..20i64 {
+                    let value = task * 1000 + i;
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![value]))],
+                    )
+                    .unwrap();
+                    match processor
+                        .process(Arc::new(MessageBatch::new_arrow(batch)))
+                        .await
+                        .unwrap()
+                    {
+                        ProcessResult::Single(batch) => {
+                            let lo = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0);
+                            let hi = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0);
+                            // Every context must see the batch it was given.
+                            assert_eq!(lo, value);
+                            assert_eq!(hi, value);
+                        }
+                        _ => panic!("Expected single result"),
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    struct StaticTemporary(RecordBatch);
+
+    #[async_trait]
+    impl Temporary for StaticTemporary {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn get(&self, _keys: &[ColumnarValue]) -> Result<Option<MessageBatch>, Error> {
+            Ok(Some(MessageBatch::new_arrow(self.0.clone())))
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_temporary_tables_join() {
+        let reference = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("extra", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["enriched"]))],
+        )
+        .unwrap();
+
+        let mut temporary: HashMap<String, Arc<dyn Temporary>> = HashMap::new();
+        temporary.insert("ref".to_string(), Arc::new(StaticTemporary(reference)));
+
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT f.id, t.extra FROM flow f JOIN temp_ref t ON 1=1".to_string(),
+                table_name: None,
+                temporary_list: Some(vec![TemporaryConfig {
+                    name: "ref".to_string(),
+                    table_name: "temp_ref".to_string(),
+                    key: Expr::Value {
+                        value: "ignored".to_string(),
+                    },
+                }]),
+            },
+            &Resource {
+                temporary,
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+
+        // The slow path re-registers per batch; run it twice.
+        for expected in [7i64, 9i64] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![expected]))],
+            )
+            .unwrap();
+            let result = processor
+                .process(Arc::new(MessageBatch::new_arrow(batch)))
+                .await
+                .unwrap();
+            match result {
+                ProcessResult::Single(batch) => {
+                    assert_eq!(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0),
+                        expected
+                    );
+                    assert_eq!(
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "enriched"
+                    );
+                }
+                _ => panic!("Expected single result"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_processor_explain_query_on_cache_path() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "EXPLAIN SELECT sum(id) as total FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+
+        // Twice: the second run goes through the cached optimized plan.
+        for _ in 0..2 {
+            let result = processor
+                .process(Arc::new(MessageBatch::new_arrow(batch.clone())))
+                .await
+                .unwrap();
+            match result {
+                ProcessResult::Single(batch) => {
+                    assert!(batch.num_rows() > 0);
+                }
+                _ => panic!("Expected single result"),
+            }
         }
     }
 
