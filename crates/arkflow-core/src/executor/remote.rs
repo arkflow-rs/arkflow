@@ -1376,10 +1376,15 @@ impl NetworkManager {
         routes.insert(key.clone(), route);
         let manager = self.clone();
         let key = key.clone();
+        let shutdown_watch = manager.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
+                    // The manager's shutdown must also stop a forwarder that
+                    // is merely parked waiting for receipts — otherwise the
+                    // task (and its strong manager Arc) outlives shutdown.
+                    _ = shutdown_watch.cancelled() => break,
                     item = queue_rx.recv_async() => {
                         let Ok(item) = item else { break };
                         // Forward to the current connection's writer; a dead
@@ -1424,7 +1429,7 @@ impl NetworkManager {
     }
 
     /// Install `sender` as the live writer for a session's receipts (called
-    /// by each connection that starts serving the key; cleared when it ends).
+    /// by each connection that starts serving the key).
     fn set_session_receipt_writer(
         &self,
         key: &EdgeSessionKey,
@@ -1439,6 +1444,35 @@ impl NetworkManager {
                 .current
                 .write()
                 .expect("session receipt slot lock") = sender;
+        }
+    }
+
+    /// Clear the session's writer slot only when it still belongs to
+    /// `ours`. During a transparent reconnect the replacement connection
+    /// can install its own sender before the dying connection's cleanup
+    /// runs; an unconditional clear would clobber the live slot and stall
+    /// every later receipt until the next reconnect.
+    fn clear_session_receipt_writer_if_owned(
+        &self,
+        key: &EdgeSessionKey,
+        ours: &flume::Sender<(Quad, ReceiptFrame)>,
+    ) {
+        let routes = self
+            .session_receipts
+            .lock()
+            .expect("session receipt lock");
+        let Some(route) = routes.get(key) else {
+            return;
+        };
+        let mut slot = route
+            .current
+            .write()
+            .expect("session receipt slot lock");
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.same_channel(ours))
+        {
+            *slot = None;
         }
     }
 
@@ -2229,6 +2263,10 @@ impl NetworkManager {
         // Session keys this connection registered, advanced once per key so a
         // reconnecting connection marks recovery for pending loss watchers.
         let mut registered_keys: BTreeSet<EdgeSessionKey> = BTreeSet::new();
+        // (session key, our receipt sender) pairs whose writer slots this
+        // connection installed; released with identity guards on exit.
+        let mut writer_slots_installed: Vec<(EdgeSessionKey, flume::Sender<(Quad, ReceiptFrame)>)> =
+            Vec::new();
         let mut authenticated_session = None;
         let mut failure_sender = self.failures.clone();
         let connection_cancel = self.shutdown.child_token();
@@ -2410,9 +2448,13 @@ impl NetworkManager {
                         self.bump_session_registration(&route_key);
                     }
                     // This connection now serves the session's receipts:
-                    // create the route (idempotent) and take the writer slot.
+                    // create the route (idempotent) and take the writer slot
+                    // (recording the sender so the guarded release on exit
+                    // can tell ours from a replacement's).
                     let _ = self.session_receipt_route(&route_key);
-                    self.set_session_receipt_writer(&route_key, Some(receipt_tx.clone()));
+                    let ours = receipt_tx.clone();
+                    self.set_session_receipt_writer(&route_key, Some(ours.clone()));
+                    writer_slots_installed.push((route_key.clone(), ours));
                     match header.kind {
                         FrameKind::Data => {
                             let (batch, seq) = match decoder.decode(&payload) {
@@ -2603,10 +2645,12 @@ impl NetworkManager {
         }
 
         // Dropping the served quads' senders closes the chains' input channels.
-        // Release every session writer slot this connection held; the
-        // forwarder retries queued receipts against the next connection.
-        for key in served_quads.keys() {
-            self.set_session_receipt_writer(key, None);
+        // Release the session writer slots this connection still owns. A
+        // reconnecting replacement may have already installed its own
+        // sender, so the clear is guarded by channel identity — clobbering
+        // the live slot would stall receipts until the next reconnect.
+        for (key, ours) in &writer_slots_installed {
+            self.clear_session_receipt_writer_if_owned(key, ours);
         }
 
         // Only entries this connection inserted are removed; a reconnecting

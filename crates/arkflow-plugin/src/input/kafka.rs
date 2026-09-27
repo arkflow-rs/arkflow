@@ -770,6 +770,13 @@ impl Input for KafkaInput {
     }
 
     fn assign_partition(&self, partition: u32) -> Result<(), Error> {
+        if self.config.transactional_offsets {
+            return Err(Error::Config(
+                "Kafka transactional_offsets requires subscribe mode (group membership for \
+                 send_offsets_to_transaction); a partition-assigned consumer never joins the \
+                 consumer group. Use a single-reader (non-job) input for L3 flows".into(),
+            ));
+        }
         let mut assigned = self
             .assigned_partition
             .try_write()

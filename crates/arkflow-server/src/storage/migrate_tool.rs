@@ -37,6 +37,14 @@ const IDENTITY_COLUMNS: [(&str, &str); 3] = [
     ("cp_outbox", "outbox_id"),
 ];
 
+/// Self-referencing foreign keys inside a single table: a child row
+/// referencing a parent row in the SAME table violates the constraint when
+/// it inserts first, so the copy must order rows parents-first.
+const SELF_REFERENCING: [(&str, &str); 2] = [
+    ("cp_config_versions", "parent_version_id"),
+    ("cp_intents", "superseded_by_intent_id"),
+];
+
 const CHUNK: usize = 1000;
 
 fn value_to_pg(value: ValueRef<'_>) -> PgVal {
@@ -166,7 +174,15 @@ pub async fn migrate_sqlite_to_postgres(
                 "source database is missing a cp_* table",
             ));
         }
-        let rows = sqlite_read_table(&source, table, &columns)?;
+        let mut rows = sqlite_read_table(&source, table, &columns)?;
+        // Parents-first row order for self-referencing tables: the natural
+        // scan order can place a child ahead of its parent and the foreign
+        // key rejects the insert mid-migration.
+        if let Some((_, parent_column)) =
+            SELF_REFERENCING.iter().find(|(name, _)| *name == table)
+        {
+            rows = order_parents_first(&columns, rows, parent_column);
+        }
         for chunk in rows.chunks(CHUNK) {
             pg_insert_chunk(pool, table, &columns, chunk).await?;
         }
@@ -192,6 +208,35 @@ pub async fn migrate_sqlite_to_postgres(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn self_referencing_rows_copy_parents_first() {
+        let columns = vec![
+            "intent_id".to_string(),
+            "superseded_by_intent_id".to_string(),
+        ];
+        // Child before parent in scan order; a NULL-parent root and a
+        // dangling reference must not block emission.
+        let rows = vec![
+            vec![PgVal::Text("i3".into()), PgVal::Text("i2".into())],
+            vec![PgVal::Text("i1".into()), PgVal::Null],
+            vec![PgVal::Text("i2".into()), PgVal::Text("i1".into())],
+            vec![PgVal::Text("i4".into()), PgVal::Text("missing".into())],
+        ];
+        let ordered = order_parents_first(&columns, rows, "superseded_by_intent_id");
+        let position = |key: &str| {
+            ordered
+                .iter()
+                .position(|row| matches!(row.first(), Some(PgVal::Text(k)) if k == key))
+                .unwrap()
+        };
+        assert!(position("i1") < position("i2"));
+        assert!(position("i2") < position("i3"));
+        // The dangling reference emits without blocking.
+        assert!(position("i4") < ordered.len());
+    }
+
     #[test]
     fn table_order_puts_referenced_tables_first() {
         let order = super::TABLE_ORDER;
@@ -270,4 +315,69 @@ mod tests {
             .expect("migrated job present");
         assert_eq!(job.generation, 3);
     }
+}
+
+/// Reorder rows so that a row never precedes the row its `parent_column`
+/// references. Rows referencing missing parents (dangling foreign keys are
+/// possible in SQLite when constraints were disabled) keep their relative
+/// order — the PostgreSQL copy surfaces the violation as a migration error
+/// instead of silently reordering past it.
+fn order_parents_first(
+    columns: &[String],
+    rows: Vec<Vec<PgVal>>,
+    parent_column: &str,
+) -> Vec<Vec<PgVal>> {
+    let Some(key_index) = columns
+        .iter()
+        .position(|column| column == "config_version_id" || column == "intent_id")
+    else {
+        return rows;
+    };
+    let Some(parent_index) = columns.iter().position(|column| column == parent_column) else {
+        return rows;
+    };
+    let key_of = |row: &Vec<PgVal>| -> Option<String> {
+        match row.get(key_index) {
+            Some(PgVal::Text(key)) => Some(key.clone()),
+            _ => None,
+        }
+    };
+    let parent_of = |row: &Vec<PgVal>| -> Option<String> {
+        match row.get(parent_index) {
+            Some(PgVal::Text(key)) => Some(key.clone()),
+            _ => None, // NULL parent: root row
+        }
+    };
+    // All present keys: a parent reference that no row satisfies is
+    // dangling and never blocks emission.
+    let present: std::collections::BTreeSet<String> =
+        rows.iter().filter_map(key_of).collect();
+    let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pending: std::collections::VecDeque<Vec<PgVal>> = rows.into();
+    let mut ordered: Vec<Vec<PgVal>> = Vec::with_capacity(pending.len());
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let scan: Vec<Vec<PgVal>> = pending.drain(..).collect();
+        let mut remaining: Vec<Vec<PgVal>> = Vec::with_capacity(scan.len());
+        for row in scan {
+            let blocked = parent_of(&row)
+                .filter(|parent| present.contains(parent))
+                .is_some_and(|parent| !emitted.contains(&parent));
+            if blocked {
+                remaining.push(row);
+            } else {
+                if let Some(key) = key_of(&row) {
+                    emitted.insert(key);
+                }
+                ordered.push(row);
+                progress = true;
+            }
+        }
+        pending = remaining.into();
+    }
+    // Cycles or deep chains that made no progress in the last pass keep
+    // their order at the tail; the copy surfaces any real violation.
+    ordered.extend(pending);
+    ordered
 }

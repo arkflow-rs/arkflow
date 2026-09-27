@@ -90,3 +90,11 @@ A Kafka output configured with `exactly_once: true` SHALL require a non-empty `t
 
 - **WHEN** write_batch 的批次不含 Kafka 源元数据列
 - **THEN** 事务不携带额外位点（L3 只覆盖 Kafka→Kafka 流），写入本身照常
+
+
+声明 `transactional_offsets` 的输入不得进入分区指派（assign）模式：显式指派的消费者不加入组、无法提供组元数据，`assign_partition` SHALL 以明确配置错误拒绝该组合。
+
+#### Scenario: 分区指派与 L3 组合被拒绝
+
+- **WHEN** 一个声明 `transactional_offsets` 的 Kafka 输入被图构建期分区指派
+- **THEN** assign_partition 以明确的配置错误失败，指明 L3 需要 subscribe 模式的单读者输入
