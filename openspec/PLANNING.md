@@ -503,4 +503,6 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 
 **三轮 CR 修复（2026-09-25 同日）**：深度 CR + 活库实证后修复四项——PG `record_audit` 错表/NULL 匹配（改 `RETURNING`）与裸 `?` 占位符穿透方言改写（乐观并发路径）两个 P1（门控套件首次对真库运行时实证，套件自身的三处断言笔误一并修复并补乐观并发/幂等复用用例）；重放去重镜像回执违反处理门控不变量（改会话级回执路由，镜像整体删除，`fix-remote-replay-ack-semantics`）；L3 注册表强 Arc 与规格相悖（改 Weak + async 读，`fix-l3-registry-lifecycle`）。顺修 P2 两项（try_read 假性失败、重放保留无门控）。
 
+**四轮 CR 修复**：会话回执槽位清空竞态（same_channel 守卫）与转发器关停监视（fix-session-receipt-lifecycle）；迁移自引用 FK 父母先行行序（fix-migrate-self-reference-ordering）；L3 与分区指派组合的构建期显式拒绝（fix-l3-assign-mode-validation）。
+
 **剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。
