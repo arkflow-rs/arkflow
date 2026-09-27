@@ -16,6 +16,12 @@
 # the committed range; a rolled-back transaction leaves group offsets
 # unchanged and the range is replayed.
 #
+# The input decodes through its `codec` (not a json_to_arrow processor):
+# codec decoding happens before `__meta_partition`/`__meta_offset` are
+# attached, so the metadata columns survive; a batch-rebuilding processor
+# (e.g. json_to_arrow) would drop them and the output would find no source
+# offsets to commit. The output re-encodes each row as JSON via its codec.
+#
 # `durability:` still persists input messages to a WAL so a crash between
 # read and output does not lose data.
 #
@@ -34,6 +40,8 @@ streams:
       consumer_group: arkflow-eos-l3
       start_from_latest: false
       transactional_offsets: true
+      codec:
+        type: json
 
     durability:
       enabled: true
@@ -41,10 +49,7 @@ streams:
       sync: group_commit
 
     pipeline:
-      thread_num: 4
-      processors:
-        - type: json_to_arrow
-        - type: arrow_to_json
+      processors: []   # no rebuilding processors: they would drop __meta_* offsets
 
     output:
       type: kafka
@@ -56,3 +61,5 @@ streams:
       exactly_once: true
       transactional_id: arkflow-orders-copy-l3-0   # stable across restarts; unique per producer
       offset_commit_group: arkflow-eos-l3          # must equal the input's consumer_group
+      codec:
+        type: json

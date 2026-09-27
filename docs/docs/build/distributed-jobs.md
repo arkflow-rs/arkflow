@@ -163,10 +163,16 @@ currently compiled plan **before** restoring state. A mismatch — a changed
 that names the task-set difference (removed/added tasks) and offers two ways
 out: restore the original parallelism, or reset state with a fresh
 checkpoint/savepoint. Nothing silently continues with empty state. Stateless
-jobs have no artifact to compare and simply compile under the new
-parallelism.
+jobs still produce recovery artifacts (an empty state snapshot, but the
+manifest keeps source positions and watermarks, which recovery restores);
+the task-set check runs before positions are restored, so a parallelism
+change fails closed the same way (an empty-state redistribution passes with
+`rescale: true`).
 
-Declaring `rescale: true` on the JobSpec opts into redistribution instead:
+Declaring `rescale: true` on the JobSpec opts into redistribution instead —
+supported for task-set changes that keep every operator represented in the
+saved state present in the new plan (parallelism changes qualify; removing
+a stateful operator does not, and fails explicitly):
 
 ```yaml validate=fragment wrap=engine
 jobs:
@@ -357,9 +363,10 @@ Transient network failures are absorbed first. Within a bounded redial budget
 replays every not-yet-acknowledged data frame; the receiving side de-duplicates
 by delivery sequence (a replayed frame at or below the highest delivered seq is
 dropped and re-acked, which is idempotent on both sides), so the job continues
-without a failure report. When the budget is exhausted — or the error is
-deterministic and would replay identically, such as an illegal frame or failed
-authentication — the edge fails closed instead.
+without a failure report. Deterministic errors (an illegal frame, failed
+authentication) are also redialed while budget remains — the replay cannot
+succeed, so they consume the budget and the edge fails closed once it is
+exhausted.
 
 Acknowledgement mirrors across remote edges: a source ack completes only after
 **all** downstream copies acknowledge, and a downstream processing failure

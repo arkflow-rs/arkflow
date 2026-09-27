@@ -247,7 +247,8 @@ fn build_insert(config: &PgVectorOutputConfig, rows: &[PointRow]) -> QueryBuilde
             assignments.push(excluded(&config.payload_field));
         }
         query_builder.push(format!(
-            " ON CONFLICT (\"{id_field}\") DO UPDATE SET {}",
+            " ON CONFLICT ({}) DO UPDATE SET {}",
+            crate::vector_util::escape_identifier(id_field),
             assignments.join(", ")
         ));
     }
@@ -645,15 +646,18 @@ mod tests {
         let config = config_with(serde_json::json!({
             "table": "odd\"table",
             "vector_field": "em\"bedding",
+            "id_field": "odd\"id",
         }));
         let rows = vec![PointRow {
-            id: None,
+            id: Some(IdValue::Int(1)),
             vector: "[1.0,2.0]".to_string(),
             payload: None,
         }];
         let sql = build_insert(&config, &rows).sql().to_string();
         assert!(sql.contains(r#"INSERT INTO "odd""table""#), "{sql}");
         assert!(sql.contains(r#""em""bedding""#), "{sql}");
+        // The conflict target escapes quotes like every other identifier.
+        assert!(sql.contains(r#"ON CONFLICT ("odd""id")"#), "{sql}");
     }
 
     #[test]

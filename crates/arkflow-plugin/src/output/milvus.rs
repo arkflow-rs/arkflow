@@ -17,9 +17,9 @@
 //! Upserts each batch's rows into a Milvus collection over the REST v2
 //! vectordb API (`POST /v2/vectordb/entities/upsert`, Milvus 2.4+): a
 //! Float32 list column becomes the vector, every remaining column packs
-//! into a JSON payload field, and an optional id column keys the row
-//! (omit it for auto-id collections). Milvus reports failures as HTTP
-//! 200 with a non-zero `code` — that is treated as an error here.
+//! into a JSON payload field, and the required id column keys the row
+//! (the upsert API needs a primary key per row). Milvus reports failures
+//! as HTTP 200 with a non-zero `code` — that is treated as an error here.
 //! `api_key` supports secret references (`${env:...}`); Milvus REST
 //! convention is `Authorization: Bearer <user>:<password>`.
 
@@ -52,7 +52,7 @@ pub fn init() -> Result<(), Error> {
                 "url": {"type": "string", "description": "Milvus base URL, e.g. http://localhost:19530."},
                 "collection": {"type": "string", "description": "Target collection name (schema must already exist)."},
                 "vector_field": {"type": "string", "description": "Name of the vector field (FixedSizeList/List of Float32). Defaults to 'embedding'."},
-                "id_field": {"type": "string", "description": "Field carrying the row id (integer or string). When omitted the id key is left out (auto-id collections)."},
+                "id_field": {"type": "string", "description": "Field carrying the row id (integer or string). Required: the upsert API needs a primary key per row (auto-id collections are not supported)."},
                 "payload_field": {"type": "string", "description": "JSON field receiving every remaining column as a per-row object. Defaults to 'payload'; set to an empty string to disable."},
                 "api_key": {"type": "string", "description": "Sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
@@ -387,6 +387,15 @@ impl OutputBuilder for MilvusOutputBuilder {
             ));
         }
         config.id_field = config.id_field.filter(|field| !field.trim().is_empty());
+        // The REST v2 upsert contract requires a primary key on every row,
+        // so a missing id_field produces requests Milvus rejects — fail at
+        // build time instead.
+        if config.id_field.is_none() {
+            return Err(Error::Config(
+                "milvus output: 'id_field' is required (the upsert API needs a primary key per row; auto-id collections are not supported)"
+                    .to_string(),
+            ));
+        }
         // Loopback endpoints (local Milvus dev instances, tests) bypass a
         // system proxy — proxying localhost is never what a user means.
         let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
@@ -488,16 +497,16 @@ mod tests {
         assert!(data[0]["payload"].get("embedding").is_none());
     }
 
-    #[tokio::test]
-    async fn omits_id_when_id_field_not_configured() {
-        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
-        let output = build_output(base_config(mock.addr(), serde_json::json!({"id_field": ""})));
-        output.write(sample_batch()).await.unwrap();
-        let (_, body) = mock.last_request();
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        for row in parsed["data"].as_array().unwrap() {
-            assert!(row.get("doc_id").is_none(), "auto-id rows must omit the id key");
-        }
+    #[test]
+    fn missing_id_field_fails_at_build() {
+        // The REST v2 upsert contract needs a primary key per row; a missing
+        // id_field must fail at build time instead of sending id-less rows.
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let error = MilvusOutputBuilder
+            .build(None, &Some(base_config(addr, serde_json::json!({"id_field": ""}))), None, &test_resource())
+            .err()
+            .expect("missing id_field must be rejected");
+        assert!(error.to_string().contains("'id_field' is required"), "{error}");
     }
 
     #[tokio::test]
@@ -556,6 +565,7 @@ mod tests {
         let output = build_output(serde_json::json!({
             "url": format!("http://{}", mock.addr()),
             "collection": "docs",
+            "id_field": "doc_id",
         }));
         output.write(sample_batch()).await.unwrap();
         let (head, _) = mock.last_request();

@@ -5,7 +5,7 @@ description: ArkFlow Milvus Search 处理器组件。
 
 # Milvus Search
 
-`milvus_search` 处理器(processor)在 [Milvus](https://milvus.io/) 集合(2.4+,REST v2)中搜索每行向量的 top-k 最近邻(nearest-neighbor),并把匹配结果作为 JSON 数组文本列追加。与 Qdrant 和 pgvector 搜索处理器(每行一次请求)不同,Milvus 接受**批量查询数组**——整个批次(Batch)是一个请求,响应按位置映射回各行。请与 [embedding 处理器](/zh-Hans/docs/components/processors/embedding)以及 [Milvus 输出](/zh-Hans/docs/components/outputs/milvus)搭配使用——后者写入的字段形状与该处理器读取的完全相同。
+`milvus_search` 处理器(processor)在 [Milvus](https://milvus.io/) 集合(2.4+,REST v2)中搜索每行向量的 top-k 最近邻(nearest-neighbor),并把匹配结果作为 JSON 数组文本列追加。与 Qdrant 和 pgvector 搜索处理器相同,逐行发起 REST 请求(单元素查询数组),采用有界、保序的并发。请与 [embedding 处理器](/zh-Hans/docs/components/processors/embedding)以及 [Milvus 输出](/zh-Hans/docs/components/outputs/milvus)搭配使用——后者写入的字段形状与该处理器读取的完全相同。
 
 ## 配置
 

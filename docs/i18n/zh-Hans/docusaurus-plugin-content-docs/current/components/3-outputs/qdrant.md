@@ -24,7 +24,7 @@ description: ArkFlow Qdrant 输出组件。
 
 ## 语义
 
-- 写入使用 `PUT /collections/{collection}/points?wait=true`——每个批次一次请求。
+- 写入使用 `PUT /collections/{collection}/points?wait=true`——每至多 1,000 个点为一个有界请求;更大的批次按序切分发送。
 - upsert 按点 id 幂等:配置了 `id_field` 时,重投递会覆盖同一个点(对至少一次投递友好);未配置时每行都会生成新的 UUID,因此每次尝试都会插入一个新点。
 - 向量维度必须与集合一致;不匹配时 Qdrant 返回 4xx,该批次失败(配置了 `error_output` 时路由到该输出)。
 - 发往回环(loopback)端点(本地 Qdrant 实例)的请求始终绕过系统代理。

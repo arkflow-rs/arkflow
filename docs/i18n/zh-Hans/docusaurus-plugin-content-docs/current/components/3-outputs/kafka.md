@@ -147,5 +147,5 @@ output:
 
 - 当 `exactly_once: true` 时,`transactional_id` 必须为非空且跨重启保持稳定的值,以便 broker 能隔离(fence)过期的生产者 epoch(即僵尸隔离,zombie fencing)。否则,构建器将拒绝该配置。
 - 启用精确一次后,每个已确认的消息批次(Batch)都在一个 Kafka 事务内生产(开始 → 发送 → 提交)。失败时事务中止,该批次被重放。
-- 配置 `offset_commit_group` 后,从各批次 `__meta_partition`/`__meta_offset` 列推导的源位点会折入同一事务提交(`send_offsets_to_transaction`),关闭「事务已提交、进程随即崩溃」的残留重复窗口。配对是进程内的:被指名的组必须有同进程、声明 `transactional_offsets: true` 的活 Kafka 输入,且输入为单主题订阅——多主题订阅与不含 Kafka 源元数据的批次不贡献位点。
+- 配置 `offset_commit_group` 后,从各批次 `__meta_partition`/`__meta_offset` 列推导的源位点会折入同一事务提交(`send_offsets_to_transaction`),关闭「事务已提交、进程随即崩溃」的残留重复窗口。配对是进程内的:被指名的组必须有同进程、声明 `transactional_offsets: true` 的活 Kafka 输入。多主题输入无法配对(会被拒绝);不含元数据的批次——`__meta_partition`/`__meta_offset` 列被重建型处理器丢弃的批次——只是不贡献位点:写入照常进行,但这些记录不在 L3 保证之内,重启后可能被重放(重复),因为事务性输入不再自行提交位点。
 - 端到端投递语义契约参见[精确一次处理](/zh-Hans/docs/build/exactly-once)。

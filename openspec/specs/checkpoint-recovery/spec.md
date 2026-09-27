@@ -107,7 +107,7 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 ### Requirement: 恢复工件的任务集兼容性 SHALL 在恢复前校验
 
-带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致；无状态作业无恢复工件可比对，不受影响。
+带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致。无状态作业同样产出恢复工件（状态快照为空，但 manifest 保留源位置与水位线，恢复时还原）；任务集校验在还原位置之前执行，因此无状态作业变更并行度同样按上述校验失败（声明 `rescale: true` 时按空状态重分布通过）。
 
 #### Scenario: 变更并行度后恢复显式失败
 
@@ -121,12 +121,12 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 #### Scenario: 无状态作业变更并行度
 
-- **WHEN** 一个无状态作业变更并行度重启
-- **THEN** 不触发该校验，作业按新并行度正常编译运行
+- **WHEN** 一个无状态作业（曾产出检查点，manifest 含源位置但状态为空）变更并行度重启且未声明 rescale
+- **THEN** 恢复在还原位置前以同样的任务集校验失败，错误给出恢复原并行度或重置状态两条出路
 
 ### Requirement: 声明 rescale 的恢复 SHALL 按 key-group 重分布 keyed 状态
 
-`rescale: true` 的 Job 在恢复工件任务集与当前计划不一致时 SHALL 重分布快照条目：从条目命名空间解析算子，从状态键按算子编码白名单（窗口：跳过 8 字节 window_start 取 utf8 键；StatefulOperator：剥类型前缀，整数大端/utf8/binary 原样；`null:<tag>` 哨兵整条）还原**路由哈希输入**，以 `key_group_for_key(输入, max_parallelism)` 计算归属，把条目命名空间重写为新 plan 中拥有该 key-group 的任务。键与值逐字节保留。无法识别的键编码 SHALL 显式失败。
+`rescale: true` 的 Job 在恢复工件任务集与当前计划不一致时 SHALL 重分布快照条目：从条目命名空间解析算子，从状态键按算子编码白名单（窗口：跳过 8 字节 window_start 取 utf8 键；StatefulOperator：剥类型前缀，整数大端/utf8/binary 原样；`null:<tag>` 哨兵整条）还原**路由哈希输入**，以 `key_group_for_key(输入, max_parallelism)` 计算归属，把条目命名空间重写为新 plan 中拥有该 key-group 的任务。键与值逐字节保留。无法识别的键编码、或条目所属算子不存在于新计划时，SHALL 显式失败（重分布仅支持保留原有状态算子的任务集变更，如并行度调整）。
 
 #### Scenario: stateful 条目按新归属落位
 

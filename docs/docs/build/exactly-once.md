@@ -144,7 +144,13 @@ L3 boundaries, enforced by explicit errors rather than silent degradation:
   rejected.
 - **Kafka → Kafka only** — a batch without Kafka source metadata columns
   contributes no offsets (the writes still proceed); non-Kafka sources cannot
-  pair with the transactional output.
+  pair with the transactional output. Such batches sit **outside the L3
+  guarantee**: with `transactional_offsets: true` the input no longer commits
+  offsets itself, so if no later metadata-carrying transaction advances the
+  group offset, a restart replays those records and duplicates the output —
+  keep the pipeline free of metadata-dropping processors (batch-rebuilding
+  transformations such as `json_to_arrow`) between the Kafka input and the
+  output, and absorb duplicates downstream otherwise.
 
 A complete runnable L3 example is in
 [`examples/eos-kafka-l3.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/eos-kafka-l3.yaml)

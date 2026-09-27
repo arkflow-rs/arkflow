@@ -27,7 +27,7 @@ Define OIDC JWT bearer federation for Hub operator APIs: token validation semant
 
 ### Requirement: 令牌验证与失败语义
 
-签名验证 SHALL 基于 JWKS 端点公钥（按令牌 `kid` 选钥）；JWKS SHALL 带 TTL 缓存，`kid` 未命中时 SHALL 强制刷新一次后重试，仍未命中 SHALL 拒绝；缓存中的已知 `kid` SHALL 在 TTL 过期后仍可用于验证（避免可用性悬崖）。JWKS 刷新 SHALL NOT 在持有缓存锁的状态下进行网络请求：缓存命中 SHALL 在锁内即时返回，不受并发刷新影响；并发触发的重复刷新 SHALL 去重。以下令牌 SHALL 一律解析失败（401，与未授权语义一致）：签名无效、`exp` 过期、`iss` 不匹配、`aud` 不匹配、算法在白名单外、`sub` 缺失、角色无匹配。
+签名验证 SHALL 基于 JWKS 端点公钥（按令牌 `kid` 选钥）；JWKS SHALL 带 TTL 缓存，`kid` 未命中时 SHALL 强制刷新一次后重试，仍未命中 SHALL 拒绝；缓存中的已知 `kid` SHALL 在 TTL 过期后仍可用于验证（避免可用性悬崖）。JWKS 刷新 SHALL NOT 在持有缓存锁的状态下进行网络请求：缓存命中 SHALL 在锁内即时返回，不受并发刷新影响；并发触发的重复刷新 SHALL 去重：未持有刷新权的一方 SHALL 等待在途刷新完成后重查缓存一次，而不是直接拒绝可能携带新轮换密钥的有效令牌。以下令牌 SHALL 一律解析失败（401，与未授权语义一致）：签名无效、`exp` 过期、`iss` 不匹配、`aud` 不匹配、算法在白名单外、`sub` 缺失、角色无匹配。
 
 #### Scenario: 过期令牌拒绝
 
@@ -48,6 +48,11 @@ Define OIDC JWT bearer federation for Hub operator APIs: token validation semant
 
 - **WHEN** 令牌被其他密钥签名
 - **THEN** 请求返回 401
+
+#### Scenario: 并发未命中等待共享刷新
+
+- **WHEN** 两个携带同一未知 `kid` 的请求并发到达且该 `kid` 已在 JWKS 端点发布
+- **THEN** 只发起一次 JWKS 刷新，两个请求都在刷新完成后验证成功
 
 #### Scenario: 刷新期间缓存命中不被阻塞
 

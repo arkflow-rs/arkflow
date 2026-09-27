@@ -95,7 +95,7 @@ L3 的边界以显式报错而非静默降级来执行:
 
 - **进程内配对**——输出通过进程内注册表解析被指名的组;输入与输出必须运行在同一个 ArkFlow 进程内。输入与输出跨节点的分布式作业不在覆盖范围(独立变更)。`offset_commit_group` 指名的组没有声明 `transactional_offsets` 的活输入时,写入失败。
 - **单一输入主题**——批次元数据只带分区不带主题,注册表按输入的主题列表路由;多主题订阅会被拒绝。
-- **仅限 Kafka → Kafka**——不含 Kafka 源元数据列的批次不贡献位点(写入照常进行);非 Kafka 源无法与事务性输出配对。
+- **仅限 Kafka → Kafka**——不含 Kafka 源元数据列的批次不贡献位点(写入照常进行);非 Kafka 源无法与事务性输出配对。这类批次**不在 L3 保证之内**:声明 `transactional_offsets: true` 后输入不再自行提交位点,若后续没有携带元数据的事务推进组位点,重启会重放这些记录并造成重复输出——请保持 Kafka 输入与输出之间的管道不含丢弃元数据的处理器(如 `json_to_arrow` 这类重建批次的变换),否则在下游吸收重复。
 
 完整可运行的 L3 示例见
 [`examples/eos-kafka-l3.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/eos-kafka-l3.yaml)

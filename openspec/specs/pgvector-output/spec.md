@@ -36,8 +36,8 @@ INSERT 语句 SHALL 按参数化绑定生成（id/vector/payload 各占一个绑
 
 #### Scenario: 标识符内嵌引号被转义
 
-- **WHEN** 配置 `table: odd"table`、`vector_field: em"bedding`
-- **THEN** 生成 SQL 中标识符以 `"odd""table"`、`"em""bedding"` 形式引用，语句可被 Postgres 解析为对应对象
+- **WHEN** 配置 `table: odd"table`、`vector_field: em"bedding`、`id_field: odd"id`
+- **THEN** 生成 SQL 中标识符（含 ON CONFLICT 冲突目标）以 `"odd""table"`、`"em""bedding"`、`"odd""id"` 形式引用，语句可被 Postgres 解析为对应对象
 
 ### Requirement: 输入校验与错误语义
 

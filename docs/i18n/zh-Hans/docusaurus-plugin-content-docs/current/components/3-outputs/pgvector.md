@@ -32,7 +32,7 @@ CREATE TABLE documents (
 );
 ```
 
-每个批次产生一条参数化语句;向量以文本形式绑定并显式 `::vector` 转换,payload 则以 `::jsonb` 转换:
+批次产生参数化 INSERT 语句并按块发送,保证每条语句不超过 Postgres 的 65,535 绑定上限;向量以文本形式绑定并显式 `::vector` 转换,payload 则以 `::jsonb` 转换:
 
 ```sql
 INSERT INTO "documents" ("doc_id", "embedding", "payload")

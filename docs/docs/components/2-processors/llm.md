@@ -31,9 +31,9 @@ It pairs naturally with [SQL](/docs/components/processors/sql) (prepare the prom
 | tool_calls_column | string | no | — | When set, appends this column with the response's tool calls as JSON text (empty string when there are none). Streamed tool-call deltas are merged by index. |
 
 :::note
-Each row is one request (the chat protocol has no batch form). Requests
-already in flight complete even if an earlier row fails — the batch fails
-as a whole and flows to `error_output`. The processor does not retry
+Each row is one request (the chat protocol has no batch form). The first
+row failure short-circuits the batch — in-flight requests are dropped
+rather than awaited — and the batch flows to `error_output` as a whole. The processor does not retry
 LLM calls; size `concurrency` and upstream batches to stay within rate
 limits. Requests to loopback endpoints always bypass the system proxy.
 :::

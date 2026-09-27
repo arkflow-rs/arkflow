@@ -20,7 +20,7 @@ docker run -d --name arkflow \
   -p 8080:8080 \
   -v $PWD/config.yaml:/app/etc/config.yaml:ro \
   -v arkflow-data:/app/data \
-  ghcr.io/arkflow-rs/arkflow:latest
+  ghcr.io/arkflow-rs/arkflow:0.5.0   # pin a released tag (or digest); do not float :latest in production
 ```
 
 - **`-p 8080:8080`** exposes the HTTP health server (`/health`, `/readiness`,
@@ -49,7 +49,7 @@ before it enters orchestration:
 ```bash
 docker run --rm \
   -v $PWD/config.yaml:/app/etc/config.yaml:ro \
-  ghcr.io/arkflow-rs/arkflow:latest \
+  ghcr.io/arkflow-rs/arkflow:0.5.0 \
   /app/arkflow --config /app/etc/config.yaml --validate
 ```
 

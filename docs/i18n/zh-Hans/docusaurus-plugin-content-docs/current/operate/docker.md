@@ -16,7 +16,7 @@ docker run -d --name arkflow \
   -p 8080:8080 \
   -v $PWD/config.yaml:/app/etc/config.yaml:ro \
   -v arkflow-data:/app/data \
-  ghcr.io/arkflow-rs/arkflow:latest
+  ghcr.io/arkflow-rs/arkflow:0.5.0   # 固定使用已发布的 tag(或 digest);生产环境不要浮动 :latest
 ```
 
 - **`-p 8080:8080`** 暴露 HTTP 健康服务(`/health`、`/readiness`、`/liveness`——见[运维概览](/zh-Hans/docs/operate/overview)),供容器健康检查使用。
@@ -33,7 +33,7 @@ docker run -d --name arkflow \
 ```bash
 docker run --rm \
   -v $PWD/config.yaml:/app/etc/config.yaml:ro \
-  ghcr.io/arkflow-rs/arkflow:latest \
+  ghcr.io/arkflow-rs/arkflow:0.5.0 \
   /app/arkflow --config /app/etc/config.yaml --validate
 ```
 

@@ -54,6 +54,10 @@ pub struct OidcAuthenticator {
     /// Deduplicates concurrent JWKS refetches so only one network request
     /// runs at a time (the cache lock is never held across it).
     refreshing: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken when a refresh completes so concurrent cache misses can await
+    /// the winner's fetch and re-check the cache instead of rejecting a
+    /// possibly-valid rotated key.
+    refresh_done: Arc<tokio::sync::Notify>,
     refresh_throttle: Duration,
 }
 
@@ -81,6 +85,7 @@ impl OidcAuthenticator {
                 .expect("OIDC HTTP client must build"),
             cache: Arc::new(Mutex::new(None)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refresh_done: Arc::new(tokio::sync::Notify::new()),
             refresh_throttle: JWKS_REFRESH_THROTTLE,
         }
     }
@@ -120,7 +125,7 @@ impl OidcAuthenticator {
     /// refetch, throttled so garbage kids cannot hammer the provider. The
     /// refetch runs OUTSIDE the cache lock: cache hits answer immediately
     /// while a refresh is in flight, and concurrent misses are deduplicated
-    /// (losers fail this request; the winner's result serves their retry).
+    /// (losers await the winner's fetch and re-check the cache).
     async fn decoding_key(&self, kid: &str) -> Option<DecodingKey> {
         {
             let cache = self.cache.lock().await;
@@ -133,8 +138,10 @@ impl OidcAuthenticator {
                 }
             }
         }
-        // One refresher at a time; everyone else is throttled out above or
-        // below and the winning fetch populates the cache for their retry.
+        // One refresher at a time. The winner fetches and wakes the losers;
+        // losers await the winner and re-check the cache once, so a valid
+        // token with a newly rotated key is not rejected just because
+        // another request owned the refresh.
         if self
             .refreshing
             .compare_exchange(
@@ -143,17 +150,33 @@ impl OidcAuthenticator {
                 std::sync::atomic::Ordering::Acquire,
                 std::sync::atomic::Ordering::Relaxed,
             )
-            .is_err()
+            .is_ok()
         {
-            return None;
+            let fetched = match self.fetch_keys().await {
+                Some(fetched) => fetched,
+                None => {
+                    self.refreshing
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    self.refresh_done.notify_waiters();
+                    return None;
+                }
+            };
+            let key = fetched.keys.get(kid).cloned();
+            // Populate the cache BEFORE clearing the refresh flag and waking
+            // losers, so a woken re-check always observes the fresh keys.
+            *self.cache.lock().await = Some(fetched);
+            self.refreshing
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.refresh_done.notify_waiters();
+            key
+        } else {
+            let notified = self.refresh_done.notified();
+            if self.refreshing.load(std::sync::atomic::Ordering::Relaxed) {
+                notified.await;
+            }
+            let cache = self.cache.lock().await;
+            cache.as_ref().and_then(|cached| cached.keys.get(kid).cloned())
         }
-        let fetched = self.fetch_keys().await;
-        self.refreshing
-            .store(false, std::sync::atomic::Ordering::Release);
-        let fetched = fetched?;
-        let key = fetched.keys.get(kid).cloned();
-        *self.cache.lock().await = Some(fetched);
-        key
     }
 
     async fn fetch_keys(&self) -> Option<CachedJwks> {
@@ -564,12 +587,19 @@ mod tests {
 
     impl MockJwks {
         fn spawn(initial_body: String) -> Self {
+            Self::spawn_with_delay(initial_body, Duration::ZERO)
+        }
+
+        /// A slow JWKS endpoint: every response stalls for `delay`, which
+        /// lets tests hold an in-flight refresh open deterministically.
+        fn spawn_with_delay(initial_body: String, delay: Duration) -> Self {
             let body = Arc::new(std::sync::Mutex::new(initial_body));
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let fetch_count = fetches.clone();
             let shared_body = body.clone();
+            let response_delay = delay;
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let mut stream = match stream {
@@ -578,7 +608,9 @@ mod tests {
                     };
                     let shared_body = shared_body.clone();
                     let fetch_count = fetch_count.clone();
+                    let response_delay = response_delay;
                     std::thread::spawn(move || {
+                        std::thread::sleep(response_delay);
                         let mut buffer = Vec::new();
                         let mut byte = [0u8; 1];
                         loop {
@@ -753,6 +785,25 @@ mod tests {
         header.kid = Some(TEST_KID.to_string());
         let hmac = encode(&header, &claims("u7", json!(["admin"]), 600), &hmac_key).unwrap();
         assert!(auth.authenticate(&hmac).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_waits_for_shared_refresh() {
+        // The IdP publishes the key but responds slowly: while the winner's
+        // refresh is in flight, the concurrent miss must await it and
+        // re-check the cache instead of rejecting a valid rotated key.
+        let mock = MockJwks::spawn_with_delay(jwks_body(&[TEST_KID]), Duration::from_millis(300));
+        let auth = authenticator(format!("http://{}/jwks", mock.addr));
+        let token = mint(claims("u9", json!(["viewer"]), 600), Some(TEST_KID));
+        let auth = std::sync::Arc::new(auth);
+        let auth_b = auth.clone();
+        let (winner, loser) = tokio::join!(
+            auth.authenticate(&token),
+            auth_b.authenticate(&token),
+        );
+        winner.as_ref().expect("the winner validates after its fetch");
+        loser.as_ref().expect("the loser must await the refresh and validate too");
+        assert_eq!(mock.fetch_count(), 1, "concurrent misses share one refresh");
     }
 
     #[tokio::test]
