@@ -22,9 +22,9 @@ Each completed checkpoint SHALL identify the Job version, task assignments, comp
 - **WHEN** adjacent stateless processors are represented by one execution chain and local recovery persists a checkpoint
 - **THEN** the manifest records every logical planned task through the chain mapping and the checkpoint passes exact task-set validation after restart
 
-#### Scenario: A stateless Job uses a non-default state format
+#### Scenario: A stateful Job with empty task state entries uses a non-default state format
 
-- **WHEN** local recovery is enabled for a Job configured with state format `N` greater than 1 but no task has state entries
+- **WHEN** local recovery is enabled for a stateful Job configured with state format `N` greater than 1 but no task has state entries (each task still contributes a snapshot reference, so the manifest is not stateless-empty)
 - **THEN** the checkpoint manifest records format `N` rather than the empty-snapshot default format 1
 
 ### Requirement: Incomplete checkpoints SHALL NOT be recoverable
