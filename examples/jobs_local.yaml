@@ -38,6 +38,8 @@ jobs:
           context: '{ "sensor": "temp_1", "value": 10, "ts": 1757000000000 }'
           interval: 100ms
           batch_size: 10
+        codec:
+          type: json
         time:
           mode: event_time
           timestamp_field: ts

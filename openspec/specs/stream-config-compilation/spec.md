@@ -40,7 +40,9 @@ temporary tables→processor config passthrough.
 
 `memory` buffers SHALL compile to a no-op; window buffers (tumbling/sliding/session)
 SHALL compile to window operators in processing-time mode; `join` buffers SHALL
-fail compilation with a migration message pointing to Job DAG configuration.
+fail compilation with a migration message pointing at the Job DAG join
+operator (a real entry point with exactly two inbound edges) instead of any
+workaround.
 
 #### Scenario: Tumbling buffer becomes operator
 
@@ -50,7 +52,13 @@ fail compilation with a migration message pointing to Job DAG configuration.
 #### Scenario: Join buffer rejected
 
 - **WHEN** a StreamConfig declares `buffer: join`
-- **THEN** compilation fails with an actionable error explaining Job DAG migration, before any component is built
+- **THEN** compilation fails with a migration message pointing at the Job DAG join operator and its two-inbound-edge requirement, before any component is built
+
+#### Scenario: Legacy window join field rejected consistently
+
+- **WHEN** a StreamConfig declares a tumbling or session window with a legacy `join` field
+- **THEN** compilation fails with the same guidance as a plain `join` buffer rejection
+
 
 ### Requirement: Local jobs field
 

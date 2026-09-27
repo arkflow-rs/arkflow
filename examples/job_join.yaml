@@ -1,0 +1,102 @@
+# Stream-stream join example.
+#
+# The Job DAG join operator matches rows from two sources by an equality key
+# when their event timestamps differ by at most `window_ms`. Input 0 (the
+# first inbound edge) is the left side, input 1 is the right side. Output
+# columns are prefixed `l_` / `r_` plus `join_key`.
+#
+# Validate first (deep checks are the same as startup):
+#   ./target/release/arkflow --config examples/job_join.yaml --validate
+# Then run:
+#   ./target/release/arkflow --config examples/job_join.yaml
+
+streams: []
+
+jobs:
+  - id: orders-profiles-join
+    version: 1
+    parallelism: 1
+    max_parallelism: 128
+
+    operators:
+      - id: orders
+        kind: source
+      - id: profiles
+        kind: source
+      - id: to-json
+        kind: map
+        config:
+          type: arrow_to_json
+      - id: join
+        kind: join
+        config:
+          left_from: orders
+          right_from: profiles
+          left_key: customer_id
+          right_key: customer_id
+          left_timestamp: ts
+          right_timestamp: ts
+          window_ms: 5000
+          ttl_ms: 1000
+          max_per_key: 10000
+      - id: sink
+        kind: sink
+    edges:
+      - id: left-edge
+        from: orders
+        to: join
+        partitioned: false
+      - id: right-edge
+        from: profiles
+        to: join
+        partitioned: false
+      - id: join-sink
+        from: join
+        to: to-json
+        partitioned: false
+      - id: json-sink
+        from: to-json
+        to: sink
+        partitioned: false
+
+    sources:
+      - operator_id: orders
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "amount": 42, "ts": 1757000000000 }'
+          interval: 500ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+          allowed_lateness_ms: 1000
+          late_event_policy: drop
+      - operator_id: profiles
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "tier": "gold", "ts": 1757000000000 }'
+          interval: 700ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+          allowed_lateness_ms: 1000
+          late_event_policy: drop
+
+    sinks:
+      - operator_id: sink
+        output_type: stdout

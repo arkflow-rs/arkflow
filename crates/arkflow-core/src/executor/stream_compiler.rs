@@ -59,6 +59,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         operator_id: source_operator_id.clone(),
         input_type: stream.input.input_type.clone(),
         config: input_config_payload(stream),
+        codec: stream.input.codec.clone(),
         time: TimeSpec {
             mode: TimeMode::ProcessingTime,
             timestamp_field: None,
@@ -114,8 +115,10 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
             }
             "join" => {
                 return Err(Error::Config(
-                    "buffer type 'join' cannot compile to the unified kernel; declare a Job DAG \
-                     with an explicit join operator instead (see the Job API documentation)"
+                    "buffer type 'join' cannot compile: the unified kernel expresses \
+                     stream-stream join as a Job DAG join operator with exactly two inbound \
+                     edges; declare a local Job with a join operator instead of a Stream join \
+                     buffer"
                         .into(),
                 ));
             }
@@ -161,6 +164,7 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
     sinks.push(SinkSpec {
         operator_id: sink_operator_id.clone(),
         output_type: stream.output.output_type.clone(),
+        codec: stream.output.codec.clone(),
         config: output_config_payload(&stream.output),
     });
     edges.push(EdgeSpec {
@@ -201,11 +205,13 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         sinks.push(SinkSpec {
             operator_id: error_operator_id,
             output_type: error_output.output_type.clone(),
+            codec: error_output.codec.clone(),
             config: output_config_payload(error_output),
         });
     }
 
     let spec = JobSpec {
+        rescale: false,
         rebalance: None,
         id: job_id,
         version: JobVersion(1),
@@ -309,8 +315,9 @@ fn window_config(
     let config = buffer.config.clone().unwrap_or(json!({}));
     if matches!(buffer_type, "tumbling_window" | "session_window") && config.get("join").is_some() {
         return Err(Error::Config(
-            "legacy window buffers with 'join' cannot compile to the unified kernel; declare a Job \
-             DAG with an explicit join operator instead (see the Job API documentation)"
+            "legacy window buffers with 'join' cannot compile: the unified kernel expresses \
+             stream-stream join as a Job DAG join operator with exactly two inbound edges; \
+             declare a local Job with a join operator instead of a Stream join buffer"
                 .into(),
         ));
     }
@@ -515,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn join_buffer_rejected_with_migration_message() {
+    fn join_buffer_rejected_with_honest_message() {
         let mut stream = minimal_stream();
         stream.buffer = Some(crate::buffer::BufferConfig {
             buffer_type: "join".into(),
@@ -524,8 +531,27 @@ mod tests {
         });
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("join"), "{message}");
-        assert!(message.contains("Job"), "{message}");
+        assert!(
+            message.contains("Job DAG join operator"),
+            "{message}"
+        );
+        assert!(message.contains("two inbound edges"), "{message}");
+    }
+
+    #[test]
+    fn legacy_window_join_field_rejected_with_same_guidance() {
+        let mut stream = minimal_stream();
+        stream.buffer = Some(crate::buffer::BufferConfig {
+            buffer_type: "tumbling_window".into(),
+            name: None,
+            config: Some(json!({"size": "1s", "join": {}})),
+        });
+        let error = compile_stream(&stream, 0).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Job DAG join operator"),
+            "{message}"
+        );
     }
 
     #[test]

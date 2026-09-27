@@ -671,7 +671,6 @@ impl InputConfig {
     /// Building input components
     pub fn build(&self, resource: &Resource) -> Result<Arc<dyn Input>, Error> {
         let builders = INPUT_BUILDERS.read().unwrap();
-
         if let Some(builder) = builders.get(&self.input_type) {
             // Build codec if configured
             let codec = if let Some(codec_config) = &self.codec {

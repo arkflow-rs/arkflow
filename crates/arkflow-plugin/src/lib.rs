@@ -20,6 +20,7 @@ pub mod context_pool;
 pub mod expr;
 pub mod input;
 pub mod kafka_security;
+pub mod kafka_txn;
 pub mod mqtt_tls;
 pub mod output;
 pub mod processor;

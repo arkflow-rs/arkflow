@@ -6986,9 +6986,12 @@ mod tests {
         hub.reconcile_rollouts().await.unwrap();
         let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
         assert_eq!(targets[0].state, "applying");
-        let content = assertion_store
-            .get_config_version_content("cfg-missing".into())
-            .unwrap()
+        let content = crate::storage::StorageBackend::get_config_version_content(
+            &assertion_store,
+            "cfg-missing".into(),
+        )
+        .await
+        .unwrap()
             .expect("version content");
         assert!(
             content.contains("${secret:never_set_x}"),

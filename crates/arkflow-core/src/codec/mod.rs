@@ -46,7 +46,7 @@ pub trait CodecBuilder: Send + Sync {
 }
 
 /// Buffer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodecConfig {
     #[serde(rename = "type")]
     pub codec_type: String,

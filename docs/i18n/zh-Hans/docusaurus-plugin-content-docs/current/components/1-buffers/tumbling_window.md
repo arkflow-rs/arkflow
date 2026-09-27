@@ -38,7 +38,7 @@ buffer:
 
 ### 带 Join 配置
 
-```yaml validate=foreign reason="legacy join configuration — join buffers cannot compile to the unified kernel; declare a Job DAG with an explicit join operator"
+```yaml validate=foreign reason="legacy join configuration — stream-stream join is not yet supported; use the SQL processor's per-batch joins against temporary tables instead"
 buffer:
   type: "tumbling_window"
   interval: "5s"

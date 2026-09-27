@@ -82,6 +82,14 @@ struct KafkaOutputConfig {
     /// Transactional id (required when exactly_once is true). Must be stable
     /// across restarts so the broker can fence prior producer epochs.
     transactional_id: Option<String>,
+    /// L3 exactly-once: name the consumer group of a Kafka input in this
+    /// process whose source offsets ride this output's producer
+    /// transactions (`send_offsets_to_transaction`). Requires
+    /// `exactly_once`; the input must declare `transactional_offsets` with
+    /// the same group. Offsets are derived from each batch's
+    /// `__meta_partition`/`__meta_offset` columns, so only batches sourced
+    /// from a Kafka input carry committable positions.
+    offset_commit_group: Option<String>,
     /// SASL authentication and TLS settings (optional; absent means
     /// plaintext, exactly as before this field existed)
     security: Option<KafkaSecurityConfig>,
@@ -405,6 +413,46 @@ impl KafkaOutput {
             return Err(e);
         }
 
+        // L3: fold the covered source offsets into the transaction before
+        // committing. Offsets come from the batches' source metadata
+        // columns (partition, consumed offset); commit positions are the
+        // exclusive next offsets, matching librdkafka's convention.
+        if let Some(group) = self.config.offset_commit_group.as_deref() {
+            let group_topic = crate::kafka_txn::single_topic(group).ok_or_else(|| {
+                Error::Config(format!(
+                    "Kafka offset commit group '{group}' does not declare exactly one topic; \
+                     transactional offset commits require a single-topic Kafka input"
+                ))
+            })?;
+            let (offsets, covered) =
+                transactional_offsets_for_batches(msgs, Some(group_topic.as_str()))?;
+            if covered {
+                let metadata = crate::kafka_txn::group_metadata(group)
+                .await
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "Kafka offset commit group '{group}' has no live input in this process; \
+                         the paired Kafka input must declare transactional_offsets"
+                    ))
+                })?;
+                let p = producer.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    p.send_offsets_to_transaction(
+                        &offsets,
+                        &metadata,
+                        Timeout::After(Duration::from_secs(30)),
+                    )
+                })
+                .await
+                {
+                    return Err(Error::Connection(format!(
+                        "Kafka send_offsets_to_transaction task join failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
         // Commit (blocking broker round-trip → spawn_blocking).
         let p = producer.clone();
         drop(producer_guard);
@@ -512,6 +560,15 @@ impl OutputBuilder for KafkaOutputBuilder {
                 }
             }
         }
+        // L3: offset_commit_group rides on a transactional producer, so it
+        // is meaningless (and silently non-functional) without exactly_once.
+        if config.offset_commit_group.is_some() && !config.exactly_once.unwrap_or(false) {
+            return Err(Error::Config(
+                "Kafka output: offset_commit_group requires exactly_once (source offsets \
+                 commit inside the producer transaction)"
+                    .into(),
+            ));
+        }
 
         // Fail before any stream starts on an inconsistent security block
         // (spec: 构建期校验与错误语义) — `--validate` reaches this path.
@@ -541,6 +598,7 @@ pub fn init() -> Result<(), Error> {
                 "value_field": {"type": "string", "description": "Record field used as the message payload."},
                 "exactly_once": {"type": "boolean", "default": false, "description": "Enable exactly-once transactional production (L2)."},
                 "transactional_id": {"type": "string", "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."},
+                "offset_commit_group": {"type": "string", "description": "L3 exactly-once: consumer group of a paired Kafka input (with transactional_offsets: true) whose source offsets commit inside this output's producer transactions. Requires exactly_once."},
                 "security": crate::kafka_security::json_schema()
             },
             "required": ["brokers", "topic"]
@@ -666,4 +724,82 @@ mod tests {
             "expected the error to name security.sasl.password, got: {err}"
         );
     }
+}
+
+/// Derive the transactional offset commit set from the batches' source
+/// metadata columns. Returns the topic-partition list (exclusive next
+/// offsets) and whether any committable position existed; batches without
+/// Kafka source metadata contribute nothing (L3 applies to Kafka→Kafka
+/// flows).
+fn transactional_offsets_for_batches(
+    msgs: &[MessageBatchRef],
+    group_topic: Option<&str>,
+) -> Result<(rdkafka::TopicPartitionList, bool), Error> {
+    use arkflow_core::meta_columns;
+    let mut offsets = rdkafka::TopicPartitionList::new();
+    let mut covered = false;
+    for msg in msgs {
+        let schema = msg.record_batch().schema();
+        let (Some(partition_col), Some(offset_col)) = (
+            schema.index_of(meta_columns::PARTITION).ok(),
+            schema.index_of(meta_columns::OFFSET).ok(),
+        ) else {
+            continue;
+        };
+        let partitions = msg
+            .record_batch()
+            .column(partition_col)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::Process(format!(
+                    "column '{}' must be a UInt32 column for transactional offsets",
+                    meta_columns::PARTITION
+                ))
+            })?;
+        let offsets_col = msg
+            .record_batch()
+            .column(offset_col)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::Process(format!(
+                    "column '{}' must be a UInt64 column for transactional offsets",
+                    meta_columns::OFFSET
+                ))
+            })?;
+        // Batch metadata carries the partition but not its topic: L3 routes
+        // partitions through the group's single subscribed topic.
+        let topic = group_topic
+            .clone()
+            .unwrap_or_default();
+        use datafusion::arrow::array::Array as _;
+        for row in 0..msg.record_batch().num_rows() {
+            if partitions.is_null(row) || offsets_col.is_null(row) {
+                continue;
+            }
+            let partition = partitions.value(row) as i32;
+            let next_offset = i64::try_from(offsets_col.value(row).saturating_add(1))
+                .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
+            // Keep the max next-offset per partition (rows arrive ordered,
+            // but a merged batch may interleave).
+            let updated = match offsets.find_partition(&topic, partition) {
+                Some(element) => match element.offset() {
+                    rdkafka::Offset::Offset(existing) => next_offset.max(existing),
+                    _ => next_offset,
+                },
+                None => next_offset,
+            };
+            if offsets
+                .add_partition_offset(&topic, partition, rdkafka::Offset::Offset(updated))
+                .is_err()
+            {
+                return Err(Error::Process(format!(
+                    "invalid transactional offset {updated} for topic '{topic}' partition {partition}"
+                )));
+            }
+            covered = true;
+        }
+    }
+    Ok((offsets, covered))
 }

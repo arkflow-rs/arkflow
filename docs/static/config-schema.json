@@ -2405,6 +2405,10 @@
               "type": "string",
               "description": "Transactional id (required when exactly_once is true); must be stable across restarts for zombie fencing."
             },
+            "offset_commit_group": {
+              "type": "string",
+              "description": "L3 exactly-once: consumer group of a paired Kafka input (with transactional_offsets: true) whose source offsets commit inside this output's producer transactions. Requires exactly_once."
+            },
             "security": {
               "type": "object",
               "description": "SASL authentication and TLS settings. Omit entirely for plaintext.",

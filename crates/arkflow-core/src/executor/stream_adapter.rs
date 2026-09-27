@@ -445,7 +445,7 @@ impl JobComponentAdapter for StreamJobAdapter {
         let config = InputConfig {
             input_type: source.input_type.clone(),
             name: decode_name(&payload),
-            codec: decode_codec(&payload)?,
+            codec: source.codec.clone().or(decode_codec(&payload)?),
             config: strip_payload_keys(payload),
         };
         let input = config.build(resource)?;
@@ -460,7 +460,7 @@ impl JobComponentAdapter for StreamJobAdapter {
         OutputConfig {
             output_type: sink.output_type.clone(),
             name: decode_name(&payload),
-            codec: decode_codec(&payload)?,
+            codec: sink.codec.clone().or(decode_codec(&payload)?),
             config: strip_payload_keys(payload),
         }
         .build(resource)

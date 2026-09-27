@@ -12,6 +12,24 @@ sidebar_position: 2
 兼容凭据可以是原始令牌(admin),也可以是 `principal|role|secret`,例如
 `readonly|viewer|viewer-secret`;viewer 凭据可以读取资源与审计历史,但不能变更 Stream、节点或灰度发布。
 
+### 存储后端
+
+Hub 默认把控制面状态(节点、作业、intents、操作、审计历史)持久化在 SQLite。`ARKFLOW_HUB_STORAGE` 按 scheme 选择后端:
+
+- 文件系统路径(或不设置)打开 SQLite 存储——WAL 日志、`synchronous=NORMAL`、`busy_timeout=5s`——无需额外配置。
+- 以 `postgres://` 或 `postgresql://` 开头的 URL 打开 PostgreSQL 后端:sqlx 连接池(8 连接、5s 获取超时),启动时探测连通性并应用幂等 `cp_*` DDL,空库首次启动即收敛出全部表结构。数据库不可达时 Hub 启动直接失败,而不是等到第一条命令才暴露。
+
+两个后端在同一 FIFO actor 之后实现同一存储契约,reconciliation、rollout 与 outbox 的顺序语义与后端无关。PostgreSQL 是 Hub HA 路线的存储阶段(不包含选主——Hub 仍是单实例)。
+
+要把既有 SQLite 部署迁移到 PostgreSQL:先停止 Hub(迁移要求源库静止),然后运行:
+
+```bash
+arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
+                       --to postgres://user:pass@db/hub
+```
+
+该工具按外键序以 1000 行事务逐表拷贝 `cp_*` 表,把 identity 序列重置到已迁移最大 id 之上,任何行数不一致都会非零退出。迁移成功后再把 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并重启 Hub。全新的 PostgreSQL 部署不需要该工具——启动 DDL 会创建 schema。
+
 ### OIDC JWT 联邦
 
 除了(或配合)静态运维凭据,Hub 还接受由组织 OIDC 身份提供方签发的 bearer JWT。通过环境变量配置:

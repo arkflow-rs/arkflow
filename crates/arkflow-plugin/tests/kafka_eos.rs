@@ -31,6 +31,7 @@
 //! available. All cases share one broker (fixed host port 9092) and run
 //! serially; each isolates by unique topic / transactional id / group.
 
+use arkflow_core::input::{Input, InputConfig};
 use arkflow_core::output::{Output, OutputConfig};
 use arkflow_core::{MessageBatch, MessageBatchRef, Resource};
 use rdkafka::config::ClientConfig;
@@ -126,6 +127,7 @@ fn docker_available() -> bool {
 static INIT: std::sync::Once = std::sync::Once::new();
 fn ensure_init() {
     INIT.call_once(|| {
+        arkflow_plugin::input::init().expect("plugin input init");
         arkflow_plugin::output::init().expect("plugin output init");
     });
 }
@@ -197,9 +199,24 @@ async fn wait_for_broker(brokers: &str) {
     }
 }
 
+
+fn l3_suffix() -> u32 {
+    std::process::id()
+}
+
 /// Build a `KafkaOutput` via the public registry path. When `exactly_once` is
 /// set, `tx_id` must be provided and is used as the stable transactional id.
 async fn build_output(topic: &str, exactly_once: bool, tx_id: Option<&str>) -> Arc<dyn Output> {
+    build_output_with_group(topic, exactly_once, tx_id, None).await
+}
+
+/// [`build_output`] plus an L3 `offset_commit_group` (requires exactly_once).
+async fn build_output_with_group(
+    topic: &str,
+    exactly_once: bool,
+    tx_id: Option<&str>,
+    group: Option<&str>,
+) -> Arc<dyn Output> {
     ensure_init();
     let mut cfg = serde_json::json!({
         "brokers": ["localhost:9092"],
@@ -208,6 +225,9 @@ async fn build_output(topic: &str, exactly_once: bool, tx_id: Option<&str>) -> A
     if exactly_once {
         cfg["exactly_once"] = serde_json::json!(true);
         cfg["transactional_id"] = serde_json::json!(tx_id.expect("tx id required"));
+    }
+    if let Some(group) = group {
+        cfg["offset_commit_group"] = serde_json::json!(group);
     }
     let out = OutputConfig {
         output_type: "kafka".into(),
@@ -311,6 +331,81 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
 /// Smoke test: the broker starts, a non-transactional `write_batch` produces,
 /// and a `read_committed` consumer observes the messages. Validates the whole
 /// fixture before the transactional cases lean on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l3_transactional_offset_commit_advances_the_group() {
+    ensure_init();
+    assert!(broker().await, "broker unavailable");
+    let source_topic = format!("l3-src-{}", l3_suffix());
+    let sink_topic = format!("l3-dst-{}", l3_suffix());
+    let group = format!("l3-group-{}", l3_suffix());
+
+    // Seed one source record through a committed transaction.
+    let seeder = txn_producer(&format!("seeder-{}", l3_suffix()));
+    let _ = txn_init(seeder.clone()).await;
+    seeder.begin_transaction().expect("seed begin");
+    seeder
+        .send(
+            FutureRecord::<str, [u8]>::to(&source_topic).payload(b"l3-payload"),
+            rdkafka::util::Timeout::Never,
+        )
+        .await
+        .expect("seed send");
+    seeder
+        .commit_transaction(rdkafka::util::Timeout::After(Duration::from_secs(10)))
+        .expect("seed commit");
+
+    // L3 input: transactional offsets, same group the output commits.
+    let input = InputConfig {
+        input_type: "kafka".into(),
+        name: None,
+        codec: None,
+        config: Some(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topics": [source_topic],
+            "consumer_group": group,
+            "start_from_latest": false,
+            "transactional_offsets": true,
+        })),
+    }
+    .build(&resource())
+    .expect("build l3 input");
+    input.connect().await.expect("l3 input connect");
+    let (batch, ack) = input.read().await.expect("l3 read");
+
+    // The batch carries Kafka source metadata (partition + offset).
+    let out = build_output_with_group(&sink_topic, true, Some(&format!("l3-txn-{}", l3_suffix())), Some(&group)).await;
+    out.write_batch(std::slice::from_ref(&batch))
+        .await
+        .expect("l3 write_batch commits source offsets in the transaction");
+    ack.ack().await.expect("ack completes (frontier only, no local store)");
+
+    // The group's committed position advanced inside the transaction: a
+    // fresh consumer with the same group sees no re-delivery.
+    let verify = InputConfig {
+        input_type: "kafka".into(),
+        name: None,
+        codec: None,
+        config: Some(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topics": [source_topic],
+            "consumer_group": group,
+            "start_from_latest": false,
+        })),
+    }
+    .build(&resource())
+    .expect("build verify consumer");
+    verify.connect().await.expect("verify connect");
+    let redelivery = tokio::time::timeout(Duration::from_secs(8), verify.read()).await;
+    assert!(
+        matches!(redelivery, Err(_)),
+        "committed offsets inside the transaction must prevent re-delivery"
+    );
+
+    drop(out);
+    drop(input);
+    drop(verify);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn smoke_broker_and_roundtrip() {

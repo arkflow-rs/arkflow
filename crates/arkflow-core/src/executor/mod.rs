@@ -13,6 +13,7 @@ pub mod envelope;
 pub mod event_time_gate;
 pub mod graph;
 pub mod job_runner_adapter;
+pub mod join;
 pub mod kernel_handle;
 pub mod metrics;
 pub mod remote;

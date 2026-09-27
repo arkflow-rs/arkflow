@@ -126,19 +126,27 @@ pub struct EdgeSpec {
     pub partitioned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceSpec {
     pub operator_id: String,
     pub input_type: String,
     #[serde(default)]
     pub config: serde_json::Value,
+    /// Decode codec applied to raw source payloads before the batch reaches
+    /// the graph (same contract as stream input codecs).
+    #[serde(default)]
+    pub codec: Option<crate::codec::CodecConfig>,
     pub time: TimeSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SinkSpec {
     pub operator_id: String,
     pub output_type: String,
+    /// Encode codec applied to outgoing batches (same contract as stream
+    /// output codecs).
+    #[serde(default)]
+    pub codec: Option<crate::codec::CodecConfig>,
     #[serde(default)]
     pub config: serde_json::Value,
 }
@@ -377,7 +385,7 @@ impl Default for RebalancePolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSpec {
     pub id: JobId,
     pub version: JobVersion,
@@ -398,6 +406,13 @@ pub struct JobSpec {
     pub checkpoint: Option<CheckpointSpec>,
     #[serde(default)]
     pub recovery: RecoveryPolicy,
+    /// Explicit opt-in for rescaling recovery: when the recovery artifact was
+    /// written under a different parallelism (or task set), keyed state is
+    /// redistributed across the new tasks by key-group ownership instead of
+    /// failing closed. Defaults to false — an undeclared topology change
+    /// still fails with the rescale guard's actionable error.
+    #[serde(default)]
+    pub rescale: bool,
     /// Task placement across compute nodes. Defaults to the historical
     /// co-location contract.
     #[serde(default)]
@@ -572,10 +587,14 @@ impl JobSpec {
                 )));
             }
             if operator.kind == OperatorKind::Join {
-                return Err(Error::Config(format!(
-                    "Join operator '{}' is not supported by the distributed runtime; use a supported single-input operator or a dedicated multi-input Join runtime",
-                    operator.id
-                )));
+                let join: crate::executor::join::JoinOperatorConfig =
+                    serde_json::from_value(operator.config.clone()).map_err(|error| {
+                        Error::Config(format!(
+                            "join operator '{}' has invalid config: {error}",
+                            operator.id
+                        ))
+                    })?;
+                join.validate()?;
             }
             if operator.stateful && operator.key_field.is_none() {
                 return Err(Error::Config(format!(
@@ -655,6 +674,25 @@ impl JobSpec {
                     "Job '{}' contains duplicate edges from '{}' to '{}'",
                     self.id, edge.from, edge.to
                 )));
+            }
+        }
+
+        // A join operator consumes exactly two sides: input 0 is the left,
+        // input 1 the right (ordered by the edge declaration order). Fewer
+        // edges leave a side starved; more cannot be routed by the kernel.
+        for operator in &self.operators {
+            if operator.kind == OperatorKind::Join {
+                let in_edges = self
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to == operator.id)
+                    .count();
+                if in_edges != 2 {
+                    return Err(Error::Config(format!(
+                        "join operator '{}' requires exactly two inbound edges, found {in_edges}",
+                        operator.id
+                    )));
+                }
             }
         }
 
@@ -946,7 +984,7 @@ pub struct TaskAttempt {
     pub state: TaskAttemptState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobPlan {
     pub spec: JobSpec,
     pub tasks: Vec<TaskSpec>,
@@ -1388,6 +1426,7 @@ mod tests {
 
     pub(super) fn base_job() -> JobSpec {
         JobSpec {
+            rescale: false,
             rebalance: None,
             placement: PlacementStrategy::Colocated,
             id: JobId::new("orders").unwrap(),
@@ -1432,6 +1471,7 @@ mod tests {
                 },
             ],
             sources: vec![SourceSpec {
+                codec: None,
                 operator_id: "source".into(),
                 input_type: "memory".into(),
                 config: serde_json::json!({}),
@@ -1449,6 +1489,7 @@ mod tests {
                 },
             }],
             sinks: vec![SinkSpec {
+                codec: None,
                 operator_id: "sink".into(),
                 output_type: "drop".into(),
                 config: serde_json::json!({}),
@@ -1473,17 +1514,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_join_operator() {
+    fn join_operator_requires_two_inbound_edges() {
         let mut job = base_job();
         job.operators.push(OperatorSpec {
             id: "join".into(),
             kind: OperatorKind::Join,
-            stateful: true,
-            key_field: Some("customer_id".into()),
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "left_key": "customer_id",
+                "right_key": "customer_id",
+                "window_ms": 5_000
+            }),
+        });
+        // No inbound edges: rejected with the arity error.
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("exactly two inbound edges"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn join_operator_with_two_edges_validates() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "join".into(),
+            kind: OperatorKind::Join,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "left_key": "customer_id",
+                "right_key": "customer_id",
+                "window_ms": 5_000
+            }),
+        });
+        job.edges.push(EdgeSpec {
+            id: "edge-join-left".into(),
+            from: "aggregate".into(),
+            to: "join".into(),
+            partitioned: false,
+        });
+        // One edge short of two sides.
+        assert!(job.validate().is_err());
+        job.operators.push(OperatorSpec {
+            id: "aux".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
             config: serde_json::json!({}),
         });
-        let error = job.validate().unwrap_err().to_string();
-        assert!(error.contains("Join operator 'join' is not supported"), "{error}");
+        // Reroute aggregate -> aux -> join and source -> join so the join has
+        // exactly two distinct inbound edges on a valid DAG.
+        job.edges.retain(|edge| edge.id != "edge-join-left");
+        job.edges.push(EdgeSpec {
+            id: "edge-aux-in".into(),
+            from: "aggregate".into(),
+            to: "aux".into(),
+            partitioned: false,
+        });
+        job.edges.push(EdgeSpec {
+            id: "edge-join-a".into(),
+            from: "aux".into(),
+            to: "join".into(),
+            partitioned: false,
+        });
+        job.edges.push(EdgeSpec {
+            id: "edge-join-b".into(),
+            from: "source".into(),
+            to: "join".into(),
+            partitioned: false,
+        });
+        job.validate().unwrap();
     }
 
     #[test]
@@ -1717,6 +1819,7 @@ mod tests {
             config: serde_json::json!({}),
         });
         job.sources.push(SourceSpec {
+            codec: None,
             operator_id: "orphan-source".into(),
             input_type: "memory".into(),
             config: serde_json::json!({}),
@@ -1740,6 +1843,7 @@ mod tests {
             config: serde_json::json!({}),
         });
         job.sinks.push(SinkSpec {
+            codec: None,
             operator_id: "orphan-sink".into(),
             output_type: "drop".into(),
             config: serde_json::json!({}),

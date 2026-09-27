@@ -90,6 +90,55 @@ impl DatabaseConnection {
     }
 }
 
+/// One `write_batch` call is one SQL transaction: every batch's insert runs
+/// inside a BEGIN…COMMIT pair, so a mid-batch failure rolls the whole ack
+/// range back instead of leaving a partial write for recovery replays to
+/// duplicate visibly.
+async fn execute_insert_transactional(
+    conn: &mut DatabaseConnection,
+    output_config: &SqlOutputConfig,
+    batches: &[(Vec<String>, Vec<Vec<SqlValue>>)],
+) -> Result<(), Error> {
+    use sqlx::Connection as _;
+    match conn {
+        DatabaseConnection::Mysql(conn) => {
+            let mut transaction = conn
+                .begin()
+                .await
+                .map_err(|e| Error::Process(format!("Failed to begin MySQL transaction: {}", e)))?;
+            for (columns, rows) in batches {
+                build_mysql_insert(output_config, columns, rows.clone())
+                    .build()
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| {
+                        Error::Process(format!("Failed to execute MySQL query: {}", e))
+                    })?;
+            }
+            transaction.commit().await.map_err(|e| {
+                Error::Process(format!("Failed to commit MySQL transaction: {}", e))
+            })
+        }
+        DatabaseConnection::Postgres(conn) => {
+            let mut transaction = conn.begin().await.map_err(|e| {
+                Error::Process(format!("Failed to begin Postgres transaction: {}", e))
+            })?;
+            for (columns, rows) in batches {
+                build_postgres_insert(output_config, columns, rows.clone())
+                    .build()
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| {
+                        Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
+                    })?;
+            }
+            transaction.commit().await.map_err(|e| {
+                Error::Process(format!("Failed to commit Postgres transaction: {}", e))
+            })
+        }
+    }
+}
+
 /// Columns a conflicting row updates on upsert: every column except the upsert
 /// keys. When every column is a key, the keys themselves are updated (a no-op
 /// assignment) so the conflict clause stays valid in both dialects.
@@ -360,6 +409,44 @@ impl Output for SqlOutput {
 
         self.insert_row(conn, &processed_msg).await?;
         Ok(())
+    }
+
+    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        // Transactional batch: the whole ack range commits atomically or not
+        // at all. Per-message `write` (the trait default) would leave a
+        // partial-write window the replay then duplicates visibly.
+        let mut conn_guard = self.conn_lock.lock().await;
+        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
+        let mut batches = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            let processed: MessageBatch = if let Some(codec) = &self.codec {
+                let encoded = codec.encode((**msg).clone()).await?;
+                MessageBatch::new_binary(encoded)?
+            } else {
+                (**msg).clone()
+            };
+            let schema = processed.schema();
+            let num_rows = processed.len();
+            let num_columns = schema.fields().len();
+            let columns: Vec<String> = (0..num_columns)
+                .map(|i| schema.field(i).name().clone())
+                .collect();
+            validate_upsert_keys(&self.sql_config, &columns)?;
+            let mut rows = Vec::with_capacity(num_columns * num_rows);
+            for row_index in 0..num_rows {
+                for col_index in 0..num_columns {
+                    let column = processed.column(col_index);
+                    let value = self.matching_data_type(column, row_index).await?;
+                    rows.push(value);
+                }
+            }
+            let rows: Vec<Vec<SqlValue>> = rows
+                .chunks(num_columns)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+            batches.push((columns, rows));
+        }
+        execute_insert_transactional(conn, &self.sql_config, &batches).await
     }
 
     async fn close(&self) -> Result<(), Error> {

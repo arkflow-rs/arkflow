@@ -121,6 +121,13 @@ pub struct Chain {
     /// values above 1 run a bounded, ordered, cancellable worker pool while
     /// the source stays a single task (partition topology unchanged).
     pub processor_parallelism: usize,
+    /// True when this chain contains a join operator: the interior loop tags
+    /// every inbound batch with `__meta_input_index` so the join processor
+    /// can distinguish its two sides.
+    pub tags_input_index: bool,
+    /// Upstream operator ids aligned with `inputs` order (join side
+    /// resolution by producer identity rather than channel position).
+    pub input_producers: Vec<String>,
     /// Downstream window timing definitions used by the source gate.
     pub window_timings: Vec<super::event_time_gate::WindowTiming>,
     /// Stable group identity for event-time gates that feed the same normal
@@ -157,6 +164,8 @@ impl Chain {
             source_time: None,
             source_partition: None,
             processor_parallelism: parallelism,
+            tags_input_index: false,
+            input_producers: Vec::new(),
             window_timings: Vec::new(),
             watermark_group: None,
             window_late_event_rows: None,
@@ -185,6 +194,8 @@ impl Chain {
             source_time: None,
             source_partition: None,
             processor_parallelism: 1,
+            tags_input_index: false,
+            input_producers: Vec::new(),
             window_timings: Vec::new(),
             watermark_group: None,
             window_late_event_rows: self.window_late_event_rows.clone(),
@@ -965,6 +976,23 @@ impl ExecutionGraphBuilder {
                 })
             })
             .map(|value| (value as usize).max(1));
+        // Upstream operator ids per inbound edge, in channel materialization
+        // order. Derived from `outbound` before chains are built so join
+        // operators can resolve their declared producers at construction.
+        let mut input_producers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (upstream_task_id, edges) in &outbound {
+            for edge in edges.iter() {
+                for target in &edge.targets {
+                    if let Some(upstream_task) = index.task(upstream_task_id.as_str()) {
+                        input_producers
+                            .entry(target.clone())
+                            .or_default()
+                            .push(upstream_task.operator_id.clone());
+                    }
+                }
+            }
+        }
+
         let mut chains = Vec::with_capacity(runs.len());
         for run in &runs {
             let first = run.first().unwrap();
@@ -979,6 +1007,13 @@ impl ExecutionGraphBuilder {
                     .is_some_and(|operator| {
                         operator.stateful || operator.kind == crate::job::OperatorKind::Window
                     })
+            });
+            let has_join = run.iter().any(|task| {
+                plan.spec
+                    .operators
+                    .iter()
+                    .find(|operator| operator.id == task.operator_id)
+                    .is_some_and(|operator| operator.kind == crate::job::OperatorKind::Join)
             });
 
             let source = if is_source {
@@ -1013,7 +1048,24 @@ impl ExecutionGraphBuilder {
                         Error::Config(format!("task '{}' references unknown operator", task.id))
                     })?;
                 let processor: Arc<dyn Processor> =
-                    if operator.kind == crate::job::OperatorKind::Window {
+                    if operator.kind == crate::job::OperatorKind::Join {
+                        let config: super::join::JoinOperatorConfig =
+                            serde_json::from_value(operator.config.clone()).map_err(|error| {
+                                Error::Config(format!(
+                                    "join operator '{}' has invalid config: {error}",
+                                    operator.id
+                                ))
+                            })?;
+                        config.validate()?;
+                        let operator = super::join::JoinOperator::new(config)?
+                            .with_input_producers(
+                                input_producers
+                                    .get(&first.id)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or_default(),
+                            )?;
+                        Arc::new(operator)
+                    } else if operator.kind == crate::job::OperatorKind::Window {
                         let backend = state_backend.clone().ok_or_else(|| {
                             Error::Config(format!(
                                 "stateful operator '{}' requires a Job state backend",
@@ -1186,11 +1238,16 @@ impl ExecutionGraphBuilder {
                 // Stateful and window operators own a mutable state epoch.
                 // Keep their chain single-threaded so a worker pool cannot
                 // interleave state updates or cross a checkpoint cut.
-                processor_parallelism: if has_stateful_processor {
+                processor_parallelism: if has_stateful_processor || has_join {
                     1
                 } else {
                     processor_parallelism.unwrap_or(1)
                 },
+                tags_input_index: has_join,
+                input_producers: input_producers
+                    .get(&first.id)
+                    .cloned()
+                    .unwrap_or_default(),
                 window_timings: if is_source {
                     window_timings_for_source(plan, &first.operator_id)?
                 } else {
