@@ -57,6 +57,14 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   const validated = editable && !dirty && validatedCandidate === identity && issues.length === 0
   useEffect(() => {
     if (configQuery.data === undefined) return
+    // A global draft loads independently of the config; wait for it to settle
+    // so its arrival cannot be transiently treated as "no draft", and report
+    // a draft-load failure instead of silently showing the active snapshot.
+    if (!nodeId && draftQuery.isPending) return
+    if (!nodeId && draftQuery.isError) {
+      onError(errorMessage(draftQuery.error))
+      return
+    }
     const draft = nodeId ? undefined : draftQuery.data
     const next = draft ?? { format: 'json' as const, content: JSON.stringify(configQuery.data, null, 2) }
     setContent(next.content)
@@ -67,7 +75,15 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     setActiveSnapshot(!draft)
     setIssues([])
     setValidatedCandidate(undefined)
-  }, [configQuery.data, draftQuery.data, nodeId])
+  }, [
+    configQuery.data,
+    draftQuery.data,
+    draftQuery.isPending,
+    draftQuery.isError,
+    draftQuery.error,
+    nodeId,
+    onError,
+  ])
   const reload = async () => {
     await queryClient.invalidateQueries({ queryKey: ['config'] })
     await queryClient.invalidateQueries({ queryKey: ['config-draft'] })

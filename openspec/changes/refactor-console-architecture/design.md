@@ -1,6 +1,6 @@
 ## Context
 
-阶段①（PR #1262）完成后，`features/` 目录已是按页面组织的模块，但两根架构支柱仍是过渡态：路由靠 `?page=` 查询参数 + 手写同步函数，数据靠 App 顶层 snapshot（8 接口 Promise.all、30s 轮询、props 下发）与页面自取并存。用户已选定引入 react-router（v8，Declarative Mode）与 TanStack Query（v5）——见记忆 `console-infra-library-preference`。官方 nginx 配置含 SPA fallback（`console/nginx.conf:5`），`?page=` 深链因阶段①修复虽可用但无路径语义、无返回键支持。
+阶段①（PR #1262）完成后，`features/` 目录已是按页面组织的模块，但两根架构支柱仍是过渡态：路由靠 `?page=` 查询参数 + 手写同步函数，数据靠 App 顶层 snapshot（8 接口 Promise.all、30s 轮询、props 下发）与页面自取并存。用户已选定引入 react-router（Declarative Mode）与 TanStack Query（v5）——见记忆 `console-infra-library-preference`。官方 nginx 配置含 SPA fallback（`console/nginx.conf:5`），`?page=` 深链因阶段①修复虽可用但无路径语义、无返回键支持。
 
 行为基线（必须保持）：轮询节奏（snapshot 30s / Job·Rollout 详情 5s / 其余不轮询）、SSE 驱动的防抖刷新（1.5s）、陈旧态横幅 + 最后快照保留、错误横幅、节点筛选贯通所有请求、`canMutate` 门控。
 
@@ -84,7 +84,7 @@ live 资源（SSE/轮询驱动）                  静态资源（挂载时取�
 ## Risks / Trade-offs
 
 - [Configuration 页 query 化后 SSE/重取打断草稿编辑] → D2 的 key 前缀隔离：`config` 不在 `['live']` 前缀下、不设 refetchInterval、`staleTime: Infinity`；仅 `nodeId` 变化才重取（与现状一致）。迁移该页时专项验证"验证中/未保存草稿在 SSE 事件后不丢失"。
-- [v8 发布仅两周（8.4.0，2026-09-15），生态资料少] → 只用 Declarative Mode 稳定 API 面（v6 起未变）；若 v8 出现回归，降级 pin 到 v7.18.4 成本为零（同 API 面）。实现首个任务即验证导入路径与类型。
+- [已按 D1 修订 pin v7.18.4（v8 peer 依赖 React ≥ 19.2.7）] → 只用 Declarative Mode 稳定 API 面（v6 起未变）；待项目升级 React 19 后可零成本升 v8。
 - [bundle 增大（router+query ≈ 20KB gz）] → 当前 509KB（minified），占比小；阶段③做代码分割时 JobEditor（xyflow）才是大头，本次不做分割。
 - [逐页迁移期间新旧两套并存] → D3 顺序保证每步全绿；snapshot 管道在最后一个页面迁完后才删除，不出现真空期。
 - [SSE 断连重连期间 invalidate 空转] → 保持现状语义：连接状态徽标独立展示，invalidate 不做连接感知。

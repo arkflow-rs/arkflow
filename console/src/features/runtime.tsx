@@ -8,7 +8,15 @@ import { useEvents, useOperations, useStreams } from '../queries'
 import { EventRow, OperationRow, Pagination, active, number } from './shared'
 import type { Command } from './types'
 
-export function Runtime({ command, canMutate = true }: { command: Command; canMutate?: boolean }) {
+export function Runtime({
+  command,
+  canMutate = true,
+  onError,
+}: {
+  command: Command
+  canMutate?: boolean
+  onError?: (message: string) => void
+}) {
   const t = useT()
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
@@ -133,6 +141,7 @@ export function Runtime({ command, canMutate = true }: { command: Command; canMu
       {detail && (
         <RuntimeDetail
           stream={detail}
+          onError={onError}
           operations={operations.filter((operation) => operation.resource_id === detail.id)}
           events={(events ?? []).filter((event) => event.stream_id === detail.id)}
           onClose={() => setSelected(undefined)}
@@ -153,7 +162,7 @@ export function Runtime({ command, canMutate = true }: { command: Command; canMu
         {operations.length ? (
           operations
             .slice(0, 12)
-            .map((operation) => <OperationRow operation={operation} key={operation.id} />)
+            .map((operation) => <OperationRow operation={operation} onError={onError} key={operation.id} />)
         ) : (
           <p className="empty">{t('runtime.noOperations')}</p>
         )}
@@ -167,11 +176,13 @@ function RuntimeDetail({
   operations,
   events,
   onClose,
+  onError,
 }: {
   stream: StreamStatus
   operations: Operation[]
   events: ControlEvent[]
   onClose: () => void
+  onError?: (message: string) => void
 }) {
   const t = useT()
   return (
@@ -237,7 +248,9 @@ function RuntimeDetail({
       )}
       <h4>{t('runtime.operationHistory')}</h4>
       {operations.length ? (
-        operations.map((operation) => <OperationRow operation={operation} key={operation.id} />)
+        operations.map((operation) => (
+          <OperationRow operation={operation} onError={onError} key={operation.id} />
+        ))
       ) : (
         <p className="empty">{t('runtime.noOperationHistory')}</p>
       )}

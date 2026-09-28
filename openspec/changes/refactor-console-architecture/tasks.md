@@ -1,6 +1,6 @@
 ## 1. 依赖与 Provider 骨架
 
-- [x] 1.1 `npm i react-router@^8.4.0 @tanstack/react-query@^5.104.0`；验证 v8 Declarative Mode 导入路径（`BrowserRouter`/`Routes`/`NavLink`/`useSearchParams` 来自 `react-router`）与 TS 类型
+- [x] 1.1 `npm i react-router@^7.18.4 @tanstack/react-query@^5.104.0`；验证 Declarative Mode 导入路径（实现期修订：v8 peer 依赖要求 React ≥ 19，故 pin v7.18.4）（`BrowserRouter`/`Routes`/`NavLink`/`useSearchParams` 来自 `react-router`）与 TS 类型
 - [x] 1.2 App 根组合 `QueryClientProvider` + Router（与 LocaleProvider 并列），`QueryClient` 默认配置（`retry: 1`、`refetchOnWindowFocus: false`）；测试 helper 可整体包裹
 - [x] 1.3 `npm test` 全绿（此步尚无行为变化）
 

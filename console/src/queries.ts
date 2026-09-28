@@ -1,5 +1,33 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useEffect, useState } from 'react'
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, SNAPSHOT_INTERVAL_MS } from './api'
+
+// The last error raised by any mounted ['live', ...] query, or null while all
+// live resources are healthy. Lets the shell mark the view stale even when the
+// failure is in a page-scoped query (e.g. streams) while nodes stays healthy.
+export function useLiveError(): Error | null {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<Error | null>(null)
+  useEffect(() => {
+    const cache = queryClient.getQueryCache()
+    const recompute = () => {
+      const failed = cache
+        .getAll()
+        .find(
+          (query) =>
+            Array.isArray(query.queryKey) &&
+            query.queryKey[0] === 'live' &&
+            query.state.status === 'error' &&
+            query.state.fetchStatus !== 'fetching' &&
+            query.state.error != null,
+        )
+      setError(failed ? (failed.state.error as Error) : null)
+    }
+    recompute()
+    return cache.subscribe(recompute)
+  }, [queryClient])
+  return error
+}
 
 // Live resources refetch on the snapshot cadence and keep the previous payload
 // visible on refetch failure so the UI can show a stale banner over the last

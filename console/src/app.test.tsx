@@ -471,6 +471,39 @@ describe('console application', () => {
     expect(screen.getByText('Fleet health')).toBeInTheDocument()
   })
 
+  it('marks the view stale when a page-scoped live query fails while nodes stay healthy', async () => {
+    render(<App />)
+    fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
+    await screen.findByText('orders')
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: url.includes('/nodes?'),
+        status: url.includes('/nodes?') ? 200 : 500,
+        headers: new Headers(),
+        json: async () => {
+          if (url.includes('/nodes?'))
+            return page([
+              {
+                id: 'local-node',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ])
+          return { code: 'internal', message: 'storage unavailable' }
+        },
+      }),
+    )
+    const refreshButton = await screen.findByRole('button', { name: /refresh/i })
+    await waitFor(() => expect(refreshButton).toBeEnabled())
+    fireEvent.click(refreshButton)
+    expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
+    expect(screen.getByText('orders')).toBeInTheDocument()
+  })
+
   it('keeps the configuration draft while live resources refresh', async () => {
     fetchMock.mockImplementation((url: string) =>
       Promise.resolve({

@@ -6,7 +6,7 @@
 
 ## What Changes
 
-- 引入 `react-router@^8`（Declarative Mode：BrowserRouter/Routes/NavLink），路由表：`/`、`/runtime`、`/jobs`、`/configuration`、`/rollouts`、`/components`、`/events`、`/audit`、`/settings`；`node_id` 保持为查询参数（横切筛选器）。
+- 引入 `react-router@^7.18.4`（Declarative Mode：BrowserRouter/Routes/NavLink；v8 要求 React ≥ 19.2.7，项目固定 React 18.3.1，故 pin v7），路由表：`/`、`/runtime`、`/jobs`、`/configuration`、`/rollouts`、`/components`、`/events`、`/audit`、`/settings`；`node_id` 保持为查询参数（横切筛选器）。
 - 旧 `?page=jobs` 链接重定向到 `/jobs`（保留 node_id），书签兼容；删除 `pageFromLocation`/`syncLocation`/`PAGES` 手写路由。
 - 引入 `@tanstack/react-query@^5`：App 顶层挂 `QueryClientProvider`；Overview/Runtime/Jobs/Events/Settings 的数据从全局 snapshot 迁为各自 `useQuery`（轮询节奏对齐现状：snapshot 资源 30s、Job 详情 5s、Rollout 详情 5s）；Configuration/Rollouts/Audit/Components 的自取 fetch 同样迁为 `useQuery`（保持无轮询现状）。
 - 全局 snapshot（`Promise.all` 8 接口 + props 下发）删除；SSE 事件改为防抖 `invalidateQueries`（对齐 `REFRESH_DEBOUNCE_MS`），仅作用于 live 资源，避免打断 Configuration 草稿编辑状态。

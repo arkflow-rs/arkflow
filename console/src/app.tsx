@@ -19,7 +19,7 @@ import {
   streamEvents,
   waitForOperation,
 } from './api'
-import { useNodes } from './queries'
+import { useNodes, useLiveError } from './queries'
 import { Overview } from './features/overview'
 import { Runtime } from './features/runtime'
 import { Jobs } from './features/jobs'
@@ -75,6 +75,7 @@ function ConsoleShell() {
   const queryClient = useQueryClient()
   const selectedNode = searchParams.get('node_id') ?? ''
   const nodesQuery = useNodes()
+  const liveError = useLiveError()
   const nodes = nodesQuery.data?.items ?? []
   const [error, setError] = useState('')
   const [live, setLive] = useState(false)
@@ -105,12 +106,11 @@ function ConsoleShell() {
     }
   }, [refresh, selectedNode])
 
-  // A failing nodes query is the canary for control-API reachability; the
-  // keepPreviousData placeholders on live queries preserve the last snapshot.
-  const stale = nodesQuery.isError
-  useEffect(() => {
-    if (nodesQuery.isError) setError(errorMessage(nodesQuery.error))
-  }, [nodesQuery.isError, nodesQuery.error])
+  // Query failures render in their own banner so they never clobber error
+  // state from mutations and page callbacks; keepPreviousData placeholders on
+  // the live queries preserve the last snapshot while the banner is up.
+  const stale = nodesQuery.isError || liveError !== null
+  const queryError = nodesQuery.isError ? nodesQuery.error : liveError
 
   const selectedNodeState = nodes.find((node) => node.id === selectedNode)
   const canMutate =
@@ -223,9 +223,13 @@ function ConsoleShell() {
           )}
         {stale && <div className="warning">{t('warning.staleState')}</div>}
         {error && <div className="error">{error}</div>}
+        {queryError && <div className="error">{errorMessage(queryError)}</div>}
         <Routes>
           <Route path="/" element={<Overview onError={setError} />} />
-          <Route path="/runtime" element={<Runtime command={command} canMutate={canMutate} />} />
+          <Route
+            path="/runtime"
+            element={<Runtime command={command} canMutate={canMutate} onError={setError} />}
+          />
           <Route path="/jobs" element={<Jobs onError={setError} canMutate={canMutate} />} />
           <Route
             path="/configuration"
