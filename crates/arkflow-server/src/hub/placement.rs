@@ -37,7 +37,17 @@ pub(crate) const RESOURCE_GAUGE_FRESH_MS: u64 = 10_000;
 /// (1, memory-available ratio, CPU headroom), gauge-less nodes rank
 /// (0, 0, 0) and land after every gauged node, in id order. Larger is
 /// better in every component.
-fn headroom_key(record: Option<&NodeRecord>, now: u64) -> (u8, f64, f64) {
+/// Declared per-node allocations from already-placed Jobs:
+/// (cpu_millicores, memory_bytes). Ranking subtracts these from the
+/// observed headroom so a loaded-by-declaration node ranks behind an
+/// equally-idle one.
+pub(crate) type NodeAllocations = BTreeMap<String, (u64, u64)>;
+
+fn headroom_key(
+    record: Option<&NodeRecord>,
+    now: u64,
+    allocated: Option<&(u64, u64)>,
+) -> (u8, f64, f64) {
     let Some(record) = record else {
         return (0, 0.0, 0.0);
     };
@@ -55,13 +65,29 @@ fn headroom_key(record: Option<&NodeRecord>, now: u64) -> (u8, f64, f64) {
     if !total.is_finite() || *total <= 0.0 || !used.is_finite() {
         return (0, 0.0, 0.0);
     }
-    let memory_available_ratio = (1.0 - used / total).clamp(0.0, 1.0);
-    let cpu_headroom = record
+    let (allocated_cpu, allocated_memory) = allocated.copied().unwrap_or((0, 0));
+    let effective_available = (total - used - allocated_memory as f64).max(0.0);
+    let memory_available_ratio = (effective_available / total).clamp(0.0, 1.0);
+    let mut cpu_headroom = record
         .metrics
         .get("node_cpu_usage_percent")
         .filter(|cpu| cpu.is_finite())
         .map(|cpu| (100.0 - cpu).clamp(0.0, 100.0))
         .unwrap_or(0.0);
+    // Convert declared millicores into a percentage of the node's CPU
+    // capacity when the core count is known; without the gauge the
+    // allocation cannot lower the (unknown) percentage.
+    if allocated_cpu > 0 {
+        if let Some(cores) = record
+            .metrics
+            .get("node_cpu_cores")
+            .copied().filter(|cores| cores.is_finite() && *cores > 0.0)
+        {
+            let allocated_percent =
+                allocated_cpu as f64 / (cores * 1000.0) * 100.0;
+            cpu_headroom = (cpu_headroom - allocated_percent).max(0.0);
+        }
+    }
     (1, memory_available_ratio, cpu_headroom)
 }
 
@@ -74,11 +100,12 @@ pub(crate) fn rank_candidates(
     candidates: Vec<String>,
     nodes: &BTreeMap<String, NodeRecord>,
     now: u64,
+    allocations: &NodeAllocations,
 ) -> Vec<String> {
     let mut ranked = candidates;
     ranked.sort_by(|left, right| {
-        let left_key = headroom_key(nodes.get(left), now);
-        let right_key = headroom_key(nodes.get(right), now);
+        let left_key = headroom_key(nodes.get(left), now, allocations.get(left));
+        let right_key = headroom_key(nodes.get(right), now, allocations.get(right));
         right_key
             .0
             .cmp(&left_key.0)
@@ -139,6 +166,177 @@ impl Hub {
             }
         }
         ordered
+    }
+
+    /// Nodes holding a non-terminal (successful or in-flight) start for the
+    /// Job at or before `generation` — the fallback placement view when the
+    /// dispatch-order memory is absent.
+    async fn successful_start_nodes(&self, job_id: &str, generation: u64) -> BTreeSet<String> {
+        self.operations
+            .read()
+            .await
+            .values()
+            .filter(|operation| {
+                operation.resource_id == job_id
+                    && operation.operation == "job_start"
+                    && operation.generation <= generation
+                    && !matches!(
+                        operation.state,
+                        HubOperationState::Failed
+                            | HubOperationState::TimedOut
+                            | HubOperationState::NodeUnavailable
+                            | HubOperationState::Cancelled
+                            | HubOperationState::Superseded
+                    )
+            })
+            .map(|operation| operation.node_id.clone())
+            .collect()
+    }
+
+    /// Stateless recompute of declared per-node allocations: every
+    /// desired-running Job (except `exclude_job`) that declares resources
+    /// contributes its per-task request times its per-node assignment count
+    /// under its current placement view (dispatch-order memory, else
+    /// successful-start nodes). Recomputing from the current view — instead
+    /// of maintaining an incremental ledger — keeps the numbers self-healing
+    /// across Hub restarts and retention re-dispatches.
+    pub(crate) async fn declared_node_allocations(
+        &self,
+        exclude_job: &str,
+    ) -> NodeAllocations {
+        let jobs = match self.jobs().await {
+            Ok(jobs) => jobs,
+            Err(_) => return NodeAllocations::new(),
+        };
+        let mut allocations = NodeAllocations::new();
+        for job in jobs {
+            if job.job_id == exclude_job || job.desired_state != "running" {
+                continue;
+            }
+            let Ok(spec) =
+                serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
+            else {
+                continue;
+            };
+            if !spec.resources.is_declared() {
+                continue;
+            }
+            let Ok(plan) = arkflow_core::job::JobPlan::compile(spec) else {
+                continue;
+            };
+            let order = {
+                let remembered = self
+                    .placement_order
+                    .read()
+                    .await
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if remembered.is_empty() {
+                    self.successful_start_nodes(&job.job_id, job.generation)
+                        .await
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    remembered
+                }
+            };
+            if order.is_empty() {
+                continue;
+            }
+            let Ok(assignments) = plan.assignments_for_nodes(&order, job.generation)
+            else {
+                continue;
+            };
+            for assignment in assignments {
+                let entry = allocations
+                    .entry(assignment.node_id.clone())
+                    .or_insert((0, 0));
+                if let Some(cpu) = plan.spec.resources.cpu_millicores {
+                    entry.0 += cpu as u64;
+                }
+                if let Some(memory) = plan.spec.resources.memory_bytes {
+                    entry.1 += memory;
+                }
+            }
+        }
+        allocations
+    }
+
+    /// Feasibility gate for declared Jobs: (allocated + this Job's share)
+    /// must fit the node's declared capacity (CPU millicores within
+    /// cores x 1000; memory within 90% of total, keeping a system
+    /// reserve). Nodes without fresh capacity gauges are exempt
+    /// (fail-open, matching the gauge-less ranking exemption). Returns an
+    /// explicit error so an overloaded fleet surfaces instead of stacking.
+    async fn enforce_resource_feasibility(
+        &self,
+        job_id: &str,
+        spec: &arkflow_core::job::JobSpec,
+        assignments: &[arkflow_core::job::TaskAttempt],
+        targets: &[String],
+    ) -> Result<(), HubError> {
+        if !spec.resources.is_declared() {
+            return Ok(());
+        }
+        let allocations = self.declared_node_allocations(job_id).await;
+        let now = now_ms();
+        let nodes = self.nodes.read().await;
+        for node_id in targets.iter().collect::<BTreeSet<_>>() {
+            let count = assignments
+                .iter()
+                .filter(|assignment| &assignment.node_id == node_id)
+                .count()
+                .max(1) as u64;
+            let Some(record) = nodes.get(node_id.as_str()) else {
+                continue;
+            };
+            if record.last_report_at_ms == 0
+                || now.saturating_sub(record.last_report_at_ms) > RESOURCE_GAUGE_FRESH_MS
+            {
+                continue;
+            }
+            let (allocated_cpu, allocated_memory) =
+                allocations.get(node_id).copied().unwrap_or((0, 0));
+            if let (Some(requested), Some(cores)) = (
+                spec.resources.cpu_millicores,
+                record
+                    .metrics
+                    .get("node_cpu_cores")
+                    .copied().filter(|cores| cores.is_finite() && *cores > 0.0),
+            ) {
+                let capacity_millicores = cores * 1000.0;
+                if allocated_cpu as f64 + (requested as u64 * count) as f64
+                    > capacity_millicores
+                {
+                    return Err(HubError::Invalid(format!(
+                        "insufficient CPU capacity on node '{node_id}': allocated {} + requested {} of {} millicores",
+                        allocated_cpu,
+                        requested as u64 * count,
+                        capacity_millicores as u64
+                    )));
+                }
+            }
+            if let Some(requested) = spec.resources.memory_bytes {
+                if let Some(total) = record
+                    .metrics
+                    .get("node_memory_total_bytes")
+                    .copied().filter(|total| total.is_finite() && *total > 0.0)
+                {
+                    // 10% reserve for the OS and agent overhead.
+                    let limit = total * 0.9;
+                    if allocated_memory as f64 + (requested * count) as f64 > limit {
+                        return Err(HubError::Invalid(format!(
+                            "insufficient memory capacity on node '{node_id}': allocated {} + requested {} of {} bytes",
+                            allocated_memory,
+                            requested * count,
+                            limit as u64
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Incremental re-placement for partial node failures: keep the
@@ -447,8 +645,9 @@ impl Hub {
         // (only when this ranked order actually drives the dispatch).
         let mut targets = targets;
         if job.node_ids.is_empty() {
+            let allocations = self.declared_node_allocations(&job.job_id).await;
             let nodes = self.nodes.read().await;
-            targets = rank_candidates(targets, &nodes, now_ms());
+            targets = rank_candidates(targets, &nodes, now_ms(), &allocations);
         }
         // Opt-in pressure rebalance: exclude nodes whose sustained-pressure
         // streak trips the Job's policy. The abandoned-placement fencing
@@ -589,6 +788,11 @@ impl Hub {
         // side-edge co-location contract.
         plan.validate_side_edge_assignments(&assignments)
             .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Declared resource feasibility: fit (allocated + share) into each
+        // target's capacity before any fencing or dispatch, so an overloaded
+        // fleet surfaces as a retryable error instead of stacking.
+        self.enforce_resource_feasibility(&job.job_id, &spec, &assignments, &targets)
+            .await?;
         // Split placement: validate that every target node runs the data
         // plane, then attach the full task→node map and peer data addresses
         // so each node's graph build can wire its remote edges without any

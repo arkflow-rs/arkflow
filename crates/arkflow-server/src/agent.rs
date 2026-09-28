@@ -91,6 +91,11 @@ struct JobTask {
     recovery_required: bool,
     cancellation: CancellationToken,
     assignments: Vec<TaskAttempt>,
+    /// Dedicated bounded runtime for Jobs declaring `resources.cpu_millicores`
+    /// (worker threads = ceil(millicores/1000), min 1): one Job cannot occupy
+    /// the shared runtime's workers. Shut down (detached, bounded) when the
+    /// task is retired. `None` for undeclared Jobs — shared runtime as before.
+    dedicated_runtime: Option<Arc<tokio::runtime::Runtime>>,
     watermark_partitions: BTreeMap<String, u32>,
     state: Arc<dyn StateBackend>,
     checkpoint_store_uri: Option<String>,
@@ -495,6 +500,22 @@ fn parse_recovery_payload(
     Ok((Some(checkpoint_id.to_owned()), savepoint, recovery_required))
 }
 
+/// Bounded, detached teardown of a dedicated runtime. Takes the task's
+/// reference (callers `take()` it before awaiting the kernel handle) so the
+/// final Arc never drops inside an async context (Runtime::drop panics
+/// there); the shutdown itself runs on the blocking pool, outside every
+/// runtime's async context. Must run only AFTER the kernel handle resolved:
+/// shutting the runtime down first would strand the JoinHandle.
+fn shutdown_dedicated_runtime(dedicated: Option<Arc<tokio::runtime::Runtime>>) {
+    if let Some(runtime) = dedicated {
+        tokio::task::spawn_blocking(move || {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_secs(10));
+            }
+        });
+    }
+}
+
 impl JobRuntime {
     async fn generation(&self, job_id: &str) -> Option<u64> {
         self.tasks
@@ -667,7 +688,10 @@ impl JobRuntime {
             }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
-            let existing = tasks.remove(&job_id);
+            let mut existing = tasks.remove(&job_id);
+            if let Some(existing) = existing.as_mut() {
+                existing.cancellation.cancel();
+            }
             // Observed on the removal lock, right before the cancel: a kernel
             // that exited on its own has a genuine crash outcome worth
             // surfacing below; an exit after the cancel is this start's own
@@ -681,12 +705,14 @@ impl JobRuntime {
             (existing, previous_exited_on_its_own)
         };
         let mut replaced_crash: Option<(u64, String)> = None;
-        if let Some(existing) = existing {
+        if let Some(mut existing) = existing {
             let existing_generation = existing.generation;
+            let dedicated = existing.dedicated_runtime.take();
             let outcome =
                 await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT)
                     .await;
             let _ = existing.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, existing_generation);
             }
@@ -852,6 +878,7 @@ impl JobRuntime {
                 recovery_required,
                 cancellation: cancellation.clone(),
                 assignments: assignments.clone(),
+                dedicated_runtime: None,
                 watermark_partitions: watermark_partitions.clone(),
                 state: state.clone(),
                 checkpoint_store_uri: plan
@@ -899,23 +926,67 @@ impl JobRuntime {
                         .collect()
                 }
             };
-            Some(arkflow_core::executor::graph::RemoteEdgeContext {
-                local_node: node_id.to_string(),
-                task_nodes,
-                node_addrs,
-                manager: manager.clone(),
-                generation,
-            })
+            Some(std::sync::Arc::new(
+                arkflow_core::executor::graph::RemoteEdgeContext {
+                    local_node: node_id.to_string(),
+                    task_nodes,
+                    node_addrs,
+                    manager: manager.clone(),
+                    generation,
+                },
+            ))
         });
-        let spawn_result = spawn_kernel_job(
-            &plan,
-            &task_ids,
-            state.clone(),
-            recovery.as_ref(),
-            cancellation.clone(),
-            remote_context.as_ref(),
-        )
-        .await;
+        // Declared CPU => dedicated bounded runtime: the kernel (and all its
+        // async work) runs on max(1, ceil(millicores/1000)) worker threads
+        // owned by this Job instead of the shared runtime's pool. Undeclared
+        // Jobs keep the shared runtime, byte-identical to before.
+        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> = match plan
+            .spec
+            .resources
+            .cpu_millicores
+        {
+            Some(millicores) => {
+                let workers = millicores.div_ceil(1000).max(1) as usize;
+                match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .thread_name(format!("arkflow-job-{job_id}"))
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(error) => {
+                        return Err(format!(
+                            "dedicated runtime for Job '{job_id}' failed to build: {error}"
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+        let state_for_spawn = state.clone();
+        let owned_plan = plan.clone();
+        let owned_task_ids = task_ids.clone();
+        let owned_recovery = recovery.clone();
+        let owned_remote = remote_context.clone();
+        let owned_cancellation = cancellation.clone();
+        let spawn_future = async move {
+            spawn_kernel_job(
+                &owned_plan,
+                &owned_task_ids,
+                state_for_spawn.clone(),
+                owned_recovery.as_ref(),
+                owned_cancellation,
+                owned_remote.as_deref(),
+            )
+            .await
+        };
+        let spawn_result = match &dedicated_runtime {
+            Some(runtime) => match runtime.spawn(spawn_future).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("dedicated kernel task failed: {error}")),
+            },
+            None => spawn_future.await,
+        };
         let kernel = match spawn_result {
             Ok(handle) => {
                 // Release the placeholder: the swap below resolves it.
@@ -928,9 +999,18 @@ impl JobRuntime {
                 }
                 drop(started_tx);
                 let placeholder = self.tasks.lock().await.remove(&job_id);
-                if let Some(task) = placeholder {
+                if let Some(mut task) = placeholder {
+                    let dedicated = task.dedicated_runtime.take();
                     task.cancellation.cancel();
                     let _ = task.handle.await;
+                    shutdown_dedicated_runtime(dedicated);
+                }
+                if let Some(runtime) = dedicated_runtime.take() {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
                 }
                 if let Some(manager) = &self.data_plane {
                     manager.remove_job_session(&job_id, generation);
@@ -960,6 +1040,7 @@ impl JobRuntime {
                         recovery_required,
                         cancellation: cancellation.clone(),
                         assignments,
+                        dedicated_runtime: dedicated_runtime.clone(),
                         watermark_partitions,
                         state,
                         checkpoint_store_uri: plan
@@ -976,6 +1057,13 @@ impl JobRuntime {
         if !registered {
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, generation);
+            }
+            if let Some(runtime) = dedicated_runtime.take() {
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                        runtime.shutdown_timeout(Duration::from_secs(10));
+                    }
+                });
             }
         }
         Ok(())
@@ -1272,13 +1360,15 @@ impl JobRuntime {
             .map(|(job_id, _)| job_id.clone())
             .collect::<Vec<_>>();
         for job_id in ids {
-            if let Some(task) = tasks.remove(&job_id) {
+            if let Some(mut task) = tasks.remove(&job_id) {
+                let dedicated = task.dedicated_runtime.take();
                 let result = match task.handle.await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(error) => Err(error.to_string()),
                 };
                 let _ = task.state.close();
+                shutdown_dedicated_runtime(dedicated);
                 if let Some(manager) = &self.data_plane {
                     manager.remove_job_session(&job_id, task.generation);
                 }
@@ -1303,10 +1393,12 @@ impl JobRuntime {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks).into_iter().collect::<Vec<_>>()
         };
-        for (job_id, task) in tasks {
+        for (job_id, mut task) in tasks {
+            let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
             let _ = task.handle.await;
             let _ = task.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, task.generation);
             }
@@ -1324,11 +1416,13 @@ impl JobRuntime {
             }
             tasks.remove(job_id)
         };
-        if let Some(task) = task {
+        if let Some(mut task) = task {
             let task_generation = task.generation;
+            let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
             let _ = task.handle.await;
             let _ = task.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(job_id, task_generation);
             }
@@ -1787,6 +1881,8 @@ pub(crate) struct ResourceSnapshot {
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub memory_available_bytes: u64,
+    /// Logical CPU cores — static capacity for placement feasibility.
+    pub cpu_cores: u32,
 }
 
 /// Shared latest-snapshot slot between the sampler task and the report path.
@@ -1849,6 +1945,9 @@ fn merge_resource_gauges(
         "node_memory_available_bytes".into(),
         snapshot.memory_available_bytes as f64,
     );
+    if snapshot.cpu_cores > 0 {
+        metrics.insert("node_cpu_cores".into(), f64::from(snapshot.cpu_cores));
+    }
 }
 
 /// Spawn the host resource sampler: a fixed-interval task publishing into the
@@ -1881,6 +1980,7 @@ pub(crate) fn spawn_resource_sampler(
                 memory_used_bytes: system.used_memory(),
                 memory_total_bytes: system.total_memory(),
                 memory_available_bytes: system.available_memory(),
+                cpu_cores: system.cpus().len() as u32,
             });
         }
     });
@@ -3221,6 +3321,7 @@ mod tests {
                 recovery_required: false,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                dedicated_runtime: None,
                 watermark_partitions: BTreeMap::new(),
                 state,
                 checkpoint_store_uri: None,
@@ -3645,6 +3746,7 @@ mod tests {
             memory_used_bytes: 4_000,
             memory_total_bytes: 8_000,
             memory_available_bytes: 4_000,
+            cpu_cores: 2,
         }
     }
 
@@ -3659,6 +3761,7 @@ mod tests {
             keys,
             [
                 "input_messages",
+                "node_cpu_cores",
                 "node_cpu_usage_percent",
                 "node_memory_available_bytes",
                 "node_memory_total_bytes",
@@ -3666,6 +3769,7 @@ mod tests {
             ]
         );
         assert_eq!(metrics["node_cpu_usage_percent"], 37.5);
+        assert_eq!(metrics["node_cpu_cores"], 2.0);
         assert_eq!(metrics["node_memory_total_bytes"], 8_000.0);
     }
 
@@ -3676,7 +3780,8 @@ mod tests {
         let mut metrics = BTreeMap::new();
         merge_resource_gauges(&mut metrics, cold);
         assert!(!metrics.contains_key("node_cpu_usage_percent"));
-        assert_eq!(metrics.len(), 3);
+        // Memory gauges plus the static CPU core count.
+        assert_eq!(metrics.len(), 4);
     }
 
     #[test]
@@ -4048,6 +4153,93 @@ mod tests {
         }
 
         runtime.stop("orders-drift", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+
+    /// A Job declaring cpu_millicores runs on a dedicated runtime with
+    /// ceil(millicores/1000) workers (min 1); an undeclared Job keeps the
+    /// shared runtime (None).
+    #[tokio::test]
+    async fn declared_cpu_runs_on_a_dedicated_bounded_runtime() {
+        let runtime = Arc::new(JobRuntime::default());
+        let mut spec_value = serde_json::json!({
+            "id": "orders-cpu",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        spec_value["resources"] = serde_json::json!({"cpu_millicores": 2500});
+        let spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(spec_value).unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("declared start succeeds");
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-cpu").expect("registered");
+            let dedicated = task
+                .dedicated_runtime
+                .as_ref()
+                .expect("declared cpu jobs own a dedicated runtime");
+            assert_eq!(
+                dedicated.metrics().num_workers(),
+                3,
+                "2500 millicores => ceil(2.5) = 3 workers"
+            );
+        }
+        runtime.stop("orders-cpu", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    #[tokio::test]
+    async fn undeclared_jobs_keep_the_shared_runtime() {
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-shared").await;
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("undeclared start succeeds");
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-shared").expect("registered");
+            assert!(
+                task.dedicated_runtime.is_none(),
+                "undeclared jobs run on the shared runtime"
+            );
+        }
+        runtime.stop("orders-shared", 1).await.unwrap();
         let _ = runtime.take_finished().await;
     }
 

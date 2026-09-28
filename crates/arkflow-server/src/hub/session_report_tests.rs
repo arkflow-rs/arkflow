@@ -539,11 +539,15 @@ fn job_spec_json(id: &str) -> String {
 }
 
 fn resource_metrics(used_ratio: f64, cpu: f64) -> BTreeMap<String, f64> {
-    BTreeMap::from([
+    let mut metrics = BTreeMap::from([
         ("node_memory_total_bytes".to_string(), 16_000.0),
         ("node_memory_used_bytes".to_string(), 16_000.0 * used_ratio),
         ("node_cpu_usage_percent".to_string(), cpu),
-    ])
+        // Two logical cores = 2000 millicores of declared capacity.
+        ("node_cpu_cores".to_string(), 2.0),
+    ]);
+    metrics.retain(|_, value| value.is_finite() && *value >= 0.0);
+    metrics
 }
 
 fn shuffle_capabilities() -> Vec<String> {
@@ -775,7 +779,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
         nodes.insert(id.to_string(), record);
     }
     let rank = |candidates: Vec<String>| {
-        rank_candidates(candidates, &nodes, now)
+        rank_candidates(candidates, &nodes, now, &NodeAllocations::new())
             .into_iter()
             .collect::<Vec<_>>()
     };
@@ -2189,4 +2193,179 @@ async fn failed_observation_redispatches_the_nodes_start() {
             .any(|command| command.operation == "job_start"),
         "the reconcile must re-dispatch the start after the runtime failure"
     );
+}
+
+/// A Job declaring more CPU than any node's declared capacity surfaces an
+/// explicit insufficient-capacity error instead of stacking onto the fleet.
+#[tokio::test]
+async fn declared_cpu_beyond_capacity_fails_explicitly() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    report_shuffle_node(&hub, &auth, 0.1, 10.0, 1).await;
+    // 2 cores = 2000 millicores; the colocated Job's two tasks request
+    // 1500 each = 3000 total.
+    let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+    spec["resources"] = serde_json::json!({"cpu_millicores": 1500});
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap_err();
+}
+
+/// A declared Job fits a node whose remaining declared capacity covers its
+/// share, and ranking prefers the node with more EFFECTIVE headroom when
+/// raw gauges are equal.
+#[tokio::test]
+async fn declared_job_lands_on_effective_headroom() {
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for node_id in ["node-a", "node-b"] {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+    }
+    // Identical gauges: 2 cores, low usage, plenty of memory.
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        },
+        0.1,
+        10.0,
+        1,
+    )
+    .await;
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        },
+        0.1,
+        10.0,
+        1,
+    )
+    .await;
+
+    // A first declared Job lands on node-a (node-id tie-break) and holds
+    // 1600 of node-a's 2000 millicores.
+    let mut heavy: serde_json::Value = serde_json::from_str(&job_spec_json("heavy")).unwrap();
+    heavy["resources"] = serde_json::json!({"cpu_millicores": 800});
+    hub.upsert_job(JobRecord {
+        job_id: "heavy".into(),
+        version: 1,
+        spec_json: heavy.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let heavy_tasks = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    assert_eq!(heavy_tasks.len(), 2, "the colocated job lands whole: {heavy_tasks:?}");
+
+    // The second declared Job needs 400 millicores: node-a's effective
+    // headroom is 400 millicores and its effective memory ratio dropped,
+    // so node-b ranks first and the job lands there.
+    let mut light: serde_json::Value = serde_json::from_str(&job_spec_json("light")).unwrap();
+    light["resources"] = serde_json::json!({"cpu_millicores": 200});
+    hub.upsert_job(JobRecord {
+        job_id: "light".into(),
+        version: 1,
+        spec_json: light.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let light_tasks = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+    assert_eq!(light_tasks.len(), 2, "the light job lands whole on node-b: {light_tasks:?}");
+}
+
+/// Undeclared Jobs are never gated: the same loaded node still receives
+/// them exactly as before.
+#[tokio::test]
+async fn undeclared_jobs_bypass_the_resource_gate() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    report_shuffle_node(&hub, &auth, 0.99, 99.0, 1).await;
+    // No resources declared: places onto the (only, fully used) node as
+    // before — the gate applies only to declared Jobs.
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: job_spec_json("orders"),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let tasks = poll_start_tasks_and_complete(&hub, "node-a", &session.session_token).await;
+    assert!(!tasks.is_empty());
 }

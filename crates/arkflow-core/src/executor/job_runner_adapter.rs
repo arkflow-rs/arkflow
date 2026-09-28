@@ -1195,6 +1195,7 @@ mod validation_tests {
     #[test]
     fn rescale_across_parallelism_fails_closed_on_recovery() {
         let mut spec = crate::job::JobSpec {
+            resources: Default::default(),
             rescale: false,
             rebalance: None,
             placement: crate::job::PlacementStrategy::Colocated,
@@ -1494,6 +1495,7 @@ mod validation_tests {
 
     fn local_spec(input_type: &str, output_type: &str) -> JobSpec {
         JobSpec {
+            resources: Default::default(),
             rebalance: None,
             id: JobId::new("validate-job").unwrap(),
             version: JobVersion(1),
@@ -1748,6 +1750,7 @@ mod metrics_registry_tests {
 
     fn registry_spec() -> JobSpec {
         JobSpec {
+            resources: Default::default(),
             rebalance: None,
             id: JobId::new("registry-metrics-job").unwrap(),
             version: JobVersion(1),

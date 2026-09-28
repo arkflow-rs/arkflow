@@ -36,6 +36,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
         late_event_route: None,
     };
     JobSpec {
+        resources: Default::default(),
         rebalance: None,
 rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,

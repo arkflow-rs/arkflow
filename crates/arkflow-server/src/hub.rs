@@ -63,7 +63,7 @@ pub(crate) use checkpoint::job_state_format_version;
 #[cfg(test)]
 pub(crate) use nodes::{sanitize_capabilities, sanitize_metrics};
 #[cfg(test)]
-pub(crate) use placement::{rank_candidates, RESOURCE_GAUGE_FRESH_MS};
+pub(crate) use placement::{rank_candidates, NodeAllocations, RESOURCE_GAUGE_FRESH_MS};
 
 const MAX_NODES: usize = 256;
 const MAX_COMMANDS_PER_NODE: usize = 128;

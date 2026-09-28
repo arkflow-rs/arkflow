@@ -31,6 +31,7 @@ const ALLOWED_NODE_METRICS: &[&str] = &[
     // Host resource gauges sampled by the Agent (see agent.rs
     // ResourceSampler): ephemeral registry state, exported as-is.
     "node_cpu_usage_percent",
+    "node_cpu_cores",
     "node_memory_used_bytes",
     "node_memory_total_bytes",
     "node_memory_available_bytes",
