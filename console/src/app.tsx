@@ -10,7 +10,14 @@ import {
   streamEvents,
   waitForOperation,
 } from './api'
-import { Configuration, Components, Events, Jobs, Overview, Runtime, Settings, Snapshot } from './features'
+import { Overview } from './features/overview'
+import { Runtime } from './features/runtime'
+import { Jobs } from './features/jobs'
+import { Configuration } from './features/configuration'
+import { Components } from './features/components'
+import { Events } from './features/events'
+import { Settings } from './features/settings'
+import type { Snapshot } from './features/types'
 import { Audit } from './features/audit'
 import { Rollouts } from './features/rollouts'
 import { useSetLocale, useLocale, useT, type Locale } from './i18n'
@@ -30,7 +37,7 @@ type Page = (typeof PAGES)[number]
 
 function pageFromLocation(): Page {
   const value = new URLSearchParams(window.location.search).get('page')
-  return PAGES.some(([key]) => key === value) ? (value as Page) : 'overview'
+  return PAGES.some((p) => p === value) ? (value as Page) : 'overview'
 }
 
 function nodeFromLocation(): string {

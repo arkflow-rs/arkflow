@@ -363,4 +363,30 @@ describe('console application', () => {
     expect(await screen.findByText('集群健康')).toBeInTheDocument()
     window.localStorage.removeItem(LOCALE_STORAGE_KEY)
   })
+
+  it('restores the current page from a deep link instead of the default overview', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return {
+              version: 'test',
+              state: 'running',
+              uptime_seconds: 4,
+              streams_total: 0,
+              streams_running: 0,
+              streams_failed: 0,
+              capabilities: [],
+            }
+          if (url.endsWith('/jobs')) return []
+          return page([])
+        },
+      }),
+    )
+    window.history.replaceState(null, '', '/?page=jobs')
+    render(<App />)
+    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Job filter')).toBeInTheDocument()
+  })
 })
