@@ -4,7 +4,7 @@ Define the operator-facing Console for discovering, observing, and administering
 ## Requirements
 ### Requirement: Operations application shell
 
-The console SHALL provide persistent navigation and route-level pages for Overview, Runtime, Configuration, Components, Events, and Settings. It SHALL show global connection, permission, stale-data, loading, empty, and error states. The console SHALL use the same node collection contract in local and Hub mode, and SHALL persist the selected `node_id` in the current URL state.
+The console SHALL provide persistent navigation and route-level pages for Overview, Runtime, Configuration, Components, Events, and Settings. It SHALL show global connection, permission, stale-data, loading, empty, and error states. The console SHALL use the same node collection contract in local and Hub mode, SHALL persist the selected `node_id` as a query parameter in the current URL state, and SHALL address each page by URL path (e.g. `/jobs`), support browser back and forward navigation, and redirect legacy `?page=` links to the corresponding path. When live updates arrive over SSE, the console SHALL refresh live resources (system, nodes, streams, jobs, operations, events, metrics, tracked operation and rollout details) without discarding local editing state such as configuration drafts, and SHALL poll live resources on their configured intervals.
 
 #### Scenario: Open the overview
 - **WHEN** an operator opens the console
@@ -16,7 +16,19 @@ The console SHALL provide persistent navigation and route-level pages for Overvi
 
 #### Scenario: Select a node
 - **WHEN** an operator selects a node
-- **THEN** the URL contains the selected `node_id` and runtime, configuration, event, operation, and metric requests use that node context
+- **THEN** the URL contains the selected `node_id` as a query parameter on the current path, and runtime, configuration, event, operation, and metric requests use that node context
+
+#### Scenario: Open a page by path
+- **WHEN** an operator opens the console at a page path (e.g. `/jobs`) or navigates back and forward in browser history
+- **THEN** the console displays the page addressed by the current path
+
+#### Scenario: Redirect a legacy page link
+- **WHEN** an operator opens the console with a legacy page query parameter (e.g. `/?page=jobs`)
+- **THEN** the console redirects to the corresponding path (`/jobs`), preserving the remaining query parameters, and displays that page
+
+#### Scenario: Live updates do not discard local edits
+- **WHEN** an SSE event arrives or a polling interval elapses while an operator has unsaved content in the configuration editor
+- **THEN** the editor content is unchanged, and only live resources are refreshed
 
 ### Requirement: Runtime administration
 
@@ -133,3 +145,26 @@ The Console SHALL provide search and Input/Processor/Output category filtering f
 - **WHEN** an operator selects a component category or enters a search term
 - **THEN** the Console shows only matching components and details for the selected matching item
 
+### Requirement: In-app destructive action confirmation
+
+The console SHALL present destructive or lifecycle-changing actions (stream start/stop/restart, node drain/maintain/resume, job stop, configuration publish/rollback, rollout create/pause/resume/cancel/rollback, upgrade restore) behind an in-application confirmation dialog with focus containment, Escape-to-cancel, and Enter-to-confirm. The console SHALL NOT use native `window.confirm` or `window.prompt` dialogs. The outcome of such actions SHALL be reported through a transient toast notification in addition to the existing operation tracking.
+
+#### Scenario: Confirm a node drain
+- **WHEN** an operator triggers a node drain and confirms the dialog
+- **THEN** the drain request is sent, a toast reports the accepted outcome, and the dialog closes
+
+#### Scenario: Cancel a destructive action
+- **WHEN** an operator dismisses the confirmation dialog with Escape or the cancel button
+- **THEN** no request is sent and the current view is unchanged
+
+### Requirement: Loading and empty states
+
+The console SHALL render skeleton placeholders for tables and metric panels while their data is loading, and empty states SHALL pair a plain-language explanation with the next available action (such as a create button or filter reset) instead of bare text alone.
+
+#### Scenario: Loading a table
+- **WHEN** a list page is fetching its first page of data
+- **THEN** skeleton rows are shown instead of an empty table or a blank panel
+
+#### Scenario: Empty state offers the next action
+- **WHEN** a filtered list matches nothing
+- **THEN** the empty state explains the miss and offers the nearest action (for example clearing the filter or creating the first resource)
