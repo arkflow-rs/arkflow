@@ -158,6 +158,11 @@ small {
   color: var(--danger-ink);
   background: var(--danger-bg);
 }
+.state.draining,
+.state.maintenance {
+  color: var(--warn-ink);
+  background: var(--warn-bg);
+}
 .actions {
   display: flex;
   gap: 7px;

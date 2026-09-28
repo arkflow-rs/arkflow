@@ -52,6 +52,7 @@ export type SystemResource = {
   active_operations: number
   capabilities: string[]
 }
+export type NodeMaintenanceState = 'active' | 'draining' | 'maintenance'
 export type ControlNode = {
   id: string
   protocol_version?: string
@@ -61,6 +62,7 @@ export type ControlNode = {
   streams_total: number
   streams_running: number
   streams_failed: number
+  maintenance_state?: NodeMaintenanceState
   role?: string
   uptime_seconds?: number
   last_seen_at_ms?: number
@@ -301,6 +303,12 @@ export const api = {
     request<MetricsResponse>(`/metrics${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
   nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE) =>
     request<Page<ControlNode>>(`/nodes?page=${page}&page_size=${pageSize}`),
+  drainNode: (id: string) =>
+    request<ControlNode>(`/nodes/${encodeURIComponent(id)}/drain`, { method: 'POST' }),
+  maintainNode: (id: string) =>
+    request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'POST' }),
+  resumeNode: (id: string) =>
+    request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'DELETE' }),
   streams: (nodeId?: string) =>
     request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
   events: (nodeId?: string) =>
