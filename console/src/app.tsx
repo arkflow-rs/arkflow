@@ -10,6 +10,7 @@ import {
   useSearchParams,
 } from 'react-router'
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query'
+import { Toaster } from 'sonner'
 import {
   api,
   errorMessage,
@@ -28,20 +29,31 @@ import { Components } from './features/components'
 import { Events } from './features/events'
 import { Settings } from './features/settings'
 import { Audit } from './features/audit'
+import { ConfirmProvider } from './features/confirm'
+import { resolvedTheme } from './theme'
 import { Rollouts } from './features/rollouts'
 import { useSetLocale, useLocale, useT, type Locale } from './i18n'
+import { useTheme, type ThemeSetting } from './theme'
 
 const NAV_ITEMS = [
   { path: '/', key: 'overview' },
   { path: '/runtime', key: 'runtime' },
-  { path: '/jobs', key: 'jobs' },
-  { path: '/configuration', key: 'configuration' },
-  { path: '/rollouts', key: 'rollouts' },
-  { path: '/components', key: 'components' },
   { path: '/events', key: 'events' },
+  { path: '/jobs', key: 'jobs' },
+  { path: '/rollouts', key: 'rollouts' },
+  { path: '/configuration', key: 'configuration' },
+  { path: '/components', key: 'components' },
   { path: '/audit', key: 'audit' },
   { path: '/settings', key: 'settings' },
 ] as const
+
+const NAV_GROUPS = [
+  { key: 'observe', items: ['overview', 'runtime', 'events'] },
+  { key: 'deliver', items: ['jobs', 'rollouts'] },
+  { key: 'admin', items: ['configuration', 'components', 'audit', 'settings'] },
+] as const
+
+const ITEM_BY_KEY = new Map(NAV_ITEMS.map((item) => [item.key, item]))
 
 function createQueryClient() {
   return new QueryClient({
@@ -61,7 +73,9 @@ function AppProviders({ children }: { children: ReactNode }) {
 export function App() {
   return (
     <AppProviders>
-      <ConsoleShell />
+      <ConfirmProvider>
+        <ConsoleShell />
+      </ConfirmProvider>
     </AppProviders>
   )
 }
@@ -70,6 +84,7 @@ function ConsoleShell() {
   const t = useT()
   const locale = useLocale()
   const setLocale = useSetLocale()
+  const { setting: themeSetting, setSetting: setThemeSetting } = useTheme()
   const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
@@ -153,19 +168,29 @@ function ConsoleShell() {
   const navSearch = selectedNode ? `?node_id=${encodeURIComponent(selectedNode)}` : ''
   return (
     <div className="shell">
+      <Toaster theme={resolvedTheme(themeSetting)} position="bottom-right" />
       <aside>
         <h1>arkflow</h1>
         <p>{t('brand.tagline')}</p>
         <nav>
-          {NAV_ITEMS.map((item) => (
-            <NavLink
-              key={item.key}
-              to={navSearch ? `${item.path}${navSearch}` : item.path}
-              end={item.path === '/'}
-              className={({ isActive }) => (isActive ? 'active' : '')}
-            >
-              {t(`nav.${item.key}`)}
-            </NavLink>
+          {NAV_GROUPS.map((group) => (
+            <div className="nav-group" key={group.key}>
+              <p className="nav-group-label">{t(`nav.group.${group.key}`)}</p>
+              {group.items.map((key) => {
+                const item = ITEM_BY_KEY.get(key)
+                if (!item) return null
+                return (
+                  <NavLink
+                    key={item.key}
+                    to={navSearch ? `${item.path}${navSearch}` : item.path}
+                    end={item.path === '/'}
+                    className={({ isActive }) => (isActive ? 'active' : '')}
+                  >
+                    {t(`nav.${item.key}`)}
+                  </NavLink>
+                )
+              })}
+            </div>
           ))}
         </nav>
       </aside>
@@ -200,6 +225,15 @@ function ConsoleShell() {
                   {node.id} · {node.state}
                 </option>
               ))}
+            </select>
+            <select
+              aria-label={t('header.theme')}
+              value={themeSetting}
+              onChange={(event) => setThemeSetting(event.target.value as ThemeSetting)}
+            >
+              <option value="dark">{t('theme.dark')}</option>
+              <option value="light">{t('theme.light')}</option>
+              <option value="system">{t('theme.system')}</option>
             </select>
             <select
               aria-label={t('header.language')}

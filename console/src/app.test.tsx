@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './app'
 
@@ -69,11 +69,12 @@ describe('console application', () => {
   })
 
   it('requires confirmation before lifecycle commands', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<App />)
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     await screen.findByText('orders')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    const dialog = await screen.findByRole('alertdialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     await waitFor(() =>
       expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/stop'), expect.anything()),
     )
@@ -206,7 +207,6 @@ describe('console application', () => {
   })
 
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     let operationReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) =>
       Promise.resolve({
@@ -288,6 +288,7 @@ describe('console application', () => {
     await waitFor(() => expect(window.location.search).toContain('node_id=node-a'))
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Start' }))
     expect(await screen.findByText('succeeded')).toBeInTheDocument()
     expect(operationReads).toBeGreaterThan(0)
     expect(fetchMock).toHaveBeenCalledWith(
@@ -299,7 +300,6 @@ describe('console application', () => {
   })
 
   it('shows a permission failure without retrying the mutation', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
       if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
         return Promise.resolve({
@@ -353,6 +353,7 @@ describe('console application', () => {
     await waitFor(() => expect(window.location.search).toContain('node_id=node-a'))
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Start' }))
     expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
     expect(
       fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
@@ -502,6 +503,22 @@ describe('console application', () => {
     fireEvent.click(refreshButton)
     expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
     expect(screen.getByText('orders')).toBeInTheDocument()
+  })
+
+  it('switches the theme, persists it, and updates the document', async () => {
+    const { THEME_STORAGE_KEY } = await import('./theme')
+    render(<App />)
+    await screen.findByText('Fleet health')
+    fireEvent.change(screen.getByRole('combobox', { name: 'Theme' }), { target: { value: 'light' } })
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe('light'))
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe('light')
+    window.localStorage.removeItem(THEME_STORAGE_KEY)
+  })
+
+  it('renders skeleton rows while data is loading', async () => {
+    fetchMock.mockImplementation(() => new Promise(() => undefined))
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.skeleton')).toBeInTheDocument())
   })
 
   it('keeps the configuration draft while live resources refresh', async () => {

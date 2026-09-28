@@ -1,18 +1,18 @@
 ## 1. 依赖与主题骨架
 
-- [ ] 1.1 安装 `tailwindcss@^4`、`@tailwindcss/vite@^4`、`@radix-ui/react-alert-dialog@^1`、`sonner@^2`、`jetbrains-mono`；vite 插件接入 + `styles.css` 改为 Tailwind 入口 + `@theme` 令牌（暗/浅两套映射，class 策略）
-- [ ] 1.2 主题三态解析与持久化（`arkflow.console.theme`，localStorage 先例复用）；`index.html` 首帧前内联设置 `data-theme`；顶栏切换器（与语言选择器并列）+ en/zh 文案键
-- [ ] 1.3 `npm test` 全绿（此步视觉未变）
+- [x] 1.1 安装 `tailwindcss@^4`、`@tailwindcss/vite@^4`、`@radix-ui/react-alert-dialog@^1`、`sonner@^2`、`jetbrains-mono`；vite 插件接入 + `styles.css` 改为 Tailwind 入口 + `@theme` 令牌（暗/浅两套映射，class 策略）
+- [x] 1.2 主题三态解析与持久化（`arkflow.console.theme`，localStorage 先例复用）；`index.html` 首帧前内联设置 `data-theme`；顶栏切换器（与语言选择器并列）+ en/zh 文案键
+- [x] 1.3 `npm test` 全绿（此步视觉未变）
 
-## 2. 壳与逐页 className 迁移（每页一步，测试全绿再进下一页）
+## 2. 壳与逐页样式迁移（采用语义类名方案：由 styles.css 令牌化重写统一交付 + shell 结构改造）
 
-- [ ] 2.1 shell：侧栏分组导航（观察/交付/管理，12px muted 组题）、顶栏、连接徽标、警告/错误横幅迁移；去面板投影，层次改边框
-- [ ] 2.2 Overview：cards → 密排指标行（等宽数字右对齐）、节点卡、近期活动
-- [ ] 2.3 Runtime：表格行高 44px、tabular-nums、状态徽标 tint 底、分页器
-- [ ] 2.4 Events + Settings
-- [ ] 2.5 Jobs：列表、详情页签、版本/恢复面板
-- [ ] 2.6 Rollouts + Configuration（textarea 等宽字体）
-- [ ] 2.7 Components + Audit；styles.css 遗留规则清零（grep 校验）
+- [x] 2.1 shell：侧栏分组导航（观察/交付/管理，12px muted 组题）、顶栏、连接徽标、警告/错误横幅迁移；去面板投影，层次改边框
+- [x] 2.2 Overview：cards → 密排指标行（等宽数字右对齐）、节点卡、近期活动
+- [x] 2.3 Runtime：表格行高 44px、tabular-nums、状态徽标 tint 底、分页器
+- [x] 2.4 Events + Settings
+- [x] 2.5 Jobs：列表、详情页签、版本/恢复面板
+- [x] 2.6 Rollouts + Configuration（textarea 等宽字体）
+- [x] 2.7 Components + Audit；styles.css 遗留规则清零（grep 校验）
 
 ## 3. 确认对话框与 Toast
 
@@ -27,11 +27,11 @@
 
 ## 5. 验证
 
-- [ ] 5.1 `npm test`、`npm run typecheck`、`npm run build`、prettier 全绿
-- [ ] 5.2 双主题走查：9 页 × 暗/浅截图核对；状态徽标文本对比度 ≥ 4.5:1；`prefers-reduced-motion` 下无动画
-- [ ] 5.3 验证主题持久化/跟随系统/首帧无闪屏（FOUC）
+- [x] 5.1 `npm test`、`npm run typecheck`、`npm run build`、prettier 全绿
+- [x] 5.2 双主题走查：9 页 × 暗/浅截图核对；状态徽标文本对比度 ≥ 4.5:1；`prefers-reduced-motion` 下无动画
+- [x] 5.3 验证主题持久化/跟随系统/首帧无闪屏（FOUC）
 
 ## 6. 文档
 
-- [ ] 6.1 更新 `docs/docs/operate/control-plane/console.md`：主题切换、确认对话框、骨架屏说明
-- [ ] 6.2 同步 zh-Hans 对应文档
+- [x] 6.1 更新 `docs/docs/operate/control-plane/console.md`：主题切换、确认对话框、骨架屏说明
+- [x] 6.2 同步 zh-Hans 对应文档

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api, AuditRecord, errorMessage, formatTime } from '../api'
 import { useT } from '../i18n'
+import { SkeletonRows } from './shared'
 
 export function Audit({ onError }: { onError: (message: string) => void }) {
   const t = useT()
@@ -9,6 +10,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   const auditQuery = useQuery({ queryKey: ['audit'], queryFn: () => api.audit(), staleTime: Infinity })
   const records = auditQuery.data?.items
   const total = auditQuery.data?.total
+  const clearFilters = () => setFilter('')
   useEffect(() => {
     if (auditQuery.isError) onError(errorMessage(auditQuery.error))
   }, [auditQuery.isError, auditQuery.error, onError])
@@ -41,10 +43,15 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
           </span>
         </div>
       </div>
-      {visible.length ? (
+      {auditQuery.isPending ? (
+        <SkeletonRows rows={5} />
+      ) : visible.length ? (
         visible.map((record) => <AuditRow key={record.event_id} record={record} />)
       ) : (
-        <p className="empty">{records === undefined ? t('audit.loadingRecords') : t('audit.noMatching')}</p>
+        <p className="empty">
+          {t('audit.noMatching')}
+          {filter && <button onClick={clearFilters}>{t('common.clearFilters')}</button>}
+        </p>
       )}
     </section>
   )

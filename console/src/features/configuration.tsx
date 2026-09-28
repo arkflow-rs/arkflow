@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { api, errorMessage, formatTime, waitForOperation } from '../api'
 import type { ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion } from '../api'
 import { useT } from '../i18n'
+import { useConfirm } from './confirm'
 
 export function convertConfiguration(
   content: string,
@@ -21,6 +23,7 @@ export function convertConfiguration(
 export function Configuration({ onError, nodeId }: { onError: (message: string) => void; nodeId?: string }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
   // Static config resources: never polled and never invalidated by the SSE
   // live-key sweep, so an open draft is only re-synced on nodeId change or
   // after an explicit publish/rollback.
@@ -121,13 +124,21 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       const operation = await api.applyConfig(candidate, nodeId)
       await waitForOperation(operation.id)
       await reload()
+      toast.success(t('toast.accepted'))
     })
   const rollback = async (id: string) => {
-    if (!window.confirm(t('config.confirmRollback', { id }))) return
+    if (
+      !(await confirm({
+        title: t('config.confirmRollback', { id }),
+        confirmLabel: t('config.rollback'),
+      }))
+    )
+      return
     await run(t('config.busyRollingBack'), async () => {
       const operation = await api.rollback(id, nodeId)
       await waitForOperation(operation.id)
       await reload()
+      toast.success(t('toast.accepted'))
     })
   }
   const compare = async (id: string) => {

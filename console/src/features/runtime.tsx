@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
+import { useConfirm } from './confirm'
 import { useQueryClient } from '@tanstack/react-query'
 import { formatTime } from '../api'
 import type { ControlEvent, Operation, StreamStatus } from '../api'
 import { useT } from '../i18n'
 import { useEvents, useOperations, useStreams } from '../queries'
-import { EventRow, OperationRow, Pagination, active, number } from './shared'
+import { EventRow, OperationRow, Pagination, SkeletonRows, active, number } from './shared'
 import type { Command } from './types'
 
 export function Runtime({
@@ -18,6 +19,7 @@ export function Runtime({
   onError?: (message: string) => void
 }) {
   const t = useT()
+  const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
   const streamsQuery = useStreams(nodeId)
@@ -86,8 +88,22 @@ export function Runtime({
             ))}
           </select>
         </div>
-        {visible.length === 0 ? (
-          <p className="empty">{t('runtime.noMatches')}</p>
+        {streamsQuery.isPending ? (
+          <SkeletonRows rows={4} />
+        ) : visible.length === 0 ? (
+          <p className="empty">
+            {t('runtime.noMatches')}
+            {(filter || state !== 'all') && (
+              <button
+                onClick={() => {
+                  setFilter('')
+                  setState('all')
+                }}
+              >
+                {t('common.clearFilters')}
+              </button>
+            )}
+          </p>
         ) : (
           <div className="table">
             {visible.map((stream) => (
@@ -120,12 +136,12 @@ export function Runtime({
                       disabled={!canMutate}
                       key={action}
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id }),
-                          )
-                        )
-                          void command(stream.id, action)
+                        void confirm({
+                          title: t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id }),
+                          confirmLabel: t(`common.${action}`),
+                        }).then((accepted) => {
+                          if (accepted) void command(stream.id, action)
+                        })
                       }}
                     >
                       {t(`common.${action}`)}

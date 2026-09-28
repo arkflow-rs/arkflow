@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { api, AuditRecord, errorMessage, formatTime, RolloutDetail } from '../api'
 import { useT } from '../i18n'
+import { usePrompt } from './confirm'
 import { useNodes, useRolloutDetail, useRollouts } from '../queries'
 
 export function Rollouts({ onError }: { onError: (message: string) => void }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const prompt = usePrompt()
   const nodes = useNodes().data?.items ?? []
   const rollouts = useRollouts().data ?? []
   const [selectedId, setSelectedId] = useState<string>()
@@ -37,7 +40,13 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
   }
   const action = async (id: string, operation: 'pause' | 'resume' | 'cancel' | 'rollback') => {
     const rollbackVersion =
-      operation === 'rollback' ? (window.prompt(t('rollouts.rollbackPrompt')) ?? undefined) : undefined
+      operation === 'rollback'
+        ? ((await prompt({
+            title: t('rollouts.rollbackPrompt'),
+            label: t('rollouts.configurationVersion'),
+            confirmLabel: t('rollouts.rollback'),
+          })) ?? undefined)
+        : undefined
     if (operation === 'rollback' && !rollbackVersion) return
     try {
       setBusy(true)
@@ -45,6 +54,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
       setSelectedId(rollout.rollout_id)
       setBusy(false)
       invalidate()
+      toast.success(t('toast.accepted'))
     } catch (cause) {
       setBusy(false)
       onError(errorMessage(cause))

@@ -6,6 +6,7 @@ import type { ReactElement } from 'react'
 import { Components } from './features/components'
 import { Configuration, convertConfiguration } from './features/configuration'
 import { Overview } from './features/overview'
+import { ConfirmProvider } from './features/confirm'
 import { Audit } from './features/audit'
 import { Jobs } from './features/jobs'
 import { JobEditor } from './features/job-editor'
@@ -18,7 +19,9 @@ const page = (items: unknown[]) => ({ items, page: 1, page_size: items.length ||
 const renderWithQueries = (ui: ReactElement) =>
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <BrowserRouter>{ui}</BrowserRouter>
+      <ConfirmProvider>
+        <BrowserRouter>{ui}</BrowserRouter>
+      </ConfirmProvider>
     </QueryClientProvider>,
   )
 
@@ -222,7 +225,6 @@ describe('rollout workflow', () => {
 
 describe('distributed Job workbench', () => {
   it('validates a Job plan before creating it in stopped state', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/validate'))
         return Promise.resolve({
@@ -257,10 +259,16 @@ describe('distributed Job workbench', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
     expect(await screen.findByText('Plan is valid')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Create stopped' }))
+    fireEvent.click(
+      within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Create Job' }),
+    )
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/jobs'),
-        expect.objectContaining({ method: 'POST' }),
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }),
+        }),
       ),
     )
     await waitFor(() =>
@@ -378,7 +386,6 @@ describe('fleet maintenance actions', () => {
     ])
 
   it('drains a node after confirmation and refreshes the fleet', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => fleetNodes() })
       if (url.includes('/nodes/node-a/drain'))
@@ -400,6 +407,7 @@ describe('fleet maintenance actions', () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch
     renderWithQueries(<Overview onError={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Drain' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Confirm' }))
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/nodes/node-a/drain'),
@@ -412,7 +420,6 @@ describe('fleet maintenance actions', () => {
   })
 
   it('does not drain without confirmation', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const fetchMock = vi.fn((url: string) =>
       Promise.resolve({
         ok: true,
@@ -422,7 +429,8 @@ describe('fleet maintenance actions', () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch
     renderWithQueries(<Overview onError={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Drain' }))
-    expect(confirm).toHaveBeenCalledWith('Drain node-a?')
+    const dialog = await screen.findByRole('alertdialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(fetchMock).not.toHaveBeenCalledWith(
       expect.stringContaining('/drain'),
       expect.objectContaining({ method: 'POST' }),
@@ -444,7 +452,6 @@ describe('fleet maintenance actions', () => {
   })
 
   it('resumes a node out of maintenance with the delete verb', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.includes('/nodes?'))
         return Promise.resolve({ ok: true, json: async () => fleetNodes('maintenance') })
@@ -467,6 +474,7 @@ describe('fleet maintenance actions', () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch
     renderWithQueries(<Overview onError={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Resume' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Confirm' }))
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/nodes/node-a/maintenance'),
@@ -479,7 +487,6 @@ describe('fleet maintenance actions', () => {
   })
 
   it('surfaces a permission failure from the maintenance endpoint', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string) => {
       if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => fleetNodes() })
       return Promise.resolve({
@@ -493,6 +500,7 @@ describe('fleet maintenance actions', () => {
     const onError = vi.fn()
     renderWithQueries(<Overview onError={onError} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Maintain' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Confirm' }))
     await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('not authorized')))
   })
 })

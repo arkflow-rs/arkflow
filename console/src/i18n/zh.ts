@@ -27,6 +27,8 @@ export const zh = {
 
   'common.loading': '加载中…',
   'common.close': '关闭',
+  'common.confirm': '确认',
+  'common.clearFilters': '清除筛选',
   'common.cancel': '取消',
   'common.previous': '上一页',
   'common.next': '下一页',
@@ -153,6 +155,15 @@ export const zh = {
   'settings.backend': '后端版本',
   'settings.snapshotPolling': '快照轮询',
   'settings.pollingValue': '每 {seconds} 秒一次',
+  'header.theme': '主题',
+  'theme.dark': '深色',
+  'theme.light': '浅色',
+  'theme.system': '跟随系统',
+  'nav.group.observe': '观测',
+  'nav.group.deliver': '交付',
+  'nav.group.admin': '管理',
+  'toast.accepted': '操作已受理',
+  'toast.failed': '操作失败',
   'settings.credentialsNote':
     '凭证从构建期环境配置读取，不会在界面中渲染。实时更新通过 SSE 推送；周期性快照作为兜底。',
 

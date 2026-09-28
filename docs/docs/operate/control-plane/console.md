@@ -60,6 +60,18 @@ parameters.
   need to reproduce — every console action is a documented route in the
   [HTTP API reference](../../reference/api.md).
 
+## Theme
+
+The console ships with a dark theme (default) and a light theme built on the
+same design tokens. The theme selector in the top bar offers **Dark / Light /
+System**; **System** follows your operating system preference. The choice is
+persisted in `localStorage` (key `arkflow.console.theme`) and applied before
+first paint, so reloading never flashes the wrong theme.
+
+Destructive and lifecycle-changing actions are confirmed with an in-app
+dialog (focus is contained, `Esc` cancels, `Enter` confirms), outcomes arrive
+as toast notifications, and tables show skeleton rows while data is loading.
+
 ## Interface language
 
 The console user interface ships with English and Simplified Chinese

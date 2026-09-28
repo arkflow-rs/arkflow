@@ -29,6 +29,8 @@ export const en = {
   // Shared fragments
   'common.loading': 'Loading…',
   'common.close': 'Close',
+  'common.confirm': 'Confirm',
+  'common.clearFilters': 'Clear filters',
   'common.cancel': 'Cancel',
   'common.previous': 'Previous',
   'common.next': 'Next',
@@ -161,6 +163,15 @@ export const en = {
   'settings.backend': 'Backend',
   'settings.snapshotPolling': 'Snapshot polling',
   'settings.pollingValue': 'every {seconds} seconds',
+  'header.theme': 'Theme',
+  'theme.dark': 'Dark',
+  'theme.light': 'Light',
+  'theme.system': 'System',
+  'nav.group.observe': 'Observe',
+  'nav.group.deliver': 'Deliver',
+  'nav.group.admin': 'Administer',
+  'toast.accepted': 'Operation accepted',
+  'toast.failed': 'Operation failed',
   'settings.credentialsNote':
     'Credentials are read from build-time environment configuration and never rendered in the UI. Live updates stream over SSE; the periodic snapshot is a fallback.',
 

@@ -1,14 +1,17 @@
 import { useSearchParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { api, errorMessage, formatTime } from '../api'
 import type { ControlNode } from '../api'
 import { useT } from '../i18n'
 import { useEvents, useMetrics, useNodes, useOperations, useStatus, useStreams, useSystem } from '../queries'
-import { Card, EventRow, active, number } from './shared'
+import { useConfirm } from './confirm'
+import { Card, EventRow, SkeletonRows, active, number } from './shared'
 
 export function Overview({ onError }: { onError?: (message: string) => void }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
   const systemQuery = useSystem()
@@ -25,18 +28,27 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
   const operations = operationsQuery.data?.items ?? []
   const events = eventsQuery.data?.items ?? []
   const metrics = metricsQuery.data?.aggregate ?? {}
-  const setMaintenance = (node: ControlNode, action: 'drain' | 'maintain' | 'resume') => {
+  const setMaintenance = async (node: ControlNode, action: 'drain' | 'maintain' | 'resume') => {
     const confirmKey =
       action === 'drain'
         ? 'overview.confirmDrain'
         : action === 'maintain'
           ? 'overview.confirmMaintain'
           : 'overview.confirmResume'
-    if (!window.confirm(t(confirmKey, { id: node.id }))) return
+    if (
+      !(await confirm({
+        title: t(confirmKey, { id: node.id }),
+        confirmLabel: t('common.confirm'),
+      }))
+    )
+      return
     const call =
       action === 'drain' ? api.drainNode : action === 'maintain' ? api.maintainNode : api.resumeNode
     call(node.id)
-      .then(() => queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] }))
+      .then(() => {
+        void queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] })
+        toast.success(t('toast.accepted'))
+      })
       .catch((cause) => onError?.(errorMessage(cause)))
   }
   const running = streams.filter((stream) => stream.state === 'running').length
@@ -74,7 +86,9 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
             <h3>{t('overview.fleetHealth')}</h3>
             <span>{t('common.registered', { count: nodes.length })}</span>
           </div>
-          {nodes.length === 0 ? (
+          {nodesQuery.isPending ? (
+            <SkeletonRows rows={3} />
+          ) : nodes.length === 0 ? (
             <p className="empty">{t('overview.noNodes')}</p>
           ) : (
             <div className="node-grid">
@@ -111,13 +125,17 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
                     <div className="actions">
                       {maintenance === 'active' ? (
                         <>
-                          <button onClick={() => setMaintenance(node, 'drain')}>{t('overview.drain')}</button>
-                          <button onClick={() => setMaintenance(node, 'maintain')}>
+                          <button onClick={() => void setMaintenance(node, 'drain')}>
+                            {t('overview.drain')}
+                          </button>
+                          <button onClick={() => void setMaintenance(node, 'maintain')}>
                             {t('overview.maintain')}
                           </button>
                         </>
                       ) : (
-                        <button onClick={() => setMaintenance(node, 'resume')}>{t('overview.resume')}</button>
+                        <button onClick={() => void setMaintenance(node, 'resume')}>
+                          {t('overview.resume')}
+                        </button>
                       )}
                     </div>
                   </article>
@@ -132,7 +150,9 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
             <span>{t('overview.latestReport')}</span>
           </div>
           <div className="metric-list">
-            {Object.entries(metrics).length ? (
+            {metricsQuery.isPending ? (
+              <SkeletonRows rows={3} />
+            ) : Object.entries(metrics).length ? (
               Object.entries(metrics).map(([key, value]) => (
                 <div className="metric" key={key}>
                   <span>{key.replaceAll('_', ' ')}</span>
@@ -150,7 +170,9 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
           <h3>{t('overview.recentActivity')}</h3>
           <span>{t('overview.eventsCount', { count: events.length })}</span>
         </div>
-        {events.length ? (
+        {eventsQuery.isPending ? (
+          <SkeletonRows rows={3} />
+        ) : events.length ? (
           events
             .slice(0, 8)
             .map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)

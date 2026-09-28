@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDetail } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
+import { useConfirm } from './confirm'
+import { SkeletonRows } from './shared'
 import { useJobDetail, useJobs, useNodes } from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
 
@@ -15,7 +18,9 @@ const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 export function Jobs({ onError, canMutate = true }: JobsProps) {
   const t = useT()
   const queryClient = useQueryClient()
-  const jobs = useJobs().data ?? []
+  const confirm = useConfirm()
+  const jobsQuery = useJobs()
+  const jobs = jobsQuery.data ?? []
   const nodes = useNodes().data?.items ?? []
   const [selectedJobId, setSelectedJobId] = useState<string>()
   const detailQuery = useJobDetail(selectedJobId)
@@ -51,12 +56,19 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
       onError(errorMessage(cause))
     }
   }
-  const setStateFor = (job: Job) => {
+  const setStateFor = async (job: Job) => {
     const stopping = job.desired_state === 'running'
-    if (!window.confirm(t(stopping ? 'jobs.confirmStop' : 'jobs.confirmStart', { jobId: job.job_id }))) return
-    void action(t(stopping ? 'jobs.stopping' : 'jobs.starting'), () =>
-      api.setJobState(job.job_id, stopping ? 'stopped' : 'running'),
+    if (
+      !(await confirm({
+        title: t(stopping ? 'jobs.confirmStop' : 'jobs.confirmStart', { jobId: job.job_id }),
+        confirmLabel: stopping ? t('jobs.stop') : t('jobs.start'),
+      }))
     )
+      return
+    void action(t(stopping ? 'jobs.stopping' : 'jobs.starting'), async () => {
+      await api.setJobState(job.job_id, stopping ? 'stopped' : 'running')
+      toast.success(t('toast.accepted'))
+    })
   }
 
   return (
@@ -90,8 +102,22 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
             <option value="degraded">Degraded</option>
           </select>
         </div>
-        {visible.length === 0 ? (
-          <p className="empty">{t('jobs.empty')}</p>
+        {jobsQuery.isPending ? (
+          <SkeletonRows rows={4} />
+        ) : visible.length === 0 ? (
+          <p className="empty">
+            {t('jobs.empty')}
+            {(filter || state !== 'all') && (
+              <button
+                onClick={() => {
+                  setFilter('')
+                  setState('all')
+                }}
+              >
+                {t('common.clearFilters')}
+              </button>
+            )}
+          </p>
         ) : (
           <div className="table">
             {visible.map((job) => (

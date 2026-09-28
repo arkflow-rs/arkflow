@@ -94,6 +94,15 @@ export function Pagination({
     </div>
   )
 }
+export function SkeletonRows({ rows = 3 }: { rows?: number }) {
+  return (
+    <div>
+      {Array.from({ length: rows }, (_, index) => (
+        <div key={index} className="skeleton" style={{ height: 32, marginBottom: 10 }} />
+      ))}
+    </div>
+  )
+}
 export function Card({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
   return (
     <div className="card">

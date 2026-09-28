@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useT } from '../i18n'
 import { useEvents } from '../queries'
-import { EventRow } from './shared'
+import { EventRow, SkeletonRows } from './shared'
 
 export function Events() {
   const [filter, setFilter] = useState('')
@@ -12,6 +12,7 @@ export function Events() {
   const eventsQuery = useEvents(nodeId)
   const events = eventsQuery.data?.items ?? []
   const total = eventsQuery.data?.total
+  const clearFilters = () => setFilter('')
   const visible = events.filter(
     (event) =>
       !filter ||
@@ -38,10 +39,15 @@ export function Events() {
           </span>
         </div>
       </div>
-      {visible.length ? (
+      {eventsQuery.isPending ? (
+        <SkeletonRows rows={5} />
+      ) : visible.length ? (
         visible.map((event, i) => <EventRow event={event} key={i} />)
       ) : (
-        <p className="empty">{t('events.noMatches')}</p>
+        <p className="empty">
+          {t('events.noMatches')}
+          {filter && <button onClick={clearFilters}>{t('common.clearFilters')}</button>}
+        </p>
       )}
     </section>
   )
