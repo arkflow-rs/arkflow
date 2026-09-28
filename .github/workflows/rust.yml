@@ -1,4 +1,3 @@
-# Faster Rust CI: cache cargo registry/git and target; use stable toolchain; keep PR fast (debug).
 name: Rust (fast CI)
 
 on:
@@ -13,23 +12,11 @@ env:
 
 jobs:
   build-and-test:
-    name: Build and Test (fast)
     runs-on: ubuntu-latest
-    # Keep PR builds fast by default (debug). Add a separate release job for pushes/tags if needed.
-    strategy:
-      matrix:
-        profile: [ debug ]
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      # The workspace's debug build (--all-targets) plus the restored target
-      # cache overflow the runner's ~20GB of free disk: drop the preinstalled
-      # toolchains we do not use (Android SDK, .NET, Haskell, CodeQL, ...)
-      # before building.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -38,51 +25,28 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
 
-      - name: Cache cargo registry & git index
-        uses: actions/cache@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          components: rustfmt, clippy
 
-      - name: Cache target dir (per profile)
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-target-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-target-${{ matrix.profile }}-
-            ${{ runner.os }}-cargo-target-
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
-      - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          components: clippy, rustfmt
-
-      # Optional: enable sccache for larger repos to speed up repeated compilations.
-      # - name: Install and enable sccache
-      #   uses: actions-rs/sccache@v1
-      #   with:
-      #     install: true
-      #     version: latest
-      # After this step, the action will set RUSTC_WRAPPER to sccache automatically.
-
-      - name: Install system dependencies (protoc)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
-      - name: Set PROTOC Environment Variable
-        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+      - name: Check
+        run: cargo check --workspace --all-targets --verbose
 
-      - name: Build (debug)
-        run: cargo build --workspace --all-targets --verbose
+      - name: Format
+        run: cargo fmt --all -- --check
 
-      - name: Run tests
-        # cargo runs tests in parallel by default; adjust flags if you want per-crate parallelism control
-        run: cargo test --workspace --all-targets --verbose
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --verbose
