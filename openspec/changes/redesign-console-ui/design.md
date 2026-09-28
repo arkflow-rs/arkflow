@@ -53,7 +53,7 @@ status  ok #34C98E · danger #F0615A · warn #E9A23B
 
 ### D4: 确认对话框 = Radix AlertDialog + Toast = sonner
 
-- `@radix-ui/react-alert-dialog@^1`：无头、可访问性（焦点圈闭/Esc/aria）开箱即用；封装 `features/confirm.tsx` 导出 `confirmDanger({title, body, confirmLabel})` Promise 化 API，替换 6 处 `window.confirm/prompt` 调用点，调用方逻辑不变（`if (!(await confirmDanger(...))) return`）。
+- `@radix-ui/react-alert-dialog@^1`：无头、可访问性（焦点圈闭/Esc/aria）开箱即用；封装 `features/confirm.tsx` 导出两个 Promise 化 API：`confirm({title, body?, confirmLabel, cancelLabel?}) → boolean` 与 `prompt({title, body?, label, confirmLabel, initialValue?}) → string | null`（带输入框，供发布回滚采集 config version 并传入 `api.rolloutAction`），替换 6 处 `window.confirm/prompt` 调用点，调用方逻辑不变。
 - `sonner@^2`：`<Toaster richColors position="bottom-right" theme={...} />` 挂 shell；mutation 成功/失败补 Toast（发布、drain、cancel、rollout 动作）。
 - Alternative「原生 `<dialog>` + 手写」被否：可访问性细节（焦点陷阱/aria）自制成本高，与标准库偏好相悖。
 - **window.confirm 的 6 处测试 spy 迁移**：改为断言对话框出现 + 点击确认/取消按钮（如 `screen.getByRole('dialog')` + `getByRole('button', {name: 'Drain'})`）。

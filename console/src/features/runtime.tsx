@@ -25,8 +25,12 @@ export function Runtime({
   const streamsQuery = useStreams(nodeId)
   const operationsQuery = useOperations(nodeId)
   const eventsQuery = useEvents(nodeId)
-  const streams = streamsQuery.data?.items ?? []
-  const operations = operationsQuery.data?.items ?? []
+  // While a node-scoped refetch is pending, placeholder rows still belong to
+  // the previously selected node — hide them so commands can never be sent
+  // against the wrong node.
+  const staleScope = streamsQuery.isPlaceholderData || operationsQuery.isPlaceholderData
+  const streams = staleScope ? [] : (streamsQuery.data?.items ?? [])
+  const operations = staleScope ? [] : (operationsQuery.data?.items ?? [])
   const events = eventsQuery.data?.items ?? []
   const streamTotal = streamsQuery.data?.total
   const operationTotal = operationsQuery.data?.total
@@ -88,7 +92,7 @@ export function Runtime({
             ))}
           </select>
         </div>
-        {streamsQuery.isPending ? (
+        {streamsQuery.isPending || staleScope ? (
           <SkeletonRows rows={4} />
         ) : visible.length === 0 ? (
           <p className="empty">

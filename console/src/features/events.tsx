@@ -10,7 +10,7 @@ export function Events() {
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
   const eventsQuery = useEvents(nodeId)
-  const events = eventsQuery.data?.items ?? []
+  const events = eventsQuery.isPlaceholderData ? [] : (eventsQuery.data?.items ?? [])
   const total = eventsQuery.data?.total
   const clearFilters = () => setFilter('')
   const visible = events.filter(
