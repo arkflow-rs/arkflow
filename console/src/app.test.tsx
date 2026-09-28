@@ -342,4 +342,25 @@ describe('console application', () => {
       fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
     ).toHaveLength(1)
   })
+
+  it('switches the interface language and persists the choice', async () => {
+    const { LOCALE_STORAGE_KEY, LocaleProvider } = await import('./i18n')
+    render(
+      <LocaleProvider>
+        <App />
+      </LocaleProvider>,
+    )
+    expect(await screen.findByText('Fleet health')).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Language' }), { target: { value: 'zh' } })
+    expect(await screen.findByText('集群健康')).toBeInTheDocument()
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh')
+    cleanup()
+    render(
+      <LocaleProvider>
+        <App />
+      </LocaleProvider>,
+    )
+    expect(await screen.findByText('集群健康')).toBeInTheDocument()
+    window.localStorage.removeItem(LOCALE_STORAGE_KEY)
+  })
 })

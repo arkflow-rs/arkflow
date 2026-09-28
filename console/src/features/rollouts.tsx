@@ -4,12 +4,15 @@ import {
   AuditRecord,
   ControlNode,
   errorMessage,
+  formatTime,
   ROLLOUT_DETAIL_INTERVAL_MS,
   Rollout,
   RolloutDetail,
 } from '../api'
+import { useT } from '../i18n'
 
 export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (message: string) => void }) {
+  const t = useT()
   const [items, setItems] = useState<Rollout[]>([])
   const [selected, setSelected] = useState<RolloutDetail>()
   const [pollError, setPollError] = useState('')
@@ -61,7 +64,7 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
   }
   const action = async (id: string, operation: 'pause' | 'resume' | 'cancel' | 'rollback') => {
     const rollbackVersion =
-      operation === 'rollback' ? (window.prompt('Rollback configuration version') ?? undefined) : undefined
+      operation === 'rollback' ? (window.prompt(t('rollouts.rollbackPrompt')) ?? undefined) : undefined
     if (operation === 'rollback' && !rollbackVersion) return
     try {
       setBusy(true)
@@ -78,29 +81,29 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
     <>
       <section className="panel">
         <div className="panel-title">
-          <h3>Configuration rollouts</h3>
-          <span>{items.length} recorded</span>
+          <h3>{t('rollouts.title')}</h3>
+          <span>{t('rollouts.recorded', { count: items.length })}</span>
         </div>
         <div className="toolbar">
           <input
-            aria-label="Configuration version"
-            placeholder="Configuration version"
+            aria-label={t('rollouts.configurationVersion')}
+            placeholder={t('rollouts.configurationVersion')}
             value={version}
             onChange={(event) => setVersion(event.target.value)}
           />
           <select
-            aria-label="Rollout batch size"
+            aria-label={t('rollouts.batchSizeLabel')}
             value={batch}
             onChange={(event) => setBatch(Number(event.target.value))}
           >
             {[1, 2, 5, 10].map((value) => (
               <option key={value} value={value}>
-                {value} per batch
+                {t('rollouts.perBatch', { value })}
               </option>
             ))}
           </select>
           <button disabled={busy || !version.trim() || targets.length === 0} onClick={() => void create()}>
-            Create rollout
+            {t('rollouts.create')}
           </button>
         </div>
         <div className="node-picker">
@@ -120,7 +123,7 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
           ))}
         </div>
         {items.length === 0 ? (
-          <p className="empty">No rollouts recorded.</p>
+          <p className="empty">{t('rollouts.empty')}</p>
         ) : (
           <div className="table">
             {items.map((item) => (
@@ -136,8 +139,11 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
               >
                 <strong>{item.rollout_id}</strong>
                 <span>
-                  {item.config_version_id} · {item.current_batch + 1} /{' '}
-                  {Math.max(1, Math.ceil(item.total_targets / item.batch_size))} batches
+                  {item.config_version_id} ·{' '}
+                  {t('rollouts.batches', {
+                    current: item.current_batch + 1,
+                    total: Math.max(1, Math.ceil(item.total_targets / item.batch_size)),
+                  })}
                 </span>
                 <span className={`state ${item.state}`}>{item.state}</span>
               </button>
@@ -180,6 +186,7 @@ function RolloutDetailPanel({
   onAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') => void
   onClose: () => void
 }) {
+  const t = useT()
   useEffect(() => {
     void api
       .audit(detail.rollout.rollout_id)
@@ -191,11 +198,11 @@ function RolloutDetailPanel({
     <section className="panel detail">
       <div className="panel-title">
         <div>
-          <span className="eyebrow">ROLLOUT DETAIL</span>
+          <span className="eyebrow">{t('rollouts.detailEyebrow')}</span>
           <h3>{detail.rollout.rollout_id}</h3>
         </div>
         <div className="actions">
-          <button onClick={onClose}>Close</button>
+          <button onClick={onClose}>{t('rollouts.close')}</button>
           {canAct && (
             <button
               disabled={busy}
@@ -203,27 +210,27 @@ function RolloutDetailPanel({
                 onAction(detail.rollout.rollout_id, detail.rollout.state === 'paused' ? 'resume' : 'pause')
               }
             >
-              {detail.rollout.state === 'paused' ? 'Resume' : 'Pause'}
+              {detail.rollout.state === 'paused' ? t('rollouts.resume') : t('rollouts.pause')}
             </button>
           )}
           {canAct && (
             <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'cancel')}>
-              Cancel
+              {t('rollouts.cancel')}
             </button>
           )}
           {canAct && (
             <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'rollback')}>
-              Rollback
+              {t('rollouts.rollback')}
             </button>
           )}
         </div>
       </div>
       {pollError && (
-        <div className="warning">Live progress paused; showing the last known targets. {pollError}</div>
+        <div className="warning">{t('rollouts.liveProgressPaused', { error: pollError })}</div>
       )}
       <p>
-        <strong>{detail.rollout.config_version_id}</strong> · batch size {detail.rollout.batch_size} ·{' '}
-        {detail.rollout.state}
+        <strong>{detail.rollout.config_version_id}</strong> ·{' '}
+        {t('rollouts.batchSize', { size: detail.rollout.batch_size })} · {detail.rollout.state}
       </p>
       <div className="table">
         {detail.targets.map((target) => (
@@ -231,25 +238,25 @@ function RolloutDetailPanel({
             <strong>{target.node_id}</strong>
             <span>{target.state}</span>
             <small>
-              {target.observed_config_version ?? 'target not observed'}
+              {target.observed_config_version ?? t('rollouts.targetNotObserved')}
               {target.error ? ` · ${target.error}` : ''}
             </small>
           </div>
         ))}
       </div>
-      <h4>Audit history</h4>
+      <h4>{t('rollouts.auditHistory')}</h4>
       {audit.length ? (
         audit.map((item) => (
           <div className="event-row" key={item.event_id}>
             <strong>{item.action}</strong>
             <span>
-              {item.outcome} · {item.actor ?? 'unknown'}
+              {item.outcome} · {item.actor ?? t('rollouts.unknownActor')}
             </span>
-            <small>{new Date(item.occurred_at_ms).toLocaleString()}</small>
+            <small>{formatTime(item.occurred_at_ms)}</small>
           </div>
         ))
       ) : (
-        <p className="empty">No audit records.</p>
+        <p className="empty">{t('rollouts.noAuditRecords')}</p>
       )}
     </section>
   )

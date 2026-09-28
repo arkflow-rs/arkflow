@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
 import { api, AuditRecord, errorMessage, formatTime } from '../api'
+import { useT } from '../i18n'
 
 export function Audit({ onError }: { onError: (message: string) => void }) {
+  const t = useT()
   const [records, setRecords] = useState<AuditRecord[]>()
   const [total, setTotal] = useState<number>()
   const [filter, setFilter] = useState('')
@@ -26,20 +28,20 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   return (
     <section className="panel">
       <div className="panel-title">
-        <h3>Audit history</h3>
+        <h3>{t('audit.title')}</h3>
         <div className="actions">
           <input
-            aria-label="Audit filter"
-            placeholder="Filter by action, actor, or resource"
+            aria-label={t('audit.filterAriaLabel')}
+            placeholder={t('audit.filterPlaceholder')}
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
           />
           <span>
             {records === undefined
-              ? 'Loading…'
-              : `${visible.length} matching${
-                  total !== undefined && total > records.length ? ` · ${total} stored server-side` : ''
-                }`}
+              ? t('audit.loading')
+              : total !== undefined && total > records.length
+                ? t('audit.matchingStored', { count: visible.length, total })
+                : t('audit.matching', { count: visible.length })}
           </span>
         </div>
       </div>
@@ -47,7 +49,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
         visible.map((record) => <AuditRow key={record.event_id} record={record} />)
       ) : (
         <p className="empty">
-          {records === undefined ? 'Loading audit records…' : 'No matching audit records.'}
+          {records === undefined ? t('audit.loadingRecords') : t('audit.noMatching')}
         </p>
       )}
     </section>
@@ -55,12 +57,13 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
 }
 
 function AuditRow({ record }: { record: AuditRecord }) {
+  const t = useT()
   return (
     <div className="event-row">
       <strong>{record.action}</strong>
       <span>
         {record.outcome}
-        {record.failure_code ? ` · ${record.failure_code}` : ''} · {record.actor ?? 'unknown actor'}
+        {record.failure_code ? ` · ${record.failure_code}` : ''} · {record.actor ?? t('audit.unknownActor')}
       </span>
       <small>
         {formatTime(record.occurred_at_ms)}
