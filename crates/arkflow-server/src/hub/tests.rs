@@ -4617,7 +4617,7 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
     let mut manifest = CheckpointManifest {
         checkpoint_id: savepoint_id.into(),
         job_id: plan.spec.id.clone(),
-        job_version: spec.version.clone(),
+        job_version: spec.version,
         generation: job.generation,
         task_attempts: attempts,
         source_positions: Vec::new(),
@@ -5082,7 +5082,7 @@ async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &st
     let mut manifest = CheckpointManifest {
         checkpoint_id: artifact_id.into(),
         job_id: plan.spec.id.clone(),
-        job_version: spec.version.clone(),
+        job_version: spec.version,
         generation: job.generation,
         task_attempts: attempts,
         source_positions: Vec::new(),
@@ -5330,9 +5330,7 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
     .unwrap();
     let request = axum::http::Request::builder()
         .method("POST")
-        .uri(format!(
-            "/api/v1/jobs/job-atomic-http/upgrades"
-        ))
+        .uri("/api/v1/jobs/job-atomic-http/upgrades")
         .header("authorization", authorization.clone())
         .header("content-type", "application/json")
         .body(Body::from(
