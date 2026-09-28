@@ -271,15 +271,14 @@ impl Hub {
     /// explicit error so an overloaded fleet surfaces instead of stacking.
     async fn enforce_resource_feasibility(
         &self,
-        job_id: &str,
         spec: &arkflow_core::job::JobSpec,
         assignments: &[arkflow_core::job::TaskAttempt],
         targets: &[String],
+        allocations: &NodeAllocations,
     ) -> Result<(), HubError> {
         if !spec.resources.is_declared() {
             return Ok(());
         }
-        let allocations = self.declared_node_allocations(job_id).await;
         let now = now_ms();
         let nodes = self.nodes.read().await;
         for node_id in targets.iter().collect::<BTreeSet<_>>() {
@@ -643,11 +642,18 @@ impl Hub {
         // round-robin spreads from the best-ranked set. Pinned node_ids pass
         // through verbatim. The dispatched order is remembered further below
         // (only when this ranked order actually drives the dispatch).
+        // One allocation snapshot per reconcile feeds BOTH the ranking and
+        // the declared-resource feasibility gate (the recompute walks every
+        // running Job's spec, so doing it twice per tick doubles the cost).
+        let declared_allocations = if job.node_ids.is_empty() {
+            self.declared_node_allocations(&job.job_id).await
+        } else {
+            NodeAllocations::new()
+        };
         let mut targets = targets;
         if job.node_ids.is_empty() {
-            let allocations = self.declared_node_allocations(&job.job_id).await;
             let nodes = self.nodes.read().await;
-            targets = rank_candidates(targets, &nodes, now_ms(), &allocations);
+            targets = rank_candidates(targets, &nodes, now_ms(), &declared_allocations);
         }
         // Opt-in pressure rebalance: exclude nodes whose sustained-pressure
         // streak trips the Job's policy. The abandoned-placement fencing
@@ -791,7 +797,7 @@ impl Hub {
         // Declared resource feasibility: fit (allocated + share) into each
         // target's capacity before any fencing or dispatch, so an overloaded
         // fleet surfaces as a retryable error instead of stacking.
-        self.enforce_resource_feasibility(&job.job_id, &spec, &assignments, &targets)
+        self.enforce_resource_feasibility(&spec, &assignments, &targets, &declared_allocations)
             .await?;
         // Split placement: validate that every target node runs the data
         // plane, then attach the full task→node map and peer data addresses

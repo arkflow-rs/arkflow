@@ -545,10 +545,21 @@ impl HubTlsListener {
             match self.inner.accept().await {
                 Ok((stream, peer)) => {
                     let _ = stream.set_nodelay(true);
-                    match self.acceptor.accept(stream).await {
-                        Ok(tls_stream) => return (tls_stream, peer),
-                        Err(error) => {
+                    // Bounded handshake so a stalled peer cannot hold the
+                    // accept loop (the handshake runs inline here because
+                    // the axum Listener contract returns the IO directly).
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        self.acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tls_stream)) => return (tls_stream, peer),
+                        Ok(Err(error)) => {
                             tracing::warn!(%error, "hub TLS handshake failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!("hub TLS handshake timed out");
                         }
                     }
                 }
@@ -5773,7 +5784,7 @@ mod tests {
     fn hub_tls_material() -> (std::path::PathBuf, std::path::PathBuf) {
         use rcgen::CertificateParams;
         use rcgen::KeyPair;
-        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
         let key = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         let dir = std::env::temp_dir().join(format!(

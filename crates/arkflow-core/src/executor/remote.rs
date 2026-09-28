@@ -1991,20 +1991,29 @@ impl NetworkManager {
                 match accepted {
                     Ok((stream, _peer)) => {
                         let _ = stream.set_nodelay(true);
-                        match &manager.config.tls {
+                        match manager.config.tls.clone() {
                             // Inbound TLS first: the peer must present a
                             // fleet-CA certificate before any frame (and
                             // before the HMAC session handshake) is read.
-                            // Handshake failures take the connection-failure
-                            // path — never a plaintext fallback.
-                            Some(tls) => match tls.accept(stream).await {
-                                Ok(tls_stream) => {
-                                    manager.accept_stream(Box::new(tls_stream));
-                                }
-                                Err(error) => {
-                                    manager.report_failure(error);
-                                }
-                            },
+                            // The handshake runs OFF the accept loop so one
+                            // slow or malicious peer cannot stall new
+                            // connections; failures take the
+                            // connection-failure path — never a plaintext
+                            // fallback.
+                            Some(tls) => {
+                                let handshake_manager = manager.clone();
+                                tokio::spawn(async move {
+                                    match tls.accept(stream).await {
+                                        Ok(tls_stream) => {
+                                            handshake_manager
+                                                .accept_stream(Box::new(tls_stream));
+                                        }
+                                        Err(error) => {
+                                            handshake_manager.report_failure(error);
+                                        }
+                                    }
+                                });
+                            }
                             None => manager.accept_stream(Box::new(stream)),
                         }
                     }

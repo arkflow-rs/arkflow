@@ -143,7 +143,13 @@ impl Hub {
                 })
                 .map(|operation| {
                     operation.state = HubOperationState::TimedOut;
-                    operation.failure_class = Some("runtime_failed".into());
+                    // `recovery_required` (not a generic runtime class): the
+                    // boot-change invalidation established that this class
+                    // preserves the "a durable start succeeded once and must
+                    // restore from a checkpoint" fact — the reconcile's
+                    // recovery gating keys on it, so the re-dispatch carries
+                    // a recovery artifact for durable Jobs.
+                    operation.failure_class = Some("recovery_required".into());
                     operation.finished_at_ms = Some(now);
                     operation.error = Some(
                         "successful Job start invalidated by a failed runtime observation"

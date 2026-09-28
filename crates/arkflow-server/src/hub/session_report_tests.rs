@@ -2180,7 +2180,7 @@ async fn failed_observation_redispatches_the_nodes_start() {
     assert!(
         starts.iter().any(|operation| {
             operation.state == HubOperationState::TimedOut
-                && operation.failure_class.as_deref() == Some("runtime_failed")
+                && operation.failure_class.as_deref() == Some("recovery_required")
         }),
         "the succeeded start must be settled for re-dispatch: {starts:?}"
     );

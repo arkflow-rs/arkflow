@@ -1934,45 +1934,43 @@ impl ResourceSampler {
 /// `_KEY`, and `_CA` (PEM file paths). All three or none: a partial set is
 /// an explicit configuration error (a half-loaded TLS config must fail, not
 /// silently degrade to plaintext). Files are read once at startup.
-fn data_plane_tls_from_env() -> Option<arkflow_core::executor::remote::DataPlaneTlsConfig> {
+fn data_plane_tls_from_env(
+) -> Result<Option<arkflow_core::executor::remote::DataPlaneTlsConfig>, String> {
     let cert = std::env::var("ARKFLOW_DATA_PLANE_TLS_CERT").ok();
     let key = std::env::var("ARKFLOW_DATA_PLANE_TLS_KEY").ok();
     let ca = std::env::var("ARKFLOW_DATA_PLANE_TLS_CA").ok();
     let declared = [cert.is_some(), key.is_some(), ca.is_some()];
     if declared == [false, false, false] {
-        return None;
+        return Ok(None);
     }
     if declared != [true, true, true] {
-        warn!(
-            "ARKFLOW_DATA_PLANE_TLS_CERT/_KEY/_CA must be set together; ignoring the data-plane TLS configuration"
+        // Fail closed per the authenticated-network-shuffle contract: a
+        // half-loaded TLS config must fail startup, never degrade to
+        // plaintext.
+        return Err(
+            "ARKFLOW_DATA_PLANE_TLS_CERT/_KEY/_CA must be set together (partial TLS configuration)"
+                .into(),
         );
-        return None;
     }
-    let read = |value: Option<String>, name: &str| -> Option<String> {
-        value.and_then(|path| std::fs::read_to_string(path).map_err(|error| {
-            warn!("data-plane TLS {name} could not be read: {error}");
-            error
-        }).ok())
+    let read = |value: Option<String>, name: &str| -> Result<String, String> {
+        value
+            .map(|path| {
+                std::fs::read_to_string(&path).map_err(|error| {
+                    format!("data-plane TLS {name} '{path}' could not be read: {error}")
+                })
+            })
+            .transpose()
+            .map(|value| value.expect("checked Some above"))
     };
-    let (cert, key, ca) = (
-        read(cert, "certificate"),
-        read(key, "private key"),
-        read(ca, "fleet CA"),
-    );
-    match (cert, key, ca) {
-        (Some(cert), Some(key), Some(ca)) => {
-            match arkflow_core::executor::remote::DataPlaneTlsConfig::from_pem(&cert, &key, &ca) {
-                Ok(tls) => {
-                    info!("data-plane mTLS enabled (fleet CA anchored)");
-                    Some(tls)
-                }
-                Err(error) => {
-                    warn!("data-plane TLS material rejected; running plaintext: {error}");
-                    None
-                }
-            }
+    let cert = read(cert, "certificate")?;
+    let key = read(key, "private key")?;
+    let ca = read(ca, "fleet CA")?;
+    match arkflow_core::executor::remote::DataPlaneTlsConfig::from_pem(&cert, &key, &ca) {
+        Ok(tls) => {
+            info!("data-plane mTLS enabled (fleet CA anchored)");
+            Ok(Some(tls))
         }
-        _ => None,
+        Err(error) => Err(format!("data-plane TLS material rejected: {error}")),
     }
 }
 
@@ -2057,6 +2055,7 @@ pub async fn run(
             .ok()
             .filter(|secret| !secret.is_empty())
             .or_else(|| (!config.node_token.is_empty()).then(|| config.node_token.clone()));
+        let data_plane_tls = data_plane_tls_from_env()?;
         let manager = data_secret
             .and_then(|data_secret| {
                 match arkflow_core::executor::remote::DataPlaneCredentials::new(
@@ -2074,7 +2073,7 @@ pub async fn run(
                 let manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
                     credentials: Some(credentials),
                     channel_capacity: 1024,
-                    tls: data_plane_tls_from_env(),
+                    tls: data_plane_tls.clone(),
                     .. arkflow_core::executor::remote::NetworkManagerConfig::default()
                 };
                 match arkflow_core::executor::remote::NetworkManager::with_config(
@@ -4290,6 +4289,27 @@ mod tests {
         }
         runtime.stop("orders-shared", 1).await.unwrap();
         let _ = runtime.take_finished().await;
+    }
+
+
+    /// Partial data-plane TLS configuration fails closed (startup error),
+    /// never a silent plaintext fallback.
+    #[test]
+    fn partial_data_plane_tls_configuration_fails_closed() {
+        unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", "/nonexistent") };
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY") };
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA") };
+        let error = match data_plane_tls_from_env() {
+            Err(error) => error,
+            Ok(_) => panic!("partial TLS configuration must fail closed"),
+        };
+        assert!(
+            error.contains("must be set together"),
+            "{error}"
+        );
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT") };
+        // Fully absent stays optional (plaintext default).
+        assert!(data_plane_tls_from_env().unwrap().is_none());
     }
 
 }
