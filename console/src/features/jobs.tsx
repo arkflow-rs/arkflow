@@ -202,6 +202,74 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   )
 }
 
+
+function ActiveUpgradeCard({
+  job,
+  upgrade,
+  canMutate,
+  busy,
+  onAction,
+  onDone,
+}: {
+  job: Job
+  upgrade: NonNullable<JobDetail['active_upgrade']>
+  canMutate: boolean
+  busy: boolean
+  onAction: (label: string, fn: () => Promise<unknown>) => Promise<void>
+  onDone: () => void
+}) {
+  const t = useT()
+  // `upgrade` is captured at render time: the parent polls `detail` every few
+  // seconds and the orchestration may reach a terminal state between render
+  // and click, so the handlers re-check instead of trusting it.
+  const run = (label: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') =>
+    upgrade && onAction(label, async () => {
+      await api.jobUpgradeAction(job.job_id, upgrade.upgrade_id, action)
+      onDone()
+    })
+  return (
+    <div className="upgrade-progress">
+      <h4>{t('jobs.upgradeProgressTitle')}</h4>
+      <div className="version">
+        <span>
+          <strong>{upgrade.phase}</strong> ·{' '}
+          {t('jobs.upgradeProgressVersions', { from: upgrade.from_version, to: upgrade.to_version })}
+        </span>
+        <span>
+          {upgrade.savepoint_id
+            ? t('jobs.upgradeSavepoint', { id: upgrade.savepoint_id })
+            : t('jobs.upgradeSavepointPending')}
+        </span>
+        {canMutate && (
+          <span className="actions">
+            {upgrade.phase === 'paused' ? (
+              <button disabled={busy} onClick={() => void run(t('jobs.resumingUpgrade'), 'resume')}>
+                {t('jobs.resumeUpgrade')}
+              </button>
+            ) : (
+              <button disabled={busy} onClick={() => void run(t('jobs.pausingUpgrade'), 'pause')}>
+                {t('jobs.pauseUpgrade')}
+              </button>
+            )}
+            {upgrade.phase === 'verifying' && (
+              <button disabled={busy} onClick={() => void run(t('jobs.rollingBackUpgrade'), 'rollback')}>
+                {t('jobs.rollbackUpgrade')}
+              </button>
+            )}
+            <button disabled={busy} onClick={() => void run(t('jobs.cancellingUpgrade'), 'cancel')}>
+              {t('jobs.cancelUpgrade')}
+            </button>
+          </span>
+        )}
+      </div>
+      {upgrade.last_error && <div className="error-row">{upgrade.last_error}</div>}
+      <p>
+        <small>{t('jobs.upgradeReplayNote')}</small>
+      </p>
+    </div>
+  )
+}
+
 function JobDetailPanel({
   detail,
   pollError,
@@ -323,94 +391,14 @@ function JobDetailPanel({
             </div>
           </div>
           {detail.active_upgrade && (
-            <div className="upgrade-progress">
-              <h4>{t('jobs.upgradeProgressTitle')}</h4>
-              <div className="version">
-                <span>
-                  <strong>{detail.active_upgrade.phase}</strong> ·{' '}
-                  {t('jobs.upgradeProgressVersions', {
-                    from: detail.active_upgrade.from_version,
-                    to: detail.active_upgrade.to_version,
-                  })}
-                </span>
-                <span>
-                  {detail.active_upgrade.savepoint_id
-                    ? t('jobs.upgradeSavepoint', { id: detail.active_upgrade.savepoint_id })
-                    : t('jobs.upgradeSavepointPending')}
-                </span>
-                {canMutate && (
-                  <span className="actions">
-                    {detail.active_upgrade.phase === 'paused' ? (
-                      <button
-                        disabled={busy}
-                        onClick={() =>
-                          void onAction(t('jobs.resumingUpgrade'), () =>
-                            api.jobUpgradeAction(
-                              detail.job.job_id,
-                              detail.active_upgrade!.upgrade_id,
-                              'resume',
-                            ),
-                          )
-                        }
-                      >
-                        {t('jobs.resumeUpgrade')}
-                      </button>
-                    ) : (
-                      <button
-                        disabled={busy}
-                        onClick={() =>
-                          void onAction(t('jobs.pausingUpgrade'), () =>
-                            api.jobUpgradeAction(
-                              detail.job.job_id,
-                              detail.active_upgrade!.upgrade_id,
-                              'pause',
-                            ),
-                          )
-                        }
-                      >
-                        {t('jobs.pauseUpgrade')}
-                      </button>
-                    )}
-                    {detail.active_upgrade.phase === 'verifying' && (
-                      <button
-                        disabled={busy}
-                        onClick={() =>
-                          void onAction(t('jobs.rollingBackUpgrade'), () =>
-                            api.jobUpgradeAction(
-                              detail.job.job_id,
-                              detail.active_upgrade!.upgrade_id,
-                              'rollback',
-                            ),
-                          )
-                        }
-                      >
-                        {t('jobs.rollbackUpgrade')}
-                      </button>
-                    )}
-                    <button
-                      disabled={busy}
-                      onClick={() =>
-                        void onAction(t('jobs.cancellingUpgrade'), () =>
-                          api.jobUpgradeAction(
-                            detail.job.job_id,
-                            detail.active_upgrade!.upgrade_id,
-                            'cancel',
-                          ),
-                        )
-                      }
-                    >
-                      {t('jobs.cancelUpgrade')}
-                    </button>
-                  </span>
-                )}
-              </div>
-              {detail.active_upgrade.last_error && (
-                <div className="error-row">{detail.active_upgrade.last_error}</div>
-              )}
-              <p>
-                <small>{t('jobs.upgradeReplayNote')}</small>
-              </p>
-            </div>
+            <ActiveUpgradeCard
+              job={detail.job}
+              upgrade={detail.active_upgrade}
+              canMutate={canMutate}
+              busy={busy}
+              onAction={onAction}
+              onDone={onRefresh}
+            />
           )}
           <h4>{t('jobs.nodeCompatibility')}</h4>
           {detail.nodes.length ? (

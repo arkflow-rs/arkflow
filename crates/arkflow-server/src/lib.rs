@@ -1742,6 +1742,11 @@ async fn hub_job_upgrade_action(
             "job_upgrade_not_found",
             format!("Unknown upgrade {upgrade_id} for Job {job_id}"),
         ),
+        Err(hub::HubError::OrchestrationPhaseConflict) => problem(
+            StatusCode::CONFLICT,
+            "orchestration_conflict",
+            "The upgrade phase changed while the action was being applied; retry against the fresh phase".into(),
+        ),
         Err(hub::HubError::Invalid(message)) => problem(
             StatusCode::CONFLICT,
             "job_upgrade_action_rejected",
@@ -3476,14 +3481,15 @@ async fn require_operator_action(
 fn hub_problem(error: hub::HubError) -> Response {
     let status = match error {
         hub::HubError::Unauthorized => StatusCode::UNAUTHORIZED,
-        hub::HubError::NodeUnavailable | hub::HubError::OrchestrationInProgress => {
-            StatusCode::CONFLICT
-        }
+        hub::HubError::NodeUnavailable
+        | hub::HubError::OrchestrationInProgress
+        | hub::HubError::OrchestrationPhaseConflict => StatusCode::CONFLICT,
         hub::HubError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::BAD_REQUEST,
     };
     let code = match error {
         hub::HubError::OrchestrationInProgress => "orchestration_in_progress",
+        hub::HubError::OrchestrationPhaseConflict => "orchestration_conflict",
         _ => "agent_request_rejected",
     };
     problem(

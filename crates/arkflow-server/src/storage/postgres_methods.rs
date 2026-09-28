@@ -1425,6 +1425,36 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let changed = transaction.execute(
+                "UPDATE cp_job_upgrades SET phase = ?1, savepoint_id = ?2, phase_deadline_at_ms = ?3, savepoint_retries = ?4, verify_timeout_ms = ?5, last_error = ?6, paused_from = ?7, updated_at_ms = ?8 WHERE upgrade_id = ?9 AND phase = ?10",
+                binds![
+                    record.phase,
+                    record.savepoint_id,
+                    record.phase_deadline_at_ms,
+                    record.savepoint_retries,
+                    record.verify_timeout_ms,
+                    record.last_error,
+                    record.paused_from,
+                    record.updated_at_ms,
+                    record.upgrade_id,
+                    expected_phase,
+                ],
+            ).await?;
+            Ok(changed > 0)
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
     async fn get_job_upgrade(
         &self,
         upgrade_id: &str,

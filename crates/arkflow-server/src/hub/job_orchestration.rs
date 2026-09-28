@@ -268,6 +268,12 @@ impl Hub {
         if record.phase_is_terminal() {
             return Err(HubError::Invalid("job upgrade is already terminal".into()));
         }
+        // Optimistic concurrency: the guarded write below applies only while
+        // the row still holds this phase, so a reconcile-tick transition that
+        // lands between the read and the write surfaces as a retryable
+        // conflict instead of silently overwriting the operator action (or
+        // vice versa).
+        let expected_phase = record.phase.clone();
         match action {
             "pause" => {
                 if record.phase == phase::PAUSED {
@@ -275,7 +281,8 @@ impl Hub {
                 }
                 record.paused_from = Some(record.phase.clone());
                 record.phase = phase::PAUSED.into();
-                self.finish_job_upgrade_transition(&mut record, None).await?;
+                self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
+                    .await?;
                 self.audit_job_upgrade_action(&record, "job.upgrade.atomic.pause", actor, correlation_id, "accepted")
                     .await?;
                 Ok(record)
@@ -294,7 +301,8 @@ impl Hub {
                 // it so resume does not immediately time the phase out.
                 record.phase_deadline_at_ms =
                     now_ms() + phase_timeout_ms(&record, &record.phase);
-                self.finish_job_upgrade_transition(&mut record, None).await?;
+                self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
+                    .await?;
                 self.audit_job_upgrade_action(&record, "job.upgrade.atomic.resume", actor, correlation_id, "accepted")
                     .await?;
                 Ok(record)
@@ -303,6 +311,7 @@ impl Hub {
                 record.phase = phase::CANCELLED.into();
                 self.finish_job_upgrade_transition(
                     &mut record,
+                    &expected_phase,
                     Some("cancelled by operator"),
                 )
                 .await?;
@@ -321,7 +330,8 @@ impl Hub {
                 record.phase = phase::ROLLING_BACK.into();
                 record.paused_from = None;
                 record.phase_deadline_at_ms = now_ms() + verify_timeout_ms(&record);
-                self.finish_job_upgrade_transition(&mut record, None).await?;
+                self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
+                    .await?;
                 self.audit_job_upgrade_action(&record, "job.upgrade.atomic.rollback", actor, correlation_id, "accepted")
                     .await?;
                 Ok(record)
@@ -347,16 +357,29 @@ impl Hub {
         let mut changes = 0;
         for mut record in active {
             let before = record.phase.clone();
-            match record.phase.as_str() {
-                phase::PAUSED => continue,
+            let expected_phase = record.phase.clone();
+            let stepped = match record.phase.as_str() {
+                phase::PAUSED => Ok(()),
                 phase::SAVING_SAVEPOINT | phase::PENDING => {
-                    self.step_savepoint_phase(storage, &mut record).await?
+                    self.step_savepoint_phase(&mut record).await
                 }
-                phase::COMMITTING_VERSION => self.step_commit_phase(&mut record).await?,
-                phase::VERIFYING => self.step_verify_phase(&mut record).await?,
-                phase::ROLLING_BACK => self.step_rollback_phase(&mut record).await?,
-                _ => {}
+                phase::COMMITTING_VERSION => self.step_commit_phase(&mut record).await,
+                phase::VERIFYING => self.step_verify_phase(&mut record).await,
+                phase::ROLLING_BACK => self.step_rollback_phase(&mut record).await,
+                _ => Ok(()),
+            };
+            if let Err(HubError::OrchestrationPhaseConflict) = stepped {
+                // An operator action (or another leader transition) won the
+                // row between this tick's fetch and its guarded write. Skip
+                // the record; the next tick re-reads the fresh phase.
+                tracing::warn!(
+                    upgrade_id = %record.upgrade_id,
+                    expected_phase = %expected_phase,
+                    "job upgrade phase changed concurrently; retrying next tick"
+                );
+                continue;
             }
+            stepped?;
             if record.phase != before {
                 changes += 1;
             }
@@ -371,11 +394,7 @@ impl Hub {
     /// Savepoint phase: dispatch a fresh savepoint round when none is in
     /// flight, poll it otherwise. The old generation keeps running through
     /// every outcome here; a failed round only costs a retry.
-    async fn step_savepoint_phase(
-        &self,
-        storage: &StorageActor,
-        record: &mut JobUpgradeRecord,
-    ) -> Result<(), HubError> {
+    async fn step_savepoint_phase(&self, record: &mut JobUpgradeRecord) -> Result<(), HubError> {
         let now = now_ms();
         if record.savepoint_id.is_none() {
             if record.savepoint_retries > MAX_SAVEPOINT_RETRIES {
@@ -383,6 +402,7 @@ impl Hub {
                 return self
                     .finish_job_upgrade_transition(
                         record,
+                        phase::SAVING_SAVEPOINT,
                         Some("savepoint retries exhausted; the Job is unchanged"),
                     )
                     .await;
@@ -390,7 +410,11 @@ impl Hub {
             let Some(job) = self.job(&record.job_id).await? else {
                 record.phase = phase::ABORTED.into();
                 return self
-                    .finish_job_upgrade_transition(record, Some("job disappeared"))
+                    .finish_job_upgrade_transition(
+                        record,
+                        phase::SAVING_SAVEPOINT,
+                        Some("job disappeared"),
+                    )
                     .await;
             };
             if job.version != record.from_version || job.desired_state != "running" {
@@ -398,6 +422,7 @@ impl Hub {
                 return self
                     .finish_job_upgrade_transition(
                         record,
+                        phase::SAVING_SAVEPOINT,
                         Some(&format!(
                             "job changed before the savepoint (version {}, desired {})",
                             job.version, job.desired_state
@@ -427,12 +452,8 @@ impl Hub {
             // moves the recovery pointer to exactly this artifact.
             self.record_job_checkpoint(checkpoint).await?;
             record.savepoint_id = Some(checkpoint_id);
-            record.updated_at_ms = now;
-            storage.upsert_job_upgrade(record.clone()).await?;
-            self.job_upgrades
-                .write()
-                .await
-                .insert(record.upgrade_id.clone(), record.clone());
+            self.persist_job_upgrade_fields(record, phase::SAVING_SAVEPOINT)
+                .await?;
             return Ok(());
         }
         let savepoint_id = record.savepoint_id.clone().expect("checked above");
@@ -446,7 +467,8 @@ impl Hub {
             Some("completed") => {
                 record.phase = phase::COMMITTING_VERSION.into();
                 record.phase_deadline_at_ms = now + COMMIT_PHASE_TIMEOUT_MS;
-                self.finish_job_upgrade_transition(record, None).await?;
+                self.finish_job_upgrade_transition(record, phase::SAVING_SAVEPOINT, None)
+                    .await?;
                 // Commit in the same tick the savepoint completed: the
                 // cutover window ends at the next reconcile_jobs pass, not a
                 // tick later.
@@ -459,17 +481,14 @@ impl Hub {
                     return self
                         .finish_job_upgrade_transition(
                             record,
+                            phase::SAVING_SAVEPOINT,
                             Some("savepoint rounds failed; the Job is unchanged"),
                         )
                         .await;
                 }
                 record.savepoint_id = None;
-                record.updated_at_ms = now;
-                storage.upsert_job_upgrade(record.clone()).await?;
-                self.job_upgrades
-                    .write()
-                    .await
-                    .insert(record.upgrade_id.clone(), record.clone());
+                self.persist_job_upgrade_fields(record, phase::SAVING_SAVEPOINT)
+                    .await?;
                 Ok(())
             }
             _ => {
@@ -478,6 +497,7 @@ impl Hub {
                     return self
                         .finish_job_upgrade_transition(
                             record,
+                            phase::SAVING_SAVEPOINT,
                             Some("savepoint phase deadline exceeded; the Job is unchanged"),
                         )
                         .await;
@@ -500,7 +520,11 @@ impl Hub {
         let Some(job) = self.job(&record.job_id).await? else {
             record.phase = phase::ABORTED.into();
             return self
-                .finish_job_upgrade_transition(record, Some("job disappeared"))
+                .finish_job_upgrade_transition(
+                    record,
+                    phase::COMMITTING_VERSION,
+                    Some("job disappeared"),
+                )
                 .await;
         };
         let already_committed =
@@ -508,13 +532,16 @@ impl Hub {
         if already_committed {
             record.phase = phase::VERIFYING.into();
             record.phase_deadline_at_ms = now + verify_timeout_ms(record);
-            return self.finish_job_upgrade_transition(record, None).await;
+            return self
+                .finish_job_upgrade_transition(record, phase::COMMITTING_VERSION, None)
+                .await;
         }
         if now > record.phase_deadline_at_ms {
             record.phase = phase::ABORTED.into();
             return self
                 .finish_job_upgrade_transition(
                     record,
+                    phase::COMMITTING_VERSION,
                     Some("commit phase deadline exceeded; the Job is unchanged"),
                 )
                 .await;
@@ -524,6 +551,7 @@ impl Hub {
             return self
                 .finish_job_upgrade_transition(
                     record,
+                    phase::COMMITTING_VERSION,
                     Some(&format!(
                         "job version moved to {} while the orchestration expected {}",
                         job.version, record.from_version
@@ -551,7 +579,8 @@ impl Hub {
             Ok(_) => {
                 record.phase = phase::VERIFYING.into();
                 record.phase_deadline_at_ms = now + verify_timeout_ms(record);
-                self.finish_job_upgrade_transition(record, None).await
+                self.finish_job_upgrade_transition(record, phase::COMMITTING_VERSION, None)
+                    .await
             }
             Err(HubError::GenerationConflict { .. }) => {
                 // Re-read and interpret: the conflict either is our own
@@ -560,17 +589,23 @@ impl Hub {
                 let Some(fresh) = self.job(&record.job_id).await? else {
                     record.phase = phase::ABORTED.into();
                     return self
-                        .finish_job_upgrade_transition(record, Some("job disappeared"))
+                        .finish_job_upgrade_transition(
+                            record,
+                            phase::COMMITTING_VERSION,
+                            Some("job disappeared"),
+                        )
                         .await;
                 };
                 if fresh.version == record.to_version && fresh.desired_state == "running" {
                     record.phase = phase::VERIFYING.into();
                     record.phase_deadline_at_ms = now + verify_timeout_ms(record);
-                    self.finish_job_upgrade_transition(record, None).await
+                    self.finish_job_upgrade_transition(record, phase::COMMITTING_VERSION, None)
+                        .await
                 } else {
                     record.phase = phase::ABORTED.into();
                     self.finish_job_upgrade_transition(
                         record,
+                        phase::COMMITTING_VERSION,
                         Some("commit lost a generation race; the newer Job state is preserved"),
                     )
                     .await
@@ -589,13 +624,21 @@ impl Hub {
         let Some(job) = self.job(&record.job_id).await? else {
             record.phase = phase::FAILED.into();
             return self
-                .finish_job_upgrade_transition(record, Some("job disappeared"))
+                .finish_job_upgrade_transition(
+                    record,
+                    phase::VERIFYING,
+                    Some("job disappeared"),
+                )
                 .await;
         };
         if job.version == record.to_version && job.observed_state == "running" {
             record.phase = phase::SUCCEEDED.into();
             return self
-                .finish_job_upgrade_transition(record, Some("verified running at the target version"))
+                .finish_job_upgrade_transition(
+                    record,
+                    phase::VERIFYING,
+                    Some("verified running at the target version"),
+                )
                 .await;
         }
         if job.version != record.to_version {
@@ -605,6 +648,7 @@ impl Hub {
             return self
                 .finish_job_upgrade_transition(
                     record,
+                    phase::VERIFYING,
                     Some(&format!(
                         "job version moved to {} while verifying {}",
                         job.version, record.to_version
@@ -619,6 +663,7 @@ impl Hub {
             record.phase_deadline_at_ms = now + verify_timeout_ms(record);
             return self.finish_job_upgrade_transition(
                 record,
+                phase::VERIFYING,
                 Some("verification deadline exceeded; rolling back to the previous version"),
             )
             .await;
@@ -636,7 +681,11 @@ impl Hub {
         let Some(job) = self.job(&record.job_id).await? else {
             record.phase = phase::FAILED.into();
             return self
-                .finish_job_upgrade_transition(record, Some("job disappeared"))
+                .finish_job_upgrade_transition(
+                    record,
+                    phase::ROLLING_BACK,
+                    Some("job disappeared"),
+                )
                 .await;
         };
         let restore_applied = job.version == record.from_version && job.desired_state == "running";
@@ -646,6 +695,7 @@ impl Hub {
                 return self
                     .finish_job_upgrade_transition(
                         record,
+                        phase::ROLLING_BACK,
                         Some("restored and running at the previous version"),
                     )
                     .await;
@@ -655,6 +705,7 @@ impl Hub {
                 return self
                     .finish_job_upgrade_transition(
                         record,
+                        phase::ROLLING_BACK,
                         Some("rollback verification deadline exceeded; the Job is stopped with its recovery pointer intact"),
                     )
                     .await;
@@ -666,6 +717,7 @@ impl Hub {
             return self
                 .finish_job_upgrade_transition(
                     record,
+                    phase::ROLLING_BACK,
                     Some(&format!(
                         "job version moved to {} during rollback",
                         job.version
@@ -683,6 +735,7 @@ impl Hub {
             return self
                 .finish_job_upgrade_transition(
                     record,
+                    phase::ROLLING_BACK,
                     Some("previous Job version is not available for rollback"),
                 )
                 .await;
@@ -708,6 +761,7 @@ impl Hub {
                 return self
                     .finish_job_upgrade_transition(
                         record,
+                        phase::ROLLING_BACK,
                         Some("the savepoint is incompatible with the previous Job version"),
                     )
                     .await;
@@ -751,19 +805,28 @@ impl Hub {
     // Persistence, events, audit
     // ------------------------------------------------------------------
 
-    /// Persist a phase transition: durable upsert, cache refresh, and an
-    /// event (phase transitions are what operators watch on the SSE stream).
+    /// Persist a phase transition through the phase-guarded write: durable
+    /// conditional update, cache refresh, and an event (phase transitions
+    /// are what operators watch on the SSE stream). A concurrent phase
+    /// change surfaces as `OrchestrationPhaseConflict` instead of a lost
+    /// update.
     async fn finish_job_upgrade_transition(
         &self,
         record: &mut JobUpgradeRecord,
+        expected_phase: &str,
         message: Option<&str>,
     ) -> Result<(), HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         record.updated_at_ms = now_ms();
-        if record.phase_is_terminal() {
+        if record.phase != phase::PAUSED {
             record.paused_from = None;
         }
-        storage.upsert_job_upgrade(record.clone()).await?;
+        if !storage
+            .transition_job_upgrade(record.clone(), expected_phase)
+            .await?
+        {
+            return Err(HubError::OrchestrationPhaseConflict);
+        }
         self.job_upgrades
             .write()
             .await
@@ -776,6 +839,29 @@ impl Hub {
                 .unwrap_or_else(|| format!("phase -> {}", record.phase)),
         )
         .await;
+        Ok(())
+    }
+
+    /// Phase-guarded field update (no phase change, no event) for the
+    /// savepoint dispatch/retry bookkeeping.
+    async fn persist_job_upgrade_fields(
+        &self,
+        record: &JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<(), HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let mut stored = record.clone();
+        stored.updated_at_ms = now_ms();
+        if !storage
+            .transition_job_upgrade(stored.clone(), expected_phase)
+            .await?
+        {
+            return Err(HubError::OrchestrationPhaseConflict);
+        }
+        self.job_upgrades
+            .write()
+            .await
+            .insert(stored.upgrade_id.clone(), stored);
         Ok(())
     }
 

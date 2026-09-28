@@ -1357,6 +1357,32 @@ impl SqliteBackend {
         })
     }
 
+    /// Phase-guarded mutation (see the trait contract).
+    pub fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let changed = transaction.execute(
+                "UPDATE cp_job_upgrades SET phase = ?1, savepoint_id = ?2, phase_deadline_at_ms = ?3, savepoint_retries = ?4, verify_timeout_ms = ?5, last_error = ?6, paused_from = ?7, updated_at_ms = ?8 WHERE upgrade_id = ?9 AND phase = ?10",
+                rusqlite::params![
+                    record.phase,
+                    record.savepoint_id,
+                    record.phase_deadline_at_ms,
+                    record.savepoint_retries,
+                    record.verify_timeout_ms,
+                    record.last_error,
+                    record.paused_from,
+                    record.updated_at_ms,
+                    record.upgrade_id,
+                    expected_phase,
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn get_job_upgrade(
         &self,
         upgrade_id: &str,
@@ -2529,6 +2555,13 @@ config_version_id: &str,
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         self.upsert_job_upgrade(record)
+    }
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        self.transition_job_upgrade(record, expected_phase)
     }
     async fn get_job_upgrade(
         &self,

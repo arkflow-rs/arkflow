@@ -609,6 +609,11 @@ enum StorageCommand {
         record: JobUpgradeRecord,
         response: oneshot::Sender<Result<(), StorageError>>,
     },
+    TransitionJobUpgrade {
+        record: JobUpgradeRecord,
+        expected_phase: String,
+        response: oneshot::Sender<Result<bool, StorageError>>,
+    },
     GetJobUpgrade {
         upgrade_id: String,
         response: oneshot::Sender<Result<Option<JobUpgradeRecord>, StorageError>>,
@@ -995,6 +1000,14 @@ impl StorageActor {
                     }
                     StorageCommand::UpsertJobUpgrade { record, response } => {
                         let _ = response.send(store.upsert_job_upgrade(record).await);
+                    }
+                    StorageCommand::TransitionJobUpgrade {
+                        record,
+                        expected_phase,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.transition_job_upgrade(record, &expected_phase).await);
                     }
                     StorageCommand::GetJobUpgrade {
                         upgrade_id,
@@ -1805,6 +1818,23 @@ impl StorageActor {
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
+    pub async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: impl Into<String>,
+    ) -> Result<bool, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::TransitionJobUpgrade {
+                record,
+                expected_phase: expected_phase.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
     pub async fn get_job_upgrade(
         &self,
         upgrade_id: impl Into<String>,
@@ -2080,6 +2110,15 @@ config_version_id: &str,
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
+    /// Optimistically-concurrent mutation of an existing orchestration row:
+    /// the mutable columns apply only while the row still holds
+    /// `expected_phase`. Returns false (no error) when the phase moved, so
+    /// the caller can treat it as a lost race instead of a storage fault.
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError>;
     async fn get_job_upgrade(
         &self,
         upgrade_id: &str,
@@ -2523,6 +2562,20 @@ config_version_id: &str,
             Self::Postgres(backend) => StorageBackend::upsert_job_upgrade(backend, record).await,
         }
     }
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::transition_job_upgrade(backend, record, expected_phase).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::transition_job_upgrade(backend, record, expected_phase).await
+            }
+        }
+    }
     async fn get_job_upgrade(
         &self,
         upgrade_id: &str,
@@ -2791,6 +2844,30 @@ mod tests {
         let loaded = store.get_job_upgrade("job-upgrade-1").await.unwrap();
         assert_eq!(loaded.as_ref(), Some(&record));
         assert!(!record.phase_is_terminal());
+
+        // Phase guard: a transition applies only against the phase the
+        // caller read; a moved phase is a lost race, not a storage fault.
+        // The stored phase here is "verifying" (set above).
+        let mut guarded = record.clone();
+        guarded.phase = "committing_version".into();
+        assert!(
+            store
+                .transition_job_upgrade(guarded, "verifying")
+                .await
+                .unwrap()
+        );
+        let mut moved = record.clone();
+        moved.phase = "rolling_back".into();
+        assert!(
+            !store
+                .transition_job_upgrade(moved, "verifying")
+                .await
+                .unwrap(),
+            "the phase moved; the stale writer must lose"
+        );
+        let stored = store.get_job_upgrade("job-upgrade-1").await.unwrap().unwrap();
+        assert_eq!(stored.phase, "committing_version");
+        record.phase = "committing_version".into();
 
         // Recover returns only non-terminal rows.
         let active = store.recover_job_upgrades().await.unwrap();
