@@ -202,7 +202,6 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   )
 }
 
-
 function ActiveUpgradeCard({
   job,
   upgrade,
@@ -223,7 +222,8 @@ function ActiveUpgradeCard({
   // seconds and the orchestration may reach a terminal state between render
   // and click, so the handlers re-check instead of trusting it.
   const run = (label: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') =>
-    upgrade && onAction(label, async () => {
+    upgrade &&
+    onAction(label, async () => {
       await api.jobUpgradeAction(job.job_id, upgrade.upgrade_id, action)
       onDone()
     })

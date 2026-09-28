@@ -425,11 +425,7 @@ export const api = {
     request<JobUpgradeOrchestration>(
       `/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}`,
     ),
-  jobUpgradeAction: (
-    id: string,
-    upgradeId: string,
-    action: 'pause' | 'resume' | 'cancel' | 'rollback',
-  ) =>
+  jobUpgradeAction: (id: string, upgradeId: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') =>
     request<JobUpgradeOrchestration>(
       `/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}/actions`,
       { method: 'POST', body: JSON.stringify({ action }) },
