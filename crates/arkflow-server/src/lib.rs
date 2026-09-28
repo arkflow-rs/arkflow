@@ -12,7 +12,8 @@ pub mod storage;
 
 use crate::api_contract::{
     AcceptedIntentResponse, CreateJobRequest, CreateRolloutRequest, DesiredStateRequest,
-    JobDesiredStateRequest, JobUpgradeRequest, OperatorAction, OperatorPrincipal,
+    JobDesiredStateRequest, JobUpgradeActionRequest, JobUpgradeRequest, OperatorAction,
+    OperatorPrincipal,
     RestartActionRequest, RolloutActionRequest, ValidateJobRequest,
 };
 use crate::storage::{DesiredMutation, JobRecord};
@@ -407,6 +408,14 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/jobs/{id}/versions", get(hub_job_versions))
         .route("/jobs/{id}/upgrades", post(hub_job_upgrade))
         .route(
+            "/jobs/{id}/upgrades/{upgrade_id}",
+            get(hub_job_upgrade_status),
+        )
+        .route(
+            "/jobs/{id}/upgrades/{upgrade_id}/actions",
+            post(hub_job_upgrade_action),
+        )
+        .route(
             "/jobs/{id}/upgrades/{upgrade_id}/rollback",
             post(hub_job_upgrade_rollback),
         )
@@ -734,6 +743,11 @@ pub async fn serve_hub(
                     let started = crate::hub::now_ms_for_metrics();
                     let result = reconcile_hub.reconcile_once("hub-reconciler").await;
                     reconcile_hub.record_reconcile_result(started, &result).await;
+                    // Upgrade orchestration runs before job reconciliation so
+                    // a savepoint completing here commits in the same tick and
+                    // the (unfenced) job reconciler starts the new generation
+                    // immediately — the cutover window costs no extra tick.
+                    let _ = reconcile_hub.reconcile_job_upgrades().await;
                     let _ = reconcile_hub.reconcile_jobs().await;
                     let _ = reconcile_hub.reconcile_rollouts().await;
                     let _ = reconcile_hub.expire_stale_job_operations().await;
@@ -763,6 +777,7 @@ pub async fn serve_hub(
                     let _ = maintenance_hub.prune_audit_history().await;
                     let _ = maintenance_hub.prune_outbox_history().await;
                     let _ = maintenance_hub.prune_attempt_history().await;
+                    let _ = maintenance_hub.prune_job_upgrade_history().await;
                 }
                 _ = maintenance_cancel.cancelled() => break,
             }
@@ -917,7 +932,7 @@ async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
 /// construction path used by local execution. The HTTP Hub is also used
 /// directly in tests and embedded deployments, so initialize the built-in
 /// catalogue here as well as in `serve_hub`.
-fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(), String> {
+pub(crate) fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(), String> {
     arkflow_plugin::initialize()
         .and_then(|_| arkflow_core::executor::job_runner_adapter::validate_local_job(spec))
         .map_err(|error| error.to_string())
@@ -1005,6 +1020,9 @@ async fn hub_job_action(
     )
     .await
     {
+        return response;
+    }
+    if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
         return response;
     }
     let state = match action.as_str() {
@@ -1246,6 +1264,7 @@ async fn hub_job_detail(
         "nodes": selected_nodes,
         "operations": operations,
         "checkpoints": checkpoints,
+        "active_upgrade": hub.active_job_upgrade_for(&job_id).await,
         "metrics": {
             "watermark_lag_ms": metrics.get("watermark_lag_ms").copied().unwrap_or_default(),
             "state_bytes": metrics.get("state_bytes").copied().unwrap_or_default(),
@@ -1321,6 +1340,72 @@ async fn hub_job_upgrade(
             ),
         );
     }
+    if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
+        return response;
+    }
+    let mode = request.mode.as_deref().unwrap_or("stopped");
+    if !matches!(mode, "stopped" | "atomic") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_upgrade_mode",
+            "mode must be stopped or atomic".into(),
+        );
+    }
+    if mode == "atomic" {
+        // Atomic mode is the inverse precondition: the Job must still be
+        // running, and the orchestration takes its own savepoint.
+        if current.desired_state != "running" {
+            return problem(
+                StatusCode::CONFLICT,
+                "job_must_be_running",
+                "The atomic upgrade mode requires a running Job".into(),
+            );
+        }
+        let mut spec: arkflow_core::job::JobSpec =
+            match serde_json::from_value(request.spec.clone()) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_job_spec",
+                        error.to_string(),
+                    )
+                }
+            };
+        return match hub
+            .create_job_upgrade(
+                &job_id,
+                &mut spec,
+                request.expected_generation,
+                request.verify_timeout_ms,
+                Some("operator".into()),
+                None,
+            )
+            .await
+        {
+            Ok(record) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "upgrade_id": record.upgrade_id,
+                    "state": record.phase,
+                    "savepoint_id": serde_json::Value::Null,
+                    "job": current,
+                })),
+            )
+                .into_response(),
+            Err(hub::HubError::GenerationConflict { expected, current }) => problem(
+                StatusCode::PRECONDITION_FAILED,
+                "generation_conflict",
+                format!("Expected generation {expected}, current generation {current}"),
+            ),
+            Err(hub::HubError::OrchestrationInProgress) => problem(
+                StatusCode::CONFLICT,
+                "orchestration_in_progress",
+                "An atomic upgrade already owns this Job".into(),
+            ),
+            Err(error) => hub_problem(error),
+        };
+    }
     if current.desired_state != "stopped" || current.observed_state == "running" {
         return problem(
             StatusCode::CONFLICT,
@@ -1367,7 +1452,7 @@ async fn hub_job_upgrade(
     }
     let checkpoint = match hub.job_checkpoints(&job_id).await.map(|records| {
         records.into_iter().find(|record| {
-            record.checkpoint_id == request.savepoint_id
+            Some(record.checkpoint_id.as_str()) == request.savepoint_id.as_deref()
                 && record.kind == "savepoint"
                 && record.status == "completed"
         })
@@ -1452,6 +1537,9 @@ async fn hub_job_upgrade_rollback(
     )
     .await
     {
+        return response;
+    }
+    if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
         return response;
     }
     let Some(current) = (match hub.job(&job_id).await {
@@ -1595,6 +1683,69 @@ async fn hub_job_upgrade_rollback(
             StatusCode::PRECONDITION_FAILED,
             "generation_conflict",
             format!("Expected generation {expected}, current generation {current}"),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_upgrade_status(
+    State(hub): State<hub::Hub>,
+    Path((job_id, upgrade_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    match hub.job_upgrade(&upgrade_id).await {
+        Ok(Some(record)) if record.job_id == job_id => Json(record).into_response(),
+        Ok(Some(_)) | Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "job_upgrade_not_found",
+            format!("Unknown upgrade {upgrade_id} for Job {job_id}"),
+        ),
+        Err(error) => hub_problem(error),
+    }
+}
+
+async fn hub_job_upgrade_action(
+    State(hub): State<hub::Hub>,
+    Path((job_id, upgrade_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<JobUpgradeActionRequest>,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Configure,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    match hub
+        .act_job_upgrade(&upgrade_id, &request.action, Some("operator".into()), None)
+        .await
+    {
+        Ok(record) if record.job_id == job_id => Json(record).into_response(),
+        Ok(_) => problem(
+            StatusCode::NOT_FOUND,
+            "job_upgrade_not_found",
+            format!("Unknown upgrade {upgrade_id} for Job {job_id}"),
+        ),
+        Err(hub::HubError::Invalid(message)) => problem(
+            StatusCode::CONFLICT,
+            "job_upgrade_action_rejected",
+            message,
         ),
         Err(error) => hub_problem(error),
     }
@@ -1765,6 +1916,9 @@ async fn hub_job_desired_state(
             "invalid_job_state",
             "state must be stopped or running".into(),
         );
+    }
+    if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
+        return response;
     }
     let current = match hub.job(&job_id).await {
         Ok(Some(job)) => job,
@@ -3322,15 +3476,34 @@ async fn require_operator_action(
 fn hub_problem(error: hub::HubError) -> Response {
     let status = match error {
         hub::HubError::Unauthorized => StatusCode::UNAUTHORIZED,
-        hub::HubError::NodeUnavailable => StatusCode::CONFLICT,
+        hub::HubError::NodeUnavailable | hub::HubError::OrchestrationInProgress => {
+            StatusCode::CONFLICT
+        }
         hub::HubError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::BAD_REQUEST,
     };
+    let code = match error {
+        hub::HubError::OrchestrationInProgress => "orchestration_in_progress",
+        _ => "agent_request_rejected",
+    };
     problem(
         status,
-        "agent_request_rejected",
+        code,
         error.to_string().chars().take(256).collect(),
     )
+}
+
+/// Reject job-level mutations while an atomic upgrade orchestration owns the
+/// Job. `Ok(())` when no orchestration is active.
+async fn reject_if_job_upgrade_active(hub: &hub::Hub, job_id: &str) -> Result<(), Response> {
+    if hub.active_job_upgrade_for(job_id).await.is_some() {
+        return Err(problem(
+            StatusCode::CONFLICT,
+            "orchestration_in_progress",
+            format!("Job {job_id} is owned by an active atomic upgrade"),
+        ));
+    }
+    Ok(())
 }
 
 async fn system(State(cp): State<ControlPlane>) -> Json<arkflow_core::control::SystemResource> {

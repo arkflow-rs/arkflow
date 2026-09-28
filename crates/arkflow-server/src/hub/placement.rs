@@ -528,6 +528,15 @@ impl Hub {
     }
 
     pub async fn reconcile_job(&self, job: &JobRecord) -> Result<usize, HubError> {
+        // Atomic-upgrade fence: while an orchestration owns the Job's
+        // dispatch state (savepoint, commit, pause) the general reconciler
+        // must not touch it — a re-placement here would bump the generation
+        // the in-flight savepoint round is keyed to and evict its dispatch
+        // targets. The observation phases (verification, rollback) fall
+        // through: there, ordinary reconciliation IS the start mechanism.
+        if self.job_upgrade_fences_reconciliation(&job.job_id).await {
+            return Ok(0);
+        }
         let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json)
             .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
         let plan = arkflow_core::job::JobPlan::compile(spec.clone())

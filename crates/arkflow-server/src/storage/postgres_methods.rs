@@ -1393,6 +1393,101 @@ impl StorageBackend for PostgresBackend {
     }
 
 
+    async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            transaction.execute(
+                "INSERT INTO cp_job_upgrades (upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT (upgrade_id) DO UPDATE SET phase = EXCLUDED.phase, savepoint_id = EXCLUDED.savepoint_id, phase_deadline_at_ms = EXCLUDED.phase_deadline_at_ms, savepoint_retries = EXCLUDED.savepoint_retries, verify_timeout_ms = EXCLUDED.verify_timeout_ms, last_error = EXCLUDED.last_error, paused_from = EXCLUDED.paused_from, updated_at_ms = EXCLUDED.updated_at_ms",
+                binds![
+                    record.upgrade_id,
+                    record.job_id,
+                    record.from_version,
+                    record.to_version,
+                    record.phase,
+                    record.savepoint_id,
+                    record.target_spec_json,
+                    record.phase_deadline_at_ms,
+                    record.savepoint_retries,
+                    record.verify_timeout_ms,
+                    record.actor,
+                    record.correlation_id,
+                    record.last_error,
+                    record.paused_from,
+                    record.created_at_ms,
+                    record.updated_at_ms,
+                ],
+            ).await?;
+            Ok(())
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
+    async fn get_job_upgrade(
+        &self,
+        upgrade_id: &str,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE upgrade_id = ?1",
+                    binds![upgrade_id],
+                    job_upgrade_from_row,
+                ).await
+                .optional()
+        }
+    }
+
+    async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection.query_all(
+                &q(
+                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY created_at_ms",
+                ),
+                &[],
+                job_upgrade_from_row,
+            ).await?;
+            Ok(rows)
+        }
+    }
+
+    async fn list_job_upgrades(&self, job_id: &str) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection.query_all(
+                &q(
+                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE job_id = ?1 ORDER BY created_at_ms DESC, upgrade_id DESC LIMIT 256",
+                ),
+                binds![job_id],
+                job_upgrade_from_row,
+            ).await?;
+            Ok(rows)
+        }
+    }
+
+    async fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let deleted = transaction.execute(
+                "DELETE FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY updated_at_ms DESC LIMIT ?2)",
+                binds![older_than_ms, max_retained],
+            ).await?;
+            Ok(deleted as usize)
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
     async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         {
             let mut transaction = self.begin().await?;

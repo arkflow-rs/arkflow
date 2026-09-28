@@ -14,6 +14,8 @@ pub enum HubError {
     Capacity,
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("an orchestration already owns this resource")]
+    OrchestrationInProgress,
     #[error("durable storage is unavailable")]
     StorageUnavailable,
     #[error("desired state generation conflict: expected {expected}, current {current}")]
@@ -31,6 +33,7 @@ impl HubError {
             Self::NodeUnavailable => "node_unavailable",
             Self::StorageUnavailable | Self::Storage(_) => "repository",
             Self::NotFound => "not_found",
+            Self::OrchestrationInProgress => "orchestration_in_progress",
             _ => "invalid",
         }
     }

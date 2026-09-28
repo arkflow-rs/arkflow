@@ -29,7 +29,11 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
   const [plan, setPlan] = useState<{ jobId: string; version: number; planJson: string }>()
-  const [editor, setEditor] = useState<{ mode: 'create' | 'upgrade'; job?: Job; savepoint?: JobCheckpoint }>()
+  const [editor, setEditor] = useState<{
+    mode: 'create' | 'upgrade' | 'atomic'
+    job?: Job
+    savepoint?: JobCheckpoint
+  }>()
   const [busy, setBusy] = useState('')
   const invalidateJobs = () => {
     void queryClient.invalidateQueries({ queryKey: ['live', 'jobs'] })
@@ -164,6 +168,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
           onRefresh={invalidateJobs}
           onAction={action}
           onUpgrade={(savepoint) => setEditor({ mode: 'upgrade', job: selected.job, savepoint })}
+          onAtomicUpgrade={() => setEditor({ mode: 'atomic', job: selected.job })}
           onViewPlan={(planJson) =>
             setPlan({ jobId: selected.job.job_id, version: selected.job.version, planJson })
           }
@@ -208,6 +213,7 @@ function JobDetailPanel({
   onRefresh,
   onAction,
   onUpgrade,
+  onAtomicUpgrade,
   onViewPlan,
 }: {
   detail: JobDetail
@@ -220,6 +226,7 @@ function JobDetailPanel({
   onRefresh: () => void
   onAction: (label: string, fn: () => Promise<unknown>) => Promise<void>
   onUpgrade: (savepoint: JobCheckpoint) => void
+  onAtomicUpgrade: () => void
   onViewPlan: (planJson: string) => void
 }) {
   const t = useT()
@@ -256,6 +263,11 @@ function JobDetailPanel({
           <button disabled={!canMutate || busy} onClick={() => runArtifact('savepoint')}>
             {t('jobs.savepoint')}
           </button>
+          {detail.job.desired_state === 'running' && (
+            <button disabled={!canMutate || busy} onClick={onAtomicUpgrade}>
+              {t('jobs.atomicUpgrade')}
+            </button>
+          )}
           {detail.job.desired_state === 'running' && (
             <button
               disabled={!canMutate || busy}
@@ -310,6 +322,96 @@ function JobDetailPanel({
               ))}
             </div>
           </div>
+          {detail.active_upgrade && (
+            <div className="upgrade-progress">
+              <h4>{t('jobs.upgradeProgressTitle')}</h4>
+              <div className="version">
+                <span>
+                  <strong>{detail.active_upgrade.phase}</strong> ·{' '}
+                  {t('jobs.upgradeProgressVersions', {
+                    from: detail.active_upgrade.from_version,
+                    to: detail.active_upgrade.to_version,
+                  })}
+                </span>
+                <span>
+                  {detail.active_upgrade.savepoint_id
+                    ? t('jobs.upgradeSavepoint', { id: detail.active_upgrade.savepoint_id })
+                    : t('jobs.upgradeSavepointPending')}
+                </span>
+                {canMutate && (
+                  <span className="actions">
+                    {detail.active_upgrade.phase === 'paused' ? (
+                      <button
+                        disabled={busy}
+                        onClick={() =>
+                          void onAction(t('jobs.resumingUpgrade'), () =>
+                            api.jobUpgradeAction(
+                              detail.job.job_id,
+                              detail.active_upgrade!.upgrade_id,
+                              'resume',
+                            ),
+                          )
+                        }
+                      >
+                        {t('jobs.resumeUpgrade')}
+                      </button>
+                    ) : (
+                      <button
+                        disabled={busy}
+                        onClick={() =>
+                          void onAction(t('jobs.pausingUpgrade'), () =>
+                            api.jobUpgradeAction(
+                              detail.job.job_id,
+                              detail.active_upgrade!.upgrade_id,
+                              'pause',
+                            ),
+                          )
+                        }
+                      >
+                        {t('jobs.pauseUpgrade')}
+                      </button>
+                    )}
+                    {detail.active_upgrade.phase === 'verifying' && (
+                      <button
+                        disabled={busy}
+                        onClick={() =>
+                          void onAction(t('jobs.rollingBackUpgrade'), () =>
+                            api.jobUpgradeAction(
+                              detail.job.job_id,
+                              detail.active_upgrade!.upgrade_id,
+                              'rollback',
+                            ),
+                          )
+                        }
+                      >
+                        {t('jobs.rollbackUpgrade')}
+                      </button>
+                    )}
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        void onAction(t('jobs.cancellingUpgrade'), () =>
+                          api.jobUpgradeAction(
+                            detail.job.job_id,
+                            detail.active_upgrade!.upgrade_id,
+                            'cancel',
+                          ),
+                        )
+                      }
+                    >
+                      {t('jobs.cancelUpgrade')}
+                    </button>
+                  </span>
+                )}
+              </div>
+              {detail.active_upgrade.last_error && (
+                <div className="error-row">{detail.active_upgrade.last_error}</div>
+              )}
+              <p>
+                <small>{t('jobs.upgradeReplayNote')}</small>
+              </p>
+            </div>
+          )}
           <h4>{t('jobs.nodeCompatibility')}</h4>
           {detail.nodes.length ? (
             detail.nodes.map((node) => (

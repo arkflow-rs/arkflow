@@ -142,7 +142,21 @@ pub struct JobUpgradeRequest {
     #[serde(default)]
     pub node_ids: Vec<String>,
     pub expected_generation: u64,
-    pub savepoint_id: String,
+    /// `"stopped"` (default, the classic stop-the-world flow) or `"atomic"`
+    /// (savepoint → version commit → recovery start, supervised by the Hub).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Required for the stopped mode; the atomic mode takes its own savepoint.
+    #[serde(default)]
+    pub savepoint_id: Option<String>,
+    /// Atomic mode: per-orchestration verification timeout override.
+    #[serde(default)]
+    pub verify_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobUpgradeActionRequest {
+    pub action: String,
 }
 
 fn default_job_desired_state() -> String {

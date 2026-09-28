@@ -54,7 +54,7 @@ const sidebars: SidebarsConfig = {
       {type: 'category', label: 'Control Plane', link: {type: 'doc', id: 'operate/control-plane'}, items: [
         'operate/control-plane/overview', 'operate/control-plane/deploy',
         'operate/control-plane/console', 'operate/control-plane/operations',
-        'operate/control-plane/reconciliation',
+        'operate/control-plane/reconciliation', 'operate/control-plane/job-upgrades',
       ]},
     ]},
     {type: 'category', label: 'Reference', items: [

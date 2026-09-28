@@ -273,6 +273,27 @@ impl Row<'_> {
     }
 }
 
+pub(crate) fn job_upgrade_from_row(row: &Row<'_>) -> Result<JobUpgradeRecord, StorageError> {
+    Ok(JobUpgradeRecord {
+        upgrade_id: row.get(0)?,
+        job_id: row.get(1)?,
+        from_version: row.get(2)?,
+        to_version: row.get(3)?,
+        phase: row.get(4)?,
+        savepoint_id: row.get(5)?,
+        target_spec_json: row.get(6)?,
+        phase_deadline_at_ms: row.get(7)?,
+        savepoint_retries: row.get(8)?,
+        verify_timeout_ms: row.get(9)?,
+        actor: row.get(10)?,
+        correlation_id: row.get(11)?,
+        last_error: row.get(12)?,
+        paused_from: row.get(13)?,
+        created_at_ms: row.get(14)?,
+        updated_at_ms: row.get(15)?,
+    })
+}
+
 /// Result of `query_row`: distinguish "no row" (optional) from errors.
 pub(crate) struct RowResult<T>(Result<Option<T>, StorageError>);
 
@@ -561,6 +582,29 @@ const PG_DDL: &str = r#"
                 FOREIGN KEY (rollout_id)
                     REFERENCES cp_rollouts(rollout_id)
             );
+
+            CREATE TABLE IF NOT EXISTS cp_job_upgrades (
+                upgrade_id TEXT COLLATE "C" PRIMARY KEY,
+                job_id TEXT COLLATE "C" NOT NULL,
+                from_version BIGINT NOT NULL,
+                to_version BIGINT NOT NULL,
+                phase TEXT NOT NULL,
+                savepoint_id TEXT COLLATE "C",
+                target_spec_json TEXT NOT NULL,
+                phase_deadline_at_ms BIGINT NOT NULL,
+                savepoint_retries BIGINT NOT NULL DEFAULT 0,
+                verify_timeout_ms BIGINT NOT NULL DEFAULT 0,
+                actor TEXT,
+                correlation_id TEXT,
+                last_error TEXT,
+                paused_from TEXT,
+                created_at_ms BIGINT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS cp_job_upgrades_phase
+                ON cp_job_upgrades(phase, created_at_ms);
+            CREATE INDEX IF NOT EXISTS cp_job_upgrades_job
+                ON cp_job_upgrades(job_id, created_at_ms);
 
             CREATE TABLE IF NOT EXISTS cp_operations (
                 operation_id TEXT COLLATE "C" PRIMARY KEY,
