@@ -41,6 +41,17 @@ action the console shows the pending operation until the matching node report
 arrives. If a node is offline, actions are accepted (the Intent is durable)
 and the view shows the operation as blocked until the node reconnects.
 
+## Navigation and URLs
+
+Every view has its own URL path (`/`, `/runtime`, `/jobs`, `/configuration`,
+`/rollouts`, `/components`, `/events`, `/audit`, `/settings`), so views can be
+bookmarked, shared, and reached with the browser's back and forward buttons.
+The selected compute node is stored as a `node_id` query parameter on the
+current path and carries over when you switch views. Legacy links that used
+the old `?page=` query parameter (for example `/?page=jobs`) redirect
+automatically to the corresponding path and keep the remaining query
+parameters.
+
 ## When to use the console vs. the API
 
 - **Console**: day-to-day observation, single job lifecycle changes, rollout
@@ -48,6 +59,18 @@ and the view shows the operation as blocked until the node reconnects.
 - **API**: automation, GitOps-style configuration delivery, and anything you
   need to reproduce — every console action is a documented route in the
   [HTTP API reference](../../reference/api.md).
+
+## Theme
+
+The console ships with a dark theme (default) and a light theme built on the
+same design tokens. The theme selector in the top bar offers **Dark / Light /
+System**; **System** follows your operating system preference. The choice is
+persisted in `localStorage` (key `arkflow.console.theme`) and applied before
+first paint, so reloading never flashes the wrong theme.
+
+Destructive and lifecycle-changing actions are confirmed with an in-app
+dialog (focus is contained, `Esc` cancels, `Enter` confirms), outcomes arrive
+as toast notifications, and tables show skeleton rows while data is loading.
 
 ## Interface language
 

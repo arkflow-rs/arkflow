@@ -1,36 +1,40 @@
 import { useEffect, useMemo, useState } from 'react'
-import {
-  api,
-  ControlNode,
-  errorMessage,
-  formatTime,
-  JOB_DETAIL_INTERVAL_MS,
-  Job,
-  JobCheckpoint,
-  JobDetail,
-} from '../api'
+import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDetail } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
+import { useConfirm } from './confirm'
+import { SkeletonRows } from './shared'
+import { useJobDetail, useJobs, useNodes } from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
 
 type JobsProps = {
-  jobs: Job[]
-  nodes: ControlNode[]
-  onRefresh: () => void
   onError: (message: string) => void
   canMutate?: boolean
 }
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 
-export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: JobsProps) {
+export function Jobs({ onError, canMutate = true }: JobsProps) {
   const t = useT()
+  const queryClient = useQueryClient()
+  const confirm = useConfirm()
+  const jobsQuery = useJobs()
+  const jobs = jobsQuery.data ?? []
+  const nodes = useNodes().data?.items ?? []
+  const [selectedJobId, setSelectedJobId] = useState<string>()
+  const detailQuery = useJobDetail(selectedJobId)
+  const selected = detailQuery.data
+  const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
-  const [selected, setSelected] = useState<JobDetail>()
-  const [pollError, setPollError] = useState('')
   const [plan, setPlan] = useState<{ jobId: string; version: number; planJson: string }>()
   const [editor, setEditor] = useState<{ mode: 'create' | 'upgrade'; job?: Job; savepoint?: JobCheckpoint }>()
   const [busy, setBusy] = useState('')
+  const invalidateJobs = () => {
+    void queryClient.invalidateQueries({ queryKey: ['live', 'jobs'] })
+    void queryClient.invalidateQueries({ queryKey: ['live', 'job-detail'] })
+  }
   const visible = useMemo(
     () =>
       jobs.filter(
@@ -41,47 +45,30 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
       ),
     [jobs, filter, state],
   )
-
-  const load = async (jobId: string) => {
-    try {
-      setSelected(await api.jobDetail(jobId))
-      setPollError('')
-    } catch (cause) {
-      onError(errorMessage(cause))
-    }
-  }
-  useEffect(() => {
-    if (!selected) return
-    const jobId = selected.job.job_id
-    const timer = window.setInterval(() => {
-      void api
-        .jobDetail(jobId)
-        .then((detail) => {
-          setSelected(detail)
-          setPollError('')
-        })
-        .catch((cause) => setPollError(errorMessage(cause)))
-    }, JOB_DETAIL_INTERVAL_MS)
-    return () => window.clearInterval(timer)
-  }, [selected?.job.job_id])
   const action = async (label: string, fn: () => Promise<unknown>) => {
     try {
       setBusy(label)
       await fn()
       setBusy('')
-      onRefresh()
-      if (selected) await load(selected.job.job_id)
+      invalidateJobs()
     } catch (cause) {
       setBusy('')
       onError(errorMessage(cause))
     }
   }
-  const setStateFor = (job: Job) => {
+  const setStateFor = async (job: Job) => {
     const stopping = job.desired_state === 'running'
-    if (!window.confirm(t(stopping ? 'jobs.confirmStop' : 'jobs.confirmStart', { jobId: job.job_id }))) return
-    void action(t(stopping ? 'jobs.stopping' : 'jobs.starting'), () =>
-      api.setJobState(job.job_id, stopping ? 'stopped' : 'running'),
+    if (
+      !(await confirm({
+        title: t(stopping ? 'jobs.confirmStop' : 'jobs.confirmStart', { jobId: job.job_id }),
+        confirmLabel: stopping ? t('jobs.stop') : t('jobs.start'),
+      }))
     )
+      return
+    void action(t(stopping ? 'jobs.stopping' : 'jobs.starting'), async () => {
+      await api.setJobState(job.job_id, stopping ? 'stopped' : 'running')
+      toast.success(t('toast.accepted'))
+    })
   }
 
   return (
@@ -103,7 +90,11 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
           />
-          <select aria-label={t('jobs.stateFilterLabel')} value={state} onChange={(event) => setState(event.target.value)}>
+          <select
+            aria-label={t('jobs.stateFilterLabel')}
+            value={state}
+            onChange={(event) => setState(event.target.value)}
+          >
             <option value="all">{t('jobs.allStates')}</option>
             <option value="running">Running</option>
             <option value="stopped">Stopped</option>
@@ -111,8 +102,22 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
             <option value="degraded">Degraded</option>
           </select>
         </div>
-        {visible.length === 0 ? (
-          <p className="empty">{t('jobs.empty')}</p>
+        {jobsQuery.isPending ? (
+          <SkeletonRows rows={4} />
+        ) : visible.length === 0 ? (
+          <p className="empty">
+            {t('jobs.empty')}
+            {(filter || state !== 'all') && (
+              <button
+                onClick={() => {
+                  setFilter('')
+                  setState('all')
+                }}
+              >
+                {t('common.clearFilters')}
+              </button>
+            )}
+          </p>
         ) : (
           <div className="table">
             {visible.map((job) => (
@@ -120,7 +125,7 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
                 className={`row ${selected?.job.job_id === job.job_id ? 'selected' : ''}`}
                 key={job.job_id}
               >
-                <button className="link-button" onClick={() => void load(job.job_id)}>
+                <button className="link-button" onClick={() => setSelectedJobId(job.job_id)}>
                   <strong>{job.job_id}</strong>
                   <small>
                     {t('jobs.rowSummary', {
@@ -132,7 +137,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
                 </button>
                 <div>
                   <span className={`state ${job.observed_state}`}>{job.observed_state}</span>
-                  <small>{t('jobs.desiredSummary', { desired: job.desired_state, convergence: job.convergence })}</small>
+                  <small>
+                    {t('jobs.desiredSummary', { desired: job.desired_state, convergence: job.convergence })}
+                  </small>
                   {job.last_error && <small className="error-text">{job.last_error}</small>}
                 </div>
                 <div className="actions">
@@ -152,12 +159,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
           nodes={nodes}
           canMutate={canMutate}
           busy={!!busy}
-          onClose={() => {
-            setSelected(undefined)
-            setPollError('')
-          }}
+          onClose={() => setSelectedJobId(undefined)}
           onError={onError}
-          onRefresh={() => void load(selected.job.job_id)}
+          onRefresh={invalidateJobs}
           onAction={action}
           onUpgrade={(savepoint) => setEditor({ mode: 'upgrade', job: selected.job, savepoint })}
           onViewPlan={(planJson) =>
@@ -176,10 +180,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
           onError={onError}
           onSaved={() => {
             setEditor(undefined)
-            onRefresh()
-            if (editor.job) void load(editor.job.job_id)
+            invalidateJobs()
           }}
-          onRefresh={onRefresh}
+          onRefresh={invalidateJobs}
           onAction={action}
         />
       )}
@@ -241,7 +244,9 @@ function JobDetailPanel({
         <div>
           <span className="eyebrow">{t('jobs.detailEyebrow')}</span>
           <h3>{detail.job.job_id}</h3>
-          <small>{t('jobs.versionGeneration', { version: detail.job.version, generation: detail.job.generation })}</small>
+          <small>
+            {t('jobs.versionGeneration', { version: detail.job.version, generation: detail.job.generation })}
+          </small>
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('jobs.close')}</button>
@@ -254,16 +259,16 @@ function JobDetailPanel({
           {detail.job.desired_state === 'running' && (
             <button
               disabled={!canMutate || busy}
-              onClick={() => void onAction(t('jobs.stopping'), () => api.setJobState(detail.job.job_id, 'stopped'))}
+              onClick={() =>
+                void onAction(t('jobs.stopping'), () => api.setJobState(detail.job.job_id, 'stopped'))
+              }
             >
               {t('jobs.stop')}
             </button>
           )}
         </div>
       </div>
-      {pollError && (
-        <div className="warning">{t('jobs.livePaused', { error: pollError })}</div>
-      )}
+      {pollError && <div className="warning">{t('jobs.livePaused', { error: pollError })}</div>}
       <div className="job-tabs">
         {(['overview', 'plan', 'tasks', 'recovery', 'versions'] as const).map((value) => (
           <button className={tab === value ? 'active' : ''} key={value} onClick={() => setTab(value)}>
@@ -277,15 +282,18 @@ function JobDetailPanel({
             <div>
               <span className={`state ${detail.job.observed_state}`}>{detail.job.observed_state}</span>
               <p>
-                {t('jobs.desiredLabel')} <strong>{detail.job.desired_state}</strong> · {t('jobs.convergenceLabel')}{' '}
-                <strong>{detail.job.convergence}</strong>
+                {t('jobs.desiredLabel')} <strong>{detail.job.desired_state}</strong> ·{' '}
+                {t('jobs.convergenceLabel')} <strong>{detail.job.convergence}</strong>
               </p>
               <p>
                 {t('jobs.nodesLabel')}{' '}
-                <strong>{detail.nodes.map((node) => node.id).join(', ') || t('jobs.automaticPlacement')}</strong>
+                <strong>
+                  {detail.nodes.map((node) => node.id).join(', ') || t('jobs.automaticPlacement')}
+                </strong>
               </p>
               <p>
-                {t('jobs.latestRecoveryLabel')} <strong>{detail.job.checkpoint_id ?? t('jobs.noneValue')}</strong>
+                {t('jobs.latestRecoveryLabel')}{' '}
+                <strong>{detail.job.checkpoint_id ?? t('jobs.noneValue')}</strong>
               </p>
               {detail.job.last_error && <div className="error-row">{detail.job.last_error}</div>}
             </div>
@@ -294,7 +302,9 @@ function JobDetailPanel({
                 <div className="metric" key={key}>
                   <span>{key.replaceAll('_', ' ')}</span>
                   <strong>
-                    {typeof value === 'number' ? value.toLocaleString(intlLocale(currentLocale())) : String(value)}
+                    {typeof value === 'number'
+                      ? value.toLocaleString(intlLocale(currentLocale()))
+                      : String(value)}
                   </strong>
                 </div>
               ))}
@@ -333,7 +343,9 @@ function JobDetailPanel({
                 <span className={`state ${String(task.state ?? 'assigned')}`}>
                   {String(task.state ?? 'assigned')}
                 </span>
-                <small>{t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}</small>
+                <small>
+                  {t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}
+                </small>
               </div>
             ))
           ) : (
@@ -425,7 +437,9 @@ function JobVersions({
           <div className="version" key={version.version}>
             <span>
               <strong>v{version.version}</strong> · {formatTime(version.created_at_ms)}
-              <small>{version.version === currentVersion ? t('jobs.versionCurrent') : t('jobs.versionAvailable')}</small>
+              <small>
+                {version.version === currentVersion ? t('jobs.versionCurrent') : t('jobs.versionAvailable')}
+              </small>
             </span>
             <div className="actions">
               <button onClick={() => onViewPlan(version.plan_json)}>{t('jobs.viewPlan')}</button>

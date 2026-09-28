@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './app'
 
@@ -69,11 +69,12 @@ describe('console application', () => {
   })
 
   it('requires confirmation before lifecycle commands', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<App />)
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     await screen.findByText('orders')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    const dialog = await screen.findByRole('alertdialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     await waitFor(() =>
       expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/stop'), expect.anything()),
     )
@@ -154,8 +155,12 @@ describe('console application', () => {
     )
     render(<App />)
     const selector = await screen.findByLabelText('Compute node')
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'node-a')).toBe(true)
+    })
     fireEvent.change(selector, { target: { value: 'node-a' } })
-    expect(window.location.search).toContain('node_id=node-a')
+    await waitFor(() => expect(window.location.search).toContain('node_id=node-a'))
     expect(await screen.findByText(/mutating actions are disabled/i)).toBeInTheDocument()
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     expect((await screen.findByRole('button', { name: 'Start' })).hasAttribute('disabled')).toBe(true)
@@ -202,7 +207,6 @@ describe('console application', () => {
   })
 
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     let operationReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) =>
       Promise.resolve({
@@ -275,9 +279,16 @@ describe('console application', () => {
       }),
     )
     render(<App />)
-    fireEvent.change(await screen.findByLabelText('Compute node'), { target: { value: 'node-a' } })
+    const selector = await screen.findByLabelText('Compute node')
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'node-a')).toBe(true)
+    })
+    fireEvent.change(selector, { target: { value: 'node-a' } })
+    await waitFor(() => expect(window.location.search).toContain('node_id=node-a'))
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Start' }))
     expect(await screen.findByText('succeeded')).toBeInTheDocument()
     expect(operationReads).toBeGreaterThan(0)
     expect(fetchMock).toHaveBeenCalledWith(
@@ -289,7 +300,6 @@ describe('console application', () => {
   })
 
   it('shows a permission failure without retrying the mutation', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
       if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
         return Promise.resolve({
@@ -334,9 +344,16 @@ describe('console application', () => {
       return Promise.resolve({ ok: true, json: async () => page([]) })
     })
     render(<App />)
-    fireEvent.change(await screen.findByLabelText('Compute node'), { target: { value: 'node-a' } })
+    const selector = await screen.findByLabelText('Compute node')
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'node-a')).toBe(true)
+    })
+    fireEvent.change(selector, { target: { value: 'node-a' } })
+    await waitFor(() => expect(window.location.search).toContain('node_id=node-a'))
     fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Start' }))
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Start' }))
     expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
     expect(
       fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
@@ -362,5 +379,169 @@ describe('console application', () => {
     )
     expect(await screen.findByText('集群健康')).toBeInTheDocument()
     window.localStorage.removeItem(LOCALE_STORAGE_KEY)
+  })
+
+  it('opens the page addressed by the URL path', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return {
+              version: 'test',
+              state: 'running',
+              uptime_seconds: 4,
+              streams_total: 0,
+              streams_running: 0,
+              streams_failed: 0,
+              capabilities: [],
+            }
+          if (url.endsWith('/jobs')) return []
+          return page([])
+        },
+      }),
+    )
+    window.history.replaceState(null, '', '/jobs')
+    render(<App />)
+    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Job filter')).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/jobs')
+  })
+
+  it('redirects legacy ?page= links to their path, preserving other params', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return {
+              version: 'test',
+              state: 'running',
+              uptime_seconds: 4,
+              streams_total: 0,
+              streams_running: 0,
+              streams_failed: 0,
+              capabilities: [],
+            }
+          if (url.endsWith('/jobs')) return []
+          return page([])
+        },
+      }),
+    )
+    window.history.replaceState(null, '', '/?page=jobs&node_id=node-a')
+    render(<App />)
+    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/jobs')
+    expect(window.location.search).toBe('?node_id=node-a')
+  })
+
+  it('navigates with browser back', async () => {
+    render(<App />)
+    fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
+    expect(window.location.pathname).toBe('/runtime')
+    window.history.back()
+    expect(await screen.findByText('Fleet health')).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/')
+  })
+
+  it('refetches node-scoped resources when the node filter changes', async () => {
+    render(<App />)
+    await screen.findByText('Fleet health')
+    fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
+    await screen.findByText('orders')
+    const scopedCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => String(url).includes('/streams?node_id=local-node')).length
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'local-node')).toBe(true)
+    })
+    const selector = screen.getByLabelText('Compute node') as HTMLSelectElement
+    fireEvent.change(selector, { target: { value: 'local-node' } })
+    await waitFor(() => expect(window.location.search).toContain('node_id=local-node'))
+    await waitFor(() => expect(scopedCalls()).toBeGreaterThan(0))
+  })
+
+  it('keeps the last snapshot visible behind the stale banner when the API fails', async () => {
+    render(<App />)
+    await screen.findByText('Fleet health')
+    const refreshButton = await screen.findByRole('button', { name: /refresh/i })
+    await waitFor(() => expect(refreshButton).toBeEnabled())
+    fetchMock.mockRejectedValue(new Error('connection refused'))
+    fireEvent.click(refreshButton)
+    expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
+    expect(screen.getByText('Fleet health')).toBeInTheDocument()
+  })
+
+  it('marks the view stale when a page-scoped live query fails while nodes stay healthy', async () => {
+    render(<App />)
+    fireEvent.click(screen.getByText('Streams', { selector: 'a' }))
+    await screen.findByText('orders')
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: url.includes('/nodes?'),
+        status: url.includes('/nodes?') ? 200 : 500,
+        headers: new Headers(),
+        json: async () => {
+          if (url.includes('/nodes?'))
+            return page([
+              {
+                id: 'local-node',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ])
+          return { code: 'internal', message: 'storage unavailable' }
+        },
+      }),
+    )
+    const refreshButton = await screen.findByRole('button', { name: /refresh/i })
+    await waitFor(() => expect(refreshButton).toBeEnabled())
+    fireEvent.click(refreshButton)
+    expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
+    expect(screen.getByText('orders')).toBeInTheDocument()
+  })
+
+  it('switches the theme, persists it, and updates the document', async () => {
+    const { THEME_STORAGE_KEY } = await import('./theme')
+    render(<App />)
+    await screen.findByText('Fleet health')
+    fireEvent.change(screen.getByRole('combobox', { name: 'Theme' }), { target: { value: 'light' } })
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe('light'))
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe('light')
+    window.localStorage.removeItem(THEME_STORAGE_KEY)
+  })
+
+  it('renders skeleton rows while data is loading', async () => {
+    fetchMock.mockImplementation(() => new Promise(() => undefined))
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.skeleton')).toBeInTheDocument())
+  })
+
+  it('keeps the configuration draft while live resources refresh', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/configuration/draft')) return null
+          if (url.endsWith('/configuration')) return { streams: [] }
+          return page([])
+        },
+      }),
+    )
+    window.history.replaceState(null, '', '/configuration')
+    render(<App />)
+    const editor = await screen.findByLabelText('Configuration editor')
+    await waitFor(() => expect(editor).toHaveValue('{\n  "streams": []\n}'))
+    fireEvent.change(editor, { target: { value: 'streams: [] # my draft' } })
+    const configCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/configuration')).length
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(configCalls()).toBe(1)
+    expect(editor).toHaveValue('streams: [] # my draft')
   })
 })

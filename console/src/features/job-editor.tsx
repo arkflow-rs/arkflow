@@ -24,6 +24,7 @@ import {
   type DagNodeData,
   type JobSpec,
 } from './job-dag'
+import { useConfirm } from './confirm'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
 import { useT } from '../i18n'
 
@@ -250,6 +251,7 @@ export function JobEditor({
   onRefresh,
   onAction,
 }: Props) {
+  const confirm = useConfirm()
   const t = useT()
   const initial = useMemo<JobSpec>(() => {
     if (mode === 'upgrade' && job) {
@@ -422,13 +424,15 @@ export function JobEditor({
       return
     }
     if (
-      !window.confirm(
-        mode === 'create'
-          ? t('editor.confirmCreate')
-          : t('editor.confirmUpgrade', {
-              checkpoint: savepoint?.checkpoint_id ?? t('editor.selectedSavepoint'),
-            }),
-      )
+      !(await confirm({
+        title:
+          mode === 'create'
+            ? t('editor.confirmCreate')
+            : t('editor.confirmUpgrade', {
+                checkpoint: savepoint?.checkpoint_id ?? t('editor.selectedSavepoint'),
+              }),
+        confirmLabel: t('jobs.createJob'),
+      }))
     )
       return
     await onAction(mode === 'create' ? t('editor.creatingJob') : t('editor.submittingUpgrade'), async () => {
@@ -470,8 +474,12 @@ export function JobEditor({
     <section className="panel detail job-editor">
       <div className="panel-title">
         <div>
-          <span className="eyebrow">{mode === 'create' ? t('editor.eyebrowCreate') : t('editor.eyebrowUpgrade')}</span>
-          <h3>{mode === 'create' ? t('editor.visualOrchestrator') : `${job?.job_id} → v${spec.version ?? 1}`}</h3>
+          <span className="eyebrow">
+            {mode === 'create' ? t('editor.eyebrowCreate') : t('editor.eyebrowUpgrade')}
+          </span>
+          <h3>
+            {mode === 'create' ? t('editor.visualOrchestrator') : `${job?.job_id} → v${spec.version ?? 1}`}
+          </h3>
           <small>
             {mode === 'upgrade'
               ? t('editor.recoveryFrom', { checkpoint: savepoint?.checkpoint_id ?? '' })

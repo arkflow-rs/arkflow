@@ -13,3 +13,15 @@ class ResizeObserverMock {
 }
 
 Object.defineProperty(globalThis, 'ResizeObserver', { writable: true, value: ResizeObserverMock })
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: (query: string) => ({
+    matches: false,
+    media: query,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+  }),
+})
