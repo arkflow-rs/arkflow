@@ -18,6 +18,9 @@ ArkFlow 提供一个可选的控制平面,用于把多个计算节点当作机�
 
 资源端点包括 `/api/v1/system`、`/nodes`、分页的 `/streams`、`/operations`、`/events`、
 `/configuration`、`/components` 与 `/schema`。`/metrics` 暴露 Prometheus 文本格式指标。
+作业端点包括作业 CRUD、检查点与保存点、版本历史与升级——升级端点的原子模式把
+"保存点 → 版本提交 → 恢复启动"编排为一次调用（见
+[原子作业升级](./job-upgrades.md)）。
 
 生命周期命令返回 `202 Accepted` 和一个操作 ID;轮询 `/api/v1/operations/{id}`
 直到它到达终态。在等价操作活跃期间,同一资源/动作的命令是幂等的。生命周期命令的目标是

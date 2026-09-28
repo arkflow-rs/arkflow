@@ -11,7 +11,7 @@ use super::StorageError;
 use rusqlite::types::ValueRef;
 
 /// Foreign-key-safe copy order (referenced tables first).
-pub const TABLE_ORDER: [&str; 16] = [
+pub const TABLE_ORDER: [&str; 17] = [
     "cp_nodes",
     "cp_jobs",
     "cp_job_versions",
@@ -26,6 +26,7 @@ pub const TABLE_ORDER: [&str; 16] = [
     "cp_audit_events",
     "cp_rollouts",
     "cp_rollout_targets",
+    "cp_job_upgrades",
     "cp_operations",
     "cp_outbox",
 ];

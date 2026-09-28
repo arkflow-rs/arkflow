@@ -233,7 +233,7 @@ export type JobDetail = {
   operations: Operation[]
   checkpoints: JobCheckpoint[]
   metrics: JobMetrics
-  active_upgrade?: Record<string, unknown>
+  active_upgrade?: JobUpgradeOrchestration
 }
 export type JobValidation = {
   valid: boolean
@@ -248,7 +248,24 @@ export type JobValidation = {
   }>
   warnings: string[]
 }
-export type JobUpgrade = { upgrade_id: string; state: string; savepoint_id: string; job: Job }
+export type JobUpgrade = { upgrade_id: string; state: string; savepoint_id: string | null; job: Job }
+export type JobUpgradeOrchestration = {
+  upgrade_id: string
+  job_id: string
+  from_version: number
+  to_version: number
+  phase: string
+  savepoint_id: string | null
+  phase_deadline_at_ms: number
+  savepoint_retries: number
+  verify_timeout_ms: number
+  actor: string | null
+  correlation_id: string | null
+  last_error: string | null
+  paused_from: string | null
+  created_at_ms: number
+  updated_at_ms: number
+}
 
 // Polling cadences, centralized so the UI text and the timers cannot drift.
 export const SNAPSHOT_INTERVAL_MS = 30_000
@@ -394,6 +411,25 @@ export const api = {
         savepoint_id: savepointId,
       }),
     }),
+  upgradeJobAtomic: (id: string, spec: unknown, expectedGeneration: number, nodeIds: string[] = []) =>
+    request<JobUpgrade>(`/jobs/${encodeURIComponent(id)}/upgrades`, {
+      method: 'POST',
+      body: JSON.stringify({
+        spec,
+        node_ids: nodeIds,
+        expected_generation: expectedGeneration,
+        mode: 'atomic',
+      }),
+    }),
+  jobUpgrade: (id: string, upgradeId: string) =>
+    request<JobUpgradeOrchestration>(
+      `/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}`,
+    ),
+  jobUpgradeAction: (id: string, upgradeId: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') =>
+    request<JobUpgradeOrchestration>(
+      `/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}/actions`,
+      { method: 'POST', body: JSON.stringify({ action }) },
+    ),
   rollbackJobUpgrade: (id: string, upgradeId = 'manual') =>
     request<Job>(`/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}/rollback`, {
       method: 'POST',

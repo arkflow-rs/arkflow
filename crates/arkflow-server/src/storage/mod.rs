@@ -283,6 +283,52 @@ pub struct RolloutTargetUpdate {
     pub updated_at_ms: u64,
 }
 
+/// Durable record of one atomic job-upgrade orchestration (see
+/// `hub/job_orchestration.rs`). `phase` is a plain string validated at use
+/// sites, matching the rollout state convention. `target_spec_json` is the
+/// persisted new spec (with `recovery = LatestSavepoint` forced) so a Hub
+/// restart can resume the commit without re-deriving it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobUpgradeRecord {
+    pub upgrade_id: String,
+    pub job_id: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    pub phase: String,
+    /// The savepoint this orchestration dispatched; `None` while the next
+    /// round has not been dispatched yet (retry or fresh start).
+    pub savepoint_id: Option<String>,
+    pub target_spec_json: String,
+    /// Wall-clock deadline of the current phase; re-armed on transitions.
+    pub phase_deadline_at_ms: u64,
+    pub savepoint_retries: u32,
+    /// Request-supplied verification timeout override (0 = default).
+    pub verify_timeout_ms: u64,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+    pub last_error: Option<String>,
+    /// The phase an operator pause interrupted; resume re-enters it.
+    pub paused_from: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+impl JobUpgradeRecord {
+    /// Terminal phases release the reconciler fence and the retention pin.
+    pub fn phase_is_terminal(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "succeeded" | "aborted" | "failed" | "rolled_back" | "cancelled"
+        )
+    }
+}
+
+/// The same terminal-phase set as [`JobUpgradeRecord::phase_is_terminal`], in
+/// SQL list form. The recovery/prune queries in both backends interpolate
+/// this constant so the set exists in exactly one place per language.
+pub(crate) const TERMINAL_JOB_UPGRADE_PHASES_SQL: &str =
+    "('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled')";
+
 /// Storage-neutral contract used by Hub/Reconciler code.
 ///
 /// Implementations must keep each method's state transition atomic. Network
@@ -564,6 +610,31 @@ enum StorageCommand {
     },
     ListRollouts {
         response: oneshot::Sender<Result<Vec<RolloutRecord>, StorageError>>,
+    },
+    UpsertJobUpgrade {
+        record: JobUpgradeRecord,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
+    TransitionJobUpgrade {
+        record: JobUpgradeRecord,
+        expected_phase: String,
+        response: oneshot::Sender<Result<bool, StorageError>>,
+    },
+    GetJobUpgrade {
+        upgrade_id: String,
+        response: oneshot::Sender<Result<Option<JobUpgradeRecord>, StorageError>>,
+    },
+    RecoverJobUpgrades {
+        response: oneshot::Sender<Result<Vec<JobUpgradeRecord>, StorageError>>,
+    },
+    ListJobUpgrades {
+        job_id: String,
+        response: oneshot::Sender<Result<Vec<JobUpgradeRecord>, StorageError>>,
+    },
+    PruneJobUpgrades {
+        older_than_ms: i64,
+        max_retained: i64,
+        response: oneshot::Sender<Result<usize, StorageError>>,
     },
     UpsertOperation {
         operation: PersistedOperation,
@@ -932,6 +1003,37 @@ impl StorageActor {
                     }
                     StorageCommand::ListRollouts { response } => {
                         let _ = response.send(store.list_rollouts().await);
+                    }
+                    StorageCommand::UpsertJobUpgrade { record, response } => {
+                        let _ = response.send(store.upsert_job_upgrade(record).await);
+                    }
+                    StorageCommand::TransitionJobUpgrade {
+                        record,
+                        expected_phase,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.transition_job_upgrade(record, &expected_phase).await);
+                    }
+                    StorageCommand::GetJobUpgrade {
+                        upgrade_id,
+                        response,
+                    } => {
+                        let _ = response.send(store.get_job_upgrade(&upgrade_id).await);
+                    }
+                    StorageCommand::RecoverJobUpgrades { response } => {
+                        let _ = response.send(store.recover_job_upgrades().await);
+                    }
+                    StorageCommand::ListJobUpgrades { job_id, response } => {
+                        let _ = response.send(store.list_job_upgrades(&job_id).await);
+                    }
+                    StorageCommand::PruneJobUpgrades {
+                        older_than_ms,
+                        max_retained,
+                        response,
+                    } => {
+                        let _ = response
+                            .send(store.prune_job_upgrades(older_than_ms, max_retained).await);
                     }
                     StorageCommand::UpsertOperation {
                         operation,
@@ -1710,6 +1812,91 @@ impl StorageActor {
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
+    pub async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::UpsertJobUpgrade {
+                record,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: impl Into<String>,
+    ) -> Result<bool, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::TransitionJobUpgrade {
+                record,
+                expected_phase: expected_phase.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn get_job_upgrade(
+        &self,
+        upgrade_id: impl Into<String>,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::GetJobUpgrade {
+                upgrade_id: upgrade_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::RecoverJobUpgrades { response })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn list_job_upgrades(
+        &self,
+        job_id: impl Into<String>,
+    ) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListJobUpgrades {
+                job_id: job_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::PruneJobUpgrades {
+                older_than_ms,
+                max_retained,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
     pub async fn upsert_operation(
         &self,
         operation: PersistedOperation,
@@ -1928,6 +2115,27 @@ config_version_id: &str,
 ) -> Result<Option<String>, StorageError>;
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
+    async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
+    /// Optimistically-concurrent mutation of an existing orchestration row:
+    /// the mutable columns apply only while the row still holds
+    /// `expected_phase`. Returns false (no error) when the phase moved, so
+    /// the caller can treat it as a lost race instead of a storage fault.
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError>;
+    async fn get_job_upgrade(
+        &self,
+        upgrade_id: &str,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError>;
+    async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError>;
+    async fn list_job_upgrades(&self, job_id: &str) -> Result<Vec<JobUpgradeRecord>, StorageError>;
+    async fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError>;
     async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError>;
     async fn get_operation(
 &self,
@@ -2354,6 +2562,61 @@ config_version_id: &str,
             Self::Postgres(backend) => StorageBackend::list_rollouts(backend, ).await,
         }
     }
+    async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::upsert_job_upgrade(backend, record).await,
+            Self::Postgres(backend) => StorageBackend::upsert_job_upgrade(backend, record).await,
+        }
+    }
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::transition_job_upgrade(backend, record, expected_phase).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::transition_job_upgrade(backend, record, expected_phase).await
+            }
+        }
+    }
+    async fn get_job_upgrade(
+        &self,
+        upgrade_id: &str,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_job_upgrade(backend, upgrade_id).await,
+            Self::Postgres(backend) => StorageBackend::get_job_upgrade(backend, upgrade_id).await,
+        }
+    }
+    async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::recover_job_upgrades(backend).await,
+            Self::Postgres(backend) => StorageBackend::recover_job_upgrades(backend).await,
+        }
+    }
+    async fn list_job_upgrades(&self, job_id: &str) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_job_upgrades(backend, job_id).await,
+            Self::Postgres(backend) => StorageBackend::list_job_upgrades(backend, job_id).await,
+        }
+    }
+    async fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_job_upgrades(backend, older_than_ms, max_retained).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_job_upgrades(backend, older_than_ms, max_retained).await
+            }
+        }
+    }
     async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::upsert_operation(backend, operation).await,
@@ -2552,6 +2815,83 @@ mod tests {
         assert!(store.table_exists("cp_audit_events").unwrap());
         assert!(store.table_exists("cp_rollouts").unwrap());
         assert!(store.table_exists("cp_rollout_targets").unwrap());
+        assert!(store.table_exists("cp_job_upgrades").unwrap());
+    }
+
+    #[tokio::test]
+    async fn job_upgrade_record_round_trips_and_prunes() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let mut record = JobUpgradeRecord {
+            upgrade_id: "job-upgrade-1".into(),
+            job_id: "job-a".into(),
+            from_version: 1,
+            to_version: 2,
+            phase: "saving_savepoint".into(),
+            savepoint_id: None,
+            target_spec_json: "{\"version\":[2]}".into(),
+            phase_deadline_at_ms: 100,
+            savepoint_retries: 0,
+            verify_timeout_ms: 0,
+            actor: Some("operator".into()),
+            correlation_id: None,
+            last_error: None,
+            paused_from: None,
+            created_at_ms: 50,
+            updated_at_ms: 50,
+        };
+        store.upsert_job_upgrade(record.clone()).await.unwrap();
+
+        // Upsert mutates the mutable columns only; identity columns stay.
+        record.phase = "verifying".into();
+        record.savepoint_id = Some("savepoint-job-a-2-90".into());
+        record.savepoint_retries = 1;
+        store.upsert_job_upgrade(record.clone()).await.unwrap();
+
+        let loaded = store.get_job_upgrade("job-upgrade-1").await.unwrap();
+        assert_eq!(loaded.as_ref(), Some(&record));
+        assert!(!record.phase_is_terminal());
+
+        // Phase guard: a transition applies only against the phase the
+        // caller read; a moved phase is a lost race, not a storage fault.
+        // The stored phase here is "verifying" (set above).
+        let mut guarded = record.clone();
+        guarded.phase = "committing_version".into();
+        assert!(
+            store
+                .transition_job_upgrade(guarded, "verifying")
+                .await
+                .unwrap()
+        );
+        let mut moved = record.clone();
+        moved.phase = "rolling_back".into();
+        assert!(
+            !store
+                .transition_job_upgrade(moved, "verifying")
+                .await
+                .unwrap(),
+            "the phase moved; the stale writer must lose"
+        );
+        let stored = store.get_job_upgrade("job-upgrade-1").await.unwrap().unwrap();
+        assert_eq!(stored.phase, "committing_version");
+        record.phase = "committing_version".into();
+
+        // Recover returns only non-terminal rows.
+        let active = store.recover_job_upgrades().await.unwrap();
+        assert_eq!(active, vec![record.clone()]);
+        let listed = store.list_job_upgrades("job-a").await.unwrap();
+        assert_eq!(listed.len(), 1);
+
+        // Terminal rows are excluded from recovery and pruned past bounds.
+        record.phase = "succeeded".into();
+        record.updated_at_ms = 10_000;
+        store.upsert_job_upgrade(record.clone()).await.unwrap();
+        assert!(record.phase_is_terminal());
+        assert!(store.recover_job_upgrades().await.unwrap().is_empty());
+        store
+            .prune_job_upgrades(15_000, 0)
+            .await
+            .unwrap();
+        assert!(store.get_job_upgrade("job-upgrade-1").await.unwrap().is_none());
     }
 
     /// The hub-lease contract every backend must satisfy: expiry takeover

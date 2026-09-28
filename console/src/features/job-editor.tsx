@@ -228,7 +228,7 @@ function KeyValueForm({ value, onChange }: { value: any; onChange: (value: any) 
   )
 }
 type Props = {
-  mode: 'create' | 'upgrade'
+  mode: 'create' | 'upgrade' | 'atomic'
   job?: Job
   savepoint?: JobCheckpoint
   nodes: ControlNode[]
@@ -254,7 +254,7 @@ export function JobEditor({
   const confirm = useConfirm()
   const t = useT()
   const initial = useMemo<JobSpec>(() => {
-    if (mode === 'upgrade' && job) {
+    if ((mode === 'upgrade' || mode === 'atomic') && job) {
       if (job.spec && typeof job.spec === 'object') return copy(job.spec as JobSpec)
       if (job.spec_json)
         try {
@@ -440,6 +440,9 @@ export function JobEditor({
       if (mode === 'create') {
         await api.createJob(next, nodeIds)
         onSaved()
+      } else if (mode === 'atomic' && job) {
+        await api.upgradeJobAtomic(job.job_id, next, job.generation, nodeIds)
+        setUpgraded(job.job_id)
       } else if (job && savepoint) {
         await api.upgradeJob(job.job_id, next, savepoint.checkpoint_id, job.generation, nodeIds)
         setUpgraded(job.job_id)
@@ -483,7 +486,9 @@ export function JobEditor({
           <small>
             {mode === 'upgrade'
               ? t('editor.recoveryFrom', { checkpoint: savepoint?.checkpoint_id ?? '' })
-              : t('editor.validatedGraphHint')}
+              : mode === 'atomic'
+                ? t('editor.atomicHint')
+                : t('editor.validatedGraphHint')}
           </small>
         </div>
         <div className="actions">

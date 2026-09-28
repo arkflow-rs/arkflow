@@ -14,6 +14,27 @@ pub struct SqliteBackend {
     connection: Arc<Mutex<Connection>>,
 }
 
+fn job_upgrade_from_row(row: &Row<'_>) -> rusqlite::Result<JobUpgradeRecord> {
+    Ok(JobUpgradeRecord {
+        upgrade_id: row.get(0)?,
+        job_id: row.get(1)?,
+        from_version: row.get(2)?,
+        to_version: row.get(3)?,
+        phase: row.get(4)?,
+        savepoint_id: row.get(5)?,
+        target_spec_json: row.get(6)?,
+        phase_deadline_at_ms: row.get(7)?,
+        savepoint_retries: row.get(8)?,
+        verify_timeout_ms: row.get(9)?,
+        actor: row.get(10)?,
+        correlation_id: row.get(11)?,
+        last_error: row.get(12)?,
+        paused_from: row.get(13)?,
+        created_at_ms: row.get(14)?,
+        updated_at_ms: row.get(15)?,
+    })
+}
+
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
     let node_ids_json: String = row.get(7)?;
     let node_ids = serde_json::from_str(&node_ids_json).map_err(|error| {
@@ -1309,6 +1330,116 @@ impl SqliteBackend {
         })
     }
 
+    pub fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_job_upgrades (upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT(upgrade_id) DO UPDATE SET phase = excluded.phase, savepoint_id = excluded.savepoint_id, phase_deadline_at_ms = excluded.phase_deadline_at_ms, savepoint_retries = excluded.savepoint_retries, verify_timeout_ms = excluded.verify_timeout_ms, last_error = excluded.last_error, paused_from = excluded.paused_from, updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    record.upgrade_id,
+                    record.job_id,
+                    record.from_version,
+                    record.to_version,
+                    record.phase,
+                    record.savepoint_id,
+                    record.target_spec_json,
+                    record.phase_deadline_at_ms,
+                    record.savepoint_retries,
+                    record.verify_timeout_ms,
+                    record.actor,
+                    record.correlation_id,
+                    record.last_error,
+                    record.paused_from,
+                    record.created_at_ms,
+                    record.updated_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Phase-guarded mutation (see the trait contract).
+    pub fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let changed = transaction.execute(
+                "UPDATE cp_job_upgrades SET phase = ?1, savepoint_id = ?2, phase_deadline_at_ms = ?3, savepoint_retries = ?4, verify_timeout_ms = ?5, last_error = ?6, paused_from = ?7, updated_at_ms = ?8 WHERE upgrade_id = ?9 AND phase = ?10",
+                rusqlite::params![
+                    record.phase,
+                    record.savepoint_id,
+                    record.phase_deadline_at_ms,
+                    record.savepoint_retries,
+                    record.verify_timeout_ms,
+                    record.last_error,
+                    record.paused_from,
+                    record.updated_at_ms,
+                    record.upgrade_id,
+                    expected_phase,
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn get_job_upgrade(
+        &self,
+        upgrade_id: &str,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE upgrade_id = ?1",
+                    [upgrade_id],
+                    job_upgrade_from_row,
+                )
+                .optional()
+        })
+    }
+
+    pub fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        let sql = format!(
+            "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN {} ORDER BY created_at_ms",
+            TERMINAL_JOB_UPGRADE_PHASES_SQL
+        );
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(sql.as_str())?;
+            let rows = statement.query_map([], job_upgrade_from_row)?;
+            rows.collect()
+        })
+    }
+
+    pub fn list_job_upgrades(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE job_id = ?1 ORDER BY created_at_ms DESC, upgrade_id DESC LIMIT 256",
+            )?;
+            let rows = statement.query_map([job_id], job_upgrade_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// Reclaim terminal upgrade rows beyond the retention window/count.
+    /// Non-terminal rows are never reclaimed: they own the reconciler fence.
+    pub fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        let sql = format!(
+            "DELETE FROM cp_job_upgrades WHERE phase IN {t} AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN {t} ORDER BY updated_at_ms DESC LIMIT ?2)",
+            t = TERMINAL_JOB_UPGRADE_PHASES_SQL
+        );
+        self.immediate_transaction(|transaction| {
+            let removed = transaction.execute(sql.as_str(), rusqlite::params![older_than_ms, max_retained])?;
+            Ok(removed)
+        })
+    }
+
     /// Take over the singleton control-plane lease when it is expired (or
     /// already ours). A takeover bumps the fencing epoch; a self-acquire only
     /// extends the TTL. Runs under BEGIN IMMEDIATE so the read-then-write is
@@ -2079,6 +2210,25 @@ impl SqliteBackend {
                     REFERENCES cp_rollouts(rollout_id)
             );
 
+            CREATE TABLE IF NOT EXISTS cp_job_upgrades (
+                upgrade_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                from_version INTEGER NOT NULL,
+                to_version INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                savepoint_id TEXT,
+                target_spec_json TEXT NOT NULL,
+                phase_deadline_at_ms INTEGER NOT NULL,
+                savepoint_retries INTEGER NOT NULL DEFAULT 0,
+                verify_timeout_ms INTEGER NOT NULL DEFAULT 0,
+                actor TEXT,
+                correlation_id TEXT,
+                last_error TEXT,
+                paused_from TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS cp_operations (
                 operation_id TEXT PRIMARY KEY,
                 node_id TEXT NOT NULL,
@@ -2122,6 +2272,10 @@ impl SqliteBackend {
                 ON cp_audit_events(resource_id, occurred_at_ms);
             CREATE INDEX IF NOT EXISTS cp_rollout_targets_state
                 ON cp_rollout_targets(rollout_id, state, ordinal);
+            CREATE INDEX IF NOT EXISTS cp_job_upgrades_phase
+                ON cp_job_upgrades(phase, created_at_ms);
+            CREATE INDEX IF NOT EXISTS cp_job_upgrades_job
+                ON cp_job_upgrades(job_id, created_at_ms);
             CREATE INDEX IF NOT EXISTS cp_operations_node_created
                 ON cp_operations(node_id, created_at_ms DESC);
             CREATE INDEX IF NOT EXISTS cp_outbox_ready
@@ -2401,6 +2555,35 @@ config_version_id: &str,
     }
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         self.list_rollouts()
+    }
+    async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
+        self.upsert_job_upgrade(record)
+    }
+    async fn transition_job_upgrade(
+        &self,
+        record: JobUpgradeRecord,
+        expected_phase: &str,
+    ) -> Result<bool, StorageError> {
+        self.transition_job_upgrade(record, expected_phase)
+    }
+    async fn get_job_upgrade(
+        &self,
+        upgrade_id: &str,
+    ) -> Result<Option<JobUpgradeRecord>, StorageError> {
+        self.get_job_upgrade(upgrade_id)
+    }
+    async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        self.recover_job_upgrades()
+    }
+    async fn list_job_upgrades(&self, job_id: &str) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        self.list_job_upgrades(job_id)
+    }
+    async fn prune_job_upgrades(
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
+        self.prune_job_upgrades(older_than_ms, max_retained)
     }
     async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.upsert_operation(operation)

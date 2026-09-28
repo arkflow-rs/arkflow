@@ -7,9 +7,9 @@
 use crate::agent::{delete_checkpoint_artifact, recovery_record_is_valid};
 use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
 use crate::storage::{
-    AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, JobVersionRecord,
-    NodeMutation, ObservedMutation, PersistedOperation, RolloutRecord, RolloutTargetRecord,
-    RolloutTargetUpdate, StorageActor, StorageError,
+    AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, JobUpgradeRecord,
+    JobVersionRecord, NodeMutation, ObservedMutation, PersistedOperation, RolloutRecord,
+    RolloutTargetRecord, RolloutTargetUpdate, StorageActor, StorageError,
 };
 use arkflow_core::control::{
     ControlEvent, NodeMaintenanceState, OperationRecord, OperationalStatus, ReconciliationHealth,
@@ -27,6 +27,7 @@ mod checkpoint;
 mod command_metrics;
 mod error;
 mod jobs;
+mod job_orchestration;
 mod leadership;
 mod lifecycle;
 mod nodes;
@@ -131,6 +132,11 @@ pub struct Hub {
     nodes: Arc<RwLock<BTreeMap<String, NodeRecord>>>,
     operations: Arc<RwLock<BTreeMap<String, HubOperation>>>,
     rollouts: Arc<RwLock<BTreeMap<String, RolloutRecord>>>,
+    /// In-flight and recently-active atomic job upgrades, keyed upgrade id.
+    /// Kept in sync with `cp_job_upgrades` on create, every phase transition,
+    /// and boot recovery; drives the reconciler fence and the retention pin
+    /// without a storage round trip per tick.
+    job_upgrades: Arc<RwLock<BTreeMap<String, JobUpgradeRecord>>>,
     events: Arc<RwLock<VecDeque<HubEvent>>>,
     updates: broadcast::Sender<HubEvent>,
     storage: Option<StorageActor>,
@@ -219,6 +225,7 @@ impl Hub {
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(RwLock::new(BTreeMap::new())),
             rollouts: Arc::new(RwLock::new(BTreeMap::new())),
+            job_upgrades: Arc::new(RwLock::new(BTreeMap::new())),
             events: Arc::new(RwLock::new(VecDeque::new())),
             updates,
             storage: None,

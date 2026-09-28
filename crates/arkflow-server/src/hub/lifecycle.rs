@@ -263,6 +263,11 @@ impl Hub {
             for rollout in recovered {
                 rollouts.insert(rollout.rollout_id.clone(), rollout);
             }
+            drop(rollouts);
+            // Upgrade orchestrations re-enter their phases on the next
+            // reconcile tick; recovering the cache first restores the
+            // reconciler fence and the retention pin before the tick runs.
+            self.recover_job_upgrade_cache().await?;
             let recovered_jobs = storage.list_jobs().await.map_err(HubError::from)?;
             let mut jobs = self.jobs.write().await;
             for job in recovered_jobs {

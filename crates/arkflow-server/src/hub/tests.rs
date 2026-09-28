@@ -4434,3 +4434,958 @@ async fn serve_hub_elects_leadership_and_flips_readiness() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(matches!(hub.leadership().await, Leadership::Standby { .. }));
 }
+
+// ---------------------------------------------------------------------
+// Atomic job-upgrade orchestration
+// ---------------------------------------------------------------------
+
+/// Deep-validatable durable spec: identical to `durable_job_spec_json` but
+/// the aggregate operator carries a registered processor type so the
+/// orchestration's deep-validation guard passes.
+fn durable_atomic_spec_json(id: &str, version: u64) -> String {
+    let mut spec = serde_json::from_str::<serde_json::Value>(&durable_job_spec_json(id)).unwrap();
+    spec["version"] = serde_json::json!(version);
+    spec["operators"][1]["config"] = serde_json::json!({"type": "batch", "count": 100, "timeout_ms": 1000});
+    spec["checkpoint"]["object_store_uri"] = serde_json::json!(format!(
+        "file:///tmp/arkflow-hub-upgrade-{}-{}",
+        id,
+        std::process::id()
+    ));
+    spec.to_string()
+}
+
+fn durable_spec_v2(id: &str) -> arkflow_core::job::JobSpec {
+    serde_json::from_str(&durable_atomic_spec_json(id, 2)).unwrap()
+}
+
+async fn succeed_command(hub: &Hub, auth: &AgentAuth, operation: &str) -> Option<AgentCommand> {
+    let commands = hub.commands(auth.clone()).await.unwrap();
+    let command = commands
+        .into_iter()
+        .find(|command| command.operation == operation)?
+        .clone();
+    hub.command_result(
+        auth.clone(),
+        CommandResult {
+            command_id: command.id.clone(),
+            operation_id: command.operation_id.clone(),
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            error: None,
+            correlation_id: command.correlation_id.clone(),
+            generation: command.generation,
+            observed_generation: Some(command.generation),
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
+        },
+    )
+    .await
+    .unwrap();
+    Some(command)
+}
+
+async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
+    let commands = hub.commands(auth.clone()).await.unwrap();
+    let mut completed = 0;
+    for command in commands
+        .iter()
+        .filter(|command| command.operation == "job_start")
+    {
+        hub.command_result(
+            auth.clone(),
+            CommandResult {
+                command_id: command.id.clone(),
+                operation_id: command.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: command.correlation_id.clone(),
+                generation: command.generation,
+                observed_generation: Some(command.generation),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        completed += 1;
+    }
+    completed
+}
+
+/// Register one node, create a durable running Job at version 1, and drive
+/// its start to a succeeded, observed-running state.
+async fn atomic_upgrade_fixture(job_id: &str) -> (Hub, AgentAuth) {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec![],
+            boot_id: Some("boot-a".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    hub.upsert_job(JobRecord {
+        job_id: job_id.into(),
+        version: 1,
+        spec_json: durable_atomic_spec_json(job_id, 1),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["node-a".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    hub.reconcile_jobs().await.unwrap();
+    succeed_command(&hub, &auth, "job_start").await;
+    (hub, auth)
+}
+
+/// Complete a dispatched savepoint the way the real agent round would:
+/// write a full artifact (per-task snapshots + sealed manifest) into the
+/// Job's object store, then flip the record to completed through the
+/// ordinary checkpoint-recording path (which moves the recovery pointer
+/// while the Job version still matches — the property the commit relies
+/// on).
+async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
+    use arkflow_core::checkpoint::{
+        CheckpointManifest, CheckpointRepository, FileCheckpointStore, RecoveryArtifactKind,
+        TaskAttemptSnapshot,
+    };
+    let job = hub.job(job_id).await.unwrap().unwrap();
+    let spec: arkflow_core::job::JobSpec =
+        serde_json::from_str(&job.spec_json).unwrap();
+    let plan = arkflow_core::job::JobPlan::compile(spec.clone()).unwrap();
+    let root = std::path::PathBuf::from(
+        spec.checkpoint
+            .as_ref()
+            .unwrap()
+            .object_store_uri
+            .trim_start_matches("file://"),
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let repository = CheckpointRepository::new(FileCheckpointStore::new(&root).unwrap());
+    let mut snapshots = Vec::new();
+    let mut attempts = Vec::new();
+    for task in &plan.tasks {
+        let namespace = arkflow_core::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            &task.operator_id,
+            &task.id,
+        );
+        let snapshot = arkflow_core::state::StateSnapshot::new(
+            spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+            vec![arkflow_core::state::StateEntry {
+                namespace,
+                key: b"utf8:seed".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let mut reference = repository
+            .write_state_snapshot(savepoint_id, &snapshot)
+            .unwrap();
+        reference.task_id = task.id.clone();
+        snapshots.push(reference);
+        attempts.push(TaskAttemptSnapshot {
+            task_id: task.id.clone(),
+            attempt_id: format!("{}:node-a:{}", task.id, job.generation),
+            node_id: "node-a".into(),
+        });
+    }
+    let mut manifest = CheckpointManifest {
+        checkpoint_id: savepoint_id.into(),
+        job_id: plan.spec.id.clone(),
+        job_version: spec.version,
+        generation: job.generation,
+        task_attempts: attempts,
+        source_positions: Vec::new(),
+        watermarks_ms: Default::default(),
+        watermark_partitions: Default::default(),
+        in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+            checkpoint_id: savepoint_id.into(),
+            generation: job.generation,
+            trace_context: None,
+        },
+        state_snapshots: snapshots,
+        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        checksum: 0,
+    };
+    manifest.seal();
+    repository
+        .write_manifest(
+            &manifest,
+            RecoveryArtifactKind::Savepoint,
+            arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Savepoint,
+                savepoint_id,
+            ),
+        )
+        .unwrap();
+
+    let mut record = hub
+        .job_checkpoints(job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.checkpoint_id == savepoint_id)
+        .expect("savepoint record exists");
+    record.status = "completed".into();
+    record.updated_at_ms = crate::hub::now_ms_for_metrics();
+    hub.record_job_checkpoint(record).await.unwrap();
+}
+
+async fn expire_phase_deadline(hub: &Hub, upgrade_id: &str) {
+    let storage = hub.storage.as_ref().unwrap();
+    let mut record = storage.get_job_upgrade(upgrade_id.to_owned()).await.unwrap().unwrap();
+    record.phase_deadline_at_ms = 1;
+    storage.upsert_job_upgrade(record).await.unwrap();
+}
+
+#[tokio::test]
+async fn atomic_upgrade_walks_savepoint_commit_and_verification_to_success() {
+    let (hub, auth) = atomic_upgrade_fixture("job-atomic-walk").await;
+    let mut spec = durable_spec_v2("job-atomic-walk");
+    let record = hub
+        .create_job_upgrade("job-atomic-walk", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    assert_eq!(record.phase, "saving_savepoint");
+    // Fence: while the savepoint phase owns the Job, reconcile is a no-op.
+    let job = hub.job("job-atomic-walk").await.unwrap().unwrap();
+    assert_eq!(hub.reconcile_job(&job).await.unwrap(), 0);
+
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    let savepoint_id = record.savepoint_id.expect("savepoint dispatched");
+    let job = hub.job("job-atomic-walk").await.unwrap().unwrap();
+    assert_eq!(job.checkpoint_id.as_deref(), Some(savepoint_id.as_str()));
+
+    complete_savepoint(&hub, "job-atomic-walk", &savepoint_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "verifying");
+    let job = hub.job("job-atomic-walk").await.unwrap().unwrap();
+    assert_eq!(job.version, 2);
+    assert_eq!(job.desired_state, "running");
+    // The pointer survives the commit: the fenced write never copies the
+    // caller's read over the checkpoint path's pointer.
+    assert_eq!(job.checkpoint_id.as_deref(), Some(savepoint_id.as_str()));
+    assert!(hub
+        .job_versions("job-atomic-walk")
+        .await
+        .unwrap()
+        .iter()
+        .any(|version| version.version == 2));
+
+    // Verification falls through the fence: normal reconciliation starts the
+    // new generation; its success observation completes the orchestration.
+    hub.reconcile_jobs().await.unwrap();
+    succeed_command(&hub, &auth, "job_start").await;
+    let job = hub.job("job-atomic-walk").await.unwrap().unwrap();
+    assert_eq!((job.version, job.observed_state.as_str()), (2, "running"));
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "succeeded");
+}
+
+#[tokio::test]
+async fn atomic_upgrade_savepoint_failures_abort_without_touching_the_running_job() {
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-fail").await;
+    let mut spec = durable_spec_v2("job-atomic-fail");
+    let record = hub
+        .create_job_upgrade("job-atomic-fail", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    let before = hub.job("job-atomic-fail").await.unwrap().unwrap();
+    // Each failed round consumes two ticks: one observes the failure and
+    // clears the in-flight reference, the next dispatches a fresh round.
+    let mut failures = 0;
+    for _ in 0..12 {
+        hub.reconcile_job_upgrades().await.unwrap();
+        let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+        if record.phase == "aborted" {
+            break;
+        }
+        if let Some(savepoint_id) = record.savepoint_id.clone() {
+            let mut checkpoint = hub
+                .job_checkpoints("job-atomic-fail")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|checkpoint| checkpoint.checkpoint_id == savepoint_id)
+                .unwrap();
+            checkpoint.status = "failed".into();
+            hub.record_job_checkpoint(checkpoint).await.unwrap();
+            failures += 1;
+        }
+    }
+    assert_eq!(failures, 3, "exactly the retry bound of rounds failed");
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "aborted");
+    let after = hub.job("job-atomic-fail").await.unwrap().unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.desired_state, "running");
+    assert_eq!(after.observed_state, "running");
+}
+
+#[tokio::test]
+async fn commit_conflict_is_interpreted_against_observable_state() {
+    // (a) An already-applied commit (crash between write and phase update)
+    // advances to verification without a second write.
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-cas").await;
+    let mut spec = durable_spec_v2("job-atomic-cas");
+    let record = hub
+        .create_job_upgrade("job-atomic-cas", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    let savepoint_id = record.savepoint_id.unwrap();
+    complete_savepoint(&hub, "job-atomic-cas", &savepoint_id).await;
+    // Pre-apply exactly the write the crashed orchestrator had made.
+    let current = hub.job("job-atomic-cas").await.unwrap().unwrap();
+    hub.update_job_with_expected_generation(
+        JobRecord {
+            version: 2,
+            spec_json: durable_atomic_spec_json("job-atomic-cas", 2),
+            desired_state: "running".into(),
+            observed_state: "stopped".into(),
+            convergence: "pending_recovery".into(),
+            generation: current.generation,
+            ..current.clone()
+        },
+        current.generation,
+    )
+    .await
+    .unwrap();
+    let committed = hub.job("job-atomic-cas").await.unwrap().unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "verifying");
+    let after = hub.job("job-atomic-cas").await.unwrap().unwrap();
+    assert_eq!(after.generation, committed.generation, "no second write");
+
+    // (b) An unrelated concurrent change aborts and preserves the newer Job
+    // state: someone else upgraded the Job to a version outside this
+    // orchestration's range while its savepoint round was completing.
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-cas-b").await;
+    let mut spec = durable_spec_v2("job-atomic-cas-b");
+    let record = hub
+        .create_job_upgrade("job-atomic-cas-b", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    let savepoint_id = record.savepoint_id.unwrap();
+    complete_savepoint(&hub, "job-atomic-cas-b", &savepoint_id).await;
+    let current = hub.job("job-atomic-cas-b").await.unwrap().unwrap();
+    let mut external = durable_spec_v2("job-atomic-cas-b");
+    external.version = arkflow_core::job::JobVersion(3);
+    hub.update_job_with_expected_generation(
+        JobRecord {
+            version: 3,
+            spec_json: serde_json::to_string(&external).unwrap(),
+            ..current.clone()
+        },
+        current.generation,
+    )
+    .await
+    .unwrap();
+    let raced = hub.job("job-atomic-cas-b").await.unwrap().unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "aborted");
+    let after = hub.job("job-atomic-cas-b").await.unwrap().unwrap();
+    assert_eq!(after.generation, raced.generation, "newer state preserved");
+    assert_eq!(after.version, raced.version);
+}
+
+#[tokio::test]
+async fn verification_deadline_rolls_back_and_rollback_failure_is_terminal() {
+    // Success path: deadline in verification triggers a rollback that
+    // restores the previous version from the same savepoint.
+    let (hub, auth) = atomic_upgrade_fixture("job-atomic-rb").await;
+    let mut spec = durable_spec_v2("job-atomic-rb");
+    let record = hub
+        .create_job_upgrade("job-atomic-rb", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    let savepoint_id = record.savepoint_id.unwrap();
+    complete_savepoint(&hub, "job-atomic-rb", &savepoint_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    // Verification never converges (no start is completed): expire it.
+    hub.reconcile_jobs().await.unwrap();
+    expire_phase_deadline(&hub, &record.upgrade_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "rolling_back");
+    // The rollback write applies; the restored generation's start succeeds.
+    // A stale verification-phase start may still be queued: complete every
+    // job_start (stale generations are dropped by the result fence) so the
+    // newest one's observation lands.
+    hub.reconcile_job_upgrades().await.unwrap();
+    hub.reconcile_jobs().await.unwrap();
+    for _ in 0..3 {
+        if succeed_all_starts(&hub, &auth).await == 0 {
+            break;
+        }
+    }
+    let job = hub.job("job-atomic-rb").await.unwrap().unwrap();
+    assert_eq!((job.version, job.observed_state.as_str()), (1, "running"));
+    assert_eq!(job.checkpoint_id.as_deref(), Some(savepoint_id.as_str()));
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "rolled_back");
+
+    // Failure path: the rollback restore applies but never converges.
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-rbf").await;
+    let mut spec = durable_spec_v2("job-atomic-rbf");
+    let record = hub
+        .create_job_upgrade("job-atomic-rbf", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    let savepoint_id = record.savepoint_id.unwrap();
+    complete_savepoint(&hub, "job-atomic-rbf", &savepoint_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    hub.reconcile_jobs().await.unwrap();
+    expire_phase_deadline(&hub, &record.upgrade_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    hub.reconcile_job_upgrades().await.unwrap();
+    // Restore applied; expire the rollback verification.
+    expire_phase_deadline(&hub, &record.upgrade_id).await;
+    hub.reconcile_job_upgrades().await.unwrap();
+    let record = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "failed");
+    let job = hub.job("job-atomic-rbf").await.unwrap().unwrap();
+    assert_eq!(job.version, 1);
+    assert_eq!(job.desired_state, "running");
+    // The savepoint and the pointer stay intact for operator recovery.
+    assert_eq!(job.checkpoint_id.as_deref(), Some(savepoint_id.as_str()));
+    assert!(hub
+        .job_checkpoints("job-atomic-rbf")
+        .await
+        .unwrap()
+        .iter()
+        .any(|checkpoint| checkpoint.checkpoint_id == savepoint_id));
+}
+
+#[tokio::test]
+async fn orchestration_survives_hub_restart_and_keeps_the_fence() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
+    let session = hub1
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec![],
+            boot_id: Some("boot-a".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    hub1.upsert_job(JobRecord {
+        job_id: "job-atomic-restart".into(),
+        version: 1,
+        spec_json: durable_atomic_spec_json("job-atomic-restart", 1),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["node-a".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    hub1.reconcile_jobs().await.unwrap();
+    succeed_command(&hub1, &auth, "job_start").await;
+    let mut spec = durable_spec_v2("job-atomic-restart");
+    let record = hub1
+        .create_job_upgrade("job-atomic-restart", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub1.reconcile_job_upgrades().await.unwrap();
+    let dispatched = hub1
+        .job_upgrade(&record.upgrade_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .savepoint_id
+        .expect("savepoint dispatched before the restart");
+
+    // "Restart": same store, fresh in-memory state.
+    let hub2 = Hub::with_storage(config(), StorageActor::start(store, 8));
+    hub2.recover_persisted_state().await.unwrap();
+    // The fence survives: the reconciler cannot re-place the Job while the
+    // savepoint round it references is still pending.
+    let job = hub2.job("job-atomic-restart").await.unwrap().unwrap();
+    let generation_before = job.generation;
+    assert_eq!(hub2.reconcile_job(&job).await.unwrap(), 0);
+    // The tick keeps waiting on the SAME savepoint round — no fresh dispatch.
+    hub2.reconcile_job_upgrades().await.unwrap();
+    let record = hub2.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.savepoint_id.as_deref(), Some(dispatched.as_str()));
+    let job = hub2.job("job-atomic-restart").await.unwrap().unwrap();
+    assert_eq!(job.generation, generation_before);
+    // Completing the round on the new Hub instance resumes the orchestration.
+    complete_savepoint(&hub2, "job-atomic-restart", &dispatched).await;
+    hub2.reconcile_job_upgrades().await.unwrap();
+    let record = hub2.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(record.phase, "verifying");
+}
+
+#[tokio::test]
+async fn concurrent_orchestration_and_pause_resume_are_guarded() {
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-exclusive").await;
+    let mut spec = durable_spec_v2("job-atomic-exclusive");
+    let record = hub
+        .create_job_upgrade("job-atomic-exclusive", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    let second = hub
+        .create_job_upgrade(
+            "job-atomic-exclusive",
+            &mut durable_spec_v2("job-atomic-exclusive"),
+            1,
+            0,
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(second, Err(crate::hub::HubError::OrchestrationInProgress)));
+
+    // Pause holds the fence; resume re-enters the phase.
+    let paused = hub
+        .act_job_upgrade(&record.upgrade_id, "pause", None, None)
+        .await
+        .unwrap();
+    assert_eq!(paused.phase, "paused");
+    let job = hub.job("job-atomic-exclusive").await.unwrap().unwrap();
+    assert_eq!(hub.reconcile_job(&job).await.unwrap(), 0, "pause still fences");
+    hub.reconcile_job_upgrades().await.unwrap();
+    let still = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
+    assert_eq!(still.phase, "paused", "a paused orchestration does not tick");
+    let resumed = hub
+        .act_job_upgrade(&record.upgrade_id, "resume", None, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.phase, "saving_savepoint");
+    assert!(hub
+        .act_job_upgrade(&record.upgrade_id, "resume", None, None)
+        .await
+        .is_err(), "only a paused orchestration can resume");
+
+    // Cancel releases the Job and clears the exclusivity.
+    let cancelled = hub
+        .act_job_upgrade(&record.upgrade_id, "cancel", None, None)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.phase, "cancelled");
+    assert!(hub.active_job_upgrade_for("job-atomic-exclusive").await.is_none());
+    let job = hub.job("job-atomic-exclusive").await.unwrap().unwrap();
+    // Unfenced again: reconcile proceeds (dispatch is a no-op here because
+    // the succeeded start still satisfies the desired state).
+    hub.reconcile_job(&job).await.unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Orchestration verification: retention pin, events/audit, guards, HTTP
+// ---------------------------------------------------------------------
+
+/// Write a real completed artifact of either kind, exactly like a finished
+/// agent round would leave it in the Job's object store.
+async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &str) {
+    use arkflow_core::checkpoint::{
+        CheckpointManifest, CheckpointRepository, FileCheckpointStore, RecoveryArtifactKind,
+        TaskAttemptSnapshot,
+    };
+    let artifact_kind = if kind == "savepoint" {
+        RecoveryArtifactKind::Savepoint
+    } else {
+        RecoveryArtifactKind::Checkpoint
+    };
+    let job = hub.job(job_id).await.unwrap().unwrap();
+    let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json).unwrap();
+    let plan = arkflow_core::job::JobPlan::compile(spec.clone()).unwrap();
+    let root = std::path::PathBuf::from(
+        spec.checkpoint
+            .as_ref()
+            .unwrap()
+            .object_store_uri
+            .trim_start_matches("file://"),
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let repository = CheckpointRepository::new(FileCheckpointStore::new(&root).unwrap());
+    let mut snapshots = Vec::new();
+    let mut attempts = Vec::new();
+    for task in &plan.tasks {
+        let namespace = arkflow_core::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            &task.operator_id,
+            &task.id,
+        );
+        let snapshot = arkflow_core::state::StateSnapshot::new(
+            spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+            vec![arkflow_core::state::StateEntry {
+                namespace,
+                key: b"utf8:seed".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let mut reference = repository
+            .write_state_snapshot(artifact_id, &snapshot)
+            .unwrap();
+        reference.task_id = task.id.clone();
+        snapshots.push(reference);
+        attempts.push(TaskAttemptSnapshot {
+            task_id: task.id.clone(),
+            attempt_id: format!("{}:node-a:{}", task.id, job.generation),
+            node_id: "node-a".into(),
+        });
+    }
+    let mut manifest = CheckpointManifest {
+        checkpoint_id: artifact_id.into(),
+        job_id: plan.spec.id.clone(),
+        job_version: spec.version,
+        generation: job.generation,
+        task_attempts: attempts,
+        source_positions: Vec::new(),
+        watermarks_ms: Default::default(),
+        watermark_partitions: Default::default(),
+        in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+            checkpoint_id: artifact_id.into(),
+            generation: job.generation,
+            trace_context: None,
+        },
+        state_snapshots: snapshots,
+        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        checksum: 0,
+    };
+    manifest.seal();
+    repository
+        .write_manifest(
+            &manifest,
+            artifact_kind,
+            arkflow_core::checkpoint::recovery_manifest_key(artifact_kind, artifact_id),
+        )
+        .unwrap();
+    // The deletion path removes the per-node intermediate manifests the real
+    // agent round writes before aggregation; leave the same layout behind.
+    use arkflow_core::checkpoint::CheckpointStore as _;
+    FileCheckpointStore::new(&root)
+        .unwrap()
+        .put(
+            &format!("{kind}s/{artifact_id}/manifests/node-a.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+    let now = crate::hub::now_ms_for_metrics();
+    hub.record_job_checkpoint(crate::storage::JobCheckpointRecord {
+        job_id: job_id.into(),
+        job_version: job.version,
+        checkpoint_id: artifact_id.into(),
+        kind: kind.into(),
+        status: "completed".into(),
+        manifest_uri: None,
+        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        created_at_ms: now,
+        updated_at_ms: now,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retention_pin_shields_orchestration_referenced_artifacts() {
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-pin").await;
+    // Retention 1: without a pin, completing a newer checkpoint deletes the
+    // older one. The orchestration references the older artifact.
+    let mut spec_value =
+        serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json("job-atomic-pin", 1))
+            .unwrap();
+    spec_value["checkpoint"]["retention"] = serde_json::json!(1);
+    let job = hub.job("job-atomic-pin").await.unwrap().unwrap();
+    hub.update_job_with_expected_generation(
+        JobRecord {
+            spec_json: spec_value.to_string(),
+            ..job.clone()
+        },
+        job.generation,
+    )
+    .await
+    .unwrap();
+
+    complete_artifact(&hub, "job-atomic-pin", "checkpoint-old", "checkpoint").await;
+    // Register a non-terminal orchestration referencing the old artifact.
+    let now = crate::hub::now_ms_for_metrics();
+    let upgrade = crate::storage::JobUpgradeRecord {
+        upgrade_id: "job-upgrade-pin".into(),
+        job_id: "job-atomic-pin".into(),
+        from_version: 1,
+        to_version: 2,
+        phase: "verifying".into(),
+        savepoint_id: Some("checkpoint-old".into()),
+        target_spec_json: durable_atomic_spec_json("job-atomic-pin", 2),
+        phase_deadline_at_ms: now + 600_000,
+        savepoint_retries: 0,
+        verify_timeout_ms: 0,
+        actor: None,
+        correlation_id: None,
+        last_error: None,
+        paused_from: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    hub.storage
+        .as_ref()
+        .unwrap()
+        .upsert_job_upgrade(upgrade.clone())
+        .await
+        .unwrap();
+    hub.job_upgrades
+        .write()
+        .await
+        .insert(upgrade.upgrade_id.clone(), upgrade.clone());
+    assert_eq!(
+        hub.pinned_job_upgrade_savepoints("job-atomic-pin").await,
+        vec!["checkpoint-old".to_owned()]
+    );
+
+    // A newer completed checkpoint triggers the retention sweep: the pinned
+    // artifact survives it.
+    complete_artifact(&hub, "job-atomic-pin", "checkpoint-new", "checkpoint").await;
+    let ids = hub
+        .job_checkpoints("job-atomic-pin")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.checkpoint_id)
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"checkpoint-old".to_owned()), "pin held: {ids:?}");
+
+    // Terminal orchestration releases the pin; the next sweep reclaims it.
+    let mut finished = upgrade.clone();
+    finished.phase = "cancelled".into();
+    hub.storage
+        .as_ref()
+        .unwrap()
+        .upsert_job_upgrade(finished)
+        .await
+        .unwrap();
+    hub.job_upgrades
+        .write()
+        .await
+        .insert("job-upgrade-pin".to_owned(), upgrade_phase_cancelled());
+    complete_artifact(&hub, "job-atomic-pin", "checkpoint-newest", "checkpoint").await;
+    let ids = hub
+        .job_checkpoints("job-atomic-pin")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.checkpoint_id)
+        .collect::<Vec<_>>();
+    assert!(
+        !ids.contains(&"checkpoint-old".to_owned()),
+        "pin released: {ids:?}"
+    );
+}
+
+fn upgrade_phase_cancelled() -> crate::storage::JobUpgradeRecord {
+    let now = crate::hub::now_ms_for_metrics();
+    crate::storage::JobUpgradeRecord {
+        upgrade_id: "job-upgrade-pin".into(),
+        job_id: "job-atomic-pin".into(),
+        from_version: 1,
+        to_version: 2,
+        phase: "cancelled".into(),
+        savepoint_id: None,
+        target_spec_json: String::new(),
+        phase_deadline_at_ms: now,
+        savepoint_retries: 0,
+        verify_timeout_ms: 0,
+        actor: None,
+        correlation_id: None,
+        last_error: None,
+        paused_from: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+#[tokio::test]
+async fn upgrade_lifecycle_broadcasts_events_and_audits_actions() {
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-events").await;
+    let mut receiver = hub.subscribe();
+    let mut spec = durable_spec_v2("job-atomic-events");
+    let record = hub
+        .create_job_upgrade("job-atomic-events", &mut spec, 1, 0, None, None)
+        .await
+        .unwrap();
+    hub.act_job_upgrade(&record.upgrade_id, "cancel", None, None)
+        .await
+        .unwrap();
+
+    let mut outcomes = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if event.event.event_type == "job.upgrade" {
+            outcomes.push(event.event.outcome.clone());
+        }
+    }
+    assert!(outcomes.contains(&"initiated".to_owned()), "{outcomes:?}");
+    assert!(outcomes.contains(&"cancelled".to_owned()), "{outcomes:?}");
+
+    let actions = hub
+        .storage
+        .as_ref()
+        .unwrap()
+        .list_audit(Some("job-atomic-events".to_owned()))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.action.starts_with("job.upgrade.atomic."))
+        .map(|record| record.action)
+        .collect::<Vec<_>>();
+    assert!(actions.contains(&"job.upgrade.atomic.initiate".to_owned()), "{actions:?}");
+    assert!(actions.contains(&"job.upgrade.atomic.cancel".to_owned()), "{actions:?}");
+}
+
+#[tokio::test]
+async fn create_job_upgrade_rejects_stale_versions_and_format_changes() {
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-guards").await;
+    // Same version: rejected.
+    let same = serde_json::from_str::<arkflow_core::job::JobSpec>(&durable_atomic_spec_json(
+        "job-atomic-guards", 1,
+    ))
+    .unwrap();
+    assert!(hub
+        .create_job_upgrade("job-atomic-guards", &mut same.clone(), 1, 0, None, None)
+        .await
+        .is_err());
+    // State-format change: the savepoint this orchestration would take could
+    // never restore into the target version.
+    let mut incompatible = serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json(
+        "job-atomic-guards", 2,
+    ))
+    .unwrap();
+    incompatible["state"]["format_version"] = serde_json::json!(2);
+    let mut incompatible: arkflow_core::job::JobSpec =
+        serde_json::from_value(incompatible).unwrap();
+    let error = hub
+        .create_job_upgrade("job-atomic-guards", &mut incompatible, 1, 0, None, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("incompatible"), "{error:?}");
+}
+
+#[tokio::test]
+async fn atomic_upgrade_http_contract_202_and_conflicts() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (hub, _auth) = atomic_upgrade_fixture("job-atomic-http").await;
+    let job = hub.job("job-atomic-http").await.unwrap().unwrap();
+    let router = crate::hub_router(hub, &crate::ServerConfig::default());
+    let authorization = "Bearer operator".to_owned();
+
+    let spec = serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json(
+        "job-atomic-http", 2,
+    ))
+    .unwrap();
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/jobs/job-atomic-http/upgrades")
+        .header("authorization", authorization.clone())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "mode": "atomic",
+                "spec": spec,
+                "expected_generation": job.generation,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+
+    // A second upgrade and a desired-state change are both fenced.
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/jobs/job-atomic-http/upgrades")
+        .header("authorization", authorization.clone())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "mode": "atomic",
+                "spec": spec,
+                "expected_generation": job.generation,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/api/v1/jobs/job-atomic-http/desired-state")
+        .header("authorization", authorization.clone())
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"state": "stopped"}).to_string()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["code"], "orchestration_in_progress");
+
+    // Unknown orchestration ids are 404s, not action-rejected conflicts.
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/jobs/job-atomic-http/upgrades/no-such-upgrade/actions")
+        .header("authorization", &authorization)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"action": "pause"}).to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}

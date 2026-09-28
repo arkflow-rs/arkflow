@@ -24,7 +24,11 @@ routes are served.
 
 Resource endpoints include `/api/v1/system`, `/nodes`, paginated `/streams`,
 `/operations`, `/events`, `/configuration`, `/components`, and `/schema`.
-`/metrics` exposes Prometheus text exposition.
+`/metrics` exposes Prometheus text exposition. Job endpoints include job
+CRUD, check­points and savepoints, version history, and upgrades — the
+upgrade endpoint's atomic mode orchestrates savepoint → version commit →
+recovery start behind one call (see
+[Atomic job upgrades](./job-upgrades.md)).
 
 Lifecycle commands return `202 Accepted` with an operation ID; poll
 `/api/v1/operations/{id}` until it reaches a terminal state. Each command is

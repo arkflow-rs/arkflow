@@ -410,7 +410,13 @@ impl Hub {
                 .cmp(&left.created_at_ms)
                 .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
         });
-        for record in completed.into_iter().skip(retention) {
+        // An active upgrade orchestration restores from its own savepoint on
+        // rollback; retention must never delete an artifact it references.
+        let pinned = self.pinned_job_upgrade_savepoints(&job.job_id).await;
+        for record in completed
+            .into_iter()
+            .skip(retention)
+            .filter(|record| !pinned.contains(&record.checkpoint_id)) {
             let artifact = arkflow_core::checkpoint::RecoveryArtifact {
                 id: record.checkpoint_id.clone(),
                 kind: arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
