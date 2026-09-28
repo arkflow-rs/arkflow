@@ -201,7 +201,7 @@ impl Processor for FailingProcessor {
 
 struct Adapter {
     input: Arc<dyn Input>,
-    output: Arc<CollectOutput>,
+    output: Arc<dyn Output>,
     processor: Arc<dyn Processor>,
 }
 
@@ -416,9 +416,10 @@ fn fuses_linear_processor_chain_into_one_chain() {
         1,
     );
     let plan = JobPlan::compile(spec).unwrap();
+    let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
-        output: Arc::new(CollectOutput::default()),
+        output: collect.clone(),
         processor: Arc::new(PassThroughProcessor),
     };
     let graph = ExecutionGraphBuilder::default()
@@ -495,12 +496,13 @@ fn stateful_operator(id: &str) -> OperatorSpec {
 
 #[tokio::test]
 async fn pipelines_batches_to_sink_in_order() {
+    let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: Arc::new(VecInput::new(vec![
             vec![(1, "a".into()), (2, "b".into())],
             vec![(3, "c".into())],
         ])),
-        output: Arc::new(CollectOutput::default()),
+        output: collect.clone(),
         processor: Arc::new(PassThroughProcessor),
     };
     let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
@@ -515,7 +517,7 @@ async fn pipelines_batches_to_sink_in_order() {
         .expect("graph run timed out")
         .unwrap()
         .unwrap();
-    let written = adapter.output.written.lock().unwrap();
+    let written = collect.written.lock().unwrap();
     let rows: Vec<i64> = written
         .iter()
         .flat_map(|batch| {
@@ -1695,9 +1697,10 @@ async fn barrier_flows_to_sink_without_stalling_data() {
         acks_needed: 0,
     });
     let _ = input.acks_needed;
+    let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
-        output: Arc::new(CollectOutput::default()),
+        output: collect.clone(),
         processor: Arc::new(PassThroughProcessor),
     };
     let plan = JobPlan::compile(spec(
@@ -1759,7 +1762,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
         .unwrap()
         .unwrap();
     coordinator_cancellation.cancel();
-    let written = adapter.output.written.lock().unwrap().len();
+    let written = collect.written.lock().unwrap().len();
     assert_eq!(
         written, 50,
         "all batches must reach the sink alongside barriers"
@@ -4016,16 +4019,7 @@ impl Processor for TickMarkerProcessor {
             // them so the leading-tick assertion stays load independent.
             return Ok(ProcessResult::None);
         }
-        let release = !self.tick_seen.swap(true, Ordering::SeqCst);
-        let output = self.tick_batch();
-        // Release the second batch only after this tick's output has been
-        // handed to the downstream publisher: on_tick and the data path share
-        // the chain task, so "b" cannot be received until a later select
-        // iteration and every tick published so far precedes it downstream.
-        if release {
-            self.gate.release().await;
-        }
-        Ok(output)
+        Ok(self.tick_batch())
     }
     async fn close(&self) -> Result<(), Error> {
         Ok(())
@@ -4105,6 +4099,37 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
             Ok(())
         }
     }
+    struct TickGateOutput {
+        written: Mutex<Vec<RecordBatch>>,
+        gate: Arc<PublishGate>,
+    }
+    #[async_trait]
+    impl Output for TickGateOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+            let batch = msg.record_batch().clone();
+            let key = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_owned();
+            self.written.lock().unwrap().push(batch);
+            if key == "tick" {
+                // Release the second batch only once this tick batch has
+                // physically reached the sink: EOF-driven shutdown can then
+                // never race the tick's downstream publish away.
+                self.gate.release().await;
+            }
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
     let second_batch_gate = Arc::new(PublishGate::default());
     let processor = Arc::new(TickMarkerProcessor {
         first_process_delay: Duration::from_millis(800),
@@ -4113,7 +4138,10 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         tick_seen: std::sync::atomic::AtomicBool::new(false),
         gate: second_batch_gate.clone(),
     });
-    let output = Arc::new(CollectOutput::default());
+    let output = Arc::new(TickGateOutput {
+        written: Mutex::new(Vec::new()),
+        gate: second_batch_gate.clone(),
+    });
     let adapter = Adapter {
         input: Arc::new(GatedInput {
             reads: AtomicUsize::new(0),
@@ -5483,6 +5511,7 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     let total: usize = joined.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(total, 1, "expected exactly one matched pair");
     let batch = &joined[0];
+    let collect = Arc::new(CollectOutput::default());
     let names: Vec<String> = batch
         .schema()
         .fields()
