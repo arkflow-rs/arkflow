@@ -252,8 +252,10 @@ async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
 }
 
 /// Restart recovery: persisted operations come back into the in-memory
-/// map, and a succeeded lifecycle start at the current generation is
-/// never re-dispatched — the dispatch-skip memory survives the restart.
+/// map. The restart wiped the assignment-fingerprint memory, so the first
+/// reconcile re-dispatches the succeeded start ONCE as an assignment
+/// confirmation (the Agent no-ops a matching assignment); once that
+/// confirmation succeeds, later ticks skip again.
 #[tokio::test]
 async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
@@ -340,18 +342,44 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
         .await
         .unwrap();
     hub2.reconcile_jobs().await.unwrap();
-    let commands2 = hub2
-        .commands(AgentAuth {
-            node_id: "node-a".into(),
-            session_token: session2.session_token.clone(),
-        })
-        .await
-        .unwrap();
+    let auth2 = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session2.session_token.clone(),
+    };
+    let commands2 = hub2.commands(auth2.clone()).await.unwrap();
+    let confirmation = commands2
+        .iter()
+        .find(|command| command.operation == "job_start")
+        .expect("one assignment-confirmation start is re-dispatched after the restart");
+    // The confirmation completes (a real Agent no-ops a matching assignment).
+    hub2.command_result(
+        auth2.clone(),
+        CommandResult {
+            command_id: confirmation.id.clone(),
+            operation_id: confirmation.operation_id.clone(),
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            error: None,
+            correlation_id: confirmation.correlation_id.clone(),
+            generation: confirmation.generation,
+            observed_generation: Some(confirmation.generation),
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
+        },
+    )
+    .await
+    .unwrap();
+    hub2.reconcile_jobs().await.unwrap();
+    let commands3 = hub2.commands(auth2).await.unwrap();
     assert!(
-        !commands2
+        !commands3
             .iter()
             .any(|command| command.operation == "job_start"),
-        "a succeeded start at the current generation must not be re-dispatched after a restart"
+        "after the one-shot confirmation the dispatch skip holds again"
     );
 }
 

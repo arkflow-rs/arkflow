@@ -71,6 +71,9 @@ const MAX_OPERATIONS: usize = 1024;
 const MAX_EVENTS: usize = 2048;
 const SUPPORTED_PROTOCOL_VERSION: &str = "v1";
 
+/// Dispatched-assignment fingerprints by (job id, node id, generation).
+type StartDispatchFingerprints = BTreeMap<(String, String, u64), u64>;
+
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub operator_token: Option<String>,
@@ -142,6 +145,13 @@ pub struct Hub {
     /// back to node-id order until the next ranked placement, which is a
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
+    /// Per-node assignment fingerprint (sorted task-id set hash) of every
+    /// dispatched job_start, keyed (job, node, generation). The dispatch-skip
+    /// requires a matching fingerprint so a Succeeded start can never keep
+    /// suppressing starts for a drifted mapping (e.g. after a Hub restart
+    /// lost the placement order). In-memory: a restart re-dispatches once
+    /// and Agents no-op matching assignments.
+    start_dispatch_fingerprints: Arc<RwLock<StartDispatchFingerprints>>,
     command_metrics: Arc<CommandMetrics>,
     /// Lease-election configuration (hub-ha stage 2). Default is disabled,
     /// which keeps single-instance behavior byte-identical.
@@ -217,6 +227,7 @@ impl Hub {
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
+            start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
             ha: HubHaConfig::default(),
             leadership: Arc::new(RwLock::new(Leadership::Disabled)),

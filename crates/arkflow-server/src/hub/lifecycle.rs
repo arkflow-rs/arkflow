@@ -95,14 +95,75 @@ impl Hub {
             return Err(HubError::Unauthorized);
         }
         drop(nodes);
-        self.observe_job(
-            &request.job_id,
-            request.generation,
-            &request.state,
-            None,
-            request.error.as_deref(),
-        )
-        .await
+        let observed = self
+            .observe_job(
+                &request.job_id,
+                request.generation,
+                &request.state,
+                None,
+                request.error.as_deref(),
+            )
+            .await;
+        // A failed observation means this node's kernel for the Job ended
+        // (for example after a remote edge exhausted its reconnect budget).
+        // Its Succeeded start would otherwise keep satisfying the
+        // dispatch-skip forever and the dead tasks never restart at this
+        // generation. Mirror the boot-change invalidation: settle the start
+        // as retriable so the next reconcile re-dispatches with recovery.
+        if request.state == "failed" {
+            self.invalidate_succeeded_start_on_runtime_failure(
+                &request.auth.node_id,
+                &request.job_id,
+                request.generation,
+            )
+            .await;
+        }
+        observed
+    }
+
+    /// Settle this node's Succeeded job_start at `generation` as TimedOut
+    /// with the `runtime_failed` class so reconciliation re-dispatches it.
+    async fn invalidate_succeeded_start_on_runtime_failure(
+        &self,
+        node_id: &str,
+        job_id: &str,
+        generation: u64,
+    ) {
+        let now = now_ms();
+        let mutated: Vec<HubOperation> = {
+            let mut operations = self.operations.write().await;
+            operations
+                .values_mut()
+                .filter(|operation| {
+                    operation.node_id == node_id
+                        && operation.resource_id == job_id
+                        && operation.operation == "job_start"
+                        && operation.generation == generation
+                        && operation.state == HubOperationState::Succeeded
+                })
+                .map(|operation| {
+                    operation.state = HubOperationState::TimedOut;
+                    operation.failure_class = Some("runtime_failed".into());
+                    operation.finished_at_ms = Some(now);
+                    operation.error = Some(
+                        "successful Job start invalidated by a failed runtime observation"
+                            .into(),
+                    );
+                    operation.clone()
+                })
+                .collect()
+        };
+        if let Some(storage) = self.storage.as_ref() {
+            for operation in &mutated {
+                if let Err(error) = persist_operation(storage, operation).await {
+                    tracing::warn!(
+                        operation_id = %operation.id,
+                        %error,
+                        "failed to persist runtime-failure start invalidation"
+                    );
+                }
+            }
+        }
     }
 
     /// Restore recently persisted operations into the in-memory map so the

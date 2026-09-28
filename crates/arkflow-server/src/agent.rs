@@ -625,18 +625,32 @@ impl JobRuntime {
                 return Err("job generation is stale".into());
             }
             // A re-delivered start at the generation already running is a
-            // no-op success — but only while that kernel is actually alive:
-            // cancelling and restarting a healthy kernel for a command the
-            // Hub re-sent after a restart would churn the data plane and
-            // (under load) wedge the start path behind a teardown that never
-            // finishes. An exited kernel at the same generation (a crash
-            // between the poll drain and this reader) must fall through to
-            // the restart path instead of being reported as a healthy no-op.
-            if tasks
-                .get(&job_id)
-                .is_some_and(|task| task.generation == generation && !task.handle.is_finished())
-            {
-                return Ok(());
+            // no-op success — but only while that kernel is actually alive
+            // AND its assignment matches the command: cancelling and
+            // restarting a healthy kernel for a command the Hub re-sent
+            // after a restart would churn the data plane and (under load)
+            // wedge the start path behind a teardown that never finishes. A
+            // start whose per-node task set differs from the running
+            // kernel's assignment (a drifted mapping) must REPLACE the
+            // kernel instead of being swallowed as a healthy no-op. An
+            // exited kernel at the same generation (a crash between the
+            // poll drain and this reader) must also fall through to the
+            // restart path instead of being reported as a healthy no-op.
+            let incoming_task_ids = assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect::<BTreeSet<_>>();
+            if let Some(task) = tasks.get(&job_id) {
+                let alive = task.generation == generation && !task.handle.is_finished();
+                let same_assignment = task
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.task_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    == incoming_task_ids;
+                if alive && same_assignment {
+                    return Ok(());
+                }
             }
             if local_recovery_marker
                 .as_ref()
@@ -3939,6 +3953,102 @@ mod tests {
         );
         // The rescale flag waives exactly that check for the same artifact.
         assert!(validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, true).is_ok());
+    }
+
+    /// A same-generation start whose per-node task set DIFFERS from the live
+    /// kernel's assignment must replace the kernel (the drifted mapping has
+    /// to take effect), not report a healthy no-op.
+    #[tokio::test]
+    async fn drifting_same_generation_start_replaces_the_kernel() {
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-drift").await;
+        let initial_task_count = assignments.len();
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the initial start succeeds");
+
+        // Same generation, a different (still complete and valid) task set:
+        // a two-source plan replaces the one-source plan. The kernel must be
+        // replaced with the new assignment instead of no-opping.
+        let drift_spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-drift",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "extra", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "sink"},
+                {"id": "e2", "from": "extra", "to": "sink"}
+            ],
+            "sources": [
+                {
+                    "operator_id": "source",
+                    "input_type": "generate",
+                    "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                    "time": {"mode": "processing_time"}
+                },
+                {
+                    "operator_id": "extra",
+                    "input_type": "generate",
+                    "config": {"context": "node-b", "interval": "10ms", "batch_size": 1},
+                    "time": {"mode": "processing_time"}
+                }
+            ],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        let drift_plan = JobPlan::compile(drift_spec).unwrap();
+        let drift_assignments = drift_plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .expect("colocated placement succeeds");
+        assert!(
+            drift_assignments.len() > initial_task_count,
+            "the two-source plan must assign more tasks"
+        );
+        runtime
+            .start(
+                drift_plan,
+                drift_assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the drifted start replaces the kernel");
+
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-drift").expect("the kernel stays registered");
+            assert_eq!(task.generation, 1, "the generation is unchanged");
+            let live: std::collections::BTreeSet<String> = task
+                .assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect();
+            let expected: std::collections::BTreeSet<String> = drift_assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect();
+            assert_eq!(live, expected, "the kernel now runs the drifted assignment");
+            assert!(live.contains("extra-0"));
+            assert!(!task.handle.is_finished());
+        }
+
+        runtime.stop("orders-drift", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
     }
 
 }

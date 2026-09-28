@@ -90,6 +90,26 @@ pub(crate) fn rank_candidates(
 }
 
 impl Hub {
+    /// Deterministic fingerprint of one node's dispatched assignment (the
+    /// sorted task-id set hashed with a fixed-key hasher). Both the
+    /// dispatch-skip gate and the drift fencing compare these; the value is
+    /// process-local and never persisted.
+    fn assignment_fingerprint(
+        assignments: &[arkflow_core::job::TaskAttempt],
+        node_id: &str,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut ids: Vec<&str> = assignments
+            .iter()
+            .filter(|assignment| assignment.node_id == node_id)
+            .map(|assignment| assignment.task_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ids.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
     /// The retained placement set, in the order its placement was actually
@@ -119,6 +139,95 @@ impl Hub {
             }
         }
         ordered
+    }
+
+    /// Incremental re-placement for partial node failures: keep the
+    /// remembered dispatch order and replace only the failed slots in place,
+    /// so every surviving node's task set stays byte-identical (the
+    /// round-robin assignment `index % len` maps each slot position to one
+    /// node; an in-place replacement moves only that slot's tasks). Failed
+    /// slots are filled from the ranked candidates not already in the order
+    /// (shuffle-capable when the Job needs the data plane); with no new
+    /// candidate a surviving node duplicates into the slot, which keeps the
+    /// list length — and therefore every survivor's mapping — stable.
+    /// Returns an empty vector when nothing of the previous placement can
+    /// host the Job, in which case the caller falls back to a full ranked
+    /// placement.
+    async fn incremental_targets(
+        &self,
+        job_id: &str,
+        previous_nodes: &BTreeSet<String>,
+        ranked: &[String],
+        evictions: &BTreeSet<String>,
+        requires_shuffle: bool,
+    ) -> Vec<String> {
+        let now = now_ms();
+        // One guard for the whole merge: slot usability is evaluated against
+        // the same registry snapshot.
+        let nodes = self.nodes.read().await;
+        let usable = |node_id: &str| -> bool {
+            if evictions.contains(node_id) {
+                return false;
+            }
+            nodes.get(node_id).is_some_and(|node| {
+                node.resource.state == NodeConnectionState::Online
+                    && node.resource.lease_expires_at_ms > now
+                    && node.resource.maintenance_state == NodeMaintenanceState::Active
+                    && (!requires_shuffle
+                        || node
+                            .resource
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "network_shuffle"))
+            })
+        };
+        // Order source: the dispatch-order memory when present, else the
+        // sorted previous-node set (deterministic across ticks after a Hub
+        // restart rebuilt nothing yet).
+        let order = {
+            let remembered = self
+                .placement_order
+                .read()
+                .await
+                .get(job_id)
+                .cloned()
+                .unwrap_or_default();
+            if remembered.is_empty() {
+                previous_nodes.iter().cloned().collect::<Vec<_>>()
+            } else {
+                remembered
+            }
+        };
+        let in_order: BTreeSet<&String> = order.iter().collect();
+        let mut replacements: VecDeque<String> = ranked
+            .iter()
+            .filter(|node_id| !in_order.contains(*node_id) && usable(node_id))
+            .cloned()
+            .collect();
+        let survivors: Vec<String> = order.iter().filter(|node| usable(node)).cloned().collect();
+        let mut out = Vec::with_capacity(order.len());
+        for slot in &order {
+            if usable(slot) {
+                out.push(slot.clone());
+            } else if let Some(replacement) = replacements.pop_front() {
+                out.push(replacement);
+            } else {
+                // No new candidate: concentrate the slot on the best-ranked
+                // surviving node (the ranked list is headroom-ordered).
+                let fallback = survivors
+                    .iter()
+                    .find(|survivor| ranked.contains(survivor))
+                    .or_else(|| survivors.first())
+                    .cloned();
+                if let Some(fallback) = fallback {
+                    out.push(fallback);
+                }
+            }
+        }
+        if survivors.is_empty() {
+            return Vec::new();
+        }
+        out
     }
 
     /// Nodes in `targets` whose sustained-pressure streak trips the Job's
@@ -416,6 +525,29 @@ impl Hub {
             // drift between dispatches.
             self.retained_targets_in_dispatch_order(&job.job_id, &previous_nodes)
                 .await
+        } else if operation == "job_start" && job.node_ids.is_empty() && !previous_nodes.is_empty()
+        {
+            // Incremental re-placement (partial node failure): replace only
+            // the failed slots of the remembered dispatch order so every
+            // surviving node keeps its exact task set and its successful
+            // start stays truthful. Falls back to the full ranked placement
+            // when nothing of the previous placement survives.
+            let requires_shuffle =
+                spec.placement == arkflow_core::job::PlacementStrategy::Split;
+            let merged = self
+                .incremental_targets(
+                    &job.job_id,
+                    &previous_nodes,
+                    &targets,
+                    &evictions,
+                    requires_shuffle,
+                )
+                .await;
+            if merged.is_empty() {
+                targets
+            } else {
+                merged
+            }
         } else if operation == "job_stop" {
             // A stopped Job must reach every node that may still host an
             // older generation. Such a node is not necessarily part of
@@ -517,20 +649,48 @@ impl Hub {
             // nodes run the same Job forever. Mark those starts Superseded so
             // the placement history stops claiming them and the nodes receive
             // a stop command when they reappear.
+            //
+            // The same fencing applies to a Succeeded start still inside the
+            // target set whose recorded assignment fingerprint no longer
+            // matches the computed assignment (a drifted mapping — e.g. after
+            // a Hub restart lost the order memory, or any placement-source
+            // change): the stale claim is superseded so the node receives a
+            // fresh start with the current assignment.
+            let recorded_fingerprints = self.start_dispatch_fingerprints.read().await;
             let abandoned: Vec<HubOperation> = {
                 let operations = self.operations.read().await;
                 operations
                     .values()
                     .filter(|operation_record| {
-                        operation_record.resource_id == job.job_id
-                            && operation_record.operation == "job_start"
-                            && operation_record.generation == job.generation
-                            && operation_record.state == HubOperationState::Succeeded
-                            && !target_ids.contains(&operation_record.node_id)
+                        if operation_record.resource_id != job.job_id
+                            || operation_record.operation != "job_start"
+                            || operation_record.generation != job.generation
+                            || operation_record.state != HubOperationState::Succeeded
+                        {
+                            return false;
+                        }
+                        if !target_ids.contains(&operation_record.node_id) {
+                            return true;
+                        }
+                        let recorded = recorded_fingerprints
+                            .get(&(
+                                job.job_id.clone(),
+                                operation_record.node_id.clone(),
+                                job.generation,
+                            ))
+                            .copied();
+                        // No recorded fingerprint means the Hub cannot prove
+                        // assignment continuity (restart wiped the memory):
+                        // re-dispatch rather than trust a stale claim.
+                        recorded.is_none_or(|recorded| {
+                            recorded
+                                != Self::assignment_fingerprint(&assignments, &operation_record.node_id)
+                        })
                     })
                     .cloned()
                     .collect()
             };
+            drop(recorded_fingerprints);
             if !abandoned.is_empty() {
                 // Apply the in-memory transition under the write lock, then
                 // persist OUTSIDE it: the storage round-trips are async and
@@ -651,19 +811,33 @@ impl Hub {
             // and a fresh persistent operation row — an unbounded churn loop
             // for stopped Jobs (and for fenced placements) with no retention
             // able to keep up. A generation bump or desired-state change
-            // re-dispatches naturally.
-            let already_terminal = self
-                .operations
-                .read()
-                .await
-                .values()
-                .any(|operation_record| {
-                    operation_record.node_id == node_id
-                        && operation_record.resource_id == job.job_id
-                        && operation_record.operation == operation
-                        && operation_record.generation == job.generation
-                        && operation_record.state == HubOperationState::Succeeded
-                });
+            // re-dispatches naturally. The skip additionally requires the
+            // recorded assignment fingerprint to match the computed
+            // assignment: a Succeeded start must not suppress a start for a
+            // mapping it was never dispatched with.
+            let fingerprint_matches = operation != "job_start"
+                || self
+                    .start_dispatch_fingerprints
+                    .read()
+                    .await
+                    .get(&(job.job_id.clone(), node_id.clone(), job.generation))
+                    .is_some_and(|recorded| {
+                        *recorded
+                            == Self::assignment_fingerprint(&assignments, node_id.as_str())
+                    });
+            let already_terminal = fingerprint_matches
+                && self
+                    .operations
+                    .read()
+                    .await
+                    .values()
+                    .any(|operation_record| {
+                        operation_record.node_id == node_id
+                            && operation_record.resource_id == job.job_id
+                            && operation_record.operation == operation
+                            && operation_record.generation == job.generation
+                            && operation_record.state == HubOperationState::Succeeded
+                    });
             if already_terminal {
                 continue;
             }
@@ -693,6 +867,14 @@ impl Hub {
                 }
             }
             let payload = Some(payload_value);
+            let fingerprint = if operation == "job_start" {
+                Some((
+                    node_id.clone(),
+                    Self::assignment_fingerprint(&assignments, node_id.as_str()),
+                ))
+            } else {
+                None
+            };
             self.enqueue_with_metadata(
                 node_id,
                 operation.into(),
@@ -707,6 +889,12 @@ impl Hub {
                 None,
             )
             .await?;
+            if let Some((node_id, fingerprint)) = fingerprint {
+                self.start_dispatch_fingerprints.write().await.insert(
+                    (job.job_id.clone(), node_id, job.generation),
+                    fingerprint,
+                );
+            }
             dispatched += 1;
         }
         Ok(dispatched)
