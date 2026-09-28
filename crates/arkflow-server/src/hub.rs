@@ -27,6 +27,7 @@ mod checkpoint;
 mod command_metrics;
 mod error;
 mod jobs;
+mod leadership;
 mod lifecycle;
 mod nodes;
 mod observability;
@@ -49,6 +50,7 @@ pub use wire::{
     HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState, NodeReport,
     RegisterRequest, RegisterResponse,
 };
+pub use leadership::{HubHaConfig, Leadership};
 
 // Internal helpers referenced across submodules.
 pub(crate) use checkpoint::recovery_record_is_compatible;
@@ -61,13 +63,16 @@ pub(crate) use checkpoint::job_state_format_version;
 #[cfg(test)]
 pub(crate) use nodes::{sanitize_capabilities, sanitize_metrics};
 #[cfg(test)]
-pub(crate) use placement::{rank_candidates, RESOURCE_GAUGE_FRESH_MS};
+pub(crate) use placement::{rank_candidates, NodeAllocations, RESOURCE_GAUGE_FRESH_MS};
 
 const MAX_NODES: usize = 256;
 const MAX_COMMANDS_PER_NODE: usize = 128;
 const MAX_OPERATIONS: usize = 1024;
 const MAX_EVENTS: usize = 2048;
 const SUPPORTED_PROTOCOL_VERSION: &str = "v1";
+
+/// Dispatched-assignment fingerprints by (job id, node id, generation).
+type StartDispatchFingerprints = BTreeMap<(String, String, u64), u64>;
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -140,7 +145,21 @@ pub struct Hub {
     /// back to node-id order until the next ranked placement, which is a
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
+    /// Per-node assignment fingerprint (sorted task-id set hash) of every
+    /// dispatched job_start, keyed (job, node, generation). The dispatch-skip
+    /// requires a matching fingerprint so a Succeeded start can never keep
+    /// suppressing starts for a drifted mapping (e.g. after a Hub restart
+    /// lost the placement order). In-memory: a restart re-dispatches once
+    /// and Agents no-op matching assignments.
+    start_dispatch_fingerprints: Arc<RwLock<StartDispatchFingerprints>>,
     command_metrics: Arc<CommandMetrics>,
+    /// Lease-election configuration (hub-ha stage 2). Default is disabled,
+    /// which keeps single-instance behavior byte-identical.
+    ha: HubHaConfig,
+    /// Current leadership view. `Disabled` bypasses every gate.
+    leadership: Arc<RwLock<Leadership>>,
+    /// Leadership transitions observed by this process (observability).
+    leadership_transitions: Arc<AtomicU64>,
     /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
     /// operator credentials keep priority when both are configured.
     oidc: Option<Arc<crate::oidc::OidcFederation>>,
@@ -208,7 +227,11 @@ impl Hub {
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
+            start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
+            ha: HubHaConfig::default(),
+            leadership: Arc::new(RwLock::new(Leadership::Disabled)),
+            leadership_transitions: Arc::new(AtomicU64::new(0)),
             oidc: None,
         }
     }

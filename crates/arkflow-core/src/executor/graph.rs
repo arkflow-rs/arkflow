@@ -27,6 +27,9 @@ pub struct RemoteEdgeContext {
     /// Data-plane address of each remote node this graph reaches.
     pub node_addrs: BTreeMap<String, std::net::SocketAddr>,
     pub manager: std::sync::Arc<super::remote::NetworkManager>,
+    /// Fleet-CA mTLS material for outbound remote edges. `None` keeps the
+    /// plaintext protocol (the default).
+    pub tls: Option<super::remote::DataPlaneTlsConfig>,
     /// Job attempt generation bound into authenticated data-plane sessions.
     pub generation: u64,
 }
@@ -871,7 +874,11 @@ impl ExecutionGraphBuilder {
                             ))
                         })?;
                         let transport = std::sync::Arc::new(
-                            super::remote::TcpEdgeTransport { addr, max_attempts: 5 },
+                            super::remote::TcpEdgeTransport {
+                                addr,
+                                max_attempts: 5,
+                                tls: ctx.tls.clone(),
+                            },
                         );
                         let sender = ctx
                             .manager

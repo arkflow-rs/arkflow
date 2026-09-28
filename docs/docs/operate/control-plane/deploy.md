@@ -32,8 +32,8 @@ by scheme:
 
 Both backends implement the same storage contract behind one FIFO actor, so
 reconciliation, rollout, and outbox ordering semantics are backend-independent.
-PostgreSQL is the storage step of the Hub HA roadmap (leader election is not
-part of it — the Hub remains single-instance).
+PostgreSQL is also the prerequisite for the Hub HA lease election described
+next.
 
 To move an existing SQLite deployment onto PostgreSQL, stop the Hub first
 (migration requires the source to be quiescent), then run:
@@ -48,6 +48,79 @@ transactions, resets identity sequences above the migrated max ids, and exits
 non-zero on any row-count mismatch. Point `ARKFLOW_HUB_STORAGE` at the
 PostgreSQL URL and restart the Hub only after a successful migration. Fresh
 PostgreSQL deployments never need the tool — startup DDL creates the schema.
+
+### TLS
+
+**Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`
+(PEM file paths) and the Hub serves every request over TLS — routes, auth,
+and readiness semantics are unchanged. Only one of the two fails startup.
+Agents reach a TLS Hub with an `https://` `hub_url` and no extra
+configuration. Without both variables the Hub binds plaintext exactly as
+before.
+
+**Data plane (cross-node shuffle).** Set `ARKFLOW_DATA_PLANE_TLS_CERT`,
+`ARKFLOW_DATA_PLANE_TLS_KEY`, and `ARKFLOW_DATA_PLANE_TLS_CA` together — the
+node's certificate, its private key, and the fleet CA — and every
+cross-node connection runs mTLS: each side must present a certificate
+chaining to the fleet CA before any frame (including the HMAC session
+handshake) is exchanged. Node certificates must carry the SAN
+`DNS:arkflow-data-plane` (the fixed verification name; node identity itself
+is still proven by the HMAC handshake). A partial set of variables is
+ignored with a warning. Generate a fleet CA and node certificates with
+openssl, for example:
+
+```bash
+# Fleet CA
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem   -subj "/CN=arkflow-fleet-ca" -days 3650
+# Per node (repeat per compute node)
+openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr   -subj "/CN=arkflow-node"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem   -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+```
+
+Enable TLS on every compute node before relying on split placement:
+during a rolling enable, plaintext and TLS nodes cannot talk to each other
+(connections fail closed). Certificate rotation means restarting the
+process (automatic renewal is out of scope).
+
+### Hub high availability (lease election)
+
+Multiple Hub processes can share one PostgreSQL database; a singleton lease
+row (`cp_hub_lease`) elects exactly one leader through compare-and-swap with a
+monotonic fencing epoch. Enable it with environment variables on every Hub
+instance pointed at the same database:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ARKFLOW_HUB_HA_ENABLED` | yes | Set `true` to join the election. Off by default; a disabled Hub is a plain single instance. |
+| `ARKFLOW_HUB_STORAGE` | yes | Must be a PostgreSQL URL for multi-instance HA (SQLite works for development and testing only and logs a warning). |
+| `ARKFLOW_HUB_HA_LEASE_TTL_MS` | no | Lease lifetime, default `15000`. Renewal runs at TTL/3; the failover window is bounded by the TTL plus one probe. Minimum 1000. |
+| `ARKFLOW_HUB_HA_HOLDER_ID` | no | Explicit holder identity; defaults to `host:pid:boot-ms`. Must be unique per Hub process: two Hubs sharing one holder id would renew each other's lease and both act as leader — leave it unset unless you have a naming scheme that guarantees uniqueness. |
+
+Behavior:
+
+- The **leader** renews the lease every TTL/3 and runs all periodic work
+  (node sweeps, reconciliation, retention). On graceful shutdown it releases
+  the lease immediately so a standby can take over without waiting out the
+  TTL.
+- A **standby** serves only `/health`, `/readiness`, `/liveness`, and the
+  metrics export; every operator and agent route answers `503 hub_standby`.
+  Its readiness reports not-ready with the role. Put a load balancer or VIP
+  in front of the instances and route to the backend whose `/readiness` is
+  healthy — Agents keep their single `hub_url` and re-register with whichever
+  instance leads.
+- On takeover the promoted standby **reloads the durable control-plane view
+  (jobs, versions, checkpoints, operations, rollouts) before serving** and
+  clears the node registry; Agents re-register through their existing
+  reconnect loop. A leader that loses the lease (renewal failure or storage
+  outage) steps down at once and stops dispatching.
+
+Operational assumptions: clocks must be NTP-aligned (the TTL must dwarf the
+skew), and the failover window is bounded by the lease TTL plus one probe
+(default ≈ 15s + 5s). Fencing epochs make each takeover observable
+(`/api/v1/system` reports `ha.role` and `ha.epoch`; readiness carries the same
+block; transitions appear in the event stream as `hub.leadership`). Writes
+already in flight when a leader loses the lease are fenced only by this
+window — full storage-level write fencing is a later HA stage.
 
 ### OIDC JWT federation
 

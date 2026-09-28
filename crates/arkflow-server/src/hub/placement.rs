@@ -37,7 +37,17 @@ pub(crate) const RESOURCE_GAUGE_FRESH_MS: u64 = 10_000;
 /// (1, memory-available ratio, CPU headroom), gauge-less nodes rank
 /// (0, 0, 0) and land after every gauged node, in id order. Larger is
 /// better in every component.
-fn headroom_key(record: Option<&NodeRecord>, now: u64) -> (u8, f64, f64) {
+/// Declared per-node allocations from already-placed Jobs:
+/// (cpu_millicores, memory_bytes). Ranking subtracts these from the
+/// observed headroom so a loaded-by-declaration node ranks behind an
+/// equally-idle one.
+pub(crate) type NodeAllocations = BTreeMap<String, (u64, u64)>;
+
+fn headroom_key(
+    record: Option<&NodeRecord>,
+    now: u64,
+    allocated: Option<&(u64, u64)>,
+) -> (u8, f64, f64) {
     let Some(record) = record else {
         return (0, 0.0, 0.0);
     };
@@ -55,13 +65,29 @@ fn headroom_key(record: Option<&NodeRecord>, now: u64) -> (u8, f64, f64) {
     if !total.is_finite() || *total <= 0.0 || !used.is_finite() {
         return (0, 0.0, 0.0);
     }
-    let memory_available_ratio = (1.0 - used / total).clamp(0.0, 1.0);
-    let cpu_headroom = record
+    let (allocated_cpu, allocated_memory) = allocated.copied().unwrap_or((0, 0));
+    let effective_available = (total - used - allocated_memory as f64).max(0.0);
+    let memory_available_ratio = (effective_available / total).clamp(0.0, 1.0);
+    let mut cpu_headroom = record
         .metrics
         .get("node_cpu_usage_percent")
         .filter(|cpu| cpu.is_finite())
         .map(|cpu| (100.0 - cpu).clamp(0.0, 100.0))
         .unwrap_or(0.0);
+    // Convert declared millicores into a percentage of the node's CPU
+    // capacity when the core count is known; without the gauge the
+    // allocation cannot lower the (unknown) percentage.
+    if allocated_cpu > 0 {
+        if let Some(cores) = record
+            .metrics
+            .get("node_cpu_cores")
+            .copied().filter(|cores| cores.is_finite() && *cores > 0.0)
+        {
+            let allocated_percent =
+                allocated_cpu as f64 / (cores * 1000.0) * 100.0;
+            cpu_headroom = (cpu_headroom - allocated_percent).max(0.0);
+        }
+    }
     (1, memory_available_ratio, cpu_headroom)
 }
 
@@ -74,11 +100,12 @@ pub(crate) fn rank_candidates(
     candidates: Vec<String>,
     nodes: &BTreeMap<String, NodeRecord>,
     now: u64,
+    allocations: &NodeAllocations,
 ) -> Vec<String> {
     let mut ranked = candidates;
     ranked.sort_by(|left, right| {
-        let left_key = headroom_key(nodes.get(left), now);
-        let right_key = headroom_key(nodes.get(right), now);
+        let left_key = headroom_key(nodes.get(left), now, allocations.get(left));
+        let right_key = headroom_key(nodes.get(right), now, allocations.get(right));
         right_key
             .0
             .cmp(&left_key.0)
@@ -90,6 +117,26 @@ pub(crate) fn rank_candidates(
 }
 
 impl Hub {
+    /// Deterministic fingerprint of one node's dispatched assignment (the
+    /// sorted task-id set hashed with a fixed-key hasher). Both the
+    /// dispatch-skip gate and the drift fencing compare these; the value is
+    /// process-local and never persisted.
+    fn assignment_fingerprint(
+        assignments: &[arkflow_core::job::TaskAttempt],
+        node_id: &str,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut ids: Vec<&str> = assignments
+            .iter()
+            .filter(|assignment| assignment.node_id == node_id)
+            .map(|assignment| assignment.task_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ids.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
     /// The retained placement set, in the order its placement was actually
@@ -119,6 +166,265 @@ impl Hub {
             }
         }
         ordered
+    }
+
+    /// Nodes holding a non-terminal (successful or in-flight) start for the
+    /// Job at or before `generation` — the fallback placement view when the
+    /// dispatch-order memory is absent.
+    async fn successful_start_nodes(&self, job_id: &str, generation: u64) -> BTreeSet<String> {
+        self.operations
+            .read()
+            .await
+            .values()
+            .filter(|operation| {
+                operation.resource_id == job_id
+                    && operation.operation == "job_start"
+                    && operation.generation <= generation
+                    && !matches!(
+                        operation.state,
+                        HubOperationState::Failed
+                            | HubOperationState::TimedOut
+                            | HubOperationState::NodeUnavailable
+                            | HubOperationState::Cancelled
+                            | HubOperationState::Superseded
+                    )
+            })
+            .map(|operation| operation.node_id.clone())
+            .collect()
+    }
+
+    /// Stateless recompute of declared per-node allocations: every
+    /// desired-running Job (except `exclude_job`) that declares resources
+    /// contributes its per-task request times its per-node assignment count
+    /// under its current placement view (dispatch-order memory, else
+    /// successful-start nodes). Recomputing from the current view — instead
+    /// of maintaining an incremental ledger — keeps the numbers self-healing
+    /// across Hub restarts and retention re-dispatches.
+    pub(crate) async fn declared_node_allocations(
+        &self,
+        exclude_job: &str,
+    ) -> NodeAllocations {
+        let jobs = match self.jobs().await {
+            Ok(jobs) => jobs,
+            Err(_) => return NodeAllocations::new(),
+        };
+        let mut allocations = NodeAllocations::new();
+        for job in jobs {
+            if job.job_id == exclude_job || job.desired_state != "running" {
+                continue;
+            }
+            let Ok(spec) =
+                serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
+            else {
+                continue;
+            };
+            if !spec.resources.is_declared() {
+                continue;
+            }
+            let Ok(plan) = arkflow_core::job::JobPlan::compile(spec) else {
+                continue;
+            };
+            let order = {
+                let remembered = self
+                    .placement_order
+                    .read()
+                    .await
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if remembered.is_empty() {
+                    self.successful_start_nodes(&job.job_id, job.generation)
+                        .await
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    remembered
+                }
+            };
+            if order.is_empty() {
+                continue;
+            }
+            let Ok(assignments) = plan.assignments_for_nodes(&order, job.generation)
+            else {
+                continue;
+            };
+            for assignment in assignments {
+                let entry = allocations
+                    .entry(assignment.node_id.clone())
+                    .or_insert((0, 0));
+                if let Some(cpu) = plan.spec.resources.cpu_millicores {
+                    entry.0 += cpu as u64;
+                }
+                if let Some(memory) = plan.spec.resources.memory_bytes {
+                    entry.1 += memory;
+                }
+            }
+        }
+        allocations
+    }
+
+    /// Feasibility gate for declared Jobs: (allocated + this Job's share)
+    /// must fit the node's declared capacity (CPU millicores within
+    /// cores x 1000; memory within 90% of total, keeping a system
+    /// reserve). Nodes without fresh capacity gauges are exempt
+    /// (fail-open, matching the gauge-less ranking exemption). Returns an
+    /// explicit error so an overloaded fleet surfaces instead of stacking.
+    async fn enforce_resource_feasibility(
+        &self,
+        spec: &arkflow_core::job::JobSpec,
+        assignments: &[arkflow_core::job::TaskAttempt],
+        targets: &[String],
+        allocations: &NodeAllocations,
+    ) -> Result<(), HubError> {
+        if !spec.resources.is_declared() {
+            return Ok(());
+        }
+        let now = now_ms();
+        let nodes = self.nodes.read().await;
+        for node_id in targets.iter().collect::<BTreeSet<_>>() {
+            let count = assignments
+                .iter()
+                .filter(|assignment| &assignment.node_id == node_id)
+                .count()
+                .max(1) as u64;
+            let Some(record) = nodes.get(node_id.as_str()) else {
+                continue;
+            };
+            if record.last_report_at_ms == 0
+                || now.saturating_sub(record.last_report_at_ms) > RESOURCE_GAUGE_FRESH_MS
+            {
+                continue;
+            }
+            let (allocated_cpu, allocated_memory) =
+                allocations.get(node_id).copied().unwrap_or((0, 0));
+            if let (Some(requested), Some(cores)) = (
+                spec.resources.cpu_millicores,
+                record
+                    .metrics
+                    .get("node_cpu_cores")
+                    .copied().filter(|cores| cores.is_finite() && *cores > 0.0),
+            ) {
+                let capacity_millicores = cores * 1000.0;
+                if allocated_cpu as f64 + (requested as u64 * count) as f64
+                    > capacity_millicores
+                {
+                    return Err(HubError::Invalid(format!(
+                        "insufficient CPU capacity on node '{node_id}': allocated {} + requested {} of {} millicores",
+                        allocated_cpu,
+                        requested as u64 * count,
+                        capacity_millicores as u64
+                    )));
+                }
+            }
+            if let Some(requested) = spec.resources.memory_bytes {
+                if let Some(total) = record
+                    .metrics
+                    .get("node_memory_total_bytes")
+                    .copied().filter(|total| total.is_finite() && *total > 0.0)
+                {
+                    // 10% reserve for the OS and agent overhead.
+                    let limit = total * 0.9;
+                    if allocated_memory as f64 + (requested * count) as f64 > limit {
+                        return Err(HubError::Invalid(format!(
+                            "insufficient memory capacity on node '{node_id}': allocated {} + requested {} of {} bytes",
+                            allocated_memory,
+                            requested * count,
+                            limit as u64
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Incremental re-placement for partial node failures: keep the
+    /// remembered dispatch order and replace only the failed slots in place,
+    /// so every surviving node's task set stays byte-identical (the
+    /// round-robin assignment `index % len` maps each slot position to one
+    /// node; an in-place replacement moves only that slot's tasks). Failed
+    /// slots are filled from the ranked candidates not already in the order
+    /// (shuffle-capable when the Job needs the data plane); with no new
+    /// candidate a surviving node duplicates into the slot, which keeps the
+    /// list length — and therefore every survivor's mapping — stable.
+    /// Returns an empty vector when nothing of the previous placement can
+    /// host the Job, in which case the caller falls back to a full ranked
+    /// placement.
+    async fn incremental_targets(
+        &self,
+        job_id: &str,
+        previous_nodes: &BTreeSet<String>,
+        ranked: &[String],
+        evictions: &BTreeSet<String>,
+        requires_shuffle: bool,
+    ) -> Vec<String> {
+        let now = now_ms();
+        // One guard for the whole merge: slot usability is evaluated against
+        // the same registry snapshot.
+        let nodes = self.nodes.read().await;
+        let usable = |node_id: &str| -> bool {
+            if evictions.contains(node_id) {
+                return false;
+            }
+            nodes.get(node_id).is_some_and(|node| {
+                node.resource.state == NodeConnectionState::Online
+                    && node.resource.lease_expires_at_ms > now
+                    && node.resource.maintenance_state == NodeMaintenanceState::Active
+                    && (!requires_shuffle
+                        || node
+                            .resource
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "network_shuffle"))
+            })
+        };
+        // Order source: the dispatch-order memory when present, else the
+        // sorted previous-node set (deterministic across ticks after a Hub
+        // restart rebuilt nothing yet).
+        let order = {
+            let remembered = self
+                .placement_order
+                .read()
+                .await
+                .get(job_id)
+                .cloned()
+                .unwrap_or_default();
+            if remembered.is_empty() {
+                previous_nodes.iter().cloned().collect::<Vec<_>>()
+            } else {
+                remembered
+            }
+        };
+        let in_order: BTreeSet<&String> = order.iter().collect();
+        let mut replacements: VecDeque<String> = ranked
+            .iter()
+            .filter(|node_id| !in_order.contains(*node_id) && usable(node_id))
+            .cloned()
+            .collect();
+        let survivors: Vec<String> = order.iter().filter(|node| usable(node)).cloned().collect();
+        let mut out = Vec::with_capacity(order.len());
+        for slot in &order {
+            if usable(slot) {
+                out.push(slot.clone());
+            } else if let Some(replacement) = replacements.pop_front() {
+                out.push(replacement);
+            } else {
+                // No new candidate: concentrate the slot on the best-ranked
+                // surviving node (the ranked list is headroom-ordered).
+                let fallback = survivors
+                    .iter()
+                    .find(|survivor| ranked.contains(survivor))
+                    .or_else(|| survivors.first())
+                    .cloned();
+                if let Some(fallback) = fallback {
+                    out.push(fallback);
+                }
+            }
+        }
+        if survivors.is_empty() {
+            return Vec::new();
+        }
+        out
     }
 
     /// Nodes in `targets` whose sustained-pressure streak trips the Job's
@@ -336,10 +642,18 @@ impl Hub {
         // round-robin spreads from the best-ranked set. Pinned node_ids pass
         // through verbatim. The dispatched order is remembered further below
         // (only when this ranked order actually drives the dispatch).
+        // One allocation snapshot per reconcile feeds BOTH the ranking and
+        // the declared-resource feasibility gate (the recompute walks every
+        // running Job's spec, so doing it twice per tick doubles the cost).
+        let declared_allocations = if job.node_ids.is_empty() {
+            self.declared_node_allocations(&job.job_id).await
+        } else {
+            NodeAllocations::new()
+        };
         let mut targets = targets;
         if job.node_ids.is_empty() {
             let nodes = self.nodes.read().await;
-            targets = rank_candidates(targets, &nodes, now_ms());
+            targets = rank_candidates(targets, &nodes, now_ms(), &declared_allocations);
         }
         // Opt-in pressure rebalance: exclude nodes whose sustained-pressure
         // streak trips the Job's policy. The abandoned-placement fencing
@@ -416,6 +730,29 @@ impl Hub {
             // drift between dispatches.
             self.retained_targets_in_dispatch_order(&job.job_id, &previous_nodes)
                 .await
+        } else if operation == "job_start" && job.node_ids.is_empty() && !previous_nodes.is_empty()
+        {
+            // Incremental re-placement (partial node failure): replace only
+            // the failed slots of the remembered dispatch order so every
+            // surviving node keeps its exact task set and its successful
+            // start stays truthful. Falls back to the full ranked placement
+            // when nothing of the previous placement survives.
+            let requires_shuffle =
+                spec.placement == arkflow_core::job::PlacementStrategy::Split;
+            let merged = self
+                .incremental_targets(
+                    &job.job_id,
+                    &previous_nodes,
+                    &targets,
+                    &evictions,
+                    requires_shuffle,
+                )
+                .await;
+            if merged.is_empty() {
+                targets
+            } else {
+                merged
+            }
         } else if operation == "job_stop" {
             // A stopped Job must reach every node that may still host an
             // older generation. Such a node is not necessarily part of
@@ -457,6 +794,11 @@ impl Hub {
         // side-edge co-location contract.
         plan.validate_side_edge_assignments(&assignments)
             .map_err(|error| HubError::Invalid(error.to_string()))?;
+        // Declared resource feasibility: fit (allocated + share) into each
+        // target's capacity before any fencing or dispatch, so an overloaded
+        // fleet surfaces as a retryable error instead of stacking.
+        self.enforce_resource_feasibility(&spec, &assignments, &targets, &declared_allocations)
+            .await?;
         // Split placement: validate that every target node runs the data
         // plane, then attach the full task→node map and peer data addresses
         // so each node's graph build can wire its remote edges without any
@@ -517,20 +859,48 @@ impl Hub {
             // nodes run the same Job forever. Mark those starts Superseded so
             // the placement history stops claiming them and the nodes receive
             // a stop command when they reappear.
+            //
+            // The same fencing applies to a Succeeded start still inside the
+            // target set whose recorded assignment fingerprint no longer
+            // matches the computed assignment (a drifted mapping — e.g. after
+            // a Hub restart lost the order memory, or any placement-source
+            // change): the stale claim is superseded so the node receives a
+            // fresh start with the current assignment.
+            let recorded_fingerprints = self.start_dispatch_fingerprints.read().await;
             let abandoned: Vec<HubOperation> = {
                 let operations = self.operations.read().await;
                 operations
                     .values()
                     .filter(|operation_record| {
-                        operation_record.resource_id == job.job_id
-                            && operation_record.operation == "job_start"
-                            && operation_record.generation == job.generation
-                            && operation_record.state == HubOperationState::Succeeded
-                            && !target_ids.contains(&operation_record.node_id)
+                        if operation_record.resource_id != job.job_id
+                            || operation_record.operation != "job_start"
+                            || operation_record.generation != job.generation
+                            || operation_record.state != HubOperationState::Succeeded
+                        {
+                            return false;
+                        }
+                        if !target_ids.contains(&operation_record.node_id) {
+                            return true;
+                        }
+                        let recorded = recorded_fingerprints
+                            .get(&(
+                                job.job_id.clone(),
+                                operation_record.node_id.clone(),
+                                job.generation,
+                            ))
+                            .copied();
+                        // No recorded fingerprint means the Hub cannot prove
+                        // assignment continuity (restart wiped the memory):
+                        // re-dispatch rather than trust a stale claim.
+                        recorded.is_none_or(|recorded| {
+                            recorded
+                                != Self::assignment_fingerprint(&assignments, &operation_record.node_id)
+                        })
                     })
                     .cloned()
                     .collect()
             };
+            drop(recorded_fingerprints);
             if !abandoned.is_empty() {
                 // Apply the in-memory transition under the write lock, then
                 // persist OUTSIDE it: the storage round-trips are async and
@@ -651,19 +1021,33 @@ impl Hub {
             // and a fresh persistent operation row — an unbounded churn loop
             // for stopped Jobs (and for fenced placements) with no retention
             // able to keep up. A generation bump or desired-state change
-            // re-dispatches naturally.
-            let already_terminal = self
-                .operations
-                .read()
-                .await
-                .values()
-                .any(|operation_record| {
-                    operation_record.node_id == node_id
-                        && operation_record.resource_id == job.job_id
-                        && operation_record.operation == operation
-                        && operation_record.generation == job.generation
-                        && operation_record.state == HubOperationState::Succeeded
-                });
+            // re-dispatches naturally. The skip additionally requires the
+            // recorded assignment fingerprint to match the computed
+            // assignment: a Succeeded start must not suppress a start for a
+            // mapping it was never dispatched with.
+            let fingerprint_matches = operation != "job_start"
+                || self
+                    .start_dispatch_fingerprints
+                    .read()
+                    .await
+                    .get(&(job.job_id.clone(), node_id.clone(), job.generation))
+                    .is_some_and(|recorded| {
+                        *recorded
+                            == Self::assignment_fingerprint(&assignments, node_id.as_str())
+                    });
+            let already_terminal = fingerprint_matches
+                && self
+                    .operations
+                    .read()
+                    .await
+                    .values()
+                    .any(|operation_record| {
+                        operation_record.node_id == node_id
+                            && operation_record.resource_id == job.job_id
+                            && operation_record.operation == operation
+                            && operation_record.generation == job.generation
+                            && operation_record.state == HubOperationState::Succeeded
+                    });
             if already_terminal {
                 continue;
             }
@@ -693,6 +1077,14 @@ impl Hub {
                 }
             }
             let payload = Some(payload_value);
+            let fingerprint = if operation == "job_start" {
+                Some((
+                    node_id.clone(),
+                    Self::assignment_fingerprint(&assignments, node_id.as_str()),
+                ))
+            } else {
+                None
+            };
             self.enqueue_with_metadata(
                 node_id,
                 operation.into(),
@@ -707,6 +1099,12 @@ impl Hub {
                 None,
             )
             .await?;
+            if let Some((node_id, fingerprint)) = fingerprint {
+                self.start_dispatch_fingerprints.write().await.insert(
+                    (job.job_id.clone(), node_id, job.generation),
+                    fingerprint,
+                );
+            }
             dispatched += 1;
         }
         Ok(dispatched)

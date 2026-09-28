@@ -82,6 +82,7 @@ jobs:
 - `partitioned: true` 按键组归属路由,因此同一个 key 总会到达同一个下游任务,无论它来自哪个源分区或上游子任务。
 - 算子 `kind` 是 `source`、`map`、`filter`、`aggregate`、`window`、`sink` 或 `udf` 之一。`join` 在公开结构中保留,但在专门的分布式多输入运行时出现之前会被拒绝。
 - 事件时间源需声明 `mode`、`timestamp_field`、水位线参数与迟到事件策略(`drop`、`route` 或 `update`)。
+- `resources`(可选)声明每 task 请求——`cpu_millicores` 与/或 `memory_bytes`。作业总请求 = 每 task 值 × 计划任务数。声明的作业参与放置记账:候选节点按**有效**余量排序(上报仪表减去已放置的声明占用),且放置仅在 (已分配 + 分摊) 装得下节点容量时成立(CPU 不超过 `node_cpu_cores × 1000` 毫核;内存不超过 `node_memory_total_bytes` 的 90%)——全无可行节点时给出显式的容量不足错误而不是盲目堆叠。声明 `cpu_millicores` 的作业还会在 `ceil(毫核/1000)`(至少 1)个工作线程的专属 runtime 上执行,单个作业无法占满 Agent 的共享 worker。这是 worker 级隔离,不是 cgroup/容器式硬限制:多作业仍共享 Agent 进程。未声明(默认)的作业行为逐位不变。
 - `rescale: true`(默认 `false`)显式选择扩缩容恢复:在变更了 `parallelism`(或保存状态中的算子在新计划中全部保留的任务集)的情况下重启,按键组归属重分布 keyed 状态,而不是保守失败。参见[分布式 Job → 恢复期扩缩容](/zh-Hans/docs/build/distributed-jobs#恢复期扩缩容)。
 
 ### 校验并运行

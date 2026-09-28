@@ -1309,6 +1309,121 @@ impl SqliteBackend {
         })
     }
 
+    /// Take over the singleton control-plane lease when it is expired (or
+    /// already ours). A takeover bumps the fencing epoch; a self-acquire only
+    /// extends the TTL. Runs under BEGIN IMMEDIATE so the read-then-write is
+    /// one atomic writer transition.
+    pub fn try_acquire_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError> {
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_hub_lease (id, holder, epoch, expires_at_ms, updated_at_ms) \
+                 VALUES (1, '', 0, 0, ?1) ON CONFLICT(id) DO NOTHING",
+                rusqlite::params![now_ms as i64],
+            )?;
+            let current = transaction.query_row(
+                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            if current.0 == holder {
+                transaction.execute(
+                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 \
+                     WHERE id = 1 AND holder = ?3",
+                    rusqlite::params![
+                        (now_ms + ttl_ms) as i64,
+                        now_ms as i64,
+                        holder
+                    ],
+                )?;
+                return Ok(HubLeaseAcquire::Acquired {
+                    epoch: current.1.max(0) as u64,
+                });
+            }
+            if current.2 <= now_ms as i64 {
+                let updated = transaction.execute(
+                    "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, \
+                     updated_at_ms = ?3 WHERE id = 1 AND expires_at_ms <= ?4",
+                    rusqlite::params![
+                        holder,
+                        (now_ms + ttl_ms) as i64,
+                        now_ms as i64,
+                        now_ms as i64
+                    ],
+                )?;
+                if updated == 1 {
+                    return Ok(HubLeaseAcquire::Acquired {
+                        epoch: (current.1 + 1).max(0) as u64,
+                    });
+                }
+            }
+            let snapshot = transaction.query_row(
+                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                [],
+                |row| {
+                    Ok(HubLeaseSnapshot {
+                        holder: row.get(0)?,
+                        epoch: row.get::<_, i64>(1)?.max(0) as u64,
+                        expires_at_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                },
+            )?;
+            Ok(HubLeaseAcquire::HeldByOther(snapshot))
+        })
+    }
+
+    /// Extend the caller's unexpired lease; `Lost` leaves the row untouched.
+    pub fn renew_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let epoch = transaction
+                .query_row(
+                    "SELECT epoch FROM cp_hub_lease WHERE id = 1 AND holder = ?1 AND expires_at_ms > ?2",
+                    rusqlite::params![holder, now_ms as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(epoch) = epoch else {
+                return Ok(HubLeaseRenew::Lost);
+            };
+            transaction.execute(
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 \
+                 WHERE id = 1 AND holder = ?3 AND expires_at_ms > ?4",
+                rusqlite::params![(now_ms + ttl_ms) as i64, now_ms as i64, holder, now_ms as i64],
+            )?;
+            Ok(HubLeaseRenew::Renewed {
+                epoch: epoch.max(0) as u64,
+            })
+        })
+    }
+
+    /// Expire the caller's unexpired lease immediately (graceful shutdown).
+    /// Returns whether this caller held a live lease.
+    pub fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?1 \
+                 WHERE id = 1 AND holder = ?2 AND expires_at_ms > ?1",
+                rusqlite::params![now_ms as i64, holder],
+            )
+        })
+        .map(|updated| updated == 1)
+    }
+
     pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -1989,6 +2104,14 @@ impl SqliteBackend {
                 created_at_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cp_hub_lease (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                holder TEXT NOT NULL DEFAULT '',
+                epoch INTEGER NOT NULL DEFAULT 0,
+                expires_at_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE INDEX IF NOT EXISTS cp_intents_due
                 ON cp_intents(state, next_retry_at_ms);
             CREATE INDEX IF NOT EXISTS cp_attempts_pending
@@ -2295,10 +2418,29 @@ node_id: Option<&str>,
         self.list_operations(node_id)
     }
     async fn list_job_start_operations(
-&self,
-resource_id: &str,
-) -> Result<Vec<PersistedOperation>, StorageError> {
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
         self.list_job_start_operations(resource_id)
+    }
+    async fn try_acquire_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError> {
+        self.try_acquire_hub_lease(holder, ttl_ms, now_ms)
+    }
+    async fn renew_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError> {
+        self.renew_hub_lease(holder, ttl_ms, now_ms)
+    }
+    async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
+        self.release_hub_lease(holder, now_ms)
     }
     async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)

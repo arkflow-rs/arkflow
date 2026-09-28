@@ -91,6 +91,11 @@ struct JobTask {
     recovery_required: bool,
     cancellation: CancellationToken,
     assignments: Vec<TaskAttempt>,
+    /// Dedicated bounded runtime for Jobs declaring `resources.cpu_millicores`
+    /// (worker threads = ceil(millicores/1000), min 1): one Job cannot occupy
+    /// the shared runtime's workers. Shut down (detached, bounded) when the
+    /// task is retired. `None` for undeclared Jobs — shared runtime as before.
+    dedicated_runtime: Option<Arc<tokio::runtime::Runtime>>,
     watermark_partitions: BTreeMap<String, u32>,
     state: Arc<dyn StateBackend>,
     checkpoint_store_uri: Option<String>,
@@ -244,6 +249,7 @@ fn validate_recovery_manifest(
     checkpoint_id: &str,
     state_format_version: u32,
     manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    rescale: bool,
 ) -> Result<(), String> {
     if manifest.checkpoint_id != checkpoint_id {
         return Err(format!(
@@ -254,18 +260,40 @@ fn validate_recovery_manifest(
     // sealing apply: an equal state format permits a target-version upgrade,
     // while downgrades, format changes, checksum failures, and manifests
     // without the complete planned task set are incompatible for everyone.
+    // A rescale-declared Job waives only the task-set equality half: every
+    // entry is redistributed to the new plan's key-group owners at restore
+    // instead of restoring per-task snapshots verbatim.
     let planned_tasks = plan
         .tasks
         .iter()
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
-    let compatibility = arkflow_core::checkpoint::evaluate_recovery_compatibility(
-        manifest,
-        &plan.spec.id,
-        plan.spec.version,
-        state_format_version,
-        &planned_tasks,
-    );
+    let compatibility = if rescale {
+        let identity = arkflow_core::checkpoint::evaluate_recovery_identity(
+            manifest,
+            &plan.spec.id,
+            plan.spec.version,
+            state_format_version,
+        );
+        if identity.is_compatible()
+            && arkflow_core::checkpoint::manifest_has_duplicate_tasks(manifest)
+        {
+            arkflow_core::checkpoint::RecoveryCompatibility::reject(format!(
+                "checkpoint '{}' contains duplicate task entries",
+                manifest.checkpoint_id
+            ))
+        } else {
+            identity
+        }
+    } else {
+        arkflow_core::checkpoint::evaluate_recovery_compatibility(
+            manifest,
+            &plan.spec.id,
+            plan.spec.version,
+            state_format_version,
+            &planned_tasks,
+        )
+    };
     if !compatibility.is_compatible() {
         return Err(format!(
             "recovery artifact '{checkpoint_id}' is incompatible with Job '{}' version {} state format {}: {}",
@@ -282,16 +310,25 @@ fn validate_recovery_snapshots<S: CheckpointStore>(
     plan: &JobPlan,
     repository: &CheckpointRepository<S>,
     manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    rescale: bool,
 ) -> Result<(), String> {
     let planned_tasks = plan
         .tasks
         .iter()
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
-    arkflow_core::checkpoint::validate_state_snapshot_task_set(
-        &manifest.state_snapshots,
-        &planned_tasks,
-    )?;
+    if rescale {
+        // Duplicate references still mean a corrupted seal; the task set
+        // legitimately differs from the plan when redistributing.
+        arkflow_core::checkpoint::validate_state_snapshot_tasks_unique(
+            &manifest.state_snapshots,
+        )?;
+    } else {
+        arkflow_core::checkpoint::validate_state_snapshot_task_set(
+            &manifest.state_snapshots,
+            &planned_tasks,
+        )?;
+    }
     let expected_prefix =
         arkflow_core::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
     for snapshot_ref in &manifest.state_snapshots {
@@ -335,12 +372,13 @@ pub(crate) fn recovery_record_is_valid(
         &record.checkpoint_id,
         record.format_version,
         &manifest,
+        spec.rescale,
     )
     .is_err()
     {
         return false;
     }
-    if validate_recovery_snapshots(&plan, &repository, &manifest).is_err() {
+    if validate_recovery_snapshots(&plan, &repository, &manifest, spec.rescale).is_err() {
         return false;
     }
     let task_ids = manifest
@@ -361,6 +399,80 @@ pub(crate) fn recovery_record_is_valid(
         .state_snapshots
         .iter()
         .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
+}
+
+/// Restore the recovery artifact's keyed state into this node's backend.
+///
+/// Exact task set: only the snapshots referenced by this node's assignments
+/// are read (the pre-existing behavior). Rescale redistribution (`task sets
+/// differ && spec.rescale`): EVERY snapshot is read, each entry is rewritten
+/// to its new key-group owner's namespace, and only entries owned by this
+/// node's assignments are restored — across the fleet each entry lands on
+/// exactly one node.
+fn restore_recovery_state<S: CheckpointStore>(
+    plan: &JobPlan,
+    repository: &CheckpointRepository<S>,
+    manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    assignments: &[arkflow_core::job::TaskAttempt],
+    state: &Arc<dyn StateBackend>,
+    redistribute: bool,
+) -> Result<(), String> {
+    let assigned_task_ids = assignments
+        .iter()
+        .map(|assignment| assignment.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if redistribute {
+        let context =
+            arkflow_core::executor::job_runner_adapter::RescaleContext::from_plan(plan)
+                .map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        for snapshot_ref in &manifest.state_snapshots {
+            let snapshot = repository
+                .read_state_snapshot(snapshot_ref)
+                .map_err(|error| error.to_string())?;
+            for entry in snapshot.entries {
+                let entry = context
+                    .redistribute(entry)
+                    .map_err(|error| error.to_string())?;
+                let owner = arkflow_core::executor::job_runner_adapter::RescaleContext::task_of_namespace(&entry.namespace)
+                    .map_err(|error| error.to_string())?;
+                if assigned_task_ids.contains(owner.as_str()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        let snapshot =
+            arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+        return state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string());
+    }
+    let mut snapshots = manifest
+        .state_snapshots
+        .iter()
+        .filter(|snapshot_ref| assigned_task_ids.contains(snapshot_ref.task_id.as_str()))
+        .map(|snapshot_ref| {
+            repository
+                .read_state_snapshot(snapshot_ref)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if snapshots.len() > 1 {
+        let entries = snapshots
+            .drain(..)
+            .flat_map(|snapshot| snapshot.entries)
+            .collect();
+        let snapshot = arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+        state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string())
+    } else if let Some(snapshot) = snapshots.pop() {
+        state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_recovery_payload(
@@ -386,6 +498,51 @@ fn parse_recovery_payload(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     Ok((Some(checkpoint_id.to_owned()), savepoint, recovery_required))
+}
+
+impl Drop for JobTask {
+    /// Last-resort guard: a JobTask dropped without one of the explicit
+    /// retirement paths must not let its `Arc<Runtime>` drop inside an
+    /// async context (Runtime::drop panics there). The explicit paths
+    /// `take()` the runtime first, so this only fires on missed paths. No
+    /// runtime context (process teardown) parks the shutdown on a bare
+    /// thread instead.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.dedicated_runtime.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
+                }
+                Err(_) => {
+                    std::thread::spawn(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Bounded, detached teardown of a dedicated runtime. Takes the task's
+/// reference (callers `take()` it before awaiting the kernel handle) so the
+/// final Arc never drops inside an async context (Runtime::drop panics
+/// there); the shutdown itself runs on the blocking pool, outside every
+/// runtime's async context. Must run only AFTER the kernel handle resolved:
+/// shutting the runtime down first would strand the JoinHandle.
+fn shutdown_dedicated_runtime(dedicated: Option<Arc<tokio::runtime::Runtime>>) {
+    if let Some(runtime) = dedicated {
+        tokio::task::spawn_blocking(move || {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_secs(10));
+            }
+        });
+    }
 }
 
 impl JobRuntime {
@@ -518,18 +675,32 @@ impl JobRuntime {
                 return Err("job generation is stale".into());
             }
             // A re-delivered start at the generation already running is a
-            // no-op success — but only while that kernel is actually alive:
-            // cancelling and restarting a healthy kernel for a command the
-            // Hub re-sent after a restart would churn the data plane and
-            // (under load) wedge the start path behind a teardown that never
-            // finishes. An exited kernel at the same generation (a crash
-            // between the poll drain and this reader) must fall through to
-            // the restart path instead of being reported as a healthy no-op.
-            if tasks
-                .get(&job_id)
-                .is_some_and(|task| task.generation == generation && !task.handle.is_finished())
-            {
-                return Ok(());
+            // no-op success — but only while that kernel is actually alive
+            // AND its assignment matches the command: cancelling and
+            // restarting a healthy kernel for a command the Hub re-sent
+            // after a restart would churn the data plane and (under load)
+            // wedge the start path behind a teardown that never finishes. A
+            // start whose per-node task set differs from the running
+            // kernel's assignment (a drifted mapping) must REPLACE the
+            // kernel instead of being swallowed as a healthy no-op. An
+            // exited kernel at the same generation (a crash between the
+            // poll drain and this reader) must also fall through to the
+            // restart path instead of being reported as a healthy no-op.
+            let incoming_task_ids = assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect::<BTreeSet<_>>();
+            if let Some(task) = tasks.get(&job_id) {
+                let alive = task.generation == generation && !task.handle.is_finished();
+                let same_assignment = task
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.task_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    == incoming_task_ids;
+                if alive && same_assignment {
+                    return Ok(());
+                }
             }
             if local_recovery_marker
                 .as_ref()
@@ -546,7 +717,10 @@ impl JobRuntime {
             }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
-            let existing = tasks.remove(&job_id);
+            let mut existing = tasks.remove(&job_id);
+            if let Some(existing) = existing.as_mut() {
+                existing.cancellation.cancel();
+            }
             // Observed on the removal lock, right before the cancel: a kernel
             // that exited on its own has a genuine crash outcome worth
             // surfacing below; an exit after the cancel is this start's own
@@ -560,12 +734,18 @@ impl JobRuntime {
             (existing, previous_exited_on_its_own)
         };
         let mut replaced_crash: Option<(u64, String)> = None;
-        if let Some(existing) = existing {
+        if let Some(mut existing) = existing {
             let existing_generation = existing.generation;
+            let dedicated = existing.dedicated_runtime.take();
             let outcome =
-                await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT)
-                    .await;
+                await_previous_teardown(
+                    &job_id,
+                    &mut existing.handle,
+                    KERNEL_TEARDOWN_JOIN_TIMEOUT,
+                )
+                .await;
             let _ = existing.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, existing_generation);
             }
@@ -657,46 +837,37 @@ impl JobRuntime {
                 let manifest = repository
                     .read_manifest(&artifact)
                     .map_err(|error| error.to_string())?;
+                let rescale = plan_for_recovery.spec.rescale;
+                // Redistribution only runs when the task set actually
+                // differs: an identical set restores verbatim exactly as
+                // before, rescale declared or not.
+                let planned_tasks = plan_for_recovery
+                    .tasks
+                    .iter()
+                    .map(|task| task.id.clone())
+                    .collect::<BTreeSet<_>>();
+                let manifest_tasks = manifest
+                    .task_attempts
+                    .iter()
+                    .map(|attempt| attempt.task_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let redistribute = rescale && manifest_tasks != planned_tasks;
                 validate_recovery_manifest(
                     &plan_for_recovery,
                     &checkpoint_id,
                     state_for_restore.format_version(),
                     &manifest,
+                    redistribute,
                 )?;
-                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest)?;
-                let assigned_task_ids = assignments_for_recovery
-                    .iter()
-                    .map(|assignment| assignment.task_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                let mut snapshots = manifest
-                    .state_snapshots
-                    .iter()
-                    .filter(|snapshot_ref| {
-                        assigned_task_ids.contains(snapshot_ref.task_id.as_str())
-                    })
-                    .map(|snapshot_ref| {
-                        repository
-                            .read_state_snapshot(snapshot_ref)
-                            .map_err(|error| error.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if snapshots.len() > 1 {
-                    let entries = snapshots
-                        .drain(..)
-                        .flat_map(|snapshot| snapshot.entries)
-                        .collect();
-                    let snapshot = arkflow_core::state::StateSnapshot::new(
-                        state_for_restore.format_version(),
-                        entries,
-                    );
-                    state_for_restore
-                        .restore(&snapshot)
-                        .map_err(|error| error.to_string())?;
-                } else if let Some(snapshot) = snapshots.pop() {
-                    state_for_restore
-                        .restore(&snapshot)
-                        .map_err(|error| error.to_string())?;
-                }
+                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest, redistribute)?;
+                restore_recovery_state(
+                    &plan_for_recovery,
+                    &repository,
+                    &manifest,
+                    &assignments_for_recovery,
+                    &state_for_restore,
+                    redistribute,
+                )?;
                 RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())
             })
             .await
@@ -740,6 +911,7 @@ impl JobRuntime {
                 recovery_required,
                 cancellation: cancellation.clone(),
                 assignments: assignments.clone(),
+                dedicated_runtime: None,
                 watermark_partitions: watermark_partitions.clone(),
                 state: state.clone(),
                 checkpoint_store_uri: plan
@@ -787,23 +959,68 @@ impl JobRuntime {
                         .collect()
                 }
             };
-            Some(arkflow_core::executor::graph::RemoteEdgeContext {
-                local_node: node_id.to_string(),
-                task_nodes,
-                node_addrs,
-                manager: manager.clone(),
-                generation,
-            })
+            Some(std::sync::Arc::new(
+                arkflow_core::executor::graph::RemoteEdgeContext {
+                    tls: manager.tls_config().cloned(),
+                    local_node: node_id.to_string(),
+                    task_nodes,
+                    node_addrs,
+                    manager: manager.clone(),
+                    generation,
+                },
+            ))
         });
-        let spawn_result = spawn_kernel_job(
-            &plan,
-            &task_ids,
-            state.clone(),
-            recovery.as_ref(),
-            cancellation.clone(),
-            remote_context.as_ref(),
-        )
-        .await;
+        // Declared CPU => dedicated bounded runtime: the kernel (and all its
+        // async work) runs on max(1, ceil(millicores/1000)) worker threads
+        // owned by this Job instead of the shared runtime's pool. Undeclared
+        // Jobs keep the shared runtime, byte-identical to before.
+        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> = match plan
+            .spec
+            .resources
+            .cpu_millicores
+        {
+            Some(millicores) => {
+                let workers = millicores.div_ceil(1000).max(1) as usize;
+                match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .thread_name(format!("arkflow-job-{job_id}"))
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(error) => {
+                        return Err(format!(
+                            "dedicated runtime for Job '{job_id}' failed to build: {error}"
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+        let state_for_spawn = state.clone();
+        let owned_plan = plan.clone();
+        let owned_task_ids = task_ids.clone();
+        let owned_recovery = recovery.clone();
+        let owned_remote = remote_context.clone();
+        let owned_cancellation = cancellation.clone();
+        let spawn_future = async move {
+            spawn_kernel_job(
+                &owned_plan,
+                &owned_task_ids,
+                state_for_spawn.clone(),
+                owned_recovery.as_ref(),
+                owned_cancellation,
+                owned_remote.as_deref(),
+            )
+            .await
+        };
+        let spawn_result = match &dedicated_runtime {
+            Some(runtime) => match runtime.spawn(spawn_future).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("dedicated kernel task failed: {error}")),
+            },
+            None => spawn_future.await,
+        };
         let kernel = match spawn_result {
             Ok(handle) => {
                 // Release the placeholder: the swap below resolves it.
@@ -816,9 +1033,18 @@ impl JobRuntime {
                 }
                 drop(started_tx);
                 let placeholder = self.tasks.lock().await.remove(&job_id);
-                if let Some(task) = placeholder {
+                if let Some(mut task) = placeholder {
+                    let dedicated = task.dedicated_runtime.take();
                     task.cancellation.cancel();
-                    let _ = task.handle.await;
+                    let _ = (&mut task.handle).await;
+                    shutdown_dedicated_runtime(dedicated);
+                }
+                if let Some(runtime) = dedicated_runtime.take() {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
                 }
                 if let Some(manager) = &self.data_plane {
                     manager.remove_job_session(&job_id, generation);
@@ -848,6 +1074,7 @@ impl JobRuntime {
                         recovery_required,
                         cancellation: cancellation.clone(),
                         assignments,
+                        dedicated_runtime: dedicated_runtime.clone(),
                         watermark_partitions,
                         state,
                         checkpoint_store_uri: plan
@@ -864,6 +1091,13 @@ impl JobRuntime {
         if !registered {
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, generation);
+            }
+            if let Some(runtime) = dedicated_runtime.take() {
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                        runtime.shutdown_timeout(Duration::from_secs(10));
+                    }
+                });
             }
         }
         Ok(())
@@ -1160,13 +1394,15 @@ impl JobRuntime {
             .map(|(job_id, _)| job_id.clone())
             .collect::<Vec<_>>();
         for job_id in ids {
-            if let Some(task) = tasks.remove(&job_id) {
-                let result = match task.handle.await {
+            if let Some(mut task) = tasks.remove(&job_id) {
+                let dedicated = task.dedicated_runtime.take();
+                let result = match (&mut task.handle).await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(error) => Err(error.to_string()),
                 };
                 let _ = task.state.close();
+                shutdown_dedicated_runtime(dedicated);
                 if let Some(manager) = &self.data_plane {
                     manager.remove_job_session(&job_id, task.generation);
                 }
@@ -1191,10 +1427,12 @@ impl JobRuntime {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks).into_iter().collect::<Vec<_>>()
         };
-        for (job_id, task) in tasks {
+        for (job_id, mut task) in tasks {
+            let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = task.handle.await;
+            let _ = (&mut task.handle).await;
             let _ = task.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(&job_id, task.generation);
             }
@@ -1212,11 +1450,13 @@ impl JobRuntime {
             }
             tasks.remove(job_id)
         };
-        if let Some(task) = task {
+        if let Some(mut task) = task {
             let task_generation = task.generation;
+            let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = task.handle.await;
+            let _ = (&mut task.handle).await;
             let _ = task.state.close();
+            shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
                 manager.remove_job_session(job_id, task_generation);
             }
@@ -1675,6 +1915,8 @@ pub(crate) struct ResourceSnapshot {
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub memory_available_bytes: u64,
+    /// Logical CPU cores — static capacity for placement feasibility.
+    pub cpu_cores: u32,
 }
 
 /// Shared latest-snapshot slot between the sampler task and the report path.
@@ -1721,6 +1963,50 @@ impl ResourceSampler {
 
 /// Merge a fresh snapshot into the report's metrics map under the fixed
 /// `node_*` vocabulary; the CPU gauge is skipped until it has a real window.
+/// Build the data-plane mTLS material from `ARKFLOW_DATA_PLANE_TLS_CERT`,
+/// `_KEY`, and `_CA` (PEM file paths). All three or none: a partial set is
+/// an explicit configuration error (a half-loaded TLS config must fail, not
+/// silently degrade to plaintext). Files are read once at startup.
+fn data_plane_tls_from_env(
+) -> Result<Option<arkflow_core::executor::remote::DataPlaneTlsConfig>, String> {
+    let cert = std::env::var("ARKFLOW_DATA_PLANE_TLS_CERT").ok();
+    let key = std::env::var("ARKFLOW_DATA_PLANE_TLS_KEY").ok();
+    let ca = std::env::var("ARKFLOW_DATA_PLANE_TLS_CA").ok();
+    let declared = [cert.is_some(), key.is_some(), ca.is_some()];
+    if declared == [false, false, false] {
+        return Ok(None);
+    }
+    if declared != [true, true, true] {
+        // Fail closed per the authenticated-network-shuffle contract: a
+        // half-loaded TLS config must fail startup, never degrade to
+        // plaintext.
+        return Err(
+            "ARKFLOW_DATA_PLANE_TLS_CERT/_KEY/_CA must be set together (partial TLS configuration)"
+                .into(),
+        );
+    }
+    let read = |value: Option<String>, name: &str| -> Result<String, String> {
+        value
+            .map(|path| {
+                std::fs::read_to_string(&path).map_err(|error| {
+                    format!("data-plane TLS {name} '{path}' could not be read: {error}")
+                })
+            })
+            .transpose()
+            .map(|value| value.expect("checked Some above"))
+    };
+    let cert = read(cert, "certificate")?;
+    let key = read(key, "private key")?;
+    let ca = read(ca, "fleet CA")?;
+    match arkflow_core::executor::remote::DataPlaneTlsConfig::from_pem(&cert, &key, &ca) {
+        Ok(tls) => {
+            info!("data-plane mTLS enabled (fleet CA anchored)");
+            Ok(Some(tls))
+        }
+        Err(error) => Err(format!("data-plane TLS material rejected: {error}")),
+    }
+}
+
 fn merge_resource_gauges(
     metrics: &mut BTreeMap<String, f64>,
     snapshot: ResourceSnapshot,
@@ -1737,6 +2023,9 @@ fn merge_resource_gauges(
         "node_memory_available_bytes".into(),
         snapshot.memory_available_bytes as f64,
     );
+    if snapshot.cpu_cores > 0 {
+        metrics.insert("node_cpu_cores".into(), f64::from(snapshot.cpu_cores));
+    }
 }
 
 /// Spawn the host resource sampler: a fixed-interval task publishing into the
@@ -1769,6 +2058,7 @@ pub(crate) fn spawn_resource_sampler(
                 memory_used_bytes: system.used_memory(),
                 memory_total_bytes: system.total_memory(),
                 memory_available_bytes: system.available_memory(),
+                cpu_cores: system.cpus().len() as u32,
             });
         }
     });
@@ -1798,6 +2088,7 @@ pub async fn run(
             .ok()
             .filter(|secret| !secret.is_empty())
             .or_else(|| (!config.node_token.is_empty()).then(|| config.node_token.clone()));
+        let data_plane_tls = data_plane_tls_from_env()?;
         let manager = data_secret
             .and_then(|data_secret| {
                 match arkflow_core::executor::remote::DataPlaneCredentials::new(
@@ -1812,10 +2103,12 @@ pub async fn run(
                 }
             })
             .and_then(|credentials| {
-                let mut manager_config =
-                    arkflow_core::executor::remote::NetworkManagerConfig::default();
-                manager_config.credentials = Some(credentials);
-                manager_config.channel_capacity = 1024;
+                let manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
+                    credentials: Some(credentials),
+                    channel_capacity: 1024,
+                    tls: data_plane_tls.clone(),
+                    .. arkflow_core::executor::remote::NetworkManagerConfig::default()
+                };
                 match arkflow_core::executor::remote::NetworkManager::with_config(
                     manager_config,
                 ) {
@@ -1966,10 +2259,10 @@ const KERNEL_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// when the bound expired with the task detached (no outcome exists).
 async fn await_previous_teardown(
     job_id: &str,
-    handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+    handle: &mut tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
     bound: Duration,
 ) -> Option<Result<(), String>> {
-    match tokio::time::timeout(bound, handle).await {
+    match tokio::time::timeout(bound, &mut *handle).await {
         Err(_) => {
             warn!(
                 job_id = %job_id,
@@ -2835,9 +3128,9 @@ fn jittered_backoff_stays_within_the_equal_jitter_window() {
 /// outcome — `None` — so the start path knows there is nothing to report.
 #[tokio::test]
 async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
-    let wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
+    let mut wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
     let started = std::time::Instant::now();
-    let outcome = await_previous_teardown("job-wedge", wedged, Duration::from_millis(100)).await;
+    let outcome = await_previous_teardown("job-wedge", &mut wedged, Duration::from_millis(100)).await;
     assert!(
         outcome.is_none(),
         "a detached teardown must report no outcome: {outcome:?}"
@@ -2855,12 +3148,12 @@ async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
 /// observation instead of silently discarding the crash.
 #[tokio::test]
 async fn crashed_previous_teardown_surfaces_the_join_error() {
-    let crashed = tokio::spawn(async {
+    let mut crashed = tokio::spawn(async {
         Result::<(), arkflow_core::Error>::Err(arkflow_core::Error::Process(
             "kernel exploded".into(),
         ))
     });
-    let outcome = await_previous_teardown("job-crash", crashed, Duration::from_secs(5)).await;
+    let outcome = await_previous_teardown("job-crash", &mut crashed, Duration::from_secs(5)).await;
     assert!(
         matches!(&outcome, Some(Err(message)) if message.contains("kernel exploded")),
         "the crash outcome must pass through: {outcome:?}"
@@ -3109,6 +3402,7 @@ mod tests {
                 recovery_required: false,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                dedicated_runtime: None,
                 watermark_partitions: BTreeMap::new(),
                 state,
                 checkpoint_store_uri: None,
@@ -3533,6 +3827,7 @@ mod tests {
             memory_used_bytes: 4_000,
             memory_total_bytes: 8_000,
             memory_available_bytes: 4_000,
+            cpu_cores: 2,
         }
     }
 
@@ -3547,6 +3842,7 @@ mod tests {
             keys,
             [
                 "input_messages",
+                "node_cpu_cores",
                 "node_cpu_usage_percent",
                 "node_memory_available_bytes",
                 "node_memory_total_bytes",
@@ -3554,6 +3850,7 @@ mod tests {
             ]
         );
         assert_eq!(metrics["node_cpu_usage_percent"], 37.5);
+        assert_eq!(metrics["node_cpu_cores"], 2.0);
         assert_eq!(metrics["node_memory_total_bytes"], 8_000.0);
     }
 
@@ -3564,7 +3861,8 @@ mod tests {
         let mut metrics = BTreeMap::new();
         merge_resource_gauges(&mut metrics, cold);
         assert!(!metrics.contains_key("node_cpu_usage_percent"));
-        assert_eq!(metrics.len(), 3);
+        // Memory gauges plus the static CPU core count.
+        assert_eq!(metrics.len(), 4);
     }
 
     #[test]
@@ -3595,4 +3893,498 @@ mod tests {
             MIN_RESOURCE_SAMPLE_INTERVAL
         );
     }
+
+    fn rescale_spec_value(parallelism: u32, rescale: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "agent-rescale-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "aggregate", "stateful": true, "key_field": "key"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {"backend": "embedded_kv", "durability": "durable", "format_version": 1},
+            "checkpoint": {"object_store_uri": "memory://rescale-test", "interval_ms": 30000, "retention": 3},
+            "parallelism": parallelism,
+            "max_parallelism": 16,
+            "rescale": rescale
+        })
+    }
+
+    fn attempt_for(plan: &JobPlan, task_id: &str, node_id: &str) -> arkflow_core::job::TaskAttempt {
+        arkflow_core::job::TaskAttempt {
+            id: format!("{task_id}:{node_id}:1"),
+            job_id: plan.spec.id.clone(),
+            job_version: plan.spec.version,
+            task_id: task_id.to_owned(),
+            generation: 1,
+            node_id: node_id.to_owned(),
+            state: arkflow_core::job::TaskAttemptState::Queued,
+        }
+    }
+
+    /// Distributed rescale: a parallelism-1 artifact restored under a
+    /// parallelism-2 plan with `rescale: true`. Each node keeps exactly the
+    /// entries whose redistributed namespace belongs to one of its assigned
+    /// tasks; the two nodes' sets are disjoint and cover every entry.
+    #[test]
+    fn agent_rescale_restore_partitions_entries_exactly_by_node() {
+        let old_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(1, true)).unwrap();
+        let old_plan = JobPlan::compile(old_spec).unwrap();
+        let new_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(2, true)).unwrap();
+        let new_plan = JobPlan::compile(new_spec).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace = arkflow_core::job::effective_state_namespace(
+            &old_plan.spec.id,
+            old_plan.spec.state.as_ref(),
+            "agg",
+            &old_task.id,
+        );
+        let keys = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ];
+        let entries = keys
+            .iter()
+            .map(|key| arkflow_core::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: format!("utf8:{key}").into_bytes(),
+                value: format!("v-{key}").into_bytes(),
+                expires_at_ms: None,
+            })
+            .collect();
+        let snapshot = arkflow_core::state::StateSnapshot::new(1, entries);
+
+        let root = std::env::temp_dir().join(format!(
+            "arkflow-agent-rescale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = CheckpointRepository::new(
+            arkflow_core::checkpoint::FileCheckpointStore::new(&root).unwrap(),
+        );
+        let mut snapshot_ref = repository
+            .write_state_snapshot("c-rescale", &snapshot)
+            .unwrap();
+        snapshot_ref.task_id = old_task.id.clone();
+        let mut manifest = arkflow_core::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-rescale".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: vec![arkflow_core::checkpoint::TaskAttemptSnapshot {
+                task_id: old_task.id.clone(),
+                attempt_id: format!("{}:n1:0", old_task.id),
+                node_id: "n1".into(),
+            }],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-rescale".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: vec![snapshot_ref],
+            format_version: 1,
+            checksum: 0,
+        };
+        manifest.seal();
+        repository
+            .write_manifest(
+                &manifest,
+                arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                arkflow_core::checkpoint::recovery_manifest_key(
+                    arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                    "c-rescale",
+                ),
+            )
+            .unwrap();
+
+        // Split the new plan's aggregate tasks across two nodes by hand.
+        let agg_tasks = new_plan
+            .tasks
+            .iter()
+            .filter(|task| task.operator_id == "agg")
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(agg_tasks.len(), 2, "parallelism 2 must plan two agg tasks");
+        let node_a = vec![
+            attempt_for(&new_plan, &agg_tasks[0], "node-a"),
+            attempt_for(&new_plan, "source-0", "node-a"),
+        ];
+        let node_b = vec![
+            attempt_for(&new_plan, &agg_tasks[1], "node-b"),
+            attempt_for(&new_plan, "sink-0", "node-b"),
+        ];
+
+        let mut restored_total = 0usize;
+        for (node, assignments) in [("node-a", &node_a), ("node-b", &node_b)] {
+            let state_root = root.join(format!("state-{node}"));
+            let backend =
+                RedbStateBackend::open(&state_root, 1).unwrap();
+            let state: Arc<dyn StateBackend> = Arc::new(backend);
+            restore_recovery_state(&new_plan, &repository, &manifest, assignments, &state, true)
+                .unwrap();
+            let assigned: BTreeSet<&str> = assignments
+                .iter()
+                .map(|assignment| assignment.task_id.as_str())
+                .collect();
+            let mut restored_here = 0usize;
+            for key in keys {
+                let group = arkflow_core::job::key_group_for_key(
+                    key.as_bytes(),
+                    new_plan.spec.max_parallelism,
+                )
+                .unwrap();
+                let owner = new_plan
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.operator_id == "agg"
+                            && task
+                                .partitions
+                                .iter()
+                                .any(|partition| partition.key_group.contains(group))
+                    })
+                    .unwrap();
+                let namespace = arkflow_core::job::effective_state_namespace(
+                    &new_plan.spec.id,
+                    new_plan.spec.state.as_ref(),
+                    "agg",
+                    &owner.id,
+                );
+                let stored = state
+                    .get(&namespace, format!("utf8:{key}").as_bytes())
+                    .unwrap();
+                if assigned.contains(owner.id.as_str()) {
+                    assert_eq!(
+                        stored.unwrap(),
+                        format!("v-{key}").into_bytes(),
+                        "{node} owns key {key}"
+                    );
+                    restored_here += 1;
+                } else {
+                    assert!(
+                        stored.is_none(),
+                        "{node} must not restore key {key} owned by {}",
+                        owner.id
+                    );
+                }
+            }
+            assert!(restored_here > 0, "{node} should own at least one key");
+            restored_total += restored_here;
+        }
+        assert_eq!(restored_total, keys.len(), "entries must partition exactly across nodes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without the rescale declaration the distributed recovery keeps the
+    /// fail-closed guard with the actionable error.
+    #[test]
+    fn agent_recovery_without_rescale_fails_closed_on_task_set_change() {
+        let old_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(1, false)).unwrap();
+        let old_plan = JobPlan::compile(old_spec).unwrap();
+        let new_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(2, false)).unwrap();
+        let new_plan = JobPlan::compile(new_spec).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let mut manifest = arkflow_core::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-guard".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: vec![arkflow_core::checkpoint::TaskAttemptSnapshot {
+                task_id: old_task.id.clone(),
+                attempt_id: format!("{}:n1:0", old_task.id),
+                node_id: "n1".into(),
+            }],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-guard".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: Vec::new(),
+            format_version: 1,
+            checksum: 0,
+        };
+        manifest.seal();
+        let error = validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, false)
+            .unwrap_err();
+        assert!(
+            error.contains("task set does not match the planned assignment"),
+            "{error}"
+        );
+        // The rescale flag waives exactly that check for the same artifact.
+        assert!(validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, true).is_ok());
+    }
+
+    /// A same-generation start whose per-node task set DIFFERS from the live
+    /// kernel's assignment must replace the kernel (the drifted mapping has
+    /// to take effect), not report a healthy no-op.
+    #[tokio::test]
+    async fn drifting_same_generation_start_replaces_the_kernel() {
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-drift").await;
+        let initial_task_count = assignments.len();
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the initial start succeeds");
+
+        // Same generation, a different (still complete and valid) task set:
+        // a two-source plan replaces the one-source plan. The kernel must be
+        // replaced with the new assignment instead of no-opping.
+        let drift_spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-drift",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "extra", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "sink"},
+                {"id": "e2", "from": "extra", "to": "sink"}
+            ],
+            "sources": [
+                {
+                    "operator_id": "source",
+                    "input_type": "generate",
+                    "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                    "time": {"mode": "processing_time"}
+                },
+                {
+                    "operator_id": "extra",
+                    "input_type": "generate",
+                    "config": {"context": "node-b", "interval": "10ms", "batch_size": 1},
+                    "time": {"mode": "processing_time"}
+                }
+            ],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        let drift_plan = JobPlan::compile(drift_spec).unwrap();
+        let drift_assignments = drift_plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .expect("colocated placement succeeds");
+        assert!(
+            drift_assignments.len() > initial_task_count,
+            "the two-source plan must assign more tasks"
+        );
+        runtime
+            .start(
+                drift_plan,
+                drift_assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the drifted start replaces the kernel");
+
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-drift").expect("the kernel stays registered");
+            assert_eq!(task.generation, 1, "the generation is unchanged");
+            let live: std::collections::BTreeSet<String> = task
+                .assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect();
+            let expected: std::collections::BTreeSet<String> = drift_assignments
+                .iter()
+                .map(|assignment| assignment.task_id.clone())
+                .collect();
+            assert_eq!(live, expected, "the kernel now runs the drifted assignment");
+            assert!(live.contains("extra-0"));
+            assert!(!task.handle.is_finished());
+        }
+
+        runtime.stop("orders-drift", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+
+    /// A Job declaring cpu_millicores runs on a dedicated runtime with
+    /// ceil(millicores/1000) workers (min 1); an undeclared Job keeps the
+    /// shared runtime (None).
+    #[tokio::test]
+    async fn declared_cpu_runs_on_a_dedicated_bounded_runtime() {
+        let runtime = Arc::new(JobRuntime::default());
+        let mut spec_value = serde_json::json!({
+            "id": "orders-cpu",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        spec_value["resources"] = serde_json::json!({"cpu_millicores": 2500});
+        let spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(spec_value).unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("declared start succeeds");
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-cpu").expect("registered");
+            let dedicated = task
+                .dedicated_runtime
+                .as_ref()
+                .expect("declared cpu jobs own a dedicated runtime");
+            assert_eq!(
+                dedicated.metrics().num_workers(),
+                3,
+                "2500 millicores => ceil(2.5) = 3 workers"
+            );
+        }
+        runtime.stop("orders-cpu", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    #[tokio::test]
+    async fn undeclared_jobs_keep_the_shared_runtime() {
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-shared").await;
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("undeclared start succeeds");
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-shared").expect("registered");
+            assert!(
+                task.dedicated_runtime.is_none(),
+                "undeclared jobs run on the shared runtime"
+            );
+        }
+        runtime.stop("orders-shared", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+
+    /// Partial data-plane TLS configuration fails closed (startup error),
+    /// never a silent plaintext fallback.
+    #[test]
+    fn partial_data_plane_tls_configuration_fails_closed() {
+        unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", "/nonexistent") };
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY") };
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA") };
+        let error = match data_plane_tls_from_env() {
+            Err(error) => error,
+            Ok(_) => panic!("partial TLS configuration must fail closed"),
+        };
+        assert!(
+            error.contains("must be set together"),
+            "{error}"
+        );
+        unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT") };
+        // Fully absent stays optional (plaintext default).
+        assert!(data_plane_tls_from_env().unwrap().is_none());
+    }
+
+
+    /// Regression for the Drop guard: a JobTask carrying a dedicated
+    /// runtime can be dropped WITHOUT the explicit retirement path — the
+    /// guard must park the shutdown on the blocking pool instead of
+    /// dropping the Arc<Runtime> inside this async context (which panics).
+    #[tokio::test]
+    async fn dropping_a_task_with_a_dedicated_runtime_never_panics() {
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("arkflow-job-dropguard-test")
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime.tasks.lock().await.insert(
+            "orders-dropguard".to_string(),
+            JobTask {
+                generation: 1,
+                ephemeral_state: false,
+                recovery_required: false,
+                cancellation: CancellationToken::new(),
+                assignments: Vec::new(),
+                dedicated_runtime: Some(Arc::new(dedicated)),
+                watermark_partitions: BTreeMap::new(),
+                state: Arc::new(
+                    arkflow_core::state::InMemoryStateBackend::new(1)
+                        .expect("in-memory test backend"),
+                ),
+                checkpoint_store_uri: None,
+                kernel: None,
+                handle: tokio::spawn(async { Ok(()) }),
+            },
+        );
+        // Drop WITHOUT calling any stop path — must not panic.
+        let dropped = runtime.tasks.lock().await.remove("orders-dropguard");
+        drop(dropped);
+        // Give the parked shutdown a moment, then prove the runtime still
+        // serves other work.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
 }

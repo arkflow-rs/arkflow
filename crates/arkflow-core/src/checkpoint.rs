@@ -573,6 +573,26 @@ pub fn evaluate_recovery_compatibility(
     format_version: u32,
     planned_tasks: &BTreeSet<String>,
 ) -> RecoveryCompatibility {
+    let verdict = evaluate_recovery_identity(manifest, expected_job_id, target_job_version, format_version);
+    if !verdict.is_compatible() {
+        return verdict;
+    }
+    if let Err(reason) = manifest_task_set_checks(manifest, planned_tasks) {
+        return RecoveryCompatibility::reject(reason);
+    }
+    RecoveryCompatibility::ok()
+}
+
+/// Checksum, Job identity, state format, and version-direction checks
+/// shared by every recovery path. Task-set equality is NOT evaluated here:
+/// rescale recovery applies these checks and then redistributes keyed state
+/// instead of demanding an identical task set.
+pub fn evaluate_recovery_identity(
+    manifest: &CheckpointManifest,
+    expected_job_id: &JobId,
+    target_job_version: JobVersion,
+    format_version: u32,
+) -> RecoveryCompatibility {
     if !manifest.verify() {
         return RecoveryCompatibility::reject(format!(
             "checkpoint '{}' checksum mismatch",
@@ -598,17 +618,28 @@ pub fn evaluate_recovery_compatibility(
             manifest.checkpoint_id, manifest.job_version.0, target_job_version.0
         ));
     }
+    RecoveryCompatibility::ok()
+}
+
+/// Duplicate-task and task-set-equality checks for exact-match recovery.
+/// Duplicates also corrupt rescale recovery (snapshot entries would be
+/// merged twice), so the duplicate half is factored into
+/// [`manifest_task_set_checks`] and reused there.
+fn manifest_task_set_checks(
+    manifest: &CheckpointManifest,
+    planned_tasks: &BTreeSet<String>,
+) -> Result<(), String> {
+    if manifest_has_duplicate_tasks(manifest) {
+        return Err(format!(
+            "checkpoint '{}' contains duplicate task entries",
+            manifest.checkpoint_id
+        ));
+    }
     let manifest_tasks = manifest
         .task_attempts
         .iter()
         .map(|attempt| attempt.task_id.clone())
         .collect::<BTreeSet<_>>();
-    if manifest_tasks.len() != manifest.task_attempts.len() {
-        return RecoveryCompatibility::reject(format!(
-            "checkpoint '{}' contains duplicate task entries",
-            manifest.checkpoint_id
-        ));
-    }
     if &manifest_tasks != planned_tasks {
         let missing = planned_tasks
             .difference(&manifest_tasks)
@@ -618,12 +649,23 @@ pub fn evaluate_recovery_compatibility(
             .difference(planned_tasks)
             .cloned()
             .collect::<Vec<_>>();
-        return RecoveryCompatibility::reject(format!(
+        return Err(format!(
             "checkpoint '{}' task set does not match the planned assignment (missing: {:?}, extra: {:?})",
             manifest.checkpoint_id, missing, extra
         ));
     }
-    RecoveryCompatibility::ok()
+    Ok(())
+}
+
+/// Whether the manifest repeats a task in its attempt records. Duplicates
+/// mean a corrupted seal and reject every recovery mode, rescale included.
+pub fn manifest_has_duplicate_tasks(manifest: &CheckpointManifest) -> bool {
+    let manifest_tasks = manifest
+        .task_attempts
+        .iter()
+        .map(|attempt| attempt.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    manifest_tasks.len() != manifest.task_attempts.len()
 }
 
 /// Require exactly one state snapshot reference per planned task.  A subset
@@ -634,13 +676,11 @@ pub fn validate_state_snapshot_task_set(
     snapshots: &[StateSnapshotRef],
     planned_tasks: &BTreeSet<String>,
 ) -> Result<(), String> {
+    validate_state_snapshot_tasks_unique(snapshots)?;
     let snapshot_tasks = snapshots
         .iter()
         .map(|snapshot| snapshot.task_id.clone())
         .collect::<BTreeSet<_>>();
-    if snapshot_tasks.len() != snapshots.len() {
-        return Err("recovery manifest contains duplicate state snapshot task references".into());
-    }
     if &snapshot_tasks != planned_tasks {
         let missing = planned_tasks
             .difference(&snapshot_tasks)
@@ -653,6 +693,22 @@ pub fn validate_state_snapshot_task_set(
         return Err(format!(
             "recovery state snapshot task set does not match the planned assignment (missing: {missing:?}, extra: {extra:?})"
         ));
+    }
+    Ok(())
+}
+
+/// Duplicate-reference check only: rescale recovery reads every snapshot in
+/// the manifest (task sets legitimately differ) but still refuses a seal
+/// that repeats a task.
+pub fn validate_state_snapshot_tasks_unique(
+    snapshots: &[StateSnapshotRef],
+) -> Result<(), String> {
+    let snapshot_tasks = snapshots
+        .iter()
+        .map(|snapshot| snapshot.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    if snapshot_tasks.len() != snapshots.len() {
+        return Err("recovery manifest contains duplicate state snapshot task references".into());
     }
     Ok(())
 }

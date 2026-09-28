@@ -219,8 +219,14 @@ entries strip the type prefix), ownership is computed as
 namespace of the task that owns that key group in the new plan. Keys and
 values are preserved byte-for-byte; an entry whose key encoding cannot be
 recognized fails recovery explicitly rather than being assigned by guesswork.
-Rescaling is a recovery-time operation — it takes effect on the restore path,
-not on a topology change of a running job (use
+The same redistribution applies to local Jobs and distributed Hub–Agent
+deployments: in the distributed path every node reads the whole artifact,
+redistributes the entries, and restores only those whose new owner is one of
+its own assignments — each entry lands on exactly one node. Keep
+`max_parallelism` unchanged across the rescale so key-group ownership stays
+stable. Rescaling is a recovery-time operation — it takes effect on the
+restore path (stop → change `parallelism` → start), not on a topology change
+of a running job (use
 [placement rebalance](#resource-aware-placement-and-rebalancing) for that).
 
 ## Control plane and compatibility
@@ -244,6 +250,27 @@ late reports from an old session are rejected without rolling back the new
 session's observation snapshot. Long checkpoints run in the background while
 heartbeats, reports, and cancellation polls continue; command failures return
 a terminal `Failed` result with correlation metadata.
+
+**Partial node failure is an incremental re-placement.** When one of several
+dispatched nodes of an automatically placed Job goes offline (or the opt-in
+rebalance policy evicts it), the reconciler keeps the remembered dispatch
+order and replaces only the failed slot in place: every surviving node keeps
+its exact task set — no restart, no re-dispatch for survivors — and a
+replacement candidate (shuffle-capable for split placements) inherits exactly
+the failed node's tasks. With no candidate available, a surviving node
+concentrates the failed slot's tasks instead of reshuffling every task across
+the reduced node set. Two guards keep this honest: a successful start only
+satisfies the dispatch skip while its recorded assignment matches the current
+mapping (a drifted claim is superseded and re-dispatched — this also covers a
+Hub restart, which re-dispatches once as an assignment confirmation), and a
+node's **failed observation invalidates its successful start** so a crashed
+kernel — for example after a remote edge exhausted its reconnect budget —
+restarts from a recovery artifact without an operator-driven restart. Under
+`placement: colocated` (the default) a surviving node's kernel is untouched by
+a peer's failure; under `placement: split` a survivor's remote edges to the
+failed node still follow the fail-closed wire protocol (bounded transparent
+reconnect, then failure), after which the guard above restarts it with the
+stable mapping.
 
 Partition edges select the downstream task by the JobPlan's key-group range
 rather than by modulo over physical source subtasks, so the same key arriving

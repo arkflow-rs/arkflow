@@ -96,6 +96,19 @@ Key points:
   rejected until a dedicated distributed multi-input runtime exists.
 - Event-time sources declare `mode`, a `timestamp_field`, watermark
   parameters, and a late-event policy (`drop`, `route`, or `update`).
+- `resources` (optional) declares per-task requests — `cpu_millicores`
+  and/or `memory_bytes`. The Job's total request is the per-task value times
+  the planned task count. Declared Jobs participate in placement accounting:
+  candidates are ranked by EFFECTIVE headroom (reported gauges minus the
+  declared allocations already placed), and a placement only fits where
+  `(allocated + share)` fits the node's capacity (CPU within
+  `node_cpu_cores × 1000`; memory within 90% of `node_memory_total_bytes`) —
+  no feasible node surfaces an explicit insufficient-capacity error instead
+  of stacking. A declared `cpu_millicores` additionally runs the Job on a
+  dedicated runtime with `ceil(millicores/1000)` worker threads (min 1), so
+  one Job cannot occupy the Agent's shared workers. This is worker-level
+  isolation, not a cgroup/container hard limit: Jobs still share the Agent
+  process. Undeclared Jobs (the default) keep byte-identical behavior.
 - `rescale: true` (default `false`) opts into rescaling recovery: a restart
   under a changed `parallelism` (or task set that keeps every operator with
   saved state in the new plan) redistributes keyed state by key-group

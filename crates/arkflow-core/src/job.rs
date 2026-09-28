@@ -420,6 +420,32 @@ pub struct JobSpec {
     /// Opt-in pressure rebalance. `None` (and a missing field) behaves
     /// exactly like `off`.
     pub rebalance: Option<RebalancePolicy>,
+    /// Optional per-task resource requests. Participates in placement
+    /// accounting/feasibility and (for `cpu_millicores`) dedicated-runtime
+    /// sizing on the Agent. Absent = undeclared: no accounting, no gating,
+    /// shared-runtime execution (byte-identical to before).
+    #[serde(default)]
+    pub resources: JobResourceSpec,
+}
+
+/// Per-task resource requests declared on a JobSpec. The Job's total
+/// request is the per-task value times the planned task count; a node's
+/// share is the per-task value times that node's assignment count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct JobResourceSpec {
+    /// Requested CPU per task in millicores (1000 = one full core).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millicores: Option<u32>,
+    /// Requested memory per task in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+}
+
+impl JobResourceSpec {
+    /// Whether the Job opted into resource accounting at all.
+    pub fn is_declared(&self) -> bool {
+        self.cpu_millicores.is_some() || self.memory_bytes.is_some()
+    }
 }
 
 fn default_max_parallelism() -> u32 {
@@ -535,6 +561,16 @@ impl JobSpec {
 
     pub fn validate(&self) -> Result<(), Error> {
         JobId::new(self.id.as_str())?;
+        if self.resources.cpu_millicores.is_some_and(|cpu| cpu == 0) {
+            return Err(Error::Config(
+                "resources.cpu_millicores must be positive".into(),
+            ));
+        }
+        if self.resources.memory_bytes.is_some_and(|memory| memory == 0) {
+            return Err(Error::Config(
+                "resources.memory_bytes must be positive".into(),
+            ));
+        }
         if let Some(state) = self.state.as_ref() {
             if state.max_pending_transactions == Some(0) {
                 // A zero bound fails every journal begin at runtime; reject it
@@ -1426,6 +1462,7 @@ mod tests {
 
     pub(super) fn base_job() -> JobSpec {
         JobSpec {
+            resources: Default::default(),
             rescale: false,
             rebalance: None,
             placement: PlacementStrategy::Colocated,
@@ -2211,6 +2248,58 @@ mod placement_tests {
         .unwrap();
         assert_eq!(explicit.rebalance,
             Some(RebalancePolicy { mode: RebalanceMode::Auto, pressure_streak: 5, cooldown_ms: 60_000 }));
+    }
+
+
+    #[test]
+    fn resource_declarations_parse_per_task_and_validate() {
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "quota-job",
+            "version": 1,
+            "resources": {"cpu_millicores": 500, "memory_bytes": 268435456},
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "e", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        assert!(spec.resources.is_declared());
+        assert_eq!(spec.resources.cpu_millicores, Some(500));
+        assert_eq!(spec.resources.memory_bytes, Some(268_435_456));
+        spec.validate().unwrap();
+
+        let undeclared: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "plain-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "e", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        assert!(!undeclared.resources.is_declared());
+        undeclared.validate().unwrap();
+
+        let zero: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "zero-job",
+            "version": 1,
+            "resources": {"cpu_millicores": 0},
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "e", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        assert!(zero.validate().is_err());
     }
 
 }

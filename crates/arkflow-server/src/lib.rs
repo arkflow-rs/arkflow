@@ -45,6 +45,13 @@ pub const API_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// PEM file path for the control-plane TLS certificate. Both this and
+    /// `tls_key` must be set to serve TLS; one without the other fails
+    /// startup.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_address")]
@@ -89,6 +96,8 @@ impl ServerConfig {
             api_prefix: health.api_prefix.clone(),
             health_path: health.health_path.clone(),
             readiness_path: health.readiness_path.clone(),
+            tls_cert: None,
+            tls_key: None,
             liveness_path: health.liveness_path.clone(),
             cors_origins: health.cors_origins.clone(),
             node_token: health.node_token.clone(),
@@ -146,6 +155,8 @@ impl Default for ServerConfig {
             api_prefix: default_api_prefix(),
             health_path: default_health_path(),
             readiness_path: default_readiness_path(),
+            tls_cert: None,
+            tls_key: None,
             liveness_path: default_liveness_path(),
             cors_origins: Vec::new(),
             node_token: None,
@@ -375,6 +386,16 @@ pub async fn serve_observability(
 /// reports stored in `Hub`.
 pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     let prefix = config.api_prefix.trim_end_matches('/');
+    // Standby allowlist: probes the load balancer needs to route traffic to
+    // the leader, plus the metrics export. Everything else is gated on
+    // leadership so a standby never serves its (stale or empty) memory view.
+    let standby_allowlist: std::sync::Arc<[String]> = vec![
+        config.health_path.clone(),
+        config.readiness_path.clone(),
+        config.liveness_path.clone(),
+        format!("{prefix}/metrics"),
+    ]
+    .into();
     let api = Router::new()
         .route("/system", get(hub_system))
         .route("/nodes", get(hub_nodes))
@@ -466,7 +487,29 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route(&config.readiness_path, get(hub_readiness))
         .route(&config.liveness_path, get(hub_liveness))
         .nest(prefix, api)
-        .with_state(hub)
+        .with_state(hub.clone())
+        .layer(middleware::from_fn(
+            move |request: axum::extract::Request, next: Next| {
+                let hub = hub.clone();
+                let allowlist = standby_allowlist.clone();
+                async move {
+                    if hub.is_leader().await {
+                        return next.run(request).await;
+                    }
+                    let path = request.uri().path();
+                    if allowlist.iter().any(|allowed| allowed == path) {
+                        return next.run(request).await;
+                    }
+                    problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "hub_standby",
+                        "This Hub instance is a standby and does not hold the control-plane \
+                         lease; retry against the elected leader"
+                            .into(),
+                    )
+                }
+            },
+        ))
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .layer(middleware::from_fn(correlation_middleware))
         .layer(TraceLayer::new_for_http());
@@ -483,6 +526,65 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     }
 }
 
+/// axum `Listener` adapter wrapping the TCP listener in TLS: every accepted
+/// connection completes the TLS handshake before the service sees it. Routes,
+/// auth, and readiness semantics are untouched (TLS lives below them).
+struct HubTlsListener {
+    inner: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl HubTlsListener {
+    async fn accept_one(
+        &mut self,
+    ) -> (
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    ) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    // Bounded handshake so a stalled peer cannot hold the
+                    // accept loop (the handshake runs inline here because
+                    // the axum Listener contract returns the IO directly).
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        self.acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tls_stream)) => return (tls_stream, peer),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "hub TLS handshake failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!("hub TLS handshake timed out");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "hub TLS accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+}
+
+impl axum::serve::Listener for HubTlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        self.accept_one()
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
 pub async fn serve_hub(
     hub: hub::Hub,
     config: ServerConfig,
@@ -492,8 +594,25 @@ pub async fn serve_hub(
         return Ok(());
     }
     let address = config.validate_hub_startup(&hub)?;
+    // HA election (hub-ha stage 2): an HA-enabled Hub starts as standby and
+    // earns leadership through the durable lease. Enabling HA without
+    // durable storage is rejected before anything binds: a standby has no
+    // lease to compete for without the store.
+    if hub.ha_config().enabled && !hub.has_storage() {
+        return Err(
+            "HA election requires durable storage: set ARKFLOW_HUB_STORAGE (PostgreSQL for multi-instance deployments)"
+                .into(),
+        );
+    }
     arkflow_plugin::initialize()?;
-    hub.recover_persisted_state().await?;
+    hub.enter_election().await;
+    if !hub.is_leader().await {
+        tracing::info!(
+            "HA standby: durable recovery is deferred until this instance acquires the lease"
+        );
+    } else {
+        hub.recover_persisted_state().await?;
+    }
     if !hub.operator_token_is_set() {
         tracing::warn!(
             "Hub is running WITHOUT an operator token: every operator API grants full Admin access. \
@@ -511,21 +630,89 @@ pub async fn serve_hub(
     // readiness): the terminal-state dispatch-skip memory and the operations
     // read API must reflect durable history before any reconcile tick or
     // operator request runs. Manual `hub_router` test setups do not restart
-    // the Hub and skip this path by construction.
-    if hub.has_storage() {
+    // the Hub and skip this path by construction. A standby defers this: it
+    // must not write terminal settlements while another Hub is leader —
+    // promotion re-runs the restore after winning the lease.
+    if hub.has_storage() && hub.is_leader().await {
         let restored = hub.restore_persisted_operations().await?;
         tracing::info!(
             restored,
             "restored persisted operations into the in-memory registry"
         );
     }
+    // Control-plane TLS: both materials or neither — a half-configured
+    // listener must fail startup rather than silently serve plaintext.
+    let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
+        (None, None) => None,
+        (Some(cert_path), Some(key_path)) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
+                format!("hub TLS certificate '{cert_path}' could not be read: {error}")
+            })?;
+            let key_pem = std::fs::read_to_string(key_path).map_err(|error| {
+                format!("hub TLS key '{key_path}' could not be read: {error}")
+            })?;
+            let mut chain = Vec::new();
+            for item in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
+                chain.push(item.map_err(|error| {
+                    format!("hub TLS certificate parse failed: {error}")
+                })?);
+            }
+            if chain.is_empty() {
+                return Err("hub TLS certificate contains no PEM certificates".into());
+            }
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .map_err(|error| format!("hub TLS key parse failed: {error}"))?
+                .ok_or("hub TLS key contains no PEM private key")?;
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .map_err(|error| format!("hub TLS config rejected: {error}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                server_config,
+            )))
+        }
+        _ => {
+            return Err(
+                "hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into(),
+            )
+        }
+    };
     let listener = TcpListener::bind(address).await?;
+    // Lease election loop: leaders renew at ttl/3, standbys probe for
+    // takeover. Failover is bounded by the lease TTL plus one probe.
+    if hub.ha_config().enabled {
+        let election_hub = hub.clone();
+        let election_cancel = cancellation.clone();
+        let probe_ms = (hub.ha_config().lease_ttl_ms / 3).max(1_000);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(probe_ms));
+            interval
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => { election_hub.run_election_tick().await; }
+                    _ = election_cancel.cancelled() => break,
+                }
+            }
+        });
+    }
     let sweep_hub = hub.clone();
     let sweep_cancel = cancellation.clone();
     let sweep_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
-            tokio::select! { _ = interval.tick() => sweep_hub.mark_stale().await, _ = sweep_cancel.cancelled() => break }
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Standbys neither age out node leases nor observe
+                    // reports: the leader owns fleet state.
+                    if sweep_hub.is_leader().await {
+                        sweep_hub.mark_stale().await;
+                    }
+                }
+                _ = sweep_cancel.cancelled() => break,
+            }
         }
     });
     let reconcile_hub = hub.clone();
@@ -537,6 +724,11 @@ pub async fn serve_hub(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Reconciliation dispatches commands and mutates durable
+                    // desired state: leader-only by definition.
+                    if !reconcile_hub.is_leader().await {
+                        continue;
+                    }
                     let _ = reconcile_hub.expire_attempts().await;
                     let _ = reconcile_hub.schedule_periodic_checkpoints().await;
                     let started = crate::hub::now_ms_for_metrics();
@@ -562,6 +754,9 @@ pub async fn serve_hub(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    if !maintenance_hub.is_leader().await {
+                        continue;
+                    }
                     let _ = maintenance_hub.prune_events(2048).await;
                     let _ = maintenance_hub.prune_operation_history().await;
                     let _ = maintenance_hub.prune_stale_checkpoint_records().await;
@@ -573,9 +768,31 @@ pub async fn serve_hub(
             }
         }
     });
-    let result = axum::serve(listener, hub_router(hub, &config).into_make_service())
-        .with_graceful_shutdown(cancellation.cancelled_owned())
-        .await;
+    let router = hub_router(hub.clone(), &config).into_make_service();
+    let result = match tls_acceptor {
+        Some(acceptor) => {
+            let tls_listener = HubTlsListener {
+                inner: listener,
+                acceptor,
+            };
+            axum::serve(tls_listener, router)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    hub.release_leadership().await;
+                })
+                .await
+        }
+        None => {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    // Release the lease before the listener drains so a standby can
+                    // take over immediately instead of waiting out the TTL.
+                    hub.release_leadership().await;
+                })
+                .await
+        }
+    };
     sweep_task.abort();
     reconcile_task.abort();
     maintenance_task.abort();
@@ -592,8 +809,9 @@ async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
         );
     }
     let nodes = hub.nodes().await;
+    let leadership = hub.leadership().await;
     Json(
-        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"]}),
+        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}}),
     ).into_response()
 }
 
@@ -2801,7 +3019,41 @@ async fn hub_health(State(hub): State<hub::Hub>) -> Response {
     }
 }
 async fn hub_readiness(State(hub): State<hub::Hub>) -> Response {
-    match hub.operational_status().await { Ok(status) if status.ready => (StatusCode::OK, Json(serde_json::json!({"status":"ready","ready":true}))).into_response(), Ok(_status) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"startup_recovery"}))).into_response(), Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"storage_unavailable"}))).into_response() }
+    let leadership = hub.leadership().await;
+    let ha = serde_json::json!({
+        "enabled": hub.ha_config().enabled,
+        "role": leadership.role(),
+        "epoch": leadership.epoch(),
+    });
+    if !leadership.is_leader() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "ready": false,
+                "reason": "standby",
+                "ha": ha,
+            })),
+        )
+            .into_response();
+    }
+    match hub.operational_status().await {
+        Ok(status) if status.ready => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status":"ready","ready":true,"ha":ha})),
+        )
+            .into_response(),
+        Ok(_status) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"startup_recovery","ha":ha})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"storage_unavailable","ha":ha})),
+        )
+            .into_response(),
+    }
 }
 async fn hub_liveness() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive","alive":true}))
@@ -3889,6 +4141,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ha_enabled_without_storage_fails_before_binding() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        })
+        .with_ha(hub::HubHaConfig {
+            enabled: true,
+            ..hub::HubHaConfig::default()
+        });
+        let config = ServerConfig {
+            address: "127.0.0.1:0".into(),
+            insecure_local: true,
+            ..ServerConfig::default()
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let error = serve_hub(hub, config, cancellation).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HA election requires durable storage"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -5499,4 +5780,105 @@ mod tests {
         let page: Page<hub::HubNode> = serde_json::from_slice(&body).unwrap();
         page.items
     }
+
+    fn hub_tls_material() -> (std::path::PathBuf, std::path::PathBuf) {
+        use rcgen::CertificateParams;
+        use rcgen::KeyPair;
+        let params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "arkflow-hub-tls-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn hub_tls_listener_serves_readiness_over_https() {
+        let (cert_path, key_path) = hub_tls_material();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let config = ServerConfig {
+            address: format!("127.0.0.1:{port}"),
+            insecure_local: true,
+            tls_cert: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key: Some(key_path.to_string_lossy().into_owned()),
+            ..ServerConfig::default()
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let shutdown = cancellation.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_hub(hub, config, shutdown).await {
+                eprintln!("SERVE_HUB ERROR: {error}");
+            }
+        });
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let mut served = false;
+        for _ in 0..100 {
+            if let Ok(response) = client
+                .get(format!("https://127.0.0.1:{port}/readiness"))
+                .send()
+                .await
+            {
+                // The response status itself is the plaintext readiness
+                // semantics (503 without storage); what matters here is
+                // that the TLS handshake completed and HTTP was served.
+                let _ = response.status();
+                served = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(served, "the TLS hub must serve https requests");
+        cancellation.cancel();
+        let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn half_configured_hub_tls_fails_startup() {
+        let (cert_path, _key_path) = hub_tls_material();
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let config = ServerConfig {
+            address: "127.0.0.1:0".into(),
+            insecure_local: true,
+            tls_cert: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key: None,
+            ..ServerConfig::default()
+        };
+        let error = serve_hub(hub, config, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("both ARKFLOW_HUB_TLS_CERT"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+    }
+
 }

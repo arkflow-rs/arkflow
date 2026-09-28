@@ -107,7 +107,9 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 ### Requirement: 恢复工件的任务集兼容性 SHALL 在恢复前校验
 
-带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致。无状态作业不产出可恢复工件：封存校验拒绝无状态快照的 manifest，本地恢复选择也仅作用于带持久状态的计划，因此无状态作业不触发该校验，变更并行度后按新并行度直接编译运行。
+带状态恢复在选择恢复工件后 SHALL 比对工件 `task_attempts` 记录的任务集与当前编译计划的任务集；不一致（并行度或算子拓扑变更导致）SHALL 以显式配置错误失败，错误信息 SHALL 说明 keyed 状态尚不能跨并行度重分布，并给出恢复原并行度或以新 checkpoint/savepoint 重置状态两条出路——**除非 JobSpec 声明 `rescale: true`**：此时本地恢复与分布式 Agent 恢复 SHALL 按声明的重分布语义执行（见下）。任务集一致时行为与现状逐位一致（本地与分布式路径均如此）。无状态作业不产出可恢复工件：封存校验拒绝无状态快照的 manifest，本地恢复选择也仅作用于带持久状态的计划，因此无状态作业不触发该校验，变更并行度后按新并行度直接编译运行。
+
+允许任务集差异的校验放宽 SHALL 是显式参数且以 `rescale: true` 为前提：校验和、Job 身份、状态格式、版本方向与重复项检查在放宽下逐条保持；仅任务集相等性被跳过。Hub 的恢复工件选择在 `rescale: true` 时应用同一放宽，使变更并行度后的 start 不会在工件选择一步被拒绝。
 
 #### Scenario: 变更并行度后恢复显式失败
 
@@ -117,16 +119,23 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 #### Scenario: 拓扑不变时零行为变化
 
 - **WHEN** 一个作业以与封存时相同的任务集恢复
-- **THEN** 校验通过，恢复流程与现状逐位一致
+- **THEN** 校验通过，恢复流程与现状逐位一致（含分布式 Agent 路径按本节点 assignment 过滤快照的既有行为）
 
 #### Scenario: 无状态作业变更并行度
 
 - **WHEN** 一个无状态作业变更并行度重启
 - **THEN** 不触发该校验（无状态作业不产出可恢复工件），作业按新并行度正常编译运行
 
+#### Scenario: 分布式 Job 变更并行度后工件仍可选
+
+- **WHEN** 一个声明 rescale 的分布式 Job 在并行度变更后启动，持久库中只有旧并行度封存的 completed checkpoint
+- **THEN** Hub 的恢复工件选择不因任务集差异拒绝该工件，Agent 收到带该工件的 start 命令
+
 ### Requirement: 声明 rescale 的恢复 SHALL 按 key-group 重分布 keyed 状态
 
 `rescale: true` 的 Job 在恢复工件任务集与当前计划不一致时 SHALL 重分布快照条目：从条目命名空间解析算子，从状态键按算子编码白名单（窗口：跳过 8 字节 window_start 取 utf8 键；StatefulOperator：剥类型前缀，整数大端/utf8/binary 原样；`null:<tag>` 哨兵整条）还原**路由哈希输入**，以 `key_group_for_key(输入, max_parallelism)` 计算归属，把条目命名空间重写为新 plan 中拥有该 key-group 的任务。键与值逐字节保留。无法识别的键编码、或条目所属算子不存在于新计划时，SHALL 显式失败（重分布仅支持保留原有状态算子的任务集变更，如并行度调整）。
+
+本地与分布式路径 SHALL 复用同一重分布实现（同一编码白名单与归属解析）。分布式 Agent 恢复 SHALL 读取工件的全部状态快照执行重分布，并仅把重分布后命名空间属于本节点 assignment 的条目恢复进本节点状态后端——每个条目在全集群恰好被一个节点恢复。
 
 #### Scenario: stateful 条目按新归属落位
 
@@ -142,3 +151,14 @@ Hub authorization, Agent validation, repository validation, and runtime restore 
 
 - **WHEN** 条目键不符合任何白名单编码
 - **THEN** 恢复以显式错误失败，不执行猜测性归属
+
+#### Scenario: 分布式重分布按节点恰好切分
+
+- **WHEN** 一个分布式 Job 以并行度 1 的 savepoint 声明 rescale 恢复到并行度 2（任务分属节点 A 与 B）
+- **THEN** 节点 A 与 B 各自恢复重分布后属于自己的条目，两边条目集合不相交且并集等于快照全部条目，任一节点都不恢复不属于自己 assignment 的任务命名空间
+
+#### Scenario: 任务集一致时不走重分布路径
+
+- **WHEN** 一个声明 rescale 的作业以与工件一致的任务集恢复
+- **THEN** 恢复按既有路径执行（按 assignment 过滤快照、无重分布），行为与未声明 rescale 时一致
+

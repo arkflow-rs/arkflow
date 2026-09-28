@@ -539,11 +539,15 @@ fn job_spec_json(id: &str) -> String {
 }
 
 fn resource_metrics(used_ratio: f64, cpu: f64) -> BTreeMap<String, f64> {
-    BTreeMap::from([
+    let mut metrics = BTreeMap::from([
         ("node_memory_total_bytes".to_string(), 16_000.0),
         ("node_memory_used_bytes".to_string(), 16_000.0 * used_ratio),
         ("node_cpu_usage_percent".to_string(), cpu),
-    ])
+        // Two logical cores = 2000 millicores of declared capacity.
+        ("node_cpu_cores".to_string(), 2.0),
+    ]);
+    metrics.retain(|_, value| value.is_finite() && *value >= 0.0);
+    metrics
 }
 
 fn shuffle_capabilities() -> Vec<String> {
@@ -672,6 +676,63 @@ async fn complete_start_commands(hub: &Hub, node_id: &str, session_token: &str) 
     }
 }
 
+/// One poll that both extracts the node's start task ids AND completes the
+/// command: `commands()` leases on first delivery, so a test must not poll
+/// twice (the second poll sees nothing and the start stays Dispatched).
+async fn poll_start_tasks_and_complete(
+    hub: &Hub,
+    node_id: &str,
+    session_token: &str,
+) -> Vec<String> {
+    let auth = AgentAuth {
+        node_id: node_id.into(),
+        session_token: session_token.into(),
+    };
+    let mut tasks = Vec::new();
+    for command in hub.commands(auth.clone()).await.unwrap() {
+        if command.operation == "job_start" {
+            let mut command_tasks: Vec<String> = command
+                .payload
+                .as_ref()
+                .expect("job_start payload")["assignments"]
+                .as_array()
+                .map(|assignments| {
+                    assignments
+                        .iter()
+                        .filter_map(|assignment| {
+                            assignment["task_id"].as_str().map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            command_tasks.sort();
+            tasks = command_tasks;
+        }
+        hub.command_result(
+            auth.clone(),
+            CommandResult {
+                command_id: command.id,
+                operation_id: command.operation_id,
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: command.correlation_id,
+                generation: command.generation,
+                observed_generation: None,
+                action_id: None,
+                failure_class: None,
+                config_version_id: command.config_version_id,
+                rollout_id: command.rollout_id,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    tasks
+}
+
 #[test]
 fn rank_candidates_is_deterministic_and_prefers_headroom() {
     let now = now_ms();
@@ -718,7 +779,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
         nodes.insert(id.to_string(), record);
     }
     let rank = |candidates: Vec<String>| {
-        rank_candidates(candidates, &nodes, now)
+        rank_candidates(candidates, &nodes, now, &NodeAllocations::new())
             .into_iter()
             .collect::<Vec<_>>()
     };
@@ -1397,9 +1458,10 @@ async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
     .await
     .unwrap();
 
-    // Sustained pressure on node-a trips the eviction, but the surviving
-    // candidate set contains the incapable node: the reconcile must fail
-    // validation BEFORE fencing, leaving the live placement untouched.
+    // Sustained pressure on node-a trips the eviction. The incremental
+    // re-placement never lets the incapable node into the target set: the
+    // failed slot concentrates onto the capable survivor instead, the
+    // placement survives, and the evicted node is fenced.
     report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
     report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
     let job_record = hub
@@ -1409,28 +1471,31 @@ async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
         .into_iter()
         .find(|record| record.job_id == "orders")
         .expect("job record");
-    let error = hub.reconcile_job(&job_record).await.unwrap_err();
-    assert!(
-        matches!(error, HubError::Invalid(_)),
-        "validation must fail the reconcile: {error}"
-    );
-    // Fleet-level reconcile swallows the invalid placement as a skipped
-    // tick (pre-existing semantics) — the live placement stays untouched.
-    hub.reconcile_jobs().await.unwrap();
-
+    hub.reconcile_job(&job_record).await.unwrap();
+    // node-a's successful start is superseded and it receives a stop.
     let starts = start_operations(&hub, "orders").await;
     assert!(
-        starts
-            .iter()
-            .all(|operation_record| operation_record.state == HubOperationState::Succeeded),
-        "no start may be superseded while the target set is invalid: {starts:?}"
+        starts.iter().any(|operation_record| {
+            operation_record.node_id == "node-a"
+                && operation_record.state == HubOperationState::Superseded
+        }),
+        "the evicted node's start must be superseded: {starts:?}"
     );
     assert!(
         hub.operations(None)
             .await
             .iter()
-            .all(|operation_record| operation_record.operation != "job_stop"),
-        "no stop command may be dispatched while the target set is invalid"
+            .any(|operation_record| operation_record.node_id == "node-a"
+                && operation_record.operation == "job_stop"),
+        "the evicted node must receive a stop command"
+    );
+    // node-plain never entered the target set: it holds no start of the
+    // placement.
+    assert!(
+        !starts
+            .iter()
+            .any(|operation_record| operation_record.node_id == "node-plain"),
+        "the incapable node must never host the split placement: {starts:?}"
     );
 }
 
@@ -1496,9 +1561,11 @@ async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
         complete_start_commands(&hub, node_id, token).await;
     }
 
-    // A plain node joins and trips the eviction into an invalid target
-    // set: the reconcile fails validation (no fencing, no dispatch) —
-    // and must not record that never-dispatched order either.
+    // A plain node joins; both capable nodes of the placement go into
+    // maintenance: the reconcile fails split validation (no fencing, no
+    // dispatch) — and must not record that never-dispatched order either.
+    // Maintenance (not lease expiry) keeps the successful starts intact,
+    // unlike a stale sweep which settles their operations.
     hub.register(RegisterRequest {
         data_address: None,
         node_id: "node-plain".into(),
@@ -1509,8 +1576,14 @@ async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
     })
     .await
     .unwrap();
-    report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 2).await;
-    report_shuffle_node(&hub, &auth_a, 0.99, 5.0, 3).await;
+    {
+        let mut nodes = hub.nodes.write().await;
+        for node_id in ["node-a", "node-b"] {
+            if let Some(node) = nodes.get_mut(node_id) {
+                node.resource.maintenance_state = NodeMaintenanceState::Maintenance;
+            }
+        }
+    }
     let job_record = hub
         .jobs()
         .await
@@ -1520,9 +1593,16 @@ async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
         .expect("job record");
     assert!(hub.reconcile_job(&job_record).await.is_err());
 
-    // Pressure subsides; the placement is retained in its original
-    // order, so the version bump re-dispatches the same mapping.
-    report_shuffle_node(&hub, &auth_a, 0.1, 10.0, 4).await;
+    // The maintained nodes return; the placement is retained in its
+    // original order, so the version bump re-dispatches the same mapping.
+    {
+        let mut nodes = hub.nodes.write().await;
+        for node_id in ["node-a", "node-b"] {
+            if let Some(node) = nodes.get_mut(node_id) {
+                node.resource.maintenance_state = NodeMaintenanceState::Active;
+            }
+        }
+    }
     let mut bumped: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
     bumped["placement"] = serde_json::json!("split");
     bumped["rebalance"] =
@@ -1739,4 +1819,553 @@ async fn rebalance_cooldown_blocks_a_move_inside_the_window() {
         .await
         .iter()
         .all(|operation_record| operation_record.operation != "job_stop"));
+}
+
+/// Partial node failure: only the failed node's tasks move. A replacement
+/// candidate takes the failed slot IN the remembered dispatch order, so
+/// every surviving node's task set stays byte-identical (no restart, no
+/// re-dispatch for survivors), and the failed node is fenced.
+#[tokio::test]
+async fn partial_node_failure_moves_only_the_failed_tasks() {
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for (index, node_id) in ["node-a", "node-b", "node-c", "node-d"]
+        .into_iter()
+        .enumerate()
+    {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: Some(format!("{node_id}:9100")),
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: shuffle_capabilities(),
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+        // Distinct memory usage produces a deterministic ranked order:
+        // a > b > c > d.
+        let auth = AgentAuth {
+            node_id: node_id.into(),
+            session_token: sessions[node_id].clone(),
+        };
+        report_shuffle_node(&hub, &auth, 0.1 + 0.1 * index as f64, 10.0, 1).await;
+    }
+
+    let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+    spec["placement"] = serde_json::json!("split");
+    spec["parallelism"] = serde_json::json!(2);
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+
+    let mut initial = BTreeMap::new();
+    for node_id in ["node-a", "node-b", "node-c", "node-d"] {
+        let tasks = poll_start_tasks_and_complete(&hub, node_id, &sessions[node_id]).await;
+        assert_eq!(tasks.len(), 1, "one task per node: {tasks:?}");
+        initial.insert(node_id.to_string(), tasks);
+    }
+
+    // A fresh shuffle node joins the fleet after the dispatch: it is the
+    // replacement candidate for any failed slot.
+    let session_e = hub
+        .register(RegisterRequest {
+            data_address: Some("node-e:9100".into()),
+            node_id: "node-e".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: shuffle_capabilities(),
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    sessions.insert("node-e".to_string(), session_e.session_token.clone());
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-e".into(),
+            session_token: sessions["node-e"].clone(),
+        },
+        0.9,
+        10.0,
+        1,
+    )
+    .await;
+
+    // node-c fails; node-e is the replacement candidate.
+    hub.nodes.write().await.get_mut("node-c").unwrap().resource.maintenance_state =
+        NodeMaintenanceState::Maintenance;
+    let job_record = hub
+        .jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.job_id == "orders")
+        .expect("job record");
+    hub.reconcile_job(&job_record).await.unwrap();
+
+    // Survivors: no new start command (their assignments are unchanged) and
+    // their successful starts stay satisfied.
+    for node_id in ["node-a", "node-b", "node-d"] {
+        let auth = AgentAuth {
+            node_id: node_id.into(),
+            session_token: sessions[node_id].clone(),
+        };
+        let commands = hub.commands(auth).await.unwrap();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.operation == "job_start"),
+            "survivor {node_id} must not be re-dispatched"
+        );
+    }
+    // The replacement inherits exactly the failed node's task.
+    let inherited = poll_start_tasks_and_complete(&hub, "node-e", &sessions["node-e"]).await;
+    assert_eq!(
+        inherited,
+        initial["node-c"],
+        "the replacement node takes over exactly the failed node's task"
+    );
+    // The failed node is fenced: its start is superseded (the stop command
+    // itself is only deliverable once the node is reachable again — an
+    // unreachable node accepts no commands by design).
+    let starts = start_operations(&hub, "orders").await;
+    assert!(starts.iter().any(|operation| {
+        operation.node_id == "node-c" && operation.state == HubOperationState::Superseded
+    }));
+}
+
+/// With no replacement candidate the failed slot concentrates onto a
+/// surviving node (keeping the list length — and every other mapping —
+/// stable) instead of reshuffling all tasks across the reduced set.
+#[tokio::test]
+async fn no_replacement_candidate_concentrates_the_failed_slot() {
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for (index, node_id) in ["node-a", "node-b"].into_iter().enumerate() {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: Some(format!("{node_id}:9100")),
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: shuffle_capabilities(),
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+        let auth = AgentAuth {
+            node_id: node_id.into(),
+            session_token: sessions[node_id].clone(),
+        };
+        report_shuffle_node(&hub, &auth, 0.1 + 0.1 * index as f64, 10.0, 1).await;
+    }
+
+    let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+    spec["placement"] = serde_json::json!("split");
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+
+    let on_a = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    let on_b = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+    assert_eq!(on_a.len(), 1);
+    assert_eq!(on_b.len(), 1);
+
+    // node-b fails with no candidate available: node-a duplicates into the
+    // slot, which also drifts its own assignment — the stale start is
+    // superseded and a fresh start with the combined task set dispatches.
+    hub.nodes.write().await.get_mut("node-b").unwrap().resource.maintenance_state =
+        NodeMaintenanceState::Maintenance;
+    let job_record = hub
+        .jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.job_id == "orders")
+        .expect("job record");
+    hub.reconcile_job(&job_record).await.unwrap();
+
+    let mut combined = on_a.clone();
+    combined.extend(on_b.iter().cloned());
+    combined.sort();
+    let mut replacement = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    replacement.sort();
+    assert_eq!(
+        replacement, combined,
+        "the survivor must receive both slots' tasks"
+    );
+    let starts = start_operations(&hub, "orders").await;
+    assert!(starts.iter().any(|operation| {
+        operation.node_id == "node-b" && operation.state == HubOperationState::Superseded
+    }));
+}
+
+/// A Succeeded start whose recorded assignment fingerprint is gone (a Hub
+/// restart wiped the memory) is superseded and re-dispatched once with the
+/// same assignment; after the confirmation completes, the skip holds again.
+#[tokio::test]
+async fn lost_fingerprint_memory_supersedes_and_redispatches_once() {
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for node_id in ["node-a", "node-b"] {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: Some(format!("{node_id}:9100")),
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: shuffle_capabilities(),
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+    }
+    let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+    spec["placement"] = serde_json::json!("split");
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let auth_a = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: sessions["node-a"].clone(),
+    };
+    let original = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+
+    // Simulate the Hub restart: the fingerprint memory (and the order
+    // memory) are gone.
+    hub.start_dispatch_fingerprints.write().await.clear();
+    hub.placement_order.write().await.remove("orders");
+    let job_record = hub
+        .jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.job_id == "orders")
+        .expect("job record");
+    hub.reconcile_job(&job_record).await.unwrap();
+
+    let starts = start_operations(&hub, "orders").await;
+    assert!(
+        starts.iter().any(|operation| {
+            operation.node_id == "node-a" && operation.state == HubOperationState::Superseded
+        }),
+        "the unprovable start must be superseded: {starts:?}"
+    );
+    // The re-dispatch carries the same task (sorted previous-node order is
+    // deterministic), and completing it restores the steady-state skip.
+    assert_eq!(
+        poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await,
+        original,
+        "the confirmation re-dispatch keeps the assignment stable"
+    );
+    poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+    hub.reconcile_job(&job_record).await.unwrap();
+    let commands = hub.commands(auth_a).await.unwrap();
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.operation == "job_start"),
+        "after the confirmation the dispatch skip holds again"
+    );
+}
+
+/// A failed runtime observation invalidates the node's Succeeded start so
+/// the reconciler re-dispatches it (a crashed kernel no longer waits for an
+/// operator-driven generation bump).
+#[tokio::test]
+async fn failed_observation_redispatches_the_nodes_start() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: job_spec_json("orders"),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    poll_start_tasks_and_complete(&hub, "node-a", &session.session_token).await;
+    // Steady state: the succeeded start satisfies the skip.
+    let job_record = hub
+        .jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.job_id == "orders")
+        .expect("job record");
+    hub.reconcile_job(&job_record).await.unwrap();
+    assert!(
+        !hub.commands(auth.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|command| command.operation == "job_start")
+    );
+
+    // The kernel dies (for example a remote edge exhausted its reconnect
+    // budget) and the agent reports the failure.
+    hub.report_job_observation(JobObservationRequest {
+        auth: auth.clone(),
+        job_id: "orders".into(),
+        generation: 1,
+        state: "failed".into(),
+        error: Some("remote edge failed".into()),
+    })
+    .await
+    .unwrap();
+    let starts = start_operations(&hub, "orders").await;
+    assert!(
+        starts.iter().any(|operation| {
+            operation.state == HubOperationState::TimedOut
+                && operation.failure_class.as_deref() == Some("recovery_required")
+        }),
+        "the succeeded start must be settled for re-dispatch: {starts:?}"
+    );
+    hub.reconcile_job(&job_record).await.unwrap();
+    assert!(
+        hub.commands(auth)
+            .await
+            .unwrap()
+            .iter()
+            .any(|command| command.operation == "job_start"),
+        "the reconcile must re-dispatch the start after the runtime failure"
+    );
+}
+
+/// A Job declaring more CPU than any node's declared capacity surfaces an
+/// explicit insufficient-capacity error instead of stacking onto the fleet.
+#[tokio::test]
+async fn declared_cpu_beyond_capacity_fails_explicitly() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    report_shuffle_node(&hub, &auth, 0.1, 10.0, 1).await;
+    // 2 cores = 2000 millicores; the colocated Job's two tasks request
+    // 1500 each = 3000 total.
+    let mut spec: serde_json::Value = serde_json::from_str(&job_spec_json("orders")).unwrap();
+    spec["resources"] = serde_json::json!({"cpu_millicores": 1500});
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap_err();
+}
+
+/// A declared Job fits a node whose remaining declared capacity covers its
+/// share, and ranking prefers the node with more EFFECTIVE headroom when
+/// raw gauges are equal.
+#[tokio::test]
+async fn declared_job_lands_on_effective_headroom() {
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for node_id in ["node-a", "node-b"] {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: None,
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: vec![],
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+    }
+    // Identical gauges: 2 cores, low usage, plenty of memory.
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-a".into(),
+            session_token: sessions["node-a"].clone(),
+        },
+        0.1,
+        10.0,
+        1,
+    )
+    .await;
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-b".into(),
+            session_token: sessions["node-b"].clone(),
+        },
+        0.1,
+        10.0,
+        1,
+    )
+    .await;
+
+    // A first declared Job lands on node-a (node-id tie-break) and holds
+    // 1600 of node-a's 2000 millicores.
+    let mut heavy: serde_json::Value = serde_json::from_str(&job_spec_json("heavy")).unwrap();
+    heavy["resources"] = serde_json::json!({"cpu_millicores": 800});
+    hub.upsert_job(JobRecord {
+        job_id: "heavy".into(),
+        version: 1,
+        spec_json: heavy.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let heavy_tasks = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    assert_eq!(heavy_tasks.len(), 2, "the colocated job lands whole: {heavy_tasks:?}");
+
+    // The second declared Job needs 400 millicores: node-a's effective
+    // headroom is 400 millicores and its effective memory ratio dropped,
+    // so node-b ranks first and the job lands there.
+    let mut light: serde_json::Value = serde_json::from_str(&job_spec_json("light")).unwrap();
+    light["resources"] = serde_json::json!({"cpu_millicores": 200});
+    hub.upsert_job(JobRecord {
+        job_id: "light".into(),
+        version: 1,
+        spec_json: light.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let light_tasks = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+    assert_eq!(light_tasks.len(), 2, "the light job lands whole on node-b: {light_tasks:?}");
+}
+
+/// Undeclared Jobs are never gated: the same loaded node still receives
+/// them exactly as before.
+#[tokio::test]
+async fn undeclared_jobs_bypass_the_resource_gate() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    let auth = AgentAuth {
+        node_id: "node-a".into(),
+        session_token: session.session_token.clone(),
+    };
+    report_shuffle_node(&hub, &auth, 0.99, 99.0, 1).await;
+    // No resources declared: places onto the (only, fully used) node as
+    // before — the gate applies only to declared Jobs.
+    hub.upsert_job(JobRecord {
+        job_id: "orders".into(),
+        version: 1,
+        spec_json: job_spec_json("orders"),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    let tasks = poll_start_tasks_and_complete(&hub, "node-a", &session.session_token).await;
+    assert!(!tasks.is_empty());
 }

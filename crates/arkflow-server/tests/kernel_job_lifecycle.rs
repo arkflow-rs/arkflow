@@ -118,6 +118,7 @@ impl arkflow_core::job::JobComponentAdapter for FixtureAdapter {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_kernel_job_snapshots_and_stops() {
     let spec = JobSpec {
+        resources: Default::default(),
         rebalance: None,
 rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
@@ -469,6 +470,7 @@ async fn recovery_restores_positions_before_new_reads() {
 
 fn kernel_job_spec() -> JobSpec {
     JobSpec {
+        resources: Default::default(),
         rebalance: None,
 rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,

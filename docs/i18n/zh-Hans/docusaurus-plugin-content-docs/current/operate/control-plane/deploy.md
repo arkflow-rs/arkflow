@@ -19,7 +19,7 @@ Hub 默认把控制面状态(节点、作业、intents、操作、审计历史)�
 - 文件系统路径(或不设置)打开 SQLite 存储——WAL 日志、`synchronous=NORMAL`、`busy_timeout=5s`——无需额外配置。
 - 以 `postgres://` 或 `postgresql://` 开头的 URL 打开 PostgreSQL 后端:sqlx 连接池(8 连接、5s 获取超时),启动时探测连通性并应用幂等 `cp_*` DDL,空库首次启动即收敛出全部表结构。数据库不可达时 Hub 启动直接失败,而不是等到第一条命令才暴露。
 
-两个后端在同一 FIFO actor 之后实现同一存储契约,reconciliation、rollout 与 outbox 的顺序语义与后端无关。PostgreSQL 是 Hub HA 路线的存储阶段(不包含选主——Hub 仍是单实例)。
+两个后端在同一 FIFO actor 之后实现同一存储契约,reconciliation、rollout 与 outbox 的顺序语义与后端无关。PostgreSQL 也是下文 Hub HA 租约选主的前提。
 
 要把既有 SQLite 部署迁移到 PostgreSQL:先停止 Hub(迁移要求源库静止),然后运行:
 
@@ -29,6 +29,44 @@ arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
 ```
 
 该工具按外键序以 1000 行事务逐表拷贝 `cp_*` 表,把 identity 序列重置到已迁移最大 id 之上,任何行数不一致都会非零退出。迁移成功后再把 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并重启 Hub。全新的 PostgreSQL 部署不需要该工具——启动 DDL 会创建 schema。
+
+### TLS
+
+**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `https://` 的 `hub_url` 访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
+
+**数据面(跨节点 shuffle)。**同时设置 `ARKFLOW_DATA_PLANE_TLS_CERT`、`ARKFLOW_DATA_PLANE_TLS_KEY`、`ARKFLOW_DATA_PLANE_TLS_CA`(节点证书、私钥、舰队 CA)后,所有跨节点连接运行 mTLS:任何帧(包括 HMAC 会话握手)交换之前,双方都必须出示锚定舰队 CA 的证书。节点证书须含 SAN `DNS:arkflow-data-plane`(固定校验名;节点身份仍由 HMAC 握手证明)。部分配置会被忽略并告警。生成舰队 CA 与节点证书的 openssl 示例:
+
+```bash
+# 舰队 CA
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
+  -subj "/CN=arkflow-fleet-ca" -days 3650
+# 每节点(逐计算节点重复)
+openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr \
+  -subj "/CN=arkflow-node"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+```
+
+请在全部计算节点上启用 TLS 后再依赖 split 放置:滚动启用期间明文与 TLS 节点互连失败(连接 fail-closed)。证书轮换意味着重启进程(自动续期不在范围内)。
+
+### Hub 高可用(租约选主)
+
+多个 Hub 进程可以共享同一个 PostgreSQL 数据库;单例租约行(`cp_hub_lease`)通过带单调围栏 epoch 的 CAS 选出唯一 leader。在指向同一数据库的每个 Hub 实例上用环境变量开启:
+
+| 变量 | 必填 | 说明 |
+|----------|----------|-------------|
+| `ARKFLOW_HUB_HA_ENABLED` | 是 | 设为 `true` 加入选主。默认关闭;关闭的 Hub 就是普通单实例。 |
+| `ARKFLOW_HUB_STORAGE` | 是 | 多实例 HA 必须是 PostgreSQL URL(SQLite 仅用于开发与测试,会记录警告)。 |
+| `ARKFLOW_HUB_HA_LEASE_TTL_MS` | 否 | 租约时长,默认 `15000`。续约周期为 TTL/3;故障接管窗口以 TTL 加一个探测周期为界。最小 1000。 |
+| `ARKFLOW_HUB_HA_HOLDER_ID` | 否 | 显式持有者标识;缺省为 `host:pid:boot-ms`。必须每个 Hub 进程唯一:两个 Hub 共用同一 holder id 会互相续约、同时充当 leader——除非命名方案能保证唯一,否则保持未设置。 |
+
+行为:
+
+- **leader** 每 TTL/3 续约一次,并运行全部周期任务(节点扫描、reconciliation、保留清理)。优雅关停时立即释放租约,standby 无需等 TTL 过期即可接管。
+- **standby** 只服务 `/health`、`/readiness`、`/liveness` 与 metrics 导出;其余 operator 与 agent 路由一律返回 `503 hub_standby`,readiness 报告未就绪并携带角色。请在实例前置负载均衡或 VIP,把流量路由到 `/readiness` 健康的那个后端——Agent 保持单一 `hub_url`,会向当选实例重新注册。
+- 接管时,晋升的 standby 在开始服务前**先从持久库重载控制面视图(作业、版本、checkpoint、操作、rollout)**并清空节点注册表;Agent 通过既有重连循环重新注册。leader 丢失租约(续约失败或存储不可达)时立即让位并停止派发。
+
+运维假设:时钟需 NTP 对齐(TTL 应远大于偏移),故障接管窗口以租约 TTL 加一个探测周期为界(默认约 15s + 5s)。每次接管都可通过围栏 epoch 观测(`/api/v1/system` 报告 `ha.role` 与 `ha.epoch`;readiness 携带相同字段;转换以 `hub.leadership` 事件进入事件流)。leader 丢租约时已在途的写仅受该窗口约束——存储级全量写围栏属于后续 HA 阶段。
 
 ### OIDC JWT 联邦
 

@@ -145,6 +145,7 @@ fn fleet_job(
         late_event_route: None,
     };
     JobSpec {
+        resources: Default::default(),
         rebalance: None,
 rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,

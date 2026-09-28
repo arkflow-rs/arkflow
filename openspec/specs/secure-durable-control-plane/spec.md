@@ -31,7 +31,7 @@ When the Hub binds a non-loopback address, startup SHALL require a configured du
 
 ### Requirement: Hub readiness SHALL follow durable recovery
 
-The Hub SHALL restore persisted Jobs, operations, desired state, leases, and checkpoint pointers before binding its listener or reporting ready. Storage recovery errors SHALL leave the server unavailable.
+The Hub SHALL restore persisted Jobs, operations, desired state, leases, and checkpoint pointers before binding its listener or reporting ready. Storage recovery errors SHALL leave the server unavailable. When HA is enabled, readiness SHALL additionally require leadership: a standby Hub (one that does not hold the control-plane lease) SHALL report not-ready with its role, and SHALL NOT serve operator or agent APIs except health, liveness, readiness, and metrics.
 
 #### Scenario: Storage recovery succeeds
 
@@ -42,6 +42,16 @@ The Hub SHALL restore persisted Jobs, operations, desired state, leases, and che
 
 - **WHEN** opening or restoring the configured store returns an error
 - **THEN** startup fails or readiness remains unavailable, and the Hub does not serve a partial in-memory state
+
+#### Scenario: Standby reports not-ready with its role
+
+- **WHEN** HA is enabled and the Hub does not hold the control-plane lease
+- **THEN** readiness reports not-ready, includes the standby role, and mutating or reading operator/agent APIs return 503 instead of serving the standby's in-memory view
+
+#### Scenario: Promoted Hub becomes ready after re-recovery
+
+- **WHEN** a standby acquires the lease and completes durable re-recovery
+- **THEN** readiness becomes healthy with the leader role before any reconcile tick dispatches operations
 
 ### Requirement: Missing credentials SHALL fail closed
 
@@ -61,3 +71,22 @@ In secure mode, an absent operator token SHALL not create an implicit Admin prin
 
 - **WHEN** the operator or node presents the configured credential
 - **THEN** the request passes the existing authorization and auditing path
+
+### Requirement: Hub SHALL support a TLS listener
+
+配置了 TLS 证书与私钥（`ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY`，PEM 路径）时，Hub SHALL 以 TLS 承载全部控制面 HTTP 流量：监听器在传输层完成 TLS，路由、认证、readiness 语义不变。只配置其一 SHALL 以显式配置错误拒绝启动。未配置时监听行为与现状逐字节一致。Agents SHALL be able to reach a TLS Hub via an `https://` hub URL with no additional configuration.
+
+#### Scenario: TLS Hub serves the API over https
+
+- **WHEN** the Hub starts with a certificate and key configured and an operator requests `/readiness` over https
+- **THEN** the TLS handshake succeeds and the readiness response matches the plaintext semantics
+
+#### Scenario: Half-configured TLS refuses to start
+
+- **WHEN** only one of the certificate or the key is configured
+- **THEN** startup fails with an explicit configuration error before binding
+
+#### Scenario: No TLS configuration keeps plaintext behavior
+
+- **WHEN** no TLS variables are set
+- **THEN** the Hub binds and serves exactly as before
