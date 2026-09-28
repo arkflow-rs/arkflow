@@ -1,11 +1,17 @@
 import { useState } from 'react'
-import type { ControlEvent } from '../api'
+import { useSearchParams } from 'react-router'
 import { useT } from '../i18n'
+import { useEvents } from '../queries'
 import { EventRow } from './shared'
 
-export function Events({ events, total }: { events: ControlEvent[]; total?: number }) {
+export function Events() {
   const [filter, setFilter] = useState('')
   const t = useT()
+  const [searchParams] = useSearchParams()
+  const nodeId = searchParams.get('node_id') ?? undefined
+  const eventsQuery = useEvents(nodeId)
+  const events = eventsQuery.data?.items ?? []
+  const total = eventsQuery.data?.total
   const visible = events.filter(
     (event) =>
       !filter ||

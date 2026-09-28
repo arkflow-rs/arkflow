@@ -1,21 +1,24 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { api, errorMessage } from '../api'
 import type { Component } from '../api'
 import { useT } from '../i18n'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
 
 export function Components({ onError }: { onError: (message: string) => void }) {
-  const [items, setItems] = useState<Component[]>([])
+  const t = useT()
+  const componentsQuery = useQuery({
+    queryKey: ['components'],
+    queryFn: () => api.components(),
+    staleTime: Infinity,
+  })
+  const items: Component[] = componentsQuery.data ?? []
   const [kind, setKind] = useState<ComponentKind>('input')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<string>()
-  const t = useT()
   useEffect(() => {
-    api
-      .components()
-      .then(setItems)
-      .catch((cause) => onError(errorMessage(cause)))
-  }, [onError])
+    if (componentsQuery.isError) onError(errorMessage(componentsQuery.error))
+  }, [componentsQuery.isError, componentsQuery.error, onError])
   const visible = useMemo(() => filterComponents(items, kind, query), [items, kind, query])
   useEffect(() => {
     if (!visible.some((item) => `${item.kind}:${item.name}` === selected))

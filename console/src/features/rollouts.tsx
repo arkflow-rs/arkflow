@@ -1,62 +1,35 @@
 import { useEffect, useState } from 'react'
-import {
-  api,
-  AuditRecord,
-  ControlNode,
-  errorMessage,
-  formatTime,
-  ROLLOUT_DETAIL_INTERVAL_MS,
-  Rollout,
-  RolloutDetail,
-} from '../api'
+import { useQueryClient } from '@tanstack/react-query'
+import { api, AuditRecord, errorMessage, formatTime, RolloutDetail } from '../api'
 import { useT } from '../i18n'
+import { useNodes, useRolloutDetail, useRollouts } from '../queries'
 
-export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (message: string) => void }) {
+export function Rollouts({ onError }: { onError: (message: string) => void }) {
   const t = useT()
-  const [items, setItems] = useState<Rollout[]>([])
-  const [selected, setSelected] = useState<RolloutDetail>()
-  const [pollError, setPollError] = useState('')
+  const queryClient = useQueryClient()
+  const nodes = useNodes().data?.items ?? []
+  const rollouts = useRollouts().data ?? []
+  const [selectedId, setSelectedId] = useState<string>()
+  const detailQuery = useRolloutDetail(selectedId)
+  const selected = detailQuery.data
+  const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [version, setVersion] = useState('')
   const [targets, setTargets] = useState<string[]>([])
   const [batch, setBatch] = useState(1)
   const [busy, setBusy] = useState(false)
   const [audit, setAudit] = useState<AuditRecord[]>([])
-  const refresh = async () => {
-    try {
-      const next = await api.rollouts()
-      setItems(next)
-      if (selected) setSelected(await api.rollout(selected.rollout.rollout_id))
-    } catch (cause) {
-      onError(errorMessage(cause))
-    }
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ['live', 'rollouts'] })
+    void queryClient.invalidateQueries({ queryKey: ['live', 'rollout-detail'] })
   }
-  useEffect(() => {
-    void refresh()
-  }, [])
-  // An active rollout advances on the Hub; poll the open detail so per-node
-  // progress updates without a manual action.
-  useEffect(() => {
-    if (!selected) return
-    const rolloutId = selected.rollout.rollout_id
-    const timer = window.setInterval(() => {
-      void api
-        .rollout(rolloutId)
-        .then((detail) => {
-          setSelected(detail)
-          setPollError('')
-        })
-        .catch((cause) => setPollError(errorMessage(cause)))
-    }, ROLLOUT_DETAIL_INTERVAL_MS)
-    return () => window.clearInterval(timer)
-  }, [selected?.rollout.rollout_id])
   const create = async () => {
     if (!version.trim() || targets.length === 0) return
     try {
       setBusy(true)
       const rollout = await api.createRollout(version.trim(), targets, batch)
-      setItems((items) => [rollout, ...items])
-      setSelected(await api.rollout(rollout.rollout_id))
+      setSelectedId(rollout.rollout_id)
       setBusy(false)
+      invalidate()
     } catch (cause) {
       setBusy(false)
       onError(errorMessage(cause))
@@ -69,9 +42,9 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
     try {
       setBusy(true)
       const rollout = await api.rolloutAction(id, operation, rollbackVersion)
-      setSelected(await api.rollout(rollout.rollout_id))
-      await refresh()
+      setSelectedId(rollout.rollout_id)
       setBusy(false)
+      invalidate()
     } catch (cause) {
       setBusy(false)
       onError(errorMessage(cause))
@@ -82,7 +55,7 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
       <section className="panel">
         <div className="panel-title">
           <h3>{t('rollouts.title')}</h3>
-          <span>{t('rollouts.recorded', { count: items.length })}</span>
+          <span>{t('rollouts.recorded', { count: rollouts.length })}</span>
         </div>
         <div className="toolbar">
           <input
@@ -122,20 +95,15 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
             </label>
           ))}
         </div>
-        {items.length === 0 ? (
+        {rollouts.length === 0 ? (
           <p className="empty">{t('rollouts.empty')}</p>
         ) : (
           <div className="table">
-            {items.map((item) => (
+            {rollouts.map((item) => (
               <button
                 className="rollout-row"
                 key={item.rollout_id}
-                onClick={() =>
-                  void api
-                    .rollout(item.rollout_id)
-                    .then(setSelected)
-                    .catch((cause) => onError(errorMessage(cause)))
-                }
+                onClick={() => setSelectedId(item.rollout_id)}
               >
                 <strong>{item.rollout_id}</strong>
                 <span>
@@ -159,10 +127,7 @@ export function Rollouts({ nodes, onError }: { nodes: ControlNode[]; onError: (m
           setAudit={setAudit}
           busy={busy}
           onAction={action}
-          onClose={() => {
-            setSelected(undefined)
-            setPollError('')
-          }}
+          onClose={() => setSelectedId(undefined)}
         />
       )}
     </>

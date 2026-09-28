@@ -1,36 +1,35 @@
 import { useEffect, useMemo, useState } from 'react'
-import {
-  api,
-  ControlNode,
-  errorMessage,
-  formatTime,
-  JOB_DETAIL_INTERVAL_MS,
-  Job,
-  JobCheckpoint,
-  JobDetail,
-} from '../api'
+import { useQueryClient } from '@tanstack/react-query'
+import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDetail } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
+import { useJobDetail, useJobs, useNodes } from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
 
 type JobsProps = {
-  jobs: Job[]
-  nodes: ControlNode[]
-  onRefresh: () => void
   onError: (message: string) => void
   canMutate?: boolean
 }
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 
-export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: JobsProps) {
+export function Jobs({ onError, canMutate = true }: JobsProps) {
   const t = useT()
+  const queryClient = useQueryClient()
+  const jobs = useJobs().data ?? []
+  const nodes = useNodes().data?.items ?? []
+  const [selectedJobId, setSelectedJobId] = useState<string>()
+  const detailQuery = useJobDetail(selectedJobId)
+  const selected = detailQuery.data
+  const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
-  const [selected, setSelected] = useState<JobDetail>()
-  const [pollError, setPollError] = useState('')
   const [plan, setPlan] = useState<{ jobId: string; version: number; planJson: string }>()
   const [editor, setEditor] = useState<{ mode: 'create' | 'upgrade'; job?: Job; savepoint?: JobCheckpoint }>()
   const [busy, setBusy] = useState('')
+  const invalidateJobs = () => {
+    void queryClient.invalidateQueries({ queryKey: ['live', 'jobs'] })
+    void queryClient.invalidateQueries({ queryKey: ['live', 'job-detail'] })
+  }
   const visible = useMemo(
     () =>
       jobs.filter(
@@ -41,36 +40,12 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
       ),
     [jobs, filter, state],
   )
-
-  const load = async (jobId: string) => {
-    try {
-      setSelected(await api.jobDetail(jobId))
-      setPollError('')
-    } catch (cause) {
-      onError(errorMessage(cause))
-    }
-  }
-  useEffect(() => {
-    if (!selected) return
-    const jobId = selected.job.job_id
-    const timer = window.setInterval(() => {
-      void api
-        .jobDetail(jobId)
-        .then((detail) => {
-          setSelected(detail)
-          setPollError('')
-        })
-        .catch((cause) => setPollError(errorMessage(cause)))
-    }, JOB_DETAIL_INTERVAL_MS)
-    return () => window.clearInterval(timer)
-  }, [selected?.job.job_id])
   const action = async (label: string, fn: () => Promise<unknown>) => {
     try {
       setBusy(label)
       await fn()
       setBusy('')
-      onRefresh()
-      if (selected) await load(selected.job.job_id)
+      invalidateJobs()
     } catch (cause) {
       setBusy('')
       onError(errorMessage(cause))
@@ -124,7 +99,7 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
                 className={`row ${selected?.job.job_id === job.job_id ? 'selected' : ''}`}
                 key={job.job_id}
               >
-                <button className="link-button" onClick={() => void load(job.job_id)}>
+                <button className="link-button" onClick={() => setSelectedJobId(job.job_id)}>
                   <strong>{job.job_id}</strong>
                   <small>
                     {t('jobs.rowSummary', {
@@ -158,12 +133,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
           nodes={nodes}
           canMutate={canMutate}
           busy={!!busy}
-          onClose={() => {
-            setSelected(undefined)
-            setPollError('')
-          }}
+          onClose={() => setSelectedJobId(undefined)}
           onError={onError}
-          onRefresh={() => void load(selected.job.job_id)}
+          onRefresh={invalidateJobs}
           onAction={action}
           onUpgrade={(savepoint) => setEditor({ mode: 'upgrade', job: selected.job, savepoint })}
           onViewPlan={(planJson) =>
@@ -182,10 +154,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
           onError={onError}
           onSaved={() => {
             setEditor(undefined)
-            onRefresh()
-            if (editor.job) void load(editor.job.job_id)
+            invalidateJobs()
           }}
-          onRefresh={onRefresh}
+          onRefresh={invalidateJobs}
           onAction={action}
         />
       )}

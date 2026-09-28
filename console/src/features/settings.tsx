@@ -1,9 +1,10 @@
-import { SNAPSHOT_INTERVAL_MS } from '../api'
-import type { EngineStatus } from '../api'
 import { useT } from '../i18n'
+import { useStatus } from '../queries'
+import { SNAPSHOT_INTERVAL_MS } from '../api'
 
-export function Settings({ status }: { status: EngineStatus | null }) {
+export function Settings() {
   const t = useT()
+  const status = useStatus().data ?? null
   return (
     <section className="panel">
       <div className="panel-title">

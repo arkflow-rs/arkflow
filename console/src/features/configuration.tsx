@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { api, errorMessage, formatTime, waitForOperation } from '../api'
 import type { ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion } from '../api'
@@ -18,46 +19,60 @@ export function convertConfiguration(
 }
 
 export function Configuration({ onError, nodeId }: { onError: (message: string) => void; nodeId?: string }) {
+  const t = useT()
+  const queryClient = useQueryClient()
+  // Static config resources: never polled and never invalidated by the SSE
+  // live-key sweep, so an open draft is only re-synced on nodeId change or
+  // after an explicit publish/rollback.
+  const draftQuery = useQuery({
+    queryKey: ['config-draft', nodeId ?? null],
+    queryFn: api.draft,
+    staleTime: Infinity,
+    enabled: !nodeId,
+  })
+  const configQuery = useQuery({
+    queryKey: ['config', nodeId ?? null],
+    queryFn: () => api.config(nodeId),
+    staleTime: Infinity,
+  })
+  const versionsQuery = useQuery({
+    queryKey: ['config-versions', nodeId ?? null],
+    queryFn: () => api.versions(nodeId),
+    staleTime: Infinity,
+  })
   const [content, setContent] = useState('streams: []\n')
   const [format, setFormat] = useState<ConfigCandidate['format']>('yaml')
   const [issues, setIssues] = useState<ConfigIssue[]>([])
   const [validatedCandidate, setValidatedCandidate] = useState<string>()
-  const [versions, setVersions] = useState<ConfigVersion[]>([])
   const [saved, setSaved] = useState('')
   const [savedFormat, setSavedFormat] = useState<ConfigCandidate['format']>('yaml')
   const [busy, setBusy] = useState('')
   const [diff, setDiff] = useState<ConfigDiff>()
   const [editable, setEditable] = useState(false)
   const [activeSnapshot, setActiveSnapshot] = useState(false)
-  const t = useT()
+  const versions = versionsQuery.data ?? []
   const candidate = { format, content }
   const identity = `${format}\u0000${content}`
   const dirty = content !== saved || format !== savedFormat
   const validated = editable && !dirty && validatedCandidate === identity && issues.length === 0
-  const load = async () => {
-    try {
-      const [draft, config, history] = await Promise.all([
-        nodeId ? Promise.resolve(undefined) : api.draft(),
-        api.config(nodeId),
-        api.versions(nodeId),
-      ])
-      const next = draft ?? { format: 'json' as const, content: JSON.stringify(config, null, 2) }
-      setContent(next.content)
-      setFormat(next.format)
-      setSaved(next.content)
-      setSavedFormat(next.format)
-      setEditable(Boolean(draft))
-      setActiveSnapshot(!draft)
-      setVersions(history)
-      setIssues([])
-      setValidatedCandidate(undefined)
-    } catch (cause) {
-      onError(errorMessage(cause))
-    }
-  }
   useEffect(() => {
-    void load()
-  }, [nodeId])
+    if (configQuery.data === undefined) return
+    const draft = nodeId ? undefined : draftQuery.data
+    const next = draft ?? { format: 'json' as const, content: JSON.stringify(configQuery.data, null, 2) }
+    setContent(next.content)
+    setFormat(next.format)
+    setSaved(next.content)
+    setSavedFormat(next.format)
+    setEditable(Boolean(draft))
+    setActiveSnapshot(!draft)
+    setIssues([])
+    setValidatedCandidate(undefined)
+  }, [configQuery.data, draftQuery.data, nodeId])
+  const reload = async () => {
+    await queryClient.invalidateQueries({ queryKey: ['config'] })
+    await queryClient.invalidateQueries({ queryKey: ['config-draft'] })
+    await queryClient.invalidateQueries({ queryKey: ['config-versions'] })
+  }
   const run = async (label: string, action: () => Promise<unknown>) => {
     try {
       setBusy(label)
@@ -89,14 +104,14 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     void run(t('config.busyPublishing'), async () => {
       const operation = await api.applyConfig(candidate, nodeId)
       await waitForOperation(operation.id)
-      await load()
+      await reload()
     })
   const rollback = async (id: string) => {
     if (!window.confirm(t('config.confirmRollback', { id }))) return
     await run(t('config.busyRollingBack'), async () => {
       const operation = await api.rollback(id, nodeId)
       await waitForOperation(operation.id)
-      await load()
+      await reload()
     })
   }
   const compare = async (id: string) => {

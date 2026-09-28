@@ -1,3 +1,4 @@
+import { useQueryClient } from '@tanstack/react-query'
 import { api, formatTime } from '../api'
 import type { ControlEvent, Operation } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
@@ -7,8 +8,9 @@ export const number = (value: number | undefined) =>
 export const active = (state: Operation['state']) =>
   ['queued', 'dispatched', 'acknowledged', 'running'].includes(state)
 
-export function OperationRow({ operation, onChanged }: { operation: Operation; onChanged?: () => void }) {
+export function OperationRow({ operation }: { operation: Operation }) {
   const t = useT()
+  const queryClient = useQueryClient()
   return (
     <div className="operation-row">
       <div>
@@ -31,7 +33,13 @@ export function OperationRow({ operation, onChanged }: { operation: Operation; o
       </div>
       <div>
         {active(operation.state) && (
-          <button onClick={() => void api.cancel(operation.id).then(() => onChanged?.())}>
+          <button
+            onClick={() =>
+              void api
+                .cancel(operation.id)
+                .then(() => queryClient.invalidateQueries({ queryKey: ['live', 'operations'] }))
+            }
+          >
             {t('common.cancel')}
           </button>
         )}

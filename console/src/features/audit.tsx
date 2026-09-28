@@ -1,21 +1,17 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { api, AuditRecord, errorMessage, formatTime } from '../api'
 import { useT } from '../i18n'
 
 export function Audit({ onError }: { onError: (message: string) => void }) {
   const t = useT()
-  const [records, setRecords] = useState<AuditRecord[]>()
-  const [total, setTotal] = useState<number>()
   const [filter, setFilter] = useState('')
+  const auditQuery = useQuery({ queryKey: ['audit'], queryFn: () => api.audit(), staleTime: Infinity })
+  const records = auditQuery.data?.items
+  const total = auditQuery.data?.total
   useEffect(() => {
-    api
-      .audit()
-      .then((page) => {
-        setRecords(page.items)
-        setTotal(page.total)
-      })
-      .catch((cause) => onError(errorMessage(cause)))
-  }, [onError])
+    if (auditQuery.isError) onError(errorMessage(auditQuery.error))
+  }, [auditQuery.isError, auditQuery.error, onError])
   const visible = (records ?? []).filter(
     (record) =>
       !filter ||

@@ -1,34 +1,29 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router'
+import { useQueryClient } from '@tanstack/react-query'
 import { formatTime } from '../api'
 import type { ControlEvent, Operation, StreamStatus } from '../api'
 import { useT } from '../i18n'
+import { useEvents, useOperations, useStreams } from '../queries'
 import { EventRow, OperationRow, Pagination, active, number } from './shared'
 import type { Command } from './types'
 
-export function Runtime({
-  streams,
-  operations,
-  events,
-  command,
-  canMutate = true,
-  onOperationChanged,
-  streamTotal,
-  operationTotal,
-}: {
-  streams: StreamStatus[]
-  operations: Operation[]
-  events?: ControlEvent[]
-  command: Command
-  canMutate?: boolean
-  onOperationChanged?: () => void
-  streamTotal?: number
-  operationTotal?: number
-}) {
+export function Runtime({ command, canMutate = true }: { command: Command; canMutate?: boolean }) {
+  const t = useT()
+  const [searchParams] = useSearchParams()
+  const nodeId = searchParams.get('node_id') ?? undefined
+  const streamsQuery = useStreams(nodeId)
+  const operationsQuery = useOperations(nodeId)
+  const eventsQuery = useEvents(nodeId)
+  const streams = streamsQuery.data?.items ?? []
+  const operations = operationsQuery.data?.items ?? []
+  const events = eventsQuery.data?.items ?? []
+  const streamTotal = streamsQuery.data?.total
+  const operationTotal = operationsQuery.data?.total
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<string>()
-  const t = useT()
   const filtered = useMemo(
     () =>
       streams.filter(
@@ -158,9 +153,7 @@ export function Runtime({
         {operations.length ? (
           operations
             .slice(0, 12)
-            .map((operation) => (
-              <OperationRow operation={operation} onChanged={onOperationChanged} key={operation.id} />
-            ))
+            .map((operation) => <OperationRow operation={operation} key={operation.id} />)
         ) : (
           <p className="empty">{t('runtime.noOperations')}</p>
         )}

@@ -1,9 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { BrowserRouter } from 'react-router'
+import type { ReactElement } from 'react'
 import { Components } from './features/components'
 import { Configuration, convertConfiguration } from './features/configuration'
 import { Overview } from './features/overview'
-import type { Snapshot } from './features/types'
 import { Audit } from './features/audit'
 import { Jobs } from './features/jobs'
 import { JobEditor } from './features/job-editor'
@@ -11,6 +13,14 @@ import type { Job, JobCheckpoint } from './api'
 import { Rollouts } from './features/rollouts'
 
 afterEach(() => cleanup())
+
+const page = (items: unknown[]) => ({ items, page: 1, page_size: items.length || 50, total: items.length })
+const renderWithQueries = (ui: ReactElement) =>
+  render(
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <BrowserRouter>{ui}</BrowserRouter>
+    </QueryClientProvider>,
+  )
 
 describe('configuration workflow', () => {
   it('converts YAML to JSON and preserves equivalent values', () => {
@@ -55,7 +65,7 @@ describe('configuration workflow', () => {
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(<Configuration onError={vi.fn()} />)
+    renderWithQueries(<Configuration onError={vi.fn()} />)
     await screen.findByDisplayValue('{"streams":[]}')
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
     await screen.findByText(/Draft is saved/)
@@ -105,6 +115,22 @@ describe('rollout workflow', () => {
             ],
           }),
         })
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ]),
+        })
       if (url.includes('/audit'))
         return Promise.resolve({
           ok: true,
@@ -113,22 +139,7 @@ describe('rollout workflow', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(
-      <Rollouts
-        nodes={[
-          {
-            id: 'node-a',
-            state: 'online',
-            version: 'test',
-            capabilities: [],
-            streams_total: 0,
-            streams_running: 0,
-            streams_failed: 0,
-          },
-        ]}
-        onError={vi.fn()}
-      />,
-    )
+    renderWithQueries(<Rollouts onError={vi.fn()} />)
     fireEvent.change(await screen.findByLabelText('Configuration version'), { target: { value: 'cfg-1' } })
     fireEvent.click(screen.getByRole('checkbox', { name: /node-a/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Create rollout' }))
@@ -167,6 +178,22 @@ describe('rollout workflow', () => {
             targets: [{ rollout_id: 'r-1', node_id: 'node-a', ordinal: 0, state, updated_at_ms: 1 }],
           }),
         })
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ]),
+        })
       if (url.includes('/audit'))
         return Promise.resolve({
           ok: true,
@@ -180,26 +207,11 @@ describe('rollout workflow', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(
-      <Rollouts
-        nodes={[
-          {
-            id: 'node-a',
-            state: 'online',
-            version: 'test',
-            capabilities: [],
-            streams_total: 0,
-            streams_running: 0,
-            streams_failed: 0,
-          },
-        ]}
-        onError={vi.fn()}
-      />,
-    )
+    renderWithQueries(<Rollouts onError={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: /r-1/ }))
     expect(await screen.findByText('applying')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
-    expect(await screen.findByText('paused')).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: 'Pause' }))
+    expect((await screen.findAllByText('paused')).length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining('/rollouts/r-1/actions'),
@@ -240,8 +252,7 @@ describe('distributed Job workbench', () => {
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const refresh = vi.fn()
-    render(<Jobs jobs={[]} nodes={[]} onRefresh={refresh} onError={vi.fn()} />)
+    renderWithQueries(<Jobs onError={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: 'Create Job' }))
     fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
     expect(await screen.findByText('Plan is valid')).toBeInTheDocument()
@@ -252,7 +263,14 @@ describe('distributed Job workbench', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     )
-    expect(refresh).toHaveBeenCalled()
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url, init]) =>
+            String(url).endsWith('/jobs') && (init as RequestInit | undefined)?.method !== 'POST',
+        ).length,
+      ).toBeGreaterThanOrEqual(2),
+    )
   })
 
   it('requires a fresh validation after Job settings change', async () => {
@@ -265,7 +283,7 @@ describe('distributed Job workbench', () => {
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const view = renderWithQueries(<Jobs onError={vi.fn()} />)
     const local = within(view.container)
     fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
     fireEvent.click(local.getByRole('button', { name: 'Validate Plan' }))
@@ -286,7 +304,7 @@ describe('distributed Job workbench', () => {
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const view = renderWithQueries(<Jobs onError={vi.fn()} />)
     const local = within(view.container)
     fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
     expect(await local.findByText('Component catalogue could not be loaded.')).toBeInTheDocument()
@@ -299,10 +317,10 @@ describe('distributed Job workbench', () => {
       { kind: 'processor', name: 'json_to_arrow', description: 'Decode JSON' },
       { kind: 'output', name: 'stdout', description: 'Write output' },
     ]
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok: true, json: async () => components }),
+    globalThis.fetch = vi.fn((url: string) =>
+      Promise.resolve({ ok: true, json: async () => (url.endsWith('/components') ? components : []) }),
     ) as unknown as typeof fetch
-    const view = render(<Jobs jobs={[]} nodes={[]} onRefresh={vi.fn()} onError={vi.fn()} />)
+    const view = renderWithQueries(<Jobs onError={vi.fn()} />)
     const local = within(view.container)
     fireEvent.click(local.getByRole('button', { name: 'Create Job' }))
     expect(await local.findByText('generate')).toBeInTheDocument()
@@ -329,7 +347,7 @@ describe('component catalogue', () => {
     globalThis.fetch = vi.fn((url: string) =>
       Promise.resolve({ ok: true, json: async () => (url.endsWith('/components') ? components : {}) }),
     ) as unknown as typeof fetch
-    const view = render(<Components onError={vi.fn()} />)
+    const view = renderWithQueries(<Components onError={vi.fn()} />)
     const local = within(view.container)
     expect(await local.findByText('generate')).toBeInTheDocument()
     expect(local.getAllByText('Generate records')).toHaveLength(2)
@@ -345,10 +363,8 @@ describe('fleet maintenance actions', () => {
     vi.restoreAllMocks()
   })
 
-  const fleetSnapshot = (maintenanceState?: string): Snapshot => ({
-    system: null,
-    status: null,
-    nodes: [
+  const fleetNodes = (maintenanceState?: string) =>
+    page([
       {
         id: 'node-a',
         state: 'online',
@@ -358,17 +374,13 @@ describe('fleet maintenance actions', () => {
         streams_running: 1,
         streams_failed: 0,
         ...(maintenanceState ? { maintenance_state: maintenanceState } : {}),
-      } as Snapshot['nodes'][number],
-    ],
-    streams: [],
-    jobs: [],
-    operations: [],
-    events: [],
-  })
+      },
+    ])
 
   it('drains a node after confirmation and refreshes the fleet', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => fleetNodes() })
       if (url.includes('/nodes/node-a/drain'))
         return Promise.resolve({
           ok: true,
@@ -386,29 +398,47 @@ describe('fleet maintenance actions', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const onNodesChanged = vi.fn()
-    render(<Overview snapshot={fleetSnapshot()} onError={vi.fn()} onNodesChanged={onNodesChanged} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Drain' }))
-    await waitFor(() => expect(onNodesChanged).toHaveBeenCalled())
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('/nodes/node-a/drain'),
+    renderWithQueries(<Overview onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Drain' }))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/nodes/node-a/drain'),
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    )
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/nodes?'), expect.anything()),
+    )
+  })
+
+  it('does not drain without confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => (url.includes('/nodes?') ? fleetNodes() : {}),
+      }),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    renderWithQueries(<Overview onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Drain' }))
+    expect(confirm).toHaveBeenCalledWith('Drain node-a?')
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('/drain'),
       expect.objectContaining({ method: 'POST' }),
     )
   })
 
-  it('does not drain without confirmation', () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: async () => ({}) }))
+  it('offers Resume instead of Drain while a node is draining', async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => (url.includes('/nodes?') ? fleetNodes('draining') : {}),
+      }),
+    )
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(<Overview snapshot={fleetSnapshot()} onError={vi.fn()} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Drain' }))
-    expect(confirm).toHaveBeenCalledWith('Drain node-a?')
-    expect(fetchMock).not.toHaveBeenCalled()
-  })
-
-  it('offers Resume instead of Drain while a node is draining', () => {
-    render(<Overview snapshot={fleetSnapshot('draining')} onError={vi.fn()} />)
-    expect(screen.getByText('draining')).toBeInTheDocument()
+    renderWithQueries(<Overview onError={vi.fn()} />)
+    expect(await screen.findByText('draining')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Drain' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
   })
@@ -416,6 +446,8 @@ describe('fleet maintenance actions', () => {
   it('resumes a node out of maintenance with the delete verb', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes('/nodes?'))
+        return Promise.resolve({ ok: true, json: async () => fleetNodes('maintenance') })
       if (url.includes('/nodes/node-a/maintenance'))
         return Promise.resolve({
           ok: true,
@@ -433,32 +465,34 @@ describe('fleet maintenance actions', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const onNodesChanged = vi.fn()
-    render(
-      <Overview snapshot={fleetSnapshot('maintenance')} onError={vi.fn()} onNodesChanged={onNodesChanged} />,
+    renderWithQueries(<Overview onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume' }))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/nodes/node-a/maintenance'),
+        expect.objectContaining({ method: 'DELETE' }),
+      ),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
-    await waitFor(() => expect(onNodesChanged).toHaveBeenCalled())
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('/nodes/node-a/maintenance'),
-      expect.objectContaining({ method: 'DELETE' }),
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/nodes?'), expect.anything()),
     )
   })
 
   it('surfaces a permission failure from the maintenance endpoint', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    const fetchMock = vi.fn(() =>
-      Promise.resolve({
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => fleetNodes() })
+      return Promise.resolve({
         ok: false,
         status: 403,
         headers: new Headers(),
         json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
-      }),
-    )
+      })
+    })
     globalThis.fetch = fetchMock as unknown as typeof fetch
     const onError = vi.fn()
-    render(<Overview snapshot={fleetSnapshot()} onError={onError} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Maintain' }))
+    renderWithQueries(<Overview onError={onError} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Maintain' }))
     await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('not authorized')))
   })
 })
@@ -468,6 +502,22 @@ describe('audit history', () => {
 
   it('lists fleet-wide audit records and filters them locally', async () => {
     const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ]),
+        })
       if (url.includes('/audit'))
         return Promise.resolve({
           ok: true,
@@ -502,7 +552,7 @@ describe('audit history', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    render(<Audit onError={vi.fn()} />)
+    renderWithQueries(<Audit onError={vi.fn()} />)
     expect(await screen.findByText('node.drain')).toBeInTheDocument()
     expect(screen.getByText('job.start')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Audit filter'), { target: { value: 'node.drain' } })
@@ -512,6 +562,22 @@ describe('audit history', () => {
 
   it('reports load failures through the error channel', async () => {
     const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                state: 'online',
+                version: 'test',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ]),
+        })
       if (url.includes('/audit'))
         return Promise.resolve({
           ok: false,
@@ -523,7 +589,7 @@ describe('audit history', () => {
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
     const onError = vi.fn()
-    render(<Audit onError={onError} />)
+    renderWithQueries(<Audit onError={onError} />)
     await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('operator token')))
   })
 })

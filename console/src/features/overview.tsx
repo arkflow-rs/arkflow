@@ -1,19 +1,30 @@
+import { useSearchParams } from 'react-router'
+import { useQueryClient } from '@tanstack/react-query'
 import { api, errorMessage, formatTime } from '../api'
 import type { ControlNode } from '../api'
 import { useT } from '../i18n'
+import { useEvents, useMetrics, useNodes, useOperations, useStatus, useStreams, useSystem } from '../queries'
 import { Card, EventRow, active, number } from './shared'
-import type { Snapshot } from './types'
 
-export function Overview({
-  snapshot,
-  onError,
-  onNodesChanged,
-}: {
-  snapshot: Snapshot
-  onError?: (message: string) => void
-  onNodesChanged?: () => void
-}) {
+export function Overview({ onError }: { onError?: (message: string) => void }) {
   const t = useT()
+  const queryClient = useQueryClient()
+  const [searchParams] = useSearchParams()
+  const nodeId = searchParams.get('node_id') ?? undefined
+  const systemQuery = useSystem()
+  const statusQuery = useStatus()
+  const nodesQuery = useNodes()
+  const streamsQuery = useStreams(nodeId)
+  const operationsQuery = useOperations(nodeId)
+  const eventsQuery = useEvents(nodeId)
+  const metricsQuery = useMetrics(nodeId)
+  const system = systemQuery.data ?? null
+  const status = statusQuery.data ?? null
+  const nodes = nodesQuery.data?.items ?? []
+  const streams = streamsQuery.data?.items ?? []
+  const operations = operationsQuery.data?.items ?? []
+  const events = eventsQuery.data?.items ?? []
+  const metrics = metricsQuery.data?.aggregate ?? {}
   const setMaintenance = (node: ControlNode, action: 'drain' | 'maintain' | 'resume') => {
     const confirmKey =
       action === 'drain'
@@ -25,36 +36,35 @@ export function Overview({
     const call =
       action === 'drain' ? api.drainNode : action === 'maintain' ? api.maintainNode : api.resumeNode
     call(node.id)
-      .then(() => onNodesChanged?.())
+      .then(() => queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] }))
       .catch((cause) => onError?.(errorMessage(cause)))
   }
-  const running = snapshot.streams.filter((stream) => stream.state === 'running').length
-  const failed = snapshot.streams.filter((stream) => stream.state === 'failed').length
-  const online = snapshot.nodes.filter((node) => node.state === 'online').length
-  const stale = snapshot.nodes.filter((node) => node.state !== 'online').length
-  const activeOperations = snapshot.operations.filter((operation) => active(operation.state)).length
-  const metrics = snapshot.metrics?.aggregate ?? {}
+  const running = streams.filter((stream) => stream.state === 'running').length
+  const failed = streams.filter((stream) => stream.state === 'failed').length
+  const online = nodes.filter((node) => node.state === 'online').length
+  const stale = nodes.filter((node) => node.state !== 'online').length
+  const activeOperations = operations.filter((operation) => active(operation.state)).length
   return (
     <>
       <section className="cards">
         <Card
           label={t('overview.cardControlPlane')}
-          value={snapshot.system?.state ?? t('common.loading')}
-          hint={snapshot.system?.version}
+          value={system?.state ?? t('common.loading')}
+          hint={system?.version}
         />
         <Card
           label={t('overview.cardNodesOnline')}
-          value={`${online}/${snapshot.nodes.length || snapshot.system?.node_count || 0}`}
+          value={`${online}/${nodes.length || system?.node_count || 0}`}
           hint={stale ? t('overview.nodesNeedAttention', { count: stale }) : t('overview.allNodesHealthy')}
         />
         <Card
           label={t('overview.cardStreamsRunning')}
-          value={`${running}/${snapshot.streams.length || snapshot.status?.streams_total || 0}`}
+          value={`${running}/${streams.length || status?.streams_total || 0}`}
           hint={failed ? t('overview.streamsFailed', { count: failed }) : t('overview.noFailures')}
         />
         <Card
           label={t('overview.cardActiveOperations')}
-          value={activeOperations || snapshot.system?.active_operations || 0}
+          value={activeOperations || system?.active_operations || 0}
           hint={t('overview.queuedAndRunning')}
         />
       </section>
@@ -62,13 +72,13 @@ export function Overview({
         <section className="panel">
           <div className="panel-title">
             <h3>{t('overview.fleetHealth')}</h3>
-            <span>{t('common.registered', { count: snapshot.nodes.length })}</span>
+            <span>{t('common.registered', { count: nodes.length })}</span>
           </div>
-          {snapshot.nodes.length === 0 ? (
+          {nodes.length === 0 ? (
             <p className="empty">{t('overview.noNodes')}</p>
           ) : (
             <div className="node-grid">
-              {snapshot.nodes.map((node) => {
+              {nodes.map((node) => {
                 const maintenance = node.maintenance_state ?? 'active'
                 return (
                   <article className="node-card" key={node.id}>
@@ -138,10 +148,10 @@ export function Overview({
       <section className="panel">
         <div className="panel-title">
           <h3>{t('overview.recentActivity')}</h3>
-          <span>{t('overview.eventsCount', { count: snapshot.events.length })}</span>
+          <span>{t('overview.eventsCount', { count: events.length })}</span>
         </div>
-        {snapshot.events.length ? (
-          snapshot.events
+        {events.length ? (
+          events
             .slice(0, 8)
             .map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)
         ) : (
