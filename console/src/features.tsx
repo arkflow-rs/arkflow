@@ -55,7 +55,24 @@ export function convertConfiguration(
   return stringifyYaml(value)
 }
 
-export function Overview({ snapshot }: { snapshot: Snapshot }) {
+export function Overview({
+  snapshot,
+  onError,
+  onNodesChanged,
+}: {
+  snapshot: Snapshot
+  onError?: (message: string) => void
+  onNodesChanged?: () => void
+}) {
+  const setMaintenance = (node: ControlNode, action: 'drain' | 'maintain' | 'resume') => {
+    const label = action === 'drain' ? 'Drain' : action === 'maintain' ? 'Move to maintenance' : 'Resume'
+    if (!window.confirm(`${label} ${node.id}?`)) return
+    const call =
+      action === 'drain' ? api.drainNode : action === 'maintain' ? api.maintainNode : api.resumeNode
+    call(node.id)
+      .then(() => onNodesChanged?.())
+      .catch((cause) => onError?.(errorMessage(cause)))
+  }
   const running = snapshot.streams.filter((stream) => stream.state === 'running').length
   const failed = snapshot.streams.filter((stream) => stream.state === 'failed').length
   const online = snapshot.nodes.filter((node) => node.state === 'online').length
@@ -96,30 +113,46 @@ export function Overview({ snapshot }: { snapshot: Snapshot }) {
             <p className="empty">No compute nodes connected.</p>
           ) : (
             <div className="node-grid">
-              {snapshot.nodes.map((node) => (
-                <article className="node-card" key={node.id}>
-                  <div className="panel-title">
-                    <strong>{node.id}</strong>
-                    <span className={`state ${node.state}`}>{node.state}</span>
-                  </div>
-                  <small>
-                    Last seen {formatTime(node.last_seen_at_ms)} · protocol{' '}
-                    {node.protocol_version ?? 'unknown'} · software {node.version}
-                  </small>
-                  <div className="node-stats">
-                    <span>
-                      <strong>{node.streams_running}</strong> running
-                    </span>
-                    <span>
-                      <strong>{node.streams_total}</strong> total
-                    </span>
-                    <span>
-                      <strong>{node.streams_failed}</strong> failed
-                    </span>
-                  </div>
-                  <small>{(node.capabilities ?? []).join(' · ') || 'No capabilities reported'}</small>
-                </article>
-              ))}
+              {snapshot.nodes.map((node) => {
+                const maintenance = node.maintenance_state ?? 'active'
+                return (
+                  <article className="node-card" key={node.id}>
+                    <div className="panel-title">
+                      <strong>{node.id}</strong>
+                      <span className={`state ${node.state}`}>{node.state}</span>
+                      {maintenance !== 'active' && (
+                        <span className={`state ${maintenance}`}>{maintenance}</span>
+                      )}
+                    </div>
+                    <small>
+                      Last seen {formatTime(node.last_seen_at_ms)} · protocol{' '}
+                      {node.protocol_version ?? 'unknown'} · software {node.version}
+                    </small>
+                    <div className="node-stats">
+                      <span>
+                        <strong>{node.streams_running}</strong> running
+                      </span>
+                      <span>
+                        <strong>{node.streams_total}</strong> total
+                      </span>
+                      <span>
+                        <strong>{node.streams_failed}</strong> failed
+                      </span>
+                    </div>
+                    <small>{(node.capabilities ?? []).join(' · ') || 'No capabilities reported'}</small>
+                    <div className="actions">
+                      {maintenance === 'active' ? (
+                        <>
+                          <button onClick={() => setMaintenance(node, 'drain')}>Drain</button>
+                          <button onClick={() => setMaintenance(node, 'maintain')}>Maintain</button>
+                        </>
+                      ) : (
+                        <button onClick={() => setMaintenance(node, 'resume')}>Resume</button>
+                      )}
+                    </div>
+                  </article>
+                )
+              })}
             </div>
           )}
         </section>

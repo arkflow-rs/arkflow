@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Components, Configuration, convertConfiguration } from './features'
+import { Components, Configuration, convertConfiguration, Overview, Snapshot } from './features'
+import { Audit } from './features/audit'
 import { Jobs } from './features/jobs'
 import { JobEditor } from './features/job-editor'
 import type { Job, JobCheckpoint } from './api'
@@ -332,6 +333,195 @@ describe('component catalogue', () => {
     fireEvent.click(local.getByRole('tab', { name: 'processor' }))
     expect(local.getAllByText('json_to_arrow')).toHaveLength(2)
     expect(local.queryByText('Generate records')).not.toBeInTheDocument()
+  })
+})
+
+describe('fleet maintenance actions', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  const fleetSnapshot = (maintenanceState?: string): Snapshot => ({
+    system: null,
+    status: null,
+    nodes: [
+      {
+        id: 'node-a',
+        state: 'online',
+        version: 'test',
+        capabilities: [],
+        streams_total: 1,
+        streams_running: 1,
+        streams_failed: 0,
+        ...(maintenanceState ? { maintenance_state: maintenanceState } : {}),
+      } as Snapshot['nodes'][number],
+    ],
+    streams: [],
+    jobs: [],
+    operations: [],
+    events: [],
+  })
+
+  it('drains a node after confirmation and refreshes the fleet', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes('/nodes/node-a/drain'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'node-a',
+            state: 'online',
+            maintenance_state: 'draining',
+            version: 'test',
+            capabilities: [],
+            streams_total: 1,
+            streams_running: 1,
+            streams_failed: 0,
+          }),
+        })
+      return Promise.resolve({ ok: true, json: async () => ({}) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const onNodesChanged = vi.fn()
+    render(<Overview snapshot={fleetSnapshot()} onError={vi.fn()} onNodesChanged={onNodesChanged} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Drain' }))
+    await waitFor(() => expect(onNodesChanged).toHaveBeenCalled())
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/nodes/node-a/drain'),
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('does not drain without confirmation', () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: async () => ({}) }))
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    render(<Overview snapshot={fleetSnapshot()} onError={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Drain' }))
+    expect(confirm).toHaveBeenCalledWith('Drain node-a?')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('offers Resume instead of Drain while a node is draining', () => {
+    render(<Overview snapshot={fleetSnapshot('draining')} onError={vi.fn()} />)
+    expect(screen.getByText('draining')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Drain' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument()
+  })
+
+  it('resumes a node out of maintenance with the delete verb', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes('/nodes/node-a/maintenance'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'node-a',
+            state: 'online',
+            maintenance_state: 'active',
+            version: 'test',
+            capabilities: [],
+            streams_total: 1,
+            streams_running: 1,
+            streams_failed: 0,
+          }),
+        })
+      return Promise.resolve({ ok: true, json: async () => ({}) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const onNodesChanged = vi.fn()
+    render(
+      <Overview snapshot={fleetSnapshot('maintenance')} onError={vi.fn()} onNodesChanged={onNodesChanged} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(onNodesChanged).toHaveBeenCalled())
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/nodes/node-a/maintenance'),
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('surfaces a permission failure from the maintenance endpoint', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        headers: new Headers(),
+        json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
+      }),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const onError = vi.fn()
+    render(<Overview snapshot={fleetSnapshot()} onError={onError} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Maintain' }))
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('not authorized')))
+  })
+})
+
+describe('audit history', () => {
+  afterEach(() => cleanup())
+
+  it('lists fleet-wide audit records and filters them locally', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/audit'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            items: [
+              {
+                event_id: 2,
+                action: 'node.drain',
+                actor: 'operator',
+                resource_type: 'node',
+                resource_id: 'node-a',
+                outcome: 'accepted',
+                occurred_at_ms: 2,
+              },
+              {
+                event_id: 1,
+                action: 'job.start',
+                actor: 'operator',
+                resource_type: 'job',
+                resource_id: 'orders',
+                node_id: 'node-a',
+                correlation_id: 'c-1',
+                outcome: 'succeeded',
+                occurred_at_ms: 1,
+              },
+            ],
+            page: 1,
+            page_size: 50,
+            total: 2,
+          }),
+        })
+      return Promise.resolve({ ok: true, json: async () => ({}) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    render(<Audit onError={vi.fn()} />)
+    expect(await screen.findByText('node.drain')).toBeInTheDocument()
+    expect(screen.getByText('job.start')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Audit filter'), { target: { value: 'node.drain' } })
+    expect(screen.queryByText('job.start')).not.toBeInTheDocument()
+    expect(screen.getByText('node.drain')).toBeInTheDocument()
+  })
+
+  it('reports load failures through the error channel', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/audit'))
+        return Promise.resolve({
+          ok: false,
+          status: 401,
+          headers: new Headers(),
+          json: async () => ({ message: 'A valid operator token is required' }),
+        })
+      return Promise.resolve({ ok: true, json: async () => ({}) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const onError = vi.fn()
+    render(<Audit onError={onError} />)
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('operator token')))
   })
 })
 

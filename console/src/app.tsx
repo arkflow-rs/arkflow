@@ -11,6 +11,7 @@ import {
   waitForOperation,
 } from './api'
 import { Configuration, Components, Events, Jobs, Overview, Runtime, Settings, Snapshot } from './features'
+import { Audit } from './features/audit'
 import { Rollouts } from './features/rollouts'
 
 const PAGES = [
@@ -21,6 +22,7 @@ const PAGES = [
   ['rollouts', 'Rollouts'],
   ['components', 'Components'],
   ['events', 'Events'],
+  ['audit', 'Audit'],
   ['settings', 'Settings'],
 ] as const
 type Page = (typeof PAGES)[number][0]
@@ -218,7 +220,9 @@ export function App() {
           </div>
         )}
         {error && <div className="error">{error}</div>}
-        {page === 'overview' && <Overview snapshot={snapshot} />}
+        {page === 'overview' && (
+          <Overview snapshot={snapshot} onError={setError} onNodesChanged={() => void refresh()} />
+        )}
         {page === 'runtime' && (
           <Runtime
             streams={snapshot.streams}
@@ -244,6 +248,7 @@ export function App() {
         {page === 'rollouts' && <Rollouts nodes={snapshot.nodes} onError={setError} />}
         {page === 'components' && <Components onError={setError} />}
         {page === 'events' && <Events events={snapshot.events} total={snapshot.totals?.events} />}
+        {page === 'audit' && <Audit onError={setError} />}
         {page === 'settings' && <Settings status={snapshot.status} />}
       </main>
     </div>

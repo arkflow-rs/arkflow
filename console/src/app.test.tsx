@@ -161,6 +161,46 @@ describe('console application', () => {
     expect((await screen.findByRole('button', { name: 'Start' })).hasAttribute('disabled')).toBe(true)
   })
 
+  it('shows fleet-wide audit records on the audit page', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+          if (url.includes('/nodes?')) return page([])
+          if (url.includes('/audit'))
+            return {
+              items: [
+                {
+                  event_id: 1,
+                  action: 'node.drain',
+                  actor: 'operator',
+                  resource_type: 'node',
+                  resource_id: 'node-a',
+                  outcome: 'accepted',
+                  occurred_at_ms: 1,
+                },
+              ],
+              page: 1,
+              page_size: 50,
+              total: 1,
+            }
+          return page([])
+        },
+      }),
+    )
+    render(<App />)
+    fireEvent.click(screen.getByText('Audit', { selector: 'a' }))
+    expect(await screen.findByText('node.drain')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/audit'),
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }),
+      }),
+    )
+  })
+
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     let operationReads = 0
