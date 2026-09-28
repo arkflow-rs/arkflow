@@ -1895,6 +1895,104 @@ impl StorageBackend for PostgresBackend {
             Ok(())
         }
     }
+    async fn try_acquire_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection.execute(
+                "INSERT INTO cp_hub_lease (id, holder, epoch, expires_at_ms, updated_at_ms) VALUES (1, '', 0, 0, ?1) ON CONFLICT(id) DO NOTHING",
+                binds![now_ms],
+            ).await?;
+            let current = connection.query_row(
+                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                binds![],
+                |row| {
+                    Ok((
+                        row.get::<String>(0)?,
+                        row.get::<u64>(1)?,
+                        row.get::<u64>(2)?,
+                    ))
+                },
+            ).await.optional()?;
+            let Some((current_holder, epoch, expires_at_ms)) = current else {
+                return Err(StorageError::Unsupported(
+                    "hub lease row missing after insert",
+                ));
+            };
+            if current_holder == holder {
+                connection.execute(
+                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 WHERE id = 1 AND holder = ?3",
+                    binds![now_ms + ttl_ms, now_ms, holder],
+                ).await?;
+                return Ok(HubLeaseAcquire::Acquired { epoch });
+            }
+            if expires_at_ms <= now_ms {
+                let updated = connection.execute(
+                    "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, updated_at_ms = ?3 WHERE id = 1 AND expires_at_ms <= ?4",
+                    binds![holder, now_ms + ttl_ms, now_ms, now_ms],
+                ).await?;
+                if updated == 1 {
+                    return Ok(HubLeaseAcquire::Acquired { epoch: epoch + 1 });
+                }
+            }
+            let snapshot = connection.query_row(
+                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                binds![],
+                |row| {
+                    Ok(HubLeaseSnapshot {
+                        holder: row.get(0)?,
+                        epoch: row.get(1)?,
+                        expires_at_ms: row.get(2)?,
+                    })
+                },
+            ).await.optional()?;
+            match snapshot {
+                Some(snapshot) => Ok(HubLeaseAcquire::HeldByOther(snapshot)),
+                None => Err(StorageError::Unsupported(
+                    "hub lease row missing after insert",
+                )),
+            }
+        }
+    }
+    async fn renew_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let updated = connection.execute(
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 WHERE id = 1 AND holder = ?3 AND expires_at_ms > ?4",
+                binds![now_ms + ttl_ms, now_ms, holder, now_ms],
+            ).await?;
+            if updated == 1 {
+                let epoch = connection.query_row(
+                    "SELECT epoch FROM cp_hub_lease WHERE id = 1",
+                    binds![],
+                    |row| row.get::<u64>(0),
+                ).await.optional()?;
+                return Ok(HubLeaseRenew::Renewed {
+                    epoch: epoch.unwrap_or(0),
+                });
+            }
+            Ok(HubLeaseRenew::Lost)
+        }
+    }
+    async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let updated = connection.execute(
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?1 WHERE id = 1 AND holder = ?2 AND expires_at_ms > ?1",
+                binds![now_ms, holder],
+            ).await?;
+            Ok(updated == 1)
+        }
+    }
     async fn operational_aggregates(
         &self,
         now_ms: u64,

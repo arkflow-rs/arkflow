@@ -27,6 +27,7 @@ mod checkpoint;
 mod command_metrics;
 mod error;
 mod jobs;
+mod leadership;
 mod lifecycle;
 mod nodes;
 mod observability;
@@ -49,6 +50,7 @@ pub use wire::{
     HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState, NodeReport,
     RegisterRequest, RegisterResponse,
 };
+pub use leadership::{HubHaConfig, Leadership};
 
 // Internal helpers referenced across submodules.
 pub(crate) use checkpoint::recovery_record_is_compatible;
@@ -141,6 +143,13 @@ pub struct Hub {
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     command_metrics: Arc<CommandMetrics>,
+    /// Lease-election configuration (hub-ha stage 2). Default is disabled,
+    /// which keeps single-instance behavior byte-identical.
+    ha: HubHaConfig,
+    /// Current leadership view. `Disabled` bypasses every gate.
+    leadership: Arc<RwLock<Leadership>>,
+    /// Leadership transitions observed by this process (observability).
+    leadership_transitions: Arc<AtomicU64>,
     /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
     /// operator credentials keep priority when both are configured.
     oidc: Option<Arc<crate::oidc::OidcFederation>>,
@@ -209,6 +218,9 @@ impl Hub {
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
+            ha: HubHaConfig::default(),
+            leadership: Arc::new(RwLock::new(Leadership::Disabled)),
+            leadership_transitions: Arc::new(AtomicU64::new(0)),
             oidc: None,
         }
     }

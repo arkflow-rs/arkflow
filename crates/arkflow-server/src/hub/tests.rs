@@ -4043,3 +4043,366 @@ async fn audit_history_prunes_old_records_but_keeps_recent() {
     assert_eq!(remaining.len(), 1, "only the recent record survives");
     assert_eq!(remaining[0].action, "job.stop");
 }
+
+// ---- HA lease election (hub-ha stage 2) ----
+use axum::http::StatusCode;
+use tower::ServiceExt;
+
+fn ha_config(holder: &str, ttl_ms: u64) -> HubHaConfig {
+    HubHaConfig {
+        enabled: true,
+        lease_ttl_ms: ttl_ms,
+        holder_id: Some(holder.into()),
+    }
+}
+
+fn ha_job_record(job_id: &str) -> JobRecord {
+    let spec_json = serde_json::json!({
+        "id": job_id,
+        "version": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+        "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {"backend": "embedded_kv", "format_version": 3}
+    })
+    .to_string();
+    JobRecord {
+        job_id: job_id.into(),
+        version: 1,
+        spec_json,
+        desired_state: "stopped".into(),
+        observed_state: "draft".into(),
+        convergence: "unknown".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 1,
+    }
+}
+
+#[tokio::test]
+async fn standby_gates_routes_and_writes_nothing() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("standby-hub", 60_000));
+    hub.enter_election().await;
+    assert!(matches!(hub.leadership().await, Leadership::Standby { .. }));
+    assert!(!hub.is_leader().await);
+    let app = crate::hub_router(hub.clone(), &crate::ServerConfig::default());
+
+    // Liveness stays 200 through the gate; /health passes the gate too (its
+    // own unrecovered-status semantics may still answer 503, but never with
+    // the standby gate payload); readiness reports the standby role.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/liveness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        health.get("code").is_none_or(|code| code != "hub_standby"),
+        "/health must pass the standby gate"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/readiness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let readiness: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(readiness["reason"], "standby");
+    assert_eq!(readiness["ha"]["role"], "standby");
+
+    // Operator mutations are rejected before any handler runs.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/v1/jobs")
+                .header("authorization", "Bearer operator")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"spec":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["code"], "hub_standby");
+
+    // Agent registration is refused: no node session may exist on a standby.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/v1/agent/register")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"node_id":"node-a","node_token":"node-secret"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(hub.nodes().await.is_empty(), "standby created a node record");
+
+    // Reads are refused too, and nothing was persisted.
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/api/v1/jobs")
+                .header("authorization", "Bearer operator")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        storage.list_jobs().await.unwrap().is_empty(),
+        "the rejected POST must not have persisted a job"
+    );
+}
+
+#[tokio::test]
+async fn disabled_ha_keeps_the_single_instance_surface() {
+    let hub = Hub::new(config());
+    hub.enter_election().await;
+    assert_eq!(hub.leadership().await, Leadership::Disabled);
+    assert!(hub.is_leader().await, "disabled HA gates nothing");
+    let app = crate::hub_router(hub.clone(), &crate::ServerConfig::default());
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/readiness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // No storage: readiness stays unavailable for its existing reason, but
+    // the role is reported and the standby gate does not fire.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn lease_failover_promotes_standby_and_recovers_durable_state() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub_a = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-a", 60_000));
+    let hub_b = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-b", 60_000));
+    hub_a.enter_election().await;
+    hub_b.enter_election().await;
+
+    // First tick wins the empty lease; the second hub stays standby.
+    assert!(matches!(
+        hub_a.run_election_tick().await,
+        Leadership::Leader { epoch: 1, .. }
+    ));
+    assert!(matches!(hub_b.run_election_tick().await, Leadership::Standby { .. }));
+
+    // The leader persists state a standby must recover on takeover.
+    hub_a
+        .upsert_job(ha_job_record("ha-job"))
+        .await
+        .unwrap();
+
+    // Graceful shutdown releases the lease immediately; the standby takes
+    // over on its next probe with a bumped epoch.
+    hub_a.release_leadership().await;
+    assert!(matches!(hub_a.leadership().await, Leadership::Standby { .. }));
+    assert!(matches!(
+        hub_b.run_election_tick().await,
+        Leadership::Leader { epoch: 2, .. }
+    ));
+    let jobs = hub_b.jobs().await.unwrap();
+    assert!(
+        jobs.iter().any(|job| job.job_id == "ha-job"),
+        "the promoted hub must serve the recovered durable state"
+    );
+
+    // The demoted hub no longer renews: it observes the loss and stays down.
+    assert!(matches!(
+        hub_a.run_election_tick().await,
+        Leadership::Standby { .. }
+    ));
+
+    // The promoted hub is ready over HTTP with the leader role.
+    let app = crate::hub_router(hub_b, &crate::ServerConfig::default());
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/readiness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let readiness: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(readiness["ha"]["role"], "leader");
+    assert_eq!(readiness["ha"]["epoch"], 2);
+}
+
+#[tokio::test]
+async fn expired_lease_is_taken_over_without_release() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub_a = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-a", 1_000));
+    let hub_b = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-b", 60_000));
+    hub_a.enter_election().await;
+    hub_b.enter_election().await;
+    assert!(matches!(
+        hub_a.run_election_tick().await,
+        Leadership::Leader { epoch: 1, .. }
+    ));
+    // The leader dies without releasing: after the TTL lapses the standby
+    // takes over on its first probe (bounded by TTL + one probe).
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    assert!(matches!(
+        hub_b.run_election_tick().await,
+        Leadership::Leader { epoch: 2, .. }
+    ));
+}
+
+#[tokio::test]
+async fn promotion_replaces_stale_memory_from_the_previous_term() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub_a = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-a", 60_000));
+    let hub_b = Hub::with_storage(config(), storage.clone())
+        .with_ha(ha_config("hub-b", 60_000));
+    hub_a.enter_election().await;
+    hub_b.enter_election().await;
+    assert!(matches!(hub_a.run_election_tick().await, Leadership::Leader { .. }));
+    hub_a.upsert_job(ha_job_record("durable-job")).await.unwrap();
+    hub_a.release_leadership().await;
+    assert!(matches!(hub_b.run_election_tick().await, Leadership::Leader { .. }));
+
+    // While B leads, it advances durable state; A keeps a ghost entry in
+    // memory from its previous term.
+    hub_b
+        .update_job("durable-job", Some("running"), None)
+        .await
+        .unwrap();
+    hub_a
+        .jobs
+        .write()
+        .await
+        .insert("ghost-job".into(), ha_job_record("ghost-job"));
+
+    // B hands back the lease; A re-promotes and must serve durable truth.
+    hub_b.release_leadership().await;
+    assert!(matches!(hub_a.run_election_tick().await, Leadership::Leader { .. }));
+    let jobs = hub_a.jobs().await.unwrap();
+    assert!(
+        !jobs.iter().any(|job| job.job_id == "ghost-job"),
+        "stale in-memory entries from the previous term must be dropped"
+    );
+    let durable = jobs
+        .iter()
+        .find(|job| job.job_id == "durable-job")
+        .expect("durable job recovered");
+    assert_eq!(durable.desired_state, "running");
+    // The node registry is rebuilt from scratch after promotion.
+    assert!(hub_a.nodes().await.is_empty());
+}
+
+#[tokio::test]
+async fn serve_hub_elects_leadership_and_flips_readiness() {
+    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub = Hub::with_storage(config(), storage)
+        .with_ha(ha_config("serve-hub", 1_000));
+    // Reserve an ephemeral port, then hand it to serve_hub.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let server_config = crate::ServerConfig {
+        address: format!("127.0.0.1:{port}"),
+        insecure_local: true,
+        ..crate::ServerConfig::default()
+    };
+    let shutdown = cancellation.clone();
+    let hub_handle = hub.clone();
+    tokio::spawn(async move {
+        let _ = crate::serve_hub(hub_handle, server_config, shutdown).await;
+    });
+    // The election loop probes at ttl/3 (>= 1s): readiness must flip from
+    // standby-503 to leader-200 within a bounded window.
+    let client = reqwest::Client::new();
+    let mut leader_ready = false;
+    for _ in 0..50 {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/readiness"))
+            .send()
+            .await
+        {
+            if response.status().as_u16() == 200 {
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["ha"]["role"], "leader");
+                assert!(body["ha"]["epoch"].as_u64().unwrap_or(0) >= 1);
+                leader_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(leader_ready, "serve_hub must promote the standby via the election loop");
+    assert!(matches!(hub.leadership().await, Leadership::Leader { .. }));
+    assert!(hub.leadership_transitions() >= 1);
+    let events = hub.events(None).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.event_type == "hub.leadership"),
+        "the promotion must appear in the event stream"
+    );
+    // Graceful shutdown releases the lease: another holder can immediately
+    // take over with the next epoch.
+    cancellation.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(matches!(hub.leadership().await, Leadership::Standby { .. }));
+}

@@ -581,6 +581,47 @@ enum StorageCommand {
         resource_id: String,
         response: oneshot::Sender<Result<Vec<PersistedOperation>, StorageError>>,
     },
+    TryAcquireHubLease {
+        holder: String,
+        ttl_ms: u64,
+        now_ms: u64,
+        response: oneshot::Sender<Result<HubLeaseAcquire, StorageError>>,
+    },
+    RenewHubLease {
+        holder: String,
+        ttl_ms: u64,
+        now_ms: u64,
+        response: oneshot::Sender<Result<HubLeaseRenew, StorageError>>,
+    },
+    ReleaseHubLease {
+        holder: String,
+        now_ms: u64,
+        response: oneshot::Sender<Result<bool, StorageError>>,
+    },
+}
+
+/// Snapshot of the singleton control-plane lease row (`cp_hub_lease`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubLeaseSnapshot {
+    pub holder: String,
+    pub epoch: u64,
+    pub expires_at_ms: u64,
+}
+
+/// Outcome of `try_acquire_hub_lease`: either the caller now holds the lease
+/// (a takeover bumped the fencing epoch; a self-acquire keeps it) or another
+/// live holder owns it and nothing was modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubLeaseAcquire {
+    Acquired { epoch: u64 },
+    HeldByOther(HubLeaseSnapshot),
+}
+
+/// Outcome of `renew_hub_lease`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubLeaseRenew {
+    Renewed { epoch: u64 },
+    Lost,
 }
 
 #[derive(Clone)]
@@ -912,6 +953,30 @@ impl StorageActor {
                         response,
                     } => {
                         let _ = response.send(store.list_job_start_operations(&resource_id).await);
+                    }
+                    StorageCommand::TryAcquireHubLease {
+                        holder,
+                        ttl_ms,
+                        now_ms,
+                        response,
+                    } => {
+                        let _ =
+                            response.send(store.try_acquire_hub_lease(&holder, ttl_ms, now_ms).await);
+                    }
+                    StorageCommand::RenewHubLease {
+                        holder,
+                        ttl_ms,
+                        now_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.renew_hub_lease(&holder, ttl_ms, now_ms).await);
+                    }
+                    StorageCommand::ReleaseHubLease {
+                        holder,
+                        now_ms,
+                        response,
+                    } => {
+                        let _ = response.send(store.release_hub_lease(&holder, now_ms).await);
                     }
                 }
             }
@@ -1704,6 +1769,61 @@ impl StorageActor {
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
+
+    pub async fn try_acquire_hub_lease(
+        &self,
+        holder: impl Into<String>,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::TryAcquireHubLease {
+                holder: holder.into(),
+                ttl_ms,
+                now_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn renew_hub_lease(
+        &self,
+        holder: impl Into<String>,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::RenewHubLease {
+                holder: holder.into(),
+                ttl_ms,
+                now_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    pub async fn release_hub_lease(
+        &self,
+        holder: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ReleaseHubLease {
+                holder: holder.into(),
+                now_ms,
+                response,
+            })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
 }
 
 /// Storage contract shared by every backend. One method per storage command;
@@ -1863,10 +1983,23 @@ expected_generation: u64,
 job_id: &str,
 ) -> Result<Vec<JobCheckpointRecord>, StorageError>;
     async fn delete_job_checkpoint(
-&self,
-job_id: &str,
-checkpoint_id: &str,
-) -> Result<(), StorageError>;
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError>;
+    async fn try_acquire_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError>;
+    async fn renew_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError>;
+    async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError>;
 }
 
 #[derive(Clone)]
@@ -2360,6 +2493,42 @@ checkpoint_id: &str,
             Self::Postgres(backend) => StorageBackend::delete_job_checkpoint(backend, job_id, checkpoint_id).await,
         }
     }
+    async fn try_acquire_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseAcquire, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::try_acquire_hub_lease(backend, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::try_acquire_hub_lease(backend, holder, ttl_ms, now_ms).await
+            }
+        }
+    }
+    async fn renew_hub_lease(
+        &self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<HubLeaseRenew, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::renew_hub_lease(backend, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::renew_hub_lease(backend, holder, ttl_ms, now_ms).await
+            }
+        }
+    }
+    async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::release_hub_lease(backend, holder, now_ms).await,
+            Self::Postgres(backend) => StorageBackend::release_hub_lease(backend, holder, now_ms).await,
+        }
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2383,6 +2552,71 @@ mod tests {
         assert!(store.table_exists("cp_audit_events").unwrap());
         assert!(store.table_exists("cp_rollouts").unwrap());
         assert!(store.table_exists("cp_rollout_targets").unwrap());
+    }
+
+    /// The hub-lease contract every backend must satisfy: expiry takeover
+    /// bumps the fencing epoch, live holders refuse takeover, renewal only
+    /// works while held and unexpired, self-acquire is idempotent, and
+    /// release expires the caller's lease immediately.
+    #[tokio::test]
+    async fn hub_lease_acquire_renew_release_contract() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        // Fresh row: the first acquire is a takeover of the expired default.
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        // Another live holder is refused and observes the current lease.
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-b", 1_000, 200).await.unwrap(),
+            HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
+                holder: "hub-a".into(),
+                epoch: 1,
+                expires_at_ms: 1_100,
+            })
+        );
+        // Holder renews; epoch is stable.
+        assert_eq!(
+            store.renew_hub_lease("hub-a", 1_000, 500).await.unwrap(),
+            HubLeaseRenew::Renewed { epoch: 1 }
+        );
+        // Non-holder renewal is Lost without touching the row.
+        assert_eq!(
+            store.renew_hub_lease("hub-b", 1_000, 500).await.unwrap(),
+            HubLeaseRenew::Lost
+        );
+        // Past expiry the old holder can no longer renew.
+        assert_eq!(
+            store.renew_hub_lease("hub-a", 1_000, 2_000).await.unwrap(),
+            HubLeaseRenew::Lost
+        );
+        // Takeover after expiry bumps the epoch.
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-b", 1_000, 2_000).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 2 }
+        );
+        // Self-acquire keeps the epoch and extends the TTL.
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-b", 2_000, 2_500).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 2 }
+        );
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-a", 1_000, 2_600).await.unwrap(),
+            HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
+                holder: "hub-b".into(),
+                epoch: 2,
+                expires_at_ms: 4_500,
+            })
+        );
+        // Release expires immediately (and only for the holder); a second
+        // release of an already-expired lease is a no-op.
+        assert!(!store.release_hub_lease("hub-a", 2_700).await.unwrap());
+        assert!(store.release_hub_lease("hub-b", 2_900).await.unwrap());
+        assert!(!store.release_hub_lease("hub-b", 2_950).await.unwrap());
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-a", 1_000, 3_000).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 3 }
+        );
     }
 
     #[tokio::test]

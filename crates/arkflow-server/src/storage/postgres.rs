@@ -582,9 +582,17 @@ const PG_DDL: &str = r#"
                 intent_id TEXT COLLATE "C",
                 available_at_ms BIGINT NOT NULL,
                 claimed_at_ms BIGINT,
-                worker_id TEXT,
+                worker_id TEXT COLLATE "C",
                 processed_at_ms BIGINT,
                 created_at_ms BIGINT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cp_hub_lease (
+                id BIGINT PRIMARY KEY CHECK (id = 1),
+                holder TEXT NOT NULL DEFAULT '',
+                epoch BIGINT NOT NULL DEFAULT 0,
+                expires_at_ms BIGINT NOT NULL DEFAULT 0,
+                updated_at_ms BIGINT NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS cp_intents_due
@@ -819,5 +827,42 @@ mod tests {
         assert!(claimed.is_some());
         let aggregates = storage.operational_aggregates(4_102_444_800_000).await.unwrap();
         assert!(aggregates.outbox_pending >= 1);
+
+        // Hub-lease contract parity with the SQLite suite. Epochs are
+        // asserted relative to the first acquired value so the battery also
+        // passes against a database that retains earlier lease takeovers.
+        let run = format!("pg-hub-{}", now_ms());
+        let now = now_ms();
+        let ttl = 60_000u64;
+        let acquired = storage.try_acquire_hub_lease(&run, ttl, now).await.unwrap();
+        assert!(matches!(acquired, HubLeaseAcquire::Acquired { .. }), "{acquired:?}");
+        let HubLeaseAcquire::Acquired { epoch } = acquired else { unreachable!() };
+        assert_eq!(
+            storage.try_acquire_hub_lease("pg-other", ttl, now + 1).await.unwrap(),
+            HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
+                holder: run.clone(),
+                epoch,
+                expires_at_ms: now + ttl,
+            })
+        );
+        assert_eq!(
+            storage.renew_hub_lease(&run, ttl, now + 2).await.unwrap(),
+            HubLeaseRenew::Renewed { epoch }
+        );
+        assert_eq!(
+            storage.renew_hub_lease("pg-other", ttl, now + 2).await.unwrap(),
+            HubLeaseRenew::Lost
+        );
+        assert_eq!(
+            storage.try_acquire_hub_lease(&run, ttl, now + 3).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch }
+        );
+        assert!(storage.release_hub_lease(&run, now + 4).await.unwrap());
+        assert!(!storage.release_hub_lease(&run, now + 5).await.unwrap());
+        assert_eq!(
+            storage.try_acquire_hub_lease("pg-other", ttl, now + 6).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: epoch + 1 }
+        );
+        assert!(storage.release_hub_lease("pg-other", now + 7).await.unwrap());
     }
 }

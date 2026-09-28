@@ -68,6 +68,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hub_storage: std::env::var("ARKFLOW_HUB_STORAGE").ok(),
         ..ServerConfig::default()
     };
+    let ha = arkflow_server::hub::HubHaConfig {
+        enabled: std::env::var("ARKFLOW_HUB_HA_ENABLED")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        lease_ttl_ms: std::env::var("ARKFLOW_HUB_HA_LEASE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|ttl| *ttl >= 1_000)
+            .unwrap_or(15_000),
+        holder_id: std::env::var("ARKFLOW_HUB_HA_HOLDER_ID").ok(),
+    };
+    if ha.enabled {
+        if config.hub_storage.is_none() {
+            return Err(
+                "ARKFLOW_HUB_HA_ENABLED requires ARKFLOW_HUB_STORAGE (use a PostgreSQL URL for multi-instance HA)"
+                    .into(),
+            );
+        }
+        let is_postgres = config
+            .hub_storage
+            .as_deref()
+            .is_some_and(|value| value.starts_with("postgres://") || value.starts_with("postgresql://"));
+        if !is_postgres {
+            tracing::warn!(
+                "HA election is enabled on a SQLite store: multi-instance HA requires the \
+                 PostgreSQL backend; this configuration is for development and testing only"
+            );
+        }
+    }
     let hub_config = HubConfig {
         operator_token: std::env::var("ARKFLOW_OPERATOR_TOKEN").ok(),
         node_token: config.node_token.clone(),
@@ -78,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let mut hub = if let Some(path) = config.hub_storage.as_deref() {
         let store = ControlPlaneStore::open(path).await?;
-        Hub::with_storage(hub_config, StorageActor::start(store, 128))
+        Hub::with_storage(hub_config, StorageActor::start(store, 128)).with_ha(ha)
     } else {
-        Hub::new(hub_config)
+        Hub::new(hub_config).with_ha(ha)
     };
     if let Some(oidc) = OidcFederation::from_env().await {
         hub = hub.with_oidc(oidc);

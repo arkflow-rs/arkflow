@@ -375,6 +375,16 @@ pub async fn serve_observability(
 /// reports stored in `Hub`.
 pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     let prefix = config.api_prefix.trim_end_matches('/');
+    // Standby allowlist: probes the load balancer needs to route traffic to
+    // the leader, plus the metrics export. Everything else is gated on
+    // leadership so a standby never serves its (stale or empty) memory view.
+    let standby_allowlist: std::sync::Arc<[String]> = vec![
+        config.health_path.clone(),
+        config.readiness_path.clone(),
+        config.liveness_path.clone(),
+        format!("{prefix}/metrics"),
+    ]
+    .into();
     let api = Router::new()
         .route("/system", get(hub_system))
         .route("/nodes", get(hub_nodes))
@@ -466,7 +476,29 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route(&config.readiness_path, get(hub_readiness))
         .route(&config.liveness_path, get(hub_liveness))
         .nest(prefix, api)
-        .with_state(hub)
+        .with_state(hub.clone())
+        .layer(middleware::from_fn(
+            move |request: axum::extract::Request, next: Next| {
+                let hub = hub.clone();
+                let allowlist = standby_allowlist.clone();
+                async move {
+                    if hub.is_leader().await {
+                        return next.run(request).await;
+                    }
+                    let path = request.uri().path();
+                    if allowlist.iter().any(|allowed| allowed == path) {
+                        return next.run(request).await;
+                    }
+                    problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "hub_standby",
+                        "This Hub instance is a standby and does not hold the control-plane \
+                         lease; retry against the elected leader"
+                            .into(),
+                    )
+                }
+            },
+        ))
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .layer(middleware::from_fn(correlation_middleware))
         .layer(TraceLayer::new_for_http());
@@ -492,8 +524,25 @@ pub async fn serve_hub(
         return Ok(());
     }
     let address = config.validate_hub_startup(&hub)?;
+    // HA election (hub-ha stage 2): an HA-enabled Hub starts as standby and
+    // earns leadership through the durable lease. Enabling HA without
+    // durable storage is rejected before anything binds: a standby has no
+    // lease to compete for without the store.
+    if hub.ha_config().enabled && !hub.has_storage() {
+        return Err(
+            "HA election requires durable storage: set ARKFLOW_HUB_STORAGE (PostgreSQL for multi-instance deployments)"
+                .into(),
+        );
+    }
     arkflow_plugin::initialize()?;
-    hub.recover_persisted_state().await?;
+    hub.enter_election().await;
+    if !hub.is_leader().await {
+        tracing::info!(
+            "HA standby: durable recovery is deferred until this instance acquires the lease"
+        );
+    } else {
+        hub.recover_persisted_state().await?;
+    }
     if !hub.operator_token_is_set() {
         tracing::warn!(
             "Hub is running WITHOUT an operator token: every operator API grants full Admin access. \
@@ -511,8 +560,10 @@ pub async fn serve_hub(
     // readiness): the terminal-state dispatch-skip memory and the operations
     // read API must reflect durable history before any reconcile tick or
     // operator request runs. Manual `hub_router` test setups do not restart
-    // the Hub and skip this path by construction.
-    if hub.has_storage() {
+    // the Hub and skip this path by construction. A standby defers this: it
+    // must not write terminal settlements while another Hub is leader —
+    // promotion re-runs the restore after winning the lease.
+    if hub.has_storage() && hub.is_leader().await {
         let restored = hub.restore_persisted_operations().await?;
         tracing::info!(
             restored,
@@ -520,12 +571,40 @@ pub async fn serve_hub(
         );
     }
     let listener = TcpListener::bind(address).await?;
+    // Lease election loop: leaders renew at ttl/3, standbys probe for
+    // takeover. Failover is bounded by the lease TTL plus one probe.
+    if hub.ha_config().enabled {
+        let election_hub = hub.clone();
+        let election_cancel = cancellation.clone();
+        let probe_ms = (hub.ha_config().lease_ttl_ms / 3).max(1_000);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(probe_ms));
+            interval
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => { election_hub.run_election_tick().await; }
+                    _ = election_cancel.cancelled() => break,
+                }
+            }
+        });
+    }
     let sweep_hub = hub.clone();
     let sweep_cancel = cancellation.clone();
     let sweep_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
-            tokio::select! { _ = interval.tick() => sweep_hub.mark_stale().await, _ = sweep_cancel.cancelled() => break }
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Standbys neither age out node leases nor observe
+                    // reports: the leader owns fleet state.
+                    if sweep_hub.is_leader().await {
+                        sweep_hub.mark_stale().await;
+                    }
+                }
+                _ = sweep_cancel.cancelled() => break,
+            }
         }
     });
     let reconcile_hub = hub.clone();
@@ -537,6 +616,11 @@ pub async fn serve_hub(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Reconciliation dispatches commands and mutates durable
+                    // desired state: leader-only by definition.
+                    if !reconcile_hub.is_leader().await {
+                        continue;
+                    }
                     let _ = reconcile_hub.expire_attempts().await;
                     let _ = reconcile_hub.schedule_periodic_checkpoints().await;
                     let started = crate::hub::now_ms_for_metrics();
@@ -562,6 +646,9 @@ pub async fn serve_hub(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    if !maintenance_hub.is_leader().await {
+                        continue;
+                    }
                     let _ = maintenance_hub.prune_events(2048).await;
                     let _ = maintenance_hub.prune_operation_history().await;
                     let _ = maintenance_hub.prune_stale_checkpoint_records().await;
@@ -573,8 +660,13 @@ pub async fn serve_hub(
             }
         }
     });
-    let result = axum::serve(listener, hub_router(hub, &config).into_make_service())
-        .with_graceful_shutdown(cancellation.cancelled_owned())
+    let result = axum::serve(listener, hub_router(hub.clone(), &config).into_make_service())
+        .with_graceful_shutdown(async move {
+            cancellation.cancelled().await;
+            // Release the lease before the listener drains so a standby can
+            // take over immediately instead of waiting out the TTL.
+            hub.release_leadership().await;
+        })
         .await;
     sweep_task.abort();
     reconcile_task.abort();
@@ -592,8 +684,9 @@ async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
         );
     }
     let nodes = hub.nodes().await;
+    let leadership = hub.leadership().await;
     Json(
-        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"]}),
+        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}}),
     ).into_response()
 }
 
@@ -2801,7 +2894,41 @@ async fn hub_health(State(hub): State<hub::Hub>) -> Response {
     }
 }
 async fn hub_readiness(State(hub): State<hub::Hub>) -> Response {
-    match hub.operational_status().await { Ok(status) if status.ready => (StatusCode::OK, Json(serde_json::json!({"status":"ready","ready":true}))).into_response(), Ok(_status) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"startup_recovery"}))).into_response(), Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"storage_unavailable"}))).into_response() }
+    let leadership = hub.leadership().await;
+    let ha = serde_json::json!({
+        "enabled": hub.ha_config().enabled,
+        "role": leadership.role(),
+        "epoch": leadership.epoch(),
+    });
+    if !leadership.is_leader() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "ready": false,
+                "reason": "standby",
+                "ha": ha,
+            })),
+        )
+            .into_response();
+    }
+    match hub.operational_status().await {
+        Ok(status) if status.ready => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status":"ready","ready":true,"ha":ha})),
+        )
+            .into_response(),
+        Ok(_status) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"startup_recovery","ha":ha})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status":"not_ready","ready":false,"reason":"storage_unavailable","ha":ha})),
+        )
+            .into_response(),
+    }
 }
 async fn hub_liveness() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"alive","alive":true}))
@@ -3889,6 +4016,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ha_enabled_without_storage_fails_before_binding() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        })
+        .with_ha(hub::HubHaConfig {
+            enabled: true,
+            ..hub::HubHaConfig::default()
+        });
+        let config = ServerConfig {
+            address: "127.0.0.1:0".into(),
+            insecure_local: true,
+            ..ServerConfig::default()
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let error = serve_hub(hub, config, cancellation).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HA election requires durable storage"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
