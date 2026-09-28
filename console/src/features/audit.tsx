@@ -48,9 +48,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
       {visible.length ? (
         visible.map((record) => <AuditRow key={record.event_id} record={record} />)
       ) : (
-        <p className="empty">
-          {records === undefined ? t('audit.loadingRecords') : t('audit.noMatching')}
-        </p>
+        <p className="empty">{records === undefined ? t('audit.loadingRecords') : t('audit.noMatching')}</p>
       )}
     </section>
   )

@@ -97,23 +97,17 @@ export function Overview({
                         <strong>{node.streams_failed}</strong> {t('overview.failed')}
                       </span>
                     </div>
-                    <small>
-                      {(node.capabilities ?? []).join(' · ') || t('overview.noCapabilities')}
-                    </small>
+                    <small>{(node.capabilities ?? []).join(' · ') || t('overview.noCapabilities')}</small>
                     <div className="actions">
                       {maintenance === 'active' ? (
                         <>
-                          <button onClick={() => setMaintenance(node, 'drain')}>
-                            {t('overview.drain')}
-                          </button>
+                          <button onClick={() => setMaintenance(node, 'drain')}>{t('overview.drain')}</button>
                           <button onClick={() => setMaintenance(node, 'maintain')}>
                             {t('overview.maintain')}
                           </button>
                         </>
                       ) : (
-                        <button onClick={() => setMaintenance(node, 'resume')}>
-                          {t('overview.resume')}
-                        </button>
+                        <button onClick={() => setMaintenance(node, 'resume')}>{t('overview.resume')}</button>
                       )}
                     </div>
                   </article>

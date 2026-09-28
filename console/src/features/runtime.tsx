@@ -117,7 +117,11 @@ export function Runtime({
                       disabled={!canMutate}
                       key={action}
                       onClick={() => {
-                        if (window.confirm(t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id })))
+                        if (
+                          window.confirm(
+                            t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id }),
+                          )
+                        )
                           void command(stream.id, action)
                       }}
                     >
@@ -193,8 +197,7 @@ function RuntimeDetail({
             {t('runtime.node')}: <strong>{stream.node_id ?? t('common.localNode')}</strong>
           </p>
           <p>
-            {t('runtime.desiredLabel')}:{' '}
-            <strong>{stream.desired_state ?? t('common.unknown')}</strong> ·{' '}
+            {t('runtime.desiredLabel')}: <strong>{stream.desired_state ?? t('common.unknown')}</strong> ·{' '}
             {t('common.generation', { value: stream.desired_generation ?? '—' })}
           </p>
           <p>
@@ -210,7 +213,9 @@ function RuntimeDetail({
           </p>
           <p>
             {t('runtime.retry')}: {stream.retry_count ?? 0}
-            {stream.next_retry_at_ms ? t('runtime.nextRetry', { time: formatTime(stream.next_retry_at_ms) }) : ''}
+            {stream.next_retry_at_ms
+              ? t('runtime.nextRetry', { time: formatTime(stream.next_retry_at_ms) })
+              : ''}
           </p>
           <p>
             {t('runtime.activeOperation')}: {stream.active_operation_id ?? t('common.none')}

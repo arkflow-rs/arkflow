@@ -339,5 +339,4 @@ export const zh = {
   'api.sseConnectionFailed': 'SSE 连接失败（{status}）',
   'api.operationState': '操作 {state}',
   'api.operationTimedOut': '操作超时',
-
 } satisfies Record<keyof typeof en, string>

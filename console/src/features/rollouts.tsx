@@ -225,9 +225,7 @@ function RolloutDetailPanel({
           )}
         </div>
       </div>
-      {pollError && (
-        <div className="warning">{t('rollouts.liveProgressPaused', { error: pollError })}</div>
-      )}
+      {pollError && <div className="warning">{t('rollouts.liveProgressPaused', { error: pollError })}</div>}
       <p>
         <strong>{detail.rollout.config_version_id}</strong> ·{' '}
         {t('rollouts.batchSize', { size: detail.rollout.batch_size })} · {detail.rollout.state}

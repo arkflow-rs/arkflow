@@ -470,8 +470,12 @@ export function JobEditor({
     <section className="panel detail job-editor">
       <div className="panel-title">
         <div>
-          <span className="eyebrow">{mode === 'create' ? t('editor.eyebrowCreate') : t('editor.eyebrowUpgrade')}</span>
-          <h3>{mode === 'create' ? t('editor.visualOrchestrator') : `${job?.job_id} → v${spec.version ?? 1}`}</h3>
+          <span className="eyebrow">
+            {mode === 'create' ? t('editor.eyebrowCreate') : t('editor.eyebrowUpgrade')}
+          </span>
+          <h3>
+            {mode === 'create' ? t('editor.visualOrchestrator') : `${job?.job_id} → v${spec.version ?? 1}`}
+          </h3>
           <small>
             {mode === 'upgrade'
               ? t('editor.recoveryFrom', { checkpoint: savepoint?.checkpoint_id ?? '' })

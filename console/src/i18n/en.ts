@@ -348,5 +348,4 @@ export const en = {
   'api.sseConnectionFailed': 'SSE connection failed ({status})',
   'api.operationState': 'Operation {state}',
   'api.operationTimedOut': 'Operation timed out',
-
 }

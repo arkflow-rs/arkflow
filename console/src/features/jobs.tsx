@@ -103,7 +103,11 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
           />
-          <select aria-label={t('jobs.stateFilterLabel')} value={state} onChange={(event) => setState(event.target.value)}>
+          <select
+            aria-label={t('jobs.stateFilterLabel')}
+            value={state}
+            onChange={(event) => setState(event.target.value)}
+          >
             <option value="all">{t('jobs.allStates')}</option>
             <option value="running">Running</option>
             <option value="stopped">Stopped</option>
@@ -132,7 +136,9 @@ export function Jobs({ jobs, nodes, onRefresh, onError, canMutate = true }: Jobs
                 </button>
                 <div>
                   <span className={`state ${job.observed_state}`}>{job.observed_state}</span>
-                  <small>{t('jobs.desiredSummary', { desired: job.desired_state, convergence: job.convergence })}</small>
+                  <small>
+                    {t('jobs.desiredSummary', { desired: job.desired_state, convergence: job.convergence })}
+                  </small>
                   {job.last_error && <small className="error-text">{job.last_error}</small>}
                 </div>
                 <div className="actions">
@@ -241,7 +247,9 @@ function JobDetailPanel({
         <div>
           <span className="eyebrow">{t('jobs.detailEyebrow')}</span>
           <h3>{detail.job.job_id}</h3>
-          <small>{t('jobs.versionGeneration', { version: detail.job.version, generation: detail.job.generation })}</small>
+          <small>
+            {t('jobs.versionGeneration', { version: detail.job.version, generation: detail.job.generation })}
+          </small>
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('jobs.close')}</button>
@@ -254,16 +262,16 @@ function JobDetailPanel({
           {detail.job.desired_state === 'running' && (
             <button
               disabled={!canMutate || busy}
-              onClick={() => void onAction(t('jobs.stopping'), () => api.setJobState(detail.job.job_id, 'stopped'))}
+              onClick={() =>
+                void onAction(t('jobs.stopping'), () => api.setJobState(detail.job.job_id, 'stopped'))
+              }
             >
               {t('jobs.stop')}
             </button>
           )}
         </div>
       </div>
-      {pollError && (
-        <div className="warning">{t('jobs.livePaused', { error: pollError })}</div>
-      )}
+      {pollError && <div className="warning">{t('jobs.livePaused', { error: pollError })}</div>}
       <div className="job-tabs">
         {(['overview', 'plan', 'tasks', 'recovery', 'versions'] as const).map((value) => (
           <button className={tab === value ? 'active' : ''} key={value} onClick={() => setTab(value)}>
@@ -277,15 +285,18 @@ function JobDetailPanel({
             <div>
               <span className={`state ${detail.job.observed_state}`}>{detail.job.observed_state}</span>
               <p>
-                {t('jobs.desiredLabel')} <strong>{detail.job.desired_state}</strong> · {t('jobs.convergenceLabel')}{' '}
-                <strong>{detail.job.convergence}</strong>
+                {t('jobs.desiredLabel')} <strong>{detail.job.desired_state}</strong> ·{' '}
+                {t('jobs.convergenceLabel')} <strong>{detail.job.convergence}</strong>
               </p>
               <p>
                 {t('jobs.nodesLabel')}{' '}
-                <strong>{detail.nodes.map((node) => node.id).join(', ') || t('jobs.automaticPlacement')}</strong>
+                <strong>
+                  {detail.nodes.map((node) => node.id).join(', ') || t('jobs.automaticPlacement')}
+                </strong>
               </p>
               <p>
-                {t('jobs.latestRecoveryLabel')} <strong>{detail.job.checkpoint_id ?? t('jobs.noneValue')}</strong>
+                {t('jobs.latestRecoveryLabel')}{' '}
+                <strong>{detail.job.checkpoint_id ?? t('jobs.noneValue')}</strong>
               </p>
               {detail.job.last_error && <div className="error-row">{detail.job.last_error}</div>}
             </div>
@@ -294,7 +305,9 @@ function JobDetailPanel({
                 <div className="metric" key={key}>
                   <span>{key.replaceAll('_', ' ')}</span>
                   <strong>
-                    {typeof value === 'number' ? value.toLocaleString(intlLocale(currentLocale())) : String(value)}
+                    {typeof value === 'number'
+                      ? value.toLocaleString(intlLocale(currentLocale()))
+                      : String(value)}
                   </strong>
                 </div>
               ))}
@@ -333,7 +346,9 @@ function JobDetailPanel({
                 <span className={`state ${String(task.state ?? 'assigned')}`}>
                   {String(task.state ?? 'assigned')}
                 </span>
-                <small>{t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}</small>
+                <small>
+                  {t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}
+                </small>
               </div>
             ))
           ) : (
@@ -425,7 +440,9 @@ function JobVersions({
           <div className="version" key={version.version}>
             <span>
               <strong>v{version.version}</strong> · {formatTime(version.created_at_ms)}
-              <small>{version.version === currentVersion ? t('jobs.versionCurrent') : t('jobs.versionAvailable')}</small>
+              <small>
+                {version.version === currentVersion ? t('jobs.versionCurrent') : t('jobs.versionAvailable')}
+              </small>
             </span>
             <div className="actions">
               <button onClick={() => onViewPlan(version.plan_json)}>{t('jobs.viewPlan')}</button>
