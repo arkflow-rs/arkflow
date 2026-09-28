@@ -94,7 +94,7 @@ instance pointed at the same database:
 | `ARKFLOW_HUB_HA_ENABLED` | yes | Set `true` to join the election. Off by default; a disabled Hub is a plain single instance. |
 | `ARKFLOW_HUB_STORAGE` | yes | Must be a PostgreSQL URL for multi-instance HA (SQLite works for development and testing only and logs a warning). |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | no | Lease lifetime, default `15000`. Renewal runs at TTL/3; the failover window is bounded by the TTL plus one probe. Minimum 1000. |
-| `ARKFLOW_HUB_HA_HOLDER_ID` | no | Explicit holder identity; defaults to `host:pid:boot-ms`. |
+| `ARKFLOW_HUB_HA_HOLDER_ID` | no | Explicit holder identity; defaults to `host:pid:boot-ms`. Must be unique per Hub process: two Hubs sharing one holder id would renew each other's lease and both act as leader — leave it unset unless you have a naming scheme that guarantees uniqueness. |
 
 Behavior:
 

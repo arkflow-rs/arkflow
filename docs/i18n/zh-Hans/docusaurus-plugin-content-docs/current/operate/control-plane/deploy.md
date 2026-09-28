@@ -58,7 +58,7 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 | `ARKFLOW_HUB_HA_ENABLED` | 是 | 设为 `true` 加入选主。默认关闭;关闭的 Hub 就是普通单实例。 |
 | `ARKFLOW_HUB_STORAGE` | 是 | 多实例 HA 必须是 PostgreSQL URL(SQLite 仅用于开发与测试,会记录警告)。 |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | 否 | 租约时长,默认 `15000`。续约周期为 TTL/3;故障接管窗口以 TTL 加一个探测周期为界。最小 1000。 |
-| `ARKFLOW_HUB_HA_HOLDER_ID` | 否 | 显式持有者标识;缺省为 `host:pid:boot-ms`。 |
+| `ARKFLOW_HUB_HA_HOLDER_ID` | 否 | 显式持有者标识;缺省为 `host:pid:boot-ms`。必须每个 Hub 进程唯一:两个 Hub 共用同一 holder id 会互相续约、同时充当 leader——除非命名方案能保证唯一,否则保持未设置。 |
 
 行为:
 

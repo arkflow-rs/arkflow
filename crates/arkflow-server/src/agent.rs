@@ -500,6 +500,35 @@ fn parse_recovery_payload(
     Ok((Some(checkpoint_id.to_owned()), savepoint, recovery_required))
 }
 
+impl Drop for JobTask {
+    /// Last-resort guard: a JobTask dropped without one of the explicit
+    /// retirement paths must not let its `Arc<Runtime>` drop inside an
+    /// async context (Runtime::drop panics there). The explicit paths
+    /// `take()` the runtime first, so this only fires on missed paths. No
+    /// runtime context (process teardown) parks the shutdown on a bare
+    /// thread instead.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.dedicated_runtime.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
+                }
+                Err(_) => {
+                    std::thread::spawn(move || {
+                        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                            runtime.shutdown_timeout(Duration::from_secs(10));
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Bounded, detached teardown of a dedicated runtime. Takes the task's
 /// reference (callers `take()` it before awaiting the kernel handle) so the
 /// final Arc never drops inside an async context (Runtime::drop panics
@@ -709,8 +738,12 @@ impl JobRuntime {
             let existing_generation = existing.generation;
             let dedicated = existing.dedicated_runtime.take();
             let outcome =
-                await_previous_teardown(&job_id, existing.handle, KERNEL_TEARDOWN_JOIN_TIMEOUT)
-                    .await;
+                await_previous_teardown(
+                    &job_id,
+                    &mut existing.handle,
+                    KERNEL_TEARDOWN_JOIN_TIMEOUT,
+                )
+                .await;
             let _ = existing.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -1003,7 +1036,7 @@ impl JobRuntime {
                 if let Some(mut task) = placeholder {
                     let dedicated = task.dedicated_runtime.take();
                     task.cancellation.cancel();
-                    let _ = task.handle.await;
+                    let _ = (&mut task.handle).await;
                     shutdown_dedicated_runtime(dedicated);
                 }
                 if let Some(runtime) = dedicated_runtime.take() {
@@ -1363,7 +1396,7 @@ impl JobRuntime {
         for job_id in ids {
             if let Some(mut task) = tasks.remove(&job_id) {
                 let dedicated = task.dedicated_runtime.take();
-                let result = match task.handle.await {
+                let result = match (&mut task.handle).await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(error) => Err(error.to_string()),
@@ -1397,7 +1430,7 @@ impl JobRuntime {
         for (job_id, mut task) in tasks {
             let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = task.handle.await;
+            let _ = (&mut task.handle).await;
             let _ = task.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -1421,7 +1454,7 @@ impl JobRuntime {
             let task_generation = task.generation;
             let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = task.handle.await;
+            let _ = (&mut task.handle).await;
             let _ = task.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -2226,10 +2259,10 @@ const KERNEL_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// when the bound expired with the task detached (no outcome exists).
 async fn await_previous_teardown(
     job_id: &str,
-    handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+    handle: &mut tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
     bound: Duration,
 ) -> Option<Result<(), String>> {
-    match tokio::time::timeout(bound, handle).await {
+    match tokio::time::timeout(bound, &mut *handle).await {
         Err(_) => {
             warn!(
                 job_id = %job_id,
@@ -3095,9 +3128,9 @@ fn jittered_backoff_stays_within_the_equal_jitter_window() {
 /// outcome — `None` — so the start path knows there is nothing to report.
 #[tokio::test]
 async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
-    let wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
+    let mut wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
     let started = std::time::Instant::now();
-    let outcome = await_previous_teardown("job-wedge", wedged, Duration::from_millis(100)).await;
+    let outcome = await_previous_teardown("job-wedge", &mut wedged, Duration::from_millis(100)).await;
     assert!(
         outcome.is_none(),
         "a detached teardown must report no outcome: {outcome:?}"
@@ -3115,12 +3148,12 @@ async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
 /// observation instead of silently discarding the crash.
 #[tokio::test]
 async fn crashed_previous_teardown_surfaces_the_join_error() {
-    let crashed = tokio::spawn(async {
+    let mut crashed = tokio::spawn(async {
         Result::<(), arkflow_core::Error>::Err(arkflow_core::Error::Process(
             "kernel exploded".into(),
         ))
     });
-    let outcome = await_previous_teardown("job-crash", crashed, Duration::from_secs(5)).await;
+    let outcome = await_previous_teardown("job-crash", &mut crashed, Duration::from_secs(5)).await;
     assert!(
         matches!(&outcome, Some(Err(message)) if message.contains("kernel exploded")),
         "the crash outcome must pass through: {outcome:?}"
@@ -4310,6 +4343,48 @@ mod tests {
         unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT") };
         // Fully absent stays optional (plaintext default).
         assert!(data_plane_tls_from_env().unwrap().is_none());
+    }
+
+
+    /// Regression for the Drop guard: a JobTask carrying a dedicated
+    /// runtime can be dropped WITHOUT the explicit retirement path — the
+    /// guard must park the shutdown on the blocking pool instead of
+    /// dropping the Arc<Runtime> inside this async context (which panics).
+    #[tokio::test]
+    async fn dropping_a_task_with_a_dedicated_runtime_never_panics() {
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("arkflow-job-dropguard-test")
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime.tasks.lock().await.insert(
+            "orders-dropguard".to_string(),
+            JobTask {
+                generation: 1,
+                ephemeral_state: false,
+                recovery_required: false,
+                cancellation: CancellationToken::new(),
+                assignments: Vec::new(),
+                dedicated_runtime: Some(Arc::new(dedicated)),
+                watermark_partitions: BTreeMap::new(),
+                state: Arc::new(
+                    arkflow_core::state::InMemoryStateBackend::new(1)
+                        .expect("in-memory test backend"),
+                ),
+                checkpoint_store_uri: None,
+                kernel: None,
+                handle: tokio::spawn(async { Ok(()) }),
+            },
+        );
+        // Drop WITHOUT calling any stop path — must not panic.
+        let dropped = runtime.tasks.lock().await.remove("orders-dropguard");
+        drop(dropped);
+        // Give the parked shutdown a moment, then prove the runtime still
+        // serves other work.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(runtime.tasks.lock().await.is_empty());
     }
 
 }
