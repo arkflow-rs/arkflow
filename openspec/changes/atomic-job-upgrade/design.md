@@ -62,6 +62,11 @@ The savepoint completes while the job is still at version V, so `record_job_chec
 `enforce_checkpoint_retention_for_job` skips any completed artifact referenced by a non-terminal orchestration (the orchestration's savepoint, including during rollback). Unpinned on every terminal transition. Without this, a long verification phase with a small retention count could GC the very artifact a rollback needs.
 
 ### D7: Exclusivity and API surface
+Orchestration rows mutate only through a phase-guarded conditional update
+(`WHERE phase = expected`): an operator action and a tick transition cannot
+silently overwrite each other — the loser surfaces a retryable conflict
+(`orchestration_conflict`). This closes the last-writer-wins weakness the
+rollout orchestration still carries, for the new code path.
 One active (non-terminal) orchestration per job, enforced at the API (409 `orchestration_in_progress` for `PUT desired-state`, job actions, a second upgrade) with the D3 CAS rule as the backstop for races the API check misses. The atomic mode is `POST /jobs/{id}/upgrades` with `{"mode": "atomic", "spec": {...}, "expected_generation", "timeout_ms?"}` → 202 + `{upgrade_id, phase}`; `GET /jobs/{id}/upgrades/{upgrade_id}` returns phase/progress/savepoint/error; `POST /jobs/{id}/upgrades/{upgrade_id}/actions` supports `pause|resume|cancel|rollback` with the same guards as rollouts (terminal states reject; resume only from `paused`).
 
 ### D8: Periodic checkpoints during orchestration

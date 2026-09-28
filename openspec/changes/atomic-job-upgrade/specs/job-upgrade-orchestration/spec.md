@@ -112,3 +112,7 @@ Phase transitions SHALL emit events through the Hub's event broadcast (SSE-visib
 #### Scenario: Operator cancels a non-terminal orchestration
 - **WHEN** the operator cancels an orchestration that has not reached a terminal state
 - **THEN** the orchestration terminates as `cancelled`, the pin on its savepoint is released, and subsequent mutations of the Job are accepted again
+
+#### Scenario: Operator action races a reconcile-tick transition
+- **WHEN** an operator action and an orchestration phase transition attempt to mutate the same orchestration row concurrently
+- **THEN** the row mutates only through a phase-guarded conditional update: the writer that observed the current phase applies its change, the stale writer is rejected with a retryable conflict (409 `orchestration_conflict` for API actions; the tick retries on its next pass), and neither side's change is silently lost
