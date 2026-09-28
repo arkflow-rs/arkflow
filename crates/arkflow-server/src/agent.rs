@@ -244,6 +244,7 @@ fn validate_recovery_manifest(
     checkpoint_id: &str,
     state_format_version: u32,
     manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    rescale: bool,
 ) -> Result<(), String> {
     if manifest.checkpoint_id != checkpoint_id {
         return Err(format!(
@@ -254,18 +255,40 @@ fn validate_recovery_manifest(
     // sealing apply: an equal state format permits a target-version upgrade,
     // while downgrades, format changes, checksum failures, and manifests
     // without the complete planned task set are incompatible for everyone.
+    // A rescale-declared Job waives only the task-set equality half: every
+    // entry is redistributed to the new plan's key-group owners at restore
+    // instead of restoring per-task snapshots verbatim.
     let planned_tasks = plan
         .tasks
         .iter()
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
-    let compatibility = arkflow_core::checkpoint::evaluate_recovery_compatibility(
-        manifest,
-        &plan.spec.id,
-        plan.spec.version,
-        state_format_version,
-        &planned_tasks,
-    );
+    let compatibility = if rescale {
+        let identity = arkflow_core::checkpoint::evaluate_recovery_identity(
+            manifest,
+            &plan.spec.id,
+            plan.spec.version,
+            state_format_version,
+        );
+        if identity.is_compatible()
+            && arkflow_core::checkpoint::manifest_has_duplicate_tasks(manifest)
+        {
+            arkflow_core::checkpoint::RecoveryCompatibility::reject(format!(
+                "checkpoint '{}' contains duplicate task entries",
+                manifest.checkpoint_id
+            ))
+        } else {
+            identity
+        }
+    } else {
+        arkflow_core::checkpoint::evaluate_recovery_compatibility(
+            manifest,
+            &plan.spec.id,
+            plan.spec.version,
+            state_format_version,
+            &planned_tasks,
+        )
+    };
     if !compatibility.is_compatible() {
         return Err(format!(
             "recovery artifact '{checkpoint_id}' is incompatible with Job '{}' version {} state format {}: {}",
@@ -282,16 +305,25 @@ fn validate_recovery_snapshots<S: CheckpointStore>(
     plan: &JobPlan,
     repository: &CheckpointRepository<S>,
     manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    rescale: bool,
 ) -> Result<(), String> {
     let planned_tasks = plan
         .tasks
         .iter()
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
-    arkflow_core::checkpoint::validate_state_snapshot_task_set(
-        &manifest.state_snapshots,
-        &planned_tasks,
-    )?;
+    if rescale {
+        // Duplicate references still mean a corrupted seal; the task set
+        // legitimately differs from the plan when redistributing.
+        arkflow_core::checkpoint::validate_state_snapshot_tasks_unique(
+            &manifest.state_snapshots,
+        )?;
+    } else {
+        arkflow_core::checkpoint::validate_state_snapshot_task_set(
+            &manifest.state_snapshots,
+            &planned_tasks,
+        )?;
+    }
     let expected_prefix =
         arkflow_core::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
     for snapshot_ref in &manifest.state_snapshots {
@@ -335,12 +367,13 @@ pub(crate) fn recovery_record_is_valid(
         &record.checkpoint_id,
         record.format_version,
         &manifest,
+        spec.rescale,
     )
     .is_err()
     {
         return false;
     }
-    if validate_recovery_snapshots(&plan, &repository, &manifest).is_err() {
+    if validate_recovery_snapshots(&plan, &repository, &manifest, spec.rescale).is_err() {
         return false;
     }
     let task_ids = manifest
@@ -361,6 +394,80 @@ pub(crate) fn recovery_record_is_valid(
         .state_snapshots
         .iter()
         .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
+}
+
+/// Restore the recovery artifact's keyed state into this node's backend.
+///
+/// Exact task set: only the snapshots referenced by this node's assignments
+/// are read (the pre-existing behavior). Rescale redistribution (`task sets
+/// differ && spec.rescale`): EVERY snapshot is read, each entry is rewritten
+/// to its new key-group owner's namespace, and only entries owned by this
+/// node's assignments are restored — across the fleet each entry lands on
+/// exactly one node.
+fn restore_recovery_state<S: CheckpointStore>(
+    plan: &JobPlan,
+    repository: &CheckpointRepository<S>,
+    manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    assignments: &[arkflow_core::job::TaskAttempt],
+    state: &Arc<dyn StateBackend>,
+    redistribute: bool,
+) -> Result<(), String> {
+    let assigned_task_ids = assignments
+        .iter()
+        .map(|assignment| assignment.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if redistribute {
+        let context =
+            arkflow_core::executor::job_runner_adapter::RescaleContext::from_plan(plan)
+                .map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        for snapshot_ref in &manifest.state_snapshots {
+            let snapshot = repository
+                .read_state_snapshot(snapshot_ref)
+                .map_err(|error| error.to_string())?;
+            for entry in snapshot.entries {
+                let entry = context
+                    .redistribute(entry)
+                    .map_err(|error| error.to_string())?;
+                let owner = arkflow_core::executor::job_runner_adapter::RescaleContext::task_of_namespace(&entry.namespace)
+                    .map_err(|error| error.to_string())?;
+                if assigned_task_ids.contains(owner.as_str()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        let snapshot =
+            arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+        return state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string());
+    }
+    let mut snapshots = manifest
+        .state_snapshots
+        .iter()
+        .filter(|snapshot_ref| assigned_task_ids.contains(snapshot_ref.task_id.as_str()))
+        .map(|snapshot_ref| {
+            repository
+                .read_state_snapshot(snapshot_ref)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if snapshots.len() > 1 {
+        let entries = snapshots
+            .drain(..)
+            .flat_map(|snapshot| snapshot.entries)
+            .collect();
+        let snapshot = arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+        state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string())
+    } else if let Some(snapshot) = snapshots.pop() {
+        state
+            .restore(&snapshot)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_recovery_payload(
@@ -657,46 +764,37 @@ impl JobRuntime {
                 let manifest = repository
                     .read_manifest(&artifact)
                     .map_err(|error| error.to_string())?;
+                let rescale = plan_for_recovery.spec.rescale;
+                // Redistribution only runs when the task set actually
+                // differs: an identical set restores verbatim exactly as
+                // before, rescale declared or not.
+                let planned_tasks = plan_for_recovery
+                    .tasks
+                    .iter()
+                    .map(|task| task.id.clone())
+                    .collect::<BTreeSet<_>>();
+                let manifest_tasks = manifest
+                    .task_attempts
+                    .iter()
+                    .map(|attempt| attempt.task_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let redistribute = rescale && manifest_tasks != planned_tasks;
                 validate_recovery_manifest(
                     &plan_for_recovery,
                     &checkpoint_id,
                     state_for_restore.format_version(),
                     &manifest,
+                    redistribute,
                 )?;
-                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest)?;
-                let assigned_task_ids = assignments_for_recovery
-                    .iter()
-                    .map(|assignment| assignment.task_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                let mut snapshots = manifest
-                    .state_snapshots
-                    .iter()
-                    .filter(|snapshot_ref| {
-                        assigned_task_ids.contains(snapshot_ref.task_id.as_str())
-                    })
-                    .map(|snapshot_ref| {
-                        repository
-                            .read_state_snapshot(snapshot_ref)
-                            .map_err(|error| error.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if snapshots.len() > 1 {
-                    let entries = snapshots
-                        .drain(..)
-                        .flat_map(|snapshot| snapshot.entries)
-                        .collect();
-                    let snapshot = arkflow_core::state::StateSnapshot::new(
-                        state_for_restore.format_version(),
-                        entries,
-                    );
-                    state_for_restore
-                        .restore(&snapshot)
-                        .map_err(|error| error.to_string())?;
-                } else if let Some(snapshot) = snapshots.pop() {
-                    state_for_restore
-                        .restore(&snapshot)
-                        .map_err(|error| error.to_string())?;
-                }
+                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest, redistribute)?;
+                restore_recovery_state(
+                    &plan_for_recovery,
+                    &repository,
+                    &manifest,
+                    &assignments_for_recovery,
+                    &state_for_restore,
+                    redistribute,
+                )?;
                 RecoveryPlan::from_manifest(&manifest).map_err(|error| error.to_string())
             })
             .await
@@ -3595,4 +3693,252 @@ mod tests {
             MIN_RESOURCE_SAMPLE_INTERVAL
         );
     }
+
+    fn rescale_spec_value(parallelism: u32, rescale: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "agent-rescale-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "aggregate", "stateful": true, "key_field": "key"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {"backend": "embedded_kv", "durability": "durable", "format_version": 1},
+            "checkpoint": {"object_store_uri": "memory://rescale-test", "interval_ms": 30000, "retention": 3},
+            "parallelism": parallelism,
+            "max_parallelism": 16,
+            "rescale": rescale
+        })
+    }
+
+    fn attempt_for(plan: &JobPlan, task_id: &str, node_id: &str) -> arkflow_core::job::TaskAttempt {
+        arkflow_core::job::TaskAttempt {
+            id: format!("{task_id}:{node_id}:1"),
+            job_id: plan.spec.id.clone(),
+            job_version: plan.spec.version,
+            task_id: task_id.to_owned(),
+            generation: 1,
+            node_id: node_id.to_owned(),
+            state: arkflow_core::job::TaskAttemptState::Queued,
+        }
+    }
+
+    /// Distributed rescale: a parallelism-1 artifact restored under a
+    /// parallelism-2 plan with `rescale: true`. Each node keeps exactly the
+    /// entries whose redistributed namespace belongs to one of its assigned
+    /// tasks; the two nodes' sets are disjoint and cover every entry.
+    #[test]
+    fn agent_rescale_restore_partitions_entries_exactly_by_node() {
+        let old_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(1, true)).unwrap();
+        let old_plan = JobPlan::compile(old_spec).unwrap();
+        let new_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(2, true)).unwrap();
+        let new_plan = JobPlan::compile(new_spec).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace = arkflow_core::job::effective_state_namespace(
+            &old_plan.spec.id,
+            old_plan.spec.state.as_ref(),
+            "agg",
+            &old_task.id,
+        );
+        let keys = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ];
+        let entries = keys
+            .iter()
+            .map(|key| arkflow_core::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: format!("utf8:{key}").into_bytes(),
+                value: format!("v-{key}").into_bytes(),
+                expires_at_ms: None,
+            })
+            .collect();
+        let snapshot = arkflow_core::state::StateSnapshot::new(1, entries);
+
+        let root = std::env::temp_dir().join(format!(
+            "arkflow-agent-rescale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = CheckpointRepository::new(
+            arkflow_core::checkpoint::FileCheckpointStore::new(&root).unwrap(),
+        );
+        let mut snapshot_ref = repository
+            .write_state_snapshot("c-rescale", &snapshot)
+            .unwrap();
+        snapshot_ref.task_id = old_task.id.clone();
+        let mut manifest = arkflow_core::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-rescale".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: vec![arkflow_core::checkpoint::TaskAttemptSnapshot {
+                task_id: old_task.id.clone(),
+                attempt_id: format!("{}:n1:0", old_task.id),
+                node_id: "n1".into(),
+            }],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-rescale".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: vec![snapshot_ref],
+            format_version: 1,
+            checksum: 0,
+        };
+        manifest.seal();
+        repository
+            .write_manifest(
+                &manifest,
+                arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                arkflow_core::checkpoint::recovery_manifest_key(
+                    arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
+                    "c-rescale",
+                ),
+            )
+            .unwrap();
+
+        // Split the new plan's aggregate tasks across two nodes by hand.
+        let agg_tasks = new_plan
+            .tasks
+            .iter()
+            .filter(|task| task.operator_id == "agg")
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(agg_tasks.len(), 2, "parallelism 2 must plan two agg tasks");
+        let node_a = vec![
+            attempt_for(&new_plan, &agg_tasks[0], "node-a"),
+            attempt_for(&new_plan, "source-0", "node-a"),
+        ];
+        let node_b = vec![
+            attempt_for(&new_plan, &agg_tasks[1], "node-b"),
+            attempt_for(&new_plan, "sink-0", "node-b"),
+        ];
+
+        let mut restored_total = 0usize;
+        for (node, assignments) in [("node-a", &node_a), ("node-b", &node_b)] {
+            let state_root = root.join(format!("state-{node}"));
+            let backend =
+                RedbStateBackend::open(&state_root, 1).unwrap();
+            let state: Arc<dyn StateBackend> = Arc::new(backend);
+            restore_recovery_state(&new_plan, &repository, &manifest, assignments, &state, true)
+                .unwrap();
+            let assigned: BTreeSet<&str> = assignments
+                .iter()
+                .map(|assignment| assignment.task_id.as_str())
+                .collect();
+            let mut restored_here = 0usize;
+            for key in keys {
+                let group = arkflow_core::job::key_group_for_key(
+                    key.as_bytes(),
+                    new_plan.spec.max_parallelism,
+                )
+                .unwrap();
+                let owner = new_plan
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.operator_id == "agg"
+                            && task
+                                .partitions
+                                .iter()
+                                .any(|partition| partition.key_group.contains(group))
+                    })
+                    .unwrap();
+                let namespace = arkflow_core::job::effective_state_namespace(
+                    &new_plan.spec.id,
+                    new_plan.spec.state.as_ref(),
+                    "agg",
+                    &owner.id,
+                );
+                let stored = state
+                    .get(&namespace, format!("utf8:{key}").as_bytes())
+                    .unwrap();
+                if assigned.contains(owner.id.as_str()) {
+                    assert_eq!(
+                        stored.unwrap(),
+                        format!("v-{key}").into_bytes(),
+                        "{node} owns key {key}"
+                    );
+                    restored_here += 1;
+                } else {
+                    assert!(
+                        stored.is_none(),
+                        "{node} must not restore key {key} owned by {}",
+                        owner.id
+                    );
+                }
+            }
+            assert!(restored_here > 0, "{node} should own at least one key");
+            restored_total += restored_here;
+        }
+        assert_eq!(restored_total, keys.len(), "entries must partition exactly across nodes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without the rescale declaration the distributed recovery keeps the
+    /// fail-closed guard with the actionable error.
+    #[test]
+    fn agent_recovery_without_rescale_fails_closed_on_task_set_change() {
+        let old_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(1, false)).unwrap();
+        let old_plan = JobPlan::compile(old_spec).unwrap();
+        let new_spec: arkflow_core::job::JobSpec =
+            serde_json::from_value(rescale_spec_value(2, false)).unwrap();
+        let new_plan = JobPlan::compile(new_spec).unwrap();
+
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let mut manifest = arkflow_core::checkpoint::CheckpointManifest {
+            checkpoint_id: "c-guard".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: vec![arkflow_core::checkpoint::TaskAttemptSnapshot {
+                task_id: old_task.id.clone(),
+                attempt_id: format!("{}:n1:0", old_task.id),
+                node_id: "n1".into(),
+            }],
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+                checkpoint_id: "c-guard".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: Vec::new(),
+            format_version: 1,
+            checksum: 0,
+        };
+        manifest.seal();
+        let error = validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, false)
+            .unwrap_err();
+        assert!(
+            error.contains("task set does not match the planned assignment"),
+            "{error}"
+        );
+        // The rescale flag waives exactly that check for the same artifact.
+        assert!(validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, true).is_ok());
+    }
+
 }

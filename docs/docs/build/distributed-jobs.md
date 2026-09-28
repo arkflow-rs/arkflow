@@ -219,8 +219,14 @@ entries strip the type prefix), ownership is computed as
 namespace of the task that owns that key group in the new plan. Keys and
 values are preserved byte-for-byte; an entry whose key encoding cannot be
 recognized fails recovery explicitly rather than being assigned by guesswork.
-Rescaling is a recovery-time operation — it takes effect on the restore path,
-not on a topology change of a running job (use
+The same redistribution applies to local Jobs and distributed Hub–Agent
+deployments: in the distributed path every node reads the whole artifact,
+redistributes the entries, and restores only those whose new owner is one of
+its own assignments — each entry lands on exactly one node. Keep
+`max_parallelism` unchanged across the rescale so key-group ownership stays
+stable. Rescaling is a recovery-time operation — it takes effect on the
+restore path (stop → change `parallelism` → start), not on a topology change
+of a running job (use
 [placement rebalance](#resource-aware-placement-and-rebalancing) for that).
 
 ## Control plane and compatibility

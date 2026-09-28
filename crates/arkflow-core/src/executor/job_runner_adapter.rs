@@ -804,12 +804,15 @@ fn latest_local_checkpoint(
 /// entry's user key is recovered from its operator-specific state-key
 /// encoding, hashed with the same normalization the routing path uses, and
 /// the entry is rewritten under the new owning task's namespace.
-pub(crate) struct RescaleContext {
+///
+/// Shared by the local runner and the distributed Agent recovery path: the
+/// encoding whitelist and key-group resolution must not fork.
+pub struct RescaleContext {
     plan: JobPlan,
 }
 
 impl RescaleContext {
-    fn from_plan(plan: &JobPlan) -> Result<Self, Error> {
+    pub fn from_plan(plan: &JobPlan) -> Result<Self, Error> {
         Ok(Self { plan: plan.clone() })
     }
 
@@ -863,7 +866,7 @@ impl RescaleContext {
         )))
     }
 
-    fn redistribute(
+    pub fn redistribute(
         &self,
         entry: crate::state::StateEntry,
     ) -> Result<crate::state::StateEntry, Error> {
@@ -896,6 +899,23 @@ impl RescaleContext {
             namespace: new_namespace,
             ..entry
         })
+    }
+
+    /// The task-id segment of a redistributed entry's namespace. Distributed
+    /// recovery uses it to keep only the entries this node's assignments own
+    /// (mirror of [`namespace_operator`]'s percent-decoding).
+    pub fn task_of_namespace(namespace: &str) -> Result<String, Error> {
+        let marker = ":task:";
+        let start = namespace
+            .find(marker)
+            .ok_or_else(|| Error::Process("state namespace lacks a task segment".into()))?
+            + marker.len();
+        Ok(namespace[start..]
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .replace("%3A", ":")
+            .replace("%25", "%"))
     }
 }
 
