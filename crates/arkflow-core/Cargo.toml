@@ -40,7 +40,13 @@ rand = { workspace = true }
 redb = { workspace = true }
 num_cpus = "1.17.0"
 
+tokio-rustls = { workspace = true, features = ["ring"] }
+rustls-pemfile = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Exactly one provider so rustls can pick a process default without ambiguity.
+
 [dev-dependencies]
+rcgen = "0.13"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only `#[tokio::test(start_paused = true)]` needs the paused clock; keeping the
 # feature out of the workspace dependency keeps it out of production builds.

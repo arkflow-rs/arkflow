@@ -45,6 +45,13 @@ pub const API_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// PEM file path for the control-plane TLS certificate. Both this and
+    /// `tls_key` must be set to serve TLS; one without the other fails
+    /// startup.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_address")]
@@ -89,6 +96,8 @@ impl ServerConfig {
             api_prefix: health.api_prefix.clone(),
             health_path: health.health_path.clone(),
             readiness_path: health.readiness_path.clone(),
+            tls_cert: None,
+            tls_key: None,
             liveness_path: health.liveness_path.clone(),
             cors_origins: health.cors_origins.clone(),
             node_token: health.node_token.clone(),
@@ -146,6 +155,8 @@ impl Default for ServerConfig {
             api_prefix: default_api_prefix(),
             health_path: default_health_path(),
             readiness_path: default_readiness_path(),
+            tls_cert: None,
+            tls_key: None,
             liveness_path: default_liveness_path(),
             cors_origins: Vec::new(),
             node_token: None,
@@ -515,6 +526,54 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     }
 }
 
+/// axum `Listener` adapter wrapping the TCP listener in TLS: every accepted
+/// connection completes the TLS handshake before the service sees it. Routes,
+/// auth, and readiness semantics are untouched (TLS lives below them).
+struct HubTlsListener {
+    inner: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl HubTlsListener {
+    async fn accept_one(
+        &mut self,
+    ) -> (
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    ) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    match self.acceptor.accept(stream).await {
+                        Ok(tls_stream) => return (tls_stream, peer),
+                        Err(error) => {
+                            tracing::warn!(%error, "hub TLS handshake failed");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "hub TLS accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+}
+
+impl axum::serve::Listener for HubTlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        self.accept_one()
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
 pub async fn serve_hub(
     hub: hub::Hub,
     config: ServerConfig,
@@ -570,6 +629,44 @@ pub async fn serve_hub(
             "restored persisted operations into the in-memory registry"
         );
     }
+    // Control-plane TLS: both materials or neither — a half-configured
+    // listener must fail startup rather than silently serve plaintext.
+    let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
+        (None, None) => None,
+        (Some(cert_path), Some(key_path)) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
+                format!("hub TLS certificate '{cert_path}' could not be read: {error}")
+            })?;
+            let key_pem = std::fs::read_to_string(key_path).map_err(|error| {
+                format!("hub TLS key '{key_path}' could not be read: {error}")
+            })?;
+            let mut chain = Vec::new();
+            for item in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
+                chain.push(item.map_err(|error| {
+                    format!("hub TLS certificate parse failed: {error}")
+                })?);
+            }
+            if chain.is_empty() {
+                return Err("hub TLS certificate contains no PEM certificates".into());
+            }
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .map_err(|error| format!("hub TLS key parse failed: {error}"))?
+                .ok_or("hub TLS key contains no PEM private key")?;
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .map_err(|error| format!("hub TLS config rejected: {error}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                server_config,
+            )))
+        }
+        _ => {
+            return Err(
+                "hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into(),
+            )
+        }
+    };
     let listener = TcpListener::bind(address).await?;
     // Lease election loop: leaders renew at ttl/3, standbys probe for
     // takeover. Failover is bounded by the lease TTL plus one probe.
@@ -660,14 +757,31 @@ pub async fn serve_hub(
             }
         }
     });
-    let result = axum::serve(listener, hub_router(hub.clone(), &config).into_make_service())
-        .with_graceful_shutdown(async move {
-            cancellation.cancelled().await;
-            // Release the lease before the listener drains so a standby can
-            // take over immediately instead of waiting out the TTL.
-            hub.release_leadership().await;
-        })
-        .await;
+    let router = hub_router(hub.clone(), &config).into_make_service();
+    let result = match tls_acceptor {
+        Some(acceptor) => {
+            let tls_listener = HubTlsListener {
+                inner: listener,
+                acceptor,
+            };
+            axum::serve(tls_listener, router)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    hub.release_leadership().await;
+                })
+                .await
+        }
+        None => {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    // Release the lease before the listener drains so a standby can
+                    // take over immediately instead of waiting out the TTL.
+                    hub.release_leadership().await;
+                })
+                .await
+        }
+    };
     sweep_task.abort();
     reconcile_task.abort();
     maintenance_task.abort();
@@ -5655,4 +5769,105 @@ mod tests {
         let page: Page<hub::HubNode> = serde_json::from_slice(&body).unwrap();
         page.items
     }
+
+    fn hub_tls_material() -> (std::path::PathBuf, std::path::PathBuf) {
+        use rcgen::CertificateParams;
+        use rcgen::KeyPair;
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "arkflow-hub-tls-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn hub_tls_listener_serves_readiness_over_https() {
+        let (cert_path, key_path) = hub_tls_material();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let config = ServerConfig {
+            address: format!("127.0.0.1:{port}"),
+            insecure_local: true,
+            tls_cert: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key: Some(key_path.to_string_lossy().into_owned()),
+            ..ServerConfig::default()
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let shutdown = cancellation.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_hub(hub, config, shutdown).await {
+                eprintln!("SERVE_HUB ERROR: {error}");
+            }
+        });
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let mut served = false;
+        for _ in 0..100 {
+            if let Ok(response) = client
+                .get(format!("https://127.0.0.1:{port}/readiness"))
+                .send()
+                .await
+            {
+                // The response status itself is the plaintext readiness
+                // semantics (503 without storage); what matters here is
+                // that the TLS handshake completed and HTTP was served.
+                let _ = response.status();
+                served = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(served, "the TLS hub must serve https requests");
+        cancellation.cancel();
+        let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn half_configured_hub_tls_fails_startup() {
+        let (cert_path, _key_path) = hub_tls_material();
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let config = ServerConfig {
+            address: "127.0.0.1:0".into(),
+            insecure_local: true,
+            tls_cert: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key: None,
+            ..ServerConfig::default()
+        };
+        let error = serve_hub(hub, config, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("both ARKFLOW_HUB_TLS_CERT"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+    }
+
 }

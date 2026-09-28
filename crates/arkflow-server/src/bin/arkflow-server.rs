@@ -66,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok()
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
         hub_storage: std::env::var("ARKFLOW_HUB_STORAGE").ok(),
+        tls_cert: std::env::var("ARKFLOW_HUB_TLS_CERT").ok(),
+        tls_key: std::env::var("ARKFLOW_HUB_TLS_KEY").ok(),
         ..ServerConfig::default()
     };
     let ha = arkflow_server::hub::HubHaConfig {

@@ -872,6 +872,10 @@ pub trait EdgeTransport: Send + Sync {
 pub struct TcpEdgeTransport {
     pub addr: std::net::SocketAddr,
     pub max_attempts: usize,
+    /// When set, the outbound connection completes the fleet-CA mTLS
+    /// handshake before the edge protocol runs. Handshake failures share
+    /// the same retry/backoff budget as TCP failures.
+    pub tls: Option<DataPlaneTlsConfig>,
 }
 
 #[async_trait::async_trait]
@@ -880,11 +884,8 @@ impl EdgeTransport for TcpEdgeTransport {
         let max_attempts = self.max_attempts.max(1);
         let mut last_error = None;
         for attempt in 0..max_attempts {
-            match tokio::net::TcpStream::connect(self.addr).await {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    return Ok(Box::new(stream));
-                }
+            let stream = match tokio::net::TcpStream::connect(self.addr).await {
+                Ok(stream) => stream,
                 Err(error) => {
                     let backoff = connect_backoff(attempt);
                     tracing::warn!(
@@ -895,8 +896,29 @@ impl EdgeTransport for TcpEdgeTransport {
                     );
                     last_error = Some(error);
                     tokio::time::sleep(backoff).await;
+                    continue;
                 }
-            }
+            };
+            let _ = stream.set_nodelay(true);
+            let stream = match &self.tls {
+                Some(tls) => match tls.connect(stream).await {
+                    Ok(tls_stream) => Box::new(tls_stream) as Box<dyn RemoteStream>,
+                    Err(error) => {
+                        let backoff = connect_backoff(attempt);
+                        tracing::warn!(
+                            "remote edge TLS connect to {} failed (attempt {}/{}): {error}; retrying in {backoff:?}",
+                            self.addr,
+                            attempt + 1,
+                            max_attempts
+                        );
+                        last_error = Some(std::io::Error::other(error.to_string()));
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                },
+                None => Box::new(stream) as Box<dyn RemoteStream>,
+            };
+            return Ok(stream);
         }
         Err(Error::Process(format!(
             "remote edge connect to {} failed after {max_attempts} attempts: {}",
@@ -905,6 +927,18 @@ impl EdgeTransport for TcpEdgeTransport {
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "unknown error".into())
         )))
+    }
+}
+
+/// Plaintext transport constructor for tests and existing call sites; the
+/// TLS-carrying form is built by the graph from the job's edge context.
+impl TcpEdgeTransport {
+    pub fn plaintext(addr: std::net::SocketAddr, max_attempts: usize) -> Self {
+        Self {
+            addr,
+            max_attempts,
+            tls: None,
+        }
     }
 }
 
@@ -937,8 +971,116 @@ impl From<Error> for ConnectionFailure {
     }
 }
 
+/// TLS material for the cross-node data plane: the local node's
+/// certificate and key plus the fleet CA that anchors peer verification.
+/// Present = mTLS in both directions (the server requires a client
+/// certificate chained to the same CA; the client verifies the server the
+/// same way under the fixed name below). The HMAC session handshake still
+/// runs on top: TLS is transport encryption plus a "certificate issued by
+/// the fleet CA" gate, while node identity and job/generation binding stay
+/// with the application-layer handshake.
+#[derive(Clone)]
+pub struct DataPlaneTlsConfig {
+    connector: std::sync::Arc<tokio_rustls::TlsConnector>,
+    acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
+}
+
+/// The fixed SNI/ServerName the outbound side verifies and node
+/// certificates must carry as a SAN. Node identity itself is proven by the
+/// HMAC handshake, so the name is only the chain-verification carrier.
+pub const DATA_PLANE_TLS_SERVER_NAME: &str = "arkflow-data-plane";
+
+impl DataPlaneTlsConfig {
+    /// Build both directions from PEM material. Any parse or key-mismatch
+    /// error is explicit: a half-loaded TLS config must fail startup, not
+    /// silently degrade to plaintext.
+    pub fn from_pem(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Result<Self, Error> {
+        // Feature unification across the workspace can enable more than one
+        // rustls crypto provider; pin ring explicitly (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fail = |context: &str, error: &str| {
+            Error::Config(format!("data-plane TLS {context}: {error}"))
+        };
+        let read_certs = |pem: &str, context: &str| -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
+            let mut reader = std::io::BufReader::new(pem.as_bytes());
+            let mut certs = Vec::new();
+            for result in rustls_pemfile::certs(&mut reader) {
+                certs.push(result.map_err(|error| fail(context, &error.to_string()))?);
+            }
+            if certs.is_empty() {
+                return Err(fail(context, "no PEM certificates found"));
+            }
+            Ok(certs)
+        };
+        let cert_chain = read_certs(cert_pem, "certificate")?;
+        let ca_certs = read_certs(ca_pem, "fleet CA")?;
+        let private_key = {
+            let mut reader = std::io::BufReader::new(key_pem.as_bytes());
+            rustls_pemfile::private_key(&mut reader)
+                .map_err(|error| fail("private key", &error.to_string()))?
+                .ok_or_else(|| fail("private key", "no PEM private key found"))?
+        };
+        let mut ca_store = rustls::RootCertStore::empty();
+        ca_store.add_parsable_certificates(ca_certs.clone());
+        if ca_store.is_empty() {
+            return Err(fail("fleet CA", "no parsable certificates"));
+        }
+        let ca_store_for_client = ca_store.clone();
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(
+                    ca_store,
+                ))
+                .build()
+                .map_err(|error| fail("client verifier", &error.to_string()))?,
+            )
+            .with_single_cert(cert_chain.clone(), private_key.clone_key())
+            .map_err(|error| fail("server config", &error.to_string()))?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(ca_store_for_client)
+            .with_client_auth_cert(cert_chain, private_key)
+            .map_err(|error| fail("client config", &error.to_string()))?;
+        Ok(Self {
+            connector: std::sync::Arc::new(tokio_rustls::TlsConnector::from(
+                std::sync::Arc::new(client_config),
+            )),
+            acceptor: std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(
+                std::sync::Arc::new(server_config),
+            )),
+        })
+    }
+
+    /// Outbound TLS wrap of an established TCP stream.
+    pub async fn connect(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Error> {
+        let name = rustls::pki_types::ServerName::try_from(DATA_PLANE_TLS_SERVER_NAME.to_owned())
+            .map_err(|error| fail_tls_name(&error.to_string()))?;
+        self.connector
+            .connect(name, stream)
+            .await
+            .map_err(|error| Error::Process(format!("data-plane TLS connect failed: {error}")))
+    }
+
+    /// Inbound TLS handshake of an accepted TCP stream.
+    pub async fn accept(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, Error> {
+        self.acceptor
+            .accept(stream)
+            .await
+            .map_err(|error| Error::Process(format!("data-plane TLS accept failed: {error}")))
+    }
+}
+
+fn fail_tls_name(error: &str) -> Error {
+    Error::Config(format!("data-plane TLS server name invalid: {error}"))
+}
+
 /// Bounded resource and authentication policy for one node's data plane.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NetworkManagerConfig {
     pub channel_capacity: usize,
     pub max_connections: usize,
@@ -961,6 +1103,9 @@ pub struct NetworkManagerConfig {
     /// forever; its capacity is bounded by the connection limit below.
     pub handshake_replay_ttl: std::time::Duration,
     pub credentials: Option<DataPlaneCredentials>,
+    /// Fleet-CA-anchored mTLS for every cross-node connection. `None`
+    /// (the default) keeps the plaintext protocol byte for byte.
+    pub tls: Option<DataPlaneTlsConfig>,
 }
 
 impl Default for NetworkManagerConfig {
@@ -978,6 +1123,7 @@ impl Default for NetworkManagerConfig {
             registration_grace: std::time::Duration::from_secs(10),
             handshake_replay_ttl: std::time::Duration::from_secs(10 * 60),
             credentials: None,
+            tls: None,
         }
     }
 }
@@ -1789,6 +1935,12 @@ impl NetworkManager {
     }
 
     /// Runs the accept loop until shutdown. Call once per manager.
+    /// The configured fleet-CA mTLS material, when enabled. Outbound edge
+    /// contexts carry this so remote transports wrap their connections.
+    pub fn tls_config(&self) -> Option<&DataPlaneTlsConfig> {
+        self.config.tls.as_ref()
+    }
+
     pub fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -1839,7 +1991,22 @@ impl NetworkManager {
                 match accepted {
                     Ok((stream, _peer)) => {
                         let _ = stream.set_nodelay(true);
-                        manager.accept_stream(Box::new(stream));
+                        match &manager.config.tls {
+                            // Inbound TLS first: the peer must present a
+                            // fleet-CA certificate before any frame (and
+                            // before the HMAC session handshake) is read.
+                            // Handshake failures take the connection-failure
+                            // path — never a plaintext fallback.
+                            Some(tls) => match tls.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    manager.accept_stream(Box::new(tls_stream));
+                                }
+                                Err(error) => {
+                                    manager.report_failure(error);
+                                }
+                            },
+                            None => manager.accept_stream(Box::new(stream)),
+                        }
                     }
                     Err(error) => {
                         tracing::warn!("data plane accept failed: {error}");
@@ -4548,6 +4715,7 @@ mod tests {
             .expect("inbound registration succeeds");
 
         let transport = TcpEdgeTransport {
+            tls: None,
             addr: format!("127.0.0.1:{port}").parse().expect("addr"),
             max_attempts: 3,
         };
@@ -4589,6 +4757,257 @@ mod tests {
             refused.is_err(),
             "data-plane listener still accepts after shutdown"
         );
+    }
+    /// One shared fleet CA with a per-node certificate, as a real fleet
+    /// deploys: all peers verify against the same CA.
+    fn generate_fleet_material() -> (Vec<(String, String)>, String) {
+        use rcgen::CertificateParams;
+        use rcgen::KeyPair;
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let node_params = CertificateParams::new(vec![
+                super::DATA_PLANE_TLS_SERVER_NAME.to_owned(),
+            ])
+            .unwrap();
+            let node_key = KeyPair::generate().unwrap();
+            let node = node_params.signed_by(&node_key, &ca, &ca_key).unwrap();
+            nodes.push((node.pem(), node_key.serialize_pem()));
+        }
+        (nodes, ca.pem())
+    }
+
+    fn tls_manager_config(node: &str, secret: &str, cert: &str, key: &str, ca: &str) -> NetworkManagerConfig {
+        let credentials = DataPlaneCredentials::new(node, secret).expect("test credentials");
+        let mut config = NetworkManagerConfig::default();
+        config.credentials = Some(credentials);
+        config.registration_grace = std::time::Duration::from_millis(100);
+        config.tls = Some(DataPlaneTlsConfig::from_pem(cert, key, ca).expect("tls"));
+        config
+    }
+
+    /// Fleet-CA mTLS end to end over loopback: the full stack (TLS
+    /// handshake, HMAC session handshake, frames, receipts) behaves exactly
+    /// like the plaintext path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_transport_connects_and_receives() {
+        let quad = quad_a_to_b();
+        let (nodes, ca) = generate_fleet_material();
+        let (cert_a, key_a) = &nodes[0];
+        let (cert_b, key_b) = &nodes[1];
+        let upstream = std::sync::Arc::new(
+            NetworkManager::with_config(tls_manager_config(
+                "node-a",
+                "shuffle-secret",
+                cert_a,
+                key_a,
+                &ca,
+            ))
+            .unwrap(),
+        );
+        let downstream = std::sync::Arc::new(
+            NetworkManager::with_config(tls_manager_config(
+                "node-b",
+                "shuffle-secret",
+                cert_b,
+                key_b,
+                &ca,
+            ))
+            .unwrap(),
+        );
+        upstream.spawn();
+        downstream.spawn();
+
+        let port = downstream
+            .bind_tcp("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(64);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "tls-job".into(),
+                    generation: 1,
+                },
+            )
+            .expect("inbound registration succeeds");
+
+        let transport = TcpEdgeTransport {
+            addr: format!("127.0.0.1:{port}").parse().expect("addr"),
+            max_attempts: 3,
+            tls: Some(
+                DataPlaneTlsConfig::from_pem(cert_a, key_a, &ca).expect("client tls"),
+            ),
+        };
+        let edge = upstream
+            .open_edge_for_session(&transport, quad, "node-b", "tls-job", 1)
+            .await
+            .expect("connect");
+
+        let branch = std::sync::Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                std::sync::Arc::new(dictionary_batch(Some("tls"))),
+                branch.clone(),
+            ))
+            .await
+            .expect("send");
+        let received = next_envelope(&input_rx).await;
+        let Envelope::Data(batch, ack) = received else {
+            panic!("expected data over TLS");
+        };
+        assert_eq!(batch.get_input_name(), Some("tls".to_owned()));
+        ack.ack().await.expect("ack");
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("receipt over TLS");
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    /// A plaintext client against a TLS server never completes a session:
+    /// the connection fails closed (no protocol fallback).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plaintext_transport_against_tls_server_fails_closed() {
+        let quad = quad_a_to_b();
+        let (nodes, ca) = generate_fleet_material();
+        let (cert_b, key_b) = &nodes[1];
+        let downstream = std::sync::Arc::new(
+            NetworkManager::with_config(tls_manager_config(
+                "node-b",
+                "shuffle-secret",
+                cert_b,
+                key_b,
+                &ca,
+            ))
+            .unwrap(),
+        );
+        downstream.spawn();
+        let port = downstream
+            .bind_tcp("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(64);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "plain-job".into(),
+                    generation: 1,
+                },
+            )
+            .expect("inbound registration succeeds");
+
+        let transport = TcpEdgeTransport {
+            addr: format!("127.0.0.1:{port}").parse().expect("addr"),
+            max_attempts: 1,
+            tls: None,
+        };
+        // The plaintext client may complete the TCP connect, but its bytes
+        // are not a TLS record: the server handshake fails and NOTHING is
+        // ever delivered into the session channel.
+        let upstream = authenticated_manager("node-a", "shuffle-secret");
+        upstream.spawn();
+        let edge = upstream
+            .open_edge_for_session(&transport, quad, "node-b", "plain-job", 1)
+            .await
+            .expect("stream-level connect (failure surfaces per-session)");
+        let branch = std::sync::Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                std::sync::Arc::new(dictionary_batch(Some("plain"))),
+                branch.clone(),
+            ))
+            .await
+            .expect("send");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), input_rx.recv_async())
+                .await
+                .is_err(),
+            "a plaintext stream must never deliver frames into a TLS session"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    /// A client whose certificate chains to a DIFFERENT CA fails the
+    /// handshake at connect time — explicit, no protocol fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_ca_client_is_rejected_at_connect() {
+        let quad = quad_a_to_b();
+        let (nodes, ca) = generate_fleet_material();
+        let (cert_b, key_b) = &nodes[1];
+        let downstream = std::sync::Arc::new(
+            NetworkManager::with_config(tls_manager_config(
+                "node-b",
+                "shuffle-secret",
+                cert_b,
+                key_b,
+                &ca,
+            ))
+            .unwrap(),
+        );
+        downstream.spawn();
+        let port = downstream
+            .bind_tcp("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+
+        // A second, unrelated fleet.
+        let (foreign_nodes, foreign_ca) = generate_fleet_material();
+        let (foreign_cert, foreign_key) = &foreign_nodes[0];
+        let upstream = std::sync::Arc::new(
+            NetworkManager::with_config(tls_manager_config(
+                "node-a",
+                "shuffle-secret",
+                foreign_cert,
+                foreign_key,
+                &foreign_ca,
+            ))
+            .unwrap(),
+        );
+        upstream.spawn();
+        let transport = TcpEdgeTransport {
+            addr: format!("127.0.0.1:{port}").parse().expect("addr"),
+            max_attempts: 1,
+            tls: Some(
+                DataPlaneTlsConfig::from_pem(foreign_cert, foreign_key, &foreign_ca)
+                    .expect("client tls"),
+            ),
+        };
+        let result = upstream
+            .open_edge_for_session(&transport, quad, "node-b", "foreign-job", 1)
+            .await;
+        assert!(
+            result.is_err(),
+            "a foreign-CA client must fail the TLS handshake at connect"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+
+    /// Partial TLS material is an explicit construction error.
+    #[test]
+    fn tls_partial_material_is_rejected() {
+        let (nodes, ca) = generate_fleet_material();
+        let (cert, key) = &nodes[0];
+        assert!(DataPlaneTlsConfig::from_pem(&cert, &key, "").is_err());
+        assert!(DataPlaneTlsConfig::from_pem("", &key, &ca).is_err());
+        assert!(DataPlaneTlsConfig::from_pem(&cert, "", &ca).is_err());
+        assert!(DataPlaneTlsConfig::from_pem(&cert, &key, &ca).is_ok());
     }
 }
 
@@ -4916,4 +5335,5 @@ mod pump_cancel_tests {
             "an acknowledged branch must not be aborted"
         );
     }
+
 }

@@ -49,6 +49,39 @@ non-zero on any row-count mismatch. Point `ARKFLOW_HUB_STORAGE` at the
 PostgreSQL URL and restart the Hub only after a successful migration. Fresh
 PostgreSQL deployments never need the tool — startup DDL creates the schema.
 
+### TLS
+
+**Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`
+(PEM file paths) and the Hub serves every request over TLS — routes, auth,
+and readiness semantics are unchanged. Only one of the two fails startup.
+Agents reach a TLS Hub with an `https://` `hub_url` and no extra
+configuration. Without both variables the Hub binds plaintext exactly as
+before.
+
+**Data plane (cross-node shuffle).** Set `ARKFLOW_DATA_PLANE_TLS_CERT`,
+`ARKFLOW_DATA_PLANE_TLS_KEY`, and `ARKFLOW_DATA_PLANE_TLS_CA` together — the
+node's certificate, its private key, and the fleet CA — and every
+cross-node connection runs mTLS: each side must present a certificate
+chaining to the fleet CA before any frame (including the HMAC session
+handshake) is exchanged. Node certificates must carry the SAN
+`DNS:arkflow-data-plane` (the fixed verification name; node identity itself
+is still proven by the HMAC handshake). A partial set of variables is
+ignored with a warning. Generate a fleet CA and node certificates with
+openssl, for example:
+
+```bash
+# Fleet CA
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem   -subj "/CN=arkflow-fleet-ca" -days 3650
+# Per node (repeat per compute node)
+openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr   -subj "/CN=arkflow-node"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem   -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+```
+
+Enable TLS on every compute node before relying on split placement:
+during a rolling enable, plaintext and TLS nodes cannot talk to each other
+(connections fail closed). Certificate rotation means restarting the
+process (automatic renewal is out of scope).
+
 ### Hub high availability (lease election)
 
 Multiple Hub processes can share one PostgreSQL database; a singleton lease

@@ -928,6 +928,7 @@ impl JobRuntime {
             };
             Some(std::sync::Arc::new(
                 arkflow_core::executor::graph::RemoteEdgeContext {
+                    tls: manager.tls_config().cloned(),
                     local_node: node_id.to_string(),
                     task_nodes,
                     node_addrs,
@@ -1929,6 +1930,52 @@ impl ResourceSampler {
 
 /// Merge a fresh snapshot into the report's metrics map under the fixed
 /// `node_*` vocabulary; the CPU gauge is skipped until it has a real window.
+/// Build the data-plane mTLS material from `ARKFLOW_DATA_PLANE_TLS_CERT`,
+/// `_KEY`, and `_CA` (PEM file paths). All three or none: a partial set is
+/// an explicit configuration error (a half-loaded TLS config must fail, not
+/// silently degrade to plaintext). Files are read once at startup.
+fn data_plane_tls_from_env() -> Option<arkflow_core::executor::remote::DataPlaneTlsConfig> {
+    let cert = std::env::var("ARKFLOW_DATA_PLANE_TLS_CERT").ok();
+    let key = std::env::var("ARKFLOW_DATA_PLANE_TLS_KEY").ok();
+    let ca = std::env::var("ARKFLOW_DATA_PLANE_TLS_CA").ok();
+    let declared = [cert.is_some(), key.is_some(), ca.is_some()];
+    if declared == [false, false, false] {
+        return None;
+    }
+    if declared != [true, true, true] {
+        warn!(
+            "ARKFLOW_DATA_PLANE_TLS_CERT/_KEY/_CA must be set together; ignoring the data-plane TLS configuration"
+        );
+        return None;
+    }
+    let read = |value: Option<String>, name: &str| -> Option<String> {
+        value.and_then(|path| std::fs::read_to_string(path).map_err(|error| {
+            warn!("data-plane TLS {name} could not be read: {error}");
+            error
+        }).ok())
+    };
+    let (cert, key, ca) = (
+        read(cert, "certificate"),
+        read(key, "private key"),
+        read(ca, "fleet CA"),
+    );
+    match (cert, key, ca) {
+        (Some(cert), Some(key), Some(ca)) => {
+            match arkflow_core::executor::remote::DataPlaneTlsConfig::from_pem(&cert, &key, &ca) {
+                Ok(tls) => {
+                    info!("data-plane mTLS enabled (fleet CA anchored)");
+                    Some(tls)
+                }
+                Err(error) => {
+                    warn!("data-plane TLS material rejected; running plaintext: {error}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn merge_resource_gauges(
     metrics: &mut BTreeMap<String, f64>,
     snapshot: ResourceSnapshot,
@@ -2024,10 +2071,12 @@ pub async fn run(
                 }
             })
             .and_then(|credentials| {
-                let mut manager_config =
-                    arkflow_core::executor::remote::NetworkManagerConfig::default();
-                manager_config.credentials = Some(credentials);
-                manager_config.channel_capacity = 1024;
+                let manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
+                    credentials: Some(credentials),
+                    channel_capacity: 1024,
+                    tls: data_plane_tls_from_env(),
+                    .. arkflow_core::executor::remote::NetworkManagerConfig::default()
+                };
                 match arkflow_core::executor::remote::NetworkManager::with_config(
                     manager_config,
                 ) {

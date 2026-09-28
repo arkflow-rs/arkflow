@@ -30,6 +30,25 @@ arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
 
 该工具按外键序以 1000 行事务逐表拷贝 `cp_*` 表,把 identity 序列重置到已迁移最大 id 之上,任何行数不一致都会非零退出。迁移成功后再把 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并重启 Hub。全新的 PostgreSQL 部署不需要该工具——启动 DDL 会创建 schema。
 
+### TLS
+
+**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `https://` 的 `hub_url` 访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
+
+**数据面(跨节点 shuffle)。**同时设置 `ARKFLOW_DATA_PLANE_TLS_CERT`、`ARKFLOW_DATA_PLANE_TLS_KEY`、`ARKFLOW_DATA_PLANE_TLS_CA`(节点证书、私钥、舰队 CA)后,所有跨节点连接运行 mTLS:任何帧(包括 HMAC 会话握手)交换之前,双方都必须出示锚定舰队 CA 的证书。节点证书须含 SAN `DNS:arkflow-data-plane`(固定校验名;节点身份仍由 HMAC 握手证明)。部分配置会被忽略并告警。生成舰队 CA 与节点证书的 openssl 示例:
+
+```bash
+# 舰队 CA
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
+  -subj "/CN=arkflow-fleet-ca" -days 3650
+# 每节点(逐计算节点重复)
+openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr \
+  -subj "/CN=arkflow-node"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+```
+
+请在全部计算节点上启用 TLS 后再依赖 split 放置:滚动启用期间明文与 TLS 节点互连失败(连接 fail-closed)。证书轮换意味着重启进程(自动续期不在范围内)。
+
 ### Hub 高可用(租约选主)
 
 多个 Hub 进程可以共享同一个 PostgreSQL 数据库;单例租约行(`cp_hub_lease`)通过带单调围栏 epoch 的 CAS 选出唯一 leader。在指向同一数据库的每个 Hub 实例上用环境变量开启:

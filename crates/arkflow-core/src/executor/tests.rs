@@ -4419,6 +4419,7 @@ async fn remote_graph_routes_data_across_nodes() {
     };
 
     let context_a = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
         local_node: "node-a".into(),
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::from([(
@@ -4429,6 +4430,7 @@ async fn remote_graph_routes_data_across_nodes() {
         generation: 1,
     };
     let context_b = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
         local_node: "node-b".into(),
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::new(),
@@ -4510,6 +4512,7 @@ async fn remote_graph_fails_closed_when_downstream_unreachable() {
     // Point node B's data plane at a closed port: connect retries exhaust and
     // the source chain's send path fails closed.
     let context_a = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
         local_node: "node-a".into(),
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::from([(
@@ -4559,6 +4562,7 @@ fn remote_graph_rejects_incomplete_side_edge_assignment() {
     let plan = JobPlan::compile(job).unwrap();
     let manager = crate::executor::remote::NetworkManager::new(16);
     let context = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
         local_node: "node-a".into(),
         // Deliberately omit late_sink-0: an Agent must not defer this failure
         // until the first late event is emitted.
@@ -4620,6 +4624,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         processor: Arc::new(PassThroughProcessor),
     };
     let context_b = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
         local_node: "node-b".into(),
         task_nodes: task_nodes(),
         node_addrs: BTreeMap::new(),
@@ -4665,6 +4670,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
     // One edge per (source subtask → map subtask) quad, over real TCP.
     let transport = || {
         std::sync::Arc::new(crate::executor::remote::TcpEdgeTransport {
+            tls: None,
             addr: format!("127.0.0.1:{port}").parse().unwrap(),
             max_attempts: 5,
         }) as std::sync::Arc<dyn crate::executor::remote::EdgeTransport>
