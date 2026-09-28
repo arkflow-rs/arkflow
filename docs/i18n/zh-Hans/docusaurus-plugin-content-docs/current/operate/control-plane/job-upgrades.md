@@ -69,7 +69,7 @@ GET  /api/v1/jobs/{id}/upgrades/{upgrade_id}      → 阶段、保存点、超�
 POST /api/v1/jobs/{id}/upgrades/{upgrade_id}/actions  {"action": "pause"|"resume"|"cancel"|"rollback"}
 ```
 
-- `pause` 冻结编排（作业继续运行）；`resume` 重新武装该阶段超时。长时间暂停会拉长重放窗口——建议改为取消后发起新的升级。
+- `pause` 冻结编排；`resume` 重新武装该阶段超时。在保存点阶段暂停时旧版本继续运行，但在验证中途暂停可能把作业冻结在切换间隙（旧版本已停、新版本未起），直到 `resume`。长时间暂停也会拉长重放窗口——建议改为取消后发起新的升级。
 - `cancel` 释放作业（verifying 阶段取消后，新版本由普通调和自行收敛继续）。
 - `rollback` 在编排进入 verifying 后可用。
 

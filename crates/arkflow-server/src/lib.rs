@@ -1264,7 +1264,19 @@ async fn hub_job_detail(
         "nodes": selected_nodes,
         "operations": operations,
         "checkpoints": checkpoints,
-        "active_upgrade": hub.active_job_upgrade_for(&job_id).await,
+        // The high-frequency detail view omits the (potentially large)
+        // target spec; the dedicated orchestration status endpoint keeps it.
+        "active_upgrade": hub
+            .active_job_upgrade_for(&job_id)
+            .await
+            .and_then(|record| {
+                serde_json::to_value(&record).ok().map(|mut value| {
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("target_spec_json");
+                    }
+                    value
+                })
+            }),
         "metrics": {
             "watermark_lag_ms": metrics.get("watermark_lag_ms").copied().unwrap_or_default(),
             "state_bytes": metrics.get("state_bytes").copied().unwrap_or_default(),
@@ -1721,16 +1733,50 @@ async fn hub_job_upgrade_action(
     headers: HeaderMap,
     Json(request): Json<JobUpgradeActionRequest>,
 ) -> Response {
+    // Lifecycle-level actions align with job start/stop (Operate); rollback
+    // swaps the Job's version and keeps the Configure level of the upgrade
+    // endpoints proper.
+    let action_level = match request.action.as_str() {
+        "pause" | "resume" | "cancel" => OperatorAction::Operate,
+        "rollback" => OperatorAction::Configure,
+        _ => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_job_upgrade_action",
+                "action must be pause, resume, cancel, or rollback".into(),
+            )
+        }
+    };
     if let Err(response) = require_operator_action(
         &hub,
         &headers,
-        OperatorAction::Configure,
+        action_level,
         "job",
         Some(job_id.clone()),
     )
     .await
     {
         return response;
+    }
+    // Resolve before acting so an unknown id is a 404, not the generic
+    // action-rejected conflict.
+    match hub.job_upgrade(&upgrade_id).await {
+        Ok(Some(record)) if record.job_id != job_id => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "job_upgrade_not_found",
+                format!("Unknown upgrade {upgrade_id} for Job {job_id}"),
+            )
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "job_upgrade_not_found",
+                format!("Unknown upgrade {upgrade_id} for Job {job_id}"),
+            )
+        }
+        Err(error) => return hub_problem(error),
     }
     match hub
         .act_job_upgrade(&upgrade_id, &request.action, Some("operator".into()), None)

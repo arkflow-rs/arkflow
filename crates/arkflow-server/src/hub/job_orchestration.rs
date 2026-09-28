@@ -15,7 +15,6 @@ use super::*;
 /// Phase-name constants. Stored as plain strings, matching the rollout
 /// state convention.
 pub(crate) mod phase {
-    pub const PENDING: &str = "pending";
     pub const SAVING_SAVEPOINT: &str = "saving_savepoint";
     pub const COMMITTING_VERSION: &str = "committing_version";
     pub const VERIFYING: &str = "verifying";
@@ -360,7 +359,7 @@ impl Hub {
             let expected_phase = record.phase.clone();
             let stepped = match record.phase.as_str() {
                 phase::PAUSED => Ok(()),
-                phase::SAVING_SAVEPOINT | phase::PENDING => {
+                phase::SAVING_SAVEPOINT => {
                     self.step_savepoint_phase(&mut record).await
                 }
                 phase::COMMITTING_VERSION => self.step_commit_phase(&mut record).await,

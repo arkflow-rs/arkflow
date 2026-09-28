@@ -323,6 +323,12 @@ impl JobUpgradeRecord {
     }
 }
 
+/// The same terminal-phase set as [`JobUpgradeRecord::phase_is_terminal`], in
+/// SQL list form. The recovery/prune queries in both backends interpolate
+/// this constant so the set exists in exactly one place per language.
+pub(crate) const TERMINAL_JOB_UPGRADE_PHASES_SQL: &str =
+    "('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled')";
+
 /// Storage-neutral contract used by Hub/Reconciler code.
 ///
 /// Implementations must keep each method's state transition atomic. Network

@@ -1475,9 +1475,10 @@ impl StorageBackend for PostgresBackend {
         {
             let mut connection = self.lease().await?;
             let rows = connection.query_all(
-                &q(
-                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY created_at_ms",
-                ),
+                &q(&format!(
+                    "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN {} ORDER BY created_at_ms",
+                    TERMINAL_JOB_UPGRADE_PHASES_SQL
+                )),
                 &[],
                 job_upgrade_from_row,
             ).await?;
@@ -1508,7 +1509,10 @@ impl StorageBackend for PostgresBackend {
             let mut transaction = self.begin().await?;
             let __ret = async {
             let deleted = transaction.execute(
-                "DELETE FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY updated_at_ms DESC LIMIT ?2)",
+                &q(&format!(
+                    "DELETE FROM cp_job_upgrades WHERE phase IN {t} AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN {t} ORDER BY updated_at_ms DESC LIMIT ?2)",
+                    t = TERMINAL_JOB_UPGRADE_PHASES_SQL
+                )),
                 binds![older_than_ms, max_retained],
             ).await?;
             Ok(deleted as usize)

@@ -88,9 +88,12 @@ GET  /api/v1/jobs/{id}/upgrades/{upgrade_id}      → phase, savepoint, deadline
 POST /api/v1/jobs/{id}/upgrades/{upgrade_id}/actions  {"action": "pause"|"resume"|"cancel"|"rollback"}
 ```
 
-- `pause` freezes the orchestration (the Job keeps running); `resume` re-arms
-  the phase deadline. A long pause stretches the replay window — consider
-  cancelling and starting a fresh upgrade instead.
+- `pause` freezes the orchestration; `resume` re-arms the phase deadline.
+  Pausing during the savepoint phase leaves the old version running, but
+  pausing mid-verification can freeze a Job in the cutover gap (old version
+  already stopped, new one not yet started) until `resume`. A long pause also
+  stretches the replay window — prefer cancelling and starting a fresh
+  upgrade instead.
 - `cancel` releases the Job (a verification-phase cancel leaves the new
   version converging on its own; ordinary reconciliation continues it).
 - `rollback` is available once the orchestration is verifying.

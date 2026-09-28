@@ -1399,10 +1399,12 @@ impl SqliteBackend {
     }
 
     pub fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+        let sql = format!(
+            "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN {} ORDER BY created_at_ms",
+            TERMINAL_JOB_UPGRADE_PHASES_SQL
+        );
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE phase NOT IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY created_at_ms",
-            )?;
+            let mut statement = connection.prepare(sql.as_str())?;
             let rows = statement.query_map([], job_upgrade_from_row)?;
             rows.collect()
         })
@@ -1428,11 +1430,12 @@ impl SqliteBackend {
         older_than_ms: i64,
         max_retained: i64,
     ) -> Result<usize, StorageError> {
+        let sql = format!(
+            "DELETE FROM cp_job_upgrades WHERE phase IN {t} AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN {t} ORDER BY updated_at_ms DESC LIMIT ?2)",
+            t = TERMINAL_JOB_UPGRADE_PHASES_SQL
+        );
         self.immediate_transaction(|transaction| {
-            let removed = transaction.execute(
-                "DELETE FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') AND updated_at_ms < ?1 AND upgrade_id NOT IN (SELECT upgrade_id FROM cp_job_upgrades WHERE phase IN ('succeeded', 'aborted', 'failed', 'rolled_back', 'cancelled') ORDER BY updated_at_ms DESC LIMIT ?2)",
-                rusqlite::params![older_than_ms, max_retained],
-            )?;
+            let removed = transaction.execute(sql.as_str(), rusqlite::params![older_than_ms, max_retained])?;
             Ok(removed)
         })
     }

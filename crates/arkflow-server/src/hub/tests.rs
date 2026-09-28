@@ -5368,15 +5368,26 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
     let request = axum::http::Request::builder()
         .method("PUT")
         .uri("/api/v1/jobs/job-atomic-http/desired-state")
-        .header("authorization", authorization)
+        .header("authorization", authorization.clone())
         .header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"state": "stopped"}).to_string()))
         .unwrap();
-    let response = router.oneshot(request).await.unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["code"], "orchestration_in_progress");
+
+    // Unknown orchestration ids are 404s, not action-rejected conflicts.
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/jobs/job-atomic-http/upgrades/no-such-upgrade/actions")
+        .header("authorization", &authorization)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"action": "pause"}).to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
 }
