@@ -21,6 +21,7 @@ import {
   waitForOperation,
 } from './api'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './features/component-browser'
+import { currentLocale, intlLocale, useT } from './i18n'
 
 export type Snapshot = {
   system: SystemResource | null
@@ -38,7 +39,7 @@ export type Command = (id: string, action: 'start' | 'stop' | 'restart') => Prom
 export { Jobs } from './features/jobs'
 
 const number = (value: number | undefined) =>
-  value === undefined ? '—' : new Intl.NumberFormat().format(value)
+  value === undefined ? '—' : new Intl.NumberFormat(intlLocale(currentLocale())).format(value)
 const active = (state: Operation['state']) =>
   ['queued', 'dispatched', 'acknowledged', 'running'].includes(state)
 
@@ -64,9 +65,15 @@ export function Overview({
   onError?: (message: string) => void
   onNodesChanged?: () => void
 }) {
+  const t = useT()
   const setMaintenance = (node: ControlNode, action: 'drain' | 'maintain' | 'resume') => {
-    const label = action === 'drain' ? 'Drain' : action === 'maintain' ? 'Move to maintenance' : 'Resume'
-    if (!window.confirm(`${label} ${node.id}?`)) return
+    const confirmKey =
+      action === 'drain'
+        ? 'overview.confirmDrain'
+        : action === 'maintain'
+          ? 'overview.confirmMaintain'
+          : 'overview.confirmResume'
+    if (!window.confirm(t(confirmKey, { id: node.id }))) return
     const call =
       action === 'drain' ? api.drainNode : action === 'maintain' ? api.maintainNode : api.resumeNode
     call(node.id)
@@ -83,34 +90,34 @@ export function Overview({
     <>
       <section className="cards">
         <Card
-          label="Control plane"
-          value={snapshot.system?.state ?? 'Loading…'}
+          label={t('overview.cardControlPlane')}
+          value={snapshot.system?.state ?? t('common.loading')}
           hint={snapshot.system?.version}
         />
         <Card
-          label="Nodes online"
+          label={t('overview.cardNodesOnline')}
           value={`${online}/${snapshot.nodes.length || snapshot.system?.node_count || 0}`}
-          hint={stale ? `${stale} need attention` : 'All nodes healthy'}
+          hint={stale ? t('overview.nodesNeedAttention', { count: stale }) : t('overview.allNodesHealthy')}
         />
         <Card
-          label="Streams running"
+          label={t('overview.cardStreamsRunning')}
           value={`${running}/${snapshot.streams.length || snapshot.status?.streams_total || 0}`}
-          hint={failed ? `${failed} failed` : 'No failures reported'}
+          hint={failed ? t('overview.streamsFailed', { count: failed }) : t('overview.noFailures')}
         />
         <Card
-          label="Active operations"
+          label={t('overview.cardActiveOperations')}
           value={activeOperations || snapshot.system?.active_operations || 0}
-          hint="Queued and running"
+          hint={t('overview.queuedAndRunning')}
         />
       </section>
       <section className="overview-grid">
         <section className="panel">
           <div className="panel-title">
-            <h3>Fleet health</h3>
-            <span>{snapshot.nodes.length} registered</span>
+            <h3>{t('overview.fleetHealth')}</h3>
+            <span>{t('common.registered', { count: snapshot.nodes.length })}</span>
           </div>
           {snapshot.nodes.length === 0 ? (
-            <p className="empty">No compute nodes connected.</p>
+            <p className="empty">{t('overview.noNodes')}</p>
           ) : (
             <div className="node-grid">
               {snapshot.nodes.map((node) => {
@@ -125,29 +132,40 @@ export function Overview({
                       )}
                     </div>
                     <small>
-                      Last seen {formatTime(node.last_seen_at_ms)} · protocol{' '}
-                      {node.protocol_version ?? 'unknown'} · software {node.version}
+                      {t('overview.lastSeen', {
+                        time: formatTime(node.last_seen_at_ms),
+                        protocol: node.protocol_version ?? t('common.unknown'),
+                        version: node.version,
+                      })}
                     </small>
                     <div className="node-stats">
                       <span>
-                        <strong>{node.streams_running}</strong> running
+                        <strong>{node.streams_running}</strong> {t('overview.running')}
                       </span>
                       <span>
-                        <strong>{node.streams_total}</strong> total
+                        <strong>{node.streams_total}</strong> {t('overview.total')}
                       </span>
                       <span>
-                        <strong>{node.streams_failed}</strong> failed
+                        <strong>{node.streams_failed}</strong> {t('overview.failed')}
                       </span>
                     </div>
-                    <small>{(node.capabilities ?? []).join(' · ') || 'No capabilities reported'}</small>
+                    <small>
+                      {(node.capabilities ?? []).join(' · ') || t('overview.noCapabilities')}
+                    </small>
                     <div className="actions">
                       {maintenance === 'active' ? (
                         <>
-                          <button onClick={() => setMaintenance(node, 'drain')}>Drain</button>
-                          <button onClick={() => setMaintenance(node, 'maintain')}>Maintain</button>
+                          <button onClick={() => setMaintenance(node, 'drain')}>
+                            {t('overview.drain')}
+                          </button>
+                          <button onClick={() => setMaintenance(node, 'maintain')}>
+                            {t('overview.maintain')}
+                          </button>
                         </>
                       ) : (
-                        <button onClick={() => setMaintenance(node, 'resume')}>Resume</button>
+                        <button onClick={() => setMaintenance(node, 'resume')}>
+                          {t('overview.resume')}
+                        </button>
                       )}
                     </div>
                   </article>
@@ -158,8 +176,8 @@ export function Overview({
         </section>
         <section className="panel">
           <div className="panel-title">
-            <h3>Aggregate metrics</h3>
-            <span>Latest report</span>
+            <h3>{t('overview.aggregateMetrics')}</h3>
+            <span>{t('overview.latestReport')}</span>
           </div>
           <div className="metric-list">
             {Object.entries(metrics).length ? (
@@ -170,22 +188,22 @@ export function Overview({
                 </div>
               ))
             ) : (
-              <p className="empty">No metrics reported yet.</p>
+              <p className="empty">{t('overview.noMetrics')}</p>
             )}
           </div>
         </section>
       </section>
       <section className="panel">
         <div className="panel-title">
-          <h3>Recent activity</h3>
-          <span>{snapshot.events.length} events</span>
+          <h3>{t('overview.recentActivity')}</h3>
+          <span>{t('overview.eventsCount', { count: snapshot.events.length })}</span>
         </div>
         {snapshot.events.length ? (
           snapshot.events
             .slice(0, 8)
             .map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)
         ) : (
-          <p className="empty">No recent events.</p>
+          <p className="empty">{t('overview.noRecentEvents')}</p>
         )}
       </section>
     </>
@@ -215,6 +233,7 @@ export function Runtime({
   const [state, setState] = useState('all')
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<string>()
+  const t = useT()
   const filtered = useMemo(
     () =>
       streams.filter(
@@ -237,18 +256,18 @@ export function Runtime({
     <>
       <section className="panel">
         <div className="panel-title">
-          <h3>Stream runtimes</h3>
+          <h3>{t('runtime.title')}</h3>
           <span>
-            {filtered.length} matching resources
+            {t('runtime.matchingResources', { count: filtered.length })}
             {streamTotal !== undefined && streamTotal > streams.length
-              ? ` · ${streamTotal} registered server-side`
+              ? t('runtime.registeredServerSide', { count: streamTotal })
               : ''}
           </span>
         </div>
         <div className="toolbar">
           <input
-            aria-label="Stream filter"
-            placeholder="Filter by stream or node"
+            aria-label={t('runtime.filterLabel')}
+            placeholder={t('runtime.filterPlaceholder')}
             value={filter}
             onChange={(event) => {
               setFilter(event.target.value)
@@ -256,21 +275,21 @@ export function Runtime({
             }}
           />
           <select
-            aria-label="Stream state"
+            aria-label={t('runtime.stateLabel')}
             value={state}
             onChange={(event) => {
               setState(event.target.value)
               setPage(1)
             }}
           >
-            <option value="all">All states</option>
+            <option value="all">{t('runtime.allStates')}</option>
             {['running', 'starting', 'stopped', 'failed', 'restarting'].map((value) => (
               <option key={value}>{value}</option>
             ))}
           </select>
         </div>
         {visible.length === 0 ? (
-          <p className="empty">No streams match the current filters.</p>
+          <p className="empty">{t('runtime.noMatches')}</p>
         ) : (
           <div className="table">
             {visible.map((stream) => (
@@ -281,19 +300,20 @@ export function Runtime({
                 <button className="link-button" onClick={() => setSelected(stream.id)}>
                   <strong>{stream.id}</strong>
                   <small>
-                    {stream.node_id ?? 'local-node'} · desired: {stream.desired_state ?? 'unknown'} ·
-                    generation {stream.desired_generation ?? '—'}
+                    {stream.node_id ?? t('common.localNode')} ·{' '}
+                    {t('runtime.desired', { state: stream.desired_state ?? t('common.unknown') })} ·{' '}
+                    {t('common.generation', { value: stream.desired_generation ?? '—' })}
                   </small>
                 </button>
                 <div>
                   <span className={`state ${stream.state}`}>{stream.state}</span>
                   <small>
-                    convergence: {stream.convergence ?? 'unknown'} · observed generation{' '}
-                    {stream.observed_generation ?? '—'}
+                    {t('runtime.convergence', { value: stream.convergence ?? t('common.unknown') })} ·{' '}
+                    {t('runtime.observedGeneration', { value: stream.observed_generation ?? '—' })}
                   </small>
                   <small>
-                    {number(stream.metrics.input_messages)} input messages ·{' '}
-                    {number(stream.metrics.output_messages)} output messages
+                    {t('runtime.inputMessages', { count: number(stream.metrics.input_messages) })} ·{' '}
+                    {t('runtime.outputMessages', { count: number(stream.metrics.output_messages) })}
                   </small>
                 </div>
                 <div className="actions">
@@ -302,10 +322,11 @@ export function Runtime({
                       disabled={!canMutate}
                       key={action}
                       onClick={() => {
-                        if (window.confirm(`${action} ${stream.id}?`)) void command(stream.id, action)
+                        if (window.confirm(t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id })))
+                          void command(stream.id, action)
                       }}
                     >
-                      {action[0].toUpperCase() + action.slice(1)}
+                      {t(`common.${action}`)}
                     </button>
                   ))}
                 </div>
@@ -325,11 +346,13 @@ export function Runtime({
       )}
       <section className="panel">
         <div className="panel-title">
-          <h3>Administrative operations</h3>
+          <h3>{t('runtime.adminOperations')}</h3>
           <span>
-            {operations.filter((operation) => active(operation.state)).length} active
+            {t('runtime.activeCount', {
+              count: operations.filter((operation) => active(operation.state)).length,
+            })}
             {operationTotal !== undefined && operationTotal > operations.length
-              ? ` · ${operationTotal} recorded server-side`
+              ? t('runtime.recordedServerSide', { count: operationTotal })
               : ''}
           </span>
         </div>
@@ -340,7 +363,7 @@ export function Runtime({
               <OperationRow operation={operation} onChanged={onOperationChanged} key={operation.id} />
             ))
         ) : (
-          <p className="empty">No operations recorded.</p>
+          <p className="empty">{t('runtime.noOperations')}</p>
         )}
       </section>
     </>
@@ -358,51 +381,57 @@ function RuntimeDetail({
   events: ControlEvent[]
   onClose: () => void
 }) {
+  const t = useT()
   return (
     <section className="panel detail">
       <div className="panel-title">
         <div>
-          <span className="eyebrow">STREAM DETAIL</span>
+          <span className="eyebrow">{t('runtime.detailEyebrow')}</span>
           <h3>{stream.id}</h3>
         </div>
-        <button onClick={onClose}>Close</button>
+        <button onClick={onClose}>{t('common.close')}</button>
       </div>
       <div className="detail-grid">
         <div>
           <span className={`state ${stream.state}`}>{stream.state}</span>
           <p>
-            Node: <strong>{stream.node_id ?? 'local-node'}</strong>
+            {t('runtime.node')}: <strong>{stream.node_id ?? t('common.localNode')}</strong>
           </p>
           <p>
-            Desired: <strong>{stream.desired_state ?? 'unknown'}</strong> · generation{' '}
-            {stream.desired_generation ?? '—'}
+            {t('runtime.desiredLabel')}:{' '}
+            <strong>{stream.desired_state ?? t('common.unknown')}</strong> ·{' '}
+            {t('common.generation', { value: stream.desired_generation ?? '—' })}
           </p>
           <p>
-            Observed: <strong>{stream.state}</strong> · generation {stream.observed_generation ?? '—'}
+            {t('runtime.observedLabel')}: <strong>{stream.state}</strong> ·{' '}
+            {t('common.generation', { value: stream.observed_generation ?? '—' })}
           </p>
           <p>
-            Convergence: <strong>{stream.convergence ?? 'unknown'}</strong>
+            {t('runtime.convergenceLabel')}: <strong>{stream.convergence ?? t('common.unknown')}</strong>
           </p>
           <p>
-            Config: {stream.desired_config_version ?? 'none'} → {stream.observed_config_version ?? 'unknown'}
+            {t('runtime.config')}: {stream.desired_config_version ?? t('common.none')} →{' '}
+            {stream.observed_config_version ?? t('common.unknown')}
           </p>
           <p>
-            Retry: {stream.retry_count ?? 0}
-            {stream.next_retry_at_ms ? ` · next ${formatTime(stream.next_retry_at_ms)}` : ''}
+            {t('runtime.retry')}: {stream.retry_count ?? 0}
+            {stream.next_retry_at_ms ? t('runtime.nextRetry', { time: formatTime(stream.next_retry_at_ms) }) : ''}
           </p>
-          <p>Active operation: {stream.active_operation_id ?? 'None'}</p>
+          <p>
+            {t('runtime.activeOperation')}: {stream.active_operation_id ?? t('common.none')}
+          </p>
         </div>
         <div className="metric-list">
           <div className="metric">
-            <span>Input messages</span>
+            <span>{t('runtime.metricInput')}</span>
             <strong>{number(stream.metrics.input_messages)}</strong>
           </div>
           <div className="metric">
-            <span>Output messages</span>
+            <span>{t('runtime.metricOutput')}</span>
             <strong>{number(stream.metrics.output_messages)}</strong>
           </div>
           <div className="metric">
-            <span>Processing errors</span>
+            <span>{t('runtime.metricErrors')}</span>
             <strong>{number(stream.metrics.processing_errors)}</strong>
           </div>
         </div>
@@ -413,17 +442,17 @@ function RuntimeDetail({
           {formatTime(stream.last_error.occurred_at_ms)}
         </div>
       )}
-      <h4>Operation history</h4>
+      <h4>{t('runtime.operationHistory')}</h4>
       {operations.length ? (
         operations.map((operation) => <OperationRow operation={operation} key={operation.id} />)
       ) : (
-        <p className="empty">No operation history.</p>
+        <p className="empty">{t('runtime.noOperationHistory')}</p>
       )}
-      <h4>Related events</h4>
+      <h4>{t('runtime.relatedEvents')}</h4>
       {events.length ? (
         events.map((event, index) => <EventRow event={event} key={`${event.occurred_at_ms}-${index}`} />)
       ) : (
-        <p className="empty">No related events.</p>
+        <p className="empty">{t('runtime.noRelatedEvents')}</p>
       )}
     </section>
   )
@@ -441,6 +470,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   const [diff, setDiff] = useState<ConfigDiff>()
   const [editable, setEditable] = useState(false)
   const [activeSnapshot, setActiveSnapshot] = useState(false)
+  const t = useT()
   const candidate = { format, content }
   const identity = `${format}\u0000${content}`
   const dirty = content !== saved || format !== savedFormat
@@ -482,13 +512,13 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     }
   }
   const validate = () =>
-    void run('Validating…', async () => {
+    void run(t('config.busyValidating'), async () => {
       const report = await api.validateConfig(candidate)
       setIssues(report.errors)
       setValidatedCandidate(report.valid ? identity : undefined)
     })
   const saveDraft = () =>
-    void run('Saving draft…', async () => {
+    void run(t('config.busySavingDraft'), async () => {
       await api.saveDraft(candidate)
       setSaved(content)
       setSavedFormat(format)
@@ -497,14 +527,14 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       setValidatedCandidate(undefined)
     })
   const publish = () =>
-    void run('Publishing…', async () => {
+    void run(t('config.busyPublishing'), async () => {
       const operation = await api.applyConfig(candidate, nodeId)
       await waitForOperation(operation.id)
       await load()
     })
   const rollback = async (id: string) => {
-    if (!window.confirm(`Rollback ${id}?`)) return
-    await run('Rolling back…', async () => {
+    if (!window.confirm(t('config.confirmRollback', { id }))) return
+    await run(t('config.busyRollingBack'), async () => {
       const operation = await api.rollback(id, nodeId)
       await waitForOperation(operation.id)
       await load()
@@ -513,7 +543,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   const compare = async (id: string) => {
     const to = versions.find((version) => version.id !== id)?.id
     if (!to) return
-    await run('Comparing…', async () => setDiff(await api.diff(id, to)))
+    await run(t('config.busyComparing'), async () => setDiff(await api.diff(id, to)))
   }
   const changeFormat = (next: ConfigCandidate['format']) => {
     if (next === format) return
@@ -527,7 +557,9 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       setIssues([
         {
           path: 'document',
-          message: `Cannot convert configuration: ${cause instanceof Error ? cause.message : String(cause)}`,
+          message: t('config.cannotConvert', {
+            message: cause instanceof Error ? cause.message : String(cause),
+          }),
         },
       ])
     }
@@ -536,20 +568,22 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     <section className="panel config">
       <div className="panel-title">
         <div>
-          <h3>Configuration {nodeId && `· ${nodeId}`}</h3>
+          <h3>
+            {t('config.title')} {nodeId && `· ${nodeId}`}
+          </h3>
           <small>
             {activeSnapshot
-              ? 'Active configuration is redacted and read-only'
+              ? t('config.activeRedacted')
               : dirty
-                ? 'Unsaved draft'
-                : 'Draft is saved'}
+                ? t('config.unsavedDraft')
+                : t('config.draftSaved')}
             {busy && ` · ${busy}`}
-            {!validated && ' · Validate current content before publishing'}
+            {!validated && t('config.validateBeforePublish')}
           </small>
         </div>
         <div className="actions">
           <select
-            aria-label="Configuration format"
+            aria-label={t('config.formatLabel')}
             value={format}
             disabled={!editable || !!busy}
             onChange={(event) => changeFormat(event.target.value as ConfigCandidate['format'])}
@@ -558,18 +592,18 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
             <option value="json">JSON</option>
           </select>
           <button disabled={!editable || !dirty || !!busy} onClick={saveDraft}>
-            Save draft
+            {t('config.saveDraft')}
           </button>
           <button disabled={!editable || !!busy} onClick={validate}>
-            Validate
+            {t('config.validate')}
           </button>
           <button disabled={!validated || !!busy} onClick={publish}>
-            Publish
+            {t('config.publish')}
           </button>
         </div>
       </div>
       <textarea
-        aria-label="Configuration editor"
+        aria-label={t('config.editorLabel')}
         value={content}
         readOnly={!editable || !!busy}
         onChange={(event) => {
@@ -581,17 +615,17 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       />
       {issues.length > 0 && (
         <div className="validation">
-          <strong>{issues.length} validation issue(s)</strong>
+          <strong>{t('config.validationIssues', { count: issues.length })}</strong>
           {issues.map((issue, index) => (
             <p key={index}>
-              <strong>{issue.path || 'document'}</strong>: {issue.message}
+              <strong>{issue.path || t('config.document')}</strong>: {issue.message}
             </p>
           ))}
         </div>
       )}
       {versions.length > 0 && (
         <>
-          <h3 className="subheading">Version history</h3>
+          <h3 className="subheading">{t('config.versionHistory')}</h3>
           {versions.map((version) => (
             <div className="version" key={version.id}>
               <span>
@@ -599,10 +633,10 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
               </span>
               <div className="actions">
                 <button disabled={versions.length < 2 || !!busy} onClick={() => void compare(version.id)}>
-                  Compare
+                  {t('config.compare')}
                 </button>
                 <button disabled={!!busy} onClick={() => void rollback(version.id)}>
-                  Rollback
+                  {t('config.rollback')}
                 </button>
               </div>
             </div>
@@ -611,14 +645,15 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       )}
       {diff && (
         <div className="validation">
-          <strong>
-            Comparing {diff.from} → {diff.to}
-          </strong>
+          <strong>{t('config.comparing', { from: diff.from, to: diff.to })}</strong>
           <p>
-            {diff.changed ? 'Content differs.' : 'No content changes.'} Formats:{' '}
-            {diff.from_format ?? 'unknown'} → {diff.to_format ?? 'unknown'}
+            {diff.changed ? t('config.contentDiffers') : t('config.noContentChanges')}{' '}
+            {t('config.formats', {
+              from: diff.from_format ?? t('common.unknown'),
+              to: diff.to_format ?? t('common.unknown'),
+            })}
           </p>
-          <button onClick={() => setDiff(undefined)}>Close</button>
+          <button onClick={() => setDiff(undefined)}>{t('common.close')}</button>
         </div>
       )}
     </section>
@@ -630,6 +665,7 @@ export function Components({ onError }: { onError: (message: string) => void }) 
   const [kind, setKind] = useState<ComponentKind>('input')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<string>()
+  const t = useT()
   useEffect(() => {
     api
       .components()
@@ -646,8 +682,8 @@ export function Components({ onError }: { onError: (message: string) => void }) 
     <section className="panel component-catalogue">
       <div className="panel-title">
         <div>
-          <h3>Component catalogue</h3>
-          <span>{items.length} registered</span>
+          <h3>{t('components.title')}</h3>
+          <span>{t('common.registered', { count: items.length })}</span>
         </div>
       </div>
       <ComponentBrowserControls
@@ -668,11 +704,11 @@ export function Components({ onError }: { onError: (message: string) => void }) 
                 onClick={() => setSelected(`${item.kind}:${item.name}`)}
               >
                 <strong>{item.name}</strong>
-                <small>{item.description ?? 'No description'}</small>
+                <small>{item.description ?? t('components.noDescription')}</small>
               </button>
             ))
           ) : (
-            <p className="empty">No matching components.</p>
+            <p className="empty">{t('components.noMatches')}</p>
           )}
         </div>
         <div className="component-detail">
@@ -680,20 +716,20 @@ export function Components({ onError }: { onError: (message: string) => void }) 
             <>
               <span className="eyebrow">{current.kind}</span>
               <h4>{current.name}</h4>
-              <p>{current.description ?? 'No description'}</p>
+              <p>{current.description ?? t('components.noDescription')}</p>
               {current.example !== undefined && (
                 <details open>
-                  <summary>Example</summary>
+                  <summary>{t('components.example')}</summary>
                   <pre className="schema">{JSON.stringify(current.example, null, 2)}</pre>
                 </details>
               )}
               <details>
-                <summary>Configuration schema</summary>
+                <summary>{t('components.schema')}</summary>
                 <pre className="schema">{JSON.stringify(current.schema ?? {}, null, 2)}</pre>
               </details>
             </>
           ) : (
-            <p className="empty">Select a component to inspect its configuration.</p>
+            <p className="empty">{t('components.selectPrompt')}</p>
           )}
         </div>
       </div>
@@ -702,6 +738,7 @@ export function Components({ onError }: { onError: (message: string) => void }) 
 }
 export function Events({ events, total }: { events: ControlEvent[]; total?: number }) {
   const [filter, setFilter] = useState('')
+  const t = useT()
   const visible = events.filter(
     (event) =>
       !filter ||
@@ -712,65 +749,66 @@ export function Events({ events, total }: { events: ControlEvent[]; total?: numb
   return (
     <section className="panel">
       <div className="panel-title">
-        <h3>Events</h3>
+        <h3>{t('events.title')}</h3>
         <div className="actions">
           <input
-            aria-label="Event filter"
-            placeholder="Filter events"
+            aria-label={t('events.filterLabel')}
+            placeholder={t('events.filterPlaceholder')}
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
           />
           <span>
-            {visible.length} matching
-            {total !== undefined && total > events.length ? ` · ${total} stored server-side` : ''}
+            {t('events.matching', { count: visible.length })}
+            {total !== undefined && total > events.length
+              ? t('common.storedServerSide', { count: total })
+              : ''}
           </span>
         </div>
       </div>
       {visible.length ? (
         visible.map((event, i) => <EventRow event={event} key={i} />)
       ) : (
-        <p className="empty">No matching events.</p>
+        <p className="empty">{t('events.noMatches')}</p>
       )}
     </section>
   )
 }
 export function Settings({ status }: { status: EngineStatus | null }) {
+  const t = useT()
   return (
     <section className="panel">
       <div className="panel-title">
-        <h3>Settings</h3>
-        <span>Security and capability status</span>
+        <h3>{t('settings.title')}</h3>
+        <span>{t('settings.subtitle')}</span>
       </div>
       <div className="settings-grid">
         <p>
-          <small>API version</small>
+          <small>{t('settings.apiVersion')}</small>
           <strong>v1</strong>
         </p>
         <p>
-          <small>Backend</small>
-          <strong>{status?.version ?? 'Loading…'}</strong>
+          <small>{t('settings.backend')}</small>
+          <strong>{status?.version ?? t('common.loading')}</strong>
         </p>
         <p>
-          <small>Snapshot polling</small>
-          <strong>every {SNAPSHOT_INTERVAL_MS / 1000} seconds</strong>
+          <small>{t('settings.snapshotPolling')}</small>
+          <strong>{t('settings.pollingValue', { seconds: SNAPSHOT_INTERVAL_MS / 1000 })}</strong>
         </p>
       </div>
-      <p>
-        Credentials are read from build-time environment configuration and never rendered in the UI. Live
-        updates stream over SSE; the periodic snapshot is a fallback.
-      </p>
+      <p>{t('settings.credentialsNote')}</p>
     </section>
   )
 }
 
 function OperationRow({ operation, onChanged }: { operation: Operation; onChanged?: () => void }) {
+  const t = useT()
   return (
     <div className="operation-row">
       <div>
         <strong>{operation.operation}</strong>
         <small>
-          {operation.node_id ?? 'local-node'} · {operation.resource_id} · generation{' '}
-          {operation.generation ?? '—'} · {operation.id}
+          {operation.node_id ?? t('common.localNode')} · {operation.resource_id} ·{' '}
+          {t('common.generation', { value: operation.generation ?? '—' })} · {operation.id}
           {operation.correlation_id ? ` · ${operation.correlation_id}` : ''}
         </small>
       </div>
@@ -780,12 +818,15 @@ function OperationRow({ operation, onChanged }: { operation: Operation; onChange
         </span>
         <progress max="100" value={operation.progress} />
         <small>
-          {operation.progress}%{operation.retry_count ? ` · retry ${operation.retry_count}` : ''}
+          {operation.progress}%
+          {operation.retry_count ? t('common.retryCount', { count: operation.retry_count }) : ''}
         </small>
       </div>
       <div>
         {active(operation.state) && (
-          <button onClick={() => void api.cancel(operation.id).then(() => onChanged?.())}>Cancel</button>
+          <button onClick={() => void api.cancel(operation.id).then(() => onChanged?.())}>
+            {t('common.cancel')}
+          </button>
         )}
         {operation.failure_class && <small className="error-text">{operation.failure_class}</small>}
         {operation.error && <small className="error-text">{operation.error}</small>}
@@ -794,11 +835,12 @@ function OperationRow({ operation, onChanged }: { operation: Operation; onChange
   )
 }
 function EventRow({ event }: { event: ControlEvent }) {
+  const t = useT()
   return (
     <div className="event-row">
       <strong>{event.event_type}</strong>
       <span>
-        {event.stream_id ?? 'system'} · {event.outcome}
+        {event.stream_id ?? t('common.system')} · {event.outcome}
       </span>
       <small>
         {formatTime(event.occurred_at_ms)}
@@ -817,16 +859,15 @@ function Pagination({
   pages: number
   onChange: (page: number) => void
 }) {
+  const t = useT()
   return pages <= 1 ? null : (
     <div className="pagination">
       <button disabled={page === 1} onClick={() => onChange(page - 1)}>
-        Previous
+        {t('common.previous')}
       </button>
-      <span>
-        Page {page} of {pages}
-      </span>
+      <span>{t('common.pageOf', { page, pages })}</span>
       <button disabled={page === pages} onClick={() => onChange(page + 1)}>
-        Next
+        {t('common.next')}
       </button>
     </div>
   )

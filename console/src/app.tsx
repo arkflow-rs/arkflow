@@ -13,19 +13,20 @@ import {
 import { Configuration, Components, Events, Jobs, Overview, Runtime, Settings, Snapshot } from './features'
 import { Audit } from './features/audit'
 import { Rollouts } from './features/rollouts'
+import { useSetLocale, useLocale, useT, type Locale } from './i18n'
 
 const PAGES = [
-  ['overview', 'Overview'],
-  ['runtime', 'Streams'],
-  ['jobs', 'Jobs'],
-  ['configuration', 'Configuration'],
-  ['rollouts', 'Rollouts'],
-  ['components', 'Components'],
-  ['events', 'Events'],
-  ['audit', 'Audit'],
-  ['settings', 'Settings'],
+  'overview',
+  'runtime',
+  'jobs',
+  'configuration',
+  'rollouts',
+  'components',
+  'events',
+  'audit',
+  'settings',
 ] as const
-type Page = (typeof PAGES)[number][0]
+type Page = (typeof PAGES)[number]
 
 function pageFromLocation(): Page {
   const value = new URLSearchParams(window.location.search).get('page')
@@ -44,6 +45,9 @@ function syncLocation(page: Page, nodeId: string) {
 }
 
 export function App() {
+  const t = useT()
+  const locale = useLocale()
+  const setLocale = useSetLocale()
   const [page, setPage] = useState<Page>(pageFromLocation)
   const [selectedNode, setSelectedNode] = useState(nodeFromLocation)
   const [snapshot, setSnapshot] = useState<Snapshot>({
@@ -143,14 +147,14 @@ export function App() {
     }
   }
 
-  const pageTitle = PAGES.find(([key]) => key === page)?.[1] ?? page
+  const pageTitle = t(`nav.${page}`)
   return (
     <div className="shell">
       <aside>
         <h1>arkflow</h1>
-        <p>Control plane</p>
+        <p>{t('brand.tagline')}</p>
         <nav>
-          {PAGES.map(([key, label]) => (
+          {PAGES.map((key) => (
             <a
               key={key}
               href={`?page=${key}`}
@@ -161,7 +165,7 @@ export function App() {
                 goTo(key)
               }}
             >
-              {label}
+              {t(`nav.${key}`)}
             </a>
           ))}
         </nav>
@@ -169,7 +173,7 @@ export function App() {
       <main>
         <header>
           <div>
-            <span className="eyebrow">CONTROL PLANE</span>
+            <span className="eyebrow">{t('header.eyebrow')}</span>
             <h2>{pageTitle}</h2>
           </div>
           <div className="actions">
@@ -180,14 +184,14 @@ export function App() {
                   void oidcLogout()
                 }}
               >
-                Sign out
+                {t('header.signOut')}
               </button>
             )}
             <span className={`connection ${live ? 'connected' : 'disconnected'}`}>
-              {live ? 'Live events' : 'Snapshot mode'}
+              {live ? t('header.liveEvents') : t('header.snapshotMode')}
             </span>
             <select
-              aria-label="Compute node"
+              aria-label={t('header.computeNode')}
               value={selectedNode}
               onChange={(event) => {
                 const value = event.target.value
@@ -195,15 +199,23 @@ export function App() {
                 syncLocation(page, value)
               }}
             >
-              <option value="">All nodes</option>
+              <option value="">{t('header.allNodes')}</option>
               {snapshot.nodes.map((node) => (
                 <option key={node.id} value={node.id}>
                   {node.id} · {node.state}
                 </option>
               ))}
             </select>
+            <select
+              aria-label={t('header.language')}
+              value={locale}
+              onChange={(event) => setLocale(event.target.value as Locale)}
+            >
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
             <button disabled={refreshing} onClick={() => void refresh()}>
-              {refreshing ? 'Refreshing…' : 'Refresh'}
+              {refreshing ? t('header.refreshing') : t('header.refresh')}
             </button>
           </div>
         </header>
@@ -211,14 +223,10 @@ export function App() {
           selectedNodeState.state !== 'online' &&
           selectedNodeState.state !== 'running' && (
             <div className="warning">
-              Node {selectedNode} is {selectedNodeState.state}; mutating actions are disabled.
+              {t('warning.nodeUnavailable', { node: selectedNode, state: selectedNodeState.state })}
             </div>
           )}
-        {stale && (
-          <div className="warning">
-            Showing the last known state. Retry when the control API is available.
-          </div>
-        )}
+        {stale && <div className="warning">{t('warning.staleState')}</div>}
         {error && <div className="error">{error}</div>}
         {page === 'overview' && (
           <Overview snapshot={snapshot} onError={setError} onNodesChanged={() => void refresh()} />

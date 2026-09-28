@@ -49,6 +49,19 @@ and the view shows the operation as blocked until the node reconnects.
   need to reproduce — every console action is a documented route in the
   [HTTP API reference](../../reference/api.md).
 
+## Interface language
+
+The console user interface ships with English and Simplified Chinese
+(简体中文) translations. On first load the console picks the language from
+your browser (`navigator.language`; any `zh*` locale selects Chinese),
+falling back to English. The language selector in the top bar
+(**中文 / English**) switches immediately and persists the choice in
+`localStorage`, so it survives reloads. Date and number formatting follow
+the selected language.
+
+Backend-returned messages (API errors, event payloads) are displayed as
+received and are not translated by the console.
+
 ## Security notes
 
 The console is a static bundle that holds no secrets beyond what you enter;

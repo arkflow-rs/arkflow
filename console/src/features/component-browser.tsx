@@ -1,4 +1,5 @@
 import { Component } from '../api'
+import { useT } from '../i18n'
 
 export const componentKinds = ['input', 'processor', 'output'] as const
 export type ComponentKind = (typeof componentKinds)[number]
@@ -25,15 +26,16 @@ export function ComponentBrowserControls({
   onQueryChange: (query: string) => void
   count: number
 }) {
+  const t = useT()
   return (
     <div className="component-browser-controls">
       <input
-        aria-label="Component search"
-        placeholder="Search components"
+        aria-label={t('browser.searchAriaLabel')}
+        placeholder={t('browser.searchPlaceholder')}
         value={query}
         onChange={(event) => onQueryChange(event.target.value)}
       />
-      <div className="component-kind-tabs" role="tablist" aria-label="Component kind">
+      <div className="component-kind-tabs" role="tablist" aria-label={t('browser.kindAriaLabel')}>
         {componentKinds.map((value) => (
           <button
             type="button"
@@ -47,7 +49,7 @@ export function ComponentBrowserControls({
           </button>
         ))}
       </div>
-      <small>{count} matching</small>
+      <small>{t('browser.matching', { count })}</small>
     </div>
   )
 }

@@ -1,3 +1,5 @@
+import { currentLocale, intlLocale, translate } from './i18n'
+
 export type StreamState =
   'created' | 'starting' | 'running' | 'stopping' | 'stopped' | 'failed' | 'restarting'
 export type DesiredState = 'running' | 'stopped'
@@ -260,11 +262,11 @@ export function errorMessage(cause: unknown): string {
     const error = cause as ApiError
     return `${error.message}${error.correlation_id ? ` (ref ${error.correlation_id})` : ''}`
   }
-  return cause instanceof Error ? cause.message : 'Control API unavailable'
+  return cause instanceof Error ? cause.message : translate(currentLocale(), 'api.controlApiUnavailable')
 }
 
 export function formatTime(value?: number): string {
-  return value ? new Date(value).toLocaleString() : '—'
+  return value ? new Date(value).toLocaleString(intlLocale(currentLocale())) : '—'
 }
 
 const base = import.meta.env.VITE_API_BASE ?? '/api/v1'
@@ -287,7 +289,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
     throw {
       code: body.code ?? 'request_failed',
-      message: body.message ?? `Request failed (${response.status})`,
+      message: body.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status }),
       field: body.field,
       stream_id: body.stream_id,
       correlation_id: body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
@@ -431,7 +433,9 @@ export function streamEvents(
           },
           signal: controller.signal,
         })
-        if (!response.ok || !response.body) throw new Error(`SSE connection failed (${response.status})`)
+        if (!response.ok || !response.body) {
+          throw new Error(translate(currentLocale(), 'api.sseConnectionFailed', { status: response.status }))
+        }
         onState?.('connected')
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
@@ -488,13 +492,18 @@ export async function waitForOperation(id: string): Promise<Operation> {
         (operation.intent_state && operation.intent_state !== 'converged') ||
         (!operation.intent_state && operation.state !== 'succeeded')
       ) {
-        throw new Error(operation.error ?? `Operation ${operation.intent_state ?? operation.state}`)
+        throw new Error(
+          operation.error ??
+            translate(currentLocale(), 'api.operationState', {
+              state: operation.intent_state ?? operation.state,
+            }),
+        )
       }
       return operation
     }
     await new Promise((resolve) => window.setTimeout(resolve, 250))
   }
-  throw new Error('Operation timed out')
+  throw new Error(translate(currentLocale(), 'api.operationTimedOut'))
 }
 
 // --- OIDC browser login integration -------------------------------------

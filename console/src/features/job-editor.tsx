@@ -25,6 +25,7 @@ import {
   type JobSpec,
 } from './job-dag'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
+import { useT } from '../i18n'
 
 const copy = <T,>(v: T): T => structuredClone(v)
 function JobNode({ data }: { data: DagNodeData }) {
@@ -54,6 +55,7 @@ function SchemaForm({
   onChange: (value: any) => void
   path?: string
 }) {
+  const t = useT()
   if (!schema) return <KeyValueForm value={value} onChange={onChange} />
   if (schema.oneOf || schema.anyOf) {
     const options = schema.oneOf ?? schema.anyOf
@@ -74,7 +76,7 @@ function SchemaForm({
         >
           {options.map((item: any, i: number) => (
             <option key={i} value={i}>
-              {item.title ?? item.const ?? item.type ?? `Option ${i + 1}`}
+              {item.title ?? item.const ?? item.type ?? t('editor.optionLabel', { index: i + 1 })}
             </option>
           ))}
         </select>
@@ -118,12 +120,12 @@ function SchemaForm({
               path={`${path}[${i}]`}
             />
             <button type="button" onClick={() => onChange(items.filter((_, index) => index !== i))}>
-              Remove
+              {t('editor.remove')}
             </button>
           </div>
         ))}
         <button type="button" onClick={() => onChange([...items, schema.items?.default ?? ''])}>
-          Add item
+          {t('editor.addItem')}
         </button>
       </div>
     )
@@ -131,7 +133,7 @@ function SchemaForm({
   if (schema.enum)
     return (
       <select value={value ?? ''} onChange={(event) => onChange(event.target.value)}>
-        <option value="">Select…</option>
+        <option value="">{t('editor.selectPlaceholder')}</option>
         {schema.enum.map((item: any) => (
           <option key={String(item)} value={item}>
             {String(item)}
@@ -158,6 +160,7 @@ function SchemaForm({
   )
 }
 function KeyValueForm({ value, onChange }: { value: any; onChange: (value: any) => void }) {
+  const t = useT()
   // A key the operator is currently retyping. Holding it in local state keeps
   // the input controlled: rejecting an edit (an empty or duplicate name) would
   // otherwise reset the field to the old key and swallow the keystroke.
@@ -184,7 +187,7 @@ function KeyValueForm({ value, onChange }: { value: any; onChange: (value: any) 
       {entries.map(([key, item]) => (
         <div className="array-row" key={key}>
           <input
-            aria-label={`Key ${key}`}
+            aria-label={t('editor.keyAriaLabel', { key })}
             value={drafts[key] ?? key}
             onChange={(event) => setDrafts((current) => ({ ...current, [key]: event.target.value }))}
             onBlur={(event) => commitRename(key, event.target.value)}
@@ -193,7 +196,7 @@ function KeyValueForm({ value, onChange }: { value: any; onChange: (value: any) 
             }}
           />
           <input
-            aria-label={`Value ${key}`}
+            aria-label={t('editor.valueAriaLabel', { key })}
             value={typeof item === 'string' ? item : JSON.stringify(item)}
             onChange={(event) => {
               let nextValue: any = event.target.value
@@ -213,12 +216,12 @@ function KeyValueForm({ value, onChange }: { value: any; onChange: (value: any) 
               onChange(next)
             }}
           >
-            Remove
+            {t('editor.remove')}
           </button>
         </div>
       ))}
       <button type="button" onClick={() => onChange({ ...(value ?? {}), key: '' })}>
-        Add property
+        {t('editor.addProperty')}
       </button>
     </div>
   )
@@ -247,6 +250,7 @@ export function JobEditor({
   onRefresh,
   onAction,
 }: Props) {
+  const t = useT()
   const initial = useMemo<JobSpec>(() => {
     if (mode === 'upgrade' && job) {
       if (job.spec && typeof job.spec === 'object') return copy(job.spec as JobSpec)
@@ -289,7 +293,7 @@ export function JobEditor({
         onError(
           typeof cause === 'object' && cause && 'message' in cause
             ? String(cause.message)
-            : 'Unable to load components',
+            : t('editor.unableToLoadComponents'),
         )
       })
   }
@@ -407,25 +411,27 @@ export function JobEditor({
       if (latestSpecJson.current !== validatedSpec || JSON.stringify([...nodeIds].sort()) !== validatedNodes)
         return
       setValidation(result)
-      setIssues(result.valid ? [] : ['The current graph or selected nodes are incompatible'])
+      setIssues(result.valid ? [] : [t('editor.incompatibleGraph')])
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : 'Validation failed')
+      onError(cause instanceof Error ? cause.message : t('editor.validationFailed'))
     }
   }
   const submit = async () => {
     if (!validation?.valid) {
-      setIssues(['Validate this exact graph before submitting'])
+      setIssues([t('editor.validateBeforeSubmit')])
       return
     }
     if (
       !window.confirm(
         mode === 'create'
-          ? 'Create this Job in stopped state?'
-          : `Upgrade from ${savepoint?.checkpoint_id ?? 'the selected savepoint'}?`,
+          ? t('editor.confirmCreate')
+          : t('editor.confirmUpgrade', {
+              checkpoint: savepoint?.checkpoint_id ?? t('editor.selectedSavepoint'),
+            }),
       )
     )
       return
-    await onAction(mode === 'create' ? 'Creating Job…' : 'Submitting upgrade…', async () => {
+    await onAction(mode === 'create' ? t('editor.creatingJob') : t('editor.submittingUpgrade'), async () => {
       const next = dagToJobSpec(dagNodes, edges, spec)
       if (mode === 'create') {
         await api.createJob(next, nodeIds)
@@ -464,27 +470,27 @@ export function JobEditor({
     <section className="panel detail job-editor">
       <div className="panel-title">
         <div>
-          <span className="eyebrow">{mode === 'create' ? 'CREATE JOB' : 'UPGRADE JOB'}</span>
-          <h3>{mode === 'create' ? 'Visual Job orchestrator' : `${job?.job_id} → v${spec.version ?? 1}`}</h3>
+          <span className="eyebrow">{mode === 'create' ? t('editor.eyebrowCreate') : t('editor.eyebrowUpgrade')}</span>
+          <h3>{mode === 'create' ? t('editor.visualOrchestrator') : `${job?.job_id} → v${spec.version ?? 1}`}</h3>
           <small>
             {mode === 'upgrade'
-              ? `Recovery: ${savepoint?.checkpoint_id}`
-              : 'A validated graph creates a stopped Job'}
+              ? t('editor.recoveryFrom', { checkpoint: savepoint?.checkpoint_id ?? '' })
+              : t('editor.validatedGraphHint')}
           </small>
         </div>
         <div className="actions">
-          <button onClick={onClose}>Cancel</button>
+          <button onClick={onClose}>{t('editor.cancel')}</button>
           <button disabled={busy} onClick={() => void validate()}>
-            Validate Plan
+            {t('editor.validatePlan')}
           </button>
           <button disabled={busy || !validation?.valid} onClick={() => void submit()}>
-            {mode === 'create' ? 'Create stopped' : 'Submit upgrade'}
+            {mode === 'create' ? t('editor.createStopped') : t('editor.submitUpgrade')}
           </button>
         </div>
       </div>
       <div className="job-settings">
         <label>
-          Job ID
+          {t('editor.jobIdLabel')}
           <input
             disabled={mode === 'upgrade'}
             value={spec.id ?? ''}
@@ -492,7 +498,7 @@ export function JobEditor({
           />
         </label>
         <label>
-          Version
+          {t('editor.versionLabel')}
           <input
             type="number"
             min={1}
@@ -501,7 +507,7 @@ export function JobEditor({
           />
         </label>
         <label>
-          Parallelism
+          {t('editor.parallelismLabel')}
           <input
             type="number"
             min={1}
@@ -510,7 +516,7 @@ export function JobEditor({
           />
         </label>
         <label>
-          Max parallelism
+          {t('editor.maxParallelismLabel')}
           <input
             type="number"
             min={1}
@@ -519,21 +525,21 @@ export function JobEditor({
           />
         </label>
         <label>
-          State backend
+          {t('editor.stateBackendLabel')}
           <input
             value={spec.state?.backend ?? ''}
             onChange={(event) => setGlobal('state', { ...(spec.state ?? {}), backend: event.target.value })}
           />
         </label>
         <label>
-          State namespace
+          {t('editor.stateNamespaceLabel')}
           <input
             value={spec.state?.namespace ?? ''}
             onChange={(event) => setGlobal('state', { ...(spec.state ?? {}), namespace: event.target.value })}
           />
         </label>
         <label>
-          State TTL (ms)
+          {t('editor.stateTtlLabel')}
           <input
             type="number"
             value={spec.state?.ttl_ms ?? ''}
@@ -543,7 +549,7 @@ export function JobEditor({
           />
         </label>
         <label>
-          Checkpoint URI
+          {t('editor.checkpointUriLabel')}
           <input
             value={spec.checkpoint?.object_store_uri ?? ''}
             onChange={(event) =>
@@ -552,7 +558,7 @@ export function JobEditor({
           />
         </label>
         <label>
-          Checkpoint interval
+          {t('editor.checkpointIntervalLabel')}
           <input
             type="number"
             value={spec.checkpoint?.interval_ms ?? 30000}
@@ -562,19 +568,19 @@ export function JobEditor({
           />
         </label>
         <label>
-          Recovery
+          {t('editor.recoveryLabel')}
           <select
             value={spec.recovery ?? 'latest_checkpoint'}
             onChange={(event) => setGlobal('recovery', event.target.value)}
           >
-            <option value="latest_checkpoint">Latest checkpoint</option>
-            <option value="latest_savepoint">Latest savepoint</option>
-            <option value="fail">Fail</option>
+            <option value="latest_checkpoint">{t('editor.recoveryLatestCheckpoint')}</option>
+            <option value="latest_savepoint">{t('editor.recoveryLatestSavepoint')}</option>
+            <option value="fail">{t('editor.recoveryFail')}</option>
           </select>
         </label>
       </div>
       <div className="node-picker">
-        <span>Target nodes</span>
+        <span>{t('editor.targetNodes')}</span>
         {nodes.map((node) => (
           <label key={node.id}>
             <input
@@ -594,7 +600,7 @@ export function JobEditor({
       </div>
       <div className="dag-layout">
         <aside className="palette">
-          <h4>Add component</h4>
+          <h4>{t('editor.addComponent')}</h4>
           <ComponentBrowserControls
             kind={componentKind}
             query={componentQuery}
@@ -612,15 +618,15 @@ export function JobEditor({
               <small>{component.description ?? component.kind}</small>
             </button>
           ))}
-          {componentLoad === 'loading' && <p className="empty">Loading registered components…</p>}
+          {componentLoad === 'loading' && <p className="empty">{t('editor.loadingComponents')}</p>}
           {componentLoad === 'ready' && palette.length === 0 && (
-            <p className="empty">No matching components.</p>
+            <p className="empty">{t('editor.noMatchingComponents')}</p>
           )}
           {componentLoad === 'error' && (
             <div className="palette-error">
-              <p>Component catalogue could not be loaded.</p>
+              <p>{t('editor.componentCatalogueError')}</p>
               <button type="button" onClick={loadComponents}>
-                Retry
+                {t('editor.retry')}
               </button>
             </div>
           )}
@@ -665,12 +671,12 @@ export function JobEditor({
           </ReactFlow>
         </div>
         <aside className="node-properties">
-          <h4>{selected ? selected.data.label : 'Job settings'}</h4>
+          <h4>{selected ? selected.data.label : t('editor.jobSettings')}</h4>
           {selected ? (
             <>
-              <p>{selected.data.description ?? 'Configure this operator and its runtime behavior.'}</p>
+              <p>{selected.data.description ?? t('editor.configureOperatorHint')}</p>
               <label>
-                Component
+                {t('editor.componentLabel')}
                 <input
                   value={selected.data.component}
                   onChange={(event) => updateNode(selected.id, { component: event.target.value })}
@@ -679,21 +685,21 @@ export function JobEditor({
               {selected.data.kind === 'processor' && (
                 <>
                   <label>
-                    Operator kind
+                    {t('editor.operatorKindLabel')}
                     <select
                       value={selected.data.operatorKind ?? 'map'}
                       onChange={(event) => updateNode(selected.id, { operatorKind: event.target.value })}
                     >
-                      <option value="map">Map</option>
-                      <option value="filter">Filter</option>
-                      <option value="aggregate">Aggregate</option>
-                      <option value="window">Window</option>
-                      <option value="join">Join</option>
-                      <option value="udf">UDF</option>
+                      <option value="map">{t('editor.operatorMap')}</option>
+                      <option value="filter">{t('editor.operatorFilter')}</option>
+                      <option value="aggregate">{t('editor.operatorAggregate')}</option>
+                      <option value="window">{t('editor.operatorWindow')}</option>
+                      <option value="join">{t('editor.operatorJoin')}</option>
+                      <option value="udf">{t('editor.operatorUdf')}</option>
                     </select>
                   </label>
                   <label>
-                    Stateful
+                    {t('editor.statefulLabel')}
                     <input
                       type="checkbox"
                       checked={Boolean(selected.data.stateful)}
@@ -701,7 +707,7 @@ export function JobEditor({
                     />
                   </label>
                   <label>
-                    Key field
+                    {t('editor.keyFieldLabel')}
                     <input
                       value={selected.data.key_field ?? ''}
                       onChange={(event) => updateNode(selected.id, { key_field: event.target.value })}
@@ -712,7 +718,7 @@ export function JobEditor({
               {selected.data.kind === 'source' && (
                 <>
                   <label>
-                    Time mode
+                    {t('editor.timeModeLabel')}
                     <select
                       value={selectedTime?.mode ?? 'processing_time'}
                       onChange={(event) => {
@@ -724,14 +730,14 @@ export function JobEditor({
                         setGlobal('sources', sources)
                       }}
                     >
-                      <option value="processing_time">Processing time</option>
-                      <option value="event_time">Event time</option>
+                      <option value="processing_time">{t('editor.processingTime')}</option>
+                      <option value="event_time">{t('editor.eventTime')}</option>
                     </select>
                   </label>
                   {selectedTime?.mode === 'event_time' && (
                     <>
                       <label>
-                        Timestamp field
+                        {t('editor.timestampFieldLabel')}
                         <input
                           value={selectedTime.timestamp_field ?? ''}
                           onChange={(event) => {
@@ -755,7 +761,7 @@ export function JobEditor({
                         />
                       </label>
                       <label>
-                        Watermark strategy
+                        {t('editor.watermarkStrategyLabel')}
                         <select
                           value={selectedTime.watermark?.strategy ?? 'bounded_out_of_orderness'}
                           onChange={(event) => {
@@ -776,12 +782,12 @@ export function JobEditor({
                             setGlobal('sources', sources)
                           }}
                         >
-                          <option value="bounded_out_of_orderness">Bounded out-of-orderness</option>
-                          <option value="monotonous">Monotonous</option>
+                          <option value="bounded_out_of_orderness">{t('editor.watermarkBounded')}</option>
+                          <option value="monotonous">{t('editor.watermarkMonotonous')}</option>
                         </select>
                       </label>
                       <label>
-                        Out-of-orderness (ms)
+                        {t('editor.outOfOrdernessLabel')}
                         <input
                           type="number"
                           value={selectedTime.watermark?.out_of_orderness_ms ?? 0}
@@ -805,7 +811,7 @@ export function JobEditor({
                         />
                       </label>
                       <label>
-                        Allowed lateness (ms)
+                        {t('editor.allowedLatenessLabel')}
                         <input
                           type="number"
                           value={selectedTime.allowed_lateness_ms ?? 0}
@@ -826,7 +832,7 @@ export function JobEditor({
                         />
                       </label>
                       <label>
-                        Late events
+                        {t('editor.lateEventsLabel')}
                         <select
                           value={selectedTime.late_event_policy ?? 'drop'}
                           onChange={(event) => {
@@ -841,9 +847,9 @@ export function JobEditor({
                             setGlobal('sources', sources)
                           }}
                         >
-                          <option value="drop">Drop</option>
-                          <option value="route">Route</option>
-                          <option value="update">Update</option>
+                          <option value="drop">{t('editor.lateDrop')}</option>
+                          <option value="route">{t('editor.lateRoute')}</option>
+                          <option value="update">{t('editor.lateUpdate')}</option>
                         </select>
                       </label>
                     </>
@@ -875,70 +881,70 @@ export function JobEditor({
                   updateSpec(next, nextEdges)
                 }}
               >
-                Delete node
+                {t('editor.deleteNode')}
               </button>
               {nodeComponent?.example && (
                 <details>
-                  <summary>Example</summary>
+                  <summary>{t('editor.example')}</summary>
                   <pre className="schema">{JSON.stringify(nodeComponent.example, null, 2)}</pre>
                 </details>
               )}
             </>
           ) : (
-            <p className="empty">Select a node to edit its component, schema, time, and state settings.</p>
+            <p className="empty">{t('editor.selectNodeHint')}</p>
           )}
         </aside>
       </div>
       {upgraded && (
         <div className="success validation">
-          <strong>Upgrade accepted</strong>
-          <p>
-            The Hub recorded Job {upgraded} as stopped and pending recovery; it processes nothing until it is
-            started.
-          </p>
+          <strong>{t('editor.upgradeAccepted')}</strong>
+          <p>{t('editor.upgradeAcceptedDetail', { job: upgraded })}</p>
           <div className="actions">
             <button
               disabled={busy}
               onClick={() =>
-                void onAction('Starting…', async () => {
+                void onAction(t('editor.starting'), async () => {
                   await api.setJobState(upgraded, 'running')
                   onRefresh()
                   onSaved()
                 })
               }
             >
-              Start {upgraded}
+              {t('editor.startJob', { job: upgraded })}
             </button>
           </div>
         </div>
       )}
       {validation && (
         <div className={validation.valid ? 'success validation' : 'validation'}>
-          <strong>{validation.valid ? 'Plan is valid' : 'Plan needs attention'}</strong>
+          <strong>{validation.valid ? t('editor.planValid') : t('editor.planNeedsAttention')}</strong>
           {validation.plan !== undefined && (
             <details>
-              <summary>Physical plan</summary>
+              <summary>{t('editor.physicalPlan')}</summary>
               <pre className="schema">{String(JSON.stringify(validation.plan, null, 2))}</pre>
             </details>
           )}
           {validation.required_capabilities.map((capability) => (
-            <p key={capability}>Capability: {capability}</p>
+            <p key={capability}>{t('editor.capabilityLine', { capability })}</p>
           ))}
           {validation.warnings.map((warning) => (
-            <p key={warning}>Warning: {warning}</p>
+            <p key={warning}>{t('editor.warningLine', { warning })}</p>
           ))}
           {validation.nodes
             .filter((node) => !node.compatible)
             .map((node) => (
               <p key={node.node_id}>
-                {node.node_id}: missing {node.missing_capabilities.join(', ')}
+                {t('editor.missingCapabilities', {
+                  nodeId: node.node_id,
+                  capabilities: node.missing_capabilities.join(', '),
+                })}
               </p>
             ))}
         </div>
       )}
       {issues.length > 0 && (
         <div className="validation">
-          <strong>{issues.length} issue(s)</strong>
+          <strong>{t('editor.issueCount', { count: issues.length })}</strong>
           {issues.map((issue) => (
             <p key={issue}>{issue}</p>
           ))}
