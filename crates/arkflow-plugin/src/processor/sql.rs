@@ -202,8 +202,12 @@ impl SqlProcessor {
 
     /// Execute SQL query
     async fn execute_query(&self, batch: MessageBatch) -> Result<RecordBatch, Error> {
-        // Acquire a session context from the pool
-        let ctx_arc = self.context_pool.acquire().await?;
+        // Acquire a session context from the pool. The guard releases the
+        // slot on every path — error returns below and future cancellation
+        // included — so repeated failures cannot exhaust the pool and park
+        // the chain silently.
+        let ctx_guard = self.context_pool.acquire_guarded().await?;
+        let ctx_arc = ctx_guard.context().clone();
 
         let table_name = self
             .config
@@ -240,8 +244,8 @@ impl SqlProcessor {
                 .await?
         };
 
-        // Release the context back to the pool
-        self.context_pool.release_context(ctx_arc).await;
+        // The context slot is released when ctx_guard drops at the end of
+        // this function, on the success and every error path alike.
 
         if result_batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -544,6 +548,71 @@ mod tests {
             }
             _ => panic!("Expected single result"),
         }
+    }
+
+    /// Spec "Processor error paths release pooled resources": repeated
+    /// schema-drift planning errors must not leak pool slots. The pool has
+    /// four contexts; six failing batches followed by a valid batch must
+    /// surface six errors and then succeed — pre-fix, the fifth acquire
+    /// busy-waited forever with no error.
+    #[tokio::test]
+    async fn repeated_processing_errors_do_not_exhaust_the_context_pool() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT v, v * 2 AS doubled FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        fn matching_batch() -> MessageBatchRef {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+            Arc::new(MessageBatch::new_arrow(batch))
+        }
+        fn drifting_batch() -> MessageBatchRef {
+            let schema = Arc::new(Schema::new(vec![Field::new("w", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+            Arc::new(MessageBatch::new_arrow(batch))
+        }
+
+        // Baseline: the schema-matching batch processes.
+        processor
+            .process(matching_batch())
+            .await
+            .expect("baseline batch processes");
+
+        // Six failing batches (pool size is 4): each surfaces its planning
+        // error promptly instead of parking on a leaked pool.
+        for i in 0..6 {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                processor.process(drifting_batch()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("iteration {i}: acquire must fail bounded, not park"));
+            assert!(
+                outcome.is_err(),
+                "iteration {i} must surface the planning error"
+            );
+        }
+
+        // The pool survived the failures: a valid batch processes again.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            processor.process(matching_batch()),
+        )
+        .await
+        .expect("valid batch must not park after repeated errors")
+        .expect("valid batch processes");
+        assert!(matches!(result, ProcessResult::Single(_)));
     }
 
     #[tokio::test]

@@ -20,7 +20,14 @@
 use arkflow_core::Error;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+
+/// How long a pooled-context acquisition may wait before failing. The pool
+/// is sized for the processor's worker parallelism, so an exhausted pool
+/// means entries leaked on error paths (a bug this module's guard prevents)
+/// or an undersized pool; either way an unbounded busy-wait would park the
+/// chain silently, which the kernel's no-silent-park contract forbids.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// SessionContext object pool
 ///
@@ -29,7 +36,7 @@ use tokio::sync::Mutex;
 /// the overhead of context creation.
 pub struct SessionContextPool {
     contexts: Vec<Arc<SessionContext>>,
-    available: Arc<Mutex<Vec<usize>>>,
+    available: std::sync::Mutex<Vec<usize>>,
 }
 
 impl SessionContextPool {
@@ -67,15 +74,52 @@ impl SessionContextPool {
 
         Ok(Self {
             contexts,
-            available: Arc::new(Mutex::new(available)),
+            available: std::sync::Mutex::new(available),
         })
     }
 
-    /// Acquire a SessionContext from the pool
+    fn pop_available(&self) -> Option<usize> {
+        self.available.lock().expect("context pool lock").pop()
+    }
+
+    fn push_available(&self, index: usize) {
+        self.available
+            .lock()
+            .expect("context pool lock")
+            .push(index);
+    }
+
+    /// Wait for a free slot until the acquisition deadline. An exhausted
+    /// pool is a leak or a sizing bug — surface it as an explicit failure
+    /// instead of busy-waiting forever.
+    async fn wait_for_slot(&self) -> Result<usize, Error> {
+        let deadline = tokio::time::Instant::now() + ACQUIRE_TIMEOUT;
+        loop {
+            if let Some(index) = self.pop_available() {
+                return Ok(index);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    pool_size = self.contexts.len(),
+                    waited = ?ACQUIRE_TIMEOUT,
+                    "session context pool exhausted: contexts are being leaked on error paths or the pool is undersized"
+                );
+                return Err(Error::Process(format!(
+                    "timed out after {ACQUIRE_TIMEOUT:?} waiting for a pooled SQL session \
+                     context (pool size {}): repeated processing errors must not exhaust the pool",
+                    self.contexts.len()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Acquire a SessionContext from the pool, bounded by the acquisition
+    /// deadline.
     ///
-    /// This method will wait until a context is available.
-    /// Returns an Arc<SessionContext> that should be released back to the pool
-    /// when done by calling `release_context()`.
+    /// Returns an Arc<SessionContext> that must be released back to the pool
+    /// with `release_context()`. Prefer `acquire_guarded()`, whose guard
+    /// releases on drop and cannot leak on error or cancellation paths.
     ///
     /// # Examples
     ///
@@ -84,35 +128,39 @@ impl SessionContextPool {
     /// # async fn example(pool: SessionContextPool) -> Result<(), Box<dyn std::error::Error>> {
     /// let ctx = pool.acquire().await?;
     /// // Use the context...
-    /// pool.release_context(ctx).await;
+    /// pool.release_context(ctx);
     /// # Ok(())
     /// # }
     /// ```
     pub async fn acquire(&self) -> Result<Arc<SessionContext>, Error> {
-        loop {
-            // Try to get an available context
-            let mut available = self.available.lock().await;
-            if let Some(index) = available.pop() {
-                return Ok(self.contexts[index].clone());
-            }
-
-            // No contexts available, wait a bit and retry
-            drop(available);
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-        }
+        let index = self.wait_for_slot().await?;
+        Ok(self.contexts[index].clone())
     }
 
-    /// Release a context back to the pool
+    /// Acquire a SessionContext behind a cancellation-safe guard. The slot
+    /// is returned when the guard drops — on the success path, on every
+    /// error path (`?` early returns), and when the surrounding future is
+    /// cancelled mid-flight — so a processing error can never leak pool
+    /// entries and silently wedge the chain.
+    pub async fn acquire_guarded(self: &Arc<Self>) -> Result<PooledContext, Error> {
+        let index = self.wait_for_slot().await?;
+        Ok(PooledContext {
+            pool: self.clone(),
+            context: self.contexts[index].clone(),
+            index,
+        })
+    }
+
+    /// Release a context obtained from [`SessionContextPool::acquire`].
     ///
     /// # Arguments
     ///
     /// * `context` - The context to release (must be from this pool)
-    pub async fn release_context(&self, context: Arc<SessionContext>) {
+    pub fn release_context(&self, context: Arc<SessionContext>) {
         // Find the index of this context
         for (i, ctx) in self.contexts.iter().enumerate() {
             if Arc::ptr_eq(ctx, &context) {
-                let mut available = self.available.lock().await;
-                available.push(i);
+                self.push_available(i);
                 return;
             }
         }
@@ -124,9 +172,38 @@ impl SessionContextPool {
     }
 
     /// Get the number of available contexts (not currently in use)
-    pub async fn available_count(&self) -> usize {
-        let available = self.available.lock().await;
-        available.len()
+    pub fn available_count(&self) -> usize {
+        self.available.lock().expect("context pool lock").len()
+    }
+}
+
+/// A cancellation-safe lease on a pooled session context (see
+/// [`SessionContextPool::acquire_guarded`]).
+pub struct PooledContext {
+    pool: Arc<SessionContextPool>,
+    context: Arc<SessionContext>,
+    index: usize,
+}
+
+impl std::ops::Deref for PooledContext {
+    type Target = SessionContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl PooledContext {
+    /// The leased context as a plain `Arc`, for signatures that take
+    /// `&Arc<SessionContext>`.
+    pub fn context(&self) -> &Arc<SessionContext> {
+        &self.context
+    }
+}
+
+impl Drop for PooledContext {
+    fn drop(&mut self) {
+        self.pool.push_available(self.index);
     }
 }
 
@@ -160,22 +237,22 @@ mod tests {
 
         // Acquire a context
         let ctx1 = pool.acquire().await.unwrap();
-        let count = pool.available_count().await;
+        let count = pool.available_count();
         assert_eq!(count, 1);
 
         // Acquire another context
         let ctx2 = pool.acquire().await.unwrap();
-        let count = pool.available_count().await;
+        let count = pool.available_count();
         assert_eq!(count, 0);
 
         // Release one context
-        pool.release_context(ctx1).await;
-        let count = pool.available_count().await;
+        pool.release_context(ctx1);
+        let count = pool.available_count();
         assert_eq!(count, 1);
 
         // Release the other
-        pool.release_context(ctx2).await;
-        let count = pool.available_count().await;
+        pool.release_context(ctx2);
+        let count = pool.available_count();
         assert_eq!(count, 2);
     }
 
@@ -192,7 +269,7 @@ mod tests {
                 let ctx = pool_clone.acquire().await.unwrap();
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                pool_clone.release_context(ctx).await;
+                pool_clone.release_context(ctx);
             });
             handles.push(handle);
         }
@@ -203,7 +280,7 @@ mod tests {
         }
 
         // All contexts should be returned to the pool
-        let count = pool.available_count().await;
+        let count = pool.available_count();
         assert_eq!(count, 4);
     }
 }

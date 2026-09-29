@@ -506,3 +506,31 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 **四轮 CR 修复**：会话回执槽位清空竞态（same_channel 守卫）与转发器关停监视（fix-session-receipt-lifecycle）；迁移自引用 FK 父母先行行序（fix-migrate-self-reference-ordering）；L3 与分区指派组合的构建期显式拒绝（fix-l3-assign-mode-validation）。
 
 **剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。
+
+---
+
+## 九、v1.0 就绪度代码审查与修复 roadmap（2026-09-29）
+
+> 源起：以「能否发布 v1.0」为题的两轮深潜——第一轮发布就绪度（四道 CI 门禁实测全绿 + 发布工程盘点），第二轮纯代码层（执行内核/并发纪律/持久化正确性/控制面/插件层/core API 面/console 七路深潜，全部论断带 file:line）。**详细修复清单见 `openspec/CODE_REVIEW_2026-09-29.md`（12 个 P1 + 分层 P2/P3 + 五个修复批次），本节只存总纲；各项立项落地后从该清单划掉。**
+
+### 9.1 总体结论
+
+- **技术内核已达 v1.0 水准，发布工程与插件层未就绪**。质量排序：内核执行器 > 持久化本地后端 ≈ 并发纪律 > 控制面领域逻辑 > console > core API 外壳 > **插件层（质量断层）**。
+- 关键洞察：openspec 规格与测试覆盖重心全在内核/控制面（近三个月演进重心），而插件层（用户真正接 Kafka/MQTT/Pulsar 之处）契约纪律失控——14 个 input 中 6 个违反 `Input::read` 取消安全契约，静默丢消息属常规路径。
+- **8.5 节「剩余边界」部分过时**：outer join（#1266）与 Hub 阶段 2 选主（#1264）已闭环；但 #1264 的 fencing 承诺未兑现（epoch 不上写路径，P1-2）。
+
+### 9.2 12 个 P1（均已核实，P1-1 为运行时实证）
+
+S3 WAL 异步路径必崩（tokio 嵌套 runtime panic，实测复现）｜租约 fencing epoch 纸面围栏｜remote 去重竞态（无条件 insert 非 max）｜Kafka L3 行级 topic 归因错误（多源图丢数据）｜6 input 取消安全违例｜SQL processor 池泄漏→4 错静默挂死｜Pulsar output 功能损坏（build 无 topic + fire-and-forget）｜multiple_inputs 重连任务翻倍+热循环+无界通道｜batch/memory buffer 失败与关闭路径丢数据｜HTTP input bind 失败被吞｜Pulsar input ack 活锁｜Console operator token 内联进公开 bundle。
+
+### 9.3 修复批次（合计约 3-5 周，详见 CODE_REVIEW 文档）
+
+1. **批次 A 数据正确性**：S3-WAL、remote 去重、L3 归因、input 取消安全、SQL 池、buffer 丢数据。
+2. **批次 B 组件可用性**：租约 epoch、Pulsar output/input、multiple_inputs、HTTP bind、console token 链。
+3. **批次 C API 面收缩**（v1.0 semver 前一次性）：~685 pub item 修剪、`Option<&String>`、删 Pipeline/dead variants、HealthCheckConfig 改名。
+4. **批次 D P2 高优**：内核无界缓冲/超时、RuntimeManager 两并发缺陷、认证中间件化+401 矩阵测试、Error Boundary、文档脱节批。
+5. **批次 E 发布工程**：发 0.6 释放积压、release 自动化、CHANGELOG/SECURITY.md/版本策略、CI clippy/fmt、插件层契约合规测试框架（把取消安全变成 CI 门禁）。
+
+### 9.4 发布路径判断
+
+批次 A+B 完成前不建议宣传 at-least-once 以外的可靠性语义；批次 A-E 全部完成即可打 v1.0（当前瓶颈是插件层与内核的质量断层，不是版本号或流程）。
