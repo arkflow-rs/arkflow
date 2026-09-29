@@ -409,7 +409,9 @@ declares exactly two inbound edges and names its sides by producer
 (`left_from`/`right_from` upstream operator ids — channel order is a
 kernel-internal detail). The config carries `left_key`/`right_key`,
 `window_ms`, and optional `left_timestamp`/`right_timestamp` (default
-`__meta_timestamp`), `ttl_ms`, and `max_per_key`:
+`__meta_timestamp`), `ttl_ms`, `max_per_key`, and `join_type` (default
+`inner`; `left_outer` / `right_outer` / `full_outer` keep the outer side's
+never-matched rows):
 
 ```yaml validate=fragment wrap=engine
 jobs:
@@ -425,6 +427,7 @@ jobs:
       - id: join-orders
         kind: join
         config:
+          join_type: left_outer
           left_from: orders
           right_from: profiles
           left_key: customer_id
@@ -477,20 +480,41 @@ jobs:
 Semantics and boundaries:
 
 - A left row and a right row match when their keys are equal and their event
-  timestamps differ by at most `window_ms`. Matches emit immediately (inner
-  join, at-least-once — downstream must tolerate replays after recovery).
+  timestamps differ by at most `window_ms`. Matches emit immediately
+  regardless of `join_type` (at-least-once — downstream must tolerate
+  replays after recovery).
 - Output columns are the original left columns prefixed `l_`, the right
-  columns prefixed `r_`, plus `join_key`.
+  columns prefixed `r_`, plus `join_key`. With an outer `join_type`, the
+  side that can be all-null in unmatched emissions is nullable in the output
+  schema (`r_*` for `left_outer`, `l_*` for `right_outer`, both for
+  `full_outer`); `inner` output schemas are unchanged.
+- With `left_outer`/`right_outer`/`full_outer`, a never-matched row on an
+  outer side is emitted once the chain watermark passes
+  `timestamp + window_ms + ttl_ms`, with the opposite side's columns all
+  null. Rows that matched at least once never re-emit as unmatched. The
+  emission needs the opposite side's schema: while that side has not
+  produced a batch, evicted rows park in a bounded queue (`max_per_key` per
+  side, oldest dropped) and flush once the schema arrives. Processing-time
+  sources without watermarks never emit unmatched rows — prefer event-time
+  sources for outer joins.
 - State is bounded: rows are evicted once the watermark passes
   `timestamp + window_ms + ttl_ms`, and each key holds at most `max_per_key`
-  rows per side (oldest first). Processing-time sources without watermarks
-  rely on the capacity bound — prefer event-time sources for joins.
-- Recovery rebuilds the buffers from checkpoint replay; there is no separate
-  join snapshot.
-- Each side's schema must stay stable for the stream's lifetime.
-- Not supported: temporal (lookup) joins, non-equi joins, outer joins, and
-  cross-node shuffle joins (the join operator and both its upstream edges
-  stay co-located on one node).
+  rows per side (oldest first). Under an outer `join_type`, capacity
+  eviction also emits the evicted row as unmatched — without a watermark
+  guarantee, so a later match can double-emit (at-least-once artifact).
+  Processing-time sources without watermarks rely on the capacity bound —
+  prefer event-time sources for joins.
+- Recovery rebuilds the buffers (and per-row matched flags) from checkpoint
+  replay; there is no separate join snapshot. The chain watermark is the
+  minimum across both sides, so replay cannot produce a false unmatched row
+  beyond the documented late-data contract.
+- Each side's schema must stay stable for the stream's lifetime, and each
+  side's upstream operator must feed the join from a single subtask — a
+  multi-subtask side fails at graph build time with guidance to set the
+  upstream parallelism to 1.
+- Not supported: temporal (lookup) joins, non-equi joins, and cross-node
+  shuffle joins (the join operator and both its upstream edges stay
+  co-located on one node).
 
 Legacy Stream `join` buffers (including window buffers with a legacy `join`
 field) still fail compilation, with guidance pointing at the Job DAG join

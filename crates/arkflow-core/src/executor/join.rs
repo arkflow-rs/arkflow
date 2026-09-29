@@ -6,18 +6,25 @@
 //! the processor can tell the sides apart. Rows are matched by an equality
 //! key: a left row and a right row with the same key join when their event
 //! timestamps differ by at most `window_ms`. Matched pairs are emitted as
-//! they arrive (inner join, at-least-once). Per-side keyed buffers are
-//! bounded: rows are evicted once the watermark advances past
+//! they arrive (at-least-once). With `join_type` set to an outer form the
+//! side(s) marked outer additionally emit never-matched rows at eviction
+//! time, with the opposite side's columns all null. Per-side keyed buffers
+//! are bounded: rows are evicted once the watermark advances past
 //! `timestamp + window_ms + ttl_ms`, or when a side exceeds `max_per_key`
 //! rows for one key (oldest first).
 //!
 //! State reconstructs from checkpoint replay: on recovery the sources rewind
 //! to the acknowledged cut and the buffers rebuild deterministically, so the
-//! operator carries no separate snapshot.
-use std::collections::{HashMap, VecDeque};
+//! operator carries no separate snapshot. Unmatched emission additionally
+//! needs the opposite side's schema for its null columns: while that side has
+//! not produced a batch, evicted rows park in a bounded pending queue and
+//! flush at the next emission point once the schema is known.
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, UInt32Array};
+use datafusion::arrow::array::{
+    new_null_array, ArrayRef, Int64Array, StringArray, UInt32Array,
+};
 use datafusion::arrow::array::Array as _;
 use datafusion::arrow::compute::interleave;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -30,6 +37,41 @@ use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult};
 
 /// The input-side tag column written by the chain loop for join chains.
 pub const META_INPUT_INDEX: &str = "__meta_input_index";
+
+/// Join flavour: matched pairs always emit; outer forms additionally emit
+/// the outer side's never-matched rows once the match window closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinType {
+    #[default]
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+}
+
+impl JoinType {
+    /// Whether never-matched rows of `side` are kept (emitted at eviction).
+    fn keeps_unmatched(self, side: Side) -> bool {
+        match self {
+            JoinType::Inner => false,
+            JoinType::LeftOuter => side == Side::Left,
+            JoinType::RightOuter => side == Side::Right,
+            JoinType::FullOuter => true,
+        }
+    }
+
+    /// Whether `side`'s output columns must be nullable: the opposite side's
+    /// unmatched rows carry all-null columns for this side.
+    fn nullable_side(self, side: Side) -> bool {
+        match self {
+            JoinType::Inner => false,
+            JoinType::LeftOuter => side == Side::Right,
+            JoinType::RightOuter => side == Side::Left,
+            JoinType::FullOuter => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinOperatorConfig {
@@ -55,6 +97,12 @@ pub struct JoinOperatorConfig {
     /// Event-time column on the right side. Falls back to `__meta_timestamp`.
     #[serde(default)]
     pub right_timestamp: Option<String>,
+    /// Join type. Matched pairs always emit; outer forms additionally emit
+    /// the outer side's never-matched rows when the match window closes
+    /// (watermark or capacity eviction), with the opposite side's columns
+    /// all null. Defaults to `inner`.
+    #[serde(default)]
+    pub join_type: JoinType,
     /// Match bound: rows join when `|left_ts - right_ts| <= window_ms`.
     pub window_ms: i64,
     /// Retention grace beyond the watermark boundary before eviction.
@@ -105,11 +153,16 @@ struct BufferedRow {
     timestamp_ms: i64,
     batch: MessageBatchRef,
     row: usize,
+    /// Set once this row has produced at least one matched pair, so outer
+    /// emission never re-emits a matched row as unmatched.
+    matched: bool,
 }
 
 #[derive(Default)]
 struct SideBuffer {
-    by_key: HashMap<String, VecDeque<BufferedRow>>,
+    // BTreeMap keeps eviction (and therefore unmatched emission) in key
+    // order, so replay rebuilds byte-identical output.
+    by_key: BTreeMap<String, VecDeque<BufferedRow>>,
     /// Schema of the batches seen so far on this side; per-side stability is
     /// required so gathered output columns stay well-typed.
     schema: Option<SchemaRef>,
@@ -117,46 +170,69 @@ struct SideBuffer {
 }
 
 impl SideBuffer {
+    /// Buffer one row; returns the row capacity-evicted by this push (at
+    /// most one, since `max_per_key >= 1`), so outer forms can emit it as
+    /// unmatched.
     fn push(
         &mut self,
         key: String,
         timestamp_ms: i64,
         batch: MessageBatchRef,
         row: usize,
+        matched: bool,
         max_per_key: usize,
-    ) {
+    ) -> Option<BufferedRow> {
         let queue = self.by_key.entry(key).or_default();
         queue.push_back(BufferedRow {
             timestamp_ms,
             batch,
             row,
+            matched,
         });
         self.total += 1;
-        while queue.len() > max_per_key {
-            queue.pop_front();
+        if queue.len() > max_per_key {
             self.total -= 1;
+            return queue.pop_front();
         }
+        None
     }
 
     /// Remove rows whose match window has closed: once the watermark passes
     /// `timestamp + window_ms (+ ttl)`, no future row on the other side can
-    /// still match.
-    fn evict(&mut self, watermark_ms: i64, window_ms: i64, ttl_ms: i64) {
+    /// still match. Returns the evicted rows with their keys so outer forms
+    /// can emit the never-matched ones.
+    fn evict(&mut self, watermark_ms: i64, window_ms: i64, ttl_ms: i64) -> Vec<MatchedRow> {
         let bound = watermark_ms.saturating_sub(window_ms).saturating_sub(ttl_ms);
-        for queue in self.by_key.values_mut() {
+        let mut evicted = Vec::new();
+        for (key, queue) in self.by_key.iter_mut() {
             while queue.front().is_some_and(|row| row.timestamp_ms < bound) {
-                queue.pop_front();
-                self.total -= 1;
+                if let Some(row) = queue.pop_front() {
+                    self.total -= 1;
+                    evicted.push(MatchedRow {
+                        row,
+                        key: key.clone(),
+                    });
+                }
             }
         }
         self.by_key.retain(|_, queue| !queue.is_empty());
+        evicted
     }
 }
 
-/// An owned (this-side, key) pair accumulated during one process call.
+/// An owned (row, key) pair: matched rows accumulated during one process
+/// call, or an evicted row awaiting unmatched emission.
 struct MatchedRow {
     row: BufferedRow,
     key: String,
+}
+
+/// Never-matched rows parked until the opposite side's schema is known;
+/// bounded per side by `max_per_key`.
+#[derive(Default)]
+struct PendingUnmatched {
+    left: VecDeque<MatchedRow>,
+    right: VecDeque<MatchedRow>,
 }
 
 pub struct JoinOperator {
@@ -167,6 +243,7 @@ pub struct JoinOperator {
     right_index: u32,
     left: Mutex<SideBuffer>,
     right: Mutex<SideBuffer>,
+    pending_unmatched: Mutex<PendingUnmatched>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -182,6 +259,21 @@ impl Side {
             Side::Right => "right",
         }
     }
+
+    /// Output column prefix for this side's block.
+    fn prefix(self) -> &'static str {
+        match self {
+            Side::Left => "l_",
+            Side::Right => "r_",
+        }
+    }
+
+    fn opposite(self) -> Side {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
 }
 
 impl JoinOperator {
@@ -193,32 +285,66 @@ impl JoinOperator {
             right_index: 1,
             left: Mutex::new(SideBuffer::default()),
             right: Mutex::new(SideBuffer::default()),
+            pending_unmatched: Mutex::new(PendingUnmatched::default()),
         })
     }
 
     /// Resolve the left/right channel indices from the chain's inbound
     /// producer order. `left_from`/`right_from` name the upstream operator
     /// ids; with a single-producer default the indices fall back to 0/1.
+    /// Each side must resolve to exactly one channel: an upstream operator
+    /// feeding the join from more than one subtask is rejected here, at
+    /// graph-build time, instead of failing on the first untagged batch at
+    /// runtime.
     pub fn with_input_producers(
         mut self,
         producers: &[String],
     ) -> Result<Self, Error> {
-        let resolve = |declared: &Option<String>, fallback: usize| -> Result<u32, Error> {
-            match declared {
-                Some(operator_id) => producers
+        let resolve = |declared: &Option<String>,
+                       fallback: usize,
+                       side: &str|
+         -> Result<u32, Error> {
+            let occurrences_for = |producer: &str| {
+                producers
                     .iter()
-                    .position(|producer| producer == operator_id)
-                    .map(|index| index as u32)
-                    .ok_or_else(|| {
-                        Error::Config(format!(
-                            "join operator 'left_from/right_from' names upstream '{operator_id}' which does not feed this join"
-                        ))
-                    }),
-                None => Ok(fallback as u32),
+                    .filter(|candidate| candidate.as_str() == producer)
+                    .count()
+            };
+            let single_subtask_error = |producer: &str, occurrences: usize| {
+                Error::Config(format!(
+                    "join {side} side upstream '{producer}' feeds this join from \
+                     {occurrences} subtasks; keyed join resolves one channel per side — \
+                     set the upstream operator's parallelism to 1"
+                ))
+            };
+            let producer = match declared {
+                Some(operator_id) => operator_id.as_str(),
+                None => {
+                    // Undeclared sides keep the positional fallback; the
+                    // duplicate-producer guard still applies when a producer
+                    // occupies the fallback position.
+                    if let Some(producer) = producers.get(fallback) {
+                        let occurrences = occurrences_for(producer.as_str());
+                        if occurrences > 1 {
+                            return Err(single_subtask_error(producer, occurrences));
+                        }
+                    }
+                    return Ok(fallback as u32);
+                }
+            };
+            match occurrences_for(producer) {
+                0 => Err(Error::Config(format!(
+                    "join operator 'left_from/right_from' names upstream '{producer}' which does not feed this join"
+                ))),
+                1 => Ok(producers
+                    .iter()
+                    .position(|candidate| candidate.as_str() == producer)
+                    .expect("occurrence counted above") as u32),
+                occurrences => Err(single_subtask_error(producer, occurrences)),
             }
         };
-        self.left_index = resolve(&self.config.left_from, 0)?;
-        self.right_index = resolve(&self.config.right_from, 1)?;
+        self.left_index = resolve(&self.config.left_from, 0, "left")?;
+        self.right_index = resolve(&self.config.right_from, 1, "right")?;
         Ok(self)
     }
 
@@ -364,6 +490,129 @@ impl JoinOperator {
             .map_err(|error| Error::Process(format!("join output assembly failed: {error}")))
     }
 
+    /// Assemble one unmatched emission: the buffered side's gathered columns
+    /// plus all-null columns for the opposite side, in the same field order
+    /// and with the same nullability as matched output under `join_type`.
+    fn assemble_unmatched(
+        rows: &[MatchedRow],
+        side: Side,
+        this_schema: &Schema,
+        opposite_schema: &Schema,
+        join_type: JoinType,
+    ) -> Result<MessageBatch, Error> {
+        let this_batch = Self::gather(rows, this_schema)?;
+        let join_key = this_batch
+            .column(this_batch.num_columns() - 1)
+            .clone();
+        let this_block = block_from_batch(
+            &this_batch,
+            side.prefix(),
+            join_type.nullable_side(side),
+        );
+        let opposite_block = null_block(
+            opposite_schema,
+            side.opposite().prefix(),
+            this_batch.num_rows(),
+        );
+        let (left_block, right_block) = match side {
+            Side::Left => (this_block, opposite_block),
+            Side::Right => (opposite_block, this_block),
+        };
+        combine_blocks(left_block, right_block, join_key)
+    }
+
+    /// Park unmatched rows until the opposite side's schema is known. The
+    /// queue is bounded per side by `max_per_key`; overflow drops the oldest
+    /// rows with a warning.
+    fn stash_pending(
+        pending: &Mutex<PendingUnmatched>,
+        side: Side,
+        mut rows: Vec<MatchedRow>,
+        max_per_key: usize,
+    ) {
+        let Ok(mut pending) = pending.lock() else {
+            return;
+        };
+        let queue = match side {
+            Side::Left => &mut pending.left,
+            Side::Right => &mut pending.right,
+        };
+        for row in rows.drain(..) {
+            queue.push_back(row);
+            while queue.len() > max_per_key {
+                if queue.pop_front().is_some() {
+                    tracing::warn!(
+                        side = side.label(),
+                        "join pending unmatched queue over capacity; dropping the oldest unmatched row"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emit every parked row whose opposite side schema has arrived; rows
+    /// still waiting remain parked. Returns the emitted batches.
+    fn flush_pending(
+        pending: &Mutex<PendingUnmatched>,
+        left: &SideBuffer,
+        right: &SideBuffer,
+        join_type: JoinType,
+    ) -> Vec<MessageBatchRef> {
+        let mut outputs = Vec::new();
+        let Ok(mut pending) = pending.lock() else {
+            return outputs;
+        };
+        for side in [Side::Left, Side::Right] {
+            let mut drained: Vec<MatchedRow> = {
+                let queue = match side {
+                    Side::Left => &mut pending.left,
+                    Side::Right => &mut pending.right,
+                };
+                std::mem::take(queue).into()
+            };
+            if drained.is_empty() {
+                continue;
+            }
+            let (this_buffer, opposite_buffer) = match side {
+                Side::Left => (left, right),
+                Side::Right => (right, left),
+            };
+            let emitted = match (&this_buffer.schema, &opposite_buffer.schema) {
+                (Some(this_schema), Some(opposite_schema)) => {
+                    match Self::assemble_unmatched(
+                        &drained,
+                        side,
+                        this_schema,
+                        opposite_schema,
+                        join_type,
+                    ) {
+                        Ok(batch) => Some(Arc::new(batch)),
+                        Err(error) => {
+                            tracing::warn!(
+                                side = side.label(),
+                                %error,
+                                "join pending unmatched emission failed; rows remain parked"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            match emitted {
+                Some(batch) => outputs.push(batch),
+                None => {
+                    let queue = match side {
+                        Side::Left => &mut pending.left,
+                        Side::Right => &mut pending.right,
+                    };
+                    queue.extend(drained.drain(..));
+                }
+            }
+        }
+        outputs
+    }
+
     fn process_side(&self, batch: &MessageBatchRef, side: Side) -> Result<ProcessResult, Error> {
         let timestamp_column = match side {
             Side::Left => self
@@ -390,12 +639,26 @@ impl JoinOperator {
             Side::Right => self.right.lock(),
         }
         .map_err(|_| Error::Process(format!("join {this_label} lock poisoned")))?;
-        let other_side = match side {
+        let mut other_side = match side {
             Side::Left => self.right.lock(),
             Side::Right => self.left.lock(),
         }
         .map_err(|_| Error::Process(format!("join {other_label} lock poisoned")))?;
         Self::remember_schema(&mut this_side, batch, this_label)?;
+        // This batch may establish the schema that parked rows of the
+        // opposite side are waiting for; flush them before new output.
+        let mut outputs = {
+            let (left_buffer, right_buffer) = match side {
+                Side::Left => (&*this_side, &*other_side),
+                Side::Right => (&*other_side, &*this_side),
+            };
+            Self::flush_pending(
+                &self.pending_unmatched,
+                left_buffer,
+                right_buffer,
+                self.config.join_type,
+            )
+        };
 
         // Extract keys and timestamps before buffering so extraction errors
         // do not leave partial state behind.
@@ -409,15 +672,20 @@ impl JoinOperator {
 
         let mut matched_this: Vec<MatchedRow> = Vec::new();
         let mut matched_other: Vec<MatchedRow> = Vec::new();
+        let mut capacity_unmatched: Vec<MatchedRow> = Vec::new();
         for (key, timestamp, row) in extracted {
-            if let Some(candidates) = other_side.by_key.get(&key) {
-                for candidate in candidates {
+            let mut matched_here = false;
+            if let Some(candidates) = other_side.by_key.get_mut(&key) {
+                for candidate in candidates.iter_mut() {
                     if (candidate.timestamp_ms - timestamp).abs() <= self.config.window_ms {
+                        candidate.matched = true;
+                        matched_here = true;
                         matched_this.push(MatchedRow {
                             row: BufferedRow {
                                 timestamp_ms: timestamp,
                                 batch: batch.clone(),
                                 row,
+                                matched: true,
                             },
                             key: key.clone(),
                         });
@@ -428,55 +696,146 @@ impl JoinOperator {
                     }
                 }
             }
-            this_side.push(key, timestamp, batch.clone(), row, self.config.max_per_key);
+            if let Some(evicted) = this_side.push(
+                key.clone(),
+                timestamp,
+                batch.clone(),
+                row,
+                matched_here,
+                self.config.max_per_key,
+            ) {
+                // Capacity eviction carries no watermark guarantee; outer
+                // forms emit the row as unmatched anyway (at-least-once
+                // artifact, see spec).
+                if !evicted.matched && self.config.join_type.keeps_unmatched(side) {
+                    capacity_unmatched.push(MatchedRow { row: evicted, key });
+                }
+            }
         }
-        if matched_this.is_empty() {
-            return Ok(ProcessResult::None);
+        if !matched_this.is_empty() {
+            let this_schema = this_side
+                .schema
+                .clone()
+                .expect("schema remembered before matching");
+            let other_schema = other_side
+                .schema
+                .clone()
+                .unwrap_or_else(|| this_schema.clone());
+            let this_batch = Self::gather(&matched_this, &this_schema)?;
+            let other_batch = Self::gather(&matched_other, &other_schema)?;
+            let output = match side {
+                Side::Left => combine_sides(&this_batch, &other_batch, self.config.join_type)?,
+                Side::Right => combine_sides(&other_batch, &this_batch, self.config.join_type)?,
+            };
+            outputs.push(Arc::new(output));
         }
-        let this_schema = this_side
-            .schema
-            .clone()
-            .expect("schema remembered before matching");
-        let other_schema = other_side
-            .schema
-            .clone()
-            .unwrap_or_else(|| this_schema.clone());
-        let this_batch = Self::gather(&matched_this, &this_schema)?;
-        let other_batch = Self::gather(&matched_other, &other_schema)?;
-        let output = match side {
-            Side::Left => combine_sides(&this_batch, &other_batch)?,
-            Side::Right => combine_sides(&other_batch, &this_batch)?,
-        };
-        Ok(ProcessResult::Single(Arc::new(output)))
+        if !capacity_unmatched.is_empty() {
+            let this_schema = this_side
+                .schema
+                .clone()
+                .expect("schema remembered before buffering");
+            match &other_side.schema {
+                Some(other_schema) => {
+                    let batch = Self::assemble_unmatched(
+                        &capacity_unmatched,
+                        side,
+                        &this_schema,
+                        other_schema,
+                        self.config.join_type,
+                    )?;
+                    outputs.push(Arc::new(batch));
+                }
+                None => Self::stash_pending(
+                    &self.pending_unmatched,
+                    side,
+                    capacity_unmatched,
+                    self.config.max_per_key,
+                ),
+            }
+        }
+        match outputs.len() {
+            0 => Ok(ProcessResult::None),
+            1 => Ok(ProcessResult::Single(
+                outputs.pop().expect("length checked above"),
+            )),
+            _ => Ok(ProcessResult::Multiple(outputs)),
+        }
     }
 }
 
-/// Prefix left columns `l_*`, right columns `r_*`, and append the join key.
-fn combine_sides(left: &RecordBatch, right: &RecordBatch) -> Result<MessageBatch, Error> {
-    let mut fields: Vec<Field> = Vec::with_capacity(left.num_columns() + right.num_columns());
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
-    for (index, field) in left.schema().fields().iter().enumerate() {
-        if field.name() == "join_key" || field.name() == META_INPUT_INDEX {
+/// Rename one gathered batch's columns with `prefix` (dropping the join key
+/// and input tag) for the combined output. `nullable` upgrades — never
+/// removes — nullability, so inner output schemas stay identical to the
+/// pre-outer-join behaviour.
+fn block_from_batch(
+    batch: &RecordBatch,
+    prefix: &str,
+    nullable: bool,
+) -> (Vec<Field>, Vec<ArrayRef>) {
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        let name = field.name();
+        if name == "join_key" || name == META_INPUT_INDEX {
             continue;
         }
-        let renamed = field.as_ref().clone().with_name(format!("l_{}", field.name()));
-        fields.push(renamed);
-        columns.push(left.column(index).clone());
+        fields.push(Field::new(
+            format!("{prefix}{name}"),
+            field.data_type().clone(),
+            nullable || field.is_nullable(),
+        ));
+        columns.push(batch.column(index).clone());
     }
-    for (index, field) in right.schema().fields().iter().enumerate() {
-        if field.name() == "join_key" || field.name() == META_INPUT_INDEX {
+    (fields, columns)
+}
+
+/// Build the all-null block for the opposite side of an unmatched emission,
+/// typed and ordered by that side's schema.
+fn null_block(schema: &Schema, prefix: &str, rows: usize) -> (Vec<Field>, Vec<ArrayRef>) {
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields().iter() {
+        let name = field.name();
+        if name == "join_key" || name == META_INPUT_INDEX {
             continue;
         }
-        let renamed = field.as_ref().clone().with_name(format!("r_{}", field.name()));
-        fields.push(renamed);
-        columns.push(right.column(index).clone());
+        let field = Field::new(format!("{prefix}{name}"), field.data_type().clone(), true);
+        columns.push(new_null_array(field.data_type(), rows));
+        fields.push(field);
     }
+    (fields, columns)
+}
+
+fn combine_blocks(
+    left: (Vec<Field>, Vec<ArrayRef>),
+    right: (Vec<Field>, Vec<ArrayRef>),
+    join_key: ArrayRef,
+) -> Result<MessageBatch, Error> {
+    let (mut fields, mut columns) = left;
+    fields.extend(right.0);
+    columns.extend(right.1);
     fields.push(Field::new("join_key", DataType::Utf8, false));
-    columns.push(left.column(left.num_columns() - 1).clone());
+    columns.push(join_key);
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|error| Error::Process(format!("join combine failed: {error}")))?;
     Ok(MessageBatch::new_arrow(batch))
+}
+
+/// Prefix left columns `l_*`, right columns `r_*`, and append the join key.
+/// Nullability follows `join_type`: sides that can be all-null in unmatched
+/// emissions are nullable here so matched and unmatched outputs share one
+/// schema.
+fn combine_sides(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    join_type: JoinType,
+) -> Result<MessageBatch, Error> {
+    combine_blocks(
+        block_from_batch(left, "l_", join_type.nullable_side(Side::Left)),
+        block_from_batch(right, "r_", join_type.nullable_side(Side::Right)),
+        left.column(left.num_columns() - 1).clone(),
+    )
 }
 
 #[async_trait::async_trait]
@@ -505,9 +864,65 @@ impl Processor for JoinOperator {
             .right
             .lock()
             .map_err(|_| Error::Process("join right lock poisoned".into()))?;
-        left.evict(watermark_ms, self.config.window_ms, self.config.ttl_ms);
-        right.evict(watermark_ms, self.config.window_ms, self.config.ttl_ms);
-        Ok(ProcessResult::None)
+        // Rows parked waiting for a side schema may flush on every emission
+        // point; older rows leave first.
+        let mut outputs = Self::flush_pending(
+            &self.pending_unmatched,
+            &left,
+            &right,
+            self.config.join_type,
+        );
+        let evictions = [
+            (
+                Side::Left,
+                left.evict(watermark_ms, self.config.window_ms, self.config.ttl_ms),
+            ),
+            (
+                Side::Right,
+                right.evict(watermark_ms, self.config.window_ms, self.config.ttl_ms),
+            ),
+        ];
+        for (side, rows) in evictions {
+            if !self.config.join_type.keeps_unmatched(side) {
+                continue;
+            }
+            let unmatched: Vec<MatchedRow> = rows
+                .into_iter()
+                .filter(|matched| !matched.row.matched)
+                .collect();
+            if unmatched.is_empty() {
+                continue;
+            }
+            let (this_buffer, other_buffer) = match side {
+                Side::Left => (&*left, &*right),
+                Side::Right => (&*right, &*left),
+            };
+            match (&this_buffer.schema, &other_buffer.schema) {
+                (Some(this_schema), Some(other_schema)) => {
+                    let batch = Self::assemble_unmatched(
+                        &unmatched,
+                        side,
+                        this_schema,
+                        other_schema,
+                        self.config.join_type,
+                    )?;
+                    outputs.push(Arc::new(batch));
+                }
+                _ => Self::stash_pending(
+                    &self.pending_unmatched,
+                    side,
+                    unmatched,
+                    self.config.max_per_key,
+                ),
+            }
+        }
+        match outputs.len() {
+            0 => Ok(ProcessResult::None),
+            1 => Ok(ProcessResult::Single(
+                outputs.pop().expect("length checked above"),
+            )),
+            _ => Ok(ProcessResult::Multiple(outputs)),
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -545,6 +960,7 @@ mod tests {
             right_key: "key".into(),
             left_timestamp: Some("ts".into()),
             right_timestamp: Some("ts".into()),
+            join_type: JoinType::Inner,
             window_ms: 5_000,
             ttl_ms: 0,
             max_per_key: 100,
@@ -693,5 +1109,299 @@ mod tests {
             panic!("expected a joined batch");
         };
         assert_eq!(batch.record_batch().num_rows(), 2);
+    }
+
+    #[test]
+    fn join_type_defaults_to_inner_and_rejects_invalid_values() {
+        let config: JoinOperatorConfig = serde_json::from_value(serde_json::json!({
+            "left_key": "key",
+            "right_key": "key",
+            "window_ms": 0,
+        }))
+        .unwrap();
+        assert_eq!(config.join_type, JoinType::Inner);
+
+        let config: JoinOperatorConfig = serde_json::from_value(serde_json::json!({
+            "left_key": "key",
+            "right_key": "key",
+            "window_ms": 0,
+            "join_type": "left_outer",
+        }))
+        .unwrap();
+        assert_eq!(config.join_type, JoinType::LeftOuter);
+
+        let error = serde_json::from_value::<JoinOperatorConfig>(serde_json::json!({
+            "left_key": "key",
+            "right_key": "key",
+            "window_ms": 0,
+            "join_type": "cross_outer",
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    fn outer_config(join_type: JoinType) -> JoinOperatorConfig {
+        let mut config = config();
+        config.join_type = join_type;
+        config
+    }
+
+    fn string_column<'a>(batch: &'a MessageBatch, column: &str) -> &'a StringArray {
+        let index = batch.record_batch().schema().index_of(column).unwrap();
+        batch
+            .record_batch()
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn left_outer_emits_unmatched_on_watermark_eviction() {
+        let join = JoinOperator::new(outer_config(JoinType::LeftOuter)).unwrap();
+        // A right row with a different key establishes the right schema
+        // without matching the left row under test.
+        assert!(matches!(
+            join.process(side_batch(1, &["b"], &[100])).await.unwrap(),
+            ProcessResult::None
+        ));
+        assert!(matches!(
+            join.process(side_batch(0, &["a"], &[100])).await.unwrap(),
+            ProcessResult::None
+        ));
+        let output = join.on_watermark(6_000).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected an unmatched emission");
+        };
+        assert_eq!(batch.record_batch().num_rows(), 1);
+        assert_eq!(string_column(&batch, "l_key").value(0), "a");
+        assert_eq!(string_column(&batch, "join_key").value(0), "a");
+        assert!(string_column(&batch, "r_key").is_null(0));
+        // The outer-kept left columns keep their nullability; the possibly
+        // all-null right columns are nullable in the schema.
+        let schema = batch.record_batch().schema();
+        assert!(!schema.field_with_name("l_key").unwrap().is_nullable());
+        assert!(schema.field_with_name("r_key").unwrap().is_nullable());
+    }
+
+    #[tokio::test]
+    async fn matched_rows_are_not_emitted_as_unmatched() {
+        let join = JoinOperator::new(outer_config(JoinType::FullOuter)).unwrap();
+        assert!(matches!(
+            join.process(side_batch(0, &["a"], &[100])).await.unwrap(),
+            ProcessResult::None
+        ));
+        // The pair matches, marking both rows.
+        assert!(matches!(
+            join.process(side_batch(1, &["a"], &[100])).await.unwrap(),
+            ProcessResult::Single(_)
+        ));
+        // Both rows evict past the window close but neither re-emits.
+        assert!(matches!(
+            join.on_watermark(6_000).await.unwrap(),
+            ProcessResult::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn capacity_eviction_emits_unmatched_in_outer_mode() {
+        let mut cfg = outer_config(JoinType::LeftOuter);
+        cfg.max_per_key = 1;
+        let join = JoinOperator::new(cfg).unwrap();
+        join.process(side_batch(1, &["b"], &[100])).await.unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        // Pushing the second "a" row evicts the first; outer emits it as
+        // unmatched even though the watermark has not moved (at-least-once
+        // artifact of the capacity bound).
+        let output = join.process(side_batch(0, &["a"], &[200])).await.unwrap();
+        let ProcessResult::Single(unmatched) = output else {
+            panic!("expected an unmatched capacity emission");
+        };
+        assert_eq!(unmatched.record_batch().num_rows(), 1);
+        let ts = unmatched
+            .record_batch()
+            .column(unmatched.record_batch().schema().index_of("l_ts").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.value(0), 100);
+        assert!(string_column(&unmatched, "r_key").is_null(0));
+        // The surviving row still matches: the at-least-once double emission
+        // (unmatched + pair) is the documented capacity-eviction semantics.
+        let output = join.process(side_batch(1, &["a"], &[200])).await.unwrap();
+        let ProcessResult::Single(pair) = output else {
+            panic!("expected a matched pair");
+        };
+        assert_eq!(pair.record_batch().num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_outer_emits_both_sides_unmatched() {
+        let join = JoinOperator::new(outer_config(JoinType::FullOuter)).unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        join.process(side_batch(1, &["b"], &[100])).await.unwrap();
+        let output = join.on_watermark(6_000).await.unwrap();
+        let ProcessResult::Multiple(batches) = output else {
+            panic!("expected one emission per outer side");
+        };
+        assert_eq!(batches.len(), 2);
+        let left_unmatched = &batches[0];
+        assert_eq!(string_column(left_unmatched, "l_key").value(0), "a");
+        assert!(string_column(left_unmatched, "r_key").is_null(0));
+        let right_unmatched = &batches[1];
+        assert_eq!(string_column(right_unmatched, "r_key").value(0), "b");
+        assert!(string_column(right_unmatched, "l_key").is_null(0));
+    }
+
+    #[tokio::test]
+    async fn inner_mode_output_schema_has_no_nullable_drift() {
+        let join = JoinOperator::new(config()).unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        let output = join.process(side_batch(1, &["a"], &[100])).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected a joined batch");
+        };
+        let schema = batch.record_batch().schema();
+        assert!(!schema.field_with_name("l_key").unwrap().is_nullable());
+        assert!(!schema.field_with_name("r_key").unwrap().is_nullable());
+    }
+
+    #[tokio::test]
+    async fn pending_unmatched_flushes_when_opposite_schema_arrives() {
+        let join = JoinOperator::new(outer_config(JoinType::LeftOuter)).unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        // The left row evicts with no right schema known: it parks instead
+        // of emitting.
+        assert!(matches!(
+            join.on_watermark(6_000).await.unwrap(),
+            ProcessResult::None
+        ));
+        // The first right batch establishes the schema; the parked row
+        // flushes as this call's output.
+        let output = join.process(side_batch(1, &["b"], &[6_000])).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected the parked unmatched emission to flush");
+        };
+        assert_eq!(string_column(&batch, "l_key").value(0), "a");
+        assert!(string_column(&batch, "r_key").is_null(0));
+    }
+
+    #[tokio::test]
+    async fn pending_unmatched_is_bounded_and_drops_oldest() {
+        let mut cfg = outer_config(JoinType::LeftOuter);
+        cfg.max_per_key = 1;
+        let join = JoinOperator::new(cfg).unwrap();
+        join.process(side_batch(0, &["a", "b"], &[100, 200])).await.unwrap();
+        // Both rows evict while the right schema is unknown: the pending
+        // queue is bounded by max_per_key, so the older row ("a") drops.
+        assert!(matches!(
+            join.on_watermark(6_000).await.unwrap(),
+            ProcessResult::None
+        ));
+        let output = join.process(side_batch(1, &["c"], &[6_000])).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected the parked unmatched emission to flush");
+        };
+        assert_eq!(batch.record_batch().num_rows(), 1);
+        assert_eq!(string_column(&batch, "l_key").value(0), "b");
+    }
+
+    /// Recovery replays inputs into a fresh operator instance; feeding the
+    /// same ordered sequence twice must reproduce identical emissions
+    /// (matched pairs and unmatched rows alike).
+    async fn run_outer_sequence(
+        join: &JoinOperator,
+    ) -> Vec<(String, Option<String>)> {
+        let mut seen = Vec::new();
+        let mut record = |result: ProcessResult| match result {
+            ProcessResult::None => {}
+            ProcessResult::Single(batch) => {
+                for row in 0..batch.record_batch().num_rows() {
+                    let left = string_column(&batch, "l_key").value(row).to_owned();
+                    let right = if string_column(&batch, "r_key").is_null(row) {
+                        None
+                    } else {
+                        Some(string_column(&batch, "r_key").value(row).to_owned())
+                    };
+                    seen.push((left, right));
+                }
+            }
+            ProcessResult::Multiple(batches) => {
+                for batch in batches {
+                    for row in 0..batch.record_batch().num_rows() {
+                        let left = string_column(&batch, "l_key").value(row).to_owned();
+                        let right = if string_column(&batch, "r_key").is_null(row) {
+                            None
+                        } else {
+                            Some(string_column(&batch, "r_key").value(row).to_owned())
+                        };
+                        seen.push((left, right));
+                    }
+                }
+            }
+            _ => panic!("unexpected process result variant"),
+        };
+        // Deliver both sides exactly as the chain loop would; the unmatched
+        // keys rely on key-ordered eviction after the watermark passes.
+        record(join.process(side_batch(1, &["z", "a"], &[100, 120])).await.unwrap());
+        record(join.process(side_batch(0, &["a", "b", "c"], &[100, 6_000, 6_050])).await.unwrap());
+        record(join.on_watermark(11_200).await.unwrap());
+        seen
+    }
+
+    #[tokio::test]
+    async fn replay_rebuild_reproduces_outer_emissions_deterministically() {
+        let first = JoinOperator::new(outer_config(JoinType::LeftOuter)).unwrap();
+        let emissions = run_outer_sequence(&first).await;
+        // "a" pairs with the right "a"; "b"/"c" have no right counterpart
+        // and must flush as unmatched rows once the watermark passes.
+        assert_eq!(
+            emissions,
+            vec![
+                ("a".to_owned(), Some("a".to_owned())),
+                ("b".to_owned(), None),
+                ("c".to_owned(), None),
+            ],
+            "{emissions:?}"
+        );
+        // A fresh operator fed the same ordered sequence (the replay
+        // contract) emits byte-identical results.
+        let replay = JoinOperator::new(outer_config(JoinType::LeftOuter)).unwrap();
+        assert_eq!(run_outer_sequence(&replay).await, emissions);
+    }
+
+    #[test]
+    fn multi_subtask_side_is_rejected_at_build_time() {
+        let mut cfg = config();
+        cfg.left_from = Some("gen".into());
+        cfg.right_from = Some("other".into());
+        let error = match JoinOperator::new(cfg.clone())
+            .unwrap()
+            .with_input_producers(&[
+                "gen".to_string(),
+                "gen".to_string(),
+                "other".to_string(),
+            ]) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a build-time rejection for a multi-subtask side"),
+        };
+        assert!(
+            error.to_string().contains("2 subtasks"),
+            "{error}"
+        );
+
+        // Undeclared sides fall back positionally but still reject a
+        // producer that feeds the join from several subtasks.
+        let error = match JoinOperator::new(config())
+            .unwrap()
+            .with_input_producers(&["gen".to_string(), "gen".to_string()])
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected a build-time rejection for an undeclared side"),
+        };
+        assert!(
+            error.to_string().contains("parallelism to 1"),
+            "{error}"
+        );
     }
 }
