@@ -85,12 +85,16 @@ impl Input for GenerateInput {
             msgs.push(s.into_bytes())
         }
 
+        // Decode BEFORE advancing the counter: the decode await above is
+        // the only droppable point in this read, and a dropped read must
+        // not consume quota it never delivered (Input::read
+        // cancellation-safety contract).
+        let mut message_batch =
+            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec).await?;
+
         self.count
             .fetch_add(self.batch_size as i64, Ordering::SeqCst);
 
-        // Apply codec if configured
-        let mut message_batch =
-            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec).await?;
         message_batch.set_input_name(self.input_name.clone());
         Ok((Arc::new(message_batch), Arc::new(NoopAck)))
     }

@@ -19,6 +19,7 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
@@ -49,18 +50,15 @@ pub struct WebSocketInputConfig {
 }
 
 /// WebSocket message types
-enum WebSocketMsg {
-    Message(Message),
-    Err(Error),
-}
-
+// The channel carries finished `Delivery` values decoded by the reader
+// task (cancellation-safety contract; see codec_helper).
 /// WebSocket input component
 pub struct WebSocketInput {
     #[allow(unused)]
     input_name: Option<String>,
     config: WebSocketInputConfig,
-    sender: Sender<WebSocketMsg>,
-    receiver: Receiver<WebSocketMsg>,
+    sender: Sender<Delivery>,
+    receiver: Receiver<Delivery>,
     #[allow(clippy::type_complexity)]
     writer: Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>>,
     cancellation_token: CancellationToken,
@@ -74,7 +72,7 @@ impl WebSocketInput {
         config: WebSocketInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<WebSocketMsg>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
@@ -125,10 +123,21 @@ impl Input for WebSocketInput {
         // Clone the sender and cancellation token for the reader task
         let sender_clone = Sender::clone(&self.sender);
         let cancellation_token = self.cancellation_token.clone();
+        let codec = self.codec.clone();
+        let input_name = self.input_name.clone();
 
-        // Spawn a task to handle incoming WebSocket messages
+        // Spawn a task to handle incoming WebSocket messages. It decodes and
+        // filters BEFORE claiming a channel slot, so `read()` below is a
+        // single await point (Input::read cancellation-safety contract).
         tokio::spawn(async move {
-            Self::handle_websocket_messages(reader, sender_clone, cancellation_token).await;
+            Self::handle_websocket_messages(
+                reader,
+                sender_clone,
+                codec,
+                input_name,
+                cancellation_token,
+            )
+            .await;
         });
 
         Ok(())
@@ -146,44 +155,13 @@ impl Input for WebSocketInput {
         let cancellation_token = self.cancellation_token.clone();
 
         tokio::select! {
+            // Deliveries arrive pre-decoded from the reader task, so this
+            // recv is the single await point — a dropped read loses nothing.
             result = self.receiver.recv_async() => {
                 match result {
-                    Ok(msg) => {
-                        match msg {
-                            WebSocketMsg::Message(message) => {
-                                let payload = match message {
-                                    Message::Text(text) => Vec::from(text.as_bytes()),
-                                    Message::Binary(binary) => Vec::from(binary),
-                                    Message::Ping(_) | Message::Pong(_) => {
-                                        // Skip control messages and wait for the next data message
-                                        return self.read().await;
-                                    }
-                                    Message::Close(_) => {
-                                        return Err(Error::Disconnection);
-                                    }
-                                    Message::Frame(_) => {
-                                        // Skip raw frame messages
-                                        return self.read().await;
-                                    }
-                                };
-
-                                // Apply codec if configured
-                                let mut msg = crate::input::codec_helper::apply_codec_to_payload(
-                                    &payload,
-                                    &self.codec,
-                                ).await?;
-                                msg.set_input_name(self.input_name.clone());
-
-                                Ok((Arc::new(msg), Arc::new(NoopAck)))
-                            },
-                            WebSocketMsg::Err(e) => {
-                                Err(e)
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        Err(Error::EOF)
-                    }
+                    Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
+                    Ok(Delivery::Err(e)) => Err(e),
+                    Err(_) => Err(Error::EOF),
                 }
             },
             _ = cancellation_token.cancelled() => {
@@ -211,7 +189,9 @@ impl Input for WebSocketInput {
 impl WebSocketInput {
     async fn handle_websocket_messages(
         mut reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-        sender: Sender<WebSocketMsg>,
+        sender: Sender<Delivery>,
+        codec: Option<Arc<dyn Codec>>,
+        input_name: Option<String>,
         cancellation_token: CancellationToken,
     ) {
         loop {
@@ -219,22 +199,44 @@ impl WebSocketInput {
                 result = reader.next() => {
                     match result {
                         Some(Ok(message)) => {
-                            // Forward the message to the channel
-                            if let Err(e) = sender.send_async(WebSocketMsg::Message(message)).await {
+                            // Control frames never reach the channel — read()
+                            // must not recurse to skip them (each recursion
+                            // was another cancellation window).
+                            let payload = match message {
+                                Message::Text(text) => Vec::from(text.as_bytes()),
+                                Message::Binary(binary) => Vec::from(binary),
+                                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                                    continue;
+                                }
+                                Message::Close(_) => {
+                                    if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
+                                        error!("Failed to send disconnection notification: {}", e);
+                                    }
+                                    break;
+                                }
+                            };
+                            let delivery = crate::input::codec_helper::decode_delivery(
+                                &payload,
+                                &codec,
+                                input_name.clone(),
+                                Arc::new(NoopAck),
+                            )
+                            .await;
+                            if let Err(e) = sender.send_async(delivery).await {
                                 error!("Failed to forward WebSocket message: {}", e);
                             }
                         },
                         Some(Err(e)) => {
                             // Log the error and notify about disconnection
                             error!("WebSocket read error: {}", e);
-                            if let Err(e) = sender.send_async(WebSocketMsg::Err(Error::Disconnection)).await {
+                            if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
                                 error!("Failed to send error notification: {}", e);
                             }
                             break;
                         },
                         None => {
                             // Connection closed
-                            if let Err(e) = sender.send_async(WebSocketMsg::Err(Error::Disconnection)).await {
+                            if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
                                 error!("Failed to send disconnection notification: {}", e);
                             }
                             break;
@@ -281,4 +283,57 @@ pub fn init() -> Result<(), Error> {
     ).with_example(serde_json::json!({
         "url": "ws://localhost:8080/stream"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::codec_helper::contract::{
+        cancel_pending_read_then_expect_delivery, gate,
+    };
+    use arkflow_core::input::Input;
+
+    /// Spec "解码进行中的取消不丢消息" (end-to-end): a local WebSocket server
+    /// pushes one message while a gate codec parks the reader task's
+    /// decode; the engine-shaped probe drops the pending read exactly like
+    /// a lost select! branch, and the delivery must still arrive exactly
+    /// once on the next read. Pre-fix, the reader handed the raw message
+    /// to `read()`, which claimed it and then lost it inside the decode
+    /// await.
+    #[tokio::test]
+    async fn read_survives_cancellation_during_codec_decode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            use futures_util::SinkExt;
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut write, _read) =
+                tokio_tungstenite::accept_async(stream).await.unwrap().split();
+            write.send(Message::Text("payload".into())).await.unwrap();
+            // Keep the server side alive until the client is done.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        });
+
+        let (codec, gate_handle) = gate();
+        let input = WebSocketInput::new(
+            None,
+            WebSocketInputConfig {
+                url: format!("ws://{addr}"),
+                headers: None,
+                timeout: Some(5),
+            },
+            Some(codec),
+        )
+        .unwrap();
+        input.connect().await.unwrap();
+
+        let input: std::sync::Arc<dyn Input> = std::sync::Arc::new(input);
+        let (batch, _ack) = cancel_pending_read_then_expect_delivery(input, &gate_handle)
+            .await
+            .expect("delivery must survive a cancelled read");
+        assert_eq!(batch.len(), 1);
+
+        server.abort();
+    }
 }

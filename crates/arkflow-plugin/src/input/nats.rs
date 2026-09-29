@@ -19,11 +19,12 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::Stream;
-use async_nats::{Client, ConnectOptions, Message};
+use async_nats::{Client, ConnectOptions};
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
@@ -77,15 +78,9 @@ pub struct NatsAuth {
 
 /// NATS message type for async processing
 #[allow(clippy::large_enum_variant)]
-enum NatsMsg {
-    /// Regular NATS message with original message for acknowledgment
-    Regular(Message),
-    /// JetStream message with payload and original message for acknowledgment
-    JetStream(async_nats::jetstream::Message),
-    /// Error message
-    Err(Error),
-}
-
+// The channel carries finished `Delivery` values: producers decode and
+// pair the mode-specific ack BEFORE claiming a slot, so `read()` is a
+// single await point (Input::read cancellation-safety contract).
 /// NATS input component
 pub struct NatsInput {
     input_name: Option<String>,
@@ -93,8 +88,8 @@ pub struct NatsInput {
     client: Arc<RwLock<Option<Client>>>,
     js_consumer: Arc<RwLock<Option<PullConsumer>>>,
     js_stream: Arc<RwLock<Option<Stream>>>,
-    sender: Sender<NatsMsg>,
-    receiver: Receiver<NatsMsg>,
+    sender: Sender<Delivery>,
+    receiver: Receiver<Delivery>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
@@ -107,7 +102,7 @@ impl NatsInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        let (sender, receiver) = flume::bounded::<NatsMsg>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(1000);
         Ok(Self {
             input_name: name.cloned(),
             config,
@@ -150,6 +145,8 @@ impl Input for NatsInput {
         // Clone sender for async tasks
         let sender_clone = self.sender.clone();
         let cancellation_token_clone = self.cancellation_token.clone();
+        let codec_clone = self.codec.clone();
+        let input_name_clone = self.input_name.clone();
 
         match &self.config.mode {
             Mode::Regular {
@@ -161,6 +158,8 @@ impl Input for NatsInput {
                 let client_clone = client.clone();
                 let sender = sender_clone;
                 let cancellation = cancellation_token_clone;
+                let codec_clone = codec_clone.clone();
+                let input_name_clone = input_name_clone.clone();
                 let queue_group = queue_group.clone();
 
                 tokio::spawn(async move {
@@ -181,13 +180,20 @@ impl Input for NatsInput {
                                     message_option = subscription.next() => {
                                         match message_option {
                                             Some(message) => {
-                                                if let Err(e) = sender.send_async(NatsMsg::Regular(message)).await {
+                                                let delivery = crate::input::codec_helper::decode_delivery(
+                                                    &message.payload,
+                                                    &codec_clone,
+                                                    input_name_clone.clone(),
+                                                    Arc::new(NatsAck::Regular),
+                                                )
+                                                .await;
+                                                if let Err(e) = sender.send_async(delivery).await {
                                                     error!("Failed to send message to channel: {}", e);
                                                 }
                                             },
                                             None => {
                                                 // Subscription ended
-                                                if let Err(e) = sender.send_async(NatsMsg::Err(Error::EOF)).await {
+                                                if let Err(e) = sender.send_async(Delivery::Err(Error::EOF)).await {
                                                     error!("Failed to send EOF to channel: {}", e);
                                                 }
                                                 break;
@@ -200,7 +206,7 @@ impl Input for NatsInput {
                         Err(e) => {
                             error!("Failed to subscribe to NATS subject: {}", e);
                             let _ = sender
-                                .send_async(NatsMsg::Err(Error::Process(format!(
+                                .send_async(Delivery::Err(Error::Process(format!(
                                     "Failed to subscribe to NATS subject: {}",
                                     e
                                 ))))
@@ -251,17 +257,25 @@ impl Input for NatsInput {
                         while let Some(message_result) = messages.next().await {
                             match message_result {
                                 Ok(message) => {
-                                    // Send to channel with original message for later acknowledgment
-                                    if let Err(e) =
-                                        sender.send_async(NatsMsg::JetStream(message)).await
-                                    {
+                                    // Decode and pair the JetStream ack
+                                    // before claiming a slot (read is a
+                                    // single await point).
+                                    let payload = message.payload.to_vec();
+                                    let delivery = crate::input::codec_helper::decode_delivery(
+                                        &payload,
+                                        &codec_clone,
+                                        input_name_clone.clone(),
+                                        Arc::new(NatsAck::JetStream { message }),
+                                    )
+                                    .await;
+                                    if let Err(e) = sender.send_async(delivery).await {
                                         error!("Failed to send message to channel: {}", e);
                                     }
                                 }
                                 Err(e) => {
                                     error!("Failed to get JetStream message: {}", e);
                                     if let Err(e) = sender
-                                        .send_async(NatsMsg::Err(Error::Process(format!(
+                                        .send_async(Delivery::Err(Error::Process(format!(
                                             "Failed to get message: {}",
                                             e
                                         ))))
@@ -278,7 +292,7 @@ impl Input for NatsInput {
                     Err(e) => {
                         error!("Failed to fetch JetStream messages: {}", e);
                         if let Err(e) = sender
-                            .send_async(NatsMsg::Err(Error::Process(format!(
+                            .send_async(Delivery::Err(Error::Process(format!(
                                 "Failed to fetch messages: {}",
                                 e
                             ))))
@@ -303,8 +317,16 @@ impl Input for NatsInput {
                                     while let Some(message_result) = messages.next().await {
                                         match message_result {
                                             Ok(message) => {
-                                                // Send to channel with original message for later acknowledgment
-                                                if let Err(e) = sender.send_async(NatsMsg::JetStream(message)).await
+                                                // Decode and pair the ack before claiming a slot.
+                                                let payload = message.payload.to_vec();
+                                                let delivery = crate::input::codec_helper::decode_delivery(
+                                                    &payload,
+                                                    &codec_clone,
+                                                    input_name_clone.clone(),
+                                                    Arc::new(NatsAck::JetStream { message }),
+                                                )
+                                                .await;
+                                                if let Err(e) = sender.send_async(delivery).await
                                                 {
                                                     error!("Failed to send message to channel: {}", e);
                                                 }
@@ -312,7 +334,7 @@ impl Input for NatsInput {
                                             Err(e) => {
                                                 error!("Failed to get JetStream message: {}", e);
                                                 if let Err(e) = sender
-                                                    .send_async(NatsMsg::Err(Error::Disconnection))
+                                                    .send_async(Delivery::Err(Error::Disconnection))
                                                     .await
                                                 {
                                                     error!("Failed to send error to channel: {}", e);
@@ -326,7 +348,7 @@ impl Input for NatsInput {
                                 Err(e) => {
                                     error!("Failed to fetch JetStream messages: {}", e);
                                     if let Err(e) = sender
-                                        .send_async(NatsMsg::Err(Error::Disconnection))
+                                        .send_async(Delivery::Err(Error::Disconnection))
                                         .await
                                     {
                                         error!("Failed to send error to channel: {}", e);
@@ -357,42 +379,13 @@ impl Input for NatsInput {
 
         // Use tokio::select to handle both message receiving and cancellation
         tokio::select! {
+            // Deliveries arrive pre-decoded with their mode-specific ack
+            // paired, so this recv is the single await point — a dropped
+            // read loses nothing.
             result = self.receiver.recv_async() => {
                 match result {
-                    Ok(msg) => {
-                        match msg {
-                            NatsMsg::Regular(message) => {
-                                let payload = message.payload.to_vec();
-
-                                // Apply codec if configured
-                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
-                                    &payload,
-                                    &self.codec,
-                                ).await?;
-                                msg_batch.set_input_name(self.input_name.clone());
-
-                                Ok((Arc::new(msg_batch), Arc::new(NatsAck::Regular)))
-                            },
-                            NatsMsg::JetStream( message) => {
-                                let payload = message.payload.to_vec();
-
-                                // Apply codec if configured
-                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
-                                    &payload,
-                                    &self.codec,
-                                ).await?;
-                                msg_batch.set_input_name(self.input_name.clone());
-
-                                let ack = NatsAck::JetStream {
-                                    message,
-                                };
-                                Ok((Arc::new(msg_batch), Arc::new(ack) as Arc<dyn Ack>))
-                            },
-                            NatsMsg::Err(e) => {
-                                Err(e)
-                            }
-                        }
-                    },
+                    Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
+                    Ok(Delivery::Err(e)) => Err(e),
                     Err(_) => {
                         Err(Error::EOF)
                     }
