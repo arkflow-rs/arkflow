@@ -99,6 +99,8 @@ Durability SHALL be opt-in per stream via a `durability` configuration section. 
 ### Requirement: Pluggable WAL storage backend
 The WAL SHALL support a configurable storage backend selected per stream via a `backend` setting. The `local` backend (the existing embedded store) SHALL be the default. An `object_store` (S3-compatible) backend SHALL be available as an opt-in alternative.
 
+Backends SHALL be drivable from asynchronous engine contexts: constructing a backend and invoking its store operations from an async task SHALL neither panic (a backend that internally parks on a private runtime via `block_on` MUST be driven on a thread where that is legal) nor block the async runtime's worker threads for the duration of its I/O. The engine's WAL wrapper SHALL drive blocking store calls on the blocking pool.
+
 #### Scenario: Local backend is the default
 - **WHEN** a stream has `durability.enabled: true` with no `backend` field (or `backend: local`)
 - **THEN** the WAL persists to a local embedded store exactly as before — process-crash recovery, single-node, no behavioral change
@@ -106,6 +108,10 @@ The WAL SHALL support a configurable storage backend selected per stream via a `
 #### Scenario: Object-store backend is opt-in
 - **WHEN** a stream has `backend: s3` (or another registered object-store backend)
 - **THEN** the WAL persists segments and a manifest to the configured object store
+
+#### Scenario: Object-store backend works through the engine's async paths
+- **WHEN** a stream with `backend: object_store` runs append / cursor-advance / acknowledge / read-after-cursor / close through the WAL's async API from a tokio runtime
+- **THEN** no "cannot start a runtime from within a runtime" panic occurs, the operations complete with their durable effects, and no async worker thread is parked for the duration of the store's network I/O
 
 ### Requirement: Per-node namespace isolation
 When the object-store backend is in use, the WAL SHALL isolate its object namespace by a node identity (`node_id`) and a stream identity (`stream_id`) in the object key prefix. Multiple arkflow nodes sharing one bucket SHALL NOT read or overwrite each other's WAL. The `node_id` SHALL be an explicit configuration value.
@@ -229,6 +235,11 @@ For a WAL acknowledgement wrapping a native source acknowledgement, the durable 
 
 - **WHEN** the local embedded WAL backend and the object-store WAL backend both advance and rewind a cursor across a failed wrapped acknowledgement
 - **THEN** each backend exposes the same replayable range for the same sequence history
+
+#### Scenario: Object-store rewind survives an intervening manifest flush
+
+- **WHEN** the object-store backend advances its cursor to sequence N, the wrapped source commit fails, and a manifest flush runs before the cursor is compensated
+- **THEN** the persisted manifest cursor SHALL NOT advance past `N - 1` (the failed sequence stays replayable: reads after the rewind include N), and once the source re-acknowledges through N the backend resumes advancing normally
 
 ### Requirement: Retryable Kafka receives reconnect
 
