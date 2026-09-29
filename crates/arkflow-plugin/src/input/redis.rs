@@ -19,6 +19,7 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
+use crate::input::codec_helper::Delivery;
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
@@ -69,8 +70,8 @@ struct RedisInput {
     input_name: Option<String>,
     config: RedisInputConfig,
     client: Arc<Mutex<Option<Cli>>>,
-    sender: Sender<RedisMsg>,
-    receiver: Receiver<RedisMsg>,
+    sender: Sender<Delivery>,
+    receiver: Receiver<Delivery>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
@@ -80,11 +81,10 @@ enum Cli {
     Cluster(ClusterConnection),
 }
 
-enum RedisMsg {
-    Message(String, Vec<u8>),
-    Err(Error),
-}
-
+// The channel carries finished `Delivery` values: producers decode and
+// pair the (noop) acknowledgement before claiming a slot, so `read()` is a
+// single await point and a dropped read future loses nothing
+// (Input::read cancellation-safety contract).
 /// Check if a Redis error is temporary (should retry) or permanent (should not retry)
 ///
 /// Temporary errors include: connection issues, timeouts, I/O errors
@@ -114,7 +114,7 @@ impl RedisInput {
         config: RedisInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<RedisMsg>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(1000);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
             ModeConfig::Cluster { urls, .. } => {
@@ -154,6 +154,8 @@ impl RedisInput {
         let client_builder = match config_type {
             Type::Subscribe { .. } => {
                 let sender_clone = Sender::clone(&self.sender);
+                let codec_clone = self.codec.clone();
+                let input_name_clone = self.input_name.clone();
                 client_builder.push_sender(move |msg: PushInfo| {
                     match msg.kind {
                         PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
@@ -161,17 +163,37 @@ impl RedisInput {
                                 return Ok(());
                             }
                             let mut iter = msg.data.into_iter();
-                            let channel: String = match iter.next() {
+                            let _channel: String = match iter.next() {
                                 Some(v) => FromRedisValue::from_owned_redis_value(v)?,
                                 None => return Ok(()),
                             };
-                            let message = match iter.next() {
+                            let message: Vec<u8> = match iter.next() {
                                 Some(v) => FromRedisValue::from_owned_redis_value(v)?,
                                 None => return Ok(()),
                             };
 
-                            if let Err(e) = sender_clone.send(RedisMsg::Message(channel, message)) {
-                                error!("{}", e);
+                            // The push callback is sync; decode off it so the
+                            // delivery entering the channel is already
+                            // finished (cancellation-safe read contract).
+                            match tokio::runtime::Handle::try_current() {
+                                Ok(handle) => {
+                                    let sender_cb = Sender::clone(&sender_clone);
+                                    let codec_cb = codec_clone.clone();
+                                    let input_name_cb = input_name_clone.clone();
+                                    handle.spawn(async move {
+                                        let delivery = crate::input::codec_helper::decode_delivery(
+                                            &message,
+                                            &codec_cb,
+                                            input_name_cb,
+                                            Arc::new(NoopAck),
+                                        )
+                                        .await;
+                                        if let Err(e) = sender_cb.send_async(delivery).await {
+                                            error!("{}", e);
+                                        }
+                                    });
+                                }
+                                Err(e) => error!("no async runtime for redis push decode: {}", e),
                             }
                         }
                         _ => {}
@@ -229,6 +251,8 @@ impl RedisInput {
             }
             Type::List { list } => {
                 let sender_clone = Sender::clone(&self.sender);
+                let codec_clone = self.codec.clone();
+                let input_name_clone = self.input_name.clone();
                 let mut cluster_connection = cluster_conn.clone();
                 tokio::spawn(async move {
                     loop {
@@ -243,7 +267,14 @@ impl RedisInput {
                                 match result {
                                     Ok(Some((list_name, payload))) => {
                                         debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                        let delivery = crate::input::codec_helper::decode_delivery(
+                                            &payload,
+                                            &codec_clone,
+                                            input_name_clone.clone(),
+                                            Arc::new(NoopAck),
+                                        )
+                                        .await;
+                                        if let Err(e) = sender_clone.send_async(delivery).await {
                                             error!("Failed to send Redis list message: {}", e);
                                         }
                                     }
@@ -252,7 +283,7 @@ impl RedisInput {
                                     }
                                     Err(e) => {
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
                                             error!("{}", e);
                                         }
                                         break;
@@ -321,17 +352,26 @@ impl RedisInput {
                         }
                     }
                 }
+                let codec_clone = self.codec.clone();
+                let input_name_clone = self.input_name.clone();
                 tokio::spawn(async move {
                     let mut msg_stream = pubsub_conn.on_message();
 
                     loop {
                         tokio::select! {
                             Some(msg_result) = msg_stream.next() => {
-                                let channel: String = msg_result.get_channel_name().to_string();
-                                let Ok(payload )=   msg_result.get_payload() else {
+                                let _channel: String = msg_result.get_channel_name().to_string();
+                                let Ok(payload) = msg_result.get_payload::<Vec<u8>>() else {
                                        continue;
                                 };
-                                if let Err(e) = sender_clone.send_async(RedisMsg::Message(channel, payload)).await {
+                                let delivery = crate::input::codec_helper::decode_delivery(
+                                    &payload,
+                                    &codec_clone,
+                                    input_name_clone.clone(),
+                                    Arc::new(NoopAck),
+                                )
+                                .await;
+                                if let Err(e) = sender_clone.send_async(delivery).await {
                                     error!("{}", e);
                                 }
                             }
@@ -345,6 +385,9 @@ impl RedisInput {
             Type::List { ref list } => {
                 let list = list.clone();
                 let mut manager = manager.clone();
+                let sender_clone = Sender::clone(&self.sender);
+                let codec_clone = self.codec.clone();
+                let input_name_clone = self.input_name.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -358,7 +401,14 @@ impl RedisInput {
                                 match result {
                                     Ok(Some((list_name, payload))) => {
                                         debug!("Received Redis list message from {},payload: {}", list_name,  String::from_utf8_lossy(&payload));
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Message(list_name, payload)).await {
+                                        let delivery = crate::input::codec_helper::decode_delivery(
+                                            &payload,
+                                            &codec_clone,
+                                            input_name_clone.clone(),
+                                            Arc::new(NoopAck),
+                                        )
+                                        .await;
+                                        if let Err(e) = sender_clone.send_async(delivery).await {
                                             error!("Failed to send Redis list message: {}", e);
                                         }
                                     }
@@ -367,7 +417,7 @@ impl RedisInput {
                                     }
                                     Err(e) => {
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(RedisMsg::Err(Error::Disconnection)).await {
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
                                             error!("{}", e);
                                         }
                                         break;
@@ -403,20 +453,11 @@ impl Input for RedisInput {
             }
         }
 
+        // Producers decode and pair the ack before claiming a slot, so this
+        // recv is the single await point — a dropped read loses nothing.
         match self.receiver.recv_async().await {
-            Ok(RedisMsg::Message(_channel, payload)) => {
-                // Apply codec if configured
-                let mut msg =
-                    crate::input::codec_helper::apply_codec_to_payload(&payload, &self.codec)
-                        .await
-                        .map_err(|e| {
-                            Error::Connection(format!("Failed to create message batch: {}", e))
-                        })?;
-                msg.set_input_name(self.input_name.clone());
-
-                Ok((Arc::new(msg), Arc::new(NoopAck)))
-            }
-            Ok(RedisMsg::Err(e)) => Err(e),
+            Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
+            Ok(Delivery::Err(e)) => Err(e),
             Err(_) => Err(Error::EOF),
         }
     }

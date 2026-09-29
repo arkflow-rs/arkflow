@@ -19,6 +19,7 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
@@ -61,17 +62,17 @@ pub struct MqttInput {
     input_name: Option<String>,
     config: MqttInputConfig,
     client: Arc<Mutex<Option<AsyncClient>>>,
-    sender: Sender<MqttMsg>,
-    receiver: Receiver<MqttMsg>,
+    sender: Sender<Delivery>,
+    receiver: Receiver<Delivery>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
 
-enum MqttMsg {
-    Publish(Publish),
-    Err(Error),
-}
-
+// The channel carries finished `Delivery` values: the eventloop task
+// decodes and pairs the MqttAck BEFORE claiming a slot (manual acks are
+// settled only when the engine acknowledges), so `read()` is a single
+// await point — a dropped read future loses nothing
+// (Input::read cancellation-safety contract).
 impl MqttInput {
     /// Create a new MQTT input component
     pub fn new(
@@ -79,7 +80,7 @@ impl MqttInput {
         config: MqttInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
@@ -142,6 +143,9 @@ impl Input for MqttInput {
         *client_guard = Some(client);
 
         let sender_clone = Sender::clone(&self.sender);
+        let codec_clone = self.codec.clone();
+        let input_name_clone = self.input_name.clone();
+        let client_for_ack = Arc::clone(&self.client);
 
         let cancellation_token = self.cancellation_token.clone();
 
@@ -152,8 +156,24 @@ impl Input for MqttInput {
                         match result {
                             Ok(event) => {
                                 if let Event::Incoming(Packet::Publish(publish)) = event {
-                                    // Add messages to the queue
-                                    match sender_clone.send_async(MqttMsg::Publish(publish)).await {
+                                    // Decode and pair the manual ack BEFORE
+                                    // claiming a channel slot: with
+                                    // set_manual_acks(true) the broker does
+                                    // not redeliver, so a read dropped
+                                    // between claim and ack construction
+                                    // would lose the message forever.
+                                    let payload = publish.payload.to_vec();
+                                    let delivery = crate::input::codec_helper::decode_delivery(
+                                        &payload,
+                                        &codec_clone,
+                                        input_name_clone.clone(),
+                                        Arc::new(MqttAck {
+                                            client: Arc::clone(&client_for_ack),
+                                            publish,
+                                        }),
+                                    )
+                                    .await;
+                                    match sender_clone.send_async(delivery).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -164,7 +184,7 @@ impl Input for MqttInput {
                             Err(e) => {
                                // Log the error and notify the main loop to trigger reconnection
                                 error!("MQTT event loop error: {}", e);
-                                match sender_clone.send_async(MqttMsg::Err(Error::Disconnection)).await {
+                                match sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -195,30 +215,12 @@ impl Input for MqttInput {
         let cancellation_token = self.cancellation_token.clone();
 
         tokio::select! {
+            // Deliveries arrive pre-decoded with their ack paired, so this
+            // recv is the single await point — a dropped read loses nothing.
             result = self.receiver.recv_async() =>{
                 match result {
-                    Ok(msg) => {
-                        match msg{
-                            MqttMsg::Publish(publish) => {
-                                let payload = publish.payload.to_vec();
-
-                                // Apply codec if configured
-                                let mut msg = crate::input::codec_helper::apply_codec_to_payload(
-                                    &payload,
-                                    &self.codec,
-                                ).await?;
-                                msg.set_input_name(self.input_name.clone());
-
-                                Ok((Arc::new(msg), Arc::new(MqttAck {
-                                    client: Arc::clone(&self.client),
-                                    publish,
-                                })))
-                            },
-                            MqttMsg::Err(e) => {
-                                  Err(e)
-                            }
-                        }
-                    }
+                    Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
+                    Ok(Delivery::Err(e)) => Err(e),
                     Err(_) => {
                         Err(Error::EOF)
                     }

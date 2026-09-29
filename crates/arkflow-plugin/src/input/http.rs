@@ -513,4 +513,54 @@ mod tests {
             time_diff
         );
     }
+    /// Spec "合规实现零误报" (control case): the HTTP input already decodes in
+    /// its request-handler task, so the same engine-shaped cancellation
+    /// probe must deliver the message exactly once — proving the harness
+    /// does not flag compliant inputs.
+    #[tokio::test]
+    async fn read_survives_cancellation_during_codec_decode() {
+        use crate::input::codec_helper::contract::{cancel_pending_read_then_expect_delivery, gate};
+        use arkflow_core::input::Input;
+
+        // Reserve then release an ephemeral port for the input's listener.
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe_listener.local_addr().unwrap();
+        drop(probe_listener);
+
+        let (codec, gate_handle) = gate();
+        let config = HttpInputConfig {
+            address: addr.to_string(),
+            path: "/ingest".to_string(),
+            cors_enabled: Some(false),
+            auth: None,
+        };
+        let input = HttpInput::new(None, config, Some(codec)).unwrap();
+        input.connect().await.unwrap();
+
+        // One POST whose body decodes inside the (gated) handler task.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // The handler extracts an axum Json body, so the payload must
+            // be valid JSON before the codec sees it.
+            let body = br#"{"v":1}"#;
+            let head = format!(
+                "POST /ingest HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            // Hold the connection open until the handler answers — closing
+            // the write half immediately races axum's body read.
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response).await;
+        });
+
+        let input: std::sync::Arc<dyn Input> = std::sync::Arc::new(input);
+        let (batch, _ack) = cancel_pending_read_then_expect_delivery(input, &gate_handle)
+            .await
+            .expect("compliant http input must deliver through a cancelled read");
+        assert_eq!(batch.len(), 1);
+    }
+
 }

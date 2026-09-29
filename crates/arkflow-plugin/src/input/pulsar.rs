@@ -22,6 +22,7 @@ use crate::pulsar::{
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
+use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -56,11 +57,11 @@ pub struct PulsarInputConfig {
 
 /// Pulsar message type for async processing
 #[allow(clippy::large_enum_variant)]
-enum PulsarMsg {
-    Message(pulsar::consumer::Message<Vec<u8>>),
-    Err(Error),
-}
-
+// The channel carries finished `Delivery` values: the consumer task
+// decodes and pairs the PulsarAck BEFORE claiming a slot (read no longer
+// awaits the consumer lock to build the ack), so `read()` is a single
+// await point — a dropped read future loses nothing
+// (Input::read cancellation-safety contract).
 /// Pulsar input component
 pub struct PulsarInput {
     input_name: Option<String>,
@@ -69,8 +70,8 @@ pub struct PulsarInput {
     #[allow(clippy::type_complexity)]
     consumer:
         Arc<RwLock<Option<Arc<Mutex<pulsar::Consumer<Vec<u8>, pulsar::executor::TokioExecutor>>>>>>,
-    sender: Sender<PulsarMsg>,
-    receiver: Receiver<PulsarMsg>,
+    sender: Sender<Delivery>,
+    receiver: Receiver<Delivery>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
@@ -83,7 +84,7 @@ impl PulsarInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        let (sender, receiver) = flume::bounded::<PulsarMsg>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(1000);
         Ok(Self {
             input_name: name.cloned(),
             config,
@@ -174,6 +175,8 @@ impl Input for PulsarInput {
         // Clone sender for async tasks
         let sender_clone = self.sender.clone();
         let cancellation_token_clone = self.cancellation_token.clone();
+        let codec_clone = self.codec.clone();
+        let input_name_clone = self.input_name.clone();
 
         // Start background task for message processing
         tokio::spawn(async move {
@@ -188,14 +191,30 @@ impl Input for PulsarInput {
                         consumer.next().await
                     } => {
                         match result {
-                            Some(Ok(message)) => {
-                                if let Err(e) = sender_clone.send_async(PulsarMsg::Message(message)).await {
+                            Some(Ok(mut message)) => {
+                                // Decode and pair the ack before claiming a
+                                // slot: the message is taken apart here, and
+                                // the ack carries the consumer so `read()`
+                                // never awaits the consumer lock.
+                                let payload = std::mem::take(&mut message.payload.data);
+                                let ack: Arc<dyn Ack> = Arc::new(PulsarAck::new(
+                                    message,
+                                    consumer.clone(),
+                                ));
+                                let delivery = crate::input::codec_helper::decode_delivery(
+                                    &payload,
+                                    &codec_clone,
+                                    input_name_clone.clone(),
+                                    ack,
+                                )
+                                .await;
+                                if let Err(e) = sender_clone.send_async(delivery).await {
                                     error!("Failed to send message to channel: {}", e);
                                 }
                             }
                             Some(Err(e)) => {
                                 warn!("Failed to receive Pulsar message: {}", e);
-                                if let Err(e) = sender_clone.send_async(PulsarMsg::Err(Error::Disconnection)).await {
+                                if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
                                     error!("Failed to send error to channel: {}", e);
                                 }
                                 // Break the loop to allow reconnection to create a new consumer task
@@ -203,7 +222,7 @@ impl Input for PulsarInput {
                             }
                             None => {
                                 // Stream ended
-                                if let Err(e) = sender_clone.send_async(PulsarMsg::Err(Error::EOF)).await {
+                                if let Err(e) = sender_clone.send_async(Delivery::Err(Error::EOF)).await {
                                     error!("Failed to send EOF to channel: {}", e);
                                 }
                                 break;
@@ -229,33 +248,14 @@ impl Input for PulsarInput {
 
         // Use tokio::select to handle both message receiving and cancellation
         tokio::select! {
+            // Deliveries arrive pre-decoded with the ack paired (built by
+            // the consumer task), so this recv is the single await point —
+            // a dropped read loses nothing and never touches the consumer
+            // lock.
             result = self.receiver.recv_async() => {
                 match result {
-                    Ok(msg) => {
-                        match msg {
-                            PulsarMsg::Message(mut message) => {
-                                let payload = std::mem::take(&mut message.payload.data);
-
-                                // Apply codec if configured
-                                let mut msg_batch = crate::input::codec_helper::apply_codec_to_payload(
-                                    &payload,
-                                    &self.codec,
-                                ).await?;
-                                msg_batch.set_input_name(self.input_name.clone());
-
-                                // Get consumer reference for acknowledgment
-                                let consumer_guard = self.consumer.read().await;
-                                let consumer = consumer_guard.as_ref().cloned()
-                                    .ok_or_else(|| Error::Connection("Pulsar consumer not available".to_string()))?;
-
-                                let ack = PulsarAck::new(message, consumer);
-                                Ok((Arc::new(msg_batch), Arc::new(ack) as Arc<dyn Ack>))
-                            },
-                            PulsarMsg::Err(e) => {
-                                Err(e)
-                            }
-                        }
-                    },
+                    Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
+                    Ok(Delivery::Err(e)) => Err(e),
                     Err(_) => {
                         Err(Error::EOF)
                     }
