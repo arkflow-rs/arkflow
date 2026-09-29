@@ -1,10 +1,6 @@
-# stream-join-operator Specification
+# stream-join-operator Delta — add-outer-join
 
-## Purpose
-
-统一执行内核的 keyed interval join 算子：双输入侧别、相等键匹配、事件时间窗口界、有界状态与重放恢复语义。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Join 算子 SHALL 以声明的生产者区分两侧
 

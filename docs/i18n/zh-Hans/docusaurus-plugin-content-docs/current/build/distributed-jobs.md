@@ -203,7 +203,7 @@ jobs:
 
 ### 双流 join
 
-Job DAG 支持 keyed interval join 算子。`Join` 算子声明恰好两条入边,并以生产者声明侧别(`left_from`/`right_from` 上游算子 id——通道顺序是内核内部细节)。配置含 `left_key`/`right_key`、`window_ms`,可选 `left_timestamp`/`right_timestamp`(默认 `__meta_timestamp`)、`ttl_ms`、`max_per_key`:
+Job DAG 支持 keyed interval join 算子。`Join` 算子声明恰好两条入边,并以生产者声明侧别(`left_from`/`right_from` 上游算子 id——通道顺序是内核内部细节)。配置含 `left_key`/`right_key`、`window_ms`,可选 `left_timestamp`/`right_timestamp`(默认 `__meta_timestamp`)、`ttl_ms`、`max_per_key`,以及 `join_type`(默认 `inner`;`left_outer`/`right_outer`/`full_outer` 保留 outer 侧的未匹配行):
 
 ```yaml validate=fragment wrap=engine
 jobs:
@@ -219,6 +219,7 @@ jobs:
       - id: join-orders
         kind: join
         config:
+          join_type: left_outer
           left_from: orders
           right_from: profiles
           left_key: customer_id
@@ -270,12 +271,13 @@ jobs:
 
 语义与边界:
 
-- 左右行在 key 相等且事件时间差 ≤ `window_ms` 时匹配。匹配即时发射(inner join、at-least-once——恢复后重放要求下游容忍重复)。
-- 输出列为原始左列加前缀 `l_`、右列加前缀 `r_`,外加 `join_key`。
-- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。
-- 恢复时缓冲由 checkpoint 重放重建,无独立 join 快照。
-- 每侧 schema 必须在流生命周期内保持稳定。
-- 不支持:temporal(维表)join、非 equi-join、outer join、跨节点 shuffle join(join 算子与两条上游边共置单节点)。
+- 左右行在 key 相等且事件时间差 ≤ `window_ms` 时匹配。匹配即时发射,与 `join_type` 无关(at-least-once——恢复后重放要求下游容忍重复)。
+- 输出列为原始左列加前缀 `l_`、右列加前缀 `r_`,外加 `join_key`。outer 模式下,可能在未匹配发射中全为 null 的侧在输出 schema 中声明为 nullable(`left_outer` 为 `r_*`,`right_outer` 为 `l_*`,`full_outer` 两侧);`inner` 输出 schema 保持不变。
+- `left_outer`/`right_outer`/`full_outer` 下,outer 侧从未匹配的行在链级 watermark 越过 `timestamp + window_ms + ttl_ms` 时发射,对侧列全为 null。匹配过的行不会再作为未匹配发射。发射需要对侧 schema:对侧尚无数据时,被逐出行暂存于有界队列(每侧 `max_per_key`,超限丢最旧),schema 已知后补发。无 watermark 的 processing-time 源永不发射未匹配行——outer join 建议使用事件时间源。
+- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。outer 模式下容量逐出同样把被逐出行作为未匹配发射——无 watermark 保证,其后的匹配可能双发(at-least-once 附属语义)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。
+- 恢复时缓冲(含逐行 matched 标记)由 checkpoint 重放重建,无独立 join 快照。链级 watermark 取两侧最小值,除既有迟到契约外,重放不会产生「假未匹配」。
+- 每侧 schema 必须在流生命周期内保持稳定;每侧上游算子必须以单子任务喂入 join——多子任务侧在图构建期即失败,并指引把上游并行度设为 1。
+- 不支持:temporal(维表)join、非 equi-join、跨节点 shuffle join(join 算子与两条上游边共置单节点)。
 
 流式配置的 legacy `join` buffer(含带 legacy `join` 字段的窗口 buffer)仍编译失败,指引指向 Job DAG join 算子。
 

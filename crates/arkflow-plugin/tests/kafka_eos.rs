@@ -30,8 +30,16 @@
 //! lifecycle, so `cargo test --test kafka_eos` works wherever Docker is
 //! available. All cases share one broker (fixed host port 9092) and run
 //! serially; each isolates by unique topic / transactional id / group.
+//!
+//! Container hygiene: on hosts without a working testcontainers reaper the
+//! broker container leaks when the `static` holding it is never dropped, and
+//! the leftover keeps host port 9092 allocated so the NEXT run cannot start
+//! its broker. Every test therefore holds a [`BrokerLease`]; the last lease
+//! released removes the container (and the next lease starts a fresh one),
+//! and a fresh start first sweeps leftover testcontainers cp-kafka
+//! containers, which also recovers from crashed runs.
 
-use arkflow_core::input::{Input, InputConfig};
+use arkflow_core::input::InputConfig;
 use arkflow_core::output::{Output, OutputConfig};
 use arkflow_core::{MessageBatch, MessageBatchRef, Resource};
 use rdkafka::config::ClientConfig;
@@ -39,12 +47,12 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::OnceCell;
 
 /// KRaft cluster id: must be a base64-encoded UUID (16 bytes → 22 chars,
 /// no padding). An arbitrary UUID string is rejected by cp-kafka and the
@@ -55,25 +63,119 @@ const CLUSTER_ID: &str = "1RlfgIc1TZWvdfLySKufPw";
 /// host port cannot be dynamic).
 const KAFKA_HOST_PORT: u16 = 9092;
 
-/// Shared broker — started once, reused by every (serial) test to avoid the
-/// fixed-port release race between back-to-back containers. `None` marks a
-/// probe-detected Docker-less environment: every test then skips instead of
-/// panicking on the missing container engine.
-static BROKER: OnceCell<Option<ContainerAsync<GenericImage>>> = OnceCell::const_new();
+/// Shared broker — started once, reused by every test to avoid the
+/// fixed-port release race between back-to-back containers. Held in a
+/// restart-capable slot: after the last [`BrokerLease`] releases and removes
+/// the container, the next `broker_lease()` call starts a fresh one instead
+/// of reusing the dead handle.
+static BROKER: LazyLock<tokio::sync::Mutex<Option<ContainerAsync<GenericImage>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-async fn broker() -> bool {
-    let container = BROKER
-        .get_or_init(|| async {
-            if !docker_available() {
-                eprintln!(
-                    "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
-                );
-                return None;
+/// RAII lease on the shared broker: every test acquires one; when the LAST
+/// lease drops, the container is removed so a reaper-less host does not
+/// leak it with host port 9092 still bound. The counter is incremented
+/// while holding the broker slot lock, and the last-out cleanup re-checks
+/// the counter under that same lock, so a lease can never be counted
+/// against a container the cleanup just removed (or vice versa).
+struct BrokerLease;
+
+async fn broker_lease() -> Option<BrokerLease> {
+    let mut broker = BROKER.lock().await;
+    if broker.is_none() {
+        if !docker_available() {
+            eprintln!(
+                "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
+            );
+            return None;
+        }
+        sweep_leftover_brokers();
+        *broker = Some(start_broker().await);
+    }
+    ACTIVE.fetch_add(1, Ordering::SeqCst);
+    Some(BrokerLease)
+}
+
+impl Drop for BrokerLease {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        remove_shared_broker();
+    }
+}
+
+/// Remove the shared broker container once no lease remains. `Drop` runs
+/// inside the test's async execution context where blocking is forbidden
+/// (`blocking_lock` panics), so the slot is taken with a bounded `try_lock`
+/// spin; the counter is re-checked under the lock so a concurrently
+/// acquired lease wins over the removal. The removal itself is async and
+/// runs on a dedicated thread with its own runtime, bounded by the channel
+/// receive so a wedged daemon cannot hang the test run. On failure the
+/// leftover stays behind — harmless, the next run's sweep removes it.
+/// Emptying the slot is what lets a later `broker_lease()` call start a
+/// fresh container.
+fn remove_shared_broker() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let container = loop {
+        match BROKER.try_lock() {
+            Ok(mut broker) => {
+                if ACTIVE.load(Ordering::SeqCst) != 0 {
+                    return;
+                }
+                break broker.take();
             }
-            Some(start_broker().await)
-        })
-        .await;
-    container.is_some()
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    };
+    let Some(container) = container else {
+        return;
+    };
+    let (done, released) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        if let Err(error) = runtime.block_on(container.rm()) {
+            eprintln!("kafka_eos: broker container removal failed: {error}");
+        }
+        let _ = done.send(());
+    });
+    let _ = released.recv_timeout(Duration::from_secs(15));
+}
+
+/// Best-effort removal of cp-kafka testcontainers containers leaked by
+/// earlier (crashed or reaper-less) runs — a leftover holding host port
+/// 9092 makes every later broker start fail with "port is already
+/// allocated". Filtering by testcontainers' managed-by label plus the
+/// broker image keeps user containers safe; a missing `docker` CLI or
+/// daemon error is silently ignored.
+fn sweep_leftover_brokers() {
+    let Ok(listing) = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "label=org.testcontainers.managed-by=testcontainers",
+            "--filter",
+            "ancestor=confluentinc/cp-kafka:7.5.0",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !listing.status.success() {
+        return;
+    }
+    for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
 }
 
 /// Skip one case loudly. A green run of this suite must never mean "zero
@@ -334,7 +436,9 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_transactional_offset_commit_advances_the_group() {
     ensure_init();
-    assert!(broker().await, "broker unavailable");
+    let Some(_broker) = broker_lease().await else {
+        panic!("broker unavailable");
+    };
     let source_topic = format!("l3-src-{}", l3_suffix());
     let sink_topic = format!("l3-dst-{}", l3_suffix());
     let group = format!("l3-group-{}", l3_suffix());
@@ -397,7 +501,7 @@ async fn l3_transactional_offset_commit_advances_the_group() {
     verify.connect().await.expect("verify connect");
     let redelivery = tokio::time::timeout(Duration::from_secs(8), verify.read()).await;
     assert!(
-        matches!(redelivery, Err(_)),
+        redelivery.is_err(),
         "committed offsets inside the transaction must prevent re-delivery"
     );
 
@@ -409,10 +513,10 @@ async fn l3_transactional_offset_commit_advances_the_group() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn smoke_broker_and_roundtrip() {
-    if !broker().await {
+    let Some(_broker) = broker_lease().await else {
         skip_without_docker("smoke_broker_and_roundtrip");
         return;
-    }
+    };
     let topic = format!("eos-smoke-{}", std::process::id());
     let output = build_output(&topic, false, None).await;
     output
@@ -434,10 +538,10 @@ async fn smoke_broker_and_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn atomic_commit_observes_whole_batch() {
-    if !broker().await {
+    let Some(_broker) = broker_lease().await else {
         skip_without_docker("atomic_commit_observes_whole_batch");
         return;
-    }
+    };
     let topic = format!("eos-atomic-{}", std::process::id());
     let tx_id = format!("atomic-tx-{}", std::process::id());
 
@@ -466,10 +570,10 @@ async fn atomic_commit_observes_whole_batch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn zombie_fenced_across_restart() {
-    if !broker().await {
+    let Some(_broker) = broker_lease().await else {
         skip_without_docker("zombie_fenced_across_restart");
         return;
-    }
+    };
     let topic = format!("eos-fence-{}", std::process::id());
     let tx_id = format!("fence-tx-{}", std::process::id());
 
@@ -505,10 +609,10 @@ async fn zombie_fenced_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn post_commit_crash_duplicates() {
-    if !broker().await {
+    let Some(_broker) = broker_lease().await else {
         skip_without_docker("post_commit_crash_duplicates");
         return;
-    }
+    };
     let topic = format!("eos-dup-{}", std::process::id());
     let tx_id = format!("dup-tx-{}", std::process::id());
 

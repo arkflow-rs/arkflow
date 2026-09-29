@@ -259,6 +259,11 @@
       "kind": "yaml"
     },
     {
+      "name": "job_join_outer",
+      "path": "../examples/job_join_outer.yaml",
+      "kind": "yaml"
+    },
+    {
       "name": "eos-kafka-l3",
       "path": "../examples/eos-kafka-l3.yaml",
       "kind": "yaml"

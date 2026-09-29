@@ -12,7 +12,7 @@ use crate::output::Output;
 use crate::processor::Processor;
 use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, StringArray};
+use datafusion::arrow::array::{Array as _, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::cell::RefCell;
@@ -5521,4 +5521,148 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     assert!(names.contains(&"l_key".to_string()), "{names:?}");
     assert!(names.contains(&"r_key".to_string()), "{names:?}");
     assert!(names.contains(&"join_key".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn left_outer_join_emits_unmatched_rows_end_to_end() {
+    let join = OperatorSpec {
+        id: "join".into(),
+        kind: OperatorKind::Join,
+        stateful: false,
+        key_field: None,
+        config: serde_json::json!({
+            "left_key": "key",
+            "right_key": "key",
+            "left_timestamp": "ts",
+            "right_timestamp": "ts",
+            "join_type": "left_outer",
+            "window_ms": 5_000
+        }),
+    };
+    let mut job = spec(vec![join], vec![], 1);
+    job.operators.retain(|operator| operator.id != "source");
+    job.sources.clear();
+    // Event-time sources drive the watermark past the match window so the
+    // unmatched left row is evicted (and emitted) before the sources end.
+    let event_time = |operator_id: &str| SourceSpec {
+        codec: None,
+        operator_id: operator_id.into(),
+        input_type: "vec".into(),
+        config: serde_json::json!({}),
+        time: TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(WatermarkSpec {
+                strategy: WatermarkStrategy::Monotonous,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        },
+    };
+    job.sources.push(event_time("left_source"));
+    job.sources.push(event_time("right_source"));
+    job.operators.insert(
+        0,
+        OperatorSpec {
+            id: "left_source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.operators.insert(
+        1,
+        OperatorSpec {
+            id: "right_source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.edges = vec![
+        EdgeSpec {
+            id: "left-edge".into(),
+            from: "left_source".into(),
+            to: "join".into(),
+            partitioned: false,
+        },
+        EdgeSpec {
+            id: "right-edge".into(),
+            from: "right_source".into(),
+            to: "join".into(),
+            partitioned: false,
+        },
+        EdgeSpec {
+            id: "join-sink".into(),
+            from: "join".into(),
+            to: "sink".into(),
+            partitioned: false,
+        },
+    ];
+    let plan = JobPlan::compile(job).unwrap();
+    let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+    // "a" matches within the window; "b" has no right counterpart and must
+    // surface as an unmatched row once the watermark passes ts + window.
+    // The trailing rows push both sides' watermarks past the eviction bound
+    // while both edges are still active.
+    let left: Arc<dyn crate::input::Input> = Arc::new(VecInput::new(vec![
+        vec![(100, "a".into())],
+        vec![(6_000, "b".into())],
+        vec![(11_100, "y".into())],
+    ]));
+    let right: Arc<dyn crate::input::Input> = Arc::new(VecInput::new(vec![
+        vec![(5_100, "a".into())],
+        vec![(6_000, "c".into())],
+        vec![(11_100, "z".into())],
+    ]));
+    let output = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: [
+            ("left_source".to_string(), left),
+            ("right_source".to_string(), right),
+        ]
+        .into_iter()
+        .collect(),
+        outputs: [("sink".to_string(), output.clone())].into_iter().collect(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let graph = ExecutionGraphBuilder::default()
+        .build_subgraph(&plan, &task_ids, &adapter, &resource(), None)
+        .unwrap_or_else(|error| panic!("build failed: {error}"));
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    let joined = output.written.lock().unwrap().clone();
+    let total: usize = joined.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total, 2, "one matched pair plus one unmatched left row");
+    // Collect (l_key, r_key) per row across every emitted batch.
+    let mut rows = Vec::new();
+    for batch in &joined {
+        let schema = batch.schema();
+        let l_key = batch
+            .column(schema.index_of("l_key").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let r_key = batch
+            .column(schema.index_of("r_key").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let right = if r_key.is_null(row) {
+                None
+            } else {
+                Some(r_key.value(row).to_owned())
+            };
+            rows.push((l_key.value(row).to_owned(), right));
+        }
+    }
+    // The matched pair keeps both sides; the unmatched left row carries a
+    // null right side.
+    assert!(rows.contains(&("a".to_owned(), Some("a".to_owned()))), "{rows:?}");
+    assert!(rows.contains(&("b".to_owned(), None)), "{rows:?}");
 }
