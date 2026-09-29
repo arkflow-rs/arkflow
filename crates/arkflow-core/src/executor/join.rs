@@ -345,6 +345,12 @@ impl JoinOperator {
         };
         self.left_index = resolve(&self.config.left_from, 0, "left")?;
         self.right_index = resolve(&self.config.right_from, 1, "right")?;
+        if self.left_index == self.right_index {
+            return Err(Error::Config(format!(
+                "join left and right sides resolve to the same input channel {}; declare both sides explicitly",
+                self.left_index
+            )));
+        }
         Ok(self)
     }
 
@@ -1401,6 +1407,25 @@ mod tests {
         };
         assert!(
             error.to_string().contains("parallelism to 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn same_channel_for_both_sides_is_rejected_at_build_time() {
+        // left_from names the second producer while the undeclared right
+        // side falls back to index 1: both sides resolve to channel 1.
+        let mut cfg = config();
+        cfg.left_from = Some("profiles".into());
+        let error = match JoinOperator::new(cfg)
+            .unwrap()
+            .with_input_producers(&["orders".to_string(), "profiles".to_string()])
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected a build-time rejection for a shared channel"),
+        };
+        assert!(
+            error.to_string().contains("same input channel"),
             "{error}"
         );
     }

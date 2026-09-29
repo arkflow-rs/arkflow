@@ -35,9 +35,9 @@
 //! broker container leaks when the `static` holding it is never dropped, and
 //! the leftover keeps host port 9092 allocated so the NEXT run cannot start
 //! its broker. Every test therefore holds a [`BrokerLease`]; the last lease
-//! released removes the container (and the next `broker()` call starts a
-//! fresh one), and `broker()` sweeps leftover testcontainers cp-kafka
-//! containers before starting, which also recovers from crashed runs.
+//! released removes the container (and the next lease starts a fresh one),
+//! and a fresh start first sweeps leftover testcontainers cp-kafka
+//! containers, which also recovers from crashed runs.
 
 use arkflow_core::input::InputConfig;
 use arkflow_core::output::{Output, OutputConfig};
@@ -63,39 +63,34 @@ const CLUSTER_ID: &str = "1RlfgIc1TZWvdfLySKufPw";
 /// host port cannot be dynamic).
 const KAFKA_HOST_PORT: u16 = 9092;
 
-/// Shared broker — started once, reused by every (serial) test to avoid the
+/// Shared broker — started once, reused by every test to avoid the
 /// fixed-port release race between back-to-back containers. Held in a
 /// restart-capable slot: after the last [`BrokerLease`] releases and removes
-/// the container, the next `broker()` call starts a fresh one instead of
-/// reusing the dead handle.
+/// the container, the next `broker_lease()` call starts a fresh one instead
+/// of reusing the dead handle.
 static BROKER: LazyLock<tokio::sync::Mutex<Option<ContainerAsync<GenericImage>>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(None));
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-async fn broker() -> bool {
-    let mut broker = BROKER.lock().await;
-    if broker.is_some() {
-        return true;
-    }
-    if !docker_available() {
-        eprintln!(
-            "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
-        );
-        return false;
-    }
-    sweep_leftover_brokers();
-    *broker = Some(start_broker().await);
-    true
-}
-
-/// RAII lease on the shared broker: every test acquires one after
-/// `broker()` succeeds; when the LAST lease drops, the container is removed
-/// so a reaper-less host does not leak it with host port 9092 still bound.
+/// RAII lease on the shared broker: every test acquires one; when the LAST
+/// lease drops, the container is removed so a reaper-less host does not
+/// leak it with host port 9092 still bound. The counter is incremented
+/// while holding the broker slot lock, and the last-out cleanup re-checks
+/// the counter under that same lock, so a lease can never be counted
+/// against a container the cleanup just removed (or vice versa).
 struct BrokerLease;
 
 async fn broker_lease() -> Option<BrokerLease> {
-    if !broker().await {
-        return None;
+    let mut broker = BROKER.lock().await;
+    if broker.is_none() {
+        if !docker_available() {
+            eprintln!(
+                "skipping kafka_eos tests: Docker is unavailable (no reachable daemon socket)"
+            );
+            return None;
+        }
+        sweep_leftover_brokers();
+        *broker = Some(start_broker().await);
     }
     ACTIVE.fetch_add(1, Ordering::SeqCst);
     Some(BrokerLease)
@@ -103,26 +98,31 @@ async fn broker_lease() -> Option<BrokerLease> {
 
 impl Drop for BrokerLease {
     fn drop(&mut self) {
-        if ACTIVE.fetch_sub(1, Ordering::SeqCst) != 1 {
-            return;
-        }
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
         remove_shared_broker();
     }
 }
 
-/// Remove the shared broker container. `Drop` runs inside the test's async
-/// execution context where blocking is forbidden (`blocking_lock` panics),
-/// so the slot is taken with a bounded `try_lock` spin; the removal itself
-/// is async and runs on a dedicated thread with its own runtime, bounded by
-/// the channel receive so a wedged daemon cannot hang the test run. On
-/// failure the leftover stays behind — harmless, the next run's sweep
-/// removes it. Emptying the slot is what lets a later `broker()` call start
-/// a fresh container.
+/// Remove the shared broker container once no lease remains. `Drop` runs
+/// inside the test's async execution context where blocking is forbidden
+/// (`blocking_lock` panics), so the slot is taken with a bounded `try_lock`
+/// spin; the counter is re-checked under the lock so a concurrently
+/// acquired lease wins over the removal. The removal itself is async and
+/// runs on a dedicated thread with its own runtime, bounded by the channel
+/// receive so a wedged daemon cannot hang the test run. On failure the
+/// leftover stays behind — harmless, the next run's sweep removes it.
+/// Emptying the slot is what lets a later `broker_lease()` call start a
+/// fresh container.
 fn remove_shared_broker() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let container = loop {
         match BROKER.try_lock() {
-            Ok(mut broker) => break broker.take(),
+            Ok(mut broker) => {
+                if ACTIVE.load(Ordering::SeqCst) != 0 {
+                    return;
+                }
+                break broker.take();
+            }
             Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
