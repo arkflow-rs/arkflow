@@ -162,12 +162,15 @@ impl Input for HttpInput {
             .parse()
             .map_err(|e| Error::Config(format!("Invalid address {}: {}", address, e)))?;
 
+        // Bind inside connect so a port conflict fails THIS call: a bind
+        // panic in a detached listener task would leave the input silently
+        // "connected" with no server behind it and no error anywhere.
+        let listener = TcpListener::bind(&addr).await.map_err(|e| {
+            Error::Connection(format!("HTTP input failed to bind {addr}: {e}"))
+        })?;
+
         let server_handle = tokio::spawn(async move {
-            let server = axum::serve(
-                TcpListener::bind(&addr).await.expect("bind error"),
-                app.into_make_service(),
-            );
-            server
+            axum::serve(listener, app.into_make_service())
                 .await
                 .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)))
         });
@@ -189,7 +192,11 @@ impl Input for HttpInput {
             msg.set_input_name(self.input_name.clone());
             Ok((Arc::new(msg), Arc::new(NoopAck)))
         } else {
-            Err(Error::Process("The queue is empty".to_string()))
+            // The channel disconnects only when the listener task (and every
+            // request handler) is gone — surface that as a disconnection so
+            // the engine's reconnect path re-binds instead of reading a
+            // misleading "empty queue" process error forever.
+            Err(Error::Disconnection)
         }
     }
 
@@ -307,6 +314,35 @@ mod tests {
     use serde_json::json;
     use tower::util::ServiceExt;
     // for `oneshot` method
+
+    /// Spec "端口占用使 connect 失败": a port conflict must fail `connect()`
+    /// itself — pre-fix, the bind panicked inside a detached listener task
+    /// and connect still reported success, leaving the input silently
+    /// "connected" with no server behind it.
+    #[tokio::test]
+    async fn port_conflict_fails_connect_instead_of_silent_panic() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let config = HttpInputConfig {
+            address: addr.to_string(),
+            path: "/test".to_string(),
+            cors_enabled: Some(false),
+            auth: None,
+        };
+        let input = HttpInput::new(None, config, None).unwrap();
+
+        let error = input
+            .connect()
+            .await
+            .expect_err("bind conflict must fail connect");
+        let message = error.to_string();
+        assert!(message.contains("bind"), "error names the bind failure: {message}");
+
+        // The input must not be marked connected: read refuses instead of
+        // blocking forever on a queue no server will ever feed.
+        assert!(input.read().await.is_err(), "read must refuse on an unconnected input");
+    }
 
     #[tokio::test]
     async fn test_handle_request_ok() {

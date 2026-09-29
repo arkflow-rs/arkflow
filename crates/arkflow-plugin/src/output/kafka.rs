@@ -613,7 +613,10 @@ pub fn init() -> Result<(), Error> {
 /// metadata columns. Returns the topic-partition list (exclusive next
 /// offsets) and whether any committable position existed; batches without
 /// Kafka source metadata contribute nothing (L3 applies to Kafka→Kafka
-/// flows).
+/// flows). Rows that carry Kafka position metadata but a source topic other
+/// than the group's topic (a fan-in graph merging a second Kafka input into
+/// the same batch) fail the write: folding their offsets into the group
+/// topic would transactionally skip records the group never consumed.
 fn transactional_offsets_for_batches(
     msgs: &[MessageBatchRef],
     group_topic: Option<&str>,
@@ -651,18 +654,42 @@ fn transactional_offsets_for_batches(
                     meta_columns::OFFSET
                 ))
             })?;
-        // Batch metadata carries the partition but not its topic: L3 routes
-        // partitions through the group's single subscribed topic.
-        let topic = group_topic
-            .unwrap_or_default();
+        // Per-row source topics, when the rows carry extended metadata: the
+        // Kafka input records each message's topic under the "topic" key of
+        // `__meta_ext`.
+        let row_topics = msg
+            .record_batch()
+            .column_by_name(meta_columns::EXT)
+            .and_then(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::MapArray>()
+            });
         use datafusion::arrow::array::Array as _;
         for row in 0..msg.record_batch().num_rows() {
             if partitions.is_null(row) || offsets_col.is_null(row) {
                 continue;
             }
+            if let (Some(expected), Some(topics)) = (group_topic, row_topics) {
+                if let Some(source_topic) = ext_map_entry(topics, row, "topic") {
+                    if source_topic != expected {
+                        return Err(Error::Process(format!(
+                            "transactional offsets: batch row carries source topic \
+                             '{source_topic}' but the offset commit group's input is \
+                             subscribed to '{expected}'; committing foreign-topic offsets \
+                             would skip records the group never consumed (fan-in graphs \
+                             must route the second source through its own output)"
+                        )));
+                    }
+                }
+            }
             let partition = partitions.value(row) as i32;
             let next_offset = i64::try_from(offsets_col.value(row).saturating_add(1))
                 .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
+            // Rows validated above all belong to the group's single topic
+            // (or carry no row-level topic metadata at all, in which case
+            // L3 keeps routing partitions through the group topic).
+            let topic = group_topic.unwrap_or_default();
             // Keep the max next-offset per partition (rows arrive ordered,
             // but a merged batch may interleave).
             let updated = match offsets.find_partition(topic, partition) {
@@ -686,6 +713,31 @@ fn transactional_offsets_for_batches(
     Ok((offsets, covered))
 }
 
+/// Read `key` from the row's `__meta_ext` map entries, if the row carries
+/// one. Mirrors the kernel's per-row topic attribution on
+/// `crate::arkflow_core`'s `batch_topic`.
+fn ext_map_entry(
+    map: &datafusion::arrow::array::MapArray,
+    row: usize,
+    key: &str,
+) -> Option<String> {
+    let entries = map.entries();
+    let keys = entries
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()?;
+    let values = entries
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()?;
+    let offsets = map.offsets();
+    let start = offsets.get(row).copied()? as usize;
+    let end = offsets.get(row + 1).copied()? as usize;
+    (start..end).find_map(|index| {
+        (keys.value(index) == key).then(|| values.value(index).to_owned())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +749,112 @@ mod tests {
             temporary: HashMap::new(),
             input_names: RefCell::new(vec![]),
         }
+    }
+
+    /// Build a batch carrying L3 position metadata (`__meta_partition` /
+    /// `__meta_offset`) plus an optional per-row `__meta_ext` map whose
+    /// "topic" key attributes each row to its source topic — the shape the
+    /// Kafka input produces.
+    fn l3_meta_batch(
+        partitions: Vec<u32>,
+        offsets: Vec<u64>,
+        topics: Option<Vec<&str>>,
+    ) -> MessageBatchRef {
+        use arkflow_core::meta_columns;
+        use datafusion::arrow::array::{
+            ArrayRef, MapArray, StringArray, StructArray, UInt32Array, UInt64Array,
+        };
+        use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let mut fields = vec![
+            Field::new(meta_columns::PARTITION, DataType::UInt32, false),
+            Field::new(meta_columns::OFFSET, DataType::UInt64, false),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(partitions)),
+            Arc::new(UInt64Array::from(offsets)),
+        ];
+        if let Some(topics) = topics {
+            use datafusion::arrow::array::Array as _;
+            let keys = StringArray::from(vec!["topic"; topics.len()]);
+            let values = StringArray::from(topics.clone());
+            let entries = StructArray::try_new(
+                datafusion::arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]),
+                vec![Arc::new(keys), Arc::new(values)],
+                None,
+            )
+            .expect("entries struct");
+            let index: Vec<i32> = (0..=topics.len() as i32).collect();
+            let map = MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(ScalarBuffer::from(index)),
+                entries,
+                None,
+                false,
+            )
+            .expect("ext map");
+            fields.push(Field::new(meta_columns::EXT, map.data_type().clone(), true));
+            columns.push(Arc::new(map));
+        }
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )
+        .expect("meta batch");
+        Arc::new(MessageBatch::new_arrow(batch))
+    }
+
+    /// Spec "混入异源 topic 的行显式失败": a fan-in graph merging a second
+    /// Kafka input's rows into the same write batch must fail the write
+    /// instead of folding foreign-topic offsets into the group topic.
+    #[test]
+    fn l3_rejects_rows_from_a_foreign_topic() {
+        let batch = l3_meta_batch(
+            vec![0, 1],
+            vec![10, 20],
+            Some(vec!["orders", "clickstream"]),
+        );
+        let err = match transactional_offsets_for_batches(&[batch], Some("orders")) {
+            Ok(_) => panic!("foreign-topic rows must fail the write"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(message.contains("clickstream"), "error names the conflict: {message}");
+        assert!(message.contains("orders"), "error names the group topic: {message}");
+    }
+
+    /// Rows attributed to the group topic fold into the offset list as
+    /// before.
+    #[test]
+    fn l3_accepts_rows_matching_group_topic() {
+        let batch = l3_meta_batch(
+            vec![0, 1],
+            vec![10, 20],
+            Some(vec!["orders", "orders"]),
+        );
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).expect("accepted");
+        assert!(covered);
+        assert_eq!(offsets.count(), 2, "one entry per partition");
+        for element in offsets.elements() {
+            assert_eq!(element.topic(), "orders");
+        }
+    }
+
+    /// Batches without the ext metadata column keep the legacy attribution
+    /// (partitions route through the group topic).
+    #[test]
+    fn l3_without_ext_topic_keeps_group_topic_attribution() {
+        let batch = l3_meta_batch(vec![3], vec![7], None);
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).expect("accepted");
+        assert!(covered);
+        assert_eq!(offsets.count(), 1);
+        assert_eq!(offsets.elements()[0].topic(), "orders");
     }
 
     /// Spec "Explicit stable transactional identity": the builder rejects

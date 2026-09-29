@@ -244,7 +244,45 @@ pub struct JoinOperator {
     left: Mutex<SideBuffer>,
     right: Mutex<SideBuffer>,
     pending_unmatched: Mutex<PendingUnmatched>,
+    /// Throttled observability for capacity evictions (see
+    /// [`JoinOperator::note_capacity_eviction`]).
+    eviction_log: Mutex<EvictionThrottle>,
 }
+
+/// Capacity evictions must be observable — a silently dropped inner row is a
+/// wrong join result — but a skewed key evicts on every batch, which would
+/// flood the log. The first eviction logs immediately; subsequent lines are
+/// throttled to one per interval and carry the suppressed count.
+#[derive(Default)]
+struct EvictionThrottle {
+    last_log: [Option<std::time::Instant>; 2],
+    suppressed: [u64; 2],
+}
+
+impl EvictionThrottle {
+    /// Decide whether this eviction should emit a warn line, and with which
+    /// suppressed count. Pure with respect to the injected clock so the
+    /// throttling contract stays deterministically testable. The two sides
+    /// throttle independently, so a left eviction never silences the first
+    /// warn about a right eviction.
+    fn should_log(&mut self, index: usize, now: std::time::Instant) -> Option<u64> {
+        self.suppressed[index] += 1;
+        if let Some(last) = self.last_log[index] {
+            if now.duration_since(last) < EVICTION_LOG_INTERVAL {
+                return None;
+            }
+        }
+        let suppressed = self.suppressed[index];
+        self.suppressed[index] = 0;
+        self.last_log[index] = Some(now);
+        Some(suppressed)
+    }
+}
+
+/// Minimum spacing between capacity-eviction warn lines.
+const EVICTION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Keys are truncated to keep the log bounded; 64 chars locate any hot key.
+const EVICTED_KEY_MAX_CHARS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -286,7 +324,36 @@ impl JoinOperator {
             left: Mutex::new(SideBuffer::default()),
             right: Mutex::new(SideBuffer::default()),
             pending_unmatched: Mutex::new(PendingUnmatched::default()),
+            eviction_log: Mutex::new(EvictionThrottle::default()),
         })
+    }
+
+    /// Record a capacity eviction (`max_per_key` exceeded) and warn,
+    /// throttled to one line per [`EVICTION_LOG_INTERVAL`] per operator with
+    /// the suppressed count folded in. Watermark evictions are normal
+    /// semantics and stay silent.
+    fn note_capacity_eviction(&self, side: Side, key: &str) {
+        let index = match side {
+            Side::Left => 0,
+            Side::Right => 1,
+        };
+        let suppressed = self
+            .eviction_log
+            .lock()
+            .expect("join eviction log lock")
+            .should_log(index, std::time::Instant::now());
+        let Some(suppressed) = suppressed else {
+            return;
+        };
+        let truncated: String = key.chars().take(EVICTED_KEY_MAX_CHARS).collect();
+        tracing::warn!(
+            side = side.label(),
+            key = %truncated,
+            max_per_key = self.config.max_per_key,
+            suppressed_since_last_log = suppressed,
+            "join key buffer exceeded max_per_key; the oldest row was capacity-evicted \
+             (inner rows are dropped — raise max_per_key or narrow window/ttl for skewed keys)"
+        );
     }
 
     /// Resolve the left/right channel indices from the chain's inbound
@@ -710,6 +777,10 @@ impl JoinOperator {
                 matched_here,
                 self.config.max_per_key,
             ) {
+                // Capacity evictions are observable for both inner and
+                // outer forms (inner rows are dropped here — invisible data
+                // loss without the warn).
+                self.note_capacity_eviction(side, &key);
                 // Capacity eviction carries no watermark guarantee; outer
                 // forms emit the row as unmatched anyway (at-least-once
                 // artifact, see spec).
@@ -1051,6 +1122,49 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ts.value(0), 200);
+    }
+
+    /// Spec "inner 容量逐出可观测": the eviction throttle logs the first
+    /// eviction immediately, suppresses lines inside the interval (counting
+    /// them), and folds the suppressed count into the next line. Tested
+    /// against the pure decision function with a synthetic clock — a
+    /// subscriber-capturing variant raced with sibling tests' global
+    /// tracing setup under the full parallel suite.
+    #[test]
+    fn eviction_throttle_first_logs_immediately_then_suppresses() {
+        let mut throttle = EvictionThrottle::default();
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(
+            throttle.should_log(0, t0),
+            Some(1),
+            "the first eviction logs immediately with count 1"
+        );
+        assert_eq!(
+            throttle.should_log(0, t0 + std::time::Duration::from_millis(10)),
+            None,
+            "lines inside the interval are suppressed"
+        );
+        assert_eq!(
+            throttle.should_log(0, t0 + std::time::Duration::from_millis(20)),
+            None,
+            "suppression continues for the whole interval"
+        );
+        assert_eq!(
+            throttle.should_log(1, t0 + std::time::Duration::from_millis(30)),
+            Some(1),
+            "the two sides throttle independently"
+        );
+        assert_eq!(
+            throttle.should_log(0, t0 + EVICTION_LOG_INTERVAL),
+            Some(3),
+            "after the interval the line carries the two suppressed evictions"
+        );
+        assert_eq!(
+            throttle.should_log(0, t0 + EVICTION_LOG_INTERVAL + EVICTION_LOG_INTERVAL),
+            Some(1),
+            "the counter resets after each emitted line"
+        );
     }
 
     #[tokio::test]

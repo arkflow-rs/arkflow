@@ -1474,6 +1474,15 @@ pub struct NetworkManager {
     /// receiver drops (and mirror-acks) sequences at or below this mark
     /// instead of double-delivering them.
     delivered_seq: std::sync::Mutex<BTreeMap<EdgeSessionKey, u64>>,
+    /// Per-session-key delivery locks serializing "dedup check → local
+    /// channel send → delivered-seq advance". During a transparent
+    /// reconnect two connections can serve the same key concurrently (the
+    /// old one still parked on a backpressured send); without this lock
+    /// both pass the dedup check for the same sequence, and the old
+    /// connection's late completion overwrites the delivered mark with a
+    /// lower value, letting later replays slip through the dedup.
+    delivery_locks:
+        std::sync::Mutex<BTreeMap<EdgeSessionKey, Arc<tokio::sync::Mutex<()>>>>,
     /// Registration generation per session key, bumped whenever a connection
     /// successfully (re)routes the key. The reconnect grace watcher compares
     /// its snapshot against the current generation to decide whether the
@@ -1658,6 +1667,7 @@ impl NetworkManager {
             legacy_job: std::sync::RwLock::new(None),
             session_receipts: std::sync::Mutex::new(BTreeMap::new()),
             delivered_seq: std::sync::Mutex::new(BTreeMap::new()),
+            delivery_locks: std::sync::Mutex::new(BTreeMap::new()),
             session_registrations: std::sync::Mutex::new(BTreeMap::new()),
             accepted,
             active_connections: std::sync::atomic::AtomicUsize::new(0),
@@ -1799,6 +1809,17 @@ impl NetworkManager {
             .remove(key);
     }
 
+    /// The per-session-key delivery lock (see `delivery_locks`). Shared by
+    /// every connection serving the key, so the check→send→record sequence
+    /// is atomic with respect to overlapping connections.
+    fn delivery_lock(&self, key: &EdgeSessionKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.delivery_locks.lock().expect("delivery lock registry");
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn claim_legacy_job_key(&self, key: JobSessionKey) -> Result<(), Error> {
         let mut current = self.legacy_job.write().expect("legacy job registry lock");
         match current.as_ref() {
@@ -1850,6 +1871,10 @@ impl NetworkManager {
         self.delivered_seq
             .lock()
             .expect("delivered seq lock")
+            .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
+        self.delivery_locks
+            .lock()
+            .expect("delivery lock registry")
             .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
         self.session_registrations
             .lock()
@@ -2648,6 +2673,16 @@ impl NetworkManager {
                             // completing the upstream branch before the local
                             // chain finishes processing would let source
                             // offsets advance past unprocessed data.
+                            // Serialize check→deliver→record per session key:
+                            // during a transparent reconnect the old
+                            // connection can still be parked on a
+                            // backpressured send while the replacement
+                            // replays the same sequences. The lock makes the
+                            // second passer see the first one's delivered
+                            // mark, and the max-update below keeps a late
+                            // completion from regressing it.
+                            let delivery_lock = self.delivery_lock(&route_key);
+                            let _delivery_guard = delivery_lock.lock().await;
                             let duplicate = {
                                 let delivered = self
                                     .delivered_seq
@@ -2683,7 +2718,10 @@ impl NetworkManager {
                                     .delivered_seq
                                     .lock()
                                     .expect("delivered seq lock");
-                                delivered.insert(route_key.clone(), seq);
+                                let mark = delivered.entry(route_key.clone()).or_insert(0);
+                                if seq > *mark {
+                                    *mark = seq;
+                                }
                             }
                         }
                         FrameKind::Signal => {
@@ -4260,6 +4298,108 @@ mod tests {
         );
         // No edge failure surfaced: the reconnect healed the loss.
         if let Ok(failure) = tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async()).await {
+            panic!("unexpected failure: {failure:?}");
+        }
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_connections_neither_double_deliver_nor_regress_the_dedup_mark() {
+        let quad = quad_a_to_b();
+        let reconnect = NetworkManagerConfig {
+            reconnect_attempts: 3,
+            reconnect_grace: std::time::Duration::from_secs(5),
+            ..NetworkManagerConfig::default()
+        };
+        let upstream = NetworkManager::with_config(reconnect.clone()).unwrap();
+        let downstream = NetworkManager::with_config(reconnect).unwrap();
+        upstream.spawn();
+        downstream.spawn();
+        let failures = upstream.failure_receiver();
+
+        // Capacity 1: seq 0 fills the local channel, seq 1 parks the first
+        // connection's delivery inside backpressure — the exact window a
+        // transparent reconnect overlaps with a still-serving old wire.
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(1);
+        downstream.register_inbound(quad, input_tx);
+
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        let (client2, server2) = tokio::io::duplex(64 * 1024);
+        let (client3, server3) = tokio::io::duplex(64 * 1024);
+        let kill1 = KillHandle::default();
+        let kill1_state = kill1.0.clone();
+        let kill2 = KillHandle::default();
+        let kill2_state = kill2.0.clone();
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server1),
+            state: kill1_state,
+        }));
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server2),
+            state: kill2_state,
+        }));
+        downstream.accept_stream(Box::new(server3));
+        let transport = QueuedTransport::of(vec![
+            Box::new(client1),
+            Box::new(client2),
+            Box::new(client3),
+        ]);
+        let edge = upstream.open_edge_deferred(transport, quad);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Three unreceipted frames: seq 0 is delivered (channel now full),
+        // seq 1 parks the old connection's send, seq 2 sits behind it.
+        let branch = Arc::new(RecordingAck::default());
+        for _ in 0..3 {
+            edge.sender
+                .send_async(Envelope::Data(
+                    Arc::new(dictionary_batch(None)),
+                    branch.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        kill1.kill();
+        // The reconnect dials client2 and replays every unreceipted frame
+        // while the old connection's parked send is still in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // Drain with a generous budget: exactly three envelopes (seq 0..=2)
+        // may arrive. The delivery lock serializes the parked send against
+        // the replay, so no sequence enters the local channel twice.
+        for expected in 0..3 {
+            tokio::time::timeout(TEST_PROPAGATION_BUDGET, next_envelope(&input_rx))
+                .await
+                .unwrap_or_else(|_| panic!("expected envelope {expected} to arrive"));
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(800),
+                next_envelope(&input_rx)
+            )
+            .await
+            .is_err(),
+            "overlapping connections must not double-deliver any sequence"
+        );
+
+        // Prove the delivered mark never regressed: nothing was acked, so a
+        // second reconnect replays seq 0..=2 — every frame must be dropped.
+        kill2.kill();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(800),
+                next_envelope(&input_rx)
+            )
+            .await
+            .is_err(),
+            "replay after the overlap must drop every sequence (mark regressed?)"
+        );
+        if let Ok(failure) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async()).await
+        {
             panic!("unexpected failure: {failure:?}");
         }
         upstream.shutdown();

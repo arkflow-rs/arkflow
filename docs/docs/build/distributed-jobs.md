@@ -503,7 +503,13 @@ Semantics and boundaries:
   eviction also emits the evicted row as unmatched — without a watermark
   guarantee, so a later match can double-emit (at-least-once artifact).
   Processing-time sources without watermarks rely on the capacity bound —
-  prefer event-time sources for joins.
+  prefer event-time sources for joins. Capacity evictions are observable:
+  each one emits a throttled `warn` log (side, key, buffer depth,
+  `max_per_key`, and the suppressed count within the throttle interval).
+  Inner-side capacity evictions drop the row, so the warn is the only
+  trace of data that fell outside the join — a sustained stream of these
+  warns on a hot key means `max_per_key` (or the window/ttl bounds) is too
+  small for the skew.
 - Recovery rebuilds the buffers (and per-row matched flags) from checkpoint
   replay; there is no separate join snapshot. The chain watermark is the
   minimum across both sides, so replay cannot produce a false unmatched row

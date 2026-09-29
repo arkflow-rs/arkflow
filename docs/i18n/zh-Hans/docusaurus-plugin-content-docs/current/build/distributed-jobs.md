@@ -274,7 +274,7 @@ jobs:
 - 左右行在 key 相等且事件时间差 ≤ `window_ms` 时匹配。匹配即时发射,与 `join_type` 无关(at-least-once——恢复后重放要求下游容忍重复)。
 - 输出列为原始左列加前缀 `l_`、右列加前缀 `r_`,外加 `join_key`。outer 模式下,可能在未匹配发射中全为 null 的侧在输出 schema 中声明为 nullable(`left_outer` 为 `r_*`,`right_outer` 为 `l_*`,`full_outer` 两侧);`inner` 输出 schema 保持不变。
 - `left_outer`/`right_outer`/`full_outer` 下,outer 侧从未匹配的行在链级 watermark 越过 `timestamp + window_ms + ttl_ms` 时发射,对侧列全为 null。匹配过的行不会再作为未匹配发射。发射需要对侧 schema:对侧尚无数据时,被逐出行暂存于有界队列(每侧 `max_per_key`,超限丢最旧),schema 已知后补发。无 watermark 的 processing-time 源永不发射未匹配行——outer join 建议使用事件时间源。
-- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。outer 模式下容量逐出同样把被逐出行作为未匹配发射——无 watermark 保证,其后的匹配可能双发(at-least-once 附属语义)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。
+- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。outer 模式下容量逐出同样把被逐出行作为未匹配发射——无 watermark 保证,其后的匹配可能双发(at-least-once 附属语义)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。容量逐出可观测:每次容量逐出会发出节流后的 `warn` 日志(含侧别、key、缓冲深度、`max_per_key` 与节流窗口内的累计次数)。inner 侧容量逐出直接丢弃该行,warn 是这些落在 join 之外的数据的唯一痕迹——热点 key 上持续出现该 warn 意味着 `max_per_key`(或 window/ttl 界)对倾斜度而言过小。
 - 恢复时缓冲(含逐行 matched 标记)由 checkpoint 重放重建,无独立 join 快照。链级 watermark 取两侧最小值,除既有迟到契约外,重放不会产生「假未匹配」。
 - 每侧 schema 必须在流生命周期内保持稳定;每侧上游算子必须以单子任务喂入 join——多子任务侧在图构建期即失败,并指引把上游并行度设为 1。
 - 不支持:temporal(维表)join、非 equi-join、跨节点 shuffle join(join 算子与两条上游边共置单节点)。
