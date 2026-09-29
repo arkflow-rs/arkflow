@@ -5,6 +5,7 @@ pub mod postgres;
 pub mod sqlite;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -382,6 +383,11 @@ pub enum StorageError {
     IdempotencyKeyReused,
     #[error("unsupported backend operation: {0}")]
     Unsupported(&'static str),
+    #[error("stale leader: claimed epoch {claimed_epoch}, current lease epoch {current_epoch}")]
+    StaleLeader {
+        claimed_epoch: u64,
+        current_epoch: u64,
+    },
     #[error("postgres pool error: {0}")]
     Pool(#[from] sqlx::Error),
 }
@@ -668,7 +674,209 @@ enum StorageCommand {
         holder: String,
         now_ms: u64,
         response: oneshot::Sender<Result<bool, StorageError>>,
+    },    /// Write-fencing envelope: execute the inner command only when the
+    /// caller's claimed lease epoch (captured at send time) still matches
+    /// the lease row's current epoch at execution time.
+    Fenced {
+        claimed_epoch: u64,
+        command: Box<StorageCommand>,
     },
+
+}
+
+impl StorageCommand {
+    /// Deliver a terminal error to the command's response channel WITHOUT
+    /// executing it (stale-leader fencing). Every command variant carries a
+    /// `response` oneshot; a missing arm is a compile error, which forces
+    /// new variants to decide their fencing classification.
+    fn nack(self, error: StorageError) {
+        match self {
+            Self::UpsertJob { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateJobWithExpectedGeneration { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetJob { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListJobs { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpsertJobVersion { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListJobVersions { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateJob { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateJobObservation { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateJobDesiredState { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpsertJobCheckpoint { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListJobCheckpoints { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::DeleteJobCheckpoint { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpsertNode { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ResetObservedCursors { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::SetDesired { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetDesired { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetIntent { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListIntents { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RecoverReconciliation { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::WakeNode { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListEvents { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneEvents { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneOperationHistory { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneJobCheckpointRecords { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneAuditEvents { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneProcessedOutbox { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneTerminalAttempts { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ClaimAttempt { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::MarkAttemptDispatched { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ExpireAttempts { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::CompleteAttempt { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RecordObserved { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ClaimOutbox { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::MarkOutboxProcessed { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::SetNodeMaintenance { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetNodeMaintenance { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::OperationalAggregates { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RecordAudit { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListAudit { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::CreateRollout { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::CreateRolloutWithContent { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetRollout { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListRolloutTargets { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateRollout { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpdateRolloutTarget { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetConfigVersionContent { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RecoverRollouts { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListRollouts { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpsertJobUpgrade { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::TransitionJobUpgrade { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetJobUpgrade { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RecoverJobUpgrades { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListJobUpgrades { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::PruneJobUpgrades { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::UpsertOperation { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::GetOperation { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListOperations { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ListJobStartOperations { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::TryAcquireHubLease { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::RenewHubLease { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::ReleaseHubLease { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::Fenced { command, .. } => command.nack(error),
+        }
+    }
 }
 
 /// Snapshot of the singleton control-plane lease row (`cp_hub_lease`).
@@ -698,14 +906,72 @@ pub enum HubLeaseRenew {
 #[derive(Clone)]
 pub struct StorageActor {
     sender: mpsc::Sender<StorageCommand>,
+    /// The process's current leadership claim (lease epoch while leader,
+    /// 0 otherwise). Fenced senders capture this at send time; the actor
+    /// verifies it against the lease row at execution time.
+    leadership_epoch: Arc<AtomicU64>,
 }
 
 impl StorageActor {
     pub fn start(store: ControlPlaneStore, capacity: usize) -> Self {
         let (sender, mut receiver) = mpsc::channel(capacity.max(1));
+        let leadership_epoch = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                match command {
+                dispatch(&store, command).await;
+            }
+        });
+        Self {
+            sender,
+            leadership_epoch,
+        }
+    }
+}
+
+/// Execute one storage command. The `Fenced` envelope verifies the caller's
+/// claimed lease epoch against the lease row BEFORE the inner command runs:
+/// a superseded leader's mutations are rejected with `StaleLeader` and
+/// produce no durable side effect. No lease row (HA disabled) passes
+/// through unchanged.
+async fn dispatch(store: &ControlPlaneStore, command: StorageCommand) {
+    // Peel fencing envelopes iteratively (an async fn cannot recurse
+    // without boxing): a stale claim nack's the inner command and stops.
+    let command = {
+        let mut command = command;
+        loop {
+            match command {
+                StorageCommand::Fenced {
+                    claimed_epoch,
+                    command: inner,
+                } => match store.current_lease_epoch().await {
+                    Ok(None) => {
+                        command = *inner;
+                        continue;
+                    }
+                    Ok(Some(current)) if current == claimed_epoch => {
+                        command = *inner;
+                        continue;
+                    }
+                    Ok(Some(current)) => {
+                        inner.nack(StorageError::StaleLeader {
+                            claimed_epoch,
+                            current_epoch: current,
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        inner.nack(error);
+                        return;
+                    }
+                },
+                unwrapped => break unwrapped,
+            }
+        }
+    };
+    match command {
+        // Unreachable in practice (the envelope peel above consumed any
+        // `Fenced`), but the match must stay exhaustive.
+        StorageCommand::Fenced { .. } => {}
                     StorageCommand::UpsertJob { job, response } => {
                         let _ = response.send(store.upsert_job(job).await);
                     }
@@ -1081,15 +1347,35 @@ impl StorageActor {
                         let _ = response.send(store.release_hub_lease(&holder, now_ms).await);
                     }
                 }
-            }
-        });
-        Self { sender }
+}
+
+impl StorageActor {
+
+    /// The current leadership claim, for the election loop to keep in sync
+    /// (lease epoch while leader, 0 on losing/never-holding the lease).
+    pub fn leadership_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.leadership_epoch)
+    }
+
+    /// Send one mutating command behind the write-fencing envelope: the
+    /// claimed epoch is captured NOW, the actor checks it against the
+    /// lease row when the command executes.
+    async fn send_fenced(
+        &self,
+        command: StorageCommand,
+    ) -> Result<(), mpsc::error::SendError<StorageCommand>> {
+        let claimed_epoch = self.leadership_epoch.load(std::sync::atomic::Ordering::Acquire);
+        self.sender
+            .send(StorageCommand::Fenced {
+                claimed_epoch,
+                command: Box::new(command),
+            })
+            .await
     }
 
     pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertJob { job, response })
+        self.send_fenced(StorageCommand::UpsertJob { job, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1101,8 +1387,7 @@ impl StorageActor {
         expected_generation: u64,
     ) -> Result<JobRecord, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateJobWithExpectedGeneration {
+        self.send_fenced(StorageCommand::UpdateJobWithExpectedGeneration {
                 job,
                 expected_generation,
                 response,
@@ -1138,8 +1423,7 @@ impl StorageActor {
 
     pub async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertJobVersion { record, response })
+        self.send_fenced(StorageCommand::UpsertJobVersion { record, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1172,8 +1456,7 @@ impl StorageActor {
         last_error: Option<String>,
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateJob {
+        self.send_fenced(StorageCommand::UpdateJob {
                 job_id: job_id.into(),
                 desired_state,
                 observed_state,
@@ -1200,8 +1483,7 @@ impl StorageActor {
         last_error: Option<String>,
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateJobObservation {
+        self.send_fenced(StorageCommand::UpdateJobObservation {
                 job_id: job_id.into(),
                 observed_state: observed_state.into(),
                 convergence: convergence.into(),
@@ -1223,8 +1505,7 @@ impl StorageActor {
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateJobDesiredState {
+        self.send_fenced(StorageCommand::UpdateJobDesiredState {
                 job_id: job_id.into(),
                 desired_state: desired_state.into(),
                 expected_generation,
@@ -1240,8 +1521,7 @@ impl StorageActor {
         record: JobCheckpointRecord,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertJobCheckpoint { record, response })
+        self.send_fenced(StorageCommand::UpsertJobCheckpoint { record, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1268,8 +1548,7 @@ impl StorageActor {
         checkpoint_id: impl Into<String>,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::DeleteJobCheckpoint {
+        self.send_fenced(StorageCommand::DeleteJobCheckpoint {
                 job_id: job_id.into(),
                 checkpoint_id: checkpoint_id.into(),
                 response,
@@ -1284,8 +1563,7 @@ impl StorageActor {
         mutation: DesiredMutation,
     ) -> Result<IntentRecord, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::SetDesired { mutation, response })
+        self.send_fenced(StorageCommand::SetDesired { mutation, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1293,8 +1571,7 @@ impl StorageActor {
 
     pub async fn upsert_node(&self, mutation: NodeMutation) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertNode { mutation, response })
+        self.send_fenced(StorageCommand::UpsertNode { mutation, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1305,8 +1582,7 @@ impl StorageActor {
         node_id: impl Into<String>,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::ResetObservedCursors {
+        self.send_fenced(StorageCommand::ResetObservedCursors {
                 node_id: node_id.into(),
                 response,
             })
@@ -1321,8 +1597,7 @@ impl StorageActor {
         now_ms: u64,
     ) -> Result<Option<OutboxRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::ClaimOutbox {
+        self.send_fenced(StorageCommand::ClaimOutbox {
                 worker_id: worker_id.into(),
                 now_ms,
                 response,
@@ -1381,8 +1656,7 @@ impl StorageActor {
 
     pub async fn recover_reconciliation(&self, now_ms: u64) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::RecoverReconciliation { now_ms, response })
+        self.send_fenced(StorageCommand::RecoverReconciliation { now_ms, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1394,8 +1668,7 @@ impl StorageActor {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::WakeNode {
+        self.send_fenced(StorageCommand::WakeNode {
                 node_id: node_id.into(),
                 now_ms,
                 response,
@@ -1422,8 +1695,7 @@ impl StorageActor {
 
     pub async fn prune_events(&self, retain: usize) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneEvents { retain, response })
+        self.send_fenced(StorageCommand::PruneEvents { retain, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1439,8 +1711,7 @@ impl StorageActor {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneOperationHistory {
+        self.send_fenced(StorageCommand::PruneOperationHistory {
                 older_than_ms,
                 max_retained,
                 response,
@@ -1458,8 +1729,7 @@ impl StorageActor {
         older_than_ms: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneJobCheckpointRecords {
+        self.send_fenced(StorageCommand::PruneJobCheckpointRecords {
                 older_than_ms,
                 response,
             })
@@ -1474,8 +1744,7 @@ impl StorageActor {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneAuditEvents {
+        self.send_fenced(StorageCommand::PruneAuditEvents {
                 older_than_ms,
                 max_retained,
                 response,
@@ -1494,8 +1763,7 @@ impl StorageActor {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneProcessedOutbox {
+        self.send_fenced(StorageCommand::PruneProcessedOutbox {
                 older_than_ms,
                 max_retained,
                 response,
@@ -1514,8 +1782,7 @@ impl StorageActor {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneTerminalAttempts {
+        self.send_fenced(StorageCommand::PruneTerminalAttempts {
                 older_than_ms,
                 max_retained,
                 response,
@@ -1530,8 +1797,7 @@ impl StorageActor {
         intent_id: impl Into<String>,
     ) -> Result<Option<AttemptRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::ClaimAttempt {
+        self.send_fenced(StorageCommand::ClaimAttempt {
                 intent_id: intent_id.into(),
                 response,
             })
@@ -1542,8 +1808,7 @@ impl StorageActor {
 
     pub async fn record_observed(&self, mutation: ObservedMutation) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::RecordObserved { mutation, response })
+        self.send_fenced(StorageCommand::RecordObserved { mutation, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1555,8 +1820,7 @@ impl StorageActor {
         expires_at_ms: u64,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::MarkAttemptDispatched {
+        self.send_fenced(StorageCommand::MarkAttemptDispatched {
                 attempt_id: attempt_id.into(),
                 expires_at_ms,
                 response,
@@ -1568,8 +1832,7 @@ impl StorageActor {
 
     pub async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::ExpireAttempts { now_ms, response })
+        self.send_fenced(StorageCommand::ExpireAttempts { now_ms, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1582,8 +1845,7 @@ impl StorageActor {
         failure_class: Option<String>,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::CompleteAttempt {
+        self.send_fenced(StorageCommand::CompleteAttempt {
                 attempt_id: attempt_id.into(),
                 state: state.into(),
                 failure_class,
@@ -1600,8 +1862,7 @@ impl StorageActor {
         now_ms: u64,
     ) -> Result<bool, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::SetNodeMaintenance {
+        self.send_fenced(StorageCommand::SetNodeMaintenance {
                 mutation,
                 now_ms,
                 response,
@@ -1644,8 +1905,7 @@ impl StorageActor {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::MarkOutboxProcessed {
+        self.send_fenced(StorageCommand::MarkOutboxProcessed {
                 outbox_id,
                 now_ms,
                 response,
@@ -1657,8 +1917,7 @@ impl StorageActor {
 
     pub async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::RecordAudit { record, response })
+        self.send_fenced(StorageCommand::RecordAudit { record, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1685,8 +1944,7 @@ impl StorageActor {
         targets: Vec<RolloutTargetRecord>,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::CreateRollout {
+        self.send_fenced(StorageCommand::CreateRollout {
                 rollout,
                 targets,
                 response,
@@ -1704,8 +1962,7 @@ impl StorageActor {
         created_by: Option<String>,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::CreateRolloutWithContent {
+        self.send_fenced(StorageCommand::CreateRolloutWithContent {
                 rollout,
                 targets,
                 content: content.into(),
@@ -1755,8 +2012,7 @@ impl StorageActor {
         updated_at_ms: u64,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateRollout {
+        self.send_fenced(StorageCommand::UpdateRollout {
                 rollout_id: rollout_id.into(),
                 state: state.into(),
                 current_batch,
@@ -1773,8 +2029,7 @@ impl StorageActor {
         update: RolloutTargetUpdate,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpdateRolloutTarget { update, response })
+        self.send_fenced(StorageCommand::UpdateRolloutTarget { update, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1797,8 +2052,7 @@ impl StorageActor {
 
     pub async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::RecoverRollouts { response })
+        self.send_fenced(StorageCommand::RecoverRollouts { response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1815,8 +2069,7 @@ impl StorageActor {
 
     pub async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertJobUpgrade {
+        self.send_fenced(StorageCommand::UpsertJobUpgrade {
                 record,
                 response,
             })
@@ -1831,8 +2084,7 @@ impl StorageActor {
         expected_phase: impl Into<String>,
     ) -> Result<bool, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::TransitionJobUpgrade {
+        self.send_fenced(StorageCommand::TransitionJobUpgrade {
                 record,
                 expected_phase: expected_phase.into(),
                 response,
@@ -1859,8 +2111,7 @@ impl StorageActor {
 
     pub async fn recover_job_upgrades(&self) -> Result<Vec<JobUpgradeRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::RecoverJobUpgrades { response })
+        self.send_fenced(StorageCommand::RecoverJobUpgrades { response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -1887,8 +2138,7 @@ impl StorageActor {
         max_retained: i64,
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::PruneJobUpgrades {
+        self.send_fenced(StorageCommand::PruneJobUpgrades {
                 older_than_ms,
                 max_retained,
                 response,
@@ -1903,8 +2153,7 @@ impl StorageActor {
         operation: PersistedOperation,
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::UpsertOperation {
+        self.send_fenced(StorageCommand::UpsertOperation {
                 operation,
                 response,
             })
@@ -2211,6 +2460,9 @@ job_id: &str,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError>;
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError>;
+    /// Current lease epoch for write fencing. `None` = no lease row (HA
+    /// disabled): fenced commands pass through unchanged.
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError>;
 }
 
 #[derive(Clone)]
@@ -2795,6 +3047,12 @@ checkpoint_id: &str,
             Self::Postgres(backend) => StorageBackend::release_hub_lease(backend, holder, now_ms).await,
         }
     }
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::current_lease_epoch(backend).await,
+            Self::Postgres(backend) => StorageBackend::current_lease_epoch(backend).await,
+        }
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2895,6 +3153,82 @@ mod tests {
             .await
             .unwrap();
         assert!(store.get_job_upgrade("job-upgrade-1").await.unwrap().is_none());
+    }
+
+    fn audit_row(event: u64) -> AuditRecord {
+        AuditRecord {
+            event_id: 0,
+            actor: Some("fencing-test".into()),
+            action: format!("probe.{event}"),
+            resource_type: "probe".into(),
+            resource_id: Some(format!("probe-{event}")),
+            node_id: None,
+            stream_id: None,
+            correlation_id: None,
+            outcome: "ok".into(),
+            failure_code: None,
+            message: None,
+            occurred_at_ms: event,
+        }
+    }
+
+    /// Write fencing: fenced commands carry the sender's claimed lease
+    /// epoch; the actor verifies it against the lease row at execution time.
+    /// No lease row (HA disabled) passes everything; a live lease row only
+    /// accepts the matching claim; lease operations themselves are exempt.
+    #[tokio::test]
+    async fn fenced_writes_reject_stale_leaders() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let actor = StorageActor::start(store.clone(), 16);
+
+        // No lease row yet: any claim passes, behaviour identical to a
+        // deployment without HA.
+        actor.leadership_epoch().store(7, Ordering::Release);
+        actor.record_audit(audit_row(1)).await.unwrap();
+        assert_eq!(store.current_lease_epoch().await.unwrap(), None);
+
+        // hub-a acquires (epoch 1) through the UNfenced lease operation.
+        assert_eq!(
+            actor.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
+
+        // The leader with the matching claim writes fine.
+        actor.leadership_epoch().store(1, Ordering::Release);
+        actor.record_audit(audit_row(2)).await.unwrap();
+
+        // A standby (claim 0) is fenced: no durable side effect.
+        actor.leadership_epoch().store(0, Ordering::Release);
+        assert!(matches!(
+            actor.record_audit(audit_row(3)).await,
+            Err(StorageError::StaleLeader { claimed_epoch: 0, current_epoch: 1 })
+        ));
+
+        // Takeover by hub-b past expiry bumps the epoch to 2; hub-a's old
+        // claim (still 1) is now stale — the exact zombie-leader window.
+        assert_eq!(
+            actor.try_acquire_hub_lease("hub-b", 1_000, 2_000).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 2 }
+        );
+        // Restore hub-a's stale leader claim (it has not noticed yet).
+        actor.leadership_epoch().store(1, Ordering::Release);
+        let before = actor.list_audit(None::<String>).await.unwrap().len();
+        assert!(matches!(
+            actor.record_audit(audit_row(4)).await,
+            Err(StorageError::StaleLeader { claimed_epoch: 1, current_epoch: 2 })
+        ));
+        assert_eq!(
+            actor.list_audit(None::<String>).await.unwrap().len(),
+            before,
+            "fenced writes must leave no durable side effect"
+        );
+
+        // The new leader (claim 2) writes again; reads stayed unfenced
+        // throughout.
+        actor.leadership_epoch().store(2, Ordering::Release);
+        actor.record_audit(audit_row(5)).await.unwrap();
+        assert_eq!(actor.list_audit(None::<String>).await.unwrap().len(), before + 1);
     }
 
     /// The hub-lease contract every backend must satisfy: expiry takeover

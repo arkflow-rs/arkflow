@@ -2114,6 +2114,20 @@ impl StorageBackend for PostgresBackend {
             Ok(updated == 1)
         }
     }
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT epoch FROM cp_hub_lease WHERE id = 1",
+                    binds![],
+                    |row| row.get::<i64>(0),
+                )
+                .await
+                .optional()
+                .map(|epoch| epoch.map(|value| value.max(0) as u64))
+        }
+    }
     async fn operational_aggregates(
         &self,
         now_ms: u64,

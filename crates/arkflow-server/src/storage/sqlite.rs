@@ -1555,6 +1555,20 @@ impl SqliteBackend {
         .map(|updated| updated == 1)
     }
 
+    /// The current lease epoch for write fencing: `None` when no lease row
+    /// exists (HA disabled) — fenced commands pass through unchanged.
+    pub fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        self.with_connection(|connection| {
+            use rusqlite::OptionalExtension;
+            connection
+                .query_row("SELECT epoch FROM cp_hub_lease WHERE id = 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+        })
+        .map(|epoch| epoch.map(|value| value.max(0) as u64))
+    }
+
     pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -2625,6 +2639,9 @@ node_id: Option<&str>,
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
         self.release_hub_lease(holder, now_ms)
+    }
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        self.current_lease_epoch()
     }
     async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)
