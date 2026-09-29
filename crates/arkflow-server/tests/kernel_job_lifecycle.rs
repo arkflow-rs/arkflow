@@ -183,12 +183,12 @@ rescale: false,
     };
     let state_dir = tempfile_dir();
     let state: Arc<dyn StateBackend> = Arc::new(RedbStateBackend::open(state_dir, 1).unwrap());
-    let mut resource = Resource {
+    let resource = Resource {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None)
         .unwrap();
     let inputs = graph
         .chains
@@ -217,9 +217,9 @@ rescale: false,
     assert_eq!(positions.len(), 1);
     assert!(positions[0].offset > 0, "source must have read batches");
 
-    let written_after_snapshot = adapter.output.written.lock().unwrap().clone();
+    let written_after_snapshot = *adapter.output.written.lock().unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let written_later = adapter.output.written.lock().unwrap().clone();
+    let written_later = *adapter.output.written.lock().unwrap();
     assert!(
         written_later > written_after_snapshot,
         "data must continue flowing after the snapshot (got {written_after_snapshot} then {written_later})"
@@ -308,12 +308,12 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
         }),
         output: Arc::new(CollectOutput::default()),
     };
-    let mut resource = Resource {
+    let resource = Resource {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None)
         .unwrap();
     let inputs = graph
         .chains
@@ -346,9 +346,9 @@ async fn snapshot_failure_fails_checkpoint_but_data_continues() {
         "injected snapshot failure must surface"
     );
     // Data continues after the failed checkpoint.
-    let after = adapter.output.written.lock().unwrap().clone();
+    let after = *adapter.output.written.lock().unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let later = adapter.output.written.lock().unwrap().clone();
+    let later = *adapter.output.written.lock().unwrap();
     assert!(
         later > after,
         "data must keep flowing after a failed checkpoint ({after} → {later})"
@@ -420,12 +420,12 @@ async fn recovery_restores_positions_before_new_reads() {
     };
     let state_dir = tempfile_dir();
     let state: Arc<dyn StateBackend> = Arc::new(RedbStateBackend::open(state_dir, 1).unwrap());
-    let mut resource = Resource {
+    let resource = Resource {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     let graph = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None)
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None)
         .unwrap();
     let inputs = graph
         .chains

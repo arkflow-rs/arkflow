@@ -87,7 +87,7 @@ impl From<&Option<u64>> for PgVal {
 }
 impl From<&Option<i64>> for PgVal {
     fn from(value: &Option<i64>) -> Self {
-        value.map(|v| PgVal::Int(v)).unwrap_or(PgVal::Null)
+        value.map(PgVal::Int).unwrap_or(PgVal::Null)
     }
 }
 impl From<&Option<u32>> for PgVal {

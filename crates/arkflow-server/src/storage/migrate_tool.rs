@@ -207,6 +207,71 @@ pub async fn migrate_sqlite_to_postgres(
     Ok(report)
 }
 
+/// Reorder rows so that a row never precedes the row its `parent_column`
+/// references. Rows referencing missing parents (dangling foreign keys are
+/// possible in SQLite when constraints were disabled) keep their relative
+/// order — the PostgreSQL copy surfaces the violation as a migration error
+/// instead of silently reordering past it.
+fn order_parents_first(
+    columns: &[String],
+    rows: Vec<Vec<PgVal>>,
+    parent_column: &str,
+) -> Vec<Vec<PgVal>> {
+    let Some(key_index) = columns
+        .iter()
+        .position(|column| column == "config_version_id" || column == "intent_id")
+    else {
+        return rows;
+    };
+    let Some(parent_index) = columns.iter().position(|column| column == parent_column) else {
+        return rows;
+    };
+    let key_of = |row: &Vec<PgVal>| -> Option<String> {
+        match row.get(key_index) {
+            Some(PgVal::Text(key)) => Some(key.clone()),
+            _ => None,
+        }
+    };
+    let parent_of = |row: &Vec<PgVal>| -> Option<String> {
+        match row.get(parent_index) {
+            Some(PgVal::Text(key)) => Some(key.clone()),
+            _ => None, // NULL parent: root row
+        }
+    };
+    // All present keys: a parent reference that no row satisfies is
+    // dangling and never blocks emission.
+    let present: std::collections::BTreeSet<String> =
+        rows.iter().filter_map(key_of).collect();
+    let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pending: std::collections::VecDeque<Vec<PgVal>> = rows.into();
+    let mut ordered: Vec<Vec<PgVal>> = Vec::with_capacity(pending.len());
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let scan: Vec<Vec<PgVal>> = pending.drain(..).collect();
+        let mut remaining: Vec<Vec<PgVal>> = Vec::with_capacity(scan.len());
+        for row in scan {
+            let blocked = parent_of(&row)
+                .filter(|parent| present.contains(parent))
+                .is_some_and(|parent| !emitted.contains(&parent));
+            if blocked {
+                remaining.push(row);
+            } else {
+                if let Some(key) = key_of(&row) {
+                    emitted.insert(key);
+                }
+                ordered.push(row);
+                progress = true;
+            }
+        }
+        pending = remaining.into();
+    }
+    // Cycles or deep chains that made no progress in the last pass keep
+    // their order at the tail; the copy surfaces any real violation.
+    ordered.extend(pending);
+    ordered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,69 +381,4 @@ mod tests {
             .expect("migrated job present");
         assert_eq!(job.generation, 3);
     }
-}
-
-/// Reorder rows so that a row never precedes the row its `parent_column`
-/// references. Rows referencing missing parents (dangling foreign keys are
-/// possible in SQLite when constraints were disabled) keep their relative
-/// order — the PostgreSQL copy surfaces the violation as a migration error
-/// instead of silently reordering past it.
-fn order_parents_first(
-    columns: &[String],
-    rows: Vec<Vec<PgVal>>,
-    parent_column: &str,
-) -> Vec<Vec<PgVal>> {
-    let Some(key_index) = columns
-        .iter()
-        .position(|column| column == "config_version_id" || column == "intent_id")
-    else {
-        return rows;
-    };
-    let Some(parent_index) = columns.iter().position(|column| column == parent_column) else {
-        return rows;
-    };
-    let key_of = |row: &Vec<PgVal>| -> Option<String> {
-        match row.get(key_index) {
-            Some(PgVal::Text(key)) => Some(key.clone()),
-            _ => None,
-        }
-    };
-    let parent_of = |row: &Vec<PgVal>| -> Option<String> {
-        match row.get(parent_index) {
-            Some(PgVal::Text(key)) => Some(key.clone()),
-            _ => None, // NULL parent: root row
-        }
-    };
-    // All present keys: a parent reference that no row satisfies is
-    // dangling and never blocks emission.
-    let present: std::collections::BTreeSet<String> =
-        rows.iter().filter_map(key_of).collect();
-    let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut pending: std::collections::VecDeque<Vec<PgVal>> = rows.into();
-    let mut ordered: Vec<Vec<PgVal>> = Vec::with_capacity(pending.len());
-    let mut progress = true;
-    while progress {
-        progress = false;
-        let scan: Vec<Vec<PgVal>> = pending.drain(..).collect();
-        let mut remaining: Vec<Vec<PgVal>> = Vec::with_capacity(scan.len());
-        for row in scan {
-            let blocked = parent_of(&row)
-                .filter(|parent| present.contains(parent))
-                .is_some_and(|parent| !emitted.contains(&parent));
-            if blocked {
-                remaining.push(row);
-            } else {
-                if let Some(key) = key_of(&row) {
-                    emitted.insert(key);
-                }
-                ordered.push(row);
-                progress = true;
-            }
-        }
-        pending = remaining.into();
-    }
-    // Cycles or deep chains that made no progress in the last pass keep
-    // their order at the tail; the copy surfaces any real violation.
-    ordered.extend(pending);
-    ordered
 }

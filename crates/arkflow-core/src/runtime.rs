@@ -594,12 +594,12 @@ impl RuntimeManager {
                 }
             };
             let build_result = async {
-                let mut resource = adapter.build_resource()?;
+                let resource = adapter.build_resource()?;
                 let plan = crate::job::JobPlan::compile(spec.clone())?;
                 crate::executor::graph::ExecutionGraphBuilder::default().build(
                     &plan,
                     &adapter,
-                    &mut resource,
+                    &resource,
                 )?;
                 Ok::<(), Error>(())
             }

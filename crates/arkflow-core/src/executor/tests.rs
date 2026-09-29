@@ -395,9 +395,11 @@ fn sink_operator(id: &str, error_sink: bool) -> OperatorSpec {
         kind: OperatorKind::Sink,
         stateful: false,
         key_field: None,
-        config: error_sink
-            .then(|| serde_json::json!({"__arkflow_error_sink": true}))
-            .unwrap_or_else(|| serde_json::json!({})),
+        config: if error_sink {
+            serde_json::json!({"__arkflow_error_sink": true})
+        } else {
+            serde_json::json!({})
+        },
     }
 }
 
@@ -1584,7 +1586,7 @@ fn data_envelope(value: i64) -> Envelope {
 #[test]
 fn aligner_buffers_until_all_inputs_barrier() {
     let mut aligner = Aligner::new(2, 100);
-    assert!(aligner.is_aligning() == false);
+    assert!(!aligner.is_aligning());
     // Input 0 barrier arrives; input 1 data must buffer.
     assert!(aligner.observe(0, barrier("cp-1")).unwrap().is_none());
     assert!(aligner.is_aligning());
@@ -1799,12 +1801,12 @@ async fn coordinator_completes_only_after_all_participants() {
     // First participant reports; checkpoint stays incomplete (no error, still running).
     report_tx.send(report("source-0", "cp-9")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(handle.is_finished() == false);
+    assert!(!handle.is_finished());
     // Second participant with a different barrier id: the coordinator rejects
     // and records the error instead of completing.
     report_tx.send(report("m-0", "cp-OTHER")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(handle.is_finished() == false);
+    assert!(!handle.is_finished());
     cancellation.cancel();
     handle.await.unwrap();
 }
@@ -2275,7 +2277,7 @@ async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
     let output = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
-        output,
+        output: output.clone(),
         processor: Arc::new(PassThroughProcessor),
     };
     let plan = JobPlan::compile(spec(
@@ -2298,7 +2300,16 @@ async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait until a batch has physically reached the sink before firing the
+    // checkpoint: the per-chain `batches_in` metric and the sealed position
+    // then trail a proven event instead of racing a 20ms startup guess.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while output.written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("no batch reached the sink before the checkpoint");
 
     let (snapshot, positions, watermarks) =
         tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot())
@@ -2667,13 +2678,13 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn crate::state::StateBackend> =
         Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
-    let mut resource = resource();
+    let resource = resource();
     // Full assignment (all tasks, both subtasks) mirrors the legacy test:
     // the source has 2 tasks and the input cannot pin partitions.
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
     let result = ExecutionGraphBuilder::default()
         .with_state(backend)
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None);
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None);
     assert!(
         matches!(&result, Err(Error::Config(message)) if message.contains("does not support partitioned")),
         "expected partition guard failure, got {}",
@@ -3127,32 +3138,6 @@ fn map_source_operator(id: &str) -> OperatorSpec {
     }
 }
 
-/// A sink with a controlled write delay: its acknowledgements (and therefore
-/// the journal applies inside them) stay in flight long enough to overlap a
-/// checkpoint barrier.
-struct SlowOutput {
-    written: Mutex<Vec<RecordBatch>>,
-    delay_ms: u64,
-}
-
-#[async_trait]
-impl Output for SlowOutput {
-    async fn connect(&self) -> Result<(), Error> {
-        Ok(())
-    }
-    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-        self.written
-            .lock()
-            .unwrap()
-            .push(msg.record_batch().clone());
-        Ok(())
-    }
-    async fn close(&self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
 /// Task 1.4: the checkpoint report waits for pre-cut state transactions. A
 /// pre-barrier row whose sink write (and acknowledgement, and journal apply)
 /// is still in flight when the barrier fires must land in the sealed cut —
@@ -3160,16 +3145,43 @@ impl Output for SlowOutput {
 /// snapshot contains the row's committed mutation.
 #[tokio::test]
 async fn barrier_waits_for_pre_cut_state_transactions() {
+    struct SignalledSlowOutput {
+        written: Mutex<Vec<RecordBatch>>,
+        /// Released the moment a write begins: firing the barrier after this
+        //  point races a sink write that is provably in flight, replacing
+        //  the old `sleep(20ms)` guess that load could invalidate either way.
+        write_started: Arc<PublishGate>,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl Output for SignalledSlowOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+            self.write_started.release().await;
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            self.written
+                .lock()
+                .unwrap()
+                .push(msg.record_batch().clone());
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
     let source = ParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
         (1, "a".into()),
     ])))]);
-    let output = Arc::new(SlowOutput {
+    let output = Arc::new(SignalledSlowOutput {
         written: Mutex::new(Vec::new()),
+        write_started: Arc::new(PublishGate::default()),
         delay_ms: 120,
     });
     struct SlowAdapter {
         input: Arc<dyn Input>,
-        output: Arc<SlowOutput>,
+        output: Arc<SignalledSlowOutput>,
         processor: Arc<dyn Processor>,
     }
     impl JobComponentAdapter for SlowAdapter {
@@ -3239,11 +3251,14 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
     .await
     .unwrap();
 
-    // Give the row time to reach the slow sink's write (in-flight, not yet
-    // acknowledged).
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    // Fire the barrier while the row's acknowledgement is still in flight.
-    let started = std::time::Instant::now();
+    // Wait until the row's sink write has actually begun, then fire the
+    // barrier: the acknowledgement is deterministically in flight, so the
+    // sealed cut must drain it. (The wall-clock "elapsed >= 100ms" proxy was
+    // dropped: under load the barrier request itself can arrive after the
+    // 120ms write finished, which is still a correct pre-cut completion.)
+    tokio::time::timeout(Duration::from_secs(5), output.write_started.wait())
+        .await
+        .expect("the pre-cut row never reached the slow sink");
     let (snapshot, _positions, _watermarks) = tokio::time::timeout(
         Duration::from_secs(10),
         handle.checkpoint_barrier("cp-precut", 1),
@@ -3251,13 +3266,6 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
     .await
     .expect("barrier checkpoint timed out")
     .unwrap();
-    // The source drained the in-flight acknowledgement before sealing: the
-    // barrier round waited for the slow sink write.
-    assert!(
-        started.elapsed() >= Duration::from_millis(100),
-        "barrier must wait for the pre-cut sink write (elapsed {:?})",
-        started.elapsed()
-    );
     let namespace = "job:test-job:state:default:operator:agg:task:agg-0";
     let committed = snapshot
         .entries
@@ -3336,7 +3344,7 @@ async fn temporaries_connect_before_chains_and_close_at_shutdown() {
         .temporary
         .insert("reference".into(), temporary.clone());
     let mut graph = ExecutionGraphBuilder::default()
-        .build(&plan, &adapter, &mut resource)
+        .build(&plan, &adapter, &resource)
         .unwrap();
     assert!(graph.temporaries.is_empty(), "builder starts clean");
     graph.temporaries = resource.temporary.values().cloned().collect();
@@ -3402,7 +3410,7 @@ async fn sink_connect_failure_fails_start_and_closes_temporaries() {
         .temporary
         .insert("reference".into(), temporary.clone());
     let mut graph = ExecutionGraphBuilder::default()
-        .build(&plan, &adapter, &mut resource)
+        .build(&plan, &adapter, &resource)
         .unwrap();
     graph.temporaries = resource.temporary.values().cloned().collect();
 
@@ -3994,12 +4002,6 @@ struct TickMarkerProcessor {
     first_process_delay: Duration,
     delayed: AtomicUsize,
     started: std::sync::atomic::AtomicBool,
-    tick_seen: std::sync::atomic::AtomicBool,
-    /// Released once a tick has actually reached the chain after the first
-    /// delivery: the input then delivers the second batch, so the tick vs
-    /// data ordering exercised here is driven by engine sequencing rather
-    /// than wall-clock margins.
-    gate: Arc<PublishGate>,
 }
 
 #[async_trait]
@@ -4043,9 +4045,6 @@ struct PublishGate {
 }
 
 impl PublishGate {
-    async fn released(&self) -> bool {
-        *self.released.lock().await
-    }
     async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
@@ -4067,7 +4066,14 @@ impl PublishGate {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     struct GatedInput {
-        reads: AtomicUsize,
+        /// Offset of the NEXT batch to hand out. Advanced only when a batch is
+        /// actually returned: the source loop's `select!` drops the in-flight
+        /// `read()` future whenever its idle-tick arm fires, so a read future
+        /// that mutated state before its first `await` (e.g. `fetch_add`)
+        /// would skip ahead on every restart and reach EOF spuriously. Real
+        /// connectors are cancellation-safe for exactly this reason; this
+        /// double must be too.
+        next: Arc<AtomicUsize>,
         gate: Arc<PublishGate>,
     }
     #[async_trait]
@@ -4076,17 +4082,22 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
             Ok(())
         }
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
-            match offset {
-                0 => Ok((
-                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
-                    Arc::new(crate::input::NoopAck),
-                )),
+            match self.next.load(Ordering::SeqCst) {
+                0 => {
+                    self.next.store(1, Ordering::SeqCst);
+                    Ok((
+                        Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                        Arc::new(crate::input::NoopAck),
+                    ))
+                }
                 1 => {
                     // Deliver the second batch only after the first one has
                     // finished processing: the idle window in which ticks can
-                    // fire is then guaranteed, not wall-clock dependent.
+                    // fire is then guaranteed, not wall-clock dependent. The
+                    // gate is re-checked on every (re)poll, so a cancelled
+                    // read restarts here instead of skipping to EOF.
                     self.gate.wait().await;
+                    self.next.store(2, Ordering::SeqCst);
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -4131,12 +4142,11 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         }
     }
     let second_batch_gate = Arc::new(PublishGate::default());
+    let input_next = Arc::new(AtomicUsize::new(0));
     let processor = Arc::new(TickMarkerProcessor {
         first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
         started: std::sync::atomic::AtomicBool::new(false),
-        tick_seen: std::sync::atomic::AtomicBool::new(false),
-        gate: second_batch_gate.clone(),
     });
     let output = Arc::new(TickGateOutput {
         written: Mutex::new(Vec::new()),
@@ -4144,11 +4154,11 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     });
     let adapter = Adapter {
         input: Arc::new(GatedInput {
-            reads: AtomicUsize::new(0),
+            next: input_next.clone(),
             gate: second_batch_gate.clone(),
         }),
         output: output.clone(),
-        processor,
+        processor: processor.clone(),
     };
     let mut job = spec(
         vec![map_operator("m")],
@@ -4186,7 +4196,10 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     // must follow the delivery, otherwise per-edge ordering is broken.
     assert!(
         keys.iter().any(|key| key == "tick"),
-        "tick output must reach the sink"
+        "tick output must reach the sink (keys={keys:?}, started={}, processed={}, input_next={})",
+        processor.started.load(Ordering::SeqCst),
+        processor.delayed.load(Ordering::SeqCst),
+        input_next.load(Ordering::SeqCst),
     );
     let leading_ticks = keys.iter().take_while(|key| key.as_str() == "tick").count();
     assert_eq!(
@@ -4389,7 +4402,6 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
         rescale: false,
-        ..spec(vec![], vec![], 2)
     };
     crate::job::JobPlan::compile(spec).unwrap()
 }
@@ -4413,9 +4425,11 @@ fn task_nodes() -> BTreeMap<String, String> {
 fn authenticated_manager(node: &str) -> std::sync::Arc<crate::executor::remote::NetworkManager> {
     let credentials = crate::executor::remote::DataPlaneCredentials::new(node, "shuffle-secret")
         .expect("test credentials");
-    let mut config = crate::executor::remote::NetworkManagerConfig::default();
-    config.credentials = Some(credentials);
-    config.registration_grace = Duration::from_millis(100);
+    let config = crate::executor::remote::NetworkManagerConfig {
+        credentials: Some(credentials),
+        registration_grace: Duration::from_millis(100),
+        ..Default::default()
+    };
     crate::executor::remote::NetworkManager::with_config(config).expect("valid test config")
 }
 
@@ -5194,8 +5208,6 @@ fn barrier_wire_json_is_backward_and_forward_compatible() {
 
 #[tokio::test]
 async fn trace_context_round_trips_to_a_remote_parent() {
-    use opentelemetry::trace::TracerProvider as _;
-
     let (exporter, provider) = span_test_tracing();
     let root = tracing::info_span!("trace-root-7354");
     let trace_context = {
@@ -5248,8 +5260,6 @@ async fn capture_is_none_without_an_active_span() {
 
 #[tokio::test]
 async fn barrier_carries_remote_trace_context_across_chains() {
-    use opentelemetry::trace::TracerProvider as _;
-
     let (exporter, provider) = span_test_tracing();
 
     struct StreamInput {
@@ -5511,7 +5521,6 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     let total: usize = joined.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(total, 1, "expected exactly one matched pair");
     let batch = &joined[0];
-    let collect = Arc::new(CollectOutput::default());
     let names: Vec<String> = batch
         .schema()
         .fields()

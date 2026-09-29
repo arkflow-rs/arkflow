@@ -257,7 +257,21 @@ pub trait Input: Send + Sync {
     /// Connect to the input source
     async fn connect(&self) -> Result<(), Error>;
 
-    /// Read a message using Arc for zero-copy
+    /// Read one message batch, returning it zero-copy alongside the
+    /// acknowledgement that settles the delivery.
+    ///
+    /// # Cancellation safety
+    ///
+    /// The engine's source loop multiplexes `read()` with control events
+    /// (idle ticks, checkpoint barriers, cancellation) inside a
+    /// `tokio::select!`: whenever another branch fires, the pending `read()`
+    /// future is dropped and a fresh call is issued on the next loop turn.
+    /// Implementations MUST be cancellation-safe: no observable side effect
+    /// before the first `await` (claiming a queued record, advancing an
+    /// internal counter, popping a channel), and a restarted call MUST
+    /// observe the same stream state. A `read()` that claims data and is
+    /// then dropped loses that delivery silently — its acknowledgement was
+    /// never created, so nothing replays it under at-least-once semantics.
     async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error>;
 
     /// Restore source cursors before a distributed Job resumes processing.

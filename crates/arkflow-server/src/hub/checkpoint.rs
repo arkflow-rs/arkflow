@@ -53,7 +53,7 @@ impl Hub {
                     .await
                     .map_err(HubError::from)?
             } else {
-                self.job(&record.job_id).await.map_err(HubError::from)?
+                self.job(&record.job_id).await?
             };
             if let Some(job) = &job {
                 self.jobs

@@ -119,7 +119,7 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
     let mut found = false;
     let _ = expr.apply(&mut |e: &LogicalExpr| {
         if let LogicalExpr::ScalarFunction(func) = e {
-            if TIME_FOLDING_FUNCTIONS.contains(&func.name().as_ref()) {
+            if TIME_FOLDING_FUNCTIONS.contains(&func.name()) {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -230,7 +230,7 @@ impl SqlProcessor {
             // Temporary tables are re-registered on every batch; leaving one
             // behind would fail the next registration on this pooled context.
             if let Some(temporary) = self.temporary.as_ref() {
-                for (_, (_, config)) in temporary.iter() {
+                for (_, config) in temporary.values() {
                     let _ = ctx_arc.deregister_table(&config.table_name);
                 }
             }

@@ -999,7 +999,7 @@ async fn run_soak(
         }
     }
     let first_third: Vec<u64> =
-        recorder.samples_ms[..recorder.samples_ms.len() / 3.max(1)].to_vec();
+        recorder.samples_ms[..recorder.samples_ms.len() / 3].to_vec();
     let last_third: Vec<u64> = recorder.samples_ms[recorder.samples_ms.len() * 2 / 3..].to_vec();
     let drift_check = |samples: &[u64], p: f64| -> Option<u64> {
         let mut sorted = samples.to_vec();

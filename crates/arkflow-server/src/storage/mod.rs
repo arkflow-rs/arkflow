@@ -1188,6 +1188,7 @@ impl StorageActor {
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_job_observation(
         &self,
         job_id: impl Into<String>,
@@ -2159,6 +2160,7 @@ expected_generation: u64,
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError>;
     async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError>;
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError>;
+    #[allow(clippy::too_many_arguments)]
     async fn update_job(
 &self,
 job_id: &str,
@@ -2169,6 +2171,7 @@ generation: Option<u64>,
 checkpoint_id: Option<&str>,
 last_error: Option<&str>,
 ) -> Result<Option<JobRecord>, StorageError>;
+    #[allow(clippy::too_many_arguments)]
     async fn update_job_observation(
 &self,
 job_id: &str,
@@ -2650,7 +2653,7 @@ resource_id: &str,
             Self::Postgres(backend) => StorageBackend::list_job_start_operations(backend, resource_id).await,
         }
     }
-    async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+    async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::upsert_job(backend, job).await,
             Self::Postgres(backend) => StorageBackend::upsert_job(backend, job).await,
@@ -2658,7 +2661,7 @@ resource_id: &str,
     }
     async fn update_job_with_expected_generation(
 &self,
-mut job: JobRecord,
+job: JobRecord,
 expected_generation: u64,
 ) -> Result<JobRecord, StorageError> {
         match self {
@@ -3366,7 +3369,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("ckpt-new".into()),
+                Some("ckpt-new"),
                 None,
             )
             .await.unwrap();

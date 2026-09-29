@@ -562,12 +562,12 @@ mod tests {
         assert!(WalInput::batch_is_covered_by_checkpoint(
             1,
             &metadata_batch(2, 10, "orders"),
-            &[position.clone()]
+            std::slice::from_ref(&position)
         ));
         assert!(!WalInput::batch_is_covered_by_checkpoint(
             1,
             &metadata_batch(2, 11, "orders"),
-            &[position.clone()]
+            std::slice::from_ref(&position)
         ));
         assert!(!WalInput::batch_is_covered_by_checkpoint(
             1,
@@ -593,7 +593,7 @@ mod tests {
         assert!(WalInput::batch_is_covered_by_checkpoint(
             2,
             &batch,
-            &[position.clone()]
+            std::slice::from_ref(&position)
         ));
         assert!(!WalInput::batch_is_covered_by_checkpoint(
             3,

@@ -10,9 +10,17 @@ use arkflow_server::hub::{Hub, HubConfig, HubOperationState};
 use arkflow_server::storage::JobRecord;
 use arkflow_server::{hub_router, ServerConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+
+/// These two smoke tests each run a Hub, two Agents, and real kernels; in
+/// parallel they saturate a shared CI runner and stretch the restart round
+/// trip past its budget (observed as a condition-4 timeout on #1264's CI).
+/// Serialize them: wall clock stays comparable, load halves.
+static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn empty_control_plane() -> ControlPlane {
     ControlPlane::new(
@@ -145,7 +153,15 @@ rescale: false,
     }
 }
 
-async fn wait_until<F, Fut>(mut condition: F)
+async fn wait_until<F, Fut>(condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    wait_until_with_budget(condition, Duration::from_secs(60)).await;
+}
+
+async fn wait_until_with_budget<F, Fut>(mut condition: F, budget: Duration)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -156,7 +172,7 @@ where
     // the same machine, and cold caches can stretch kernel startup. A full
     // restart-recovery round trip (re-register, recovery, dispatch, run,
     // complete) has been observed to exceed 30s under that load.
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(budget, async {
         loop {
             if condition().await {
                 return;
@@ -170,6 +186,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_node_hub_agent_checkpoint_and_restart_recover() {
+    let _serial = ONE_AT_A_TIME.lock().await;
     arkflow_plugin::initialize().unwrap();
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let job_id = format!("two-node-smoke-{}", std::process::id());
@@ -185,7 +202,10 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         insecure_local: true,
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
-        session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
+        // The default (1h) would leave a killed Agent's session live for the
+        // whole test; heartbeats renew every 50ms so 2s bounds any
+        // stale-session-gated replacement step without spurious expiry.
+        session_ttl_ms: 2_000,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -383,19 +403,26 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         })
         .map(|operation| operation.id)
         .collect::<Vec<_>>();
-    wait_until(|| {
-        let hub = hub.clone();
-        let job_id = job_id.clone();
-        let initial_start_ids = initial_start_ids.clone();
-        async move {
-            hub.operations(None).await.iter().any(|operation| {
-                operation.resource_id == job_id
-                    && operation.operation == "job_start"
-                    && operation.state == HubOperationState::Succeeded
-                    && !initial_start_ids.contains(&operation.id)
-            })
-        }
-    })
+    // The replacement round trip (kill → re-register → fence → recovery
+    // dispatch → kernel restart → success report) is the longest chain in
+    // the suite; give it triple the default budget instead of letting a
+    // loaded runner turn it into a false red.
+    wait_until_with_budget(
+        || {
+            let hub = hub.clone();
+            let job_id = job_id.clone();
+            let initial_start_ids = initial_start_ids.clone();
+            async move {
+                hub.operations(None).await.iter().any(|operation| {
+                    operation.resource_id == job_id
+                        && operation.operation == "job_start"
+                        && operation.state == HubOperationState::Succeeded
+                        && !initial_start_ids.contains(&operation.id)
+                })
+            }
+        },
+        Duration::from_secs(180),
+    )
     .await;
 
     cancel_a_restart.cancel();
@@ -422,6 +449,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
 /// existing aggregation path (all_nodes_succeeded → job_checkpoint_commit).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
+    let _serial = ONE_AT_A_TIME.lock().await;
     arkflow_plugin::initialize().unwrap();
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let job_id = format!("split-smoke-{}", std::process::id());
@@ -447,7 +475,10 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         insecure_local: true,
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
-        session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
+        // The default (1h) would leave a killed Agent's session live for the
+        // whole test; heartbeats renew every 50ms so 2s bounds any
+        // stale-session-gated replacement step without spurious expiry.
+        session_ttl_ms: 2_000,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

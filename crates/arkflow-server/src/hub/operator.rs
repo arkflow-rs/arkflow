@@ -10,7 +10,8 @@ impl Hub {
     pub async fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
         if let Some(expected) = self.config.operator_token.as_deref() {
             if !expected.trim().is_empty() {
-                if let Some(supplied) = supplied {
+                {
+                    let supplied = supplied?;
                     let (id, role, secret, scopes) = parse_operator_credential(expected);
                     if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
                         return Some(OperatorPrincipal {
@@ -21,8 +22,6 @@ impl Hub {
                     }
                     // A bearer that is not the static credential falls
                     // through to OIDC below (JWTs never ct_eq-match).
-                } else {
-                    return None;
                 }
             }
         } else if self.config.insecure_local {

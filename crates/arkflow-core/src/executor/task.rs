@@ -812,9 +812,7 @@ async fn run_source_chain(
                     // is nothing to observe and nothing to lose, so settle the
                     // delivery. Leaving the tracking ack unsettled would park
                     // every later checkpoint drain at its timeout.
-                    if let Err(error) = ack.ack().await {
-                        return Err(error);
-                    }
+                    ack.ack().await?;
                     continue;
                 }
                 let child_acks = crate::input::fanout_ack(ack, partitions.len());
@@ -907,6 +905,7 @@ async fn seed_event_time_partitions(
 /// a later ready slice or a dropped slice fails. A gate can split one source
 /// delivery into several ready/held/dropped outcomes; returning on the first
 /// error must still settle every outcome that will no longer be dispatched.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_gate_outputs(
     chain: &Chain,
     hook: &CheckpointHook,
@@ -2564,7 +2563,7 @@ async fn process_chain(
                             let mut acknowledgements =
                                 next.into_iter().map(|(_, ack)| ack).collect::<Vec<_>>();
                             acknowledgements.push(ack);
-                            acknowledgements.extend(remaining.into_iter().map(|(_, ack)| ack));
+                            acknowledgements.extend(remaining.map(|(_, ack)| ack));
                             return Err(ProcessChainError::Fatal(FatalFailure {
                                 error,
                                 acknowledgements,
@@ -2589,7 +2588,7 @@ async fn process_chain(
                         let mut acknowledgements =
                             next.into_iter().map(|(_, ack)| ack).collect::<Vec<_>>();
                         acknowledgements.push(ack);
-                        acknowledgements.extend(remaining.into_iter().map(|(_, ack)| ack));
+                        acknowledgements.extend(remaining.map(|(_, ack)| ack));
                         return Err(ProcessChainError::Fatal(FatalFailure {
                             error,
                             acknowledgements,
@@ -2937,12 +2936,10 @@ fn partition_batch_by_key_hash(
     };
     let key_groups = hash_column(column.as_ref(), max_parallelism)?;
     let mut result = Vec::with_capacity(subtasks);
-    for subtask in 0..subtasks {
+    for key_group_range in key_group_ranges.iter().take(subtasks) {
         let keep: BooleanArray = key_groups
             .iter()
-            .map(|key_group| {
-                key_group.is_some_and(|key_group| key_group_ranges[subtask].contains(key_group))
-            })
+            .map(|key_group| key_group.is_some_and(|key_group| key_group_range.contains(key_group)))
             .collect();
         if keep.false_count() == keep.len() {
             result.push(None);
@@ -3008,7 +3005,7 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
         .as_any()
         .downcast_ref::<datafusion::arrow::array::BooleanArray>()
     {
-        return Ok(values
+        return values
             .iter()
             .map(|value| {
                 let group = match value {
@@ -3018,10 +3015,10 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
                 };
                 Ok(Some(group))
             })
-            .collect::<Result<Vec<Option<u32>>, Error>>()?);
+            .collect::<Result<Vec<Option<u32>>, Error>>();
     }
     if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
-        return Ok(values
+        return values
             .iter()
             .map(|value| {
                 let group = match value {
@@ -3030,10 +3027,10 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
                 };
                 Ok(Some(group))
             })
-            .collect::<Result<Vec<Option<u32>>, Error>>()?);
+            .collect::<Result<Vec<Option<u32>>, Error>>();
     }
     if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(values
+        return values
             .iter()
             .map(|value| {
                 let group = match value {
@@ -3042,7 +3039,7 @@ fn hash_column(column: &dyn Array, max_parallelism: u32) -> Result<Vec<Option<u3
                 };
                 Ok(Some(group))
             })
-            .collect::<Result<Vec<Option<u32>>, Error>>()?);
+            .collect::<Result<Vec<Option<u32>>, Error>>();
     }
     Err(Error::Process(format!(
         "partition key column has unsupported Arrow type {:?}",

@@ -48,10 +48,7 @@ impl WindowTiming {
                     return Vec::new();
                 };
                 let mut ends = Vec::new();
-                loop {
-                    let Some(end) = start.checked_add(size_ms) else {
-                        break;
-                    };
+                while let Some(end) = start.checked_add(size_ms) {
                     if end <= event_time_ms {
                         break;
                     }
@@ -122,6 +119,7 @@ struct OutcomeGroup {
     expired: Vec<Vec<i64>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_outcome_group(
     groups: &mut Vec<OutcomeGroup>,
     action: WindowAction,
@@ -659,7 +657,7 @@ impl EventTimeGate {
         ack: std::sync::Arc<dyn Ack>,
         decision: &mut GateDecision,
     ) -> Result<(), Error> {
-        if batch.len() == 0 {
+        if batch.is_empty() {
             decision.dropped_acks.push(ack);
             return Ok(());
         }
@@ -766,6 +764,7 @@ impl EventTimeGate {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn classify_row(
         &self,
         event_time_ms: Option<i64>,
@@ -921,7 +920,7 @@ impl EventTimeGate {
                 )
             })
             .collect::<Vec<_>>();
-        if actions.iter().any(|action| *action == WindowAction::Hold) {
+        if actions.contains(&WindowAction::Hold) {
             return RowDecision {
                 action: WindowAction::Hold,
                 invalid_timestamp: false,
@@ -939,11 +938,11 @@ impl EventTimeGate {
             .zip(window_ends.iter())
             .filter_map(|(action, end)| (*action == WindowAction::Drop).then_some(*end))
             .collect();
-        let action = if actions.iter().any(|action| *action == WindowAction::Update) {
+        let action = if actions.contains(&WindowAction::Update) {
             WindowAction::Update
-        } else if actions.iter().any(|action| *action == WindowAction::Route) {
+        } else if actions.contains(&WindowAction::Route) {
             WindowAction::Route
-        } else if actions.iter().any(|action| *action == WindowAction::Drop) {
+        } else if actions.contains(&WindowAction::Drop) {
             WindowAction::Drop
         } else {
             WindowAction::Emit
@@ -1017,7 +1016,7 @@ fn mark_window_exclusions(
             .ok_or_else(|| {
                 Error::Process("event-time window exclusion marker has an invalid type".into())
             })?;
-        for row in 0..batch.len() {
+        for (row, slot) in values.iter_mut().enumerate().take(batch.len()) {
             let mut merged = std::collections::BTreeSet::new();
             if existing.is_valid(row) {
                 for end in existing.value(row).split(',') {
@@ -1029,7 +1028,7 @@ fn mark_window_exclusions(
             if let Some(new_values) = exclusions.get(row) {
                 merged.extend(new_values.iter().copied());
             }
-            values[row] = (!merged.is_empty()).then(|| {
+            *slot = (!merged.is_empty()).then(|| {
                 merged
                     .into_iter()
                     .map(|end| end.to_string())
@@ -1040,7 +1039,7 @@ fn mark_window_exclusions(
     }
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
     let mut columns = batch.columns().to_vec();
-    if let Some(index) = batch.schema().index_of(marker).ok() {
+    if let Ok(index) = batch.schema().index_of(marker) {
         columns[index] = Arc::new(StringArray::from(values)) as ArrayRef;
     } else {
         fields.push(Arc::new(Field::new(marker, DataType::Utf8, true)));
@@ -1093,7 +1092,7 @@ fn mark_window_updates(
             .ok_or_else(|| {
                 Error::Process("event-time window update marker has an invalid type".into())
             })?;
-        for row in 0..batch.len() {
+        for (row, slot) in values.iter_mut().enumerate().take(batch.len()) {
             let mut merged = std::collections::BTreeSet::new();
             if existing.is_valid(row) {
                 for end in existing.value(row).split(',') {
@@ -1105,7 +1104,7 @@ fn mark_window_updates(
             if let Some(new_values) = updates.get(row) {
                 merged.extend(new_values.iter().copied());
             }
-            values[row] = (!merged.is_empty()).then(|| {
+            *slot = (!merged.is_empty()).then(|| {
                 merged
                     .into_iter()
                     .map(|end| end.to_string())
@@ -1116,7 +1115,7 @@ fn mark_window_updates(
     }
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
     let mut columns = batch.columns().to_vec();
-    if let Some(index) = batch.schema().index_of(marker).ok() {
+    if let Ok(index) = batch.schema().index_of(marker) {
         columns[index] = Arc::new(StringArray::from(values)) as ArrayRef;
     } else {
         fields.push(Arc::new(Field::new(marker, DataType::Utf8, true)));

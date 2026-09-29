@@ -1398,7 +1398,6 @@ impl PendingReceipts {
 /// when the current context carries no valid span — including tracing being
 /// disabled entirely, which keeps barriers byte-identical on the wire.
 pub fn capture_trace_context() -> Option<String> {
-    use opentelemetry::propagation::Injector as _;
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -1417,7 +1416,6 @@ pub fn capture_trace_context() -> Option<String> {
 /// Returns `None` for absent or unparsable values so a malformed hop can
 /// never detach a downstream span from its local parent.
 pub fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
-    use opentelemetry::propagation::Extractor as _;
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
 
@@ -2427,8 +2425,6 @@ impl NetworkManager {
         self: &Arc<Self>,
         stream: Box<dyn RemoteStream>,
     ) -> Result<(), ConnectionFailure> {
-        static SERVE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let serve_id = SERVE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (receipt_tx, receipt_rx) =
             flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
@@ -3002,6 +2998,7 @@ async fn wait_for_route(
 /// `reconnectable`, the pump defers its failure-path branch aborts to the
 /// supervisor: the branches must stay registered so a reconnect can replay
 /// them, and the supervisor aborts them if recovery does not succeed.
+#[allow(clippy::too_many_arguments)]
 async fn run_edge_connection(
     stream: Box<dyn RemoteStream>,
     quad: Quad,
@@ -3183,6 +3180,7 @@ async fn replay_pending(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_edge(
     receiver: flume::Receiver<super::envelope::Envelope>,
     writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -3594,92 +3592,6 @@ mod tests {
         }
     }
 
-    /// Logs every successful write.
-    struct WriteProbe {
-        inner: Box<dyn RemoteStream>,
-        label: &'static str,
-    }
-
-    impl AsyncRead for WriteProbe {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncWrite for WriteProbe {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
-            if let std::task::Poll::Ready(Ok(n)) = &result {
-            }
-            result
-        }
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-        }
-        fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-        }
-    }
-
-    /// Logs every successful read so tests can see exactly which wrapped
-    /// half receives bytes.
-    struct ReadProbe {
-        inner: Box<dyn RemoteStream>,
-        label: &'static str,
-    }
-
-    impl AsyncRead for ReadProbe {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            let before = buf.filled().len();
-            match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
-                std::task::Poll::Ready(Ok(())) => {
-                    std::task::Poll::Ready(Ok(()))
-                }
-                other => other,
-            }
-        }
-    }
-
-    impl AsyncWrite for ReadProbe {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-        }
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-        }
-        fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-        }
-    }
-
     /// Shared kill state: the flag plus the currently registered reader
     /// waker, so `kill()` wakes a read parked inside the inner stream.
     #[derive(Default)]
@@ -3821,9 +3733,11 @@ mod tests {
 
     fn authenticated_manager(node: &str, secret: &str) -> Arc<NetworkManager> {
         let credentials = DataPlaneCredentials::new(node, secret).expect("test credentials");
-        let mut config = NetworkManagerConfig::default();
-        config.credentials = Some(credentials);
-        config.registration_grace = std::time::Duration::from_millis(100);
+        let config = NetworkManagerConfig {
+            credentials: Some(credentials),
+            registration_grace: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
         NetworkManager::with_config(config).expect("valid test network config")
     }
 
@@ -4791,11 +4705,12 @@ mod tests {
 
     fn tls_manager_config(node: &str, secret: &str, cert: &str, key: &str, ca: &str) -> NetworkManagerConfig {
         let credentials = DataPlaneCredentials::new(node, secret).expect("test credentials");
-        let mut config = NetworkManagerConfig::default();
-        config.credentials = Some(credentials);
-        config.registration_grace = std::time::Duration::from_millis(100);
-        config.tls = Some(DataPlaneTlsConfig::from_pem(cert, key, ca).expect("tls"));
-        config
+        NetworkManagerConfig {
+            credentials: Some(credentials),
+            registration_grace: std::time::Duration::from_millis(100),
+            tls: Some(DataPlaneTlsConfig::from_pem(cert, key, ca).expect("tls")),
+            ..Default::default()
+        }
     }
 
     /// Fleet-CA mTLS end to end over loopback: the full stack (TLS
@@ -5013,10 +4928,11 @@ mod tests {
     fn tls_partial_material_is_rejected() {
         let (nodes, ca) = generate_fleet_material();
         let (cert, key) = &nodes[0];
-        assert!(DataPlaneTlsConfig::from_pem(&cert, &key, "").is_err());
-        assert!(DataPlaneTlsConfig::from_pem("", &key, &ca).is_err());
-        assert!(DataPlaneTlsConfig::from_pem(&cert, "", &ca).is_err());
-        assert!(DataPlaneTlsConfig::from_pem(&cert, &key, &ca).is_ok());
+        let ca = ca.as_str();
+        assert!(DataPlaneTlsConfig::from_pem(cert, key, "").is_err());
+        assert!(DataPlaneTlsConfig::from_pem("", key, ca).is_err());
+        assert!(DataPlaneTlsConfig::from_pem(cert, "", ca).is_err());
+        assert!(DataPlaneTlsConfig::from_pem(cert, key, ca).is_ok());
     }
 }
 

@@ -99,8 +99,7 @@ impl StagedMutation {
             Self::Delete { .. } => None,
             Self::Increment { delta, .. } => {
                 let current = value
-                    .map(|raw| serde_json::from_slice::<i64>(&raw).ok())
-                    .flatten()
+                    .and_then(|raw| serde_json::from_slice::<i64>(&raw).ok())
                     .unwrap_or_default();
                 Some(
                     serde_json::to_vec(&current.saturating_add(*delta))
@@ -1183,9 +1182,7 @@ impl Ack for CommitOnAck {
                         Ok(())
                     }
                 };
-                if let Err(error) = state_result {
-                    return Err(error);
-                }
+                state_result?;
                 self.inner.undo().await.err().map_or(Ok(()), Err)
             })
             .await

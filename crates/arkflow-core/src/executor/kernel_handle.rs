@@ -641,6 +641,7 @@ impl KernelJobRunner {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_with_cancellation_mode(
         graph: ExecutionGraph,
         inputs: Vec<Arc<dyn Input>>,
