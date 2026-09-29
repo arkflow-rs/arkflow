@@ -2275,7 +2275,7 @@ async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
     let output = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
-        output,
+        output: output.clone(),
         processor: Arc::new(PassThroughProcessor),
     };
     let plan = JobPlan::compile(spec(
@@ -2298,7 +2298,16 @@ async fn kernel_runner_checkpoint_barrier_collects_every_chain_snapshot() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait until a batch has physically reached the sink before firing the
+    // checkpoint: the per-chain `batches_in` metric and the sealed position
+    // then trail a proven event instead of racing a 20ms startup guess.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while output.written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("no batch reached the sink before the checkpoint");
 
     let (snapshot, positions, watermarks) =
         tokio::time::timeout(Duration::from_secs(2), handle.checkpoint_snapshot())
@@ -5233,8 +5242,6 @@ fn barrier_wire_json_is_backward_and_forward_compatible() {
 
 #[tokio::test]
 async fn trace_context_round_trips_to_a_remote_parent() {
-    use opentelemetry::trace::TracerProvider as _;
-
     let (exporter, provider) = span_test_tracing();
     let root = tracing::info_span!("trace-root-7354");
     let trace_context = {
@@ -5287,8 +5294,6 @@ async fn capture_is_none_without_an_active_span() {
 
 #[tokio::test]
 async fn barrier_carries_remote_trace_context_across_chains() {
-    use opentelemetry::trace::TracerProvider as _;
-
     let (exporter, provider) = span_test_tracing();
 
     struct StreamInput {
@@ -5550,7 +5555,6 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     let total: usize = joined.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(total, 1, "expected exactly one matched pair");
     let batch = &joined[0];
-    let collect = Arc::new(CollectOutput::default());
     let names: Vec<String> = batch
         .schema()
         .fields()

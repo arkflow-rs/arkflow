@@ -1398,7 +1398,6 @@ impl PendingReceipts {
 /// when the current context carries no valid span — including tracing being
 /// disabled entirely, which keeps barriers byte-identical on the wire.
 pub fn capture_trace_context() -> Option<String> {
-    use opentelemetry::propagation::Injector as _;
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -1417,7 +1416,6 @@ pub fn capture_trace_context() -> Option<String> {
 /// Returns `None` for absent or unparsable values so a malformed hop can
 /// never detach a downstream span from its local parent.
 pub fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
-    use opentelemetry::propagation::Extractor as _;
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
 
@@ -2427,8 +2425,6 @@ impl NetworkManager {
         self: &Arc<Self>,
         stream: Box<dyn RemoteStream>,
     ) -> Result<(), ConnectionFailure> {
-        static SERVE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let serve_id = SERVE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (receipt_tx, receipt_rx) =
             flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
@@ -3616,8 +3612,10 @@ mod tests {
             cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
+            let label = self.label;
             let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
             if let std::task::Poll::Ready(Ok(n)) = &result {
+                tracing::debug!(stream = label, bytes = n, "remote test stream wrote");
             }
             result
         }
@@ -3648,9 +3646,15 @@ mod tests {
             cx: &mut std::task::Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
+            let label = self.label;
             let before = buf.filled().len();
             match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
                 std::task::Poll::Ready(Ok(())) => {
+                    tracing::debug!(
+                        stream = label,
+                        bytes = buf.filled().len() - before,
+                        "remote test stream read"
+                    );
                     std::task::Poll::Ready(Ok(()))
                 }
                 other => other,
