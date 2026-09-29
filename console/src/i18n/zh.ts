@@ -24,7 +24,8 @@ export const zh = {
 
   'warning.nodeUnavailable': '节点 {node} 当前为 {state}；变更操作已禁用。',
   'warning.staleState': '正在显示最后已知状态。控制面 API 恢复后可重试。',
-  'warning.hubStandby': '当前连接的是备用 Hub，未持有控制面租约；正在自动重试。若持续出现，请将控制台指向当选的 Leader。',
+  'warning.hubStandby':
+    '当前连接的是备用 Hub，未持有控制面租约；正在自动重试。若持续出现，请将控制台指向当选的 Leader。',
 
   'common.loading': '加载中…',
   'common.close': '关闭',

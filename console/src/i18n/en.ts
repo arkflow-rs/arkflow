@@ -25,7 +25,8 @@ export const en = {
   // Global warnings
   'warning.nodeUnavailable': 'Node {node} is {state}; mutating actions are disabled.',
   'warning.staleState': 'Showing the last known state. Retry when the control API is available.',
-  'warning.hubStandby': 'This Hub is a standby and does not hold the control-plane lease; requests are being retried. Point the console at the elected leader if this persists.',
+  'warning.hubStandby':
+    'This Hub is a standby and does not hold the control-plane lease; requests are being retried. Point the console at the elected leader if this persists.',
 
   // Shared fragments
   'common.loading': 'Loading…',
@@ -119,7 +120,8 @@ export const en = {
   // Configuration
   'config.title': 'Configuration',
   'config.hubSelectNode': 'Select a compute node to manage its configuration.',
-  'config.hubFleetNotice': 'Hub deployments manage configuration per node. Drafts are a local-control-plane feature.',
+  'config.hubFleetNotice':
+    'Hub deployments manage configuration per node. Drafts are a local-control-plane feature.',
   'config.activeRedacted': 'Active configuration is redacted and read-only',
   'config.unsavedDraft': 'Unsaved draft',
   'config.draftSaved': 'Draft is saved',

@@ -363,9 +363,7 @@ export const api = {
     request<ConfigCandidate>('/configuration/draft', { method: 'PUT', body: JSON.stringify(candidate) }),
   validateConfig: (candidate: ConfigCandidate, nodeId?: string) =>
     request<ConfigValidationReport | Operation>(
-      nodeId
-        ? `/nodes/${encodeURIComponent(nodeId)}/configuration/validate`
-        : '/configuration/validate',
+      nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/validate` : '/configuration/validate',
       { method: 'POST', body: JSON.stringify(candidate) },
     ),
   diff: (from: string, to: string, nodeId?: string) => {
@@ -544,9 +542,7 @@ export function streamEvents(
 export async function waitForOperation(id: string): Promise<Operation> {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const operation = await api.operation(id)
-    const terminalIntent = ['converged', 'blocked', 'superseded'].includes(
-      operation.intent_state ?? '',
-    )
+    const terminalIntent = ['converged', 'blocked', 'superseded'].includes(operation.intent_state ?? '')
     const terminalState = ['succeeded', 'failed', 'cancelled', 'timed_out', 'node_unavailable'].includes(
       operation.state,
     )
@@ -596,11 +592,7 @@ export async function resolveValidation(
   return unwrapReport<ConfigValidationReport>(operation, 'validation report')
 }
 
-export async function resolveDiff(
-  from: string,
-  to: string,
-  nodeId?: string,
-): Promise<ConfigDiff> {
+export async function resolveDiff(from: string, to: string, nodeId?: string): Promise<ConfigDiff> {
   const response = await api.diff(from, to, nodeId)
   if (!isOperation(response)) return response
   const operation = await waitForOperation(operationId(response))
@@ -616,9 +608,7 @@ function operationId(operation: Operation): string {
  * command) gets a named error instead of a downstream TypeError. */
 function unwrapReport<T>(operation: Operation, what: string): T {
   if (operation.result === undefined || operation.result === null) {
-    throw new Error(
-      translate(currentLocale(), 'api.reportMissing', { what }),
-    )
+    throw new Error(translate(currentLocale(), 'api.reportMissing', { what }))
   }
   return operation.result as T
 }

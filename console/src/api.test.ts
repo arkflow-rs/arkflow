@@ -152,7 +152,6 @@ function locations_missing(): boolean {
   return true
 }
 
-
 describe('read-only configuration reports', () => {
   afterEach(() => {
     vi.restoreAllMocks()
