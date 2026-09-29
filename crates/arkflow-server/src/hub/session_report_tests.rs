@@ -83,6 +83,8 @@ async fn new_session_resets_the_report_cursor() {
         configuration_version: None,
         boot_id: Some(session.session_token.clone()),
         report_seq: seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     };
     hub.report(report(&first, 7, "running")).await.unwrap();
     // Re-register: a fresh session identity with a fresh cursor.
@@ -195,6 +197,8 @@ async fn re_registration_rotates_the_credential_and_preserves_state() {
         configuration_version: None,
         boot_id: Some("boot-1".into()),
         report_seq: seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     };
     hub.report(report(&first, 1)).await.unwrap();
 
@@ -301,6 +305,7 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
                 rollout_id: command.rollout_id.clone(),
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await;
@@ -381,6 +386,7 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
             rollout_id: redelivered[0].rollout_id.clone(),
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -486,6 +492,8 @@ async fn delayed_report_from_an_old_session_is_ignored() {
         configuration_version: None,
         boot_id: Some(second.session_token.clone()),
         report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -511,6 +519,8 @@ async fn delayed_report_from_an_old_session_is_ignored() {
             configuration_version: None,
             boot_id: Some(first.session_token.clone()),
             report_seq: 99,
+            config_versions: Vec::new(),
+            job_tasks: BTreeMap::new(),
         })
         .await;
     assert!(stale.is_err(), "the old session token is revoked");
@@ -581,6 +591,8 @@ async fn report_shuffle_node(
         configuration_version: None,
         boot_id: Some("boot".into()),
         report_seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -631,6 +643,8 @@ async fn report_resources(hub: &Hub, auth: &AgentAuth, used_ratio: f64, cpu: f64
         configuration_version: None,
         boot_id: None,
         report_seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -669,6 +683,7 @@ async fn complete_start_commands(hub: &Hub, node_id: &str, session_token: &str) 
                 rollout_id: command.rollout_id,
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -699,9 +714,7 @@ async fn poll_start_tasks_and_complete(
                 .map(|assignments| {
                     assignments
                         .iter()
-                        .filter_map(|assignment| {
-                            assignment["task_id"].as_str().map(str::to_owned)
-                        })
+                        .filter_map(|assignment| assignment["task_id"].as_str().map(str::to_owned))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -725,6 +738,7 @@ async fn poll_start_tasks_and_complete(
                 rollout_id: command.rollout_id,
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -762,6 +776,8 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
             session_expires_at_ms: now + 1_000,
             boot_id: Some("boot".into()),
             report_seq: 0,
+            config_versions: Vec::new(),
+            job_tasks: BTreeMap::new(),
             commands: VecDeque::new(),
             leased_commands: BTreeMap::new(),
             streams: vec![],
@@ -975,6 +991,8 @@ async fn pressure_streak_counts_consecutive_pressuring_reports() {
         configuration_version: None,
         boot_id: Some("boot".into()),
         report_seq: 4,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -1907,8 +1925,13 @@ async fn partial_node_failure_moves_only_the_failed_tasks() {
     .await;
 
     // node-c fails; node-e is the replacement candidate.
-    hub.nodes.write().await.get_mut("node-c").unwrap().resource.maintenance_state =
-        NodeMaintenanceState::Maintenance;
+    hub.nodes
+        .write()
+        .await
+        .get_mut("node-c")
+        .unwrap()
+        .resource
+        .maintenance_state = NodeMaintenanceState::Maintenance;
     let job_record = hub
         .jobs()
         .await
@@ -1936,8 +1959,7 @@ async fn partial_node_failure_moves_only_the_failed_tasks() {
     // The replacement inherits exactly the failed node's task.
     let inherited = poll_start_tasks_and_complete(&hub, "node-e", &sessions["node-e"]).await;
     assert_eq!(
-        inherited,
-        initial["node-c"],
+        inherited, initial["node-c"],
         "the replacement node takes over exactly the failed node's task"
     );
     // The failed node is fenced: its start is superseded (the stop command
@@ -2002,8 +2024,13 @@ async fn no_replacement_candidate_concentrates_the_failed_slot() {
     // node-b fails with no candidate available: node-a duplicates into the
     // slot, which also drifts its own assignment — the stale start is
     // superseded and a fresh start with the combined task set dispatches.
-    hub.nodes.write().await.get_mut("node-b").unwrap().resource.maintenance_state =
-        NodeMaintenanceState::Maintenance;
+    hub.nodes
+        .write()
+        .await
+        .get_mut("node-b")
+        .unwrap()
+        .resource
+        .maintenance_state = NodeMaintenanceState::Maintenance;
     let job_record = hub
         .jobs()
         .await
@@ -2157,13 +2184,12 @@ async fn failed_observation_redispatches_the_nodes_start() {
         .find(|record| record.job_id == "orders")
         .expect("job record");
     hub.reconcile_job(&job_record).await.unwrap();
-    assert!(
-        !hub.commands(auth.clone())
-            .await
-            .unwrap()
-            .iter()
-            .any(|command| command.operation == "job_start")
-    );
+    assert!(!hub
+        .commands(auth.clone())
+        .await
+        .unwrap()
+        .iter()
+        .any(|command| command.operation == "job_start"));
 
     // The kernel dies (for example a remote edge exhausted its reconnect
     // budget) and the agent reports the failure.
@@ -2302,7 +2328,11 @@ async fn declared_job_lands_on_effective_headroom() {
     .await
     .unwrap();
     let heavy_tasks = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
-    assert_eq!(heavy_tasks.len(), 2, "the colocated job lands whole: {heavy_tasks:?}");
+    assert_eq!(
+        heavy_tasks.len(),
+        2,
+        "the colocated job lands whole: {heavy_tasks:?}"
+    );
 
     // The second declared Job needs 400 millicores: node-a's effective
     // headroom is 400 millicores and its effective memory ratio dropped,
@@ -2325,7 +2355,11 @@ async fn declared_job_lands_on_effective_headroom() {
     .await
     .unwrap();
     let light_tasks = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
-    assert_eq!(light_tasks.len(), 2, "the light job lands whole on node-b: {light_tasks:?}");
+    assert_eq!(
+        light_tasks.len(),
+        2,
+        "the light job lands whole on node-b: {light_tasks:?}"
+    );
 }
 
 /// Undeclared Jobs are never gated: the same loaded node still receives

@@ -5,6 +5,8 @@ import {
   redirectToOidcLogin,
   request,
   resetOidcStatusCacheForTests,
+  resolveDiff,
+  resolveValidation,
   streamEvents,
 } from './api'
 
@@ -149,3 +151,92 @@ describe('OIDC console integration', () => {
 function locations_missing(): boolean {
   return true
 }
+
+
+describe('read-only configuration reports', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete (globalThis as Record<string, unknown>).fetch
+  })
+
+  it('unwraps a tracked Hub validation operation into the report', async () => {
+    let postedUrl = ''
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/configuration/validate')) {
+        postedUrl = url
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: async () => ({
+            id: 'op-1',
+            operation: 'validate_configuration',
+            progress: 0,
+            state: 'queued',
+            created_at_ms: 1,
+          }),
+        })
+      }
+      if (url.includes('/operations/op-1'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'op-1',
+            operation: 'validate_configuration',
+            progress: 100,
+            state: 'succeeded',
+            created_at_ms: 1,
+            result: { valid: false, errors: [{ path: 'streams', message: 'unknown input' }] },
+          }),
+        })
+      return Promise.reject(new Error(`unexpected ${url}`))
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const report = await resolveValidation({ format: 'yaml', content: 'streams: []\n' }, 'node-a')
+    expect(postedUrl).toContain('/nodes/node-a/configuration/validate')
+    expect(report.valid).toBe(false)
+    expect(report.errors[0]?.path).toBe('streams')
+  })
+
+  it('passes the synchronous local-mode report through unchanged', async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({ ok: true, json: async () => ({ valid: true, errors: [] }) }),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const report = await resolveValidation({ format: 'yaml', content: 'streams: []\n' })
+    expect(report.valid).toBe(true)
+  })
+
+  it('unwraps a tracked Hub diff operation into the diff metadata', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/configuration/diff'))
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: async () => ({
+            id: 'op-2',
+            operation: 'diff_configuration',
+            progress: 0,
+            state: 'queued',
+            created_at_ms: 1,
+          }),
+        })
+      if (url.includes('/operations/op-2'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'op-2',
+            operation: 'diff_configuration',
+            progress: 100,
+            state: 'succeeded',
+            created_at_ms: 1,
+            result: { from: 'v1', to: 'v2', changed: true, from_format: 'yaml', to_format: 'json' },
+          }),
+        })
+      return Promise.reject(new Error(`unexpected ${url}`))
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const diff = await resolveDiff('v1', 'v2', 'node-a')
+    expect(diff.changed).toBe(true)
+    expect(diff.from_format).toBe('yaml')
+  })
+})

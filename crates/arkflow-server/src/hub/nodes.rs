@@ -75,6 +75,36 @@ fn bounded_job_snapshots(
     jobs.into_iter().take(MAX_REPORTED_JOBS_PER_NODE).collect()
 }
 
+/// Version metadata is small and finite, but the same bounding discipline as
+/// job snapshots applies: a misbehaving Agent cannot grow Hub memory.
+const MAX_REPORTED_VERSIONS_PER_NODE: usize = 128;
+const MAX_REPORTED_TASKS_PER_JOB: usize = 1024;
+
+fn bounded_config_versions(
+    versions: Vec<arkflow_core::configuration::ConfigVersion>,
+) -> Vec<arkflow_core::configuration::ConfigVersion> {
+    versions
+        .into_iter()
+        .take(MAX_REPORTED_VERSIONS_PER_NODE)
+        .collect()
+}
+
+fn bounded_job_tasks(map: BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    map.into_iter()
+        .take(MAX_REPORTED_JOBS_PER_NODE)
+        .map(|(job, tasks)| {
+            (
+                job,
+                tasks
+                    .into_iter()
+                    .filter(|task| !task.is_empty())
+                    .take(MAX_REPORTED_TASKS_PER_JOB)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn sanitize_capabilities(capabilities: Vec<String>) -> Vec<String> {
     capabilities
         .into_iter()
@@ -299,6 +329,19 @@ impl Hub {
                         .map(|record| record.jobs.clone())
                         .unwrap_or_default()
                 },
+                // Version metadata lives in the node's durable store, so it
+                // survives re-registration like the redacted configuration.
+                config_versions: old
+                    .as_ref()
+                    .map(|record| record.config_versions.clone())
+                    .unwrap_or_default(),
+                job_tasks: if boot_changed {
+                    BTreeMap::new()
+                } else {
+                    old.as_ref()
+                        .map(|record| record.job_tasks.clone())
+                        .unwrap_or_default()
+                },
                 metrics: old.map(|record| record.metrics).unwrap_or_default(),
             },
         );
@@ -511,6 +554,8 @@ impl Hub {
         };
         node.jobs = bounded_job_snapshots(report.jobs);
         node.configuration = report.configuration;
+        node.config_versions = bounded_config_versions(report.config_versions);
+        node.job_tasks = bounded_job_tasks(report.job_tasks);
         let persisted_version = node.resource.version.clone();
         let persisted_state = format!("{:?}", node.resource.state).to_lowercase();
         let persisted_capabilities =

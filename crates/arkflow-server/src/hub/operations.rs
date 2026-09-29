@@ -72,6 +72,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
         superseded_generation: intent.superseded_generation,
         observed_generation: intent.observed_generation,
         observed_state: intent.observed_state,
+        result: None,
     }
 }
 
@@ -429,6 +430,7 @@ impl Hub {
             superseded_generation: None,
             observed_generation: None,
             observed_state: None,
+            result: None,
         };
         let command = AgentCommand {
             id: command_id.clone(),
@@ -606,6 +608,11 @@ impl Hub {
         operation.progress = result.progress;
         operation.error = result.error.clone();
         operation.failure_class = result.failure_class.clone();
+        // Read-only command reports (validation/diff) ride the terminal
+        // result; mutations never set the field.
+        if result.result.is_some() {
+            operation.result = result.result.clone();
+        }
         if matches!(
             result.state,
             HubOperationState::Succeeded

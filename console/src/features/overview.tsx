@@ -61,8 +61,19 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
       <section className="cards">
         <Card
           label={t('overview.cardControlPlane')}
-          value={system?.state ?? t('common.loading')}
-          hint={system?.version}
+          value={
+            system?.ha?.enabled
+              ? t('overview.haRole', { role: system.ha.role, epoch: system.ha.epoch })
+              : (system?.state ?? t('common.loading'))
+          }
+          hint={
+            system?.ha?.enabled
+              ? t('overview.haHint', {
+                  transitions: system.ha.transitions,
+                  version: system.version,
+                })
+              : system?.version
+          }
         />
         <Card
           label={t('overview.cardNodesOnline')}

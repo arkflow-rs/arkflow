@@ -320,9 +320,7 @@ fn validate_recovery_snapshots<S: CheckpointStore>(
     if rescale {
         // Duplicate references still mean a corrupted seal; the task set
         // legitimately differs from the plan when redistributing.
-        arkflow_core::checkpoint::validate_state_snapshot_tasks_unique(
-            &manifest.state_snapshots,
-        )?;
+        arkflow_core::checkpoint::validate_state_snapshot_tasks_unique(&manifest.state_snapshots)?;
     } else {
         arkflow_core::checkpoint::validate_state_snapshot_task_set(
             &manifest.state_snapshots,
@@ -422,9 +420,8 @@ fn restore_recovery_state<S: CheckpointStore>(
         .map(|assignment| assignment.task_id.as_str())
         .collect::<BTreeSet<_>>();
     if redistribute {
-        let context =
-            arkflow_core::executor::job_runner_adapter::RescaleContext::from_plan(plan)
-                .map_err(|error| error.to_string())?;
+        let context = arkflow_core::executor::job_runner_adapter::RescaleContext::from_plan(plan)
+            .map_err(|error| error.to_string())?;
         let mut entries = Vec::new();
         for snapshot_ref in &manifest.state_snapshots {
             let snapshot = repository
@@ -434,18 +431,18 @@ fn restore_recovery_state<S: CheckpointStore>(
                 let entry = context
                     .redistribute(entry)
                     .map_err(|error| error.to_string())?;
-                let owner = arkflow_core::executor::job_runner_adapter::RescaleContext::task_of_namespace(&entry.namespace)
+                let owner =
+                    arkflow_core::executor::job_runner_adapter::RescaleContext::task_of_namespace(
+                        &entry.namespace,
+                    )
                     .map_err(|error| error.to_string())?;
                 if assigned_task_ids.contains(owner.as_str()) {
                     entries.push(entry);
                 }
             }
         }
-        let snapshot =
-            arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
-        return state
-            .restore(&snapshot)
-            .map_err(|error| error.to_string());
+        let snapshot = arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
+        return state.restore(&snapshot).map_err(|error| error.to_string());
     }
     let mut snapshots = manifest
         .state_snapshots
@@ -463,13 +460,9 @@ fn restore_recovery_state<S: CheckpointStore>(
             .flat_map(|snapshot| snapshot.entries)
             .collect();
         let snapshot = arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
-        state
-            .restore(&snapshot)
-            .map_err(|error| error.to_string())
+        state.restore(&snapshot).map_err(|error| error.to_string())
     } else if let Some(snapshot) = snapshots.pop() {
-        state
-            .restore(&snapshot)
-            .map_err(|error| error.to_string())
+        state.restore(&snapshot).map_err(|error| error.to_string())
     } else {
         Ok(())
     }
@@ -568,6 +561,27 @@ impl JobRuntime {
                 task.kernel
                     .as_ref()
                     .map(|kernel| (job_id.clone(), kernel.metrics().snapshot()))
+            })
+            .collect()
+    }
+
+    /// Task ids each running Job kernel executes on this node, keyed by job
+    /// id: the observed runtime state the Hub merges over desired placement.
+    async fn job_tasks(&self) -> BTreeMap<String, Vec<String>> {
+        self.tasks
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(job_id, task)| {
+                task.kernel.as_ref().map(|_| {
+                    (
+                        job_id.clone(),
+                        task.assignments
+                            .iter()
+                            .map(|attempt| attempt.task_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
             })
             .collect()
     }
@@ -738,13 +752,12 @@ impl JobRuntime {
         if let Some(mut existing) = existing {
             let existing_generation = existing.generation;
             let dedicated = existing.dedicated_runtime.take();
-            let outcome =
-                await_previous_teardown(
-                    &job_id,
-                    &mut existing.handle,
-                    KERNEL_TEARDOWN_JOIN_TIMEOUT,
-                )
-                .await;
+            let outcome = await_previous_teardown(
+                &job_id,
+                &mut existing.handle,
+                KERNEL_TEARDOWN_JOIN_TIMEOUT,
+            )
+            .await;
             let _ = existing.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -860,7 +873,12 @@ impl JobRuntime {
                     &manifest,
                     redistribute,
                 )?;
-                validate_recovery_snapshots(&plan_for_recovery, &repository, &manifest, redistribute)?;
+                validate_recovery_snapshots(
+                    &plan_for_recovery,
+                    &repository,
+                    &manifest,
+                    redistribute,
+                )?;
                 restore_recovery_state(
                     &plan_for_recovery,
                     &repository,
@@ -975,29 +993,26 @@ impl JobRuntime {
         // async work) runs on max(1, ceil(millicores/1000)) worker threads
         // owned by this Job instead of the shared runtime's pool. Undeclared
         // Jobs keep the shared runtime, byte-identical to before.
-        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> = match plan
-            .spec
-            .resources
-            .cpu_millicores
-        {
-            Some(millicores) => {
-                let workers = millicores.div_ceil(1000).max(1) as usize;
-                match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(workers)
-                    .thread_name(format!("arkflow-job-{job_id}"))
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => Some(Arc::new(runtime)),
-                    Err(error) => {
-                        return Err(format!(
-                            "dedicated runtime for Job '{job_id}' failed to build: {error}"
-                        ))
+        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> =
+            match plan.spec.resources.cpu_millicores {
+                Some(millicores) => {
+                    let workers = millicores.div_ceil(1000).max(1) as usize;
+                    match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(workers)
+                        .thread_name(format!("arkflow-job-{job_id}"))
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => Some(Arc::new(runtime)),
+                        Err(error) => {
+                            return Err(format!(
+                                "dedicated runtime for Job '{job_id}' failed to build: {error}"
+                            ))
+                        }
                     }
                 }
-            }
-            None => None,
-        };
+                None => None,
+            };
         let state_for_spawn = state.clone();
         let owned_plan = plan.clone();
         let owned_task_ids = task_ids.clone();
@@ -1661,9 +1676,9 @@ async fn spawn_kernel_job(
                 }
             }
             if !partitions.is_empty() {
-                if let Some(gate) = gate.lock()
-                    .await
-                    .as_mut() { gate.seed_partitions(&partitions) }
+                if let Some(gate) = gate.lock().await.as_mut() {
+                    gate.seed_partitions(&partitions)
+                }
             }
         }
         for input in &inputs {
@@ -2007,14 +2022,14 @@ fn data_plane_tls_from_env(
     }
 }
 
-fn merge_resource_gauges(
-    metrics: &mut BTreeMap<String, f64>,
-    snapshot: ResourceSnapshot,
-) {
+fn merge_resource_gauges(metrics: &mut BTreeMap<String, f64>, snapshot: ResourceSnapshot) {
     if let Some(cpu) = snapshot.cpu_usage_percent {
         metrics.insert("node_cpu_usage_percent".into(), cpu);
     }
-    metrics.insert("node_memory_used_bytes".into(), snapshot.memory_used_bytes as f64);
+    metrics.insert(
+        "node_memory_used_bytes".into(),
+        snapshot.memory_used_bytes as f64,
+    );
     metrics.insert(
         "node_memory_total_bytes".into(),
         snapshot.memory_total_bytes as f64,
@@ -2077,8 +2092,7 @@ pub async fn run(
     // Host resource gauges: sampled on an interval derived from the report
     // cadence for the whole process lifetime, so re-registration churn
     // never resets the view.
-    let resource_sampler =
-        spawn_resource_sampler(config.report_interval, cancellation.clone());
+    let resource_sampler = spawn_resource_sampler(config.report_interval, cancellation.clone());
     // Cross-node shuffle data plane: one listener per Agent process. A bind
     // failure degrades to the co-location contract (warn, no listener) rather
     // than blocking node startup — observability and placement still work.
@@ -2487,8 +2501,17 @@ async fn report(
         events: cp.events().await,
         metrics,
         jobs: job_runtime.job_snapshots().await,
+        job_tasks: job_runtime.job_tasks().await,
         configuration: redacted_config(&cp.configuration().await).ok(),
         configuration_version,
+        // The report rides every poll tick; truncate client-side to the
+        // Hub's bound so a long-lived version store cannot bloat reports.
+        config_versions: cp
+            .versions()
+            .unwrap_or_default()
+            .into_iter()
+            .take(128)
+            .collect(),
         boot_id: Some(boot_id.into()),
         report_seq,
     }
@@ -2517,6 +2540,7 @@ async fn execute_command(
         rollout_id: command.rollout_id.clone(),
         observed_checkpoint_id: None,
         checkpoint_manifest_uri: None,
+        result: None,
     };
     if command_expired(command.expires_at_ms, now_ms()) {
         result.state = HubOperationState::TimedOut;
@@ -2575,6 +2599,95 @@ async fn execute_command(
         return deliver_result(client, config, auth, result).await;
     }
     send_result(client, config, auth, result).await?;
+    if matches!(
+        command.operation.as_str(),
+        "validate_configuration" | "diff_configuration"
+    ) {
+        // Read-only reports dispatched by the Hub for console clients.
+        // Execution success is distinct from the report's own verdict: an
+        // invalid candidate still validates successfully, so the report
+        // rides the result payload instead of the error channel.
+        let outcome: Result<serde_json::Value, String> = if command.operation
+            == "validate_configuration"
+        {
+            command
+                .payload
+                .clone()
+                .ok_or_else(|| "missing configuration payload".to_string())
+                .and_then(|payload| {
+                    serde_json::from_value::<arkflow_core::configuration::ConfigCandidate>(payload)
+                        .map_err(|error| error.to_string())
+                })
+                .map(|candidate| {
+                    serde_json::to_value(cp.validate_configuration(&candidate)).unwrap_or_default()
+                })
+        } else {
+            let from = command
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("from"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing configuration version".to_string())?;
+            let to = command
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("to"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing configuration version".to_string())?;
+            let from_candidate = cp
+                .version_store()
+                .load(from)
+                .map_err(|error| error.to_string())?;
+            let to_candidate = cp
+                .version_store()
+                .load(to)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({
+                "from": from,
+                "to": to,
+                "changed": from_candidate.content != to_candidate.content,
+                "from_format": from_candidate.format,
+                "to_format": to_candidate.format,
+            }))
+        };
+        let (state, report, error, failure_class) = match outcome {
+            Ok(report) => (
+                HubOperationState::Succeeded,
+                Some(report),
+                None,
+                None::<String>,
+            ),
+            Err(error) => (
+                HubOperationState::Failed,
+                None,
+                Some(error),
+                Some("permanent_execution".into()),
+            ),
+        };
+        return deliver_result(
+            client,
+            config,
+            auth,
+            CommandResult {
+                command_id: command.id.clone(),
+                operation_id: command.operation_id.clone(),
+                state,
+                progress: 100,
+                error,
+                correlation_id: command.correlation_id.clone(),
+                generation: command.generation,
+                observed_generation: None,
+                action_id: command.action_id.clone(),
+                failure_class,
+                config_version_id: command.config_version_id.clone(),
+                rollout_id: command.rollout_id.clone(),
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+                result: report,
+            },
+        )
+        .await;
+    }
     if matches!(
         command.operation.as_str(),
         "apply_configuration" | "rollback_configuration"
@@ -2649,6 +2762,7 @@ async fn execute_command(
                 rollout_id: command.rollout_id.clone(),
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await;
@@ -2682,6 +2796,7 @@ async fn execute_command(
                     rollout_id: command.rollout_id.clone(),
                     observed_checkpoint_id: None,
                     checkpoint_manifest_uri: None,
+                    result: None,
                 },
             )
             .await;
@@ -2706,6 +2821,7 @@ async fn execute_command(
             rollout_id: command.rollout_id.clone(),
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await?;
@@ -2752,6 +2868,7 @@ async fn execute_command(
                         rollout_id: command.rollout_id.clone(),
                         observed_checkpoint_id: None,
                         checkpoint_manifest_uri: None,
+                        result: None,
                     },
                 )
                 .await;
@@ -2784,6 +2901,7 @@ async fn execute_command(
                     rollout_id: command.rollout_id.clone(),
                     observed_checkpoint_id: None,
                     checkpoint_manifest_uri: None,
+                    result: None,
                 },
             )
             .await;
@@ -2813,6 +2931,7 @@ async fn execute_command(
                     rollout_id: command.rollout_id.clone(),
                     observed_checkpoint_id: None,
                     checkpoint_manifest_uri: None,
+                    result: None,
                 },
             )
             .await;
@@ -3131,7 +3250,8 @@ fn jittered_backoff_stays_within_the_equal_jitter_window() {
 async fn wedged_previous_teardown_does_not_block_beyond_the_bound() {
     let mut wedged = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
     let started = std::time::Instant::now();
-    let outcome = await_previous_teardown("job-wedge", &mut wedged, Duration::from_millis(100)).await;
+    let outcome =
+        await_previous_teardown("job-wedge", &mut wedged, Duration::from_millis(100)).await;
     assert!(
         outcome.is_none(),
         "a detached teardown must report no outcome: {outcome:?}"
@@ -3692,6 +3812,7 @@ mod tests {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         };
         assert!(replay_cached_command(&cache, "cmd-1").is_none());
         remember_completed_command(&mut cache, "cmd-1".into(), result.clone());
@@ -3971,7 +4092,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "arkflow-agent-rescale-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let repository = CheckpointRepository::new(
@@ -4035,8 +4159,7 @@ mod tests {
         let mut restored_total = 0usize;
         for (node, assignments) in [("node-a", &node_a), ("node-b", &node_b)] {
             let state_root = root.join(format!("state-{node}"));
-            let backend =
-                RedbStateBackend::open(&state_root, 1).unwrap();
+            let backend = RedbStateBackend::open(&state_root, 1).unwrap();
             let state: Arc<dyn StateBackend> = Arc::new(backend);
             restore_recovery_state(&new_plan, &repository, &manifest, assignments, &state, true)
                 .unwrap();
@@ -4089,7 +4212,11 @@ mod tests {
             assert!(restored_here > 0, "{node} should own at least one key");
             restored_total += restored_here;
         }
-        assert_eq!(restored_total, keys.len(), "entries must partition exactly across nodes");
+        assert_eq!(
+            restored_total,
+            keys.len(),
+            "entries must partition exactly across nodes"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4132,8 +4259,8 @@ mod tests {
             checksum: 0,
         };
         manifest.seal();
-        let error = validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, false)
-            .unwrap_err();
+        let error =
+            validate_recovery_manifest(&new_plan, "c-guard", 1, &manifest, false).unwrap_err();
         assert!(
             error.contains("task set does not match the planned assignment"),
             "{error}"
@@ -4218,7 +4345,9 @@ mod tests {
 
         {
             let tasks = runtime.tasks.lock().await;
-            let task = tasks.get("orders-drift").expect("the kernel stays registered");
+            let task = tasks
+                .get("orders-drift")
+                .expect("the kernel stays registered");
             assert_eq!(task.generation, 1, "the generation is unchanged");
             let live: std::collections::BTreeSet<String> = task
                 .assignments
@@ -4237,7 +4366,6 @@ mod tests {
         runtime.stop("orders-drift", 1).await.unwrap();
         let _ = runtime.take_finished().await;
     }
-
 
     /// A Job declaring cpu_millicores runs on a dedicated runtime with
     /// ceil(millicores/1000) workers (min 1); an undeclared Job keeps the
@@ -4262,8 +4390,7 @@ mod tests {
             "sinks": [{"operator_id": "sink", "output_type": "drop"}]
         });
         spec_value["resources"] = serde_json::json!({"cpu_millicores": 2500});
-        let spec: arkflow_core::job::JobSpec =
-            serde_json::from_value(spec_value).unwrap();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(spec_value).unwrap();
         let plan = JobPlan::compile(spec).unwrap();
         let assignments = plan
             .assignments_for_nodes(&["node-a".to_string()], 1)
@@ -4325,7 +4452,6 @@ mod tests {
         let _ = runtime.take_finished().await;
     }
 
-
     /// Partial data-plane TLS configuration fails closed (startup error),
     /// never a silent plaintext fallback.
     #[test]
@@ -4337,15 +4463,11 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("partial TLS configuration must fail closed"),
         };
-        assert!(
-            error.contains("must be set together"),
-            "{error}"
-        );
+        assert!(error.contains("must be set together"), "{error}");
         unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT") };
         // Fully absent stays optional (plaintext default).
         assert!(data_plane_tls_from_env().unwrap().is_none());
     }
-
 
     /// Regression for the Drop guard: a JobTask carrying a dedicated
     /// runtime can be dropped WITHOUT the explicit retirement path — the
@@ -4387,5 +4509,4 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(runtime.tasks.lock().await.is_empty());
     }
-
 }

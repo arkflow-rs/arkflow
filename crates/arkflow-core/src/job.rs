@@ -81,17 +81,6 @@ pub enum JobConvergenceState {
     Blocked,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct JobMetricsSnapshot {
-    pub watermark_lag_ms: u64,
-    pub state_bytes: u64,
-    pub checkpoint_duration_ms: u64,
-    pub checkpoint_failures: u64,
-    pub recovery_progress: f64,
-    pub task_pressure: f64,
-    pub partition_health: f64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatorKind {
@@ -566,7 +555,11 @@ impl JobSpec {
                 "resources.cpu_millicores must be positive".into(),
             ));
         }
-        if self.resources.memory_bytes.is_some_and(|memory| memory == 0) {
+        if self
+            .resources
+            .memory_bytes
+            .is_some_and(|memory| memory == 0)
+        {
             return Err(Error::Config(
                 "resources.memory_bytes must be positive".into(),
             ));
@@ -939,9 +932,7 @@ impl JobSpec {
                 ));
             }
             if state.max_bytes == Some(0) {
-                return Err(Error::Config(
-                    "Job state max_bytes must be positive".into(),
-                ));
+                return Err(Error::Config("Job state max_bytes must be positive".into()));
             }
             if requires_state
                 && state.durability == StateDurability::Durable
@@ -1143,10 +1134,7 @@ impl JobPlan {
     /// Validate every task assignment participating in a runtime side edge.
     /// This is intentionally public so the Hub and Agent can both enforce the
     /// same invariant at their trust boundaries.
-    pub fn validate_side_edge_assignments(
-        &self,
-        assignments: &[TaskAttempt],
-    ) -> Result<(), Error> {
+    pub fn validate_side_edge_assignments(&self, assignments: &[TaskAttempt]) -> Result<(), Error> {
         let mut node_by_task = BTreeMap::new();
         for assignment in assignments {
             if node_by_task
@@ -1214,11 +1202,7 @@ impl JobPlan {
         Ok(())
     }
 
-    fn assignments_colocated(
-        &self,
-        node_ids: &[String],
-        generation: u64,
-    ) -> Vec<TaskAttempt> {
+    fn assignments_colocated(&self, node_ids: &[String], generation: u64) -> Vec<TaskAttempt> {
         // The colocated runner has no cross-node data edges. Co-locate
         // every connected operator component so an edge can never disappear
         // merely because its endpoints were assigned to different Agents.
@@ -1566,10 +1550,7 @@ mod tests {
         });
         // No inbound edges: rejected with the arity error.
         let error = job.validate().unwrap_err().to_string();
-        assert!(
-            error.contains("exactly two inbound edges"),
-            "{error}"
-        );
+        assert!(error.contains("exactly two inbound edges"), "{error}");
     }
 
     #[test]
@@ -1635,7 +1616,10 @@ mod tests {
         let mut missing_state = base_job();
         missing_state.state = None;
         let error = missing_state.validate().unwrap_err().to_string();
-        assert!(error.contains("require an explicit state specification"), "{error}");
+        assert!(
+            error.contains("require an explicit state specification"),
+            "{error}"
+        );
 
         let mut missing_checkpoint = base_job();
         missing_checkpoint.checkpoint = None;
@@ -1727,12 +1711,7 @@ mod tests {
     fn effective_state_namespace_preserves_job_operator_and_task_identity() {
         let job = base_job();
         assert_eq!(
-            effective_state_namespace(
-                &job.id,
-                job.state.as_ref(),
-                "aggregate",
-                "aggregate-1"
-            ),
+            effective_state_namespace(&job.id, job.state.as_ref(), "aggregate", "aggregate-1"),
             "job:orders:state:orders:operator:aggregate:task:aggregate-1"
         );
         assert_eq!(
@@ -2136,7 +2115,9 @@ mod placement_tests {
             .assignments_for_nodes(&["a".into(), "b".into()], 1)
             .expect_err("error side edge must reject the placement");
         assert!(
-            error.to_string().contains("error edge 'source -> error_sink'"),
+            error
+                .to_string()
+                .contains("error edge 'source -> error_sink'"),
             "expected the error side edge in the rejection, got {error}"
         );
     }
@@ -2246,10 +2227,15 @@ mod placement_tests {
             "rebalance": {"mode": "auto", "pressure_streak": 5, "cooldown_ms": 60_000}
         }))
         .unwrap();
-        assert_eq!(explicit.rebalance,
-            Some(RebalancePolicy { mode: RebalanceMode::Auto, pressure_streak: 5, cooldown_ms: 60_000 }));
+        assert_eq!(
+            explicit.rebalance,
+            Some(RebalancePolicy {
+                mode: RebalanceMode::Auto,
+                pressure_streak: 5,
+                cooldown_ms: 60_000
+            })
+        );
     }
-
 
     #[test]
     fn resource_declarations_parse_per_task_and_validate() {
@@ -2301,5 +2287,4 @@ mod placement_tests {
         .unwrap();
         assert!(zero.validate().is_err());
     }
-
 }

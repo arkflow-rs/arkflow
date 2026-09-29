@@ -12,6 +12,24 @@ the configured operator-token boundary or an authenticated monitoring proxy;
 never publish bearer tokens, configuration payloads, node IDs as metric
 labels, or error text as labels.
 
+`/api/v1/metrics` is content-negotiated: the default response stays the
+Prometheus text exposition above, while an explicit `Accept: application/json`
+(or `?format=json`) returns the JSON aggregate `{"items": [{"node_id",
+"metrics"}], "aggregate"}` that the web console renders; the `node_id` query
+filter is honored on both branches. The Hub also serves `GET /api/v1/status` —
+a fleet-aggregated engine status (stream totals summed over registered nodes,
+plus Hub version and uptime) — so console clients see one overview contract in
+local and Hub mode. Job detail diagnostics (`GET /api/v1/jobs/{id}/detail`)
+carry only measured, job-scoped gauges (`watermark_lag_ms`,
+`checkpoint_duration_ms`, `checkpoint_failures`) and merge observed task
+state — reported by the nodes executing the job — over the desired placement,
+marking not-yet-observed tasks explicitly instead of presenting placement
+state as runtime state. Read-only configuration reports are reachable through
+the Hub at `POST /api/v1/nodes/{node_id}/configuration/validate` and
+`GET /api/v1/nodes/{node_id}/configuration/diff?from&to`: both dispatch a
+read-only node command (no version or rollout side effects) and deliver the
+report on the tracked operation's `result` field.
+
 Command dispatch metrics cover enqueue-to-acknowledgement latency
 (`arkflow_command_duration_bucket`/`_count`/`_sum`) and per-outcome counters
 (`arkflow_command_total`) with fixed `command` and `outcome` label

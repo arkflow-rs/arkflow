@@ -21,6 +21,7 @@ import {
   waitForOperation,
 } from './api'
 import { useNodes, useLiveError } from './queries'
+import type { ApiError } from './api'
 import { Overview } from './features/overview'
 import { Runtime } from './features/runtime'
 import { Jobs } from './features/jobs'
@@ -34,6 +35,11 @@ import { resolvedTheme } from './theme'
 import { Rollouts } from './features/rollouts'
 import { useSetLocale, useLocale, useT, type Locale } from './i18n'
 import { useTheme, type ThemeSetting } from './theme'
+
+/** True when the failing request was rejected by a standby Hub. */
+function isStandbyError(cause: unknown): boolean {
+  return (cause as ApiError | null)?.code === 'hub_standby'
+}
 
 const NAV_ITEMS = [
   { path: '/', key: 'overview' },
@@ -92,6 +98,10 @@ function ConsoleShell() {
   const nodesQuery = useNodes()
   const liveError = useLiveError()
   const nodes = nodesQuery.data?.items ?? []
+  // A standby Hub rejects everything but health probes with 503 `hub_standby`;
+  // that gets its own explanation instead of the generic stale-state banner.
+  // Polling continues, so the banner self-clears when this Hub wins the lease.
+  const standby = isStandbyError(nodesQuery.error) || isStandbyError(liveError)
   const [error, setError] = useState('')
   const [live, setLive] = useState(false)
   const [oidcAuthenticated, setOidcAuthenticated] = useState(false)
@@ -255,9 +265,13 @@ function ConsoleShell() {
               {t('warning.nodeUnavailable', { node: selectedNode, state: selectedNodeState.state })}
             </div>
           )}
-        {stale && <div className="warning">{t('warning.staleState')}</div>}
+        {standby ? (
+          <div className="warning">{t('warning.hubStandby')}</div>
+        ) : (
+          stale && <div className="warning">{t('warning.staleState')}</div>
+        )}
         {error && <div className="error">{error}</div>}
-        {queryError && <div className="error">{errorMessage(queryError)}</div>}
+        {queryError && !standby && <div className="error">{errorMessage(queryError)}</div>}
         <Routes>
           <Route path="/" element={<Overview onError={setError} />} />
           <Route

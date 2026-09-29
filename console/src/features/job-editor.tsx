@@ -255,7 +255,6 @@ export function JobEditor({
   const t = useT()
   const initial = useMemo<JobSpec>(() => {
     if ((mode === 'upgrade' || mode === 'atomic') && job) {
-      if (job.spec && typeof job.spec === 'object') return copy(job.spec as JobSpec)
       if (job.spec_json)
         try {
           return JSON.parse(job.spec_json)
@@ -455,6 +454,12 @@ export function JobEditor({
     latestSpecJson.current = JSON.stringify(next)
     setValidation(undefined)
   }
+  // Per-task resource requests: both optional, and clearing the last input
+  // serializes the whole `resources` object back to its absent form.
+  const setResource = (key: 'cpu_millicores' | 'memory_bytes', value: number | undefined) => {
+    const next = { ...(spec.resources ?? {}), [key]: value }
+    setGlobal('resources', next.cpu_millicores || next.memory_bytes ? next : undefined)
+  }
   const nodeComponent =
     selected &&
     components.find(
@@ -535,6 +540,32 @@ export function JobEditor({
             min={1}
             value={spec.max_parallelism ?? 128}
             onChange={(event) => setGlobal('max_parallelism', Number(event.target.value))}
+          />
+        </label>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={Boolean(spec.rescale)}
+            onChange={(event) => setGlobal('rescale', event.target.checked)}
+          />
+          {t('editor.rescaleLabel')}
+        </label>
+        <label>
+          {t('editor.cpuMillicoresLabel')}
+          <input
+            type="number"
+            min={0}
+            value={spec.resources?.cpu_millicores ?? ''}
+            onChange={(event) => setResource('cpu_millicores', Number(event.target.value) || undefined)}
+          />
+        </label>
+        <label>
+          {t('editor.memoryBytesLabel')}
+          <input
+            type="number"
+            min={0}
+            value={spec.resources?.memory_bytes ?? ''}
+            onChange={(event) => setResource('memory_bytes', Number(event.target.value) || undefined)}
           />
         </label>
         <label>

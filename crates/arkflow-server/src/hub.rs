@@ -26,8 +26,8 @@ use tokio::sync::{broadcast, RwLock};
 mod checkpoint;
 mod command_metrics;
 mod error;
-mod jobs;
 mod job_orchestration;
+mod jobs;
 mod leadership;
 mod lifecycle;
 mod nodes;
@@ -45,13 +45,13 @@ mod tests;
 
 pub use command_metrics::CommandMetrics;
 pub use error::HubError;
+pub use leadership::{HubHaConfig, Leadership};
 pub(crate) use wire::default_protocol_version;
 pub use wire::{
     AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, HubEvent, HubNode, HubNodeMetrics,
     HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState, NodeReport,
     RegisterRequest, RegisterResponse,
 };
-pub use leadership::{HubHaConfig, Leadership};
 
 // Internal helpers referenced across submodules.
 pub(crate) use checkpoint::recovery_record_is_compatible;
@@ -124,6 +124,10 @@ pub(crate) struct NodeRecord {
     /// Most recent per-Job kernel snapshots reported by the Agent.
     jobs: BTreeMap<String, arkflow_core::executor::metrics::KernelMetricsSnapshot>,
     configuration: Option<serde_json::Value>,
+    /// Configuration version metadata (never content) reported by the Agent.
+    config_versions: Vec<arkflow_core::configuration::ConfigVersion>,
+    /// Task ids each Job kernel is currently executing on the node.
+    job_tasks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -169,6 +173,8 @@ pub struct Hub {
     /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
     /// operator credentials keep priority when both are configured.
     oidc: Option<Arc<crate::oidc::OidcFederation>>,
+    /// Process start of this Hub instance, for `/status` uptime reporting.
+    started_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -240,6 +246,7 @@ impl Hub {
             leadership: Arc::new(RwLock::new(Leadership::Disabled)),
             leadership_transitions: Arc::new(AtomicU64::new(0)),
             oidc: None,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -286,5 +293,10 @@ impl Hub {
             .node_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty())
+    }
+
+    /// Seconds this Hub process has been serving.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 }

@@ -217,6 +217,7 @@ async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -314,6 +315,7 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -369,6 +371,7 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -448,6 +451,7 @@ async fn durable_replacement_without_checkpoint_fails_closed_before_dispatch() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -540,6 +544,7 @@ async fn current_generation_recovery_required_failure_overrides_running_observat
             superseded_generation: None,
             observed_generation: None,
             observed_state: None,
+            result: None,
         },
     );
 
@@ -645,6 +650,7 @@ async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -835,6 +841,7 @@ async fn stale_operation_and_checkpoint_records_are_reclaimed() {
         superseded_generation: None,
         observed_generation: None,
         observed_state: None,
+        result: None,
     };
     hub.operations
         .write()
@@ -1180,6 +1187,8 @@ async fn register_and_report_resources(hub: &Hub, report_seq: u64) {
         configuration_version: None,
         boot_id: None,
         report_seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -1351,6 +1360,8 @@ fn agent_wire_contract_round_trips_reconciliation_fields() {
         configuration_version: Some("cfg-7".into()),
         boot_id: Some("boot-7".into()),
         report_seq: 9,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     };
     let decoded: NodeReport =
         serde_json::from_value(serde_json::to_value(report).unwrap()).unwrap();
@@ -1535,13 +1546,11 @@ async fn rollout_dispatch_keeps_reference_when_secret_missing() {
     hub.reconcile_rollouts().await.unwrap();
     let (_, targets) = hub.rollout(&rollout.rollout_id).await.unwrap().unwrap();
     assert_eq!(targets[0].state, "applying");
-    let content = crate::storage::StorageBackend::get_config_version_content(
-        &assertion_store,
-        "cfg-missing",
-    )
-    .await
-    .unwrap()
-    .expect("version content");
+    let content =
+        crate::storage::StorageBackend::get_config_version_content(&assertion_store, "cfg-missing")
+            .await
+            .unwrap()
+            .expect("version content");
     assert!(
         content.contains("${secret:never_set_x}"),
         "stored version must keep the reference: {content}"
@@ -1809,6 +1818,8 @@ async fn rollout_converges_only_after_target_configuration_is_observed() {
         configuration_version: Some("cfg-health".into()),
         boot_id: Some(session.session_token.clone()),
         report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -1919,6 +1930,8 @@ async fn rollout_state_machine_covers_gates_drain_restart_rollback_and_cancel() 
         configuration_version: Some("cfg-state-a".into()),
         boot_id: Some(node_a.session_token.clone()),
         report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -2086,6 +2099,7 @@ async fn multiple_agent_rollout_smoke_completes_through_commands_and_reports() {
                 rollout_id: commands[0].rollout_id.clone(),
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -2104,6 +2118,8 @@ async fn multiple_agent_rollout_smoke_completes_through_commands_and_reports() {
             configuration_version: Some("cfg-e2e".into()),
             boot_id: Some(auth.session_token.clone()),
             report_seq: 1,
+            config_versions: Vec::new(),
+            job_tasks: BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -2188,6 +2204,8 @@ async fn dispatched_attempt_waits_for_fresh_report_after_hub_restart() {
         configuration_version: None,
         boot_id: Some(session2.session_token.clone()),
         report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -2241,6 +2259,8 @@ async fn registers_reports_and_dispatches_targeted_commands() {
         configuration_version: None,
         boot_id: None,
         report_seq: 0,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -2293,6 +2313,7 @@ async fn registers_reports_and_dispatches_targeted_commands() {
                 rollout_id: None,
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -2376,6 +2397,8 @@ async fn report_without_job_snapshots_exports_no_data_plane_series() {
         configuration_version: None,
         boot_id: None,
         report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -2421,6 +2444,8 @@ async fn reported_job_metrics_carry_node_and_job_labels() {
             configuration_version: None,
             boot_id: None,
             report_seq: 1,
+            config_versions: Vec::new(),
+            job_tasks: BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -2479,6 +2504,8 @@ async fn expired_lease_stops_data_plane_export() {
             configuration_version: None,
             boot_id: None,
             report_seq: 1,
+            config_versions: Vec::new(),
+            job_tasks: BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -2609,6 +2636,8 @@ async fn ignores_replayed_reports_from_the_same_boot() {
         configuration_version: None,
         boot_id: Some(session.session_token.clone()),
         report_seq,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
     };
     hub.report(report(2, "running")).await.unwrap();
     hub.report(report(1, "stopped")).await.unwrap();
@@ -3031,6 +3060,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -3109,6 +3139,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
             rollout_id: None,
             observed_checkpoint_id: Some("checkpoint-7".into()),
             checkpoint_manifest_uri: Some("/tmp/checkpoint-7/manifest.json".into()),
+            result: None,
         },
     )
     .await
@@ -3162,6 +3193,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
             rollout_id: None,
             observed_checkpoint_id: Some("checkpoint-7".into()),
             checkpoint_manifest_uri: Some("/tmp/final/checkpoint-7/manifest.json".into()),
+            result: None,
         },
     )
     .await
@@ -3304,6 +3336,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -3350,6 +3383,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -3395,6 +3429,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -3522,6 +3557,7 @@ async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
                 rollout_id: None,
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -3603,6 +3639,7 @@ async fn periodic_job_reconciliation_retries_a_failed_runtime() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -3830,6 +3867,7 @@ async fn command_metrics_track_enqueues_latency_and_rejections() {
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -4117,8 +4155,8 @@ fn ha_job_record(job_id: &str) -> JobRecord {
 async fn standby_gates_routes_and_writes_nothing() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
     let storage = crate::storage::StorageActor::start(store, 8);
-    let hub = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("standby-hub", 60_000));
+    let hub =
+        Hub::with_storage(config(), storage.clone()).with_ha(ha_config("standby-hub", 60_000));
     hub.enter_election().await;
     assert!(matches!(hub.leadership().await, Leadership::Standby { .. }));
     assert!(!hub.is_leader().await);
@@ -4199,15 +4237,17 @@ async fn standby_gates_routes_and_writes_nothing() {
             axum::http::Request::post("/api/v1/agent/register")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    serde_json::json!({"node_id":"node-a","node_token":"node-secret"})
-                        .to_string(),
+                    serde_json::json!({"node_id":"node-a","node_token":"node-secret"}).to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(hub.nodes().await.is_empty(), "standby created a node record");
+    assert!(
+        hub.nodes().await.is_empty(),
+        "standby created a node record"
+    );
 
     // Reads are refused too, and nothing was persisted.
     let response = app
@@ -4250,10 +4290,8 @@ async fn disabled_ha_keeps_the_single_instance_surface() {
 async fn lease_failover_promotes_standby_and_recovers_durable_state() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
     let storage = crate::storage::StorageActor::start(store, 8);
-    let hub_a = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-a", 60_000));
-    let hub_b = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-b", 60_000));
+    let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 60_000));
+    let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
     hub_a.enter_election().await;
     hub_b.enter_election().await;
 
@@ -4262,18 +4300,21 @@ async fn lease_failover_promotes_standby_and_recovers_durable_state() {
         hub_a.run_election_tick().await,
         Leadership::Leader { epoch: 1, .. }
     ));
-    assert!(matches!(hub_b.run_election_tick().await, Leadership::Standby { .. }));
+    assert!(matches!(
+        hub_b.run_election_tick().await,
+        Leadership::Standby { .. }
+    ));
 
     // The leader persists state a standby must recover on takeover.
-    hub_a
-        .upsert_job(ha_job_record("ha-job"))
-        .await
-        .unwrap();
+    hub_a.upsert_job(ha_job_record("ha-job")).await.unwrap();
 
     // Graceful shutdown releases the lease immediately; the standby takes
     // over on its next probe with a bumped epoch.
     hub_a.release_leadership().await;
-    assert!(matches!(hub_a.leadership().await, Leadership::Standby { .. }));
+    assert!(matches!(
+        hub_a.leadership().await,
+        Leadership::Standby { .. }
+    ));
     assert!(matches!(
         hub_b.run_election_tick().await,
         Leadership::Leader { epoch: 2, .. }
@@ -4313,10 +4354,8 @@ async fn lease_failover_promotes_standby_and_recovers_durable_state() {
 async fn expired_lease_is_taken_over_without_release() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
     let storage = crate::storage::StorageActor::start(store, 8);
-    let hub_a = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-a", 1_000));
-    let hub_b = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-b", 60_000));
+    let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 1_000));
+    let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
     hub_a.enter_election().await;
     hub_b.enter_election().await;
     assert!(matches!(
@@ -4336,16 +4375,23 @@ async fn expired_lease_is_taken_over_without_release() {
 async fn promotion_replaces_stale_memory_from_the_previous_term() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
     let storage = crate::storage::StorageActor::start(store, 8);
-    let hub_a = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-a", 60_000));
-    let hub_b = Hub::with_storage(config(), storage.clone())
-        .with_ha(ha_config("hub-b", 60_000));
+    let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 60_000));
+    let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
     hub_a.enter_election().await;
     hub_b.enter_election().await;
-    assert!(matches!(hub_a.run_election_tick().await, Leadership::Leader { .. }));
-    hub_a.upsert_job(ha_job_record("durable-job")).await.unwrap();
+    assert!(matches!(
+        hub_a.run_election_tick().await,
+        Leadership::Leader { .. }
+    ));
+    hub_a
+        .upsert_job(ha_job_record("durable-job"))
+        .await
+        .unwrap();
     hub_a.release_leadership().await;
-    assert!(matches!(hub_b.run_election_tick().await, Leadership::Leader { .. }));
+    assert!(matches!(
+        hub_b.run_election_tick().await,
+        Leadership::Leader { .. }
+    ));
 
     // While B leads, it advances durable state; A keeps a ghost entry in
     // memory from its previous term.
@@ -4361,7 +4407,10 @@ async fn promotion_replaces_stale_memory_from_the_previous_term() {
 
     // B hands back the lease; A re-promotes and must serve durable truth.
     hub_b.release_leadership().await;
-    assert!(matches!(hub_a.run_election_tick().await, Leadership::Leader { .. }));
+    assert!(matches!(
+        hub_a.run_election_tick().await,
+        Leadership::Leader { .. }
+    ));
     let jobs = hub_a.jobs().await.unwrap();
     assert!(
         !jobs.iter().any(|job| job.job_id == "ghost-job"),
@@ -4380,8 +4429,7 @@ async fn promotion_replaces_stale_memory_from_the_previous_term() {
 async fn serve_hub_elects_leadership_and_flips_readiness() {
     let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
     let storage = crate::storage::StorageActor::start(store, 8);
-    let hub = Hub::with_storage(config(), storage)
-        .with_ha(ha_config("serve-hub", 1_000));
+    let hub = Hub::with_storage(config(), storage).with_ha(ha_config("serve-hub", 1_000));
     // Reserve an ephemeral port, then hand it to serve_hub.
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4418,7 +4466,10 @@ async fn serve_hub_elects_leadership_and_flips_readiness() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    assert!(leader_ready, "serve_hub must promote the standby via the election loop");
+    assert!(
+        leader_ready,
+        "serve_hub must promote the standby via the election loop"
+    );
     assert!(matches!(hub.leadership().await, Leadership::Leader { .. }));
     assert!(hub.leadership_transitions() >= 1);
     let events = hub.events(None).await;
@@ -4445,7 +4496,8 @@ async fn serve_hub_elects_leadership_and_flips_readiness() {
 fn durable_atomic_spec_json(id: &str, version: u64) -> String {
     let mut spec = serde_json::from_str::<serde_json::Value>(&durable_job_spec_json(id)).unwrap();
     spec["version"] = serde_json::json!(version);
-    spec["operators"][1]["config"] = serde_json::json!({"type": "batch", "count": 100, "timeout_ms": 1000});
+    spec["operators"][1]["config"] =
+        serde_json::json!({"type": "batch", "count": 100, "timeout_ms": 1000});
     spec["checkpoint"]["object_store_uri"] = serde_json::json!(format!(
         "file:///tmp/arkflow-hub-upgrade-{}-{}",
         id,
@@ -4481,6 +4533,7 @@ async fn succeed_command(hub: &Hub, auth: &AgentAuth, operation: &str) -> Option
             rollout_id: None,
             observed_checkpoint_id: None,
             checkpoint_manifest_uri: None,
+            result: None,
         },
     )
     .await
@@ -4512,6 +4565,7 @@ async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
                 rollout_id: None,
                 observed_checkpoint_id: None,
                 checkpoint_manifest_uri: None,
+                result: None,
             },
         )
         .await
@@ -4573,8 +4627,7 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
         TaskAttemptSnapshot,
     };
     let job = hub.job(job_id).await.unwrap().unwrap();
-    let spec: arkflow_core::job::JobSpec =
-        serde_json::from_str(&job.spec_json).unwrap();
+    let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json).unwrap();
     let plan = arkflow_core::job::JobPlan::compile(spec.clone()).unwrap();
     let root = std::path::PathBuf::from(
         spec.checkpoint
@@ -4595,7 +4648,10 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
             &task.id,
         );
         let snapshot = arkflow_core::state::StateSnapshot::new(
-            spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+            spec.state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             vec![arkflow_core::state::StateEntry {
                 namespace,
                 key: b"utf8:seed".to_vec(),
@@ -4629,7 +4685,11 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
             trace_context: None,
         },
         state_snapshots: snapshots,
-        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        format_version: spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1),
         checksum: 0,
     };
     manifest.seal();
@@ -4658,7 +4718,11 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
 
 async fn expire_phase_deadline(hub: &Hub, upgrade_id: &str) {
     let storage = hub.storage.as_ref().unwrap();
-    let mut record = storage.get_job_upgrade(upgrade_id.to_owned()).await.unwrap().unwrap();
+    let mut record = storage
+        .get_job_upgrade(upgrade_id.to_owned())
+        .await
+        .unwrap()
+        .unwrap();
     record.phase_deadline_at_ms = 1;
     storage.upsert_job_upgrade(record).await.unwrap();
 }
@@ -4986,7 +5050,10 @@ async fn concurrent_orchestration_and_pause_resume_are_guarded() {
             None,
         )
         .await;
-    assert!(matches!(second, Err(crate::hub::HubError::OrchestrationInProgress)));
+    assert!(matches!(
+        second,
+        Err(crate::hub::HubError::OrchestrationInProgress)
+    ));
 
     // Pause holds the fence; resume re-enters the phase.
     let paused = hub
@@ -4995,19 +5062,28 @@ async fn concurrent_orchestration_and_pause_resume_are_guarded() {
         .unwrap();
     assert_eq!(paused.phase, "paused");
     let job = hub.job("job-atomic-exclusive").await.unwrap().unwrap();
-    assert_eq!(hub.reconcile_job(&job).await.unwrap(), 0, "pause still fences");
+    assert_eq!(
+        hub.reconcile_job(&job).await.unwrap(),
+        0,
+        "pause still fences"
+    );
     hub.reconcile_job_upgrades().await.unwrap();
     let still = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
-    assert_eq!(still.phase, "paused", "a paused orchestration does not tick");
+    assert_eq!(
+        still.phase, "paused",
+        "a paused orchestration does not tick"
+    );
     let resumed = hub
         .act_job_upgrade(&record.upgrade_id, "resume", None, None)
         .await
         .unwrap();
     assert_eq!(resumed.phase, "saving_savepoint");
-    assert!(hub
-        .act_job_upgrade(&record.upgrade_id, "resume", None, None)
-        .await
-        .is_err(), "only a paused orchestration can resume");
+    assert!(
+        hub.act_job_upgrade(&record.upgrade_id, "resume", None, None)
+            .await
+            .is_err(),
+        "only a paused orchestration can resume"
+    );
 
     // Cancel releases the Job and clears the exclusivity.
     let cancelled = hub
@@ -5015,7 +5091,10 @@ async fn concurrent_orchestration_and_pause_resume_are_guarded() {
         .await
         .unwrap();
     assert_eq!(cancelled.phase, "cancelled");
-    assert!(hub.active_job_upgrade_for("job-atomic-exclusive").await.is_none());
+    assert!(hub
+        .active_job_upgrade_for("job-atomic-exclusive")
+        .await
+        .is_none());
     let job = hub.job("job-atomic-exclusive").await.unwrap().unwrap();
     // Unfenced again: reconcile proceeds (dispatch is a no-op here because
     // the succeeded start still satisfies the desired state).
@@ -5060,7 +5139,10 @@ async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &st
             &task.id,
         );
         let snapshot = arkflow_core::state::StateSnapshot::new(
-            spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+            spec.state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
             vec![arkflow_core::state::StateEntry {
                 namespace,
                 key: b"utf8:seed".to_vec(),
@@ -5094,7 +5176,11 @@ async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &st
             trace_context: None,
         },
         state_snapshots: snapshots,
-        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        format_version: spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1),
         checksum: 0,
     };
     manifest.seal();
@@ -5124,7 +5210,11 @@ async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &st
         kind: kind.into(),
         status: "completed".into(),
         manifest_uri: None,
-        format_version: spec.state.as_ref().map(|state| state.format_version).unwrap_or(1),
+        format_version: spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1),
         created_at_ms: now,
         updated_at_ms: now,
     })
@@ -5198,7 +5288,10 @@ async fn retention_pin_shields_orchestration_referenced_artifacts() {
         .into_iter()
         .map(|record| record.checkpoint_id)
         .collect::<Vec<_>>();
-    assert!(ids.contains(&"checkpoint-old".to_owned()), "pin held: {ids:?}");
+    assert!(
+        ids.contains(&"checkpoint-old".to_owned()),
+        "pin held: {ids:?}"
+    );
 
     // Terminal orchestration releases the pin; the next sweep reclaims it.
     let mut finished = upgrade.clone();
@@ -5282,8 +5375,14 @@ async fn upgrade_lifecycle_broadcasts_events_and_audits_actions() {
         .filter(|record| record.action.starts_with("job.upgrade.atomic."))
         .map(|record| record.action)
         .collect::<Vec<_>>();
-    assert!(actions.contains(&"job.upgrade.atomic.initiate".to_owned()), "{actions:?}");
-    assert!(actions.contains(&"job.upgrade.atomic.cancel".to_owned()), "{actions:?}");
+    assert!(
+        actions.contains(&"job.upgrade.atomic.initiate".to_owned()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"job.upgrade.atomic.cancel".to_owned()),
+        "{actions:?}"
+    );
 }
 
 #[tokio::test]
@@ -5291,7 +5390,8 @@ async fn create_job_upgrade_rejects_stale_versions_and_format_changes() {
     let (hub, _auth) = atomic_upgrade_fixture("job-atomic-guards").await;
     // Same version: rejected.
     let same = serde_json::from_str::<arkflow_core::job::JobSpec>(&durable_atomic_spec_json(
-        "job-atomic-guards", 1,
+        "job-atomic-guards",
+        1,
     ))
     .unwrap();
     assert!(hub
@@ -5301,7 +5401,8 @@ async fn create_job_upgrade_rejects_stale_versions_and_format_changes() {
     // State-format change: the savepoint this orchestration would take could
     // never restore into the target version.
     let mut incompatible = serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json(
-        "job-atomic-guards", 2,
+        "job-atomic-guards",
+        2,
     ))
     .unwrap();
     incompatible["state"]["format_version"] = serde_json::json!(2);
@@ -5324,10 +5425,9 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
     let router = crate::hub_router(hub, &crate::ServerConfig::default());
     let authorization = "Bearer operator".to_owned();
 
-    let spec = serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json(
-        "job-atomic-http", 2,
-    ))
-    .unwrap();
+    let spec =
+        serde_json::from_str::<serde_json::Value>(&durable_atomic_spec_json("job-atomic-http", 2))
+            .unwrap();
     let request = axum::http::Request::builder()
         .method("POST")
         .uri("/api/v1/jobs/job-atomic-http/upgrades")
@@ -5368,7 +5468,9 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
         .uri("/api/v1/jobs/job-atomic-http/desired-state")
         .header("authorization", authorization.clone())
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"state": "stopped"}).to_string()))
+        .body(Body::from(
+            serde_json::json!({"state": "stopped"}).to_string(),
+        ))
         .unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
@@ -5384,7 +5486,9 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
         .uri("/api/v1/jobs/job-atomic-http/upgrades/no-such-upgrade/actions")
         .header("authorization", &authorization)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"action": "pause"}).to_string()))
+        .body(Body::from(
+            serde_json::json!({"action": "pause"}).to_string(),
+        ))
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);

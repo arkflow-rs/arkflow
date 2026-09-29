@@ -378,16 +378,20 @@ function JobDetailPanel({
               {detail.job.last_error && <div className="error-row">{detail.job.last_error}</div>}
             </div>
             <div className="metric-list">
-              {Object.entries(detail.metrics ?? {}).map(([key, value]) => (
-                <div className="metric" key={key}>
-                  <span>{key.replaceAll('_', ' ')}</span>
-                  <strong>
-                    {typeof value === 'number'
-                      ? value.toLocaleString(intlLocale(currentLocale()))
-                      : String(value)}
-                  </strong>
-                </div>
-              ))}
+              {Object.entries(detail.metrics ?? {}).length ? (
+                Object.entries(detail.metrics ?? {}).map(([key, value]) => (
+                  <div className="metric" key={key}>
+                    <span>{key.replaceAll('_', ' ')}</span>
+                    <strong>
+                      {typeof value === 'number'
+                        ? value.toLocaleString(intlLocale(currentLocale()))
+                        : String(value)}
+                    </strong>
+                  </div>
+                ))
+              ) : (
+                <p className="empty">{t('jobs.noMeasuredMetrics')}</p>
+              )}
             </div>
           </div>
           {detail.active_upgrade && (
@@ -420,18 +424,18 @@ function JobDetailPanel({
         <div className="table">
           {detail.tasks.length ? (
             detail.tasks.map((task, index) => (
-              <div className="row" key={`${String(task.task_id ?? task.id ?? index)}`}>
+              <div className="row" key={task.id || task.task_id || index}>
                 <div>
-                  <strong>{String(task.task_id ?? task.id ?? `task-${index}`)}</strong>
+                  <strong>{task.task_id || `task-${index}`}</strong>
                   <small>
                     {t('jobs.taskPlacement', {
-                      node: String(task.node_id ?? t('jobs.unassignedValue')),
-                      attempt: String(task.attempt_id ?? '—'),
+                      node: task.observed_node_id ?? task.node_id ?? t('jobs.unassignedValue'),
                     })}
                   </small>
                 </div>
-                <span className={`state ${String(task.state ?? 'assigned')}`}>
-                  {String(task.state ?? 'assigned')}
+                <span className={`state ${task.state ?? 'queued'}`}>
+                  {task.state ?? 'queued'}
+                  {task.observed === false && ` · ${t('jobs.taskNotObserved')}`}
                 </span>
                 <small>
                   {t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}
