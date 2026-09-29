@@ -22,7 +22,7 @@
 
 - [x] 4.1 executor 集成测试:真实链路(双源 + join_type=left_outer)watermark 推进后未匹配行产出,输出列结构符合 spec(对照 delta「left outer 未匹配行的 null 装配」场景)
 - [x] 4.2 重放确定性测试:恢复重放窗口内,先左后右到达的匹配序列不产生「假未匹配」(对照 delta「outer 重放的未匹配确定性」场景)
-- [ ] 4.3 `cargo test -p arkflow-core --all-targets` + `cargo test -p arkflow-plugin` 通过,`cargo clippy --workspace --all-targets` 无新增告警
+- [x] 4.3 `cargo test -p arkflow-core --all-targets` + `cargo test -p arkflow-plugin` 通过,`cargo clippy --workspace --all-targets` 无新增告警
 
 ## 5. 示例与文档
 
@@ -33,4 +33,4 @@
 ## 6. 收口
 
 - [x] 6.1 `cargo test --workspace --all-targets` 全绿(与 CI 同口径)
-- [ ] 6.2 对照 delta spec 逐场景核对实现与测试覆盖,准备归档(verify → archive)
+- [x] 6.2 对照 delta spec 逐场景核对实现与测试覆盖,准备归档(verify → archive)
