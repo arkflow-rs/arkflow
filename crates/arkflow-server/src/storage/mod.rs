@@ -392,6 +392,19 @@ pub enum StorageError {
     Pool(#[from] sqlx::Error),
 }
 
+/// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
+/// (`Held`) or a verified passthrough with nothing to release.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteFence {
+    Held,
+    Passthrough,
+}
+
+/// Leadership-claim value meaning "HA disabled: do not fence". Distinct
+/// from `0`, which means "HA enabled, standby claim" (fenced while a lease
+/// row exists).
+pub const UNFENCED: u64 = u64::MAX;
+
 enum StorageCommand {
     UpsertJob {
         job: JobRecord,
@@ -915,7 +928,7 @@ pub struct StorageActor {
 impl StorageActor {
     pub fn start(store: ControlPlaneStore, capacity: usize) -> Self {
         let (sender, mut receiver) = mpsc::channel(capacity.max(1));
-        let leadership_epoch = Arc::new(AtomicU64::new(0));
+        let leadership_epoch = Arc::new(AtomicU64::new(UNFENCED));
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 dispatch(&store, command).await;
@@ -934,44 +947,35 @@ impl StorageActor {
 /// produce no durable side effect. No lease row (HA disabled) passes
 /// through unchanged.
 async fn dispatch(store: &ControlPlaneStore, command: StorageCommand) {
-    // Peel fencing envelopes iteratively (an async fn cannot recurse
-    // without boxing): a stale claim nack's the inner command and stops.
-    let command = {
-        let mut command = command;
-        loop {
-            match command {
-                StorageCommand::Fenced {
-                    claimed_epoch,
-                    command: inner,
-                } => match store.current_lease_epoch().await {
-                    Ok(None) => {
-                        command = *inner;
-                        continue;
+    match command {
+        // Fenced mutations run inside a takeover-serialized fence: the
+        // claim is verified AND held locked across the write, so a
+        // competing Hub's takeover cannot commit between the check and
+        // the mutation. A stale claim is nack'd with no side effects.
+        StorageCommand::Fenced {
+            claimed_epoch,
+            command: inner,
+        } => {
+            match store.begin_write_fence(claimed_epoch).await {
+                Ok(WriteFence::Held) => {
+                    Box::pin(dispatch(store, *inner)).await;
+                    if let Err(error) = store.end_write_fence().await {
+                        // The mutation already reported success; a fence
+                        // commit failure is a durability incident, logged
+                        // loudly rather than dropped.
+                        tracing::error!(
+                            %error,
+                            "write-fence commit failed after a fenced mutation"
+                        );
                     }
-                    Ok(Some(current)) if current == claimed_epoch => {
-                        command = *inner;
-                        continue;
-                    }
-                    Ok(Some(current)) => {
-                        inner.nack(StorageError::StaleLeader {
-                            claimed_epoch,
-                            current_epoch: current,
-                        });
-                        return;
-                    }
-                    Err(error) => {
-                        inner.nack(error);
-                        return;
-                    }
-                },
-                unwrapped => break unwrapped,
+                }
+                // Nothing to fence against (no lease row): run bare.
+                Ok(WriteFence::Passthrough) => {
+                    Box::pin(dispatch(store, *inner)).await;
+                }
+                Err(error) => inner.nack(error),
             }
         }
-    };
-    match command {
-        // Unreachable in practice (the envelope peel above consumed any
-        // `Fenced`), but the match must stay exhaustive.
-        StorageCommand::Fenced { .. } => {}
                     StorageCommand::UpsertJob { job, response } => {
                         let _ = response.send(store.upsert_job(job).await);
                     }
@@ -1365,6 +1369,12 @@ impl StorageActor {
         command: StorageCommand,
     ) -> Result<(), mpsc::error::SendError<StorageCommand>> {
         let claimed_epoch = self.leadership_epoch.load(std::sync::atomic::Ordering::Acquire);
+        if claimed_epoch == UNFENCED {
+            // HA disabled: fencing must not depend on the absence of a
+            // lease row — a leftover row from an earlier HA deployment
+            // would otherwise reject every write.
+            return self.sender.send(command).await;
+        }
         self.sender
             .send(StorageCommand::Fenced {
                 claimed_epoch,
@@ -2463,6 +2473,16 @@ job_id: &str,
     /// Current lease epoch for write fencing. `None` = no lease row (HA
     /// disabled): fenced commands pass through unchanged.
     async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError>;
+    /// Begin a write fence for `claimed_epoch`, serialized against lease
+    /// takeovers for the duration of the fenced mutation: PostgreSQL holds
+    /// a `FOR SHARE` row lock on the lease until `end_write_fence`;
+    /// SQLite holds an open `BEGIN IMMEDIATE` transaction. A stale claim
+    /// errors without side effects; no lease row passes without holding a
+    /// lock. This closes the check-then-write window a competing Hub
+    /// process could otherwise interleave a takeover through.
+    async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError>;
+    /// Commit/release the fence begun by `begin_write_fence`.
+    async fn end_write_fence(&self) -> Result<(), StorageError>;
 }
 
 #[derive(Clone)]
@@ -2526,7 +2546,7 @@ impl ControlPlaneStore {
     /// fixture writes atomically.
     pub fn immediate_transaction<T>(
         &self,
-        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StorageError>,
+        operation: impl FnOnce(&rusqlite::Connection) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         match self {
             Self::Sqlite(backend) => backend.immediate_transaction(operation),
@@ -3053,6 +3073,18 @@ checkpoint_id: &str,
             Self::Postgres(backend) => StorageBackend::current_lease_epoch(backend).await,
         }
     }
+    async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::begin_write_fence(backend, claimed_epoch).await,
+            Self::Postgres(backend) => StorageBackend::begin_write_fence(backend, claimed_epoch).await,
+        }
+    }
+    async fn end_write_fence(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::end_write_fence(backend).await,
+            Self::Postgres(backend) => StorageBackend::end_write_fence(backend).await,
+        }
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -3229,6 +3261,35 @@ mod tests {
         actor.leadership_epoch().store(2, Ordering::Release);
         actor.record_audit(audit_row(5)).await.unwrap();
         assert_eq!(actor.list_audit(None::<String>).await.unwrap().len(), before + 1);
+    }
+
+    /// CodeRabbit finding: with HA disabled, a LEFTOVER lease row (an
+    /// earlier HA deployment) must not fence writes — the unfenced state
+    /// is the explicit UNFENCED sentinel, not the absence of the row.
+    #[tokio::test]
+    async fn unfenced_claim_bypasses_a_leftover_lease_row() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        let actor = StorageActor::start(store.clone(), 16);
+        // Simulate a prior HA deployment: a lease row exists (epoch 1 —
+        // a live holder's self-acquire stays idempotent).
+        assert_eq!(
+            store.try_acquire_hub_lease("old-hub", 1_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
+
+        // This process never enters the election: claim stays UNFENCED and
+        // every mutation passes despite the row.
+        assert_eq!(
+            actor.leadership_epoch().load(Ordering::Acquire),
+            crate::storage::UNFENCED
+        );
+        actor.record_audit(audit_row(11)).await.unwrap();
+        actor.record_audit(audit_row(12)).await.unwrap();
+        assert_eq!(
+            actor.list_audit(None::<String>).await.unwrap().len(),
+            2
+        );
     }
 
     /// The hub-lease contract every backend must satisfy: expiry takeover

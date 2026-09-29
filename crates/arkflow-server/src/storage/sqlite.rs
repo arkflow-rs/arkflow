@@ -5,12 +5,17 @@
 //! actor can drive either backend through one contract.
 use super::*;
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct SqliteBackend {
+    /// Depth of open write-fence transactions (0 = autocommit). While a
+    /// fence holds an ambient `BEGIN IMMEDIATE` open on the connection,
+    /// `immediate_transaction` nests via SAVEPOINT instead of BEGIN. Shared
+    /// across clones like the connection itself.
+    fence_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     connection: Arc<Mutex<Connection>>,
 }
 
@@ -63,6 +68,7 @@ impl SqliteBackend {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
+            fence_depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             connection: Arc::new(Mutex::new(connection)),
         };
         store.migrate()?;
@@ -85,13 +91,68 @@ impl SqliteBackend {
     /// Callers must not perform network or other awaitable work in `operation`.
     pub fn immediate_transaction<T>(
         &self,
-        operation: impl FnOnce(&Transaction<'_>) -> Result<T, StorageError>,
+        operation: impl FnOnce(&Connection) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        if self.fence_depth.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            // A write fence holds an ambient BEGIN IMMEDIATE open on this
+            // connection: nest as a SAVEPOINT so the mutation commits with
+            // the fence (and its takeover serialization). Both arms pass a
+            // Connection-deref'd handle; the bodies only use that surface.
+            let savepoint = connection.savepoint()?;
+            let result = operation(&savepoint)?;
+            savepoint.commit()?;
+            return Ok(result);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = operation(&transaction)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Open the write fence for `claimed_epoch`: take SQLite's write lock
+    /// (BEGIN IMMEDIATE — a competing process's lease takeover blocks
+    /// here), verify the claim inside it, and hold the transaction open
+    /// across the fenced mutation.
+    pub fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let epoch: Option<i64> = connection
+            .query_row("SELECT epoch FROM cp_hub_lease WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match epoch {
+            None => {
+                // No lease row (HA disabled at the row level): nothing to
+                // fence against; release the write lock immediately and
+                // report passthrough — no fence is held, no end pairs it.
+                connection.execute_batch("ROLLBACK")?;
+                Ok(WriteFence::Passthrough)
+            }
+            Some(current) if (current.max(0) as u64) == claimed_epoch => {
+                self.fence_depth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(WriteFence::Held)
+            }
+            Some(current) => {
+                connection.execute_batch("ROLLBACK")?;
+                Err(StorageError::StaleLeader {
+                    claimed_epoch,
+                    current_epoch: current.max(0) as u64,
+                })
+            }
+        }
+    }
+
+    /// Commit the ambient fence transaction (releasing the write lock the
+    /// mutation's takeover serialization depended on).
+    pub fn end_write_fence(&self) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let prev = self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 1 {
+            connection.execute_batch("COMMIT")?;
+        }
+        Ok(())
     }
 
     /// Persist one desired-state mutation and its reconciliation wake-up as a
@@ -1569,6 +1630,7 @@ impl SqliteBackend {
         .map(|epoch| epoch.map(|value| value.max(0) as u64))
     }
 
+
     pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -2642,6 +2704,12 @@ node_id: Option<&str>,
     }
     async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
         self.current_lease_epoch()
+    }
+    async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        self.begin_write_fence(claimed_epoch)
+    }
+    async fn end_write_fence(&self) -> Result<(), StorageError> {
+        self.end_write_fence()
     }
     async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)

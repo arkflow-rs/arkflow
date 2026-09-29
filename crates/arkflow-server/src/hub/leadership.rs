@@ -118,6 +118,14 @@ impl Hub {
         if !self.ha.enabled {
             return;
         }
+        // Entering the election opts this process's writes into fencing:
+        // the standby claim (0) is rejected while another holder's lease
+        // row exists.
+        if let Some(storage) = &self.storage {
+            storage
+                .leadership_epoch()
+                .store(0, Ordering::Release);
+        }
         let mut leadership = self.leadership.write().await;
         if matches!(*leadership, Leadership::Disabled) {
             *leadership = Leadership::Standby { since_ms: now_ms() };
@@ -140,11 +148,16 @@ impl Hub {
         };
         // Keep the storage handle's fencing claim in sync with the role:
         // leader writes carry the lease epoch; anything else claims 0 and
-        // fenced mutations are rejected while a lease row exists.
+        // fenced mutations are rejected while a lease row exists. A
+        // Disabled transition never touches the claim — a never-enabled
+        // handle keeps UNFENCED (no fencing at all).
         if let Some(storage) = &self.storage {
-            storage
-                .leadership_epoch()
-                .store(next.epoch().unwrap_or(0), Ordering::Release);
+            let previous_claim = storage.leadership_epoch().load(Ordering::Acquire);
+            if previous_claim != crate::storage::UNFENCED {
+                storage
+                    .leadership_epoch()
+                    .store(next.epoch().unwrap_or(0), Ordering::Release);
+            }
         }
         self.leadership_transitions.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
