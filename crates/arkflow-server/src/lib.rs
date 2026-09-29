@@ -13,8 +13,7 @@ pub mod storage;
 use crate::api_contract::{
     AcceptedIntentResponse, CreateJobRequest, CreateRolloutRequest, DesiredStateRequest,
     JobDesiredStateRequest, JobUpgradeActionRequest, JobUpgradeRequest, OperatorAction,
-    OperatorPrincipal,
-    RestartActionRequest, RolloutActionRequest, ValidateJobRequest,
+    OperatorPrincipal, RestartActionRequest, RolloutActionRequest, ValidateJobRequest,
 };
 use crate::storage::{DesiredMutation, JobRecord};
 use arkflow_core::component::{self, ComponentKind};
@@ -24,7 +23,6 @@ use arkflow_core::control::{ApiError, Page};
 use arkflow_core::control_plane::ControlPlane;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, Query, State};
-use subtle::ConstantTimeEq;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -36,6 +34,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
@@ -114,10 +113,7 @@ impl ServerConfig {
     /// Validate the deployment boundary before any Hub recovery work or
     /// listener bind.  The returned address is the exact socket address that
     /// the caller may safely bind.
-    pub fn validate_hub_startup(
-        &self,
-        hub: &hub::Hub,
-    ) -> Result<SocketAddr, std::io::Error> {
+    pub fn validate_hub_startup(&self, hub: &hub::Hub) -> Result<SocketAddr, std::io::Error> {
         let address: SocketAddr = self.address.parse().map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -399,6 +395,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     .into();
     let api = Router::new()
         .route("/system", get(hub_system))
+        .route("/status", get(hub_status))
         .route("/nodes", get(hub_nodes))
         .route("/streams", get(hub_streams))
         .route("/jobs", get(hub_jobs).post(hub_create_job))
@@ -436,6 +433,14 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route(
             "/nodes/{node_id}/configuration/versions",
             get(hub_configuration_versions),
+        )
+        .route(
+            "/nodes/{node_id}/configuration/validate",
+            post(hub_validate_configuration),
+        )
+        .route(
+            "/nodes/{node_id}/configuration/diff",
+            get(hub_configuration_diff),
         )
         .route(
             "/nodes/{node_id}/configuration/apply",
@@ -658,14 +663,13 @@ pub async fn serve_hub(
             let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
                 format!("hub TLS certificate '{cert_path}' could not be read: {error}")
             })?;
-            let key_pem = std::fs::read_to_string(key_path).map_err(|error| {
-                format!("hub TLS key '{key_path}' could not be read: {error}")
-            })?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|error| format!("hub TLS key '{key_path}' could not be read: {error}"))?;
             let mut chain = Vec::new();
             for item in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
-                chain.push(item.map_err(|error| {
-                    format!("hub TLS certificate parse failed: {error}")
-                })?);
+                chain.push(
+                    item.map_err(|error| format!("hub TLS certificate parse failed: {error}"))?,
+                );
             }
             if chain.is_empty() {
                 return Err("hub TLS certificate contains no PEM certificates".into());
@@ -682,9 +686,7 @@ pub async fn serve_hub(
             )))
         }
         _ => {
-            return Err(
-                "hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into(),
-            )
+            return Err("hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into())
         }
     };
     let listener = TcpListener::bind(address).await?;
@@ -695,10 +697,8 @@ pub async fn serve_hub(
         let election_cancel = cancellation.clone();
         let probe_ms = (hub.ha_config().lease_ttl_ms / 3).max(1_000);
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(probe_ms));
-            interval
-                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(probe_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = interval.tick() => { election_hub.run_election_tick().await; }
@@ -828,6 +828,29 @@ async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
     Json(
         serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}}),
     ).into_response()
+}
+
+/// Fleet-aggregated EngineStatus so console clients get one overview
+/// contract in local and Hub mode. Only a lease-holding Hub reaches this
+/// handler; standbys are rejected by the router's standby middleware.
+async fn hub_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        );
+    }
+    let nodes = hub.nodes().await;
+    Json(arkflow_core::control::EngineStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        state: "running".into(),
+        uptime_seconds: hub.uptime_seconds(),
+        streams_total: nodes.iter().map(|node| node.streams_total).sum(),
+        streams_running: nodes.iter().map(|node| node.streams_running).sum(),
+        streams_failed: nodes.iter().map(|node| node.streams_failed).sum(),
+    })
+    .into_response()
 }
 
 async fn hub_nodes(
@@ -1256,11 +1279,38 @@ async fn hub_job_detail(
         Ok(checkpoints) => checkpoints,
         Err(error) => return hub_problem(error),
     };
-    let metrics = hub.metrics(None).await;
+    // Observed runtime state: tasks the executing nodes report running, and
+    // diagnostics scoped to this Job only (never fleet-wide sums).
+    let observed_tasks = hub.observed_job_tasks(&job_id).await;
+    let tasks = assignments
+        .into_iter()
+        .map(|attempt| {
+            let mut value = serde_json::to_value(attempt).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                let task_id = object
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match observed_tasks.get(&task_id) {
+                    Some(node_id) => {
+                        object.insert("state".into(), serde_json::json!("running"));
+                        object.insert("observed".into(), serde_json::json!(true));
+                        object.insert("observed_node_id".into(), serde_json::json!(node_id));
+                    }
+                    None => {
+                        object.insert("observed".into(), serde_json::json!(false));
+                    }
+                }
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let metrics = hub.job_detail_metrics(&job_id).await;
     Json(serde_json::json!({
         "job": job,
         "plan": plan,
-        "tasks": assignments,
+        "tasks": tasks,
         "nodes": selected_nodes,
         "operations": operations,
         "checkpoints": checkpoints,
@@ -1277,15 +1327,7 @@ async fn hub_job_detail(
                     value
                 })
             }),
-        "metrics": {
-            "watermark_lag_ms": metrics.get("watermark_lag_ms").copied().unwrap_or_default(),
-            "state_bytes": metrics.get("state_bytes").copied().unwrap_or_default(),
-            "checkpoint_duration_ms": metrics.get("checkpoint_duration_ms").copied().unwrap_or_default(),
-            "checkpoint_failures": metrics.get("checkpoint_failures").copied().unwrap_or_default(),
-            "recovery_progress": metrics.get("recovery_progress").copied().unwrap_or_default(),
-            "task_pressure": metrics.get("task_pressure").copied().unwrap_or_default(),
-            "partition_health": metrics.get("partition_health").copied().unwrap_or_default(),
-        }
+        "metrics": metrics
     }))
     .into_response()
 }
@@ -1321,17 +1363,18 @@ async fn hub_job_upgrade(
     headers: HeaderMap,
     Json(request): Json<JobUpgradeRequest>,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Configure,
         "job",
-        Some(job_id.clone()),
+        Some(job_id.clone())
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     let Some(current) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -1390,7 +1433,7 @@ async fn hub_job_upgrade(
                 &mut spec,
                 request.expected_generation,
                 request.verify_timeout_ms,
-                Some("operator".into()),
+                Some(principal.id.clone()),
                 None,
             )
             .await
@@ -1619,10 +1662,11 @@ async fn hub_job_upgrade_rollback(
             Ok(format) => format,
             Err(response) => return response,
         };
-        let restored_format = serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json)
-            .ok()
-            .and_then(|spec| spec.state.map(|state| state.format_version))
-            .unwrap_or(1);
+        let restored_format =
+            serde_json::from_str::<arkflow_core::job::JobSpec>(&previous.spec_json)
+                .ok()
+                .and_then(|spec| spec.state.map(|state| state.format_version))
+                .unwrap_or(1);
         let compatible = artifact_format == Some(restored_format);
         if !compatible {
             return problem(
@@ -1747,17 +1791,18 @@ async fn hub_job_upgrade_action(
             )
         }
     };
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         action_level,
         "job",
-        Some(job_id.clone()),
+        Some(job_id.clone())
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     // Resolve before acting so an unknown id is a 404, not the generic
     // action-rejected conflict.
     match hub.job_upgrade(&upgrade_id).await {
@@ -1779,7 +1824,12 @@ async fn hub_job_upgrade_action(
         Err(error) => return hub_problem(error),
     }
     match hub
-        .act_job_upgrade(&upgrade_id, &request.action, Some("operator".into()), None)
+        .act_job_upgrade(
+            &upgrade_id,
+            &request.action,
+            Some(principal.id),
+            None,
+        )
         .await
     {
         Ok(record) if record.job_id == job_id => Json(record).into_response(),
@@ -2037,7 +2087,92 @@ async fn hub_configuration_versions(
             "Node has not reported configuration".into(),
         );
     }
-    Json(Vec::<serde_json::Value>::new()).into_response()
+    Json(hub.config_versions(&node_id).await).into_response()
+}
+
+/// Read-only configuration reports (validation, version diff) dispatched to
+/// the selected node. Unlike apply/rollback these never create versions or
+/// rollouts: the report rides the terminal command result.
+async fn hub_readonly_configuration_command(
+    hub: &hub::Hub,
+    node_id: String,
+    operation: &str,
+    payload: serde_json::Value,
+    headers: &HeaderMap,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        hub,
+        headers,
+        OperatorAction::Configure,
+        "configuration",
+        Some(node_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    let correlation_id = headers
+        .get("x-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match hub
+        .enqueue_with_payload(
+            node_id,
+            operation.into(),
+            "configuration".into(),
+            correlation_id,
+            Some(payload),
+        )
+        .await
+    {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(hub::HubError::NodeUnavailable) => problem(
+            StatusCode::CONFLICT,
+            "node_unavailable",
+            "Target node is stale or offline".into(),
+        ),
+        Err(_) => problem(
+            StatusCode::BAD_REQUEST,
+            "command_rejected",
+            "Invalid configuration command".into(),
+        ),
+    }
+}
+
+async fn hub_validate_configuration(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(candidate): Json<ConfigCandidate>,
+) -> Response {
+    let payload = match serde_json::to_value(candidate) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_configuration",
+                "Configuration payload is not serializable".into(),
+            )
+        }
+    };
+    hub_readonly_configuration_command(&hub, node_id, "validate_configuration", payload, &headers)
+        .await
+}
+
+async fn hub_configuration_diff(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<DiffQuery>,
+) -> Response {
+    hub_readonly_configuration_command(
+        &hub,
+        node_id,
+        "diff_configuration",
+        serde_json::json!({"from": query.from, "to": query.to}),
+        &headers,
+    )
+    .await
 }
 
 async fn hub_apply_configuration(
@@ -2071,17 +2206,18 @@ async fn hub_configuration_command<T: Serialize>(
     payload: T,
     headers: &HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         hub,
         headers,
         OperatorAction::Configure,
         "configuration",
-        Some(node_id.clone()),
+        Some(node_id.clone())
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     let correlation_id = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
@@ -2123,7 +2259,7 @@ async fn hub_configuration_command<T: Serialize>(
                 payload.to_string(),
                 vec![node_id.clone()],
                 1,
-                Some("operator".into()),
+                Some(principal.id.clone()),
                 correlation_id.clone(),
             )
             .await
@@ -2132,7 +2268,7 @@ async fn hub_configuration_command<T: Serialize>(
                 config_version_id,
                 vec![node_id.clone()],
                 1,
-                Some("operator".into()),
+                Some(principal.id.clone()),
                 correlation_id.clone(),
             )
             .await
@@ -2219,17 +2355,18 @@ async fn hub_targeted_command(
     Path((node_id, id, action)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
         "stream",
-        Some(format!("{node_id}/{id}")),
+        Some(format!("{node_id}/{id}"))
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     if !matches!(action.as_str(), "start" | "stop" | "restart") {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -2257,7 +2394,7 @@ async fn hub_targeted_command(
                     .get("if-match")
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_generation_etag),
-                actor: Some("operator".into()),
+                actor: Some(principal.id.clone()),
                 correlation_id,
                 idempotency_key: headers
                     .get("idempotency-key")
@@ -2321,7 +2458,7 @@ async fn hub_targeted_command(
                     .get("if-match")
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_generation_etag),
-                Some("operator".into()),
+                Some(principal.id.clone()),
                 correlation_id,
                 headers
                     .get("idempotency-key")
@@ -2415,17 +2552,18 @@ async fn hub_desired_state(
     headers: HeaderMap,
     Json(request): Json<DesiredStateRequest>,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
         "stream",
-        Some(format!("{node_id}/{id}")),
+        Some(format!("{node_id}/{id}"))
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     if !matches!(request.state.as_str(), "running" | "stopped") {
         return problem(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2449,7 +2587,7 @@ async fn hub_desired_state(
             config_version_id: request.config_version,
             action_id: request.action_id,
             expected_generation,
-            actor: Some("operator".into()),
+            actor: Some(principal.id.clone()),
             correlation_id,
             idempotency_key: headers
                 .get("idempotency-key")
@@ -2761,18 +2899,19 @@ async fn create_rollout(
     headers: HeaderMap,
     Json(request): Json<CreateRolloutRequest>,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::ManageRollouts,
         "rollout",
-        None,
+        None
     )
-    .await
+        .await
     {
-        return response;
-    }
-    let actor = Some("operator".into());
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let actor = Some(principal.id);
     let correlation_id = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
@@ -2842,17 +2981,18 @@ async fn rollout_action(
     headers: HeaderMap,
     Json(request): Json<RolloutActionRequest>,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::ManageRollouts,
         "rollout",
-        Some(id.clone()),
+        Some(id.clone())
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     let correlation_id = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
@@ -2862,7 +3002,7 @@ async fn rollout_action(
             &id,
             &request.action,
             request.config_version,
-            Some("operator".into()),
+            Some(principal.id),
             correlation_id,
         )
         .await
@@ -2877,9 +3017,17 @@ async fn rollout_action(
     }
 }
 
+#[derive(Deserialize)]
+struct MetricsQuery {
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
 async fn hub_metrics(
     State(hub): State<hub::Hub>,
-    Query(_query): Query<PageQuery>,
+    Query(query): Query<MetricsQuery>,
     headers: HeaderMap,
 ) -> Response {
     if !hub.operator_authorized(bearer(&headers).as_deref()).await {
@@ -2888,6 +3036,22 @@ async fn hub_metrics(
             "unauthorized",
             "A valid operator token is required".into(),
         );
+    }
+    // Console clients ask for the JSON aggregate explicitly; anything else
+    // (including every Prometheus scraper) keeps the text exposition.
+    let wants_json = query.format.as_deref() == Some("json")
+        || headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|accept| {
+                accept
+                    .split(',')
+                    .any(|part| part.trim().starts_with("application/json"))
+            });
+    if wants_json {
+        let items = hub.metrics_by_node(query.node_id.as_deref()).await;
+        let aggregate = hub.metrics(query.node_id.as_deref()).await;
+        return Json(serde_json::json!({"items": items, "aggregate": aggregate})).into_response();
     }
     let status = hub.operational_status().await;
     let mut body = String::new();
@@ -2948,7 +3112,7 @@ async fn hub_metrics(
             ));
         }
     }
-    for node in hub.metrics_by_node(None).await {
+    for node in hub.metrics_by_node(query.node_id.as_deref()).await {
         let node_id = prometheus_label(&node.node_id);
         for (name, value) in node.metrics {
             body.push_str(&format!(
@@ -2963,11 +3127,7 @@ async fn hub_metrics(
     for (node_id, jobs) in hub.job_metrics().await {
         for (job_id, snapshot) in &jobs {
             body.push_str(&crate::metrics::encode_families(
-                crate::metrics::kernel_job_families(
-                    job_id,
-                    snapshot,
-                    &[("node", node_id.clone())],
-                ),
+                crate::metrics::kernel_job_families(job_id, snapshot, &[("node", node_id.clone())]),
             ));
         }
     }
@@ -3055,23 +3215,24 @@ async fn hub_set_maintenance(
     state: arkflow_core::control::NodeMaintenanceState,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::ManageNodes,
         "node",
-        Some(node_id.clone()),
+        Some(node_id.clone())
     )
-    .await
+        .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     let correlation = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     match hub
-        .set_node_maintenance(&node_id, state, Some("operator".into()), correlation)
+        .set_node_maintenance(&node_id, state, Some(principal.id), correlation)
         .await
     {
         Ok(node) => Json(node).into_response(),
@@ -3330,7 +3491,11 @@ pub(crate) async fn hub_oidc_login(State(hub): State<hub::Hub>) -> Response {
             header::SET_COOKIE,
             format!(
                 "arkflow_oidc_state={cookie_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{}",
-                if federation.login_is_secure() { "; Secure" } else { "" }
+                if federation.login_is_secure() {
+                    "; Secure"
+                } else {
+                    ""
+                }
             ),
         )
         .body(axum::body::Body::empty())
@@ -3365,8 +3530,11 @@ pub(crate) async fn hub_oidc_callback(
     // The state cookie packs `state.verifier.nonce` (PKCE S256 + OIDC nonce
     // round-trip).
     let mut cookie_parts = expected_state.split('.');
-    let (expected_state, code_verifier, expected_nonce) =
-        (cookie_parts.next(), cookie_parts.next(), cookie_parts.next());
+    let (expected_state, code_verifier, expected_nonce) = (
+        cookie_parts.next(),
+        cookie_parts.next(),
+        cookie_parts.next(),
+    );
     let (Some(expected_state), Some(code_verifier), Some(expected_nonce)) =
         (expected_state, code_verifier, expected_nonce)
     else {
@@ -3383,9 +3551,9 @@ pub(crate) async fn hub_oidc_callback(
     };
     // Nonce pre-check (raw claim read); signature/iss/aud validation happens
     // in `authenticate` below.
-    if oidc::OidcFederation::nonce_claim(&id_token).is_none_or(|claim| {
-        !bool::from(claim.as_bytes().ct_eq(expected_nonce.as_bytes()))
-    }) {
+    if oidc::OidcFederation::nonce_claim(&id_token)
+        .is_none_or(|claim| !bool::from(claim.as_bytes().ct_eq(expected_nonce.as_bytes())))
+    {
         return unauthorized();
     }
     let Some(principal) = federation.authenticate(&id_token).await else {
@@ -3406,7 +3574,11 @@ pub(crate) async fn hub_oidc_callback(
             header::SET_COOKIE,
             format!(
                 "arkflow_session={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{}",
-                if federation.login_is_secure() { "; Secure" } else { "" }
+                if federation.login_is_secure() {
+                    "; Secure"
+                } else {
+                    ""
+                }
             ),
         )
         .body(axum::body::Body::empty())
@@ -3435,13 +3607,15 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|pair| {
         let pair = pair.trim();
-        pair.strip_prefix(&format!("{name}="))
-            .map(str::to_string)
+        pair.strip_prefix(&format!("{name}=")).map(str::to_string)
     })
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) {
+    if let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
         return value.strip_prefix("Bearer ").map(str::to_string);
     }
     // Browser sessions authenticate with the OIDC login cookie; expose it
@@ -3463,7 +3637,11 @@ fn prometheus_label(value: &str) -> String {
         .collect()
 }
 
-async fn operator_denied(hub: &hub::Hub, supplied: Option<String>, action: OperatorAction) -> Response {
+async fn operator_denied(
+    hub: &hub::Hub,
+    supplied: Option<String>,
+    action: OperatorAction,
+) -> Response {
     if hub.operator_principal(supplied.as_deref()).await.is_none() {
         problem(
             StatusCode::UNAUTHORIZED,
@@ -3538,11 +3716,7 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::OrchestrationPhaseConflict => "orchestration_conflict",
         _ => "agent_request_rejected",
     };
-    problem(
-        status,
-        code,
-        error.to_string().chars().take(256).collect(),
-    )
+    problem(status, code, error.to_string().chars().take(256).collect())
 }
 
 /// Reject job-level mutations while an atomic upgrade orchestration owns the
@@ -4441,7 +4615,10 @@ mod tests {
             .contains("durable storage"));
 
         let temp = tempfile::tempdir().unwrap();
-        let store = storage::ControlPlaneStore::open(temp.path().join("hub.sqlite").to_str().unwrap()).await.unwrap();
+        let store =
+            storage::ControlPlaneStore::open(temp.path().join("hub.sqlite").to_str().unwrap())
+                .await
+                .unwrap();
         let missing_credentials = hub::Hub::with_storage(
             hub::HubConfig {
                 operator_token: None,
@@ -5014,8 +5191,7 @@ mod tests {
                     .header("authorization", "Bearer operator-secret")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::json!({"spec": spec, "desired_state": "stopped"})
-                            .to_string(),
+                        serde_json::json!({"spec": spec, "desired_state": "stopped"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -5063,9 +5239,12 @@ mod tests {
             "the start action must be audited, got {actions:?}"
         );
         // The hub-level funnel keeps working for direct dispatches too.
-        assert!(hub.audit(Some("audit-job")).await.unwrap().iter().any(
-            |record| record.action == "job.start" && record.outcome == "accepted"
-        ));
+        assert!(hub
+            .audit(Some("audit-job"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.action == "job.start" && record.outcome == "accepted"));
         // The operator-triggered checkpoint is audited exactly once at the
         // trigger, not per dispatch and not by the periodic scheduler.
         let response = app
@@ -5086,10 +5265,7 @@ mod tests {
             .iter()
             .filter(|record| record.action == "job.checkpoint")
             .count();
-        assert_eq!(
-            checkpoint_audits, 1,
-            "the trigger is audited exactly once"
-        );
+        assert_eq!(checkpoint_audits, 1, "the trigger is audited exactly once");
     }
 
     #[tokio::test]
@@ -5486,6 +5662,8 @@ mod tests {
             jobs: Default::default(),
             configuration: None,
             configuration_version: Some(config_version),
+            config_versions: Vec::new(),
+            job_tasks: Default::default(),
             boot_id: Some(session.session_token.clone()),
             report_seq: 1,
         })
@@ -5798,6 +5976,7 @@ mod tests {
                         rollout_id: None,
                         observed_checkpoint_id: None,
                         checkpoint_manifest_uri: None,
+                        result: None,
                     })
                     .unwrap(),
                 ))
@@ -6012,10 +6191,7 @@ mod tests {
         let params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
         let key = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "arkflow-hub-tls-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("arkflow-hub-tls-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -6106,4 +6282,403 @@ mod tests {
         let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
     }
 
+    fn console_hub() -> hub::Hub {
+        hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
+        })
+    }
+
+    async fn post_json(
+        app: &Router,
+        path: &str,
+        bearer: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(path)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        read_json(response).await
+    }
+
+    async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(path)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        read_json(response).await
+    }
+
+    async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = if content_type.starts_with("application/json") {
+            serde_json::from_slice(&body).unwrap_or_default()
+        } else {
+            serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
+        };
+        (status, value)
+    }
+
+    async fn report_node_raw(app: &Router, body: serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/agent/report")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn agent_report_body(session: &hub::RegisterResponse) -> serde_json::Value {
+        serde_json::json!({
+            "node_id": session.node_id,
+            "session_token": session.session_token,
+            "version": "test-node",
+            "state": "online",
+            "capabilities": ["stream_lifecycle", "metrics"],
+        })
+    }
+
+    #[tokio::test]
+    async fn hub_status_aggregates_fleet_gauges() {
+        let hub = console_hub();
+        let app = hub_router(hub, &ServerConfig::default());
+        let session = register_hub_node(&app, "node-a").await;
+        let mut report = agent_report_body(&session);
+        report["streams"] = serde_json::json!([
+            {
+                "id": "s1", "state": "running", "desired_state": "running",
+                "started_at_ms": 1, "last_error": null, "metrics": {
+                    "input_batches": 1, "input_messages": 1, "processing_errors": 0,
+                    "output_batches": 1, "output_messages": 1, "input_errors": 0,
+                    "input_reconnects": 0, "output_errors": 0, "restarts": 0
+                }
+            },
+            {
+                "id": "s2", "state": "failed", "desired_state": "running",
+                "started_at_ms": 1, "last_error": null, "metrics": {
+                    "input_batches": 0, "input_messages": 0, "processing_errors": 1,
+                    "output_batches": 0, "output_messages": 0, "input_errors": 0,
+                    "input_reconnects": 0, "output_errors": 0, "restarts": 0
+                }
+            }
+        ]);
+        report_node_raw(&app, report).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, body) = get_json(&app, "/api/v1/status", "operator-secret").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["streams_total"], 2);
+        assert_eq!(body["streams_running"], 1);
+        assert_eq!(body["streams_failed"], 1);
+        assert_eq!(body["state"], "running");
+        assert!(body["uptime_seconds"].is_u64());
+        assert!(body["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn hub_metrics_serves_json_for_console_and_text_for_scrapers() {
+        let hub = console_hub();
+        let app = hub_router(hub, &ServerConfig::default());
+        let session_a = register_hub_node(&app, "node-a").await;
+        let mut report = agent_report_body(&session_a);
+        report["metrics"] = serde_json::json!({"input_batches": 3.0, "streams_total": 2.0});
+        report_node_raw(&app, report).await;
+        let session_b = register_hub_node(&app, "node-b").await;
+        let mut report = agent_report_body(&session_b);
+        report["metrics"] = serde_json::json!({"input_batches": 4.0});
+        report_node_raw(&app, report).await;
+
+        // Default branch: Prometheus text, unchanged for scrapers.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/metrics")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain; version=0.0.4"
+        );
+
+        // JSON branch via Accept header.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/metrics")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("accept", "application/json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = read_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        assert_eq!(body["aggregate"]["input_batches"], 7.0);
+
+        // node_id filter and explicit format override.
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/metrics?node_id=node-a&format=json",
+            "operator-secret",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["node_id"], "node-a");
+        assert_eq!(body["aggregate"]["input_batches"], 3.0);
+    }
+
+    #[tokio::test]
+    async fn hub_configuration_validate_and_diff_round_trip_through_commands() {
+        let hub = console_hub();
+        let app = hub_router(hub, &ServerConfig::default());
+        let session = register_hub_node(&app, "node-a").await;
+
+        // Unknown node is rejected, not silently queued.
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/nodes/node-b/configuration/validate",
+            "operator-secret",
+            serde_json::json!({"format": "yaml", "content": "streams: []\n"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "node_unavailable");
+
+        let (status, operation) = post_json(
+            &app,
+            "/api/v1/nodes/node-a/configuration/validate",
+            "operator-secret",
+            serde_json::json!({"format": "yaml", "content": "streams: []\n"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(operation["operation"], "validate_configuration");
+
+        // The agent receives the read-only command.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/agent/commands?node_id=node-a&session_token={}",
+                    session.session_token
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let commands: Vec<hub::AgentCommand> = serde_json::from_slice(&body).unwrap();
+        let command = commands
+            .iter()
+            .find(|command| command.operation == "validate_configuration")
+            .expect("validate command dispatched");
+        assert!(command.payload.is_some());
+
+        // Terminal result carries the validation report.
+        let (status, settled) = post_json(
+            &app,
+            &format!(
+                "/api/v1/agent/commands/{}/result?node_id=node-a",
+                command.id
+            ),
+            &session.session_token,
+            serde_json::json!({
+                "command_id": command.id,
+                "operation_id": command.operation_id,
+                "state": "succeeded",
+                "progress": 100,
+                "result": {"valid": true, "errors": []}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settled["result"]["valid"], true);
+
+        let operation_id = operation["id"].as_str().unwrap().to_owned();
+        let (status, fetched) = get_json(
+            &app,
+            &format!("/api/v1/operations/{operation_id}"),
+            "operator-secret",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["state"], "succeeded");
+        assert_eq!(fetched["result"]["valid"], true);
+
+        // Diff dispatches through the same read-only channel.
+        let (status, diff_operation) = get_json(
+            &app,
+            "/api/v1/nodes/node-a/configuration/diff?from=v1&to=v2",
+            "operator-secret",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(diff_operation["operation"], "diff_configuration");
+
+        // Reported version metadata becomes the node's version list.
+        let mut report = agent_report_body(&session);
+        report["config_versions"] = serde_json::json!([
+            {"id": "v2", "created_at_ms": 2, "format": "yaml"},
+            {"id": "v1", "created_at_ms": 1, "format": "json"}
+        ]);
+        report["configuration"] = serde_json::json!({"streams": []});
+        report_node_raw(&app, report).await;
+        let (status, versions) = get_json(
+            &app,
+            "/api/v1/nodes/node-a/configuration/versions",
+            "operator-secret",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let versions = versions.as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["id"], "v2");
+    }
+
+    #[tokio::test]
+    async fn job_detail_reports_scoped_metrics_and_observed_tasks() {
+        let hub = hub::Hub::new(hub::HubConfig {
+            operator_token: Some("operator-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: true,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
+        });
+        let app = hub_router(hub, &ServerConfig::default());
+        let spec = serde_json::json!({
+            "id": "scoped-job",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/jobs",
+            "operator-secret",
+            serde_json::json!({"spec": spec, "desired_state": "stopped"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let session = register_hub_node(&app, "node-a").await;
+        let mut report = agent_report_body(&session);
+        report["jobs"] = serde_json::json!({
+            "scoped-job": {
+                "chains": {},
+                "checkpoint_duration_ms": 7,
+                "checkpoint_failures": 2,
+                "watermark_lag_ms": 5,
+                "late_events": 0
+            }
+        });
+        report_node_raw(&app, report).await;
+
+        let (status, detail) =
+            get_json(&app, "/api/v1/jobs/scoped-job/detail", "operator-secret").await;
+        assert_eq!(status, StatusCode::OK);
+        let metrics = detail["metrics"].as_object().unwrap();
+        assert_eq!(
+            metrics
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "checkpoint_duration_ms",
+                "checkpoint_failures",
+                "watermark_lag_ms"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(detail["metrics"]["watermark_lag_ms"], 5);
+        let tasks = detail["tasks"].as_array().unwrap();
+        assert!(!tasks.is_empty());
+        assert!(tasks.iter().all(|task| task["observed"].is_boolean()));
+
+        // Report one of the planned tasks as executing: it flips to observed
+        // running state while the others stay marked not observed.
+        let running_task = tasks[0]["task_id"].as_str().unwrap().to_owned();
+        let mut report = agent_report_body(&session);
+        report["job_tasks"] = serde_json::json!({"scoped-job": [running_task]});
+        report_node_raw(&app, report).await;
+        let (status, detail) =
+            get_json(&app, "/api/v1/jobs/scoped-job/detail", "operator-secret").await;
+        assert_eq!(status, StatusCode::OK);
+        let tasks = detail["tasks"].as_array().unwrap();
+        let observed = tasks
+            .iter()
+            .find(|task| task["task_id"] == running_task.as_str())
+            .unwrap();
+        assert_eq!(observed["observed"], true);
+        assert_eq!(observed["state"], "running");
+        assert!(tasks.len() > 1);
+        assert!(tasks
+            .iter()
+            .filter(|task| task["task_id"] != running_task.as_str())
+            .all(|task| task["observed"] == false));
+    }
 }

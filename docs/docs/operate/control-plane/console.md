@@ -22,7 +22,7 @@ is served from a reverse proxy next to the Hub — see
 | **Rollouts** | Per-node rollout progress with pause, resume, cancel, and rollback actions. |
 | **Runtime** | Live per-node stream state and convergence, backed by node reports. |
 | **Components** | The component registry browser: every registered kind/type with its config schema and example, mirroring `arkflow components show`. |
-| **Configuration** | Node configuration history, drafts, diffs, apply, and rollback. |
+| **Configuration** | Node configuration history, diffs, apply, and rollback. In Hub mode every action is routed through the selected node; drafts are a local-control-plane feature. |
 | **Events** | The fleet event log (same data as `GET /api/v1/events`, with the SSE stream for live updates). |
 | **Settings** | Console preferences and connection settings. |
 
@@ -40,6 +40,20 @@ A green badge means converged, not "command succeeded": after you click an
 action the console shows the pending operation until the matching node report
 arrives. If a node is offline, actions are accepted (the Intent is durable)
 and the view shows the operation as blocked until the node reconnects.
+
+The console reports the fleet's High-Availability posture when the Hub
+advertises it: the overview card shows the leadership role (leader or
+standby) with the lease epoch and transition count. When every request is
+rejected because the connected Hub is a standby (503 `hub_standby`), the
+console replaces the generic stale banner with an explicit standby notice and
+keeps polling, so the notice clears itself when that Hub wins the lease.
+Diagnostics stay honest: the job detail view renders only gauges the API
+actually measures, and the tasks tab distinguishes observed runtime state
+from desired placement that has not been reported yet. The job editor exposes
+the distributed-runtime spec fields — the `rescale` opt-in for redistributing
+keyed state across a changed parallelism, and per-task `resources` requests
+(`cpu_millicores`, `memory_bytes`) that participate in placement accounting —
+as form controls, serializing both back to their absent form when cleared.
 
 ## Navigation and URLs
 

@@ -351,4 +351,78 @@ impl Hub {
             })
             .collect()
     }
+
+    /// Configuration version metadata last reported by a node (never content).
+    pub async fn config_versions(
+        &self,
+        node_id: &str,
+    ) -> Vec<arkflow_core::configuration::ConfigVersion> {
+        self.nodes
+            .read()
+            .await
+            .get(node_id)
+            .map(|node| node.config_versions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Job-scoped diagnostics for the detail view: aggregates only the
+    /// displayed Job's kernel snapshots across nodes with a live lease, and
+    /// emits only gauges with a measurement source. Max-valued gauges stay
+    /// maxima across nodes (a sum of maxima would over-report lag); failure
+    /// counters sum.
+    pub async fn job_detail_metrics(&self, job_id: &str) -> serde_json::Value {
+        let now = now_ms();
+        let mut watermark_lag_ms: u64 = 0;
+        let mut checkpoint_duration_ms: u64 = 0;
+        let mut checkpoint_failures: u64 = 0;
+        let mut reported = false;
+        for node in self
+            .nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| node.resource.lease_expires_at_ms > now)
+        {
+            let Some(snapshot) = node.jobs.get(job_id) else {
+                continue;
+            };
+            reported = true;
+            watermark_lag_ms = watermark_lag_ms.max(snapshot.watermark_lag_ms);
+            checkpoint_duration_ms = checkpoint_duration_ms.max(snapshot.checkpoint_duration_ms);
+            checkpoint_failures += snapshot.checkpoint_failures;
+        }
+        if !reported {
+            return serde_json::json!({});
+        }
+        serde_json::json!({
+            "watermark_lag_ms": watermark_lag_ms,
+            "checkpoint_duration_ms": checkpoint_duration_ms,
+            "checkpoint_failures": checkpoint_failures,
+        })
+    }
+
+    /// Task ids any node currently reports executing for the Job, mapped to
+    /// the executing node id. This is the observed runtime state the detail
+    /// view merges over the desired placement.
+    pub async fn observed_job_tasks(&self, job_id: &str) -> BTreeMap<String, String> {
+        let now = now_ms();
+        let mut observed = BTreeMap::new();
+        for node in self
+            .nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| node.resource.lease_expires_at_ms > now)
+        {
+            for task_id in node
+                .job_tasks
+                .get(job_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                observed.insert(task_id.clone(), node.resource.id.clone());
+            }
+        }
+        observed
+    }
 }

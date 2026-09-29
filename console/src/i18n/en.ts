@@ -25,6 +25,8 @@ export const en = {
   // Global warnings
   'warning.nodeUnavailable': 'Node {node} is {state}; mutating actions are disabled.',
   'warning.staleState': 'Showing the last known state. Retry when the control API is available.',
+  'warning.hubStandby':
+    'This Hub is a standby and does not hold the control-plane lease; requests are being retried. Point the console at the elected leader if this persists.',
 
   // Shared fragments
   'common.loading': 'Loading…',
@@ -55,6 +57,8 @@ export const en = {
   'overview.maintain': 'Maintain',
   'overview.resume': 'Resume',
   'overview.cardControlPlane': 'Control plane',
+  'overview.haRole': 'HA: {role} · epoch {epoch}',
+  'overview.haHint': '{transitions} leadership transitions · {version}',
   'overview.cardNodesOnline': 'Nodes online',
   'overview.nodesNeedAttention': '{count} need attention',
   'overview.allNodesHealthy': 'All nodes healthy',
@@ -115,6 +119,9 @@ export const en = {
 
   // Configuration
   'config.title': 'Configuration',
+  'config.hubSelectNode': 'Select a compute node to manage its configuration.',
+  'config.hubFleetNotice':
+    'Hub deployments manage configuration per node. Drafts are a local-control-plane feature.',
   'config.activeRedacted': 'Active configuration is redacted and read-only',
   'config.unsavedDraft': 'Unsaved draft',
   'config.draftSaved': 'Draft is saved',
@@ -214,7 +221,9 @@ export const en = {
   'jobs.noneValue': 'none',
   'jobs.nodeCompatibility': 'Node compatibility',
   'jobs.noAssignedNodes': 'No assigned nodes.',
-  'jobs.taskPlacement': 'node {node} · attempt {attempt}',
+  'jobs.taskPlacement': 'node {node}',
+  'jobs.taskNotObserved': 'not observed yet',
+  'jobs.noMeasuredMetrics': 'No measured diagnostics reported yet.',
   'jobs.unassignedValue': 'unassigned',
   'jobs.taskGeneration': 'generation {generation}',
   'jobs.noTasks': 'No task assignments reported.',
@@ -317,6 +326,9 @@ export const en = {
   'editor.versionLabel': 'Version',
   'editor.parallelismLabel': 'Parallelism',
   'editor.maxParallelismLabel': 'Max parallelism',
+  'editor.rescaleLabel': 'Rescale recovery (redistribute keyed state on parallelism changes)',
+  'editor.cpuMillicoresLabel': 'CPU per task (millicores)',
+  'editor.memoryBytesLabel': 'Memory per task (bytes)',
   'editor.stateBackendLabel': 'State backend',
   'editor.stateNamespaceLabel': 'State namespace',
   'editor.stateTtlLabel': 'State TTL (ms)',
@@ -378,4 +390,5 @@ export const en = {
   'api.sseConnectionFailed': 'SSE connection failed ({status})',
   'api.operationState': 'Operation {state}',
   'api.operationTimedOut': 'Operation timed out',
+  'api.reportMissing': 'The {what} was not delivered with the operation result.',
 }

@@ -37,6 +37,12 @@ export type StreamStatus = {
   metrics: StreamMetrics
 }
 export type Page<T> = { items: T[]; page: number; page_size: number; total: number }
+export type SystemHaStatus = {
+  enabled: boolean
+  role: string
+  epoch: number
+  transitions: number
+}
 export type EngineStatus = {
   version: string
   state: string
@@ -50,9 +56,11 @@ export type SystemResource = {
   version: string
   state: string
   node_count: number
+  online_nodes?: number
   stream_count: number
   active_operations: number
   capabilities: string[]
+  ha?: SystemHaStatus
 }
 export type NodeMaintenanceState = 'active' | 'draining' | 'maintenance'
 export type ControlNode = {
@@ -65,10 +73,9 @@ export type ControlNode = {
   streams_running: number
   streams_failed: number
   maintenance_state?: NodeMaintenanceState
-  role?: string
-  uptime_seconds?: number
   last_seen_at_ms?: number
   lease_expires_at_ms?: number
+  data_address?: string
 }
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type Operation = {
@@ -76,7 +83,6 @@ export type Operation = {
   intent_id?: string
   attempt_id?: string
   operation: string
-  resource_type?: string
   resource_id: string
   node_id?: string
   state: OperationState | 'dispatched' | 'acknowledged' | 'node_unavailable' | 'superseded'
@@ -90,6 +96,9 @@ export type Operation = {
   failure_class?: string
   superseded_generation?: number
   config_version_id?: string
+  /** Report payload of a read-only command (configuration validation/diff),
+   * present once the command reaches a terminal state. */
+  result?: unknown
   progress: number
   created_at_ms: number
   dispatched_at_ms?: number
@@ -97,7 +106,6 @@ export type Operation = {
   finished_at_ms?: number
   correlation_id?: string
   error?: string
-  result?: unknown
 }
 export type ApiError = {
   code: string
@@ -112,12 +120,11 @@ export type ControlEvent = {
   occurred_at_ms: number
   event_type: string
   stream_id?: string
+  node_id?: string
   outcome: string
   message?: string
   operation_id?: string
   correlation_id?: string
-  failure_class?: string
-  generation?: number
 }
 export type ConfigCandidate = { format: 'yaml' | 'json' | 'toml'; content: string }
 export type ConfigIssue = { path: string; message: string }
@@ -187,7 +194,6 @@ export type AuditRecord = {
 export type Job = {
   job_id: string
   version: number
-  spec?: unknown
   spec_json?: string
   desired_state: string
   observed_state: string
@@ -199,13 +205,9 @@ export type Job = {
   updated_at_ms: number
 }
 export type JobMetrics = {
-  watermark_lag_ms: number
-  state_bytes: number
-  checkpoint_duration_ms: number
-  checkpoint_failures: number
-  recovery_progress: number
-  task_pressure: number
-  partition_health: number
+  watermark_lag_ms?: number
+  checkpoint_duration_ms?: number
+  checkpoint_failures?: number
 }
 export type JobCheckpoint = {
   job_id: string
@@ -225,10 +227,23 @@ export type JobVersion = {
   plan_json: string
   created_at_ms: number
 }
+export type JobTask = {
+  id: string
+  job_id: string
+  job_version: number
+  task_id: string
+  generation: number
+  node_id: string
+  state: string
+  /** True when an executing node reports this task as running; false marks
+   * the desired-placement fallback (not yet observed). */
+  observed?: boolean
+  observed_node_id?: string
+}
 export type JobDetail = {
   job: Job
   plan: unknown
-  tasks: Array<Record<string, unknown>>
+  tasks: JobTask[]
   nodes: ControlNode[]
   operations: Operation[]
   checkpoints: JobCheckpoint[]
@@ -319,7 +334,11 @@ export const api = {
   system: () => request<SystemResource>('/system'),
   status: () => request<EngineStatus>('/status'),
   metrics: (nodeId?: string) =>
-    request<MetricsResponse>(`/metrics${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
+    request<MetricsResponse>(
+      `/metrics${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`,
+      // The Hub negotiates: Prometheus text by default, JSON for consoles.
+      { headers: { Accept: 'application/json' } },
+    ),
   nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE) =>
     request<Page<ControlNode>>(`/nodes?page=${page}&page_size=${pageSize}`),
   drainNode: (id: string) =>
@@ -342,13 +361,19 @@ export const api = {
   draft: () => request<ConfigCandidate | undefined>('/configuration/draft'),
   saveDraft: (candidate: ConfigCandidate) =>
     request<ConfigCandidate>('/configuration/draft', { method: 'PUT', body: JSON.stringify(candidate) }),
-  validateConfig: (candidate: ConfigCandidate) =>
-    request<ConfigValidationReport>('/configuration/validate', {
-      method: 'POST',
-      body: JSON.stringify(candidate),
-    }),
-  diff: (from: string, to: string) =>
-    request<ConfigDiff>(`/configuration/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  validateConfig: (candidate: ConfigCandidate, nodeId?: string) =>
+    request<ConfigValidationReport | Operation>(
+      nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/validate` : '/configuration/validate',
+      { method: 'POST', body: JSON.stringify(candidate) },
+    ),
+  diff: (from: string, to: string, nodeId?: string) => {
+    const query = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+    return request<ConfigDiff | Operation>(
+      nodeId
+        ? `/nodes/${encodeURIComponent(nodeId)}/configuration/diff?${query}`
+        : `/configuration/diff?${query}`,
+    )
+  },
   applyConfig: (candidate: ConfigCandidate, nodeId?: string) =>
     request<Operation>(
       nodeId ? `/nodes/${encodeURIComponent(nodeId)}/configuration/apply` : '/configuration/apply',
@@ -517,9 +542,7 @@ export function streamEvents(
 export async function waitForOperation(id: string): Promise<Operation> {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const operation = await api.operation(id)
-    const terminalIntent = ['converged', 'blocked', 'cancelled', 'superseded'].includes(
-      operation.intent_state ?? '',
-    )
+    const terminalIntent = ['converged', 'blocked', 'superseded'].includes(operation.intent_state ?? '')
     const terminalState = ['succeeded', 'failed', 'cancelled', 'timed_out', 'node_unavailable'].includes(
       operation.state,
     )
@@ -540,6 +563,54 @@ export async function waitForOperation(id: string): Promise<Operation> {
     await new Promise((resolve) => window.setTimeout(resolve, 250))
   }
   throw new Error(translate(currentLocale(), 'api.operationTimedOut'))
+}
+
+// --- Read-only configuration reports in local and Hub mode ---------------
+//
+// Local control planes answer validation and diff synchronously with the
+// report; the Hub dispatches a read-only node command and the report rides
+// the terminal operation's `result`. Both helpers accept either shape.
+
+function isOperation(value: unknown): value is Operation {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'operation' in value &&
+    'progress' in value &&
+    !('errors' in value) &&
+    !('changed' in value)
+  )
+}
+
+export async function resolveValidation(
+  candidate: ConfigCandidate,
+  nodeId?: string,
+): Promise<ConfigValidationReport> {
+  const response = await api.validateConfig(candidate, nodeId)
+  if (!isOperation(response)) return response
+  const operation = await waitForOperation(operationId(response))
+  return unwrapReport<ConfigValidationReport>(operation, 'validation report')
+}
+
+export async function resolveDiff(from: string, to: string, nodeId?: string): Promise<ConfigDiff> {
+  const response = await api.diff(from, to, nodeId)
+  if (!isOperation(response)) return response
+  const operation = await waitForOperation(operationId(response))
+  return unwrapReport<ConfigDiff>(operation, 'version diff')
+}
+
+function operationId(operation: Operation): string {
+  return operation.id
+}
+
+/** A tracked read-only command must deliver its report on `result`; an
+ * operation that settles without one (e.g. an Agent too old to know the
+ * command) gets a named error instead of a downstream TypeError. */
+function unwrapReport<T>(operation: Operation, what: string): T {
+  if (operation.result === undefined || operation.result === null) {
+    throw new Error(translate(currentLocale(), 'api.reportMissing', { what }))
+  }
+  return operation.result as T
 }
 
 // --- OIDC browser login integration -------------------------------------

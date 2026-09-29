@@ -1,7 +1,7 @@
-## Purpose
+# control-plane-console Delta — console-hub-alignment
 
-Define the operator-facing Console for discovering, observing, and administering ArkFlow control-plane resources.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: Operations application shell
 
 The console SHALL provide persistent navigation and route-level pages for Overview, Runtime, Configuration, Components, Events, and Settings. It SHALL show global connection, permission, stale-data, loading, empty, and error states. The console SHALL use the same node collection contract in local and Hub mode, SHALL persist the selected `node_id` as a query parameter in the current URL state, and SHALL address each page by URL path (e.g. `/jobs`), support browser back and forward navigation, and redirect legacy `?page=` links to the corresponding path. When live updates arrive over SSE, the console SHALL refresh live resources (system, nodes, streams, jobs, operations, events, metrics, tracked operation and rollout details) without discarding local editing state such as configuration drafts, and SHALL poll live resources on their configured intervals.
@@ -53,22 +53,6 @@ Every live resource the overview loads SHALL resolve against a healthy Hub exact
 - **WHEN** the system identity reports HA enabled with role and epoch
 - **THEN** the overview displays the leadership role and epoch alongside system identity
 
-### Requirement: Runtime administration
-
-The Runtime page SHALL support filtering and pagination over Streams, topology/resource summaries, desired/observed state, metrics, recent errors, operation history, and lifecycle actions. Actions SHALL display operation progress, target node, correlation ID, and terminal results. Mutations SHALL be disabled for stale or unavailable nodes and SHALL not be retried automatically after a permission or availability error.
-
-#### Scenario: Operate one Stream from the runtime page
-- **WHEN** an operator starts, stops, or restarts a Stream
-- **THEN** the UI confirms the action, tracks its operation ID, refreshes the affected resource, and reports success or failure without blocking other Streams
-
-#### Scenario: Inspect a failed Stream
-- **WHEN** an operator opens a failed Stream
-- **THEN** the UI shows last error, transition timeline, metrics, recent related events, and available recovery actions
-
-#### Scenario: Target a stale node
-- **WHEN** an operator selects a stale or unavailable node
-- **THEN** lifecycle controls are disabled and the UI explains that the node must reconnect before mutation
-
 ### Requirement: Configuration workflow
 
 The Configuration page SHALL load redacted active configuration, support YAML/JSON editing, schema-aware validation with path locations, draft/publish separation, version listing, diff metadata, and rollback confirmation. A dirty or invalid draft MUST NOT be publishable; publish SHALL be enabled only after a successful validation of the current content and SHALL track the returned operation to terminal state.
@@ -94,18 +78,6 @@ In Hub mode the page's node-scoped actions — version comparison and rollback �
 
 - **WHEN** a configuration mutation returns 401 or 403
 - **THEN** the UI shows a permission error, does not retry the mutation, and does not expose the bearer token or configuration secret
-
-### Requirement: Components, events, and settings
-
-The console SHALL provide component catalogue/schema display, filterable event/audit history, and settings for API endpoint, authentication status, CORS/security posture, node identity, and capability information. It SHALL preserve redaction and never put secrets in URLs, browser logs, or client-side error messages.
-
-#### Scenario: Investigate an administrative event
-- **WHEN** an operator filters events by Stream, operation, type, or outcome
-- **THEN** the UI shows ordered event details and links to the related resource/operation without exposing credentials
-
-#### Scenario: View security settings
-- **WHEN** an operator opens Settings
-- **THEN** the console shows whether the session is authenticated and the server's effective security/capability status without rendering token values
 
 ### Requirement: Visual Job DAG orchestration
 
@@ -143,71 +115,7 @@ The editor SHALL expose the JobSpec's distributed-runtime fields as first-class 
 - **WHEN** an operator enables `rescale` and enters per-task `cpu_millicores` and `memory_bytes` values, then submits
 - **THEN** the derived JobSpec carries `rescale: true` and the declared `resources` fields, passes the existing validation API, and reloading the Job into the editor restores the same values; clearing the inputs serializes both to their absent form
 
-### Requirement: Graph and compatibility validation
-
-The Console SHALL reject self-loops, duplicate edges, source input edges, sink output edges, and cyclic graphs, SHALL invalidate a previous validation after any change to the Job's graph, fields, configuration values, or target-node selection, and SHALL enable submission only after the current `/jobs/validate` result is valid. A validation response SHALL apply only to the exact spec it validated: a response that arrives after the graph changed SHALL NOT re-enable submission for the newer graph. Presentation-only interactions — selecting or focusing a node, panning or zooming the canvas, and repositioning a node without changing its configuration — SHALL NOT invalidate an existing validation result.
-
-#### Scenario: Change a validated graph
-
-- **WHEN** an operator changes a node, edge, configuration value, or target node after validation
-- **THEN** the Console disables create or upgrade until it validates the new JobSpec and target selection
-
-#### Scenario: Select a node after validation
-
-- **WHEN** an operator selects or focuses a node, or repositions it without changing its configuration, after a successful validation
-- **THEN** the Console keeps the validation result and leaves the create or upgrade action enabled
-
-#### Scenario: A late validation response cannot unlock a newer graph
-
-- **WHEN** a validate request is in flight, the operator edits the graph, and the response for the older spec arrives afterwards
-- **THEN** the Console does not mark the newer graph valid, and submission stays disabled until a validation of the current spec succeeds
-
-#### Scenario: Inspect incompatible nodes
-
-- **WHEN** Hub validation reports warnings, a physical plan, required capabilities, or missing node capabilities
-- **THEN** the Console displays those results next to the editor and does not submit an invalid graph
-
-### Requirement: Hub component catalogue availability
-
-The Console SHALL load the registered component catalogue from both local-server and external-Hub deployments. The external Hub SHALL expose the existing component and schema routes after initializing the shared plugin registry.
-
-#### Scenario: Open the Job editor against a Hub
-
-- **WHEN** an operator opens the Job editor through the external Hub
-- **THEN** the source, processor, and sink palette loads registered component metadata, or displays a retryable request failure instead of an indefinite loading state
-
-### Requirement: Compact component browsing
-
-The Console SHALL provide search and Input/Processor/Output category filtering for both the Job palette and component catalogue. The catalogue SHALL show configuration metadata only for the selected component rather than expanding every registered component at once.
-
-#### Scenario: Filter a component catalogue
-
-- **WHEN** an operator selects a component category or enters a search term
-- **THEN** the Console shows only matching components and details for the selected matching item
-
-### Requirement: In-app destructive action confirmation
-
-The console SHALL present destructive or lifecycle-changing actions (stream start/stop/restart, node drain/maintain/resume, job stop, configuration publish/rollback, rollout create/pause/resume/cancel/rollback, upgrade restore) behind an in-application confirmation dialog with focus containment, Escape-to-cancel, and Enter-to-confirm. The console SHALL NOT use native `window.confirm` or `window.prompt` dialogs. The outcome of such actions SHALL be reported through a transient toast notification in addition to the existing operation tracking.
-
-#### Scenario: Confirm a node drain
-- **WHEN** an operator triggers a node drain and confirms the dialog
-- **THEN** the drain request is sent, a toast reports the accepted outcome, and the dialog closes
-
-#### Scenario: Cancel a destructive action
-- **WHEN** an operator dismisses the confirmation dialog with Escape or the cancel button
-- **THEN** no request is sent and the current view is unchanged
-
-### Requirement: Loading and empty states
-
-The console SHALL render skeleton placeholders for tables and metric panels while their data is loading, and empty states SHALL pair a plain-language explanation with the next available action (such as a create button or filter reset) instead of bare text alone.
-
-#### Scenario: Loading a table
-- **WHEN** a list page is fetching its first page of data
-- **THEN** skeleton rows are shown instead of an empty table or a blank panel
-
-#### Scenario: Empty state offers the next action
-- **WHEN** a filtered list matches nothing
-- **THEN** the empty state explains the miss and offers the nearest action (for example clearing the filter or creating the first resource)
+## ADDED Requirements
 
 ### Requirement: Job detail diagnostics rendering
 

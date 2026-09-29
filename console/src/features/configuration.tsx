@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import { api, errorMessage, formatTime, waitForOperation } from '../api'
+import { api, errorMessage, formatTime, resolveDiff, resolveValidation, waitForOperation } from '../api'
 import type { ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion } from '../api'
 import { useT } from '../i18n'
+import { useSystem } from '../queries'
 import { useConfirm } from './confirm'
 
 export function convertConfiguration(
@@ -24,6 +25,14 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   const t = useT()
   const queryClient = useQueryClient()
   const confirm = useConfirm()
+  // Hub deployments manage configuration per node; there is no fleet-wide
+  // draft or active config to load until a node is selected. The mode stays
+  // undetermined until /system settles, so a slow first load cannot briefly
+  // fire the local-mode (fleet-global) endpoints against a Hub.
+  const systemQuery = useSystem()
+  const systemKnown = !systemQuery.isPending
+  const isHub = systemQuery.data?.id === 'arkflow-control-hub'
+  const fleetMode = systemKnown && Boolean(isHub) && !nodeId
   // Static config resources: never polled and never invalidated by the SSE
   // live-key sweep, so an open draft is only re-synced on nodeId change or
   // after an explicit publish/rollback.
@@ -31,17 +40,19 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     queryKey: ['config-draft', nodeId ?? null],
     queryFn: api.draft,
     staleTime: Infinity,
-    enabled: !nodeId,
+    enabled: systemKnown && !nodeId && !isHub,
   })
   const configQuery = useQuery({
     queryKey: ['config', nodeId ?? null],
     queryFn: () => api.config(nodeId),
     staleTime: Infinity,
+    enabled: systemKnown && !fleetMode,
   })
   const versionsQuery = useQuery({
     queryKey: ['config-versions', nodeId ?? null],
     queryFn: () => api.versions(nodeId),
     staleTime: Infinity,
+    enabled: systemKnown && !fleetMode,
   })
   const [content, setContent] = useState('streams: []\n')
   const [format, setFormat] = useState<ConfigCandidate['format']>('yaml')
@@ -63,12 +74,13 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     // A global draft loads independently of the config; wait for it to settle
     // so its arrival cannot be transiently treated as "no draft", and report
     // a draft-load failure instead of silently showing the active snapshot.
-    if (!nodeId && draftQuery.isPending) return
-    if (!nodeId && draftQuery.isError) {
+    const draftRelevant = !nodeId && !isHub
+    if (draftRelevant && draftQuery.isPending) return
+    if (draftRelevant && draftQuery.isError) {
       onError(errorMessage(draftQuery.error))
       return
     }
-    const draft = nodeId ? undefined : draftQuery.data
+    const draft = draftRelevant ? draftQuery.data : undefined
     const next = draft ?? { format: 'json' as const, content: JSON.stringify(configQuery.data, null, 2) }
     setContent(next.content)
     setFormat(next.format)
@@ -84,6 +96,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
     draftQuery.isPending,
     draftQuery.isError,
     draftQuery.error,
+    isHub,
     nodeId,
     onError,
   ])
@@ -106,7 +119,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   }
   const validate = () =>
     void run(t('config.busyValidating'), async () => {
-      const report = await api.validateConfig(candidate)
+      const report = await resolveValidation(candidate, nodeId)
       setIssues(report.errors)
       setValidatedCandidate(report.valid ? identity : undefined)
     })
@@ -144,7 +157,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
   const compare = async (id: string) => {
     const to = versions.find((version) => version.id !== id)?.id
     if (!to) return
-    await run(t('config.busyComparing'), async () => setDiff(await api.diff(id, to)))
+    await run(t('config.busyComparing'), async () => setDiff(await resolveDiff(id, to, nodeId)))
   }
   const changeFormat = (next: ConfigCandidate['format']) => {
     if (next === format) return
@@ -164,6 +177,36 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
         },
       ])
     }
+  }
+  // Mode undetermined (first /system fetch): hold the neutral state rather
+  // than flashing an editable local-mode draft against a Hub.
+  if (!systemKnown) {
+    return (
+      <section className="panel config">
+        <div className="panel-title">
+          <div>
+            <h3>{t('config.title')}</h3>
+            <small>{t('common.loading')}</small>
+          </div>
+        </div>
+        <p className="empty">{t('common.loading')}</p>
+      </section>
+    )
+  }
+  // Hub mode without a selected node: configuration is node-scoped, so say
+  // so instead of surfacing the fleet-wide 404s as load errors.
+  if (fleetMode) {
+    return (
+      <section className="panel config">
+        <div className="panel-title">
+          <div>
+            <h3>{t('config.title')}</h3>
+            <small>{t('config.hubSelectNode')}</small>
+          </div>
+        </div>
+        <p className="empty">{t('config.hubFleetNotice')}</p>
+      </section>
+    )
   }
   return (
     <section className="panel config">

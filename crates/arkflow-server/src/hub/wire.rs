@@ -88,6 +88,16 @@ pub struct NodeReport {
     pub configuration: Option<serde_json::Value>,
     #[serde(default)]
     pub configuration_version: Option<String>,
+    /// Known configuration versions on the node (id/format metadata only,
+    /// never content) so Hub consumers can list and diff without a second
+    /// channel. Older Agents omit the field (empty list).
+    #[serde(default)]
+    pub config_versions: Vec<arkflow_core::configuration::ConfigVersion>,
+    /// Task ids each Job kernel is currently executing on the node, keyed by
+    /// job id. Presence of a task id is the node's observation that the task
+    /// is running there. Older Agents omit the field.
+    #[serde(default)]
+    pub job_tasks: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub boot_id: Option<String>,
     #[serde(default)]
@@ -186,6 +196,10 @@ pub struct CommandResult {
     pub observed_checkpoint_id: Option<String>,
     #[serde(default)]
     pub checkpoint_manifest_uri: Option<String>,
+    /// Read-only command report (e.g. a configuration validation or diff)
+    /// delivered alongside the terminal state. Absent for mutations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +265,10 @@ pub struct HubOperation {
     pub observed_generation: Option<u64>,
     #[serde(default)]
     pub observed_state: Option<String>,
+    /// Report payload of a read-only command (validation/diff), carried from
+    /// the agent result so polling clients can read the outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 pub(crate) fn default_protocol_version() -> String {

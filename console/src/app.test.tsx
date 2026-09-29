@@ -103,7 +103,8 @@ describe('console application', () => {
     )
     render(<App />)
     fireEvent.click(screen.getByText('Configuration', { selector: 'a' }))
-    expect(screen.getByLabelText('Configuration editor')).toBeInTheDocument()
+    // The page waits for /system to decide local vs Hub mode before loading.
+    expect(await screen.findByLabelText('Configuration editor')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled()
     expect(screen.queryByText('api_token')).not.toBeInTheDocument()
   })
@@ -113,6 +114,82 @@ describe('console application', () => {
     render(<App />)
     expect(await screen.findByText(/last known state/i)).toBeInTheDocument()
     expect(screen.getByText(/connection refused/i)).toBeInTheDocument()
+  })
+
+  it('explains a standby Hub instead of the generic stale banner', async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve({
+        ok: false,
+        status: 503,
+        json: async () => ({
+          code: 'hub_standby',
+          message: 'This Hub instance is a standby',
+          correlation_id: 'c-1',
+        }),
+      }),
+    )
+    render(<App />)
+    expect(await screen.findByText(/standby and does not hold the control-plane lease/i)).toBeInTheDocument()
+    expect(screen.queryByText(/last known state/i)).toBeNull()
+  })
+
+  it('renders HA leadership and JSON metrics in Hub mode', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system'))
+            return {
+              id: 'arkflow-control-hub',
+              version: 'hub',
+              state: 'running',
+              node_count: 1,
+              stream_count: 0,
+              active_operations: 0,
+              capabilities: [],
+              ha: { enabled: true, role: 'leader', epoch: 3, transitions: 1 },
+            }
+          if (url.endsWith('/status'))
+            return {
+              version: 'hub',
+              state: 'running',
+              uptime_seconds: 9,
+              streams_total: 2,
+              streams_running: 1,
+              streams_failed: 1,
+            }
+          if (url.includes('/metrics'))
+            return {
+              items: [{ node_id: 'n1', metrics: { input_batches: 5 } }],
+              aggregate: { input_batches: 5 },
+            }
+          if (url.includes('/nodes?'))
+            return page([
+              {
+                id: 'n1',
+                version: 'agent',
+                state: 'online',
+                capabilities: [],
+                streams_total: 2,
+                streams_running: 1,
+                streams_failed: 1,
+              },
+            ])
+          return page([])
+        },
+      }),
+    )
+    render(<App />)
+    expect(await screen.findByText(/HA: leader · epoch 3/)).toBeInTheDocument()
+    expect(await screen.findByText('input batches')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/metrics/),
+        expect.objectContaining({
+          headers: expect.objectContaining({ Accept: 'application/json' }),
+        }),
+      ),
+    )
   })
 
   it('selects a node and disables mutations when its lease is stale', async () => {

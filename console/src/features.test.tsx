@@ -26,6 +26,89 @@ const renderWithQueries = (ui: ReactElement) =>
   )
 
 describe('configuration workflow', () => {
+  it('compares node versions through the Hub dispatch and renders the tracked diff', async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/system'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'arkflow-control-hub',
+            version: 'hub',
+            state: 'running',
+            node_count: 1,
+            stream_count: 0,
+            active_operations: 0,
+            capabilities: [],
+          }),
+        })
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            page([
+              {
+                id: 'node-a',
+                version: 'agent',
+                state: 'online',
+                capabilities: [],
+                streams_total: 0,
+                streams_running: 0,
+                streams_failed: 0,
+              },
+            ]),
+        })
+      if (url.includes('/nodes/node-a/configuration/diff')) {
+        // The Hub proxies the comparison as a read-only node command.
+        expect(url).toContain('from=v2')
+        expect(url).toContain('to=v1')
+        expect(init?.method).toBeUndefined()
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: async () => ({
+            id: 'op-2',
+            operation: 'diff_configuration',
+            progress: 0,
+            state: 'queued',
+            created_at_ms: 1,
+          }),
+        })
+      }
+      if (url.includes('/operations/op-2'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: 'op-2',
+            operation: 'diff_configuration',
+            progress: 100,
+            state: 'succeeded',
+            created_at_ms: 1,
+            result: { from: 'v2', to: 'v1', changed: true, from_format: 'json', to_format: 'yaml' },
+          }),
+        })
+      if (url.includes('/nodes/node-a/configuration/versions'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            { id: 'v2', created_at_ms: 2, format: 'json' },
+            { id: 'v1', created_at_ms: 1, format: 'yaml' },
+          ],
+        })
+      if (url.includes('/nodes/node-a/configuration'))
+        return Promise.resolve({ ok: true, json: async () => ({ streams: [] }) })
+      return Promise.resolve({ ok: true, json: async () => page([]) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    renderWithQueries(<Configuration onError={vi.fn()} nodeId="node-a" />)
+    // The active snapshot and its version list render in node-scoped mode.
+    await screen.findByText('v2', { selector: 'strong' })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Compare' })[0])
+    // The Hub-delivered diff renders exactly like the local one.
+    expect(await screen.findByText(/Comparing v2 → v1/)).toBeInTheDocument()
+    expect(screen.getByText(/Content differs\./)).toBeInTheDocument()
+    expect(screen.getByText(/Formats: json → yaml/)).toBeInTheDocument()
+  })
+
   it('converts YAML to JSON and preserves equivalent values', () => {
     expect(JSON.parse(convertConfiguration('streams: []\n', 'yaml', 'json'))).toEqual({ streams: [] })
     expect(convertConfiguration('{"streams":[]}', 'json', 'yaml')).toContain('streams: []')
@@ -298,6 +381,89 @@ describe('distributed Job workbench', () => {
     await waitFor(() => expect(local.getByRole('button', { name: 'Create stopped' })).not.toBeDisabled())
     fireEvent.change(local.getByLabelText('Job ID'), { target: { value: 'changed-job' } })
     expect(local.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+  })
+
+  it('renders only measured Job metrics and distinguishes observed tasks', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/jobs'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            {
+              job_id: 'scoped-job',
+              version: 1,
+              desired_state: 'running',
+              observed_state: 'running',
+              convergence: 'in_sync',
+              generation: 1,
+              node_ids: ['n1'],
+              updated_at_ms: 1,
+            },
+          ],
+        })
+      if (url.endsWith('/jobs/scoped-job/detail'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            job: {
+              job_id: 'scoped-job',
+              version: 1,
+              desired_state: 'running',
+              observed_state: 'running',
+              convergence: 'in_sync',
+              generation: 1,
+              node_ids: ['n1'],
+              updated_at_ms: 1,
+            },
+            plan: {},
+            nodes: [],
+            operations: [],
+            checkpoints: [],
+            metrics: { watermark_lag_ms: 5, checkpoint_duration_ms: 7, checkpoint_failures: 2 },
+            tasks: [
+              {
+                id: 't1:n1:1',
+                job_id: 'scoped-job',
+                job_version: 1,
+                task_id: 't1',
+                generation: 1,
+                node_id: 'n1',
+                state: 'running',
+                observed: true,
+                observed_node_id: 'n1',
+              },
+              {
+                id: 't2:n1:1',
+                job_id: 'scoped-job',
+                job_version: 1,
+                task_id: 't2',
+                generation: 1,
+                node_id: 'n1',
+                state: 'queued',
+                observed: false,
+              },
+            ],
+          }),
+        })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    renderWithQueries(<Jobs onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /scoped-job/ }))
+    // Only the measured gauges render; the removed always-zero keys never appear.
+    await waitFor(() => expect(screen.getByText('watermark lag ms')).toBeInTheDocument())
+    expect(screen.getByText('checkpoint duration ms')).toBeInTheDocument()
+    expect(screen.getByText('checkpoint failures')).toBeInTheDocument()
+    expect(screen.queryByText('state bytes')).toBeNull()
+    expect(screen.queryByText('recovery progress')).toBeNull()
+    expect(screen.queryByText('task pressure')).toBeNull()
+    expect(screen.queryByText('partition health')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }))
+    const observedRow = screen.getByText('t1').closest('div.row')
+    expect(within(observedRow as HTMLElement).getByText('running')).toBeInTheDocument()
+    expect(within(observedRow as HTMLElement).queryByText(/not observed yet/)).toBeNull()
+    const fallbackRow = screen.getByText('t2').closest('div.row')
+    expect(within(fallbackRow as HTMLElement).getByText(/queued · not observed yet/)).toBeInTheDocument()
   })
 
   it('shows a retryable component-catalogue failure in the Job palette', async () => {
@@ -632,14 +798,15 @@ describe('job editor determinism', () => {
     desired_state: 'stopped',
     state: 'stopped',
     node_ids: [],
-    spec: {
+    // The Hub serializes job specs as spec_json only.
+    spec_json: JSON.stringify({
       id: 'orders',
       version: 3,
       operators: [{ id: 'kept-source', kind: 'source', component: 'generate', config: {} }],
       sources: [{ operator_id: 'kept-source', input_type: 'generate' }],
       sinks: [],
       edges: [],
-    },
+    }),
   }
 
   it('resets the draft when the editor target switches from create to upgrade', async () => {
@@ -691,6 +858,61 @@ describe('job editor determinism', () => {
     await view.findByDisplayValue('orders')
     expect(view.queryByText('generate-1')).toBeNull()
     expect(view.getByText(/Recovery: sp-1/)).toBeTruthy()
+  })
+
+  it('serializes rescale and per-task resources, and clears them back to absent', async () => {
+    const bodies: string[] = []
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/components'))
+        return Promise.resolve({ ok: true, json: async () => componentCatalogue })
+      if (url.endsWith('/jobs/validate')) {
+        bodies.push(String(init?.body))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            valid: true,
+            warnings: [],
+            plan: undefined,
+            required_capabilities: [],
+            nodes: [],
+          }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const view = render(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
+    await screen.findByText('Rescale recovery (redistribute keyed state on parallelism changes)')
+    fireEvent.click(view.getByLabelText(/Rescale recovery/))
+    fireEvent.change(view.getByLabelText('CPU per task (millicores)'), { target: { value: '500' } })
+    fireEvent.change(view.getByLabelText('Memory per task (bytes)'), { target: { value: '1024' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    await waitFor(() => expect(bodies).toHaveLength(1))
+    expect(JSON.parse(bodies[0]).spec).toMatchObject({
+      rescale: true,
+      resources: { cpu_millicores: 500, memory_bytes: 1024 },
+    })
+    // Clearing the inputs serializes both back to their absent form.
+    fireEvent.change(view.getByLabelText('CPU per task (millicores)'), { target: { value: '' } })
+    fireEvent.change(view.getByLabelText('Memory per task (bytes)'), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    const cleared = JSON.parse(bodies[1]).spec
+    expect(cleared.rescale).toBe(true)
+    expect(cleared.resources).toBeUndefined()
   })
 
   it('generates collision-free node ids across add/delete/add', async () => {

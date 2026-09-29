@@ -24,6 +24,8 @@ export const zh = {
 
   'warning.nodeUnavailable': '节点 {node} 当前为 {state}；变更操作已禁用。',
   'warning.staleState': '正在显示最后已知状态。控制面 API 恢复后可重试。',
+  'warning.hubStandby':
+    '当前连接的是备用 Hub，未持有控制面租约；正在自动重试。若持续出现，请将控制台指向当选的 Leader。',
 
   'common.loading': '加载中…',
   'common.close': '关闭',
@@ -52,6 +54,8 @@ export const zh = {
   'overview.maintain': '维护',
   'overview.resume': '恢复',
   'overview.cardControlPlane': '控制面',
+  'overview.haRole': '高可用：{role} · 纪元 {epoch}',
+  'overview.haHint': '{transitions} 次领导权切换 · {version}',
   'overview.cardNodesOnline': '在线节点',
   'overview.nodesNeedAttention': '{count} 个节点需要关注',
   'overview.allNodesHealthy': '所有节点正常',
@@ -110,6 +114,8 @@ export const zh = {
   'runtime.noOperations': '暂无操作记录。',
 
   'config.title': '配置',
+  'config.hubSelectNode': '请选择要管理的计算节点。',
+  'config.hubFleetNotice': 'Hub 部署按节点管理配置；草稿是本地控制面功能。',
   'config.activeRedacted': '生效配置已脱敏且只读',
   'config.unsavedDraft': '草稿未保存',
   'config.draftSaved': '草稿已保存',
@@ -206,7 +212,9 @@ export const zh = {
   'jobs.noneValue': '无',
   'jobs.nodeCompatibility': '节点兼容性',
   'jobs.noAssignedNodes': '暂无已分配节点。',
-  'jobs.taskPlacement': '节点 {node} · 尝试 {attempt}',
+  'jobs.taskPlacement': '节点 {node}',
+  'jobs.taskNotObserved': '尚未观测',
+  'jobs.noMeasuredMetrics': '暂无已度量的诊断数据。',
   'jobs.unassignedValue': '未分配',
   'jobs.taskGeneration': '第 {generation} 代',
   'jobs.noTasks': '暂无任务分配记录。',
@@ -309,6 +317,9 @@ export const zh = {
   'editor.versionLabel': '版本',
   'editor.parallelismLabel': '并行度',
   'editor.maxParallelismLabel': '最大并行度',
+  'editor.rescaleLabel': '扩缩容恢复（并行度变化时重分布键控状态）',
+  'editor.cpuMillicoresLabel': '每任务 CPU（毫核）',
+  'editor.memoryBytesLabel': '每任务内存（字节）',
   'editor.stateBackendLabel': '状态后端',
   'editor.stateNamespaceLabel': '状态命名空间',
   'editor.stateTtlLabel': '状态 TTL（毫秒）',
@@ -369,4 +380,5 @@ export const zh = {
   'api.sseConnectionFailed': 'SSE 连接失败（{status}）',
   'api.operationState': '操作 {state}',
   'api.operationTimedOut': '操作超时',
+  'api.reportMissing': '操作结果中未携带{what}。',
 } satisfies Record<keyof typeof en, string>

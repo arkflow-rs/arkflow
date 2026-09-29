@@ -10,6 +10,8 @@ Hub 在 `/liveness` 暴露进程存活,在 `/readiness` 暴露存储/恢复就�
 请将这些运维路由置于所配置的运维令牌边界或经过认证的监控代理之后;
 绝不要公开 bearer 令牌、配置载荷、作为指标标签的节点 ID 或作为标签的错误文本。
 
+`/api/v1/metrics` 支持内容协商:默认响应仍为上文的 Prometheus 文本;显式携带 `Accept: application/json`(或 `?format=json`)时返回 Web 控制台渲染的 JSON 聚合 `{"items": [{"node_id", "metrics"}], "aggregate"}`,两个分支都支持 `node_id` 过滤。Hub 还提供 `GET /api/v1/status`——机群聚合的引擎状态(流总量为各注册节点之和,以及 Hub 版本与运行时长)——使控制台客户端在本地与 Hub 模式下看到同一份概览契约。作业详情诊断(`GET /api/v1/jobs/{id}/detail`)只包含已度量的、作业级别的指标(`watermark_lag_ms`、`checkpoint_duration_ms`、`checkpoint_failures`),并将执行节点上报的观测任务状态合并到期望放置之上,显式标记尚未观测的任务,而不是把放置状态当作运行时状态。只读配置报告可通过 Hub 访问:`POST /api/v1/nodes/{node_id}/configuration/validate` 与 `GET /api/v1/nodes/{node_id}/configuration/diff?from&to`——两者都只派发只读节点命令(不产生版本或 rollout 副作用),报告随跟踪操作的 `result` 字段返回。
+
 命令分发指标覆盖从入队到确认的延迟(`arkflow_command_duration_bucket`/`_count`/`_sum`)以及按结果分类的计数器
 (`arkflow_command_total`),标签使用固定的 `command` 与 `outcome` 词表。这些计数器在 Hub
 重启时归零,符合 Prometheus 计数器语义。作业生命周期变更(`job_start`、`job_stop`、
