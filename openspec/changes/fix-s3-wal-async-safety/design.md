@@ -23,7 +23,7 @@ S3Store 的同步 `WalStore` 方法内部 `self.runtime.block_on(...)`，引擎�
 **D3 — rewind 补偿：毒化 floor + 内存 cursor 镜像。**
 - `floor: AtomicU64`（`u64::MAX` = 无毒化）。`rewind_cursor(r)`：`floor.fetch_min(r + 1)`（毒化 r+1 与其后），并把镜像 cursor 钳到 ≤ r；若 manifest 已持久化越过 r，做一次纠正性 flush（钳回，尽力而为——失败显式报错，符合 spec "or the compensation reports an explicit failure"）。
 - `advance_cursor(s)`：镜像 `fetch_max`；若 `s + 1 >= floor` 则解除毒化（`floor = u64::MAX`）——源重新 ack 通过毒化序列后恢复正常推进。
-- `flush_manifest` 的 target 取 `min(acked_hwm, max_sealed_seq, floor - 1)`。
+- `flush_manifest` 的 target 取 `min(acked_hwm, max_sealed_seq, floor - 1)`；毒化期间 mutator **允许下调**已持久化的 cursor（纠正与 flusher 竞速的先发 flush），水位在 mutator 内读取（每次 ETag 重试用当前值，防陈旧 ceiling 回封）——CR 轮修正：初版只增不减的 mutator 使纠正性 flush 成为 no-op。
 - `cursor()` 读内存镜像（构造期从 recovery 加载）——同时消灭每-ack 一次 S3 GET。
 - 镜像仅本进程写（node_id 命名空间隔离，spec 既有保证），缓存语义可靠。
 

@@ -486,10 +486,17 @@ impl S3Store {
             match response {
                 Ok(r) => match r.bytes().await {
                     Ok(b) => Ok(Manifest::from_json(&b).map(|m| m.cursor).unwrap_or(0)),
-                    Err(_) => Ok(0),
+                    // A transient read failure must not seed the mirror
+                    // with 0 (the ack parking logic would stall behind the
+                    // phantom gap) — fail the construction instead.
+                    Err(e) => Err(Error::Connection(format!(
+                        "manifest read for cursor seed failed: {e}"
+                    ))),
                 },
                 Err(object_store::Error::NotFound { .. }) => Ok(0),
-                Err(_) => Ok(0),
+                Err(e) => Err(Error::Connection(format!(
+                    "manifest read for cursor seed failed: {e}"
+                ))),
             }
         };
         block_on_init(self.rt(), fetch)?
@@ -999,27 +1006,36 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 /// objects (orphans), so it has been removed; sealed segments stay listed in the
 /// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
-    // Advance the committed cursor to the highest acknowledged sequence,
-    // clamped to `max_sealed_seq` (D2). The clamp is the safety guarantee:
-    // the cursor never advances past data that has actually been sealed to
-    // object storage, so an acked-but-unsealed entry remains replayable on
-    // restart (at-least-once, never loss). The ETag-coordinated mutator
-    // keeps concurrent flushes (flusher vs ingestion) from losing updates.
-    let acked_hwm = store.acked_hwm.load(Ordering::Acquire);
-    // The rewind floor clamps the target strictly below a poisoned sequence
-    // until the source re-acknowledges through it (advance_cursor clears
-    // the floor), keeping the failed entry replayable.
-    let floor = store.rewind_floor.load(Ordering::Acquire);
-    let ceiling = if floor == u64::MAX {
-        acked_hwm
-    } else {
-        acked_hwm.min(floor.saturating_sub(1))
-    };
+    // The cursor tracks the highest acknowledged sequence, clamped to
+    // `max_sealed_seq`: it never passes data not yet sealed to object
+    // storage, so an acked-but-unsealed entry stays replayable
+    // (at-least-once, never loss). The rewind floor clamps the target
+    // strictly below a poisoned sequence until the source re-acknowledges
+    // through it — and, while poisoned, may LOWER an already-persisted
+    // cursor: a flush that raced ahead of the rewind must be corrected or
+    // the failed entry would be sealed past.
+    //
+    // The watermarks are read INSIDE the mutator so every ETag retry uses
+    // the current values — the mutator re-runs per attempt, and a retry
+    // reusing a ceiling captured before a concurrent rewind would seal the
+    // poisoned sequence right back.
     write_manifest_with_etag(store, |m| {
+        let acked_hwm = store.acked_hwm.load(Ordering::Acquire);
+        let floor = store.rewind_floor.load(Ordering::Acquire);
+        let poisoned = floor != u64::MAX;
+        let ceiling = if poisoned {
+            acked_hwm.min(floor.saturating_sub(1))
+        } else {
+            acked_hwm
+        };
         let target = ceiling.min(m.max_sealed_seq);
-        if target > m.cursor {
-            m.cursor = target;
-        }
+        // Unpoisoned: monotonic (acked_hwm only shrinks via a rewind, which
+        // poisons). Poisoned: clamp down to the floor.
+        m.cursor = if poisoned {
+            m.cursor.min(target)
+        } else {
+            m.cursor.max(target)
+        };
     })
     .await?;
 
@@ -1379,36 +1395,76 @@ mod tests {
         store2.close().unwrap();
     }
 
-    /// Spec "Object-store rewind survives an intervening manifest flush":
-    /// advancing to 4 then rewinding to 3 (failed wrapped source commit)
-    /// poisons the floor — an intervening flush (the close path seals and
-    /// flushes the manifest) must not seal 4 — and the source re-ack
-    /// through 4..5 resumes normal advancement.
+    /// Spec "Object-store rewind survives an intervening manifest flush".
+    ///
+    /// Threshold-driven so every flush lands at a deterministic point: the
+    /// 5th append seals [1..=4], the 4th advance flushes the manifest with
+    /// cursor 4 — the poisoned-before state — and the rewind's corrective
+    /// flush must LOWER the persisted cursor back to 3 (the original
+    /// monotonic-only mutator made the corrective flush a no-op here).
+    /// The source re-ack through 4..5 then resumes normal advancement.
     #[test]
     fn rewind_floor_survives_an_intervening_manifest_flush() {
+        // seal at the 5th append, flush at the 4th advance, quiet intervals
+        let build = |dir: &std::path::Path| {
+            let client: Arc<dyn object_store::ObjectStore> =
+                Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
+            let osc = ObjectStoreWalConfig {
+                node_id: "pod-a".into(),
+                stream_id: "poison".into(),
+                prefix: "arkflow/wal".into(),
+                s3: ObjectStoreS3Config {
+                    bucket: "unused".into(),
+                    region: None,
+                    endpoint: None,
+                    access_key_id: None,
+                    secret_access_key: None,
+                    allow_http: false,
+                },
+                segment: SegmentConfig {
+                    max_entries: 4,
+                    max_bytes: 1024 * 1024,
+                    flush_interval: std::time::Duration::from_secs(600),
+                },
+                cursor: CursorFlushConfig {
+                    max_entries: 4,
+                    interval: std::time::Duration::from_secs(600),
+                },
+                segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+                parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+                compression: arkflow_core::wal::config::CompressionConfig::default(),
+                sync: SyncPolicy::GroupCommit,
+            };
+            S3Store::build_with_client(&WalConfig::default(), osc, Runtime::new().unwrap(), client)
+                .unwrap()
+        };
+
         let dir = tempdir();
-        let (store, _) = build_local_store_in(&dir);
+        let store = build(&dir);
+        // 5 appends: the 5th crosses segment.max_entries and seals [1..=4].
         store
             .append_batch((1..=5u64).map(|s| (s, sample_payload(None))).collect())
             .unwrap();
-        for seq in 1..=3u64 {
+        // 4 advances: the 4th crosses cursor.max_entries and flushes the
+        // manifest with cursor 4 — the failed commit is now PERSISTED past.
+        for seq in 1..=4u64 {
             store.advance_cursor(seq).unwrap();
         }
-        // The wrapped source commit for 4 fails AFTER the cursor
-        // tentatively advanced.
-        store.advance_cursor(4).unwrap();
+        assert_eq!(store.cursor(), 4);
+
+        // The wrapped source commit for 4 failed; the rewind must correct
+        // the already-persisted manifest, not just the in-memory mirror.
         store.rewind_cursor(3).unwrap();
         assert_eq!(store.cursor(), 3, "cursor mirror rewound");
 
-        // Intervening flush: close seals all five entries and flushes the
-        // manifest. Pre-fix the poisoned 4 was sealed (acked_hwm had hit 4
-        // with no compensation path).
+        // Close (seals 5, flushes under the poison clamp) and reopen: the
+        // manifest must read 3 and replay [4, 5].
         store.close().unwrap();
-        let (reopened, _) = build_local_store_in(&dir);
+        let reopened = build(&dir);
         assert_eq!(
             reopened.cursor(),
             3,
-            "manifest must not seal the poisoned sequence"
+            "corrective flush must lower the persisted cursor below the poison"
         );
         let replay: Vec<u64> = reopened
             .read_after_cursor()
@@ -1423,7 +1479,7 @@ mod tests {
         reopened.advance_cursor(4).unwrap();
         reopened.advance_cursor(5).unwrap();
         reopened.close().unwrap();
-        let (final_store, _) = build_local_store_in(&dir);
+        let final_store = build(&dir);
         assert_eq!(final_store.cursor(), 5);
         assert!(final_store.read_after_cursor().unwrap().is_empty());
         final_store.close().unwrap();

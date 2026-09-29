@@ -681,7 +681,7 @@ impl Wal {
                 let cursor = self.call_store(|store| Ok(store.cursor())).await?;
                 if cursor == seq {
                     let rewind_to = seq.saturating_sub(1);
-        self.call_store(move |store| store.rewind_cursor(rewind_to))
+                    self.call_store(move |store| store.rewind_cursor(rewind_to))
                         .await?;
                 } else if cursor > seq {
                     if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {

@@ -129,8 +129,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<MessageBatch, Error> {
 /// `Wal`'s wrappers, which use `tokio::task::spawn_blocking` for redb's
 /// blocking calls and `await` directly for S3's async client.
 pub trait WalStore: Send + Sync + 'static {
-    /// Short name identifying this store kind (`"local"`, `"s3"`, …).
-    /// Diagnostics only — the dispatcher uses `WalConfig.backend_kind()`.
+    /// Short name identifying this store kind (`"local"`, `"object_store"`).
+    /// Also used by the WAL wrapper to dispatch blocking-pool driving
+    /// (remote/object-store kinds must not run their I/O on async workers);
+    /// backends added by third parties that block should mirror the
+    /// `"object_store"` behaviour expectations in `Wal::call_store`.
     fn kind(&self) -> &'static str;
 
     /// Persist a batch of `(seq, payload)` entries. Implementations are free

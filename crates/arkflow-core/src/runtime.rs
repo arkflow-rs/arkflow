@@ -640,10 +640,22 @@ impl RuntimeManager {
 
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         let handle = self.spawn_supervised(entry.clone(), async move {
-            let adapter = crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
-                config.durability.as_ref(),
-                config.temporary.clone(),
-            )?;
+            // Adapter construction builds the WAL — the object-store
+            // backend's recovery GETs every segment — so keep it off the
+            // async workers.
+            let durability = config.durability.clone();
+            let temporary = config.temporary.clone();
+            let adapter = tokio::task::spawn_blocking(move || {
+                crate::executor::stream_adapter::StreamJobAdapter::with_temporary(
+                    durability.as_ref(),
+                    temporary,
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Process(format!("stream adapter construction task failed: {e}")
+                )
+            })??;
             // The adapter owns the WAL flusher. Close it even when resource
             // construction or graph startup fails before the graph takes
             // ownership of the source.
