@@ -229,7 +229,7 @@ struct FlusherHandle {
 /// Holds a dedicated tokio runtime so its sync `WalStore` methods can drive
 /// the async `object_store` client without forcing the trait to be async.
 pub(crate) struct S3Store {
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     client: Arc<dyn object_store::ObjectStore>,
     /// Root namespace — `{prefix}/{node_id}/{stream_id}`.
     ns: String,
@@ -257,6 +257,17 @@ pub(crate) struct S3Store {
     /// `append_batch`; `next_seq_hint` returns this + 1 so a restart never
     /// reuses a sequence already on the store.
     max_written_seq: AtomicU64,
+    /// Rewind floor: the lowest poisoned sequence. The manifest cursor must
+    /// stay strictly below it until a later `advance_cursor` re-commits
+    /// through it (the source re-acknowledges after replay). `u64::MAX`
+    /// means no poison. Without this, a manifest flush racing a cursor
+    /// compensation would seal the failed sequence and break the replay
+    /// guarantee ("Both WAL backends keep the replay guarantee").
+    rewind_floor: AtomicU64,
+    /// In-memory mirror of the committed cursor, seeded by recovery and
+    /// maintained by advance/rewind/flush. `cursor()` runs on every WAL
+    /// acknowledgement, so it must not perform a manifest GET per call.
+    cursor_mirror: AtomicU64,
     flusher: StdMutex<Option<FlusherHandle>>,
 }
 
@@ -273,7 +284,41 @@ struct ActiveSegment {
     next_index: u64,
 }
 
+/// Run one construction-path future on the private runtime, off the
+/// calling thread. `Runtime::block_on` panics when the caller is already
+/// inside a runtime context (sync builders are invoked from async
+/// `connect()`s), so initialization parks on a short-lived OS thread where
+/// `block_on` is always legal.
+/// Dispose of a private runtime that never made it into a store: dropping
+/// a multi-thread runtime inside an async context panics, and construction
+/// error paths (`?`) return exactly there.
+fn dispose_runtime(runtime: Runtime) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || runtime.shutdown_timeout(std::time::Duration::from_secs(10)));
+    } else {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
+fn block_on_init<F>(runtime: &Runtime, fut: F) -> Result<F::Output, Error>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| runtime.block_on(fut))
+            .join()
+            .map_err(|_| Error::Process("WAL object-store init task panicked".into()))
+    })
+}
+
 impl S3Store {
+    /// The private runtime (present until Drop shuts it down).
+    fn rt(&self) -> &Runtime {
+        self.runtime.as_ref().expect("S3 store runtime alive")
+    }
+
     /// Build the store from a config. Validates that `sync` is not
     /// `PerEntry` (D8) and constructs an S3 client from the config's
     /// `s3:` block.
@@ -288,9 +333,10 @@ impl S3Store {
         };
         let runtime =
             Runtime::new().map_err(|e| Error::Process(format!("S3 store runtime init: {}", e)))?;
-        let client: Arc<dyn object_store::ObjectStore> = runtime
-            .block_on(build_s3_client(&osc.s3))
-            .map_err(|e| Error::Config(format!("S3 client init: {}", e)))?;
+        let client: Arc<dyn object_store::ObjectStore> =
+            block_on_init(&runtime, build_s3_client(&osc.s3))
+                .map_err(|e| Error::Config(format!("S3 client init: {}", e)))?
+                .map_err(|e| Error::Config(format!("S3 client init: {}", e)))?;
         Self::build_with_client(cfg, osc, runtime, client)
     }
 
@@ -299,9 +345,28 @@ impl S3Store {
     /// across multiple WAL instances). Performs the same validation +
     /// recovery + flusher spawn as `build`.
     fn build_with_client(
-        _cfg: &WalConfig,
+        cfg: &WalConfig,
         osc: arkflow_core::wal::config::ObjectStoreWalConfig,
         runtime: Runtime,
+        client: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Arc<Self>, Error> {
+        // Any construction error must dispose of the private runtime OFF
+        // the caller's context: a plain `?` would drop it inline and panic
+        // inside an async caller ("cannot drop a runtime ...").
+        let mut runtime_slot = Some(runtime);
+        let result = Self::build_with_client_inner(cfg, osc, &mut runtime_slot, client);
+        if result.is_err() {
+            if let Some(rt) = runtime_slot.take() {
+                dispose_runtime(rt);
+            }
+        }
+        result
+    }
+
+    fn build_with_client_inner(
+        _cfg: &WalConfig,
+        osc: arkflow_core::wal::config::ObjectStoreWalConfig,
+        runtime_slot: &mut Option<Runtime>,
         client: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Arc<Self>, Error> {
         // D8: reject PerEntry on remote backends. `WalConfig::validate` is
@@ -378,11 +443,16 @@ impl S3Store {
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
 
-        let first_index = runtime
-            .block_on(async { probe_next_segment_index(&*client, &segments_prefix).await })?;
+        let runtime = runtime_slot
+            .as_ref()
+            .expect("construction runtime present");
+        let first_index =
+            block_on_init(runtime, async {
+                probe_next_segment_index(&*client, &segments_prefix).await
+            })??;
 
         let store = Arc::new(Self {
-            runtime,
+            runtime: runtime_slot.take(),
             client: client.clone(),
             ns: ns.clone(),
             segments_prefix,
@@ -410,10 +480,17 @@ impl S3Store {
             cursor_last_flush_ms: AtomicU64::new(now_ms()),
             acked_hwm: AtomicU64::new(0),
             max_written_seq: AtomicU64::new(0),
+            rewind_floor: AtomicU64::new(u64::MAX),
+            cursor_mirror: AtomicU64::new(0),
             flusher: StdMutex::new(None),
         });
 
-        store.runtime.block_on(recover(&store))?;
+        let manifest_cursor = block_on_init(store.rt(), recover(&store))??;
+        // Seed the cursor mirror from the manifest recovery just read — no
+        // second GET, so a transient second-read failure cannot exist.
+        store
+            .cursor_mirror
+            .store(manifest_cursor, Ordering::Release);
 
         let handle = spawn_flusher(store.clone());
         *store.flusher.lock().unwrap() = Some(handle);
@@ -491,7 +568,9 @@ async fn probe_next_segment_index(
 /// Run recovery: GET manifest → union with LIST → decode all segments →
 /// seal any sealed segments whose tail is past the cursor so subsequent
 /// truncations are correct.
-async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
+/// Returns the recovered manifest cursor (the in-memory mirror seed — no
+/// second GET after recovery).
+async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     // Step 1: GET manifest (optional — absent on a fresh bucket).
     let manifest = match store
         .client
@@ -604,7 +683,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
         active.bytes.clear();
     }
 
-    Ok(())
+    Ok(manifest.cursor)
 }
 
 fn store_ns_node_id(store: &S3Store) -> String {
@@ -658,7 +737,7 @@ impl WalStore for S3Store {
         //    segment is *committed*; per-entry writes are not allowed on
         //    remote backends (D8).
         if seal_now {
-            self.runtime.block_on(seal_active_segment(self))?;
+            self.rt().block_on(seal_active_segment(self))?;
         }
         Ok(())
     }
@@ -670,9 +749,33 @@ impl WalStore for S3Store {
         // touching the `active` lock. Flushing the manifest is async/batched
         // (D6): triggered by the configured cursor threshold or interval.
         self.acked_hwm.fetch_max(seq, Ordering::AcqRel);
+        self.cursor_mirror.fetch_max(seq, Ordering::AcqRel);
+        // A re-commit through the poisoned sequence means the source has
+        // re-acknowledged past the rewind: normal advancement resumes.
+        if seq.saturating_add(1) >= self.rewind_floor.load(Ordering::Acquire) {
+            self.rewind_floor.store(u64::MAX, Ordering::Release);
+        }
         let n = self.cursor_pending.fetch_add(1, Ordering::AcqRel);
         if n + 1 >= self.cursor_cfg.max_entries as u64 || self.cursor_should_flush() {
-            self.runtime.block_on(flush_manifest(self))?;
+            self.rt().block_on(flush_manifest(self))?;
+        }
+        Ok(())
+    }
+
+    /// Compensate a failed wrapped source commit: the failed sequence
+    /// (`seq + 1`) stays replayable. Poisons the manifest floor so a racing
+    /// flush cannot seal past it, rewinds the in-memory watermarks, and —
+    /// when the manifest was already persisted past the rewound position —
+    /// performs a corrective flush. A corrective-write failure is reported
+    /// explicitly (the replay guarantee fails closed, never silently).
+    fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+        self.rewind_floor
+            .fetch_min(seq.saturating_add(1), Ordering::AcqRel);
+        self.acked_hwm.fetch_min(seq, Ordering::AcqRel);
+        let previous = self.cursor_mirror.fetch_min(seq, Ordering::AcqRel);
+        if previous > seq {
+            block_on_init(self.rt(), flush_manifest(self))
+                .map_err(|e| Error::Process(format!("rewind corrective flush failed: {e}")))??;
         }
         Ok(())
     }
@@ -682,13 +785,13 @@ impl WalStore for S3Store {
         // greater than the manifest's cursor. The active segment is included.
         // LIST-fallback segments (not in the manifest) are read here too
         // because they're in the same `list_segments()` set.
-        let manifest = match self.runtime.block_on(
+        let manifest = match self.rt().block_on(
             self.client
                 .get(&ObjectPath::from(self.manifest_key.as_str())),
         ) {
             Ok(r) => {
                 let bytes = self
-                    .runtime
+                    .rt()
                     .block_on(r.bytes())
                     .map_err(|e| Error::Process(format!("S3 GET manifest: {}", e)))?;
                 Manifest::from_json(&bytes)
@@ -705,7 +808,7 @@ impl WalStore for S3Store {
             segs.insert(a.clone());
         }
         let prefix = ObjectPath::from(self.segments_prefix.as_str());
-        let mut stream = self.runtime.block_on(async {
+        let mut stream = self.rt().block_on(async {
             let s = self.client.list(Some(&prefix));
             // Drive the stream inside the runtime.
             let mut out = Vec::new();
@@ -726,8 +829,8 @@ impl WalStore for S3Store {
         let mut out: Vec<(u64, MessageBatchRef)> = Vec::new();
         for seg_name in segs {
             let key = ObjectPath::from(format!("{}/{}", self.segments_prefix, seg_name).as_str());
-            let bytes = match self.runtime.block_on(self.client.get(&key)) {
-                Ok(r) => match self.runtime.block_on(r.bytes()) {
+            let bytes = match self.rt().block_on(self.client.get(&key)) {
+                Ok(r) => match self.rt().block_on(r.bytes()) {
                     Ok(b) => b,
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
@@ -746,22 +849,18 @@ impl WalStore for S3Store {
     }
 
     fn cursor(&self) -> u64 {
-        // Read the manifest synchronously. Cheap enough; happens once per
-        // `Wal::open`.
-        match self.runtime.block_on(
-            self.client
-                .get(&ObjectPath::from(self.manifest_key.as_str())),
-        ) {
-            Ok(r) => {
-                let bytes = match self.runtime.block_on(r.bytes()) {
-                    Ok(b) => b,
-                    Err(_) => return 0,
-                };
-                Manifest::from_json(&bytes).map(|m| m.cursor).unwrap_or(0)
-            }
-            Err(object_store::Error::NotFound { .. }) => 0,
-            Err(_) => 0,
-        }
+        // In-memory mirror (seeded by recovery, maintained by
+        // advance/rewind/flush). `cursor()` runs on every WAL
+        // acknowledgement — a manifest GET per call is neither affordable
+        // nor legal on an async worker thread.
+        //
+        // Two views by design: this mirror is the LIVE view (includes
+        // acknowledged-but-not-yet-flushed sequences); `read_after_cursor`
+        // filters on the PERSISTED manifest cursor, because replay must
+        // restart from durable truth. Between flushes the live cursor can
+        // run ahead of replay — callers must not mix the two (replay runs
+        // once at recovery; the live cursor drives ack parking).
+        self.cursor_mirror.load(Ordering::Acquire)
     }
 
     fn next_seq_hint(&self) -> u64 {
@@ -784,9 +883,28 @@ impl WalStore for S3Store {
             let _ = handle.join.join();
         }
         // Final seal + manifest flush so anything buffered is durable.
-        self.runtime.block_on(seal_active_segment(self))?;
-        self.runtime.block_on(flush_manifest(self))?;
+        self.rt().block_on(seal_active_segment(self))?;
+        self.rt().block_on(flush_manifest(self))?;
         Ok(())
+    }
+}
+
+impl Drop for S3Store {
+    fn drop(&mut self) {
+        // Shut the private runtime down off any async context: dropping a
+        // multi-thread runtime inside one panics ("cannot drop a runtime in
+        // a context where blocking is not allowed"). The store is usually
+        // released through `close()` on a blocking thread, but the last Arc
+        // can also die inside an async task (e.g. a test scope).
+        if let Some(runtime) = self.runtime.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(move || {
+                    runtime.shutdown_timeout(std::time::Duration::from_secs(10))
+                });
+            } else {
+                runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+            }
+        }
     }
 }
 
@@ -903,18 +1021,36 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 /// objects (orphans), so it has been removed; sealed segments stay listed in the
 /// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
-    // Advance the committed cursor to the highest acknowledged sequence,
-    // clamped to `max_sealed_seq` (D2). The clamp is the safety guarantee:
-    // the cursor never advances past data that has actually been sealed to
-    // object storage, so an acked-but-unsealed entry remains replayable on
-    // restart (at-least-once, never loss). The ETag-coordinated mutator
-    // keeps concurrent flushes (flusher vs ingestion) from losing updates.
-    let acked_hwm = store.acked_hwm.load(Ordering::Acquire);
+    // The cursor tracks the highest acknowledged sequence, clamped to
+    // `max_sealed_seq`: it never passes data not yet sealed to object
+    // storage, so an acked-but-unsealed entry stays replayable
+    // (at-least-once, never loss). The rewind floor clamps the target
+    // strictly below a poisoned sequence until the source re-acknowledges
+    // through it — and, while poisoned, may LOWER an already-persisted
+    // cursor: a flush that raced ahead of the rewind must be corrected or
+    // the failed entry would be sealed past.
+    //
+    // The watermarks are read INSIDE the mutator so every ETag retry uses
+    // the current values — the mutator re-runs per attempt, and a retry
+    // reusing a ceiling captured before a concurrent rewind would seal the
+    // poisoned sequence right back.
     write_manifest_with_etag(store, |m| {
-        let target = acked_hwm.min(m.max_sealed_seq);
-        if target > m.cursor {
-            m.cursor = target;
-        }
+        let acked_hwm = store.acked_hwm.load(Ordering::Acquire);
+        let floor = store.rewind_floor.load(Ordering::Acquire);
+        let poisoned = floor != u64::MAX;
+        let ceiling = if poisoned {
+            acked_hwm.min(floor.saturating_sub(1))
+        } else {
+            acked_hwm
+        };
+        let target = ceiling.min(m.max_sealed_seq);
+        // Unpoisoned: monotonic (acked_hwm only shrinks via a rewind, which
+        // poisons). Poisoned: clamp down to the floor.
+        m.cursor = if poisoned {
+            m.cursor.min(target)
+        } else {
+            m.cursor.max(target)
+        };
     })
     .await?;
 
@@ -1195,6 +1331,55 @@ mod tests {
         (store, dir.to_path_buf())
     }
 
+    /// Spec "Object-store backend works through the engine's async paths":
+    /// the engine drives the WAL's async API from a tokio runtime; pre-fix
+    /// the store's internal `block_on` panicked with "cannot start a runtime
+    /// from within a runtime" on the first store call. This is the async
+    /// repro from the 2026-09-29 review, now a permanent regression test.
+    #[tokio::test]
+    async fn store_works_through_the_wal_async_api() {
+        use arkflow_core::wal::Wal;
+
+        let dir = tempdir();
+        let (store, _) = build_local_store_in(&dir);
+        let config = WalConfig {
+            sync: SyncPolicy::GroupCommit,
+            ..WalConfig::default()
+        };
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+
+        for expected in 1..=3u64 {
+            let seq = wal.append(&Arc::new(arkflow_core::MessageBatch::try_from(vec![
+                format!("{{\"v\":{expected}}}"),
+            ]).unwrap()))
+            .await
+            .unwrap_or_else(|e| panic!("append {expected} through the async API: {e}"));
+            assert_eq!(seq, expected);
+        }
+        // Drives append_batch on the blocking pool (the exact call that
+        // panicked pre-fix).
+        wal.flush().await.unwrap();
+        for seq in 1..=3u64 {
+            wal.advance(seq).await.unwrap();
+        }
+        // The cursor mirror is visible through the async API before any
+        // manifest flush.
+        assert_eq!(wal.cursor().await.unwrap(), 3);
+        wal.close().await.unwrap();
+
+        // Reopen: the flushed manifest replays nothing (prefix acked) and
+        // the cursor survives the restart.
+        let (store2, _) = build_local_store_in(&dir);
+        let wal2 = Wal::open_with_store(&config, store2, 4).unwrap();
+        let replay = wal2.read_after_cursor().await.unwrap();
+        assert!(
+            replay.is_empty(),
+            "acked prefix must not replay: {replay:?}"
+        );
+        assert_eq!(wal2.cursor().await.unwrap(), 3);
+        wal2.close().await.unwrap();
+    }
+
     /// 4.3: clean restart — write entries, flush, "restart" (re-open), the
     /// manifest is consistent and read_after_cursor returns the unacked
     /// prefix.
@@ -1223,6 +1408,96 @@ mod tests {
             "all four flushed entries must be replayable after restart"
         );
         store2.close().unwrap();
+    }
+
+    /// Spec "Object-store rewind survives an intervening manifest flush".
+    ///
+    /// Threshold-driven so every flush lands at a deterministic point: the
+    /// 5th append seals [1..=4], the 4th advance flushes the manifest with
+    /// cursor 4 — the poisoned-before state — and the rewind's corrective
+    /// flush must LOWER the persisted cursor back to 3 (the original
+    /// monotonic-only mutator made the corrective flush a no-op here).
+    /// The source re-ack through 4..5 then resumes normal advancement.
+    #[test]
+    fn rewind_floor_survives_an_intervening_manifest_flush() {
+        // seal at the 5th append, flush at the 4th advance, quiet intervals
+        let build = |dir: &std::path::Path| {
+            let client: Arc<dyn object_store::ObjectStore> =
+                Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
+            let osc = ObjectStoreWalConfig {
+                node_id: "pod-a".into(),
+                stream_id: "poison".into(),
+                prefix: "arkflow/wal".into(),
+                s3: ObjectStoreS3Config {
+                    bucket: "unused".into(),
+                    region: None,
+                    endpoint: None,
+                    access_key_id: None,
+                    secret_access_key: None,
+                    allow_http: false,
+                },
+                segment: SegmentConfig {
+                    max_entries: 4,
+                    max_bytes: 1024 * 1024,
+                    flush_interval: std::time::Duration::from_secs(600),
+                },
+                cursor: CursorFlushConfig {
+                    max_entries: 4,
+                    interval: std::time::Duration::from_secs(600),
+                },
+                segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+                parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+                compression: arkflow_core::wal::config::CompressionConfig::default(),
+                sync: SyncPolicy::GroupCommit,
+            };
+            S3Store::build_with_client(&WalConfig::default(), osc, Runtime::new().unwrap(), client)
+                .unwrap()
+        };
+
+        let dir = tempdir();
+        let store = build(&dir);
+        // 5 appends: the 5th crosses segment.max_entries and seals [1..=4].
+        store
+            .append_batch((1..=5u64).map(|s| (s, sample_payload(None))).collect())
+            .unwrap();
+        // 4 advances: the 4th crosses cursor.max_entries and flushes the
+        // manifest with cursor 4 — the failed commit is now PERSISTED past.
+        for seq in 1..=4u64 {
+            store.advance_cursor(seq).unwrap();
+        }
+        assert_eq!(store.cursor(), 4);
+
+        // The wrapped source commit for 4 failed; the rewind must correct
+        // the already-persisted manifest, not just the in-memory mirror.
+        store.rewind_cursor(3).unwrap();
+        assert_eq!(store.cursor(), 3, "cursor mirror rewound");
+
+        // Close (seals 5, flushes under the poison clamp) and reopen: the
+        // manifest must read 3 and replay [4, 5].
+        store.close().unwrap();
+        let reopened = build(&dir);
+        assert_eq!(
+            reopened.cursor(),
+            3,
+            "corrective flush must lower the persisted cursor below the poison"
+        );
+        let replay: Vec<u64> = reopened
+            .read_after_cursor()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(replay, vec![4, 5], "failed sequence stays replayable");
+
+        // The source re-acknowledges through the poison: the floor clears
+        // and advancement resumes.
+        reopened.advance_cursor(4).unwrap();
+        reopened.advance_cursor(5).unwrap();
+        reopened.close().unwrap();
+        let final_store = build(&dir);
+        assert_eq!(final_store.cursor(), 5);
+        assert!(final_store.read_after_cursor().unwrap().is_empty());
+        final_store.close().unwrap();
     }
 
     /// 4.3: torn tail (mid-PUT crash on the active segment) is silently
@@ -1892,7 +2167,7 @@ mod tests {
         // triggered here must clamp the cursor to 0, NOT advance it to 3.
         store.advance_cursor(3).unwrap();
 
-        store.runtime.block_on(async {
+        store.rt().block_on(async {
             let (m, _) = read_manifest_with_etag(&store).await.unwrap();
             assert_eq!(
                 m.cursor, 0,
@@ -1911,7 +2186,7 @@ mod tests {
         drop(store);
 
         let store2 = build_store_at("pod-c", "stream-3", client.clone(), 100, 1);
-        store2.runtime.block_on(async {
+        store2.rt().block_on(async {
             let (m, _) = read_manifest_with_etag(&store2).await.unwrap();
             assert_eq!(
                 m.cursor, 3,
@@ -1931,7 +2206,7 @@ mod tests {
     fn manifest_race_concurrent_cursor_keeps_max() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             let mut handles = Vec::new();
             for i in 1u64..=8 {
                 let s = inner.clone();
@@ -1963,7 +2238,7 @@ mod tests {
     fn manifest_race_concurrent_seal_keeps_all_segments() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             let mut handles = Vec::new();
             for i in 0u64..8 {
                 let s = inner.clone();
@@ -2007,7 +2282,7 @@ mod tests {
     fn manifest_race_single_writer_baseline() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             for _ in 0..8 {
                 write_manifest_with_etag(&inner, |m| {
                     m.cursor += 1;
@@ -2028,7 +2303,7 @@ mod tests {
         let store = build_failing_store();
         let inner = store.clone();
         let err = store
-            .runtime
+            .rt()
             .block_on(async move {
                 write_manifest_with_etag(&inner, |m| {
                     m.cursor = 1;
@@ -2053,7 +2328,7 @@ mod tests {
     fn manifest_race_out_of_order_seal_keeps_newest_active() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             // Newer segment sealed first (won the manifest race).
             write_manifest_with_etag(&inner, |m| {
                 m.active_segment = Some("00000002.wal".to_string());
@@ -2098,7 +2373,7 @@ mod tests {
     fn manifest_race_repeat_same_seal_keeps_it_active_only() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             // First application installs it as active (fresh manifest).
             write_manifest_with_etag(&inner, |m| apply_seal(m, "00000005.wal"))
                 .await
@@ -2146,7 +2421,7 @@ mod tests {
         }
         let inner = store.clone();
         let result = store
-            .runtime
+            .rt()
             .block_on(async move { seal_active_segment(&inner).await });
         assert!(result.is_err(), "seal must surface the segment PUT failure");
 
@@ -2168,7 +2443,7 @@ mod tests {
     fn manifest_race_concurrent_apply_seal_converges() {
         let store = build_inmemory_store();
         let inner = store.clone();
-        store.runtime.block_on(async move {
+        store.rt().block_on(async move {
             let mut handles = Vec::new();
             for i in 0u64..8 {
                 let s = inner.clone();

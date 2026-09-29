@@ -383,6 +383,30 @@ impl Wal {
         })
     }
 
+    /// Drive one blocking store call safely for the active backend.
+    ///
+    /// The object-store backend executes real network I/O (S3 PUT/GET) and
+    /// parks on its private runtime via `block_on`; running that on an async
+    /// worker thread blocks the executor and panics with "cannot start a
+    /// runtime from within a runtime". The blocking pool has neither
+    /// problem. The local embedded backend stays on the caller's thread:
+    /// redb's fcntl flock can deadlock against the blocking pool when the
+    /// close path contends on the database file (see `append`), and its
+    /// commit latency is µs–ms.
+    async fn call_store<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Arc<dyn WalStore>) -> Result<T, Error> + Send + 'static,
+    {
+        if self.store.kind() != "object_store" {
+            return f(&self.store);
+        }
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|e| Error::Process(format!("WAL store task failed: {e}")))?
+    }
+
     /// Persist a message and return its assigned sequence number.
     ///
     /// `per-entry` commits (fsyncs) before returning — fully durable. `group-
@@ -392,23 +416,18 @@ impl Wal {
     /// appends.
     ///
     /// The store's blocking calls (redb `commit`, S3 `PUT`) are wrapped in
-    /// `spawn_blocking` for `per-entry` to keep the async executor from
-    /// stalling on fsync / network I/O.
     pub async fn append(&self, msg: &MessageBatchRef) -> Result<u64, Error> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let bytes = serialize(msg)?;
 
         match &self.policy {
             SyncPolicy::PerEntry => {
-                // redb's `commit` is briefly blocking (~µs–ms); the
-                // multi-thread tokio runtime that arkflow ships with handles
-                // this fine. We don't `spawn_blocking` here because the
-                // blocking thread pool can deadlock against redb's fcntl
-                // flock on the database file (the close path also touches
-                // it). The local backend is fast enough; the S3 backend will
-                // be added later and will do its own async PUT inside its
-                // store.
-                self.store.append_batch(vec![(seq, bytes)])?;
+                // The local backend's `commit` is briefly blocking (~µs–ms)
+                // and stays inline (see `call_store` for why redb must not
+                // touch the blocking pool); the object-store backend is
+                // driven on the blocking pool by `call_store`.
+                self.call_store(move |store| store.append_batch(vec![(seq, bytes)]))
+                    .await?;
             }
             SyncPolicy::GroupCommit | SyncPolicy::Periodic(_) => {
                 self.pending.lock().await.push((seq, bytes));
@@ -434,13 +453,15 @@ impl Wal {
             .next_offset_of(None, 0)
             .unwrap_or_default()
             .saturating_sub(1);
-        if target > self.store.cursor() {
+        let current = self.call_store(|store| Ok(store.cursor())).await?;
+        if target > current {
             // Cursor advancement only. Reclaiming here would delete entries
             // this path has no wrapped source commit for, and the trait's
             // contract keeps every entry above the reclaim floor replayable for
             // a cursor compensation — so only `acknowledge`, after the wrapped
             // source commit succeeds, marks a sequence committed.
-            self.store.advance_cursor(target)?;
+            self.call_store(move |store| store.advance_cursor(target))
+                .await?;
             self.ack_notify.notify_waiters();
         }
         Ok(())
@@ -499,7 +520,7 @@ impl Wal {
                 // true even after the WAL cursor has been advanced before
                 // its source-side acknowledgement: later callers must not
                 // overtake an in-flight earlier source commit.
-                let cursor = self.store.cursor();
+                let cursor = self.call_store(|store| Ok(store.cursor())).await?;
                 if first_seq != Some(seq)
                     || entry.in_flight
                     // A caller may acknowledge a later WAL sequence before
@@ -516,7 +537,7 @@ impl Wal {
                     // another caller for a later sequence remains parked.
                     entry.last_error = None;
                     let cursor_advanced = if cursor < seq {
-                        self.store.advance_cursor(seq)?;
+                        self.call_store(move |store| store.advance_cursor(seq)).await?;
                         true
                     } else {
                         false
@@ -530,7 +551,10 @@ impl Wal {
                 Some((ack, cursor_advanced)) => {
                     if let Err(error) = ack.ack().await {
                         let compensation = if cursor_advanced {
-                            self.store.rewind_cursor(seq.saturating_sub(1)).err()
+                            let rewind_to = seq.saturating_sub(1);
+                            self.call_store(move |store| store.rewind_cursor(rewind_to))
+                                .await
+                                .err()
                         } else {
                             None
                         };
@@ -552,7 +576,9 @@ impl Wal {
                     // can be reclaimed. A reclamation failure costs disk space,
                     // not correctness — the acknowledgement itself stands — so
                     // it is reported and not propagated.
-                    if let Err(error) = self.store.mark_committed(seq) {
+                    if let Err(error) =
+                        self.call_store(move |store| store.mark_committed(seq)).await
+                    {
                         tracing::warn!(
                             seq,
                             %error,
@@ -622,7 +648,7 @@ impl Wal {
                         "cannot undo an in-flight WAL acknowledgement".into(),
                     ));
                 }
-                let cursor = self.store.cursor();
+                let cursor = self.call_store(|store| Ok(store.cursor())).await?;
                 if cursor > seq {
                     return Err(Error::Process(
                         "cannot undo a WAL acknowledgement behind a later cursor".into(),
@@ -652,9 +678,11 @@ impl Wal {
                     self.ack_notify.notify_waiters();
                     return Err(error);
                 }
-                let cursor = self.store.cursor();
+                let cursor = self.call_store(|store| Ok(store.cursor())).await?;
                 if cursor == seq {
-                    self.store.rewind_cursor(seq.saturating_sub(1))?;
+                    let rewind_to = seq.saturating_sub(1);
+                    self.call_store(move |store| store.rewind_cursor(rewind_to))
+                        .await?;
                 } else if cursor > seq {
                     if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {
                         entry.in_flight = false;
@@ -671,7 +699,7 @@ impl Wal {
             None => {}
         }
 
-        let cursor = self.store.cursor();
+        let cursor = self.call_store(|store| Ok(store.cursor())).await?;
         if cursor < seq {
             return Ok(());
         }
@@ -685,7 +713,9 @@ impl Wal {
         // otherwise a crash in this compensation window could replay a record
         // whose connector offset had already been restored.
         inner.undo().await?;
-        self.store.rewind_cursor(seq.saturating_sub(1))?;
+        let rewind_to = seq.saturating_sub(1);
+        self.call_store(move |store| store.rewind_cursor(rewind_to))
+            .await?;
         if !self
             .frontier
             .rewind_position(None, 0, seq.saturating_add(1))
@@ -701,14 +731,14 @@ impl Wal {
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     pub async fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
-        self.store.read_after_cursor()
+        self.call_store(|store| store.read_after_cursor()).await
     }
 
     /// Flush staged appends before a record is exposed to downstream
     /// processing. This is the durability boundary for group-commit and
     /// periodic policies: a process crash after `read()` returns must leave
     /// the record replayable from the WAL.
-    pub async fn flush(&self) -> Result<(), Error> {
+    pub async fn flush(self: &Arc<Self>) -> Result<(), Error> {
         self.flush_pending().await
     }
 
@@ -722,7 +752,7 @@ impl Wal {
         covered.dedup();
 
         let _guard = self.acknowledgements.lock().await;
-        let cursor = self.store.cursor();
+        let cursor = self.call_store(|store| Ok(store.cursor())).await?;
         let mut target = cursor;
         for sequence in covered {
             if sequence == target.saturating_add(1) {
@@ -732,7 +762,8 @@ impl Wal {
             }
         }
         if target > cursor {
-            self.store.advance_cursor(target)?;
+            self.call_store(move |store| store.advance_cursor(target))
+                .await?;
             self.frontier
                 .seed(&[crate::checkpoint::SourcePosition::for_partition(
                     0,
@@ -745,10 +776,15 @@ impl Wal {
 
     /// Current committed watermark (highest acked sequence, 0 if none).
     pub async fn cursor(&self) -> Result<u64, Error> {
-        Ok(self.store.cursor())
+        self.call_store(|store| Ok(store.cursor())).await
     }
 
-    async fn flush_pending(&self) -> Result<(), Error> {
+    /// One serialized flush pass: take the staged batch, hand it to the
+    /// store, and on failure restore the batch ahead of anything appended
+    /// while the write was in flight (so an explicit read-side flush, or
+    /// the final close, retries instead of observing an empty queue and
+    /// treating the record as durable).
+    async fn flush_locked(self: &Arc<Self>) -> Result<(), Error> {
         let _flush_guard = self.flush_lock.lock().await;
         let batch: Vec<(u64, Vec<u8>)> = {
             let mut p = self.pending.lock().await;
@@ -757,20 +793,44 @@ impl Wal {
             }
             std::mem::take(p.as_mut())
         };
-        match self.store.append_batch(batch.clone()) {
+        // The clone keeps the batch retryable when the store write fails —
+        // the store call consumes its copy.
+        let retry_batch = batch.clone();
+        let result = self
+            .call_store(move |store| store.append_batch(batch))
+            .await;
+        match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                // A background flusher may be the caller here. Put the batch
-                // back ahead of entries appended while the store write was in
-                // flight so an explicit read-side flush, or the final close,
-                // can retry instead of observing an empty queue and
-                // incorrectly treating the record as durable.
                 let mut pending = self.pending.lock().await;
-                let mut retry = batch;
+                let mut retry = retry_batch;
                 retry.extend(std::mem::take(&mut *pending));
                 *pending = retry;
                 self.pending_notify.notify_one();
                 Err(error)
+            }
+        }
+    }
+
+    async fn flush_pending(self: &Arc<Self>) -> Result<(), Error> {
+        // Cancellation ownership depends on the backend:
+        //
+        // - Local (inline store calls): a dropped flush future is atomic
+        //   per poll — the append and its failure restoration execute in
+        //   the same poll, so nothing is lost. Keep the inline shape.
+        // - Object store (spawn_blocking): the store task keeps running
+        //   after its JoinHandle is dropped, so a caller cancelled at the
+        //   await would lose the restoration (the batch is already out of
+        //   `pending`). Run the whole flush — lock, append, restore — in a
+        //   task that survives cancellation.
+        if self.store.kind() != "object_store" {
+            self.flush_locked().await
+        } else {
+            let wal = Arc::clone(self);
+            let task = tokio::spawn(async move { wal.flush_locked().await });
+            match task.await {
+                Ok(result) => result,
+                Err(e) => Err(Error::Process(format!("WAL flush task failed: {e}"))),
             }
         }
     }
@@ -783,7 +843,7 @@ impl Wal {
     /// failure rather than silently dropping it. The flusher task's join is
     /// best-effort: a panic inside the flusher is logged and `Ok` is returned
     /// so shutdown still proceeds.
-    pub async fn close(&self) -> Result<(), Error> {
+    pub async fn close(self: &Arc<Self>) -> Result<(), Error> {
         self.close.cancel();
         if let Some(handle) = self.flusher.lock().await.take() {
             if let Err(e) = handle.await {
@@ -796,7 +856,7 @@ impl Wal {
         // by the flusher's shutdown branch otherwise). Surface the result so
         // a torn-write / disk failure is not silently lost on graceful shutdown.
         self.flush_pending().await?;
-        self.store.close()
+        self.call_store(|store| store.close()).await
     }
 
     /// Shrinks the close drain window so tests can exercise window expiry
@@ -854,6 +914,83 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use std::ops::Deref;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    /// A store whose appends always fail, counting the attempts through a
+    /// shared counter.
+    struct FailingAppendStore {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl crate::wal::store::WalStore for FailingAppendStore {
+        fn kind(&self) -> &'static str {
+            "object_store"
+        }
+        fn append_batch(&self, _entries: Vec<(u64, Vec<u8>)>) -> Result<(), Error> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Process("append always fails".into()))
+        }
+        fn advance_cursor(&self, _seq: u64) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_after_cursor(&self) -> Result<Vec<(u64, crate::MessageBatchRef)>, Error> {
+            Ok(Vec::new())
+        }
+        fn cursor(&self) -> u64 {
+            0
+        }
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// CodeRabbit/CR finding: a flush future cancelled while its store call
+    /// is in flight must not lose the staged batch — spawn_blocking keeps
+    /// running after the handle is dropped, and the failure restoration
+    /// used to live in the discarded future. Post-fix the restoration runs
+    /// in a surviving task, so a RETRY flush still reports the failure; a
+    /// lost batch would make the retry observe an empty queue and report
+    /// success without durability.
+    #[tokio::test]
+    async fn cancelled_flush_keeps_the_staged_batch_retryable() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let store: Arc<dyn crate::wal::store::WalStore> = Arc::new(FailingAppendStore {
+            attempts: attempts.clone(),
+        });
+
+        let config = WalConfig {
+            sync: SyncPolicy::GroupCommit,
+            ..WalConfig::default()
+        };
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+
+        // Cancel a flush while it is pending (the store call may or may not
+        // have started — both paths must keep the batch).
+        {
+            // Cancel while the flush is pending — the store task may or may
+            // not have started; both paths must keep the batch.
+            tokio::select! {
+                _ = wal.flush() => {}
+                _ = std::future::ready(()) => {}
+            }
+        }
+        // Let the surviving flush task run its failing append.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while attempts.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "flush task never ran");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // The retry must still surface the failure: the batch was restored,
+        // not lost. (A lost batch makes this flush report Ok with the
+        // record silently non-durable.)
+        assert!(
+            wal.flush().await.is_err(),
+            "restored batch must fail again — a success here means the staged entries were lost"
+        );
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        wal.close().await.ok();
+    }
 
     fn sample_batch(input_name: Option<&str>) -> MessageBatch {
         let schema = StdArc::new(Schema::new(vec![
