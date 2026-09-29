@@ -289,6 +289,17 @@ struct ActiveSegment {
 /// inside a runtime context (sync builders are invoked from async
 /// `connect()`s), so initialization parks on a short-lived OS thread where
 /// `block_on` is always legal.
+/// Dispose of a private runtime that never made it into a store: dropping
+/// a multi-thread runtime inside an async context panics, and construction
+/// error paths (`?`) return exactly there.
+fn dispose_runtime(runtime: Runtime) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || runtime.shutdown_timeout(std::time::Duration::from_secs(10)));
+    } else {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
 fn block_on_init<F>(runtime: &Runtime, fut: F) -> Result<F::Output, Error>
 where
     F: std::future::Future + Send,
@@ -334,9 +345,28 @@ impl S3Store {
     /// across multiple WAL instances). Performs the same validation +
     /// recovery + flusher spawn as `build`.
     fn build_with_client(
-        _cfg: &WalConfig,
+        cfg: &WalConfig,
         osc: arkflow_core::wal::config::ObjectStoreWalConfig,
         runtime: Runtime,
+        client: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Arc<Self>, Error> {
+        // Any construction error must dispose of the private runtime OFF
+        // the caller's context: a plain `?` would drop it inline and panic
+        // inside an async caller ("cannot drop a runtime ...").
+        let mut runtime_slot = Some(runtime);
+        let result = Self::build_with_client_inner(cfg, osc, &mut runtime_slot, client);
+        if result.is_err() {
+            if let Some(rt) = runtime_slot.take() {
+                dispose_runtime(rt);
+            }
+        }
+        result
+    }
+
+    fn build_with_client_inner(
+        _cfg: &WalConfig,
+        osc: arkflow_core::wal::config::ObjectStoreWalConfig,
+        runtime_slot: &mut Option<Runtime>,
         client: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Arc<Self>, Error> {
         // D8: reject PerEntry on remote backends. `WalConfig::validate` is
@@ -413,13 +443,16 @@ impl S3Store {
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
 
+        let runtime = runtime_slot
+            .as_ref()
+            .expect("construction runtime present");
         let first_index =
-            block_on_init(&runtime, async {
+            block_on_init(runtime, async {
                 probe_next_segment_index(&*client, &segments_prefix).await
             })??;
 
         let store = Arc::new(Self {
-            runtime: Some(runtime),
+            runtime: runtime_slot.take(),
             client: client.clone(),
             ns: ns.clone(),
             segments_prefix,
@@ -452,12 +485,12 @@ impl S3Store {
             flusher: StdMutex::new(None),
         });
 
-        block_on_init(store.rt(), recover(&store))??;
-        // Seed the cursor mirror from the recovered manifest so `cursor()`
-        // never needs a per-call GET.
+        let manifest_cursor = block_on_init(store.rt(), recover(&store))??;
+        // Seed the cursor mirror from the manifest recovery just read — no
+        // second GET, so a transient second-read failure cannot exist.
         store
             .cursor_mirror
-            .store(store.manifest_cursor()?, Ordering::Release);
+            .store(manifest_cursor, Ordering::Release);
 
         let handle = spawn_flusher(store.clone());
         *store.flusher.lock().unwrap() = Some(handle);
@@ -473,33 +506,6 @@ impl S3Store {
         }
         let elapsed = now_ms().saturating_sub(self.cursor_last_flush_ms.load(Ordering::Acquire));
         elapsed >= self.cursor_cfg.interval.as_millis() as u64
-    }
-
-    /// The persisted manifest cursor, fetched directly (construction path
-    /// only — runs on the init thread via `block_on_init`).
-    fn manifest_cursor(&self) -> Result<u64, Error> {
-        let fetch = async {
-            let response = self
-                .client
-                .get(&ObjectPath::from(self.manifest_key.as_str()))
-                .await;
-            match response {
-                Ok(r) => match r.bytes().await {
-                    Ok(b) => Ok(Manifest::from_json(&b).map(|m| m.cursor).unwrap_or(0)),
-                    // A transient read failure must not seed the mirror
-                    // with 0 (the ack parking logic would stall behind the
-                    // phantom gap) — fail the construction instead.
-                    Err(e) => Err(Error::Connection(format!(
-                        "manifest read for cursor seed failed: {e}"
-                    ))),
-                },
-                Err(object_store::Error::NotFound { .. }) => Ok(0),
-                Err(e) => Err(Error::Connection(format!(
-                    "manifest read for cursor seed failed: {e}"
-                ))),
-            }
-        };
-        block_on_init(self.rt(), fetch)?
     }
 }
 
@@ -562,7 +568,9 @@ async fn probe_next_segment_index(
 /// Run recovery: GET manifest → union with LIST → decode all segments →
 /// seal any sealed segments whose tail is past the cursor so subsequent
 /// truncations are correct.
-async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
+/// Returns the recovered manifest cursor (the in-memory mirror seed — no
+/// second GET after recovery).
+async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     // Step 1: GET manifest (optional — absent on a fresh bucket).
     let manifest = match store
         .client
@@ -675,7 +683,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<(), Error> {
         active.bytes.clear();
     }
 
-    Ok(())
+    Ok(manifest.cursor)
 }
 
 fn store_ns_node_id(store: &S3Store) -> String {
@@ -845,6 +853,13 @@ impl WalStore for S3Store {
         // advance/rewind/flush). `cursor()` runs on every WAL
         // acknowledgement — a manifest GET per call is neither affordable
         // nor legal on an async worker thread.
+        //
+        // Two views by design: this mirror is the LIVE view (includes
+        // acknowledged-but-not-yet-flushed sequences); `read_after_cursor`
+        // filters on the PERSISTED manifest cursor, because replay must
+        // restart from durable truth. Between flushes the live cursor can
+        // run ahead of replay — callers must not mix the two (replay runs
+        // once at recovery; the live cursor drives ack parking).
         self.cursor_mirror.load(Ordering::Acquire)
     }
 

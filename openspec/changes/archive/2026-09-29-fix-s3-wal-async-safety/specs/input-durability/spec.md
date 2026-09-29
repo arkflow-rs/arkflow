@@ -3,7 +3,7 @@
 ### Requirement: Pluggable WAL storage backend
 The WAL SHALL support a configurable storage backend selected per stream via a `backend` setting. The `local` backend (the existing embedded store) SHALL be the default. An `object_store` (S3-compatible) backend SHALL be available as an opt-in alternative.
 
-Backends SHALL be drivable from asynchronous engine contexts: constructing a backend and invoking its store operations from an async task SHALL neither panic (a backend that internally parks on a private runtime via `block_on` MUST be driven on a thread where that is legal) nor block the async runtime's worker threads for the duration of its I/O. The engine's WAL wrapper SHALL drive blocking store calls on the blocking pool.
+Remote/object-store backends SHALL be drivable from asynchronous engine contexts: constructing the backend and invoking its store operations from an async task SHALL neither panic (a backend that internally parks on a private runtime via `block_on` MUST be driven on a thread where that is legal) nor block an async runtime worker for the duration of its network I/O — the engine's WAL wrapper drives such stores' calls on the blocking pool. The embedded local backend runs inline on the caller by design: its commit latency is bounded (µs–ms) and redb's fcntl flock must not contend with the blocking pool on the database file.
 
 #### Scenario: Local backend is the default
 - **WHEN** a stream has `durability.enabled: true` with no `backend` field (or `backend: local`)
