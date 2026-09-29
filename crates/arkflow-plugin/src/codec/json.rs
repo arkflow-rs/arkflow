@@ -159,8 +159,9 @@ mod tests {
         let codec = JsonCodec;
         let invalid_data = vec![b"{invalid json}".to_vec()];
         let result = codec.decode(invalid_data).await;
-        // Should handle invalid JSON gracefully or return error
-        assert!(result.is_err() || result.is_ok());
+        // Invalid JSON must surface as a decode error, never as a silent
+        // success (the old `is_err() || is_ok()` form was a tautology).
+        assert!(result.is_err());
     }
 
     #[tokio::test]

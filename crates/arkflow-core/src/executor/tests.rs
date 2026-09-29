@@ -3160,16 +3160,43 @@ impl Output for SlowOutput {
 /// snapshot contains the row's committed mutation.
 #[tokio::test]
 async fn barrier_waits_for_pre_cut_state_transactions() {
+    struct SignalledSlowOutput {
+        written: Mutex<Vec<RecordBatch>>,
+        /// Released the moment a write begins: firing the barrier after this
+        //  point races a sink write that is provably in flight, replacing
+        //  the old `sleep(20ms)` guess that load could invalidate either way.
+        write_started: Arc<PublishGate>,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl Output for SignalledSlowOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+            self.write_started.release().await;
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            self.written
+                .lock()
+                .unwrap()
+                .push(msg.record_batch().clone());
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
     let source = ParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
         (1, "a".into()),
     ])))]);
-    let output = Arc::new(SlowOutput {
+    let output = Arc::new(SignalledSlowOutput {
         written: Mutex::new(Vec::new()),
+        write_started: Arc::new(PublishGate::default()),
         delay_ms: 120,
     });
     struct SlowAdapter {
         input: Arc<dyn Input>,
-        output: Arc<SlowOutput>,
+        output: Arc<SignalledSlowOutput>,
         processor: Arc<dyn Processor>,
     }
     impl JobComponentAdapter for SlowAdapter {
@@ -3239,11 +3266,14 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
     .await
     .unwrap();
 
-    // Give the row time to reach the slow sink's write (in-flight, not yet
-    // acknowledged).
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    // Fire the barrier while the row's acknowledgement is still in flight.
-    let started = std::time::Instant::now();
+    // Wait until the row's sink write has actually begun, then fire the
+    // barrier: the acknowledgement is deterministically in flight, so the
+    // sealed cut must drain it. (The wall-clock "elapsed >= 100ms" proxy was
+    // dropped: under load the barrier request itself can arrive after the
+    // 120ms write finished, which is still a correct pre-cut completion.)
+    tokio::time::timeout(Duration::from_secs(5), output.write_started.wait())
+        .await
+        .expect("the pre-cut row never reached the slow sink");
     let (snapshot, _positions, _watermarks) = tokio::time::timeout(
         Duration::from_secs(10),
         handle.checkpoint_barrier("cp-precut", 1),
@@ -3251,13 +3281,6 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
     .await
     .expect("barrier checkpoint timed out")
     .unwrap();
-    // The source drained the in-flight acknowledgement before sealing: the
-    // barrier round waited for the slow sink write.
-    assert!(
-        started.elapsed() >= Duration::from_millis(100),
-        "barrier must wait for the pre-cut sink write (elapsed {:?})",
-        started.elapsed()
-    );
     let namespace = "job:test-job:state:default:operator:agg:task:agg-0";
     let committed = snapshot
         .entries
@@ -4067,7 +4090,14 @@ impl PublishGate {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     struct GatedInput {
-        reads: AtomicUsize,
+        /// Offset of the NEXT batch to hand out. Advanced only when a batch is
+        /// actually returned: the source loop's `select!` drops the in-flight
+        /// `read()` future whenever its idle-tick arm fires, so a read future
+        /// that mutated state before its first `await` (e.g. `fetch_add`)
+        /// would skip ahead on every restart and reach EOF spuriously. Real
+        /// connectors are cancellation-safe for exactly this reason; this
+        /// double must be too.
+        next: Arc<AtomicUsize>,
         gate: Arc<PublishGate>,
     }
     #[async_trait]
@@ -4076,17 +4106,22 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
             Ok(())
         }
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-            let offset = self.reads.fetch_add(1, Ordering::SeqCst);
-            match offset {
-                0 => Ok((
-                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
-                    Arc::new(crate::input::NoopAck),
-                )),
+            match self.next.load(Ordering::SeqCst) {
+                0 => {
+                    self.next.store(1, Ordering::SeqCst);
+                    Ok((
+                        Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                        Arc::new(crate::input::NoopAck),
+                    ))
+                }
                 1 => {
                     // Deliver the second batch only after the first one has
                     // finished processing: the idle window in which ticks can
-                    // fire is then guaranteed, not wall-clock dependent.
+                    // fire is then guaranteed, not wall-clock dependent. The
+                    // gate is re-checked on every (re)poll, so a cancelled
+                    // read restarts here instead of skipping to EOF.
                     self.gate.wait().await;
+                    self.next.store(2, Ordering::SeqCst);
                     Ok((
                         Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "a".into())]))),
                         Arc::new(crate::input::NoopAck),
@@ -4131,6 +4166,7 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         }
     }
     let second_batch_gate = Arc::new(PublishGate::default());
+    let input_next = Arc::new(AtomicUsize::new(0));
     let processor = Arc::new(TickMarkerProcessor {
         first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
@@ -4144,11 +4180,11 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     });
     let adapter = Adapter {
         input: Arc::new(GatedInput {
-            reads: AtomicUsize::new(0),
+            next: input_next.clone(),
             gate: second_batch_gate.clone(),
         }),
         output: output.clone(),
-        processor,
+        processor: processor.clone(),
     };
     let mut job = spec(
         vec![map_operator("m")],
@@ -4186,7 +4222,10 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
     // must follow the delivery, otherwise per-edge ordering is broken.
     assert!(
         keys.iter().any(|key| key == "tick"),
-        "tick output must reach the sink"
+        "tick output must reach the sink (keys={keys:?}, started={}, processed={}, input_next={})",
+        processor.started.load(Ordering::SeqCst),
+        processor.delayed.load(Ordering::SeqCst),
+        input_next.load(Ordering::SeqCst),
     );
     let leading_ticks = keys.iter().take_while(|key| key.as_str() == "tick").count();
     assert_eq!(

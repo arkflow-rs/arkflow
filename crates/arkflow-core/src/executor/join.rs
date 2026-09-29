@@ -1191,6 +1191,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn right_outer_emits_unmatched_on_watermark_eviction() {
+        let join = JoinOperator::new(outer_config(JoinType::RightOuter)).unwrap();
+        // A left row with a different key establishes the left schema
+        // without matching the right row under study.
+        assert!(matches!(
+            join.process(side_batch(0, &["b"], &[100])).await.unwrap(),
+            ProcessResult::None
+        ));
+        assert!(matches!(
+            join.process(side_batch(1, &["a"], &[100])).await.unwrap(),
+            ProcessResult::None
+        ));
+        let output = join.on_watermark(6_000).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected an unmatched emission");
+        };
+        assert_eq!(batch.record_batch().num_rows(), 1);
+        assert_eq!(string_column(&batch, "r_key").value(0), "a");
+        assert_eq!(string_column(&batch, "join_key").value(0), "a");
+        // The unmatched right row carries all-null LEFT columns.
+        assert!(string_column(&batch, "l_key").is_null(0));
+        let schema = batch.record_batch().schema();
+        assert!(!schema.field_with_name("r_key").unwrap().is_nullable());
+        assert!(schema.field_with_name("l_key").unwrap().is_nullable());
+    }
+
+    #[tokio::test]
     async fn matched_rows_are_not_emitted_as_unmatched() {
         let join = JoinOperator::new(outer_config(JoinType::FullOuter)).unwrap();
         assert!(matches!(
