@@ -15,6 +15,13 @@ When durability is enabled for a stream, every message returned by `input.read()
 - **WHEN** a restored connector position covers entries already present in the WAL
 - **THEN** those entries are removed from replay and the WAL cursor is advanced past the covered prefix before new input is acknowledged
 
+### Requirement: read() is cancellation-safe at the source boundary
+The engine's source loop multiplexes `input.read()` with control events (idle ticks, checkpoint barriers, cancellation) inside a `select!`: a pending `read()` future MAY be dropped and re-issued at any loop turn. An input SHALL therefore be cancellation-safe: it SHALL NOT take any observable side effect before its first `await` (claiming a queued record, advancing an internal cursor, popping a channel), and a re-issued read SHALL observe the same stream state. A read that claimed data and was then dropped would lose that delivery silently — no acknowledgement exists for it, so nothing replays it under at-least-once semantics.
+
+#### Scenario: Pending read is dropped and re-issued
+- **WHEN** the source loop's idle tick fires while a `read()` future is in flight
+- **THEN** the dropped future leaves no side effect and the next `read()` call returns the same next delivery — no record is skipped or double-claimed
+
 ### Requirement: Ack-gated cursor advancement and source commit
 The WAL cursor SHALL advance through a contiguous acknowledged frontier, and the source-side acknowledgement SHALL be performed only as part of the corresponding delivery boundary. The implementation SHALL keep each delivery's source outcome independent, SHALL not let an unrelated later acknowledgement make an earlier caller fail after its own commit, and SHALL preserve retryability when a source commit fails.
 
