@@ -140,7 +140,7 @@ fn classify(meta: &str) -> Result<Classification, String> {
     match kind {
         "full" => Ok(Classification { kind: kind.into(), wrap: None, reason: None }),
         "fragment" => {
-            let wrap = wrap.ok_or_else(|| {
+            let wrap = wrap.ok_or({
                 "validate=fragment requires wrap=<input|output|processors|durability|engine>"
             })?;
             if !WRAP_KINDS.contains(&wrap) {
@@ -155,7 +155,7 @@ fn classify(meta: &str) -> Result<Classification, String> {
             let reason = reason
                 .map(|r| r.trim_matches('"').to_string())
                 .filter(|r| !r.trim().is_empty())
-                .ok_or_else(|| {
+                .ok_or({
                     "validate=foreign requires a reason=\"...\" (why this block is not an ArkFlow config)"
                 })?;
             Ok(Classification { kind: kind.into(), wrap: None, reason: Some(reason) })
@@ -304,7 +304,7 @@ async fn docs_yaml_snippets_validate() {
     for file in &files {
         let text = std::fs::read_to_string(file).expect("markdown file is readable");
         let relative = file
-            .strip_prefix(&repo_root())
+            .strip_prefix(repo_root())
             .expect("file under repository root")
             .to_string_lossy()
             .to_string();

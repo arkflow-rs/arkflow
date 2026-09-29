@@ -542,7 +542,7 @@ impl ExecutionGraphBuilder {
                     .iter()
                     .filter(|candidate| candidate.operator_id == downstream_operator)
                     .collect();
-                let is_error_edge = index.is_error_sink(&downstream_operator);
+                let is_error_edge = index.is_error_sink(downstream_operator);
                 let mut remote_task_targets: Vec<TaskSpec> = Vec::new();
                 if let Some(ctx) = remote {
                     for candidate in index
@@ -641,7 +641,7 @@ impl ExecutionGraphBuilder {
                     .or_default()
                     .push(OutboundEdge {
                         kind,
-                        error: index.is_error_sink(&downstream_operator),
+                        error: index.is_error_sink(downstream_operator),
                         late_route: false,
                         targets,
                         key_group_ranges,
@@ -839,7 +839,7 @@ impl ExecutionGraphBuilder {
                     let upstream_task = index
                         .task(upstream_task_id.as_str())
                         .ok_or_else(|| Error::Config(format!("task '{upstream_task_id}' lost its run")))?;
-                    if run_of_task.get(target.as_str()).is_none() {
+                    if !run_of_task.contains_key(target.as_str()) {
                         // Remote target: route through the network manager.
                         let Some(ctx) = remote else {
                             return Err(Error::Config(format!(

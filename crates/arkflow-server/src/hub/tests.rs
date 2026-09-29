@@ -1537,7 +1537,7 @@ async fn rollout_dispatch_keeps_reference_when_secret_missing() {
     assert_eq!(targets[0].state, "applying");
     let content = crate::storage::StorageBackend::get_config_version_content(
         &assertion_store,
-        "cfg-missing".into(),
+        "cfg-missing",
     )
     .await
     .unwrap()

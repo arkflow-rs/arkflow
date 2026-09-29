@@ -276,12 +276,12 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
                 None,
                 stream.temporary.clone(),
             )?;
-            let mut resource = adapter.build_resource()?;
+            let resource = adapter.build_resource()?;
             let plan = crate::job::JobPlan::compile(spec)?;
             crate::executor::graph::ExecutionGraphBuilder::default().build(
                 &plan,
                 &adapter,
-                &mut resource,
+                &resource,
             )?;
             Ok(())
         })() {

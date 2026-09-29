@@ -395,9 +395,11 @@ fn sink_operator(id: &str, error_sink: bool) -> OperatorSpec {
         kind: OperatorKind::Sink,
         stateful: false,
         key_field: None,
-        config: error_sink
-            .then(|| serde_json::json!({"__arkflow_error_sink": true}))
-            .unwrap_or_else(|| serde_json::json!({})),
+        config: if error_sink {
+            serde_json::json!({"__arkflow_error_sink": true})
+        } else {
+            serde_json::json!({})
+        },
     }
 }
 
@@ -1584,7 +1586,7 @@ fn data_envelope(value: i64) -> Envelope {
 #[test]
 fn aligner_buffers_until_all_inputs_barrier() {
     let mut aligner = Aligner::new(2, 100);
-    assert!(aligner.is_aligning() == false);
+    assert!(!aligner.is_aligning());
     // Input 0 barrier arrives; input 1 data must buffer.
     assert!(aligner.observe(0, barrier("cp-1")).unwrap().is_none());
     assert!(aligner.is_aligning());
@@ -1799,12 +1801,12 @@ async fn coordinator_completes_only_after_all_participants() {
     // First participant reports; checkpoint stays incomplete (no error, still running).
     report_tx.send(report("source-0", "cp-9")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(handle.is_finished() == false);
+    assert!(!handle.is_finished());
     // Second participant with a different barrier id: the coordinator rejects
     // and records the error instead of completing.
     report_tx.send(report("m-0", "cp-OTHER")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(handle.is_finished() == false);
+    assert!(!handle.is_finished());
     cancellation.cancel();
     handle.await.unwrap();
 }
@@ -2676,13 +2678,13 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn crate::state::StateBackend> =
         Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
-    let mut resource = resource();
+    let resource = resource();
     // Full assignment (all tasks, both subtasks) mirrors the legacy test:
     // the source has 2 tasks and the input cannot pin partitions.
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
     let result = ExecutionGraphBuilder::default()
         .with_state(backend)
-        .build_subgraph(&plan, &task_ids, &adapter, &mut resource, None);
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None);
     assert!(
         matches!(&result, Err(Error::Config(message)) if message.contains("does not support partitioned")),
         "expected partition guard failure, got {}",
@@ -3136,32 +3138,6 @@ fn map_source_operator(id: &str) -> OperatorSpec {
     }
 }
 
-/// A sink with a controlled write delay: its acknowledgements (and therefore
-/// the journal applies inside them) stay in flight long enough to overlap a
-/// checkpoint barrier.
-struct SlowOutput {
-    written: Mutex<Vec<RecordBatch>>,
-    delay_ms: u64,
-}
-
-#[async_trait]
-impl Output for SlowOutput {
-    async fn connect(&self) -> Result<(), Error> {
-        Ok(())
-    }
-    async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-        self.written
-            .lock()
-            .unwrap()
-            .push(msg.record_batch().clone());
-        Ok(())
-    }
-    async fn close(&self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
 /// Task 1.4: the checkpoint report waits for pre-cut state transactions. A
 /// pre-barrier row whose sink write (and acknowledgement, and journal apply)
 /// is still in flight when the barrier fires must land in the sealed cut —
@@ -3368,7 +3344,7 @@ async fn temporaries_connect_before_chains_and_close_at_shutdown() {
         .temporary
         .insert("reference".into(), temporary.clone());
     let mut graph = ExecutionGraphBuilder::default()
-        .build(&plan, &adapter, &mut resource)
+        .build(&plan, &adapter, &resource)
         .unwrap();
     assert!(graph.temporaries.is_empty(), "builder starts clean");
     graph.temporaries = resource.temporary.values().cloned().collect();
@@ -3434,7 +3410,7 @@ async fn sink_connect_failure_fails_start_and_closes_temporaries() {
         .temporary
         .insert("reference".into(), temporary.clone());
     let mut graph = ExecutionGraphBuilder::default()
-        .build(&plan, &adapter, &mut resource)
+        .build(&plan, &adapter, &resource)
         .unwrap();
     graph.temporaries = resource.temporary.values().cloned().collect();
 
@@ -4026,12 +4002,6 @@ struct TickMarkerProcessor {
     first_process_delay: Duration,
     delayed: AtomicUsize,
     started: std::sync::atomic::AtomicBool,
-    tick_seen: std::sync::atomic::AtomicBool,
-    /// Released once a tick has actually reached the chain after the first
-    /// delivery: the input then delivers the second batch, so the tick vs
-    /// data ordering exercised here is driven by engine sequencing rather
-    /// than wall-clock margins.
-    gate: Arc<PublishGate>,
 }
 
 #[async_trait]
@@ -4075,9 +4045,6 @@ struct PublishGate {
 }
 
 impl PublishGate {
-    async fn released(&self) -> bool {
-        *self.released.lock().await
-    }
     async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
@@ -4180,8 +4147,6 @@ async fn tick_output_does_not_overtake_in_flight_pooled_data() {
         first_process_delay: Duration::from_millis(800),
         delayed: AtomicUsize::new(0),
         started: std::sync::atomic::AtomicBool::new(false),
-        tick_seen: std::sync::atomic::AtomicBool::new(false),
-        gate: second_batch_gate.clone(),
     });
     let output = Arc::new(TickGateOutput {
         written: Mutex::new(Vec::new()),
@@ -4437,7 +4402,6 @@ fn remote_job_plan(partitioned: bool) -> crate::job::JobPlan {
         placement: crate::job::PlacementStrategy::Colocated,
         recovery: Default::default(),
         rescale: false,
-        ..spec(vec![], vec![], 2)
     };
     crate::job::JobPlan::compile(spec).unwrap()
 }
@@ -4461,9 +4425,11 @@ fn task_nodes() -> BTreeMap<String, String> {
 fn authenticated_manager(node: &str) -> std::sync::Arc<crate::executor::remote::NetworkManager> {
     let credentials = crate::executor::remote::DataPlaneCredentials::new(node, "shuffle-secret")
         .expect("test credentials");
-    let mut config = crate::executor::remote::NetworkManagerConfig::default();
-    config.credentials = Some(credentials);
-    config.registration_grace = Duration::from_millis(100);
+    let config = crate::executor::remote::NetworkManagerConfig {
+        credentials: Some(credentials),
+        registration_grace: Duration::from_millis(100),
+        ..Default::default()
+    };
     crate::executor::remote::NetworkManager::with_config(config).expect("valid test config")
 }
 

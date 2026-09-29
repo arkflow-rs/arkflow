@@ -292,6 +292,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The concrete Arcs are asserted on below, so the one-element
+    // slices rely on array-literal trait coercion instead of from_ref.
+    #[allow(clippy::cloned_ref_to_slice_refs)]
     async fn connects_in_dependency_order_and_closes_in_reverse() {
         let temporary = Arc::new(RecordingTemporary {
             connects: AtomicUsize::new(0),
@@ -330,6 +333,9 @@ mod tests {
     /// Task 2.1: one resource failing to connect closes everything already
     /// connected in reverse order before the error surfaces.
     #[tokio::test]
+    // The concrete Arcs are asserted on below, so the one-element
+    // slices rely on array-literal trait coercion instead of from_ref.
+    #[allow(clippy::cloned_ref_to_slice_refs)]
     async fn partial_connect_failure_cleans_up_in_reverse_order() {
         let temporary = Arc::new(RecordingTemporary {
             connects: AtomicUsize::new(0),

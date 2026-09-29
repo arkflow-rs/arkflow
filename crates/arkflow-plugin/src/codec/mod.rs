@@ -27,18 +27,6 @@ fn register_components() -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_codec_init() {
-        // Test that codec initialization succeeds
-        let result = init();
-        assert!(result.is_ok());
-    }
-}
-
 /// Component registration is process-global, so `init()` is idempotent: the
 /// first call registers every builder and later calls (tests, multi-entry
 /// binaries) return the first result without touching the registries again.
@@ -50,5 +38,17 @@ pub fn init() -> Result<(), Error> {
     match INIT.get_or_init(|| register_components().map_err(|error| error.to_string())) {
         Ok(()) => Ok(()),
         Err(error) => Err(Error::Config(error.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_codec_init() {
+        // Test that codec initialization succeeds
+        let result = init();
+        assert!(result.is_ok());
     }
 }

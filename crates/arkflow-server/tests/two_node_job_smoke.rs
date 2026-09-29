@@ -153,7 +153,7 @@ rescale: false,
     }
 }
 
-async fn wait_until<F, Fut>(mut condition: F)
+async fn wait_until<F, Fut>(condition: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,

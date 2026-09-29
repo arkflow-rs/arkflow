@@ -33,17 +33,14 @@ use std::sync::{Arc, Mutex};
 /// sentinels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum NumericKind {
+    #[default]
     Int64,
     Float32,
     Float64,
 }
 
-impl Default for NumericKind {
-    fn default() -> Self {
-        Self::Int64
-    }
-}
 
 impl NumericKind {
     /// The emitted `sum`/`min`/`max` column type for this aggregate kind.
@@ -493,6 +490,7 @@ pub struct ColumnarWindowOperator {
     buffers: Arc<Mutex<BTreeMap<(i64, String), AggregateBuffer>>>,
     /// Source acknowledgements held until the corresponding aggregate is
     /// successfully written downstream.
+    #[allow(clippy::type_complexity)]
     pending_acks: Arc<Mutex<BTreeMap<(i64, String), Vec<Arc<dyn Ack>>>>>,
     watermark_ms: Arc<Mutex<Option<i64>>>,
     last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
@@ -1072,6 +1070,7 @@ impl ColumnarWindowOperator {
     /// rows that must be dropped or sent to the configured late side output.
     /// Rows marked late are never accumulated into a new partial session after
     /// the original session has expired.
+    #[allow(clippy::type_complexity)]
     fn session_late_masks(
         &self,
         batch: &crate::MessageBatchRef,
@@ -1125,10 +1124,11 @@ impl ColumnarWindowOperator {
                     && self.late_event_policy == LateEventPolicy::Update;
                 let route = self.late_event_policy == LateEventPolicy::Route
                     && self.late_event_route_configured;
-                if !update_existing && !route {
-                    keep[row] = false;
-                    late[row] = true;
-                } else if route {
+                // A pure drop and a routed late row both leave the window and
+                // are reported through the late mask; only an in-place update
+                // keeps the row. (`!update_existing || route` is exactly the
+                // old two-branch condition with the shared body factored out.)
+                if !update_existing || route {
                     keep[row] = false;
                     late[row] = true;
                 }
@@ -1741,14 +1741,14 @@ fn mark_late_session_batch(
     let mut columns = batch.columns().to_vec();
     let route_values = Arc::new(BooleanArray::from(vec![true; batch.len()])) as ArrayRef;
     let invalid_values = Arc::new(BooleanArray::from(invalid_timestamps.to_vec())) as ArrayRef;
-    if let Some(index) = batch.schema().index_of(marker).ok() {
+    if let Ok(index) = batch.schema().index_of(marker) {
         columns[index] = route_values;
     } else {
         fields.push(Arc::new(Field::new(marker, DataType::Boolean, false)));
         columns.push(route_values);
     }
     if invalid_timestamps.iter().any(|invalid| *invalid) {
-        if let Some(index) = batch.schema().index_of(invalid_marker).ok() {
+        if let Ok(index) = batch.schema().index_of(invalid_marker) {
             columns[index] = invalid_values;
         } else {
             fields.push(Arc::new(Field::new(

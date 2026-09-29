@@ -359,6 +359,6 @@ impl BarrierCoordinator {
 /// Snapshot helper shared by chains: capture a state backend snapshot without
 /// blocking the caller's event loop (spawn_blocking-friendly).
 pub async fn snapshot_state(backend: Arc<dyn StateBackend>) -> Result<StateSnapshot, crate::Error> {
-    let handle = tokio::task::spawn_blocking(move || backend.snapshot().map_err(Into::into)).await;
+    let handle = tokio::task::spawn_blocking(move || backend.snapshot()).await;
     handle.map_err(|error| crate::Error::Process(format!("state snapshot task failed: {error}")))?
 }

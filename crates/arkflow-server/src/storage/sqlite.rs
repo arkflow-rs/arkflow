@@ -1844,6 +1844,7 @@ impl SqliteBackend {
     /// desired-state change or placement move must never be rolled back by a
     /// stale report — that would fence every newer observation and pin the
     /// Job in a reconciling loop.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_job_observation(
         &self,
         job_id: &str,
@@ -2625,12 +2626,12 @@ node_id: Option<&str>,
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
         self.release_hub_lease(holder, now_ms)
     }
-    async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+    async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)
     }
     async fn update_job_with_expected_generation(
 &self,
-mut job: JobRecord,
+job: JobRecord,
 expected_generation: u64,
 ) -> Result<JobRecord, StorageError> {
         self.update_job_with_expected_generation(job, expected_generation)

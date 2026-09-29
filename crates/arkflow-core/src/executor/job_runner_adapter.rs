@@ -32,11 +32,11 @@ pub fn validate_local_job(spec: &JobSpec) -> Result<(), Error> {
         None => ExecutionGraphBuilder::default(),
     };
     let adapter = crate::executor::stream_adapter::StreamJobAdapter::new(None)?;
-    let mut resource = crate::Resource {
+    let resource = crate::Resource {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
-    builder.build(&plan, &adapter, &mut resource)?;
+    builder.build(&plan, &adapter, &resource)?;
     Ok(())
 }
 
@@ -481,6 +481,7 @@ fn state_map(
         .collect()
 }
 
+#[allow(clippy::type_complexity)]
 fn event_time_gates(
     graph: &crate::executor::graph::ExecutionGraph,
 ) -> Result<
@@ -566,10 +567,9 @@ async fn seed_event_time_partitions(
             }
         }
         if !partitions.is_empty() {
-            gate.lock()
+            if let Some(gate) = gate.lock()
                 .await
-                .as_mut()
-                .map(|gate| gate.seed_partitions(&partitions));
+                .as_mut() { gate.seed_partitions(&partitions) }
         }
     }
     Ok(())
@@ -1083,6 +1083,7 @@ async fn run_local_checkpoint_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_local_checkpoint(
     store: &crate::checkpoint::FileCheckpointStore,
     catalog: &mut crate::checkpoint::CheckpointCatalog,
@@ -1185,6 +1186,10 @@ fn local_checkpoint_root(uri: &str) -> Result<PathBuf, Error> {
 
 /// Convenience for building the shared `Resource` outside the executor.
 pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
+    // `Resource` is not `Sync` (its `input_names` RefCell is only touched
+    // during the single-threaded build phase), so this Arc is shared for
+    // cheap cloning, never for cross-thread mutation of that field.
+    #[allow(clippy::arc_with_non_send_sync)]
     std::sync::Arc::new(resource)
 }
 

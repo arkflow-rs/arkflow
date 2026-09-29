@@ -640,6 +640,7 @@ impl JobRuntime {
         ])
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         &self,
         plan: JobPlan,
@@ -1550,13 +1551,13 @@ async fn spawn_kernel_job(
     cancellation: CancellationToken,
     remote: Option<&arkflow_core::executor::graph::RemoteEdgeContext>,
 ) -> Result<arkflow_core::executor::kernel_handle::KernelJobHandle, String> {
-    let mut resource = Resource {
+    let resource = Resource {
         temporary: HashMap::<String, Arc<dyn Temporary>>::new(),
         input_names: RefCell::new(Vec::new()),
     };
     let mut graph = arkflow_core::executor::graph::ExecutionGraphBuilder::default()
         .with_state(state.clone())
-        .build_subgraph(plan, task_ids, &RegistryJobAdapter, &mut resource, remote)
+        .build_subgraph(plan, task_ids, &RegistryJobAdapter, &resource, remote)
         .map_err(|error| error.to_string())?;
     // The graph builder constructs temporary resources through `Resource`;
     // transfer those instances into the unified graph so the resource guard
@@ -1660,10 +1661,9 @@ async fn spawn_kernel_job(
                 }
             }
             if !partitions.is_empty() {
-                gate.lock()
+                if let Some(gate) = gate.lock()
                     .await
-                    .as_mut()
-                    .map(|gate| gate.seed_partitions(&partitions));
+                    .as_mut() { gate.seed_partitions(&partitions) }
             }
         }
         for input in &inputs {
@@ -2304,6 +2304,7 @@ async fn register(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     client: &Client,
     cp: &ControlPlane,

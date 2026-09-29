@@ -204,7 +204,6 @@ impl StorageBackend for PostgresBackend {
     /// every new report until the node caught up to it — blinding stream
     /// convergence, configuration rollout, and reconcile for the whole
     /// previous session's duration.
-
     async fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
         {
             let mut transaction = self.begin().await?;
@@ -546,7 +545,6 @@ impl StorageBackend for PostgresBackend {
 
     /// Reclaim audit history by age and count bound. Recent records within
     /// both bounds always survive; the trail stays queryable but bounded.
-
     async fn prune_audit_events(
         &self,
         older_than_ms: i64,
@@ -572,7 +570,6 @@ impl StorageBackend for PostgresBackend {
 
     /// Reclaim processed outbox rows by age and count bound. Rows still
     /// awaiting processing (pending or claimed) are never reclaimed.
-
     async fn prune_processed_outbox(
         &self,
         older_than_ms: i64,
@@ -599,7 +596,6 @@ impl StorageBackend for PostgresBackend {
     /// Reclaim terminal Attempt records by age and count bound. Active
     /// attempts are protected by both the state predicate and the
     /// `cp_one_active_attempt` unique index.
-
     async fn prune_terminal_attempts(
         &self,
         older_than_ms: i64,
@@ -624,7 +620,6 @@ impl StorageBackend for PostgresBackend {
     }
 
     #[allow(clippy::type_complexity)]
-
     async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
         {
             let mut transaction = self.begin().await?;
@@ -1681,7 +1676,6 @@ impl StorageBackend for PostgresBackend {
     /// which moves it without bumping the generation, so a rollback copying its
     /// earlier read back would regress recovery to a checkpoint retention may
     /// already have deleted.
-
     async fn update_job_with_expected_generation(
         &self,
         mut job: JobRecord,
@@ -1821,7 +1815,6 @@ impl StorageBackend for PostgresBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     async fn update_job(
         &self,
         job_id: &str,
@@ -1853,7 +1846,6 @@ impl StorageBackend for PostgresBackend {
     /// desired-state change or placement move must never be rolled back by a
     /// stale report — that would fence every newer observation and pin the
     /// Job in a reconciling loop.
-
     async fn update_job_observation(
         &self,
         job_id: &str,
@@ -1896,13 +1888,13 @@ impl StorageBackend for PostgresBackend {
                     None => Ok(None),
                 };
             }
-            Ok(connection
+            connection
                 .query_row(
                     "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
-                .optional()?)
+                .optional()
             }.await;
             connection.commit().await?;
             __ret
@@ -1945,13 +1937,13 @@ impl StorageBackend for PostgresBackend {
                     None => Ok(None),
                 };
             }
-            Ok(connection
+            connection
                 .query_row(
                     "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
-                .optional()?)
+                .optional()
             }.await;
             connection.commit().await?;
             __ret

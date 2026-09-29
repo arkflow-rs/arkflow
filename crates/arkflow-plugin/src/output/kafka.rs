@@ -609,6 +609,83 @@ pub fn init() -> Result<(), Error> {
     })))
 }
 
+/// Derive the transactional offset commit set from the batches' source
+/// metadata columns. Returns the topic-partition list (exclusive next
+/// offsets) and whether any committable position existed; batches without
+/// Kafka source metadata contribute nothing (L3 applies to Kafka→Kafka
+/// flows).
+fn transactional_offsets_for_batches(
+    msgs: &[MessageBatchRef],
+    group_topic: Option<&str>,
+) -> Result<(rdkafka::TopicPartitionList, bool), Error> {
+    use arkflow_core::meta_columns;
+    let mut offsets = rdkafka::TopicPartitionList::new();
+    let mut covered = false;
+    for msg in msgs {
+        let schema = msg.record_batch().schema();
+        let (Some(partition_col), Some(offset_col)) = (
+            schema.index_of(meta_columns::PARTITION).ok(),
+            schema.index_of(meta_columns::OFFSET).ok(),
+        ) else {
+            continue;
+        };
+        let partitions = msg
+            .record_batch()
+            .column(partition_col)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::Process(format!(
+                    "column '{}' must be a UInt32 column for transactional offsets",
+                    meta_columns::PARTITION
+                ))
+            })?;
+        let offsets_col = msg
+            .record_batch()
+            .column(offset_col)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::Process(format!(
+                    "column '{}' must be a UInt64 column for transactional offsets",
+                    meta_columns::OFFSET
+                ))
+            })?;
+        // Batch metadata carries the partition but not its topic: L3 routes
+        // partitions through the group's single subscribed topic.
+        let topic = group_topic
+            .unwrap_or_default();
+        use datafusion::arrow::array::Array as _;
+        for row in 0..msg.record_batch().num_rows() {
+            if partitions.is_null(row) || offsets_col.is_null(row) {
+                continue;
+            }
+            let partition = partitions.value(row) as i32;
+            let next_offset = i64::try_from(offsets_col.value(row).saturating_add(1))
+                .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
+            // Keep the max next-offset per partition (rows arrive ordered,
+            // but a merged batch may interleave).
+            let updated = match offsets.find_partition(topic, partition) {
+                Some(element) => match element.offset() {
+                    rdkafka::Offset::Offset(existing) => next_offset.max(existing),
+                    _ => next_offset,
+                },
+                None => next_offset,
+            };
+            if offsets
+                .add_partition_offset(topic, partition, rdkafka::Offset::Offset(updated))
+                .is_err()
+            {
+                return Err(Error::Process(format!(
+                    "invalid transactional offset {updated} for topic '{topic}' partition {partition}"
+                )));
+            }
+            covered = true;
+        }
+    }
+    Ok((offsets, covered))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,82 +801,4 @@ mod tests {
             "expected the error to name security.sasl.password, got: {err}"
         );
     }
-}
-
-/// Derive the transactional offset commit set from the batches' source
-/// metadata columns. Returns the topic-partition list (exclusive next
-/// offsets) and whether any committable position existed; batches without
-/// Kafka source metadata contribute nothing (L3 applies to Kafka→Kafka
-/// flows).
-fn transactional_offsets_for_batches(
-    msgs: &[MessageBatchRef],
-    group_topic: Option<&str>,
-) -> Result<(rdkafka::TopicPartitionList, bool), Error> {
-    use arkflow_core::meta_columns;
-    let mut offsets = rdkafka::TopicPartitionList::new();
-    let mut covered = false;
-    for msg in msgs {
-        let schema = msg.record_batch().schema();
-        let (Some(partition_col), Some(offset_col)) = (
-            schema.index_of(meta_columns::PARTITION).ok(),
-            schema.index_of(meta_columns::OFFSET).ok(),
-        ) else {
-            continue;
-        };
-        let partitions = msg
-            .record_batch()
-            .column(partition_col)
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::Process(format!(
-                    "column '{}' must be a UInt32 column for transactional offsets",
-                    meta_columns::PARTITION
-                ))
-            })?;
-        let offsets_col = msg
-            .record_batch()
-            .column(offset_col)
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::Process(format!(
-                    "column '{}' must be a UInt64 column for transactional offsets",
-                    meta_columns::OFFSET
-                ))
-            })?;
-        // Batch metadata carries the partition but not its topic: L3 routes
-        // partitions through the group's single subscribed topic.
-        let topic = group_topic
-            .clone()
-            .unwrap_or_default();
-        use datafusion::arrow::array::Array as _;
-        for row in 0..msg.record_batch().num_rows() {
-            if partitions.is_null(row) || offsets_col.is_null(row) {
-                continue;
-            }
-            let partition = partitions.value(row) as i32;
-            let next_offset = i64::try_from(offsets_col.value(row).saturating_add(1))
-                .map_err(|_| Error::Process("Kafka offset overflow".into()))?;
-            // Keep the max next-offset per partition (rows arrive ordered,
-            // but a merged batch may interleave).
-            let updated = match offsets.find_partition(&topic, partition) {
-                Some(element) => match element.offset() {
-                    rdkafka::Offset::Offset(existing) => next_offset.max(existing),
-                    _ => next_offset,
-                },
-                None => next_offset,
-            };
-            if offsets
-                .add_partition_offset(&topic, partition, rdkafka::Offset::Offset(updated))
-                .is_err()
-            {
-                return Err(Error::Process(format!(
-                    "invalid transactional offset {updated} for topic '{topic}' partition {partition}"
-                )));
-            }
-            covered = true;
-        }
-    }
-    Ok((offsets, covered))
 }
