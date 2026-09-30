@@ -40,6 +40,9 @@ pub(crate) struct JoinOperation {
     codec: Arc<dyn Decoder>,
     input_names: HashSet<String>,
     thread_num: usize,
+    /// Batches discarded because they lacked an input_name (contract
+    /// break). Exposed for tests; production code reads it via logs.
+    pub(crate) discarded_unnamed_batches: std::sync::atomic::AtomicUsize,
 }
 
 impl JoinOperation {
@@ -54,6 +57,7 @@ impl JoinOperation {
             query,
             value_field,
             thread_num,
+            discarded_unnamed_batches: std::sync::atomic::AtomicUsize::new(0),
             codec,
             input_names,
         })
@@ -75,6 +79,15 @@ impl JoinOperation {
             let msg_batch = x?;
             let input_name_opt = msg_batch.get_input_name();
             let Some(input_name) = input_name_opt else {
+                // Contract break: a mid-stream construction path dropped
+                // the origin name. Warn (not trace) — the downstream join
+                // data will be silently incomplete without this signal.
+                tracing::warn!(
+                    "join buffer discarded a batch without an input_name; \
+                     downstream join data will be incomplete"
+                );
+                self.discarded_unnamed_batches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             };
 
@@ -147,4 +160,63 @@ impl JoinOperation {
 
 fn default_thread_num() -> usize {
     num_cpus::get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopCodec;
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Decoder for NoopCodec {
+        async fn decode(&self, b: Vec<arkflow_core::Bytes>) -> Result<MessageBatch, Error> {
+            MessageBatch::new_binary(b)
+        }
+    }
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Encoder for NoopCodec {
+        async fn encode(&self, _m: MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+            Ok(Vec::new())
+        }
+    }
+    use arkflow_core::MessageBatch;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    fn unnamed_batch() -> MessageBatch {
+        // Binary batch (the join buffer decodes via to_binary, which
+        // requires the __value__ column): no input_name — simulates a
+        // construction path that dropped it.
+        MessageBatch::new_binary(vec![b"payload".to_vec()]).unwrap()
+    }
+
+    /// Spec "无名批次的丢弃有 warn 与计数": a batch without input_name is
+    /// skipped (not crashed) but now with a warn and a counter — the old
+    /// trace-level continue was silent data loss for downstream joins.
+    #[tokio::test]
+    async fn unnamed_batch_discard_is_counted() {
+        let op = JoinOperation::new(
+            "SELECT 1".into(),
+            None,
+            1,
+            Arc::new(NoopCodec),
+            ["left".into()].into(),
+        )
+        .unwrap();
+        let before = op
+            .discarded_unnamed_batches
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Feed a batch with no input_name — the buffer should skip it and
+        // increment the counter (previously just a trace-level continue).
+        let ctx = SessionContext::new();
+        let result = op.join_operation(&ctx, vec![unnamed_batch()]).await;
+        let _ = result; // may succeed with an empty result — the counter is the assertion
+        let after = op
+            .discarded_unnamed_batches
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "discarding an unnamed batch must increment the counter: before={before} after={after}"
+        );
+    }
 }

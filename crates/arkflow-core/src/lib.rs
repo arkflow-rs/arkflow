@@ -351,7 +351,10 @@ impl MessageBatch {
 
         let new_msg = RecordBatch::try_new(new_schema, columns)
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
-        Ok(MessageBatch::new_arrow(new_msg))
+        // Preserve the origin (see filter_columns).
+        let mut result = MessageBatch::new_arrow(new_msg);
+        result.set_input_name(self.input_name.clone());
+        Ok(result)
     }
 
     pub fn filter_columns(
@@ -377,7 +380,13 @@ impl MessageBatch {
         let new_schema: SchemaRef = SchemaRef::new(Schema::new(fields));
         let batch = RecordBatch::try_new(new_schema, new_columns)
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
-        Ok(batch.into())
+        // Preserve the origin: a column filter is a transformation of THIS
+        // batch, and the input_name is the cross-component contract (the
+        // join buffer registers data by it) — dropping it silently empties
+        // downstream joins.
+        let mut result: MessageBatch = batch.into();
+        result.set_input_name(self.input_name.clone());
+        Ok(result)
     }
 
     pub fn from_json<T: Serialize>(value: &T) -> Result<Self, Error> {

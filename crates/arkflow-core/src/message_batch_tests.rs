@@ -212,3 +212,56 @@ mod tests {
         assert_eq!(binary_data[1], b"data2");
     }
 }
+
+#[test]
+fn filter_columns_preserves_input_name() {
+    let batch = {
+        let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("keep", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new("drop", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(datafusion::arrow::array::Int64Array::from(vec![1])),
+                std::sync::Arc::new(datafusion::arrow::array::Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let mut mb = crate::MessageBatch::new_arrow(rb);
+        mb.set_input_name(Some("source-left".into()));
+        mb
+    };
+    let filtered: std::collections::HashSet<String> = ["keep".into()].into();
+    let result = batch.filter_columns(&filtered).unwrap();
+    assert_eq!(
+        result.get_input_name(),
+        Some("source-left".to_string()),
+        "filter_columns must preserve the origin input_name (join buffer registers by it)"
+    );
+}
+
+#[test]
+fn new_binary_with_origin_preserves_input_name() {
+    let batch = {
+        let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("v", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(datafusion::arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let mut mb = crate::MessageBatch::new_arrow(rb);
+        mb.set_input_name(Some("source-right".into()));
+        mb
+    };
+    let result = batch
+        .new_binary_with_origin(vec![b"payload".to_vec()])
+        .unwrap();
+    assert_eq!(
+        result.get_input_name(),
+        Some("source-right".to_string()),
+        "new_binary_with_origin must preserve the origin input_name"
+    );
+}
