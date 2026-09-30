@@ -31,7 +31,7 @@ event-time gate 因等待 watermark 而持有的行 SHALL 有累计行数上限�
 #### Scenario: 驱逐毒化同组兄弟确认
 
 - **WHEN** 被驱逐批与仍在下游持有的兄弟切片同属一个 fan-out 投递，停顿解除后兄弟尝试确认
-- **THEN** 兄弟确认失败（fan-out 已 abort），投递整体回滚、任务按 at-least-once 重启——该行为被显式接受并有测试钉住
+- **THEN** 兄弟确认失败（fan-out 已 abort）、父确认不发生，投递整体回滚——该失败机制有测试钉住；任务级重启后果由引擎既有失败路径承担（at-least-once）
 
 #### Scenario: 未超限时无驱逐
 
