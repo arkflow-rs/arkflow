@@ -6,6 +6,12 @@
 //! the marker through their FIFO data channels, align multi-input vertices,
 //! and snapshot state asynchronously without a job-wide read/write gate.
 
+/// Bound on one checkpoint round's report-collection phase: catches
+/// hung-not-slow pipelines (a barrier stuck behind sustained backpressure
+/// would otherwise park the serialized round loop forever). Far above any
+/// legitimate round (barrier transit + snapshot are seconds).
+const CHECKPOINT_ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 use crate::executor::graph::ExecutionGraph;
 use crate::executor::metrics::KernelMetrics;
 use crate::input::Input;
@@ -54,6 +60,9 @@ pub struct KernelJobHandle {
     chain_finished: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     _finished_keepalive: tokio::sync::mpsc::UnboundedSender<String>,
     checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Round deadline in milliseconds (see CHECKPOINT_ROUND_TIMEOUT);
+    /// AtomicU64 so tests can shrink it without waiting 10 minutes.
+    checkpoint_round_timeout_ms: AtomicU64,
     next_snapshot_id: AtomicU64,
     /// Shared job metrics.  The runner installs the corresponding
     /// `RuntimeMetrics` in every chain hook, so Agent jobs and local streams
@@ -138,6 +147,18 @@ impl KernelJobHandle {
         result
     }
 
+    /// The current round deadline as a Duration.
+    fn round_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.checkpoint_round_timeout_ms.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Shrink the round deadline. Test-only.
+    #[cfg(test)]
+    pub(crate) fn override_round_timeout_for_tests(&mut self, timeout: std::time::Duration) {
+        self.checkpoint_round_timeout_ms
+            .store(timeout.as_millis() as u64, std::sync::atomic::Ordering::Release);
+    }
+
     async fn checkpoint_barrier_inner(
         &self,
         checkpoint_id: String,
@@ -202,6 +223,11 @@ impl KernelJobHandle {
         }
 
         let mut snapshots = BTreeMap::new();
+        // The whole collection phase is bounded: a hung-not-slow pipeline
+        // fails the round explicitly instead of parking the serialized
+        // round loop forever. Stragglers from an abandoned round are
+        // absorbed by the stale-report handling below.
+        let round_deadline = tokio::time::Instant::now() + self.round_timeout();
         while !remaining.is_empty() {
             let report = {
                 let mut reports = self.reports.lock().await;
@@ -210,6 +236,13 @@ impl KernelJobHandle {
                 tokio::select! {
                     _ = self.cancellation.cancelled() => {
                         return Err(Error::Process("kernel cancelled during checkpoint".into()));
+                    }
+                    _ = tokio::time::sleep_until(round_deadline) => {
+                        return Err(Error::Process(format!(
+                            "checkpoint round timed out after {:?} waiting for chains {:?}",
+                            self.round_timeout(),
+                            remaining
+                        )));
                     }
                     error = checkpoint_errors.recv() => {
                         if let Some(error) = error {
@@ -809,6 +842,9 @@ impl KernelJobRunner {
             chain_finished,
             _finished_keepalive: chain_finished_tx,
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_round_timeout_ms: AtomicU64::new(
+                CHECKPOINT_ROUND_TIMEOUT.as_millis() as u64,
+            ),
             next_snapshot_id: AtomicU64::new(0),
             metrics: runtime_metrics.kernel.clone(),
             state_format,

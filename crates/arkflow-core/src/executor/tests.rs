@@ -5675,3 +5675,224 @@ async fn left_outer_join_emits_unmatched_rows_end_to_end() {
     assert!(rows.contains(&("a".to_owned(), Some("a".to_owned()))), "{rows:?}");
     assert!(rows.contains(&("b".to_owned(), None)), "{rows:?}");
 }
+
+// ---------- bounded-wait timeouts (fix-checkpoint-round-timeouts) ----------
+
+/// A sink whose `write_batch` never completes: exercises the sink-write
+/// bound end to end through a real chain.
+struct HangingSink {
+    release: Arc<tokio::sync::Notify>,
+    started: AtomicUsize,
+}
+
+#[async_trait]
+impl Output for HangingSink {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn write_batch(&self, _msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+/// Spec "A hung sink write fails the chain within a bound": the chain fails
+/// with an explicit timeout naming the duration — and the job (therefore
+/// shutdown) unblocks instead of parking forever.
+#[tokio::test]
+async fn hung_sink_write_fails_the_chain_within_a_bound() {
+    crate::executor::task::override_sink_write_timeout_for_tests(Duration::from_millis(50));
+
+    let sink = Arc::new(HangingSink {
+        release: Arc::new(tokio::sync::Notify::new()),
+        started: AtomicUsize::new(0),
+    });
+    let input = Arc::new(VecInput::new(vec![vec![(1, "a".into())]]));
+    let adapter = Adapter {
+        input,
+        output: sink.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        // The runner connects inputs itself; pass an empty set — the adapter
+        // supplies the real input to the graph.
+        vec![],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        true,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+
+    // The sink hangs on the first batch; the bound fires and the job ends
+    // with the explicit timeout error.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.watcher()).await;
+    crate::executor::task::override_sink_write_timeout_for_tests(Duration::from_secs(5 * 60));
+    let result = outcome
+        .expect("the bounded sink write must unblock the job")
+        .expect("watcher join failed");
+    assert!(result.is_err(), "the chain must fail, not park");
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("sink write timed out"),
+        "error names the timeout: {message}"
+    );
+    cancellation.cancel();
+}
+
+/// Spec "A hung state snapshot fails the round within a bound".
+#[tokio::test]
+async fn hung_state_snapshot_fails_within_a_bound() {
+    crate::executor::barrier::override_snapshot_timeout_for_tests(Duration::from_millis(50));
+
+    struct HangingBackend;
+    impl crate::state::StateBackend for HangingBackend {
+        fn format_version(&self) -> u32 {
+            1
+        }
+        fn get(&self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            Ok(None)
+        }
+        fn put_with_ttl(
+            &self,
+            _namespace: &str,
+            _key: &[u8],
+            _value: &[u8],
+            _expires_at_ms: Option<u64>,
+            _now_ms: u64,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn update_i64(
+            &self,
+            _namespace: &str,
+            _key: &[u8],
+            _delta: i64,
+        ) -> Result<i64, Error> {
+            Ok(0)
+        }
+        fn delete(&self, _namespace: &str, _key: &[u8]) -> Result<bool, Error> {
+            Ok(false)
+        }
+        fn purge_expired(&self, _now_ms: u64) -> Result<u64, Error> {
+            Ok(0)
+        }
+        fn scan(&self, _namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            Ok(Vec::new())
+        }
+        fn snapshot_at(&self, _epoch: u64) -> Result<crate::state::StateSnapshot, Error> {
+            self.snapshot()
+        }
+        fn snapshot(&self) -> Result<crate::state::StateSnapshot, Error> {
+            // Park the blocking thread well past the (shrunken) bound; a
+            // bounded park lets the test process exit cleanly instead of a
+            // forever-parked thread blocking runtime shutdown.
+            std::thread::park_timeout(Duration::from_secs(2));
+            unreachable!("parked snapshot never returns within the test")
+        }
+        fn restore(&self, _snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            Ok(())
+        }
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            Ok(crate::state::StateMetrics::default())
+        }
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let result =
+        crate::executor::barrier::snapshot_state(Arc::new(HangingBackend)).await;
+    crate::executor::barrier::override_snapshot_timeout_for_tests(Duration::from_secs(5 * 60));
+    let Err(error) = result else {
+        panic!("a hung snapshot must fail within the bound");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("snapshot timed out"),
+        "error names the timeout: {message}"
+    );
+}
+
+/// Spec "挂起轮次超时失败而非永久停摆": a round whose reporting chain is
+/// wedged behind a never-completing processor fails at the (shrunken)
+/// deadline with an explicit error instead of parking forever.
+#[tokio::test]
+async fn wedged_round_fails_at_the_deadline_instead_of_parking() {
+    struct WedgingProcessor;
+    #[async_trait]
+    impl Processor for WedgingProcessor {
+        async fn process(
+            &self,
+            _msg: MessageBatchRef,
+        ) -> Result<ProcessResult, Error> {
+            // Park the worker forever: the barrier queues behind the stuck
+            // delivery and the round can never collect its report.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let input = Arc::new(VecInput::new(vec![vec![(1, "a".into())]]));
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(WedgingProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut handle = crate::executor::kernel_handle::KernelJobRunner::spawn_with_cancellation(
+        graph,
+        vec![input.clone()],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        false,
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+    handle.override_round_timeout_for_tests(Duration::from_millis(100));
+
+    let outcome = handle.checkpoint_snapshot().await;
+    cancellation.cancel();
+    let Err(error) = outcome else {
+        panic!("a wedged round must fail at the deadline");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("round timed out"),
+        "error names the round deadline: {message}"
+    );
+}
