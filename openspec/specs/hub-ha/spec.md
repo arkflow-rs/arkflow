@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Hub 高可用：`architecture.md` 是选项调研（选主机制、存储后端、Agent 重连、迁移路径），`postgres-storage-design.md` 是阶段 1（存储迁移）的实施蓝图，需求正文覆盖阶段 1 的双后端契约与阶段 2 的租约选主（多实例共享 PostgreSQL、standby 门控、晋升重恢复、让位语义）。阶段 3（Agent 多 Hub 发现、存储级写围栏）未实现。
+Hub 高可用：`architecture.md` 是选项调研（选主机制、存储后端、Agent 重连、迁移路径），`postgres-storage-design.md` 是阶段 1（存储迁移）的实施蓝图，需求正文覆盖阶段 1 的双后端契约与阶段 2 的租约选主（多实例共享 PostgreSQL、standby 门控、晋升重恢复、让位语义）。存储级写围栏已随租约 fencing epoch 落地（见租约需求的围栏段落）；阶段 3 的 Agent 多 Hub 发现未实现。
 
 ## Requirements
 
@@ -75,6 +75,8 @@ The storage contract suite SHALL be parameterized over the backend abstraction: 
 
 持久存储 SHALL 提供单例控制面租约（固定主键行），语义为：`try_acquire` 仅在租约过期或持有者即自己时成功并递增单调 fencing epoch；`renew` 仅在持有者匹配且未过期时延长 TTL；`release` 使持有者的租约立即过期且不改变 epoch。SQLite 与 PostgreSQL 后端 SHALL 以同一契约实现这三个操作，空库启动时幂等建表收敛。
 
+存储 SHALL 暴露当前租约 epoch（`current_lease_epoch`，无租约行返回空）。变更类存储命令 SHALL 携带发送时刻的声明 epoch，并在**执行前**与当前租约 epoch 比对：无租约行（未启用 HA）SHALL 直通；声明值与当前值一致 SHALL 执行；不一致 SHALL 以显式的 stale-leader 错误拒绝且不执行。读命令与租约三操作（acquire/renew/release）SHALL 豁免比对。失去领导（含 standby）的进程声明 epoch 不再与租约一致，其变更写 SHALL 被拒绝。
+
 #### Scenario: 过期租约被 standby 接管
 
 - **WHEN** 租约行已过期（expires_at_ms <= now）且 standby 以自己的 holder id 调用 `try_acquire`
@@ -94,6 +96,21 @@ The storage contract suite SHALL be parameterized over the backend abstraction: 
 
 - **WHEN** 当前持有者对自己调用 `try_acquire`
 - **THEN** 操作按续约处理（TTL 重算，epoch 不再递增），不产生额外的 epoch 跳变
+
+#### Scenario: 旧 leader 的写在接管后被拒绝
+
+- **WHEN** holder A（声明 epoch N）因停顿错过 TTL，standby B 接管使租约 epoch 递增至 N+1，A 在感知失去领导之前发起变更写（携带声明 epoch N）
+- **THEN** 存储层拒绝该写并返回显式 stale-leader 错误（含声明值与当前值），对应命令不产生任何持久化副作用；B（声明 N+1）的同类写正常执行
+
+#### Scenario: 无租约行时变更写直通
+
+- **WHEN** 部署未启用 HA（租约表无行），进程以任意声明值发起变更写
+- **THEN** 写正常执行，行为与未引入围栏前逐位一致
+
+#### Scenario: standby 与租约操作豁免
+
+- **WHEN** standby（从未取得租约，声明 epoch 为 0）在有租约行存在时发起变更写，或任意进程执行租约 acquire/renew/release 与读命令
+- **THEN** standby 的变更写被拒绝（声明 0 ≠ 当前值）；租约操作与读不受围栏影响，select/renew/release 语义保持
 
 ### Requirement: 非 leader Hub SHALL 以 standby 模式运行
 
