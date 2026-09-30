@@ -526,6 +526,34 @@ mod tests {
         }
     }
 
+    /// Pins the eviction ricochet (event-time gate held-cap overflow): the
+    /// gate aborts its held fan-out child as a last resort, and the abort
+    /// poisons the WHOLE group — a sibling child still held downstream (a
+    /// window operator, exactly the stall scenario) fails when it later
+    /// acknowledges, failing the delivery and restarting the task. This is
+    /// the accepted semantics of last-resort eviction; this test keeps it
+    /// from silently changing.
+    #[tokio::test]
+    async fn fanout_abort_poisons_sibling_acknowledgements() {
+        let parent_impl = Arc::new(RecordingAck {
+            acked: AtomicUsize::new(0),
+        });
+        let children = fanout_ack(parent_impl.clone() as Arc<dyn Ack>, 2);
+
+        // The gate's eviction path aborts the held branch.
+        children[0].abort().await.unwrap();
+
+        // The sibling (held by a downstream window) settles when the stall
+        // resolves: the abort has poisoned the group.
+        let outcome = children[1].ack().await;
+        assert!(
+            outcome.is_err(),
+            "a sibling acknowledgement after an eviction abort must fail, not silently succeed"
+        );
+        // The parent never acknowledges: the delivery rolls back wholesale.
+        assert_eq!(parent_impl.acked.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn fanout_ack_retries_parent_after_transient_failure() {
         let parent_impl = Arc::new(FailOnceAck {

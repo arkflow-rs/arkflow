@@ -96,6 +96,22 @@ Key points:
   rejected until a dedicated distributed multi-input runtime exists.
 - Event-time sources declare `mode`, a `timestamp_field`, watermark
   parameters, and a late-event policy (`drop`, `route`, or `update`).
+- Multi-input vertices aggregate watermarks across their inputs: an input
+  that has not emitted a watermark for 5 minutes is treated as idle and
+  excluded from the aggregation, so a silent input (for example a
+  processing-time source mixed into an event-time fan-in) cannot freeze
+  window firing and state cleanup forever. An idle input that resumes with
+  a stale watermark is clamped to the monotonic downstream frontier; its
+  late rows follow the configured late policy.
+- Rows held by an event-time gate while waiting for their window to open
+  are bounded (1,048,576 rows per gate). If the bound is exceeded while the
+  watermark is stalled, the oldest held deliveries are aborted as a last
+  resort against unbounded growth, and a throttled warning reports the
+  cumulative eviction. Semantics: an abort rolls back the WHOLE fan-out
+  delivery — a sibling acknowledgement still held downstream may fail when
+  the stall resolves, failing and restarting the task (at-least-once); rows
+  replayed after a restart land behind the recovered watermark and follow
+  the configured late policy (a Drop policy discards them).
 - `resources` (optional) declares per-task requests — `cpu_millicores`
   and/or `memory_bytes`. The Job's total request is the per-task value times
   the planned task count. Declared Jobs participate in placement accounting:

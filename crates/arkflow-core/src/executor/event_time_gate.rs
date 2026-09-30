@@ -81,8 +81,31 @@ pub struct EventTimeGate {
     /// slice carries the source delivery ack that owns it, so releasing an old
     /// batch can commit the correct input delivery rather than a later batch's
     /// ack.
-    held: Vec<HeldBatch>,
+    held: std::collections::VecDeque<HeldBatch>,
+    /// Incremental row count of `held`, kept so the overflow check at push
+    /// time is O(1) instead of a scan over every held batch.
+    held_rows: usize,
+    /// Row cap for `held`: a stalled watermark (e.g. one silent multi-input
+    /// source) would otherwise grow the hold buffer without limit. Overflow
+    /// evicts the oldest rows and aborts their acks — the delivery replays
+    /// from the WAL after a restart.
+    held_row_cap: usize,
+    /// Cumulative rows evicted by the cap, surfaced in the throttled warning.
+    evicted_held_rows: usize,
+    /// When the eviction warning last fired; a pipeline pinned at the cap
+    /// evicts on every push, so the warning is rate-limited to at most one
+    /// per 10 seconds (the counters stay exact).
+    last_eviction_warn: Option<std::time::Instant>,
+    /// Acks of evicted batches that could not be aborted inline (no runtime
+    /// on the calling thread); drained by [`EventTimeGate::abort_held`].
+    pending_eviction_acks: Vec<std::sync::Arc<dyn Ack>>,
 }
+
+/// Default row cap for a gate's held batches (see `EventTimeGate::held_row_cap`).
+pub const DEFAULT_HELD_ROW_CAP: usize = 1 << 20;
+
+/// Minimum spacing between eviction warnings.
+const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct HeldBatch {
     batch: crate::MessageBatchRef,
@@ -202,7 +225,12 @@ impl EventTimeGate {
             late_policy: LateEventPolicy::Drop,
             allowed_lateness_ms: 0,
             window_timings: Vec::new(),
-            held: Vec::new(),
+            held: std::collections::VecDeque::new(),
+            held_rows: 0,
+            held_row_cap: DEFAULT_HELD_ROW_CAP,
+            evicted_held_rows: 0,
+            last_eviction_warn: None,
+            pending_eviction_acks: Vec::new(),
         }
     }
 
@@ -248,7 +276,12 @@ impl EventTimeGate {
             late_policy: time.late_event_policy,
             allowed_lateness_ms: time.allowed_lateness_ms,
             window_timings: window_timings.into_iter().map(Into::into).collect(),
-            held: Vec::new(),
+            held: std::collections::VecDeque::new(),
+            held_rows: 0,
+            held_row_cap: DEFAULT_HELD_ROW_CAP,
+            evicted_held_rows: 0,
+            last_eviction_warn: None,
+            pending_eviction_acks: Vec::new(),
         })
     }
 
@@ -462,6 +495,7 @@ impl EventTimeGate {
 
         let mut decision = GateDecision::new(watermark_after);
         // Held rows first (FIFO), re-evaluated against the new watermark.
+        self.held_rows = 0;
         let held = std::mem::take(&mut self.held);
         for pending in held {
             let actions = pending
@@ -530,6 +564,7 @@ impl EventTimeGate {
             tracker.watermark()
         };
         let mut decision = GateDecision::new(watermark);
+        self.held_rows = 0;
         let held = std::mem::take(&mut self.held);
         for pending in held {
             let actions = pending
@@ -565,6 +600,7 @@ impl EventTimeGate {
     pub async fn finish(&mut self) -> Result<GateDecision, Error> {
         let mut decision = GateDecision::new(self.watermark());
         let (late_policy, allowed_lateness_ms) = (self.late_policy, self.allowed_lateness_ms);
+        self.held_rows = 0;
         for pending in std::mem::take(&mut self.held) {
             let actions = pending
                 .event_times_ms
@@ -608,6 +644,63 @@ impl EventTimeGate {
         Ok(decision)
     }
 
+    /// Drop the oldest held batches while the buffer exceeds its row cap.
+    /// Evicted acknowledgements are aborted (not acked): the delivery stays
+    /// unconfirmed and replays from the WAL after a restart, matching the
+    /// engine's cancellation semantics — preferable to growing without
+    /// bound while the watermark is stalled.
+    ///
+    /// The push path is synchronous, so aborts are spawned onto the current
+    /// runtime when one exists and queued for [`EventTimeGate::abort_held`]
+    /// otherwise (tests, embedders).
+    fn evict_overflowed_held(&mut self) {
+        if self.held_rows <= self.held_row_cap {
+            return;
+        }
+        let mut evicted_now = 0usize;
+        while self.held_rows > self.held_row_cap && !self.held.is_empty() {
+            let Some(oldest) = self.held.pop_front() else {
+                break;
+            };
+            self.held_rows = self.held_rows.saturating_sub(oldest.batch.len());
+            evicted_now += oldest.batch.len();
+            oldest.ack.release_held();
+            let ack = oldest.ack;
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        if let Err(error) = ack.abort().await {
+                            tracing::warn!(%error, "failed to abort an evicted held acknowledgement");
+                        }
+                    });
+                }
+                Err(_) => self.pending_eviction_acks.push(ack),
+            }
+        }
+        if evicted_now > 0 {
+            self.evicted_held_rows += evicted_now;
+            let now = std::time::Instant::now();
+            let due = self
+                .last_eviction_warn
+                .is_none_or(|last| now.duration_since(last) >= WARN_INTERVAL);
+            if due {
+                self.last_eviction_warn = Some(now);
+                tracing::warn!(
+                    evicted_rows = evicted_now,
+                    total_evicted = self.evicted_held_rows,
+                    cap = self.held_row_cap,
+                    "event-time gate held buffer exceeded its row cap while the watermark is \
+                     stalled; the oldest held deliveries were aborted as a last resort against \
+                     unbounded growth. Semantics: an abort rolls back the WHOLE fan-out \
+                     delivery — a sibling acknowledgement still held downstream may fail when \
+                     the stall resolves, failing and restarting the task (at-least-once); rows \
+                     replayed after a restart land behind the recovered watermark and follow \
+                     the configured late policy (a Drop policy discards them)"
+                );
+            }
+        }
+    }
+
     /// Abort every delivery still retained by the gate.  This is used when a
     /// refresh/observation or downstream dispatch fails after a row has been
     /// classified as `Hold`: merely dropping the gate would leave a WAL or
@@ -615,6 +708,11 @@ impl EventTimeGate {
     /// checkpoint tracker entry alive.
     pub async fn abort_held(&mut self) -> Result<(), Error> {
         let mut first_error = None;
+        for ack in std::mem::take(&mut self.pending_eviction_acks) {
+            if let Err(error) = ack.abort().await {
+                first_error.get_or_insert(error);
+            }
+        }
         for ack in self.take_held_acknowledgements() {
             if let Err(error) = ack.abort().await {
                 first_error.get_or_insert(error);
@@ -623,10 +721,23 @@ impl EventTimeGate {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Shrink the held-row cap. Test-only: production gates keep
+    /// [`DEFAULT_HELD_ROW_CAP`].
+    #[cfg(test)]
+    pub(crate) fn set_held_row_cap_for_test(&mut self, cap: usize) {
+        self.held_row_cap = cap;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_row_totals_for_test(&self) -> (usize, usize, usize) {
+        (self.held_rows, self.held.len(), self.evicted_held_rows)
+    }
+
     /// Take ownership of acknowledgements retained by held rows.  Callers
     /// that need to await them should use this synchronous extraction first so
     /// the gate mutex can be released before the futures are polled.
     pub fn take_held_acknowledgements(&mut self) -> Vec<std::sync::Arc<dyn Ack>> {
+        self.held_rows = 0;
         std::mem::take(&mut self.held)
             .into_iter()
             .map(|pending| pending.ack)
@@ -729,12 +840,14 @@ impl EventTimeGate {
                     // watermark opens their window; barrier draining must not
                     // wait on them, so mark the child as held.
                     child_ack.mark_held();
-                    self.held.push(HeldBatch {
+                    self.held_rows += filtered.len();
+                    self.held.push_back(HeldBatch {
                         batch: filtered,
                         event_times_ms: group.times,
                         expired_window_ends: group.expired,
                         ack: child_ack,
-                    })
+                    });
+                    self.evict_overflowed_held();
                 }
                 WindowAction::Drop => {
                     // This child may have been held by an earlier gate pass.
@@ -1849,5 +1962,100 @@ mod cut_consistency_tests {
             routed.late_event_rows, 1,
             "a route_late row is counted once, not once per output group"
         );
+    }
+    /// Ack that records which settlement it received (the gate aborts the
+    /// evicted delivery on a spawned task, so the flag is polled).
+    struct SettlementRecordingAck {
+        acked: std::sync::atomic::AtomicBool,
+        aborted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::input::Ack for SettlementRecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborted.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// Pins the eviction semantics end to end: the OLDEST delivery is
+    /// aborted (observable on its ack — never acknowledged), the survivor
+    /// stays held with its own data, and a later watermark advance releases
+    /// the survivor (not the evicted rows).
+    #[tokio::test]
+    async fn held_eviction_aborts_the_oldest_delivery_and_keeps_the_survivor() {
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        gate.set_held_row_cap_for_test(1);
+
+        let oldest_ack = Arc::new(SettlementRecordingAck {
+            acked: std::sync::atomic::AtomicBool::new(false),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let survivor_ack = Arc::new(SettlementRecordingAck {
+            acked: std::sync::atomic::AtomicBool::new(false),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        gate.observe_with_ack(0, nullable_batch(vec![Some(2_500)]), oldest_ack.clone())
+            .unwrap();
+        // The second future row exceeds the cap: the OLDEST delivery is
+        // evicted (its abort runs on a spawned task).
+        gate.observe_with_ack(0, nullable_batch(vec![Some(2_600)]), survivor_ack.clone())
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !oldest_ack.aborted.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the evicted delivery's abort never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !oldest_ack.acked.load(std::sync::atomic::Ordering::Acquire),
+            "an evicted delivery is aborted, never acknowledged"
+        );
+        assert!(
+            !survivor_ack.aborted.load(std::sync::atomic::Ordering::Acquire) && !survivor_ack.acked.load(std::sync::atomic::Ordering::Acquire),
+            "the surviving delivery stays pending while held"
+        );
+        assert_eq!(gate.held_row_totals_for_test(), (1, 1, 1));
+
+        // A later row advances the watermark (held rows drive the tracker
+        // too) past the survivor's window end, releasing the SURVIVOR's row
+        // (2_600); the evicted delivery (2_500) is gone. Raise the cap first
+        // so the advancing row itself is not evicted.
+        gate.set_held_row_cap_for_test(10);
+        let released = gate.observe(0, nullable_batch(vec![Some(3_600)])).unwrap();
+        assert_eq!(times_of(&released), vec![Some(2_600)]);
+        // The advancing row stays held (its own window is still open).
+        assert_eq!(gate.held_row_totals_for_test(), (1, 1, 1));
+    }
+
+    #[test]
+    fn held_rows_are_evicted_beyond_the_cap() {
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        gate.set_held_row_cap_for_test(1);
+        // Two future rows in two batches: the second push puts held_rows at
+        // 2 > 1, evicting the OLDEST batch (abort + replay semantics).
+        gate.observe(0, nullable_batch(vec![Some(2_500)])).unwrap();
+        let decision = gate.observe(0, nullable_batch(vec![Some(2_600)])).unwrap();
+        assert!(decision.ready.is_empty());
+        assert_eq!(gate.held_row_totals_for_test(), (1, 1, 1));
+        assert!(gate.has_held());
+    }
+
+    #[test]
+    fn held_rows_under_the_cap_are_not_evicted() {
+        let mut gate = EventTimeGate::new(&spec(LateEventPolicy::Drop, 0), vec![1_000]).unwrap();
+        gate.set_held_row_cap_for_test(4);
+        gate.observe(0, nullable_batch(vec![Some(2_500)])).unwrap();
+        gate.observe(0, nullable_batch(vec![Some(2_600)])).unwrap();
+        assert_eq!(gate.held_row_totals_for_test(), (2, 2, 0));
+        assert!(gate.has_held());
     }
 }

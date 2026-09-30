@@ -1285,7 +1285,13 @@ async fn run_interior_chain_loop(
     // every active input has reported; using the latest/max value would let a
     // fast partition close a window while a lagging partition can still
     // deliver data for it.
-    let mut upstream_watermarks = BTreeMap::<usize, i64>::new();
+    // (watermark, last arrival) per input edge; the arrival instant drives
+    // idle exclusion in `effective_watermark`.
+    let mut upstream_watermarks = BTreeMap::<usize, (i64, std::time::Instant)>::new();
+    let chain_started = std::time::Instant::now();
+    // Last watermark forwarded downstream; clamps re-joining inputs so the
+    // downstream frontier stays monotonic.
+    let mut last_forwarded_watermark: Option<i64> = None;
     let mut idle_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Bounded, ordered processor worker pool (`pipeline.thread_num`): data
@@ -1387,6 +1393,8 @@ async fn run_interior_chain_loop(
                             &mut ended_inputs,
                             pool,
                             &mut upstream_watermarks,
+                            chain_started,
+                            &mut last_forwarded_watermark,
                         )
                         .await?
                         {
@@ -1403,6 +1411,8 @@ async fn run_interior_chain_loop(
                                 &mut ended_inputs,
                                 pool.as_ref(),
                                 &mut upstream_watermarks,
+                                chain_started,
+                                &mut last_forwarded_watermark,
                             )
                             .await?
                             {
@@ -1434,6 +1444,8 @@ async fn run_interior_chain_loop(
                     &mut ended_inputs,
                     pool,
                     &mut upstream_watermarks,
+                    chain_started,
+                    &mut last_forwarded_watermark,
                 )
                 .await?
                 {
@@ -1453,6 +1465,8 @@ async fn run_interior_chain_loop(
                         &mut ended_inputs,
                         pool.as_ref(),
                         &mut upstream_watermarks,
+                        chain_started,
+                        &mut last_forwarded_watermark,
                     )
                     .await?
                     {
@@ -1482,6 +1496,8 @@ async fn run_interior_chain_loop(
                         &mut ended_inputs,
                         pool.as_ref(),
                         &mut upstream_watermarks,
+                        chain_started,
+                        &mut last_forwarded_watermark,
                     )
                     .await?
                     {
@@ -1538,6 +1554,7 @@ fn barrier_span(chain: &Chain, barrier: &crate::checkpoint::CheckpointBarrier) -
     span
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_completed_barrier(
     chain: &Chain,
     hook: &CheckpointHook,
@@ -1545,17 +1562,30 @@ async fn handle_completed_barrier(
     aligner: &mut super::barrier::Aligner,
     ended_inputs: &mut BTreeSet<usize>,
     pool: &mut Option<ProcessorWorkerPool>,
-    upstream_watermarks: &mut BTreeMap<usize, i64>,
+    upstream_watermarks: &mut BTreeMap<usize, (i64, std::time::Instant)>,
+    chain_started: std::time::Instant,
+    last_forwarded_watermark: &mut Option<i64>,
 ) -> Result<bool, Error> {
     let span = barrier_span(chain, &barrier);
     return async move {
-        handle_completed_barrier_inner(chain, hook, barrier, aligner, ended_inputs, pool, upstream_watermarks)
-            .await
+        handle_completed_barrier_inner(
+            chain,
+            hook,
+            barrier,
+            aligner,
+            ended_inputs,
+            pool,
+            upstream_watermarks,
+            chain_started,
+            last_forwarded_watermark,
+        )
+        .await
     }
     .instrument(span)
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_completed_barrier_inner(
     chain: &Chain,
     hook: &CheckpointHook,
@@ -1563,7 +1593,9 @@ async fn handle_completed_barrier_inner(
     aligner: &mut super::barrier::Aligner,
     ended_inputs: &mut BTreeSet<usize>,
     pool: &mut Option<ProcessorWorkerPool>,
-    upstream_watermarks: &mut BTreeMap<usize, i64>,
+    upstream_watermarks: &mut BTreeMap<usize, (i64, std::time::Instant)>,
+    chain_started: std::time::Instant,
+    last_forwarded_watermark: &mut Option<i64>,
 ) -> Result<bool, Error> {
     // A barrier is a control fence for the data submitted before it. Do not
     // snapshot or forward it while a worker can still publish pre-barrier
@@ -1615,6 +1647,8 @@ async fn handle_completed_barrier_inner(
             ended_inputs,
             pool.as_ref(),
             upstream_watermarks,
+            chain_started,
+            last_forwarded_watermark,
         )
         .await?
         {
@@ -1660,6 +1694,58 @@ fn tag_input_index(
     })
 }
 
+/// How long an input may go without emitting a watermark before it is
+/// excluded from the multi-input watermark frontier. Generous by design:
+/// normal watermark cadences are seconds, so only genuinely silent sources
+/// (e.g. processing-time inputs mixed into an event-time fan-in) hit it.
+/// Excluding them keeps watermark-driven progress — gate releases, window
+/// firing, state cleanup — from freezing forever; their late rows follow the
+/// configured late policy when they resume.
+const WATERMARK_INPUT_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// The downstream watermark frontier never moves backwards: a re-joining
+/// idle input can carry a stale value, and downstream consumers (window
+/// firing, state cleanup) assume monotonicity.
+fn clamp_forwarded_watermark(previous: Option<i64>, candidate: i64) -> i64 {
+    previous.map_or(candidate, |last| last.max(candidate))
+}
+
+/// The effective watermark across a vertex's inputs: the minimum over every
+/// active input that reported recently, or `None` while some recently-active
+/// input has never reported. Inputs idle longer than `idle_timeout` (never
+/// reported counts from `started`) and ended inputs are excluded, mirroring
+/// the upstream contract but bounded in time.
+fn effective_watermark(
+    watermarks: &BTreeMap<usize, (i64, std::time::Instant)>,
+    ended_inputs: &BTreeSet<usize>,
+    input_count: usize,
+    now: std::time::Instant,
+    started: std::time::Instant,
+    idle_timeout: std::time::Duration,
+) -> Option<i64> {
+    let mut minimum = None;
+    for index in 0..input_count {
+        if ended_inputs.contains(&index) {
+            continue;
+        }
+        let last_arrival = watermarks
+            .get(&index)
+            .map(|(_, arrived)| *arrived)
+            .unwrap_or(started);
+        if now.duration_since(last_arrival) > idle_timeout {
+            continue; // idle: outside both the gate and the minimum
+        }
+        let Some((watermark, _)) = watermarks.get(&index) else {
+            return None; // recently active but has not reported yet
+        };
+        let watermark = *watermark;
+        minimum = Some(minimum.map_or(watermark, |current: i64| current.min(watermark)));
+    }
+    minimum
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_envelope(
     chain: &Chain,
     hook: &CheckpointHook,
@@ -1667,7 +1753,9 @@ async fn handle_envelope(
     envelope: Envelope,
     ended_inputs: &mut BTreeSet<usize>,
     pool: Option<&ProcessorWorkerPool>,
-    upstream_watermarks: &mut BTreeMap<usize, i64>,
+    upstream_watermarks: &mut BTreeMap<usize, (i64, std::time::Instant)>,
+    chain_started: std::time::Instant,
+    last_forwarded_watermark: &mut Option<i64>,
 ) -> Result<bool, Error> {
     match envelope {
         Envelope::Data(batch, ack) => {
@@ -1732,23 +1820,27 @@ async fn handle_envelope(
             .await
         }
         Envelope::Watermark(watermark) => {
-            upstream_watermarks.insert(input_index, watermark);
-            // An input that has not emitted a watermark yet is still active;
-            // wait for every still-active input before allowing the first
-            // aggregate to fire. Subsequent values use the slowest active
-            // input's progress; ended inputs were removed above.
-            if !(0..chain.inputs.len())
-                .filter(|index| !ended_inputs.contains(index))
-                .all(|index| upstream_watermarks.contains_key(&index))
-            {
+            upstream_watermarks.insert(input_index, (watermark, std::time::Instant::now()));
+            // Every still-active, non-idle input must have reported before
+            // the first aggregate fires; subsequent values use the slowest
+            // such input's progress. Ended inputs were removed above, and an
+            // input idle beyond WATERMARK_INPUT_IDLE_TIMEOUT is excluded so a
+            // source that never emits watermarks cannot freeze
+            // watermark-driven progress forever.
+            let Some(candidate) = effective_watermark(
+                upstream_watermarks,
+                ended_inputs,
+                chain.inputs.len(),
+                std::time::Instant::now(),
+                chain_started,
+                WATERMARK_INPUT_IDLE_TIMEOUT,
+            ) else {
                 return Ok(false);
-            }
-            let watermark = upstream_watermarks
-                .iter()
-                .filter(|(index, _)| !ended_inputs.contains(index))
-                .map(|(_, watermark)| *watermark)
-                .min()
-                .unwrap_or(watermark);
+            };
+            // A re-joining idle input can carry a stale value; never move
+            // the downstream frontier backwards.
+            let watermark = clamp_forwarded_watermark(*last_forwarded_watermark, candidate);
+            *last_forwarded_watermark = Some(watermark);
             if let Some(pool) = pool {
                 // Watermarks must not overtake data already accepted by the
                 // worker pool.
@@ -3262,4 +3354,156 @@ mod worker_pool_tests {
             "the fence reports the stalled delivery: {error}"
         );
     }
+}
+
+#[cfg(test)]
+mod watermark_idle_tests {
+    use super::*;
+
+    fn watermarks(
+        now: std::time::Instant,
+        entries: &[(usize, i64, std::time::Duration)],
+    ) -> BTreeMap<usize, (i64, std::time::Instant)> {
+        entries
+            .iter()
+            .map(|(index, value, age)| (*index, (*value, now - *age)))
+            .collect()
+    }
+
+    #[test]
+    fn silent_input_no_longer_freezes_the_frontier() {
+        // Input 1 never reported a watermark and has been idle since the
+        // chain started: excluded, so the frontier follows input 0 alone.
+        let now = std::time::Instant::now();
+        let started = now - std::time::Duration::from_secs(600);
+        let marks = watermarks(now, &[(0, 1_000, std::time::Duration::from_secs(1))]);
+        assert_eq!(
+            effective_watermark(
+                &marks,
+                &BTreeSet::new(),
+                2,
+                now,
+                started,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn all_recent_inputs_must_report_before_the_first_frontier() {
+        // Input 1 is recently active but has not reported yet: the gate
+        // holds (same semantics as before idle exclusion existed).
+        let now = std::time::Instant::now();
+        let started = now - std::time::Duration::from_secs(1);
+        let marks = watermarks(now, &[(0, 1_000, std::time::Duration::ZERO)]);
+        assert_eq!(
+            effective_watermark(
+                &marks,
+                &BTreeSet::new(),
+                2,
+                now,
+                started,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_input_is_excluded_until_it_reports_again() {
+        let now = std::time::Instant::now();
+        let started = now - std::time::Duration::from_secs(400);
+        // Input 1's last report is older than the idle timeout: the minimum
+        // follows the recent inputs only.
+        let idle = watermarks(
+            now,
+            &[
+                (0, 5_000, std::time::Duration::from_secs(1)),
+                (1, 2_000, std::time::Duration::from_secs(400)),
+            ],
+        );
+        assert_eq!(
+            effective_watermark(&idle, &BTreeSet::new(), 2, now, started, WATERMARK_INPUT_IDLE_TIMEOUT),
+            Some(5_000)
+        );
+        // Once it reports again it rejoins the minimum; the caller clamps
+        // the forwarded value so the downstream frontier stays monotonic.
+        let rejoined = watermarks(
+            now,
+            &[
+                (0, 5_000, std::time::Duration::from_secs(1)),
+                (1, 2_000, std::time::Duration::from_secs(1)),
+            ],
+        );
+        assert_eq!(
+            effective_watermark(&rejoined, &BTreeSet::new(), 2, now, started, WATERMARK_INPUT_IDLE_TIMEOUT),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn ended_inputs_stay_excluded() {
+        let now = std::time::Instant::now();
+        let marks = watermarks(now, &[(0, 9_000, std::time::Duration::from_secs(1))]);
+        let mut ended = BTreeSet::new();
+        ended.insert(1usize);
+        assert_eq!(
+            effective_watermark(&marks, &ended, 2, now, now, WATERMARK_INPUT_IDLE_TIMEOUT),
+            Some(9_000)
+        );
+    }
+    /// The default 5-minute timeout itself is part of the contract: a silent
+    /// input gates the aggregate only while it is plausibly merely slow
+    /// (within the threshold); past it, progress must continue.
+    #[test]
+    fn default_timeout_unfreezes_a_silent_input_only_past_the_threshold() {
+        let now = std::time::Instant::now();
+        let reported = watermarks(now, &[(0, 2_000, std::time::Duration::ZERO)]);
+
+        // Within the default timeout the silent input still gates.
+        let recent_start = now - WATERMARK_INPUT_IDLE_TIMEOUT / 2;
+        assert_eq!(
+            effective_watermark(
+                &reported,
+                &BTreeSet::new(),
+                2,
+                now,
+                recent_start,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
+            None,
+            "a silent input within the threshold must keep the aggregate gated"
+        );
+
+        // Past the default timeout the silent input is excluded.
+        let old_start = now - WATERMARK_INPUT_IDLE_TIMEOUT - std::time::Duration::from_secs(1);
+        assert_eq!(
+            effective_watermark(
+                &reported,
+                &BTreeSet::new(),
+                2,
+                now,
+                old_start,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
+            Some(2_000),
+            "a silent input past the default timeout must no longer freeze progress"
+        );
+    }
+
+    /// The forward clamp is the monotonicity contract of the whole gate
+    /// change: a re-joining idle input's stale candidate must not move the
+    /// frontier backwards, and genuine progress must pass through.
+    #[test]
+    fn forwarded_watermark_is_clamped_monotonically() {
+        assert_eq!(clamp_forwarded_watermark(None, 1_000), 1_000);
+        // Stale rejoin: frozen at the previous frontier.
+        assert_eq!(clamp_forwarded_watermark(Some(5_000), 1_000), 5_000);
+        // Genuine progress passes through.
+        assert_eq!(clamp_forwarded_watermark(Some(5_000), 6_000), 6_000);
+        // Equal values are stable.
+        assert_eq!(clamp_forwarded_watermark(Some(5_000), 5_000), 5_000);
+    }
+
 }
