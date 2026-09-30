@@ -912,7 +912,7 @@ async fn hub_streams(
             }
             value
         })
-        .skip((page - 1) * page_size)
+        .skip(page.saturating_sub(1).saturating_mul(page_size))
         .take(page_size)
         .collect();
     Json(Page {
@@ -2617,7 +2617,7 @@ async fn hub_operations(
     Json(Page {
         items: items
             .into_iter()
-            .skip((page - 1) * page_size)
+            .skip(page.saturating_sub(1).saturating_mul(page_size))
             .take(page_size)
             .collect::<Vec<_>>(),
         page,
@@ -2689,7 +2689,7 @@ async fn hub_events(
     Json(Page {
         items: items
             .into_iter()
-            .skip((page - 1) * page_size)
+            .skip(page.saturating_sub(1).saturating_mul(page_size))
             .take(page_size)
             .collect::<Vec<_>>(),
         page,
@@ -3605,12 +3605,21 @@ fn hub_problem(error: hub::HubError) -> Response {
         // A fenced write means this process no longer holds the lease —
         // same family as standby: retry against the elected leader.
         hub::HubError::StaleLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // Storage failures are server-side problems (retryable), not client
+        // errors; generation conflicts are semantic conflicts, not bad
+        // requests.
+        hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        hub::HubError::GenerationConflict { .. } => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     let code = match error {
         hub::HubError::OrchestrationInProgress => "orchestration_in_progress",
         hub::HubError::OrchestrationPhaseConflict => "orchestration_conflict",
         hub::HubError::StaleLeader { .. } => "stale_leader",
+        hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => "storage_unavailable",
+        hub::HubError::GenerationConflict { .. } => "generation_conflict",
         _ => "agent_request_rejected",
     };
     problem(status, code, error.to_string().chars().take(256).collect())
@@ -3738,7 +3747,7 @@ async fn operations(
     let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
     let items = items
         .into_iter()
-        .skip((page - 1) * page_size)
+        .skip(page.saturating_sub(1).saturating_mul(page_size))
         .take(page_size)
         .collect();
     Json(Page {
@@ -3803,7 +3812,7 @@ async fn events(
     Json(Page {
         items: items
             .into_iter()
-            .skip((page - 1) * page_size)
+            .skip(page.saturating_sub(1).saturating_mul(page_size))
             .take(page_size)
             .collect(),
         page,

@@ -320,11 +320,33 @@ fn resolve_file(spec: &str, reference: &str, path: &str) -> Result<String, Error
             "empty file path".to_string(),
         ));
     }
-    let content = std::fs::read_to_string(spec).map_err(|e| {
+    // Path sandbox: only absolute paths without `..` components are
+    // accepted. This prevents the ${file:} reference from being weaponized
+    // into an arbitrary-file-read channel through the control plane's
+    // configuration endpoints (a relative path would also depend on the
+    // process CWD, which is not a stable contract).
+    let candidate = std::path::Path::new(spec);
+    if !candidate.is_absolute() {
+        return Err(secret_error(
+            path,
+            reference,
+            "file path must be absolute".to_string(),
+        ));
+    }
+    if candidate.components().any(|c| {
+        matches!(c, std::path::Component::ParentDir)
+    }) {
+        return Err(secret_error(
+            path,
+            reference,
+            "file path must not contain '..' components".to_string(),
+        ));
+    }
+    let content = std::fs::read_to_string(spec).map_err(|_| {
         secret_error(
             path,
             reference,
-            format!("unable to read file '{spec}': {}", e.kind()),
+            "unable to read the referenced file".to_string(),
         )
     })?;
     Ok(content.trim_end_matches(['\n', '\r']).to_string())
@@ -515,8 +537,25 @@ mod tests {
         let err =
             resolve_string("${file:/nonexistent/arkflow/nope.pem}", "tls.ca").unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("/nonexistent/arkflow/nope.pem"), "{message}");
-        assert!(message.contains("entity not found") || message.contains("NotFound"), "{message}");
+        // The sandbox returns a fixed error description that does NOT
+        // include the underlying IO error kind or file content. The
+        // reference itself (with the user-provided path) is included by
+        // the secret_error helper for diagnostics — that is not a leak.
+        assert!(message.contains("unable to read the referenced file"), "{message}");
+    }
+
+    #[test]
+    fn file_path_rejects_parent_dir_traversal() {
+        let err = resolve_string("${file:/etc/../etc/shadow}", "test.key").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("must not contain '..'"), "{message}");
+    }
+
+    #[test]
+    fn file_path_rejects_relative_paths() {
+        let err = resolve_string("${file:relative/secret.txt}", "test.key").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("must be absolute"), "{message}");
     }
 
     #[test]
