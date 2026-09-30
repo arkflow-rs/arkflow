@@ -8,7 +8,7 @@ Pulsar input/output 组件契约：可靠投递（broker 回执级确认、失�
 
 ### Requirement: Pulsar output SHALL 在拿到 broker 回执后才报告成功
 
-`pulsar` output 的 `connect()` SHALL 为实际使用的 topic 构建 producer（构建期必须携带 topic），并按 topic 缓存复用（各 producer 独立加锁，单个 topic 阻塞不波及其他 topic）。topic 表达式解析 SHALL 对齐 kafka output 语义：`Scalar` 表示全部消息发往同一 topic，`Vec` 表示逐消息取 `v[i]`，长度不足时 SHALL 返回配置错误而非 panic。`write()` SHALL 等待每条消息的发送回执（`CommandSendReceipt`）后才返回 `Ok`，且回执等待 SHALL 有上界——broker 不可达、拒绝或超时 SHALL 返回错误，不得 fire-and-forget 返回 `Ok`，也不得无限挂起。
+`pulsar` output 的 `connect()` SHALL 只建立 client；`write()` SHALL 在首次使用某 topic 时构建 producer（构建期必须携带 topic）并按 topic 缓存复用（各 producer 独立加锁，单个 topic 阻塞不波及其他 topic）；producer 构建与回执等待 SHALL 同受有界超时约束。topic 表达式解析 SHALL 对齐 kafka output 语义：`Scalar` 表示全部消息发往同一 topic，`Vec` 表示逐消息取 `v[i]`，长度不足时 SHALL 返回配置错误而非 panic。`write()` SHALL 等待每条消息的发送回执（`CommandSendReceipt`）后才返回 `Ok`，且回执等待 SHALL 有上界——broker 不可达、拒绝或超时 SHALL 返回错误，不得 fire-and-forget 返回 `Ok`，也不得无限挂起。
 
 #### Scenario: 端到端投递被真实 consumer 验收
 

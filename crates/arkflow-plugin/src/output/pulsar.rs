@@ -33,10 +33,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-/// How long a single message may wait for its broker receipt. The pulsar
-/// client reconnects internally and keeps receipts pending when the broker
-/// is unreachable, so an unbounded wait would hang `write` forever on
-/// broker loss instead of surfacing an error.
+/// How long a single broker operation may take in `write` — both the
+/// per-topic producer build and the receipt wait. The pulsar client
+/// reconnects internally and retries operations without limit, so an
+/// unbounded wait would hang `write` forever on broker loss instead of
+/// surfacing an error.
 const WRITE_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pulsar output configuration
@@ -93,16 +94,25 @@ impl PulsarOutput {
             match producers.get(topic) {
                 Some(producer) => Arc::clone(producer),
                 None => {
-                    let producer = client
-                        .producer()
-                        .with_topic(topic)
-                        .build()
-                        .await
-                        .map_err(|e| {
-                            Error::Connection(format!(
-                                "Failed to create Pulsar producer for topic {topic}: {e}"
-                            ))
-                        })?;
+                    // The build (topic lookup + handshake) is bounded too:
+                    // pulsar retries operations without limit, so without
+                    // this timeout a first write to a lost broker would
+                    // hang before the receipt wait even starts.
+                    let producer = tokio::time::timeout(
+                        WRITE_RECEIPT_TIMEOUT,
+                        client.producer().with_topic(topic).build(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::Connection(format!(
+                            "Timed out creating Pulsar producer for topic {topic}"
+                        ))
+                    })?
+                    .map_err(|e| {
+                        Error::Connection(format!(
+                            "Failed to create Pulsar producer for topic {topic}: {e}"
+                        ))
+                    })?;
                     let producer = Arc::new(Mutex::new(producer));
                     producers.insert(topic.to_string(), Arc::clone(&producer));
                     producer
@@ -240,8 +250,14 @@ impl Output for PulsarOutput {
 }
 
 /// One payload per row, taken from the named column. Binary columns are
-/// sent verbatim, string columns as their UTF-8 bytes; anything else fails
-/// closed rather than guessing a serialization.
+/// sent verbatim, string columns as their UTF-8 bytes; nulls and any other
+/// type fail closed rather than guessing a serialization (silently dropping
+/// null rows would shift every later payload onto the previous row's topic
+/// when topics resolve per message).
+fn null_value_field(field: &str) -> Error {
+    Error::Config(format!("pulsar value_field '{field}' contains a null value"))
+}
+
 fn field_payloads(msg: &MessageBatchRef, field: &str) -> Result<Vec<Vec<u8>>, Error> {
     use datafusion::arrow::array::{
         Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
@@ -257,9 +273,8 @@ fn field_payloads(msg: &MessageBatchRef, field: &str) -> Result<Vec<Vec<u8>>, Er
             .downcast_ref::<BinaryArray>()
             .expect("checked binary column")
             .iter()
-            .flatten()
-            .map(<[u8]>::to_vec)
-            .collect()),
+            .map(|v| v.map(<[u8]>::to_vec).ok_or_else(|| null_value_field(field)))
+            .collect::<Result<Vec<_>, _>>()?),
         DataType::LargeBinary => Ok(column
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
@@ -273,9 +288,8 @@ fn field_payloads(msg: &MessageBatchRef, field: &str) -> Result<Vec<Vec<u8>>, Er
             .downcast_ref::<StringArray>()
             .expect("checked utf8 column")
             .iter()
-            .flatten()
-            .map(|s| s.as_bytes().to_vec())
-            .collect()),
+            .map(|v| v.map(|s| s.as_bytes().to_vec()).ok_or_else(|| null_value_field(field)))
+            .collect::<Result<Vec<_>, _>>()?),
         DataType::LargeUtf8 => Ok(column
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -336,4 +350,43 @@ pub fn init() -> Result<(), Error> {
         "service_url": "pulsar://localhost:6650",
         "topic": "persistent://public/default/events"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::MessageBatch;
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    fn utf8_batch(rows: Vec<Option<&str>>) -> MessageBatchRef {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(rows))]).expect("utf8 batch");
+        Arc::new(MessageBatch::new_arrow(batch))
+    }
+
+    #[test]
+    fn value_field_rejects_null_rows() {
+        // Silently dropping nulls would shift later payloads onto the
+        // previous row's topic when topics resolve per message.
+        let error = field_payloads(&utf8_batch(vec![Some("a"), None]), "col")
+            .err()
+            .expect("null rows must be rejected");
+        assert!(error.to_string().contains("null"));
+    }
+
+    #[test]
+    fn value_field_rejects_unsupported_types() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .expect("int batch");
+        let error = field_payloads(&Arc::new(MessageBatch::new_arrow(batch)), "n")
+            .err()
+            .expect("non-string/binary columns must be rejected");
+        assert!(error.to_string().contains("unsupported type"));
+    }
 }
