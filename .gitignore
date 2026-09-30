@@ -19,3 +19,9 @@ data/
 .zcode/
 __pycache__/
 *.pyc
+
+# Credential files must never be committed (the console token is a
+# write-capable operator credential); templates stay tracked.
+.env
+.env.*
+!.env.example
