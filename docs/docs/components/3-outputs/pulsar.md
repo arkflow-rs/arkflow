@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Pulsar
 
-The Pulsar output publishes messages to an Apache Pulsar topic. It supports token and OAuth2 authentication and uses a single shared producer per output.
+The Pulsar output publishes messages to an Apache Pulsar topic. It supports token and OAuth2 authentication and builds one producer per destination topic (reused across writes). Writes are reliable: each message is confirmed by a broker receipt before the write returns, and a lost broker surfaces as a bounded error rather than a hang or a fire-and-forget success.
 
 ## Configuration
 
@@ -15,7 +15,7 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 | service_url | string | yes | — | Pulsar service URL (e.g. `pulsar://localhost:6650`). |
 | topic | object | yes | — | Destination topic (expression; see below). |
 | auth | object | no | — | Authentication configuration (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Record field used as the message payload (binary or string column; takes precedence over `codec` when set). |
 
 ### topic
 

@@ -5,7 +5,7 @@ description: ArkFlow 文档页面。
 
 # Pulsar
 
-Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。它支持令牌(Token)与 OAuth2 认证,并且每个输出使用单一共享的生产者(Producer)。
+Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。它支持令牌(Token)与 OAuth2 认证,并按目标主题(Topic)各建一个生产者(Producer)、跨写入复用。写入是可靠投递:每条消息都在拿到 broker 回执后才视为成功;broker 失联时在有限时间内报错,不会挂起,也不会以 fire-and-forget 方式假报成功。
 
 ## 配置
 
@@ -15,7 +15,7 @@ Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。�
 | service_url | string | yes | — | Pulsar 服务 URL(例如 `pulsar://localhost:6650`)。 |
 | topic | object | yes | — | 目标主题(表达式;见下文)。 |
 | auth | object | no | — | 认证配置(见下文)。 |
-| value_field | string | no | — | 用作消息载荷的记录字段。 |
+| value_field | string | no | — | 用作消息载荷的记录字段(二进制或字符串列;设置后优先于 `codec` 生效)。 |
 
 ### topic
 

@@ -35,6 +35,14 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+/// How long the consumer task may hold the shared consumer mutex while
+/// waiting for the next message. `PulsarAck::ack` needs the same mutex
+/// (pulsar's `Consumer::ack` takes `&mut self`), so an unbounded `next()`
+/// wait would starve acknowledgements whenever the broker goes quiet.
+/// Messages flowing normally return from `next()` immediately, so this
+/// bound only affects the idle case.
+const CONSUMER_LOCK_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Pulsar input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulsarInputConfig {
@@ -163,6 +171,14 @@ impl Input for PulsarInput {
                 SubscriptionType::Failover => SubType::Failover,
                 SubscriptionType::KeyShared => SubType::KeyShared,
             })
+            // pulsar-rust's default initial position is Latest, which would
+            // silently skip the existing backlog on a fresh subscription —
+            // the kafka input consumes from earliest by default, so match
+            // that at-least-once behavior here.
+            .with_options(
+                pulsar::consumer::ConsumerOptions::default()
+                    .with_initial_position(pulsar::consumer::InitialPosition::Earliest),
+            )
             .build()
             .await
             .map_err(|e| Error::Connection(format!("Failed to create consumer: {}", e)))?;
@@ -187,11 +203,16 @@ impl Input for PulsarInput {
                         break;
                     }
                     result = async {
+                        // The ack path shares this mutex (pulsar's
+                        // `Consumer::ack` needs `&mut self`), so the wait
+                        // for the next message must be bounded: park on
+                        // `next()` for at most CONSUMER_LOCK_BOUND, then
+                        // release the lock and re-check cancellation.
                         let mut consumer = consumer.lock().await;
-                        consumer.next().await
+                        tokio::time::timeout(CONSUMER_LOCK_BOUND, consumer.next()).await
                     } => {
                         match result {
-                            Some(Ok(mut message)) => {
+                            Ok(Some(Ok(mut message))) => {
                                 // Decode and pair the ack before claiming a
                                 // slot: the message is taken apart here, and
                                 // the ack carries the consumer so `read()`
@@ -212,7 +233,7 @@ impl Input for PulsarInput {
                                     error!("Failed to send message to channel: {}", e);
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 warn!("Failed to receive Pulsar message: {}", e);
                                 if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
                                     error!("Failed to send error to channel: {}", e);
@@ -220,12 +241,18 @@ impl Input for PulsarInput {
                                 // Break the loop to allow reconnection to create a new consumer task
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 // Stream ended
                                 if let Err(e) = sender_clone.send_async(Delivery::Err(Error::EOF)).await {
                                     error!("Failed to send EOF to channel: {}", e);
                                 }
                                 break;
+                            }
+                            Err(_lock_budget_elapsed) => {
+                                // No message arrived within the lock budget:
+                                // loop back with the lock released so a
+                                // pending ack can proceed.
+                                continue;
                             }
                         }
                     }
