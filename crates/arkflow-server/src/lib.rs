@@ -381,7 +381,50 @@ pub async fn serve_observability(
 /// Build the external Hub API. Unlike `router`, this router has no local
 /// Engine state; all node-owned resources come from authenticated Agent
 /// reports stored in `Hub`.
+/// Paths exempt from operator-token auth: health probes, metrics export,
+/// the public component catalog, OIDC login flow, and agent routes (agent
+/// requests carry a node token verified inside the hub methods, not the
+/// operator credential this middleware enforces).
+const OPERATOR_AUTH_EXEMPT: &[&str] = &[
+    // Health probes, metrics and the public component catalog are mounted
+    // on the OUTER router (after nesting) and never reach this middleware;
+    // the OIDC login flow and agent routes are inner-router paths exempt
+    // from the operator credential (agent requests carry a node token
+    // verified inside the hub methods).
+    "/auth/oidc/",
+    "/agent/",
+];
+
+/// Route-level operator authentication: every non-exempt hub route requires
+/// a valid operator credential (static token, OIDC session, or scoped
+/// credential). A new operator route is protected automatically — the old
+/// per-handler boilerplate let a forgotten check become an auth bypass.
+async fn operator_auth_middleware(
+    State(hub): State<hub::Hub>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    if OPERATOR_AUTH_EXEMPT
+        .iter()
+        .any(|p| path.starts_with(p) || path.contains(p))
+    {
+        return next.run(req).await;
+    }
+    let token = bearer(req.headers());
+    if hub.operator_authorized(token.as_deref()).await {
+        next.run(req).await
+    } else {
+        problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid operator token is required".into(),
+        )
+    }
+}
+
 pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
+    let auth_hub = hub.clone();
     let prefix = config.api_prefix.trim_end_matches('/');
     // Standby allowlist: probes the load balancer needs to route traffic to
     // the leader, plus the metrics export. Everything else is gated on
@@ -495,7 +538,11 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     } else {
         api
     }
-    .with_state(hub.clone());
+    .with_state(hub.clone())
+    .layer(axum::middleware::from_fn_with_state(
+        auth_hub,
+        operator_auth_middleware,
+    ));
     let app = Router::new()
         .route(&config.health_path, get(hub_health))
         .route(&config.readiness_path, get(hub_readiness))
@@ -815,14 +862,7 @@ pub async fn serve_hub(
     Ok(())
 }
 
-async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
+async fn hub_system(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
     let nodes = hub.nodes().await;
     let leadership = hub.leadership().await;
     Json(
@@ -833,14 +873,7 @@ async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
 /// Fleet-aggregated EngineStatus so console clients get one overview
 /// contract in local and Hub mode. Only a lease-holding Hub reaches this
 /// handler; standbys are rejected by the router's standby middleware.
-async fn hub_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
+async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
     let nodes = hub.nodes().await;
     Json(arkflow_core::control::EngineStatus {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -856,30 +889,16 @@ async fn hub_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response
 async fn hub_nodes(
     State(hub): State<hub::Hub>,
     Query(query): Query<PageQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     Json(page_items(hub.nodes().await, &query)).into_response()
 }
 
 async fn hub_streams(
     State(hub): State<hub::Hub>,
     Query(query): Query<PageQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let all = hub.streams(query.node_id.as_deref()).await;
     let total = all.len();
     let page = query.page.unwrap_or(1).max(1);
@@ -908,15 +927,8 @@ async fn hub_streams(
 async fn hub_stream(
     State(hub): State<hub::Hub>,
     Path((node_id, stream_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.stream_resource(&node_id, &stream_id).await {
         Ok(Some(resource)) => Json(resource).into_response(),
         Ok(None) => problem(
@@ -937,14 +949,7 @@ async fn hub_stream(
     }
 }
 
-async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
+async fn hub_jobs(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
     match hub.jobs().await {
         Ok(jobs) => Json(jobs).into_response(),
         Err(error) => hub_problem(error),
@@ -964,15 +969,8 @@ pub(crate) fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(),
 async fn hub_job(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.job(&job_id).await {
         Ok(Some(job)) => Json(job).into_response(),
         Ok(None) => problem(
@@ -987,15 +985,8 @@ async fn hub_job(
 async fn hub_job_plan(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -1103,15 +1094,8 @@ async fn hub_job_savepoint(
 async fn hub_job_checkpoints(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.job_checkpoints(&job_id).await {
         Ok(records) => Json(records).into_response(),
         Err(error) => hub_problem(error),
@@ -1202,15 +1186,8 @@ async fn hub_validate_job(
 async fn hub_job_detail(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -1335,15 +1312,8 @@ async fn hub_job_detail(
 async fn hub_job_versions(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     if matches!(hub.job(&job_id).await, Ok(None)) {
         return problem(
             StatusCode::NOT_FOUND,
@@ -2049,15 +2019,8 @@ async fn hub_job_desired_state(
 async fn hub_configuration(
     State(hub): State<hub::Hub>,
     Path(node_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.configuration(&node_id).await {
         Some(configuration) => Json(configuration).into_response(),
         None => problem(
@@ -2071,15 +2034,8 @@ async fn hub_configuration(
 async fn hub_configuration_versions(
     State(hub): State<hub::Hub>,
     Path(node_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     if hub.configuration(&node_id).await.is_none() {
         return problem(
             StatusCode::NOT_FOUND,
@@ -2646,15 +2602,8 @@ fn parse_generation_etag(value: &str) -> Option<u64> {
 async fn hub_operations(
     State(hub): State<hub::Hub>,
     Query(query): Query<OperationQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let mut items = hub.operations(query.node_id.as_deref()).await;
     if let Some(resource_id) = query.resource_id.as_deref() {
         items.retain(|item| item.resource_id == resource_id);
@@ -2681,15 +2630,8 @@ async fn hub_operations(
 async fn hub_operation(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.operation(&id).await {
         Some(operation) => Json(operation).into_response(),
         None => problem(
@@ -2729,15 +2671,8 @@ async fn hub_cancel_operation(
 async fn hub_events(
     State(hub): State<hub::Hub>,
     Query(query): Query<EventQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let mut items = hub.events(query.node_id.as_deref()).await;
     if let Some(event_type) = query.event_type.as_deref() {
         items.retain(|item| item.event.event_type == event_type);
@@ -2769,13 +2704,6 @@ async fn hub_event_stream(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -2871,15 +2799,8 @@ fn event_matches(event: &hub::HubEvent, query: &EventQuery) -> bool {
 async fn hub_audit(
     State(hub): State<hub::Hub>,
     Query(query): Query<AuditQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.audit(query.resource_id.as_deref()).await {
         Ok(records) => Json(page_items(
             records,
@@ -2934,14 +2855,7 @@ async fn create_rollout(
     }
 }
 
-async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
+async fn hub_rollouts(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
     match hub.rollouts().await {
         Ok(rollouts) => Json(rollouts).into_response(),
         Err(error) => hub_problem(error),
@@ -2951,15 +2865,8 @@ async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Respon
 async fn hub_rollout(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     match hub.rollout(&id).await {
         Ok(Some((rollout, targets))) => Json(serde_json::json!({
             "rollout": rollout,
@@ -3030,13 +2937,6 @@ async fn hub_metrics(
     Query(query): Query<MetricsQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
     // Console clients ask for the JSON aggregate explicitly; anything else
     // (including every Prometheus scraper) keeps the text exposition.
     let wants_json = query.format.as_deref() == Some("json")
@@ -3134,14 +3034,7 @@ async fn hub_metrics(
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
-async fn hub_operational_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    if !hub.operator_authorized(bearer(&headers).as_deref()).await {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid operator token is required".into(),
-        );
-    }
+async fn hub_operational_status(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
     match hub.operational_status().await {
         Ok(status) => {
             let mut value = serde_json::to_value(status).unwrap_or_default();
