@@ -5,7 +5,7 @@ sidebar_label: NATS
 
 # NATS
 
-NATS 输入(Input)连接到 NATS 服务器,支持两种模式:常规订阅(regular)与 JetStream 拉取消费者(jet_stream)。
+NATS 输入(Input)连接到 NATS 服务器,支持两种模式:常规订阅(regular)与 JetStream 拉取消费者(jet_stream)。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
 
 ## 配置
 

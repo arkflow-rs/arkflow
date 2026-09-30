@@ -152,6 +152,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
 | `GET` | `/system` | Hub 系统描述符。 |
+| `GET` | `/status` | 机群聚合的引擎状态:streams total/running/failed 对全部注册节点求和。 |
 | `GET` | `/nodes` | 集群节点注册表。 |
 | `GET` | `/streams` | 整个集群中的流。 |
 | `GET` | `/nodes/{node_id}/streams/{id}` | 某节点上某条流的权威时点视图。 |
@@ -160,6 +161,8 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | `POST` | `/nodes/{node_id}/streams/{id}/actions/restart` | 重启操作;只有当 Agent 上报匹配的 `action_id` 后才算收敛。 |
 | `GET` | `/nodes/{node_id}/configuration` | 节点配置视图。 |
 | `GET` | `/nodes/{node_id}/configuration/versions` | 节点配置历史。 |
+| `POST` | `/nodes/{node_id}/configuration/validate` | 在应用前将配置候选对单个节点校验。 |
+| `GET` | `/nodes/{node_id}/configuration/diff` | 对节点上两个配置版本求差异(`from`/`to` 查询参数)。 |
 | `POST` | `/nodes/{node_id}/configuration/apply` | 向单个节点应用配置。 |
 | `POST` | `/nodes/{node_id}/configuration/rollback/{version}` | 回滚节点配置。 |
 | `POST` | `/nodes/{node_id}/drain` | 排空节点(维护前迁走其分配)。 |
@@ -200,7 +203,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | `GET` | `/components` | 集群镜像中已注册的组件。 |
 | `GET` | `/components/{kind}/{name}` | 单个组件的 schema 与示例。 |
 | `GET` | `/schema` | 引擎配置 JSON Schema。 |
-| `GET` | `/metrics` | Prometheus 文本格式指标。 |
+| `GET` | `/metrics` | 默认 Prometheus 文本格式;`?format=json`(或带 `Accept: application/json` 的请求)返回 `{"items": ..., "aggregate": ...}`——各节点指标加机群聚合,可用 `?node_id=` 收窄。 |
 
 除就绪度、对账、outbox 与集群状态仪表之外,命令派发还暴露 `arkflow_command_duration_bucket{command,le}`(从入队到确认的延迟,附带 `_count`/`_sum`)与 `arkflow_command_total{command,outcome}`。标签来自固定词表——命令类型(`job_start`、`job_stop`、`job_checkpoint`、`job_savepoint`、流操作)与结果类别(`enqueued`、`acknowledged`、`succeeded`、`failed`、`timed_out`、`node_unavailable`、`capacity`、`rejected`);未知命令名会折叠为 `other`,资源 ID、关联 ID 与错误文本绝不会成为标签。计数器在 Hub 重启时重置。
 

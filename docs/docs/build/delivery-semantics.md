@@ -64,6 +64,23 @@ duplicates; residual duplicates at the post-commit boundary still require
 downstream idempotency. See [Exactly-once delivery](./exactly-once.md) for the
 full contract and its honest boundary.
 
+## Cancellation safety
+
+The engine may abandon a pending `Input::read` — when an idle tick, a
+barrier, or shutdown needs the source chain to make progress, the in-flight
+read future is dropped and re-issued later. For the channel-based inputs
+shipped with the engine (MQTT, Pulsar, NATS, Redis, WebSocket, HTTP), that
+abandonment never loses a message: each delivery enters the input's internal
+channel only after codec decoding has completed and its ack handle is
+attached, and `read()` waits on that single claim point. If a read is
+dropped mid-flight, the next `read()` returns exactly that delivery, once.
+A decoding failure travels through the same channel and surfaces as a
+`read()` error on the engine's normal failure path.
+
+In short: cancelling a read never drops a decoded message and never
+re-delivers one — duplicates still come only from the at-least-once
+contract above.
+
 ## Single-node boundary
 
 The durable WAL lives on the local disk of the node running the stream. It

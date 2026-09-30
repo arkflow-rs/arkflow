@@ -5,7 +5,7 @@ sidebar_label: Pulsar
 
 # Pulsar
 
-The Pulsar input subscribes to an Apache Pulsar topic and supports four subscription types — exclusive / shared / failover / key_shared — with optional Token or OAuth2 authentication. A fresh subscription starts from the earliest message (the existing backlog is consumed, matching the Kafka input default); acknowledgements always complete within a bounded time, even when the broker stops delivering new messages.
+The Pulsar input subscribes to an Apache Pulsar topic and supports four subscription types — exclusive / shared / failover / key_shared — with optional Token or OAuth2 authentication. A fresh subscription starts from the earliest message (the existing backlog is consumed, matching the Kafka input default); acknowledgements always complete within a bounded time, even when the broker stops delivering new messages. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

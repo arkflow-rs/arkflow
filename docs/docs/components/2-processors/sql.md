@@ -36,6 +36,24 @@ Tagged union (`type` field selects the variant, snake_cased):
 | expr | string | no | — | Expression to evaluate per row against the batch (used when `type: expr`). |
 | value | string | no | — | Static string value used as the key (used when `type: value`). |
 
+## Performance and semantics
+
+- **Plan caching.** The SQL statement is fixed per processor, so its analyzed
+  and optimized plans are cached per worker context and reused whenever the
+  incoming batch schema is unchanged — per-batch re-analysis and
+  re-optimization are skipped, and execution always reads the batch that was
+  just registered.
+- **Time functions stay fresh.** `now()`, `current_date`, `current_time`, and
+  `current_timestamp` would otherwise be folded to a constant at plan
+  optimization time. Queries containing them skip optimized-plan caching and
+  re-optimize on every batch, so each batch observes the time at which it is
+  processed.
+- **Context pooling.** Queries run on a small pool of DataFusion
+  `SessionContext`s (four contexts), so concurrent pipeline workers execute in
+  parallel; a worker waits up to 10 seconds for a free context before
+  failing, and a context is always returned to the pool after use — repeated
+  failures cannot exhaust it.
+
 ## Examples
 
 ### Basic SQL Query
