@@ -33,6 +33,10 @@ Composite acknowledgements SHALL return `Err` if any constituent acknowledgement
 - **WHEN** a `NoopAck` is acked
 - **THEN** it returns `Ok(())` without side effect
 
+#### Scenario: Merged buffer batch acknowledgement compensates sibling failures
+- **WHEN** the memory buffer emits a merged batch whose composite acknowledgement (the shared `VecAck`) acks the acknowledgements of multiple retained input deliveries and one constituent fails
+- **THEN** the composite returns `Err`, undoes the already-successful constituents in reverse order, and the merged delivery remains retryable
+
 ### Requirement: State finalization SHALL be ordered with dependent acknowledgements
 
 The runtime SHALL treat state/window finalization, WAL cursor advancement, and source commit as one ordered acknowledgement unit. If any earlier step fails, later dependent steps SHALL NOT be considered durable.

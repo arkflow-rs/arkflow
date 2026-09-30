@@ -7,6 +7,8 @@ description: ArkFlow documentation page.
 
 The Batch processor accumulates incoming message batches and flushes them as a single merged batch when either a configured message count is reached or a timeout elapses. It is useful for grouping small batches together to improve downstream throughput.
 
+The timeout fires without waiting for the next arrival: once `timeout_ms` elapses with no new input, the partial batch is flushed on the next idle tick. When the upstream source ends (graceful shutdown or a bounded source reaching its end), a partial batch is drained and forwarded instead of being discarded. If the pipeline is cancelled mid-flight, any messages still buffered at that point cannot be delivered and are dropped with a warning log.
+
 ## Configuration
 
 | Field | Type | Required | Default | Description |

@@ -90,6 +90,14 @@ impl BatchProcessor {
 
         Ok(result)
     }
+
+    fn as_process_result(batches: Vec<MessageBatchRef>) -> ProcessResult {
+        match batches.len() {
+            0 => ProcessResult::None,
+            1 => ProcessResult::Single(batches.into_iter().next().unwrap()),
+            _ => ProcessResult::Multiple(batches),
+        }
+    }
 }
 
 #[async_trait]
@@ -104,23 +112,43 @@ impl Processor for BatchProcessor {
         // Check if the batch should be refreshed
         if self.should_flush().await {
             let batches = self.flush().await?;
-            if batches.is_empty() {
-                Ok(ProcessResult::None)
-            } else if batches.len() == 1 {
-                Ok(ProcessResult::Single(batches.into_iter().next().unwrap()))
-            } else {
-                Ok(ProcessResult::Multiple(batches))
-            }
+            Ok(Self::as_process_result(batches))
         } else {
             // If it is not refreshed, return None (filtered)
             Ok(ProcessResult::None)
         }
     }
 
+    async fn finish(&self) -> Result<ProcessResult, Error> {
+        // EOS: emit the partial batch so its acknowledgements settle through
+        // the normal output path instead of dying in `close`.
+        let batches = self.flush().await?;
+        Ok(Self::as_process_result(batches))
+    }
+
+    async fn on_tick(&self) -> Result<ProcessResult, Error> {
+        // Idle input: fire the timeout trigger without waiting for the next
+        // arrival to run the flush check.
+        if !self.should_flush().await {
+            return Ok(ProcessResult::None);
+        }
+        let batches = self.flush().await?;
+        Ok(Self::as_process_result(batches))
+    }
+
     async fn close(&self) -> Result<(), Error> {
         let mut batch = self.batch.write().await;
-
-        batch.clear();
+        if !batch.is_empty() {
+            // Only reachable when the chain exited without an orderly EOS
+            // drain (`finish` already emitted on normal shutdown paths).
+            let rows: usize = batch.iter().map(|b| b.len()).sum();
+            tracing::warn!(
+                batches = batch.len(),
+                rows,
+                "batch processor closed with retained messages; dropping them"
+            );
+            batch.clear();
+        }
         Ok(())
     }
 }
@@ -263,11 +291,113 @@ mod tests {
             .await
             .unwrap();
 
+        // Orderly shutdown drains the partial batch through `finish`
+        // before `close` releases the processor.
+        let drained = processor.finish().await.unwrap();
+        assert!(matches!(drained, ProcessResult::Single(ref b) if b.len() == 1));
+
         // Close the processor
         processor.close().await.unwrap();
 
         // Verify the batch is empty by checking that flush returns empty
         let result = processor.flush().await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_finish_drains_partial() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 5,
+            timeout_ms: 60_000,
+        })
+        .unwrap();
+
+        // Two messages below the count threshold: no flush on process
+        processor
+            .process(Arc::new(
+                MessageBatch::new_binary(vec!["a".as_bytes().to_vec()]).unwrap(),
+            ))
+            .await
+            .unwrap();
+        processor
+            .process(Arc::new(
+                MessageBatch::new_binary(vec!["b".as_bytes().to_vec()]).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // EOS drains the partial batch instead of dropping it in close
+        match processor.finish().await.unwrap() {
+            ProcessResult::Single(batch) => assert_eq!(batch.len(), 2),
+            other => panic!("expected ProcessResult::Single, got empty: {}", other.is_empty()),
+        }
+
+        // A second finish has nothing left to emit
+        assert!(processor.finish().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_on_tick_flushes_timeout() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 5,
+            timeout_ms: 100,
+        })
+        .unwrap();
+
+        processor
+            .process(Arc::new(
+                MessageBatch::new_binary(vec!["late".as_bytes().to_vec()]).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // Before the timeout elapses the tick is a no-op
+        assert!(processor.on_tick().await.unwrap().is_empty());
+
+        sleep(Duration::from_millis(150)).await;
+
+        // The idle tick fires the timeout flush without a new arrival
+        match processor.on_tick().await.unwrap() {
+            ProcessResult::Single(batch) => assert_eq!(batch.len(), 1),
+            other => panic!("expected ProcessResult::Single, got empty: {}", other.is_empty()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_flush_failure_retains_buffer() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 2,
+            timeout_ms: 60_000,
+        })
+        .unwrap();
+
+        // Two batches with incompatible schemas make the merge fail
+        processor
+            .process(Arc::new(
+                MessageBatch::new_binary(vec!["a".as_bytes().to_vec()]).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arrow_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(arrow_batch)))
+            .await;
+
+        // The merge failure propagates...
+        assert!(result.is_err());
+
+        // ...and the buffer retained both messages: retrying the merge
+        // fails again instead of reporting an empty buffer.
+        assert!(processor.finish().await.is_err());
+
+        // After a failed flush the buffer is still occupied
+        let batch = processor.batch.read().await;
+        assert_eq!(batch.len(), 2);
     }
 }

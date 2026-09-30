@@ -21,7 +21,7 @@
 use crate::time::deserialize_duration;
 use arkflow_core::buffer::{register_buffer_builder, Buffer, BufferBuilder};
 use arkflow_core::component::{register_buffer_metadata, ComponentMetadata};
-use arkflow_core::input::Ack;
+use arkflow_core::input::{Ack, VecAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
@@ -102,37 +102,38 @@ impl MemoryBuffer {
 
     /// Processes accumulated messages by merging them into a single batch
     ///
+    /// The merge runs on clones while the queue is still intact; the queue is
+    /// only cleared after the merge succeeded, so a merge failure leaves every
+    /// retained message and acknowledgement available for a later retry.
+    ///
     /// # Returns
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the queue is empty
     async fn process_messages(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        let queue_arc = Arc::clone(&self.queue);
-        let mut queue_lock = queue_arc.write().await;
+        let mut queue_lock = self.queue.write().await;
 
         if queue_lock.is_empty() {
             return Ok(None);
         }
 
-        let mut messages = Vec::new();
-        let mut acks = Vec::new();
-
-        while let Some((msg, ack)) = queue_lock.pop_back() {
-            messages.push(msg);
-            acks.push(ack);
-        }
-
-        if messages.is_empty() {
-            return Ok(None);
-        }
-        let schema = messages[0].schema();
-        let x: Vec<RecordBatch> = messages
-            .into_iter()
-            .map(|batch| (*batch).clone().into())
+        // Writes push to the front, so the back of the deque is the oldest
+        // delivery; merge oldest-first to preserve arrival order.
+        let schema = queue_lock.back().map(|(msg, _)| msg.schema()).unwrap();
+        let x: Vec<RecordBatch> = queue_lock
+            .iter()
+            .rev()
+            .map(|(msg, _)| (**msg).clone().into())
             .collect();
         let new_batch = arrow::compute::concat_batches(&schema, &x)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+        let acks: Vec<Arc<dyn Ack>> = queue_lock.iter().rev().map(|(_, ack)| Arc::clone(ack)).collect();
 
-        let new_ack = Arc::new(ArrayAck(acks));
+        queue_lock.clear();
+        // Capacity released: wake writers that are waiting for room.
+        self.notify.notify_waiters();
+        drop(queue_lock);
+
+        let new_ack: Arc<dyn Ack> = Arc::new(VecAck(acks));
         Ok(Some((
             Arc::new(MessageBatch::new_arrow(new_batch)),
             new_ack,
@@ -144,6 +145,10 @@ impl MemoryBuffer {
 impl Buffer for MemoryBuffer {
     /// Writes a message batch to the memory buffer
     ///
+    /// Once the retained message count reaches `capacity`, the write awaits a
+    /// drain instead of accumulating further, so backpressure propagates
+    /// upstream. An awaiting write is released when the buffer closes.
+    ///
     /// # Arguments
     /// * `msg` - The message batch to write
     /// * `arc` - The acknowledgment for the message batch
@@ -151,24 +156,37 @@ impl Buffer for MemoryBuffer {
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatchRef, arc: Arc<dyn Ack>) -> Result<(), Error> {
-        let queue_arc = Arc::clone(&self.queue);
+        loop {
+            // Register for a capacity notification before checking the fill
+            // level: a drain between the check and the wait must not be lost
+            // (the periodic timer would only paper over it one timeout
+            // later).
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+            {
+                let mut queue_lock = self.queue.write().await;
+                // Calculate the total number of messages in the buffer
+                let cnt: usize = queue_lock.iter().map(|x| x.0.len()).sum();
 
-        let mut queue_lock = queue_arc.write().await;
-        queue_lock.push_front((msg, arc));
-
-        // Calculate the total number of messages in the buffer
-        let cnt = queue_lock
-            .iter()
-            .map(|x| x.0.len())
-            .reduce(|acc, x| acc + x);
-        let cnt = cnt.unwrap_or(0);
-
-        // If capacity threshold is reached, notify readers to process the batch
-        if cnt >= self.config.capacity as usize {
-            let notify = self.notify.clone();
-            notify.notify_waiters();
+                if cnt < self.config.capacity as usize {
+                    queue_lock.push_front((Arc::clone(&msg), Arc::clone(&arc)));
+                    // If capacity threshold is reached, notify readers to process the batch
+                    if cnt + msg.len() >= self.config.capacity as usize {
+                        self.notify.notify_waiters();
+                    }
+                    return Ok(());
+                }
+                // At capacity: wait for a drain (or close) outside the lock.
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = self.close.cancelled() => {
+                    return Err(Error::Process(
+                        "memory buffer closed while awaiting capacity".to_string(),
+                    ));
+                }
+            }
         }
-        Ok(())
     }
 
     /// Reads a message batch from the memory buffer
@@ -199,20 +217,15 @@ impl Buffer for MemoryBuffer {
         self.process_messages().await
     }
 
-    /// Flushes the buffer by cancelling the background task and notifying waiters
+    /// Flushes the buffer by waking waiting readers
+    ///
+    /// Non-terminal: the accumulated messages are drained by the readers and
+    /// the timeout-release task keeps running. Only `close` terminates it.
     ///
     /// # Returns
     /// * `Result<(), Error>` - Success or an error
     async fn flush(&self) -> Result<(), Error> {
-        self.close.cancel();
-
-        let queue_arc = Arc::clone(&self.queue);
-        let queue_lock = queue_arc.read().await;
-        if !queue_lock.is_empty() {
-            // Notify any waiting readers to process remaining messages
-            let notify = Arc::clone(&self.notify);
-            notify.notify_waiters();
-        }
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -225,21 +238,6 @@ impl Buffer for MemoryBuffer {
         Ok(())
     }
 }
-/// Acknowledgment implementation that combines multiple acknowledgments
-/// When acknowledged, it acknowledges all contained acknowledgments
-struct ArrayAck(Vec<Arc<dyn Ack>>);
-
-#[async_trait]
-impl Ack for ArrayAck {
-    /// Acknowledges all contained acknowledgments
-    async fn ack(&self) -> Result<(), Error> {
-        for ack in self.0.iter() {
-            ack.ack().await?;
-        }
-        Ok(())
-    }
-}
-
 struct MemoryBufferBuilder;
 
 impl BufferBuilder for MemoryBufferBuilder {
@@ -263,6 +261,15 @@ impl BufferBuilder for MemoryBufferBuilder {
         }
 
         let config: MemoryBufferConfig = serde_json::from_value(config.clone().unwrap())?;
+        // The capacity bound is what makes `write` backpressure instead of
+        // accumulating without limit; a zero capacity would block every
+        // write forever, so reject it here rather than at the schema layer
+        // only (serde does not enforce the documented `minimum: 1`).
+        if config.capacity == 0 {
+            return Err(Error::Config(
+                "memory buffer 'capacity' must be at least 1".to_string(),
+            ));
+        }
         Ok(Arc::new(MemoryBuffer::new(config)?))
     }
 }
@@ -292,24 +299,77 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use super::*;
     use arkflow_core::input::NoopAck;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Acknowledgement double that can inject a failure and counts undos.
+    struct RecordingAck {
+        fail: bool,
+        undos: AtomicUsize,
+    }
+
+    impl RecordingAck {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail,
+                undos: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail {
+                Err(Error::Process("injected acknowledgement failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn undo(&self) -> Result<(), Error> {
+            self.undos.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn binary_msg(body: &str) -> MessageBatchRef {
+        Arc::new(MessageBatch::new_binary(vec![body.as_bytes().to_vec()]).unwrap())
+    }
 
     #[tokio::test]
     async fn test_memory_buffer_capacity_limit() {
-        let buf = MemoryBuffer::new(MemoryBufferConfig {
-            capacity: 2,
-            timeout: time::Duration::from_millis(100),
-        })
-        .unwrap();
-        let msg1 = Arc::new(MessageBatch::new_binary(vec![b"a".to_vec()]).unwrap());
-        let msg2 = Arc::new(MessageBatch::new_binary(vec![b"b".to_vec()]).unwrap());
-        let msg3 = Arc::new(MessageBatch::new_binary(vec![b"c".to_vec()]).unwrap());
-        buf.write(msg1, Arc::new(NoopAck)).await.unwrap();
-        buf.write(msg2, Arc::new(NoopAck)).await.unwrap();
-        buf.write(msg3, Arc::new(NoopAck)).await.unwrap();
-        let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
-        assert!(r.is_ok());
-        let batch = r.unwrap().unwrap();
-        assert!(batch.is_some());
+        let buf = Arc::new(
+            MemoryBuffer::new(MemoryBufferConfig {
+                capacity: 2,
+                timeout: time::Duration::from_millis(100),
+            })
+            .unwrap(),
+        );
+        let reader_buf = Arc::clone(&buf);
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            while total < 3 {
+                match reader_buf.read().await {
+                    Ok(Some((batch, _))) => total += batch.len(),
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            total
+        });
+
+        // The third write blocks at capacity until the reader drains.
+        for body in ["a", "b", "c"] {
+            buf.write(binary_msg(body), Arc::new(NoopAck))
+                .await
+                .unwrap();
+        }
+
+        let total = tokio::time::timeout(time::Duration::from_secs(2), reader)
+            .await
+            .expect("reads should complete as the writer is released")
+            .unwrap();
+        assert_eq!(total, 3);
     }
 
     #[tokio::test]
@@ -319,8 +379,7 @@ mod tests {
             timeout: time::Duration::from_millis(100),
         })
         .unwrap();
-        let msg = Arc::new(MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap());
-        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
+        buf.write(binary_msg("x"), Arc::new(NoopAck)).await.unwrap();
         let r = tokio::time::timeout(time::Duration::from_millis(200), buf.read()).await;
         assert!(r.is_ok());
         let batch = r.unwrap().unwrap();
@@ -328,19 +387,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_buffer_flush() {
+    async fn test_memory_buffer_flush_keeps_timeout_release() {
         let buf = MemoryBuffer::new(MemoryBufferConfig {
             capacity: 10,
-            timeout: time::Duration::from_secs(10),
+            timeout: time::Duration::from_millis(100),
         })
         .unwrap();
-        let msg = Arc::new(MessageBatch::new_binary(vec![b"flush".to_vec()]).unwrap());
-        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
-        let _ = buf.flush().await;
-        let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
-        assert!(r.is_ok());
-        let batch = r.unwrap().unwrap();
-        assert!(batch.is_some());
+        buf.write(binary_msg("first"), Arc::new(NoopAck))
+            .await
+            .unwrap();
+        buf.flush().await.unwrap();
+
+        // The pending message is readable right after the flush.
+        let first = tokio::time::timeout(time::Duration::from_secs(1), buf.read())
+            .await
+            .expect("flush should make pending messages readable")
+            .unwrap()
+            .expect("pending message expected");
+        assert_eq!(first.0.len(), 1);
+
+        // A later write below capacity must still be released by the
+        // timeout task: flush must not have terminated it.
+        buf.write(binary_msg("second"), Arc::new(NoopAck))
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(time::Duration::from_millis(400), buf.read())
+            .await
+            .expect("timeout release must still fire after a flush")
+            .unwrap()
+            .expect("message expected");
+        assert_eq!(second.0.len(), 1);
     }
 
     #[tokio::test]
@@ -350,11 +426,148 @@ mod tests {
             timeout: time::Duration::from_secs(10),
         })
         .unwrap();
-        let msg = Arc::new(MessageBatch::new_binary(vec![b"close".to_vec()]).unwrap());
-        buf.write(msg, Arc::new(NoopAck)).await.unwrap();
-        let _ = buf.close().await;
-        let r = tokio::time::timeout(time::Duration::from_millis(100), buf.read()).await;
-        assert!(r.is_ok());
+        buf.write(binary_msg("close"), Arc::new(NoopAck))
+            .await
+            .unwrap();
+        buf.close().await.unwrap();
+
+        // Pending messages are drained after close...
+        let pending = tokio::time::timeout(time::Duration::from_millis(100), buf.read())
+            .await
+            .expect("close must not hang a pending read")
+            .unwrap()
+            .expect("pending message expected");
+        assert_eq!(pending.0.len(), 1);
+
+        // ...then the reader observes the end of the stream.
+        let end = tokio::time::timeout(time::Duration::from_millis(100), buf.read())
+            .await
+            .expect("closed empty buffer must return")
+            .unwrap();
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_close_unblocks_awaiting_write() {
+        let buf = Arc::new(
+            MemoryBuffer::new(MemoryBufferConfig {
+                capacity: 1,
+                timeout: time::Duration::from_secs(10),
+            })
+            .unwrap(),
+        );
+        buf.write(binary_msg("full"), Arc::new(NoopAck))
+            .await
+            .unwrap();
+
+        let writer_buf = Arc::clone(&buf);
+        let mut writer = tokio::spawn(async move {
+            writer_buf
+                .write(binary_msg("overflow"), Arc::new(NoopAck))
+                .await
+        });
+
+        // The overflowing write sits at capacity and must not complete
+        // while nothing drains.
+        sleep(time::Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(time::Duration::from_millis(100), &mut writer)
+                .await
+                .is_err(),
+            "write should await capacity release"
+        );
+
+        // Closing releases the awaiting write instead of hanging shutdown.
+        buf.close().await.unwrap();
+        let result = tokio::time::timeout(time::Duration::from_secs(1), writer)
+            .await
+            .expect("close must release the awaiting write")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_zero_capacity_rejected() {
+        use arkflow_core::Resource;
+        use std::cell::RefCell;
+
+        let resource = Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        let error = MemoryBufferBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"capacity": 0, "timeout": "1s"})),
+                &resource,
+            )
+            .err()
+            .expect("zero capacity must be rejected at build time");
+        assert!(error.to_string().contains("capacity"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_merge_failure_retains_queue() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 10,
+            timeout: time::Duration::from_secs(10),
+        })
+        .unwrap();
+
+        buf.write(binary_msg("a"), Arc::new(NoopAck))
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arrow_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        buf.write(
+            Arc::new(MessageBatch::new_arrow(arrow_batch)),
+            Arc::new(NoopAck),
+        )
+        .await
+        .unwrap();
+
+        // The merge fails on the incompatible schemas...
+        assert!(buf.read().await.is_err());
+
+        // ...but the queue kept both deliveries: a retry sees the same
+        // failure instead of an emptied buffer.
+        {
+            let queue = buf.queue.read().await;
+            assert_eq!(queue.len(), 2);
+        }
+        assert!(buf.read().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffer_merged_ack_compensates_sibling_failure() {
+        let ok_ack = RecordingAck::new(false);
+        let fail_ack = RecordingAck::new(true);
+        let buf = MemoryBuffer::new(MemoryBufferConfig {
+            capacity: 10,
+            timeout: time::Duration::from_secs(10),
+        })
+        .unwrap();
+
+        buf.write(binary_msg("first"), ok_ack.clone()).await.unwrap();
+        buf.write(binary_msg("second"), fail_ack.clone())
+            .await
+            .unwrap();
+
+        let (merged, ack) = buf
+            .read()
+            .await
+            .unwrap()
+            .expect("merged batch expected");
+        assert_eq!(merged.len(), 2);
+
+        // The composite acknowledgement fails on the second constituent and
+        // compensates the already-successful first one (VecAck semantics).
+        assert!(ack.ack().await.is_err());
+        assert_eq!(ok_ack.undos.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -369,10 +582,9 @@ mod tests {
         let buf2 = buf.clone();
         let handle = tokio::spawn(async move {
             for i in 0..10 {
-                let msg = Arc::new(
-                    MessageBatch::new_binary(vec![format!("msg{}", i).into_bytes()]).unwrap(),
-                );
-                buf2.write(msg, Arc::new(NoopAck)).await.unwrap();
+                buf2.write(binary_msg(&format!("msg{}", i)), Arc::new(NoopAck))
+                    .await
+                    .unwrap();
             }
         });
         let mut total = 0;
