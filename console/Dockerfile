@@ -1,4 +1,10 @@
 FROM node:22-alpine AS build
+# Explicit channel for the static operator token on controlled builds; the
+# value is inlined into the public bundle by Vite, so treat it accordingly
+# and prefer OIDC (no token) whenever possible. Local .env* files are
+# excluded from this context via .dockerignore.
+ARG VITE_API_TOKEN
+ENV VITE_API_TOKEN=$VITE_API_TOKEN
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci

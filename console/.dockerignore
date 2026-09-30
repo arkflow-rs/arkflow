@@ -1,0 +1,14 @@
+# Credential files must never enter the image build context: Vite inlines
+# VITE_API_TOKEN into the public bundle, and `COPY . .` would otherwise
+# snapshot local .env* files into image layers. Controlled builds pass the
+# token explicitly via `--build-arg VITE_API_TOKEN=...` (see Dockerfile).
+.env*
+!.env.example
+
+# Reinstalled by `npm ci` and rebuilt by the multi-stage build.
+node_modules
+dist
+
+# Not needed inside the image build context.
+*.log
+.git
