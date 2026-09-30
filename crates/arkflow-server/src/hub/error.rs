@@ -26,6 +26,8 @@ pub enum HubError {
     IdempotencyKeyReused,
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("stale leader: claimed epoch {claimed}, current lease epoch {current}")]
+    StaleLeader { claimed: u64, current: u64 },
 }
 
 impl HubError {
@@ -34,6 +36,7 @@ impl HubError {
             Self::Unauthorized => "authorization",
             Self::NodeUnavailable => "node_unavailable",
             Self::StorageUnavailable | Self::Storage(_) => "repository",
+            Self::StaleLeader { .. } => "stale_leader",
             Self::NotFound => "not_found",
             Self::OrchestrationInProgress => "orchestration_in_progress",
             Self::OrchestrationPhaseConflict => "orchestration_conflict",
@@ -50,6 +53,13 @@ impl From<StorageError> for HubError {
             }
             StorageError::IdempotencyKeyReused => Self::IdempotencyKeyReused,
             StorageError::ActorClosed => Self::StorageUnavailable,
+            StorageError::StaleLeader {
+                claimed_epoch,
+                current_epoch,
+            } => Self::StaleLeader {
+                claimed: claimed_epoch,
+                current: current_epoch,
+            },
             other => Self::Storage(other.to_string()),
         }
     }

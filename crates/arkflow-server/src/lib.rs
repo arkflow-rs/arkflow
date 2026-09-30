@@ -3709,11 +3709,15 @@ fn hub_problem(error: hub::HubError) -> Response {
         | hub::HubError::OrchestrationInProgress
         | hub::HubError::OrchestrationPhaseConflict => StatusCode::CONFLICT,
         hub::HubError::NotFound => StatusCode::NOT_FOUND,
+        // A fenced write means this process no longer holds the lease —
+        // same family as standby: retry against the elected leader.
+        hub::HubError::StaleLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     };
     let code = match error {
         hub::HubError::OrchestrationInProgress => "orchestration_in_progress",
         hub::HubError::OrchestrationPhaseConflict => "orchestration_conflict",
+        hub::HubError::StaleLeader { .. } => "stale_leader",
         _ => "agent_request_rejected",
     };
     problem(status, code, error.to_string().chars().take(256).collect())
@@ -4255,6 +4259,25 @@ async fn correlation_middleware(mut request: Request<Body>, next: Next) -> Respo
 
 #[cfg(test)]
 mod tests {
+    /// Stale-leader fencing surfaces as 503 with an explicit code, in the
+    /// same retry-against-the-elected-leader family as standby.
+    #[tokio::test]
+    async fn hub_problem_maps_stale_leader_to_503() {
+        let response = hub_problem(hub::HubError::StaleLeader {
+            claimed: 3,
+            current: 4,
+        });
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("\"stale_leader\""), "body carries the code: {text}");
+    }
+
     use super::*;
 
     fn headers_with(authorization: Option<&str>) -> HeaderMap {

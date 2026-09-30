@@ -5,12 +5,17 @@
 //! actor can drive either backend through one contract.
 use super::*;
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct SqliteBackend {
+    /// Depth of open write-fence transactions (0 = autocommit). While a
+    /// fence holds an ambient `BEGIN IMMEDIATE` open on the connection,
+    /// `immediate_transaction` nests via SAVEPOINT instead of BEGIN. Shared
+    /// across clones like the connection itself.
+    fence_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     connection: Arc<Mutex<Connection>>,
 }
 
@@ -63,6 +68,7 @@ impl SqliteBackend {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
+            fence_depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             connection: Arc::new(Mutex::new(connection)),
         };
         store.migrate()?;
@@ -85,13 +91,104 @@ impl SqliteBackend {
     /// Callers must not perform network or other awaitable work in `operation`.
     pub fn immediate_transaction<T>(
         &self,
-        operation: impl FnOnce(&Transaction<'_>) -> Result<T, StorageError>,
+        operation: impl FnOnce(&Connection) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        if self.fence_depth.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            // A write fence holds an ambient BEGIN IMMEDIATE open on this
+            // connection: nest as a SAVEPOINT so the mutation commits with
+            // the fence (and its takeover serialization). Both arms pass a
+            // Connection-deref'd handle; the bodies only use that surface.
+            let savepoint = connection.savepoint()?;
+            let result = operation(&savepoint)?;
+            savepoint.commit()?;
+            return Ok(result);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = operation(&transaction)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Open the write fence for `claimed_epoch`: take SQLite's write lock
+    /// (BEGIN IMMEDIATE — a competing process's lease takeover blocks
+    /// here), verify the claim inside it, and hold the transaction open
+    /// across the fenced mutation.
+    pub fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let epoch: Option<i64> = match connection
+            .query_row("SELECT epoch FROM cp_hub_lease WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                // SQLite does not guarantee automatic rollback after an
+                // error inside a transaction: roll back explicitly so the
+                // shared connection does not strand the write lock with
+                // `fence_depth` still reporting zero.
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+        };
+        match epoch {
+            None => {
+                // No lease row (HA disabled at the row level): nothing to
+                // fence against; release the write lock immediately and
+                // report passthrough — no fence is held, no end pairs it.
+                if let Err(error) = connection.execute_batch("ROLLBACK") {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Ok(WriteFence::Passthrough)
+            }
+            Some(current) if (current.max(0) as u64) == claimed_epoch => {
+                self.fence_depth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(WriteFence::Held)
+            }
+            Some(current) => {
+                if let Err(error) = connection.execute_batch("ROLLBACK") {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Err(StorageError::StaleLeader {
+                    claimed_epoch,
+                    current_epoch: current.max(0) as u64,
+                })
+            }
+        }
+    }
+
+    /// Commit the ambient fence transaction (releasing the write lock the
+    /// mutation's takeover serialization depended on).
+    pub fn end_write_fence(&self) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        if self.fence_depth.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            // Nested fence or an unpaired end: only the outermost commit.
+            self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+        // Decrement ONLY after a successful commit so `fence_depth` stays
+        // consistent with the connection's transaction state. A failed
+        // commit attempts an explicit rollback (again not automatic on
+        // I/O errors); if that also fails, the depth stays > 0 and every
+        // later use of this connection fails loudly instead of silently
+        // running in the wrong transaction mode.
+        match connection.execute_batch("COMMIT") {
+            Ok(()) => {
+                self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                let cleanup = connection.execute_batch("ROLLBACK");
+                if cleanup.is_ok() {
+                    self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Persist one desired-state mutation and its reconciliation wake-up as a
@@ -1555,6 +1652,21 @@ impl SqliteBackend {
         .map(|updated| updated == 1)
     }
 
+    /// The current lease epoch for write fencing: `None` when no lease row
+    /// exists (HA disabled) — fenced commands pass through unchanged.
+    pub fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        self.with_connection(|connection| {
+            use rusqlite::OptionalExtension;
+            connection
+                .query_row("SELECT epoch FROM cp_hub_lease WHERE id = 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+        })
+        .map(|epoch| epoch.map(|value| value.max(0) as u64))
+    }
+
+
     pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -2625,6 +2737,15 @@ node_id: Option<&str>,
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
         self.release_hub_lease(holder, now_ms)
+    }
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        self.current_lease_epoch()
+    }
+    async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        self.begin_write_fence(claimed_epoch)
+    }
+    async fn end_write_fence(&self) -> Result<(), StorageError> {
+        self.end_write_fence()
     }
     async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)

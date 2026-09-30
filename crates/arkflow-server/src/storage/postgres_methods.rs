@@ -2114,6 +2114,56 @@ impl StorageBackend for PostgresBackend {
             Ok(updated == 1)
         }
     }
+    async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
+        // Take a FOR SHARE lock on the lease row and hold the transaction
+        // open for the duration of the fenced mutation: a competing Hub's
+        // takeover UPDATE blocks until end_write_fence commits, so any
+        // mutation whose claim passed is linearized before the takeover
+        // that would invalidate it.
+        let mut transaction = self.pool().begin().await?;
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT epoch FROM cp_hub_lease WHERE id = 1 FOR SHARE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        match epoch {
+            None => {
+                transaction.rollback().await?;
+                Ok(WriteFence::Passthrough)
+            }
+            Some(current) if (current.max(0) as u64) == claimed_epoch => {
+                *self.fence.lock().await = Some(transaction);
+                Ok(WriteFence::Held)
+            }
+            Some(current) => {
+                transaction.rollback().await?;
+                Err(StorageError::StaleLeader {
+                    claimed_epoch,
+                    current_epoch: current.max(0) as u64,
+                })
+            }
+        }
+    }
+    async fn end_write_fence(&self) -> Result<(), StorageError> {
+        if let Some(transaction) = self.fence.lock().await.take() {
+            transaction.commit().await?;
+        }
+        Ok(())
+    }
+    async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT epoch FROM cp_hub_lease WHERE id = 1",
+                    binds![],
+                    |row| row.get::<i64>(0),
+                )
+                .await
+                .optional()
+                .map(|epoch| epoch.map(|value| value.max(0) as u64))
+        }
+    }
     async fn operational_aggregates(
         &self,
         now_ms: u64,

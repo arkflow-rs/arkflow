@@ -366,6 +366,10 @@ impl PgConn {
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: PgPool,
+    /// The open write-fence transaction (a `FOR SHARE` lock on the lease
+    /// row), held for the duration of a fenced mutation. Shared across
+    /// clones: the FIFO actor runs at most one fence at a time.
+    fence: std::sync::Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, Postgres>>>>,
 }
 
 /// Idempotent PostgreSQL DDL: one table per SQLite counterpart, BIGINT for
@@ -671,7 +675,10 @@ impl PostgresBackend {
             .await?;
         sqlx::query("SELECT 1").execute(&pool).await?;
         sqlx::raw_sql(PG_DDL).execute(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fence: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     async fn lease(&self) -> Result<PgConn, StorageError> {

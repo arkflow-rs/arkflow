@@ -118,6 +118,14 @@ impl Hub {
         if !self.ha.enabled {
             return;
         }
+        // Entering the election opts this process's writes into fencing:
+        // the standby claim (0) is rejected while another holder's lease
+        // row exists.
+        if let Some(storage) = &self.storage {
+            storage
+                .leadership_epoch()
+                .store(0, Ordering::Release);
+        }
         let mut leadership = self.leadership.write().await;
         if matches!(*leadership, Leadership::Disabled) {
             *leadership = Leadership::Standby { since_ms: now_ms() };
@@ -138,6 +146,19 @@ impl Hub {
             }
             std::mem::replace(&mut *leadership, next.clone())
         };
+        // Keep the storage handle's fencing claim in sync with the role:
+        // leader writes carry the lease epoch; anything else claims 0 and
+        // fenced mutations are rejected while a lease row exists. A
+        // Disabled transition never touches the claim — a never-enabled
+        // handle keeps UNFENCED (no fencing at all).
+        if let Some(storage) = &self.storage {
+            let previous_claim = storage.leadership_epoch().load(Ordering::Acquire);
+            if previous_claim != crate::storage::UNFENCED {
+                storage
+                    .leadership_epoch()
+                    .store(next.epoch().unwrap_or(0), Ordering::Release);
+            }
+        }
         self.leadership_transitions.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             from = previous.role(),
@@ -256,6 +277,12 @@ impl Hub {
             Leadership::Standby { .. } => {
                 match storage.try_acquire_hub_lease(&holder, ttl, now).await {
                     Ok(crate::storage::HubLeaseAcquire::Acquired { epoch }) => {
+                        // Publish the fencing claim before the promotion's
+                        // recovery writes: they are fenced commands and must
+                        // carry the freshly acquired epoch.
+                        storage
+                            .leadership_epoch()
+                            .store(epoch, Ordering::Release);
                         match self.reload_durable_state_for_promotion().await {
                             Ok(()) => {
                                 self.transition_to(
@@ -270,6 +297,7 @@ impl Hub {
                                     epoch,
                                     "promotion recovery failed; releasing the lease and staying standby"
                                 );
+                                storage.leadership_epoch().store(0, Ordering::Release);
                                 let _ = storage
                                     .release_hub_lease(&holder, now_ms())
                                     .await;
