@@ -38,3 +38,22 @@ The Web Console SHALL render redacted values returned by the API and SHALL NOT e
 - **WHEN** the operator opens a connector configuration containing credentials
 - **THEN** the console displays redaction markers rather than secret values
 
+### Requirement: Credential material SHALL NOT enter the image build context or the repository
+The console build chain SHALL prevent accidental credential spread: the `console/` Docker build context SHALL exclude `.env*` files (and `node_modules`, `dist`) via `.dockerignore`; repository ignore rules SHALL cover `.env` and `.env.*` while keeping `.env.example` tracked. Injecting the static token on a controlled build SHALL go through the explicit `ARG VITE_API_TOKEN` channel rather than a `.env` file placed in the build directory. The example configuration SHALL warn that the static token is inlined into the public JavaScript bundle, is for trusted networks only, and that production deployments should use OIDC.
+
+#### Scenario: Local .env stays out of the image
+- **WHEN** a `.env` file containing `VITE_API_TOKEN` exists in `console/` and a Docker image build runs
+- **THEN** the file is excluded from the build context and appears in no image layer
+
+#### Scenario: Static token injection is explicit
+- **WHEN** a controlled build needs the static token
+- **THEN** it is passed via `--build-arg VITE_API_TOKEN=...` (the Dockerfile declares the `ARG`), leaving an auditable build command with no dependency on files in the build directory
+
+#### Scenario: A real .env is never committed
+- **WHEN** a developer creates `console/.env` (or any `.env.*` other than `.env.example`) and runs `git add`
+- **THEN** ignore rules keep the credential out of the repository
+
+#### Scenario: The example file carries the exposure warning
+- **WHEN** someone consults `console/.env.example`
+- **THEN** it states that the static token is inlined into the public bundle, is for trusted networks only, and that production should use OIDC
+
