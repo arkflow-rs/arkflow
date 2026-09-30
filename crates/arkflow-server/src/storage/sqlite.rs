@@ -117,17 +117,31 @@ impl SqliteBackend {
     pub fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute_batch("BEGIN IMMEDIATE")?;
-        let epoch: Option<i64> = connection
+        let epoch: Option<i64> = match connection
             .query_row("SELECT epoch FROM cp_hub_lease WHERE id = 1", [], |row| {
                 row.get(0)
             })
-            .optional()?;
+            .optional()
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                // SQLite does not guarantee automatic rollback after an
+                // error inside a transaction: roll back explicitly so the
+                // shared connection does not strand the write lock with
+                // `fence_depth` still reporting zero.
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+        };
         match epoch {
             None => {
                 // No lease row (HA disabled at the row level): nothing to
                 // fence against; release the write lock immediately and
                 // report passthrough — no fence is held, no end pairs it.
-                connection.execute_batch("ROLLBACK")?;
+                if let Err(error) = connection.execute_batch("ROLLBACK") {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
                 Ok(WriteFence::Passthrough)
             }
             Some(current) if (current.max(0) as u64) == claimed_epoch => {
@@ -135,7 +149,10 @@ impl SqliteBackend {
                 Ok(WriteFence::Held)
             }
             Some(current) => {
-                connection.execute_batch("ROLLBACK")?;
+                if let Err(error) = connection.execute_batch("ROLLBACK") {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
                 Err(StorageError::StaleLeader {
                     claimed_epoch,
                     current_epoch: current.max(0) as u64,
@@ -148,11 +165,30 @@ impl SqliteBackend {
     /// mutation's takeover serialization depended on).
     pub fn end_write_fence(&self) -> Result<(), StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
-        let prev = self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 1 {
-            connection.execute_batch("COMMIT")?;
+        if self.fence_depth.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            // Nested fence or an unpaired end: only the outermost commit.
+            self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
         }
-        Ok(())
+        // Decrement ONLY after a successful commit so `fence_depth` stays
+        // consistent with the connection's transaction state. A failed
+        // commit attempts an explicit rollback (again not automatic on
+        // I/O errors); if that also fails, the depth stays > 0 and every
+        // later use of this connection fails loudly instead of silently
+        // running in the wrong transaction mode.
+        match connection.execute_batch("COMMIT") {
+            Ok(()) => {
+                self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                let cleanup = connection.execute_batch("ROLLBACK");
+                if cleanup.is_ok() {
+                    self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Persist one desired-state mutation and its reconciliation wake-up as a
