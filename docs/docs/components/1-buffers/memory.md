@@ -16,7 +16,7 @@ Failed merges never drop retained messages: if accumulated batches cannot be mer
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `memory` |
-| capacity | integer | yes | — | Maximum number of messages to accumulate. Once this many messages are held, writes wait (backpressure) until the reader releases them. |
+| capacity | integer | yes | — | Maximum number of messages to accumulate. Once this many messages are held, writes wait (backpressure) until the reader releases them. Must be at least 1 — a capacity of `0` is rejected at build time. |
 | timeout | duration | yes | — | Maximum time to wait before flushing accumulated batches, even if `capacity` has not been reached. Examples: `1ms`, `1s`, `1m`, `1h`. |
 
 ## Examples

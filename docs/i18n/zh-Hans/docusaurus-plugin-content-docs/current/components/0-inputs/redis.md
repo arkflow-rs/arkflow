@@ -5,7 +5,7 @@ sidebar_label: Redis
 
 # Redis
 
-Redis 输入(Input)从 Redis 读取数据,同时支持单机(standalone)与集群(cluster)两种连接模式,并提供 Subscribe(频道/模式)与 List 两种消费模式。
+Redis 输入(Input)从 Redis 读取数据,同时支持单机(standalone)与集群(cluster)两种连接模式,并提供 Subscribe(频道/模式)与 List 两种消费模式。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
 
 ## 配置
 

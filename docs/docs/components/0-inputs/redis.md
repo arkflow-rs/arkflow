@@ -5,7 +5,7 @@ sidebar_label: Redis
 
 # Redis
 
-The Redis input reads from Redis with both standalone and cluster connection modes, and supports Subscribe (channels / patterns) and List consumption modes.
+The Redis input reads from Redis with both standalone and cluster connection modes, and supports Subscribe (channels / patterns) and List consumption modes. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

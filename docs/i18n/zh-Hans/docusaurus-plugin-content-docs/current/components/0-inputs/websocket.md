@@ -5,7 +5,7 @@ sidebar_label: WebSocket
 
 # WebSocket
 
-WebSocket 输入(Input)以客户端身份连接远程 WebSocket 服务器,解码每条入站消息(Message)并转发到流水线(Pipeline)中。当前实现仅支持客户端模式。
+WebSocket 输入(Input)以客户端身份连接远程 WebSocket 服务器,解码每条入站消息(Message)并转发到流水线(Pipeline)中。当前实现仅支持客户端模式。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
 
 ## 配置
 

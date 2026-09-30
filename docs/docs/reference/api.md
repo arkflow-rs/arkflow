@@ -172,6 +172,7 @@ corrupting state.
 | Method | Route | Purpose |
 |--------|-------|---------|
 | `GET` | `/system` | Hub system descriptor. |
+| `GET` | `/status` | Fleet-aggregated engine status: streams total/running/failed summed across registered nodes. |
 | `GET` | `/nodes` | Fleet node registry. |
 | `GET` | `/streams` | Streams across the fleet. |
 | `GET` | `/nodes/{node_id}/streams/{id}` | Authoritative point-in-time stream view on a node. |
@@ -180,6 +181,8 @@ corrupting state.
 | `POST` | `/nodes/{node_id}/streams/{id}/actions/restart` | Restart action; converges only after the Agent reports the matching `action_id`. |
 | `GET` | `/nodes/{node_id}/configuration` | Node configuration view. |
 | `GET` | `/nodes/{node_id}/configuration/versions` | Node configuration history. |
+| `POST` | `/nodes/{node_id}/configuration/validate` | Validate a configuration candidate against one node before applying. |
+| `GET` | `/nodes/{node_id}/configuration/diff` | Diff two configuration versions on a node (`from`/`to` query parameters). |
 | `POST` | `/nodes/{node_id}/configuration/apply` | Apply configuration to one node. |
 | `POST` | `/nodes/{node_id}/configuration/rollback/{version}` | Roll node configuration back. |
 | `POST` | `/nodes/{node_id}/drain` | Drain a node (evacuate assignments before maintenance). |
@@ -227,7 +230,7 @@ for the state machine behind these routes.
 | `GET` | `/components` | Registered components across the fleet image. |
 | `GET` | `/components/{kind}/{name}` | One component's schema and example. |
 | `GET` | `/schema` | Engine configuration JSON Schema. |
-| `GET` | `/metrics` | Prometheus text exposition. |
+| `GET` | `/metrics` | Prometheus text exposition by default; `?format=json` (or an `Accept: application/json` request) returns `{"items": ..., "aggregate": ...}` — per-node metrics plus the fleet aggregate, optionally narrowed with `?node_id=`. |
 
 Beyond readiness, reconciliation, outbox, and fleet-state gauges, command
 dispatch exposes `arkflow_command_duration_bucket{command,le}` (enqueue-to-

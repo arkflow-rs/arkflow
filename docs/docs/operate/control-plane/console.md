@@ -24,6 +24,7 @@ is served from a reverse proxy next to the Hub — see
 | **Components** | The component registry browser: every registered kind/type with its config schema and example, mirroring `arkflow components show`. |
 | **Configuration** | Node configuration history, diffs, apply, and rollback. In Hub mode every action is routed through the selected node; drafts are a local-control-plane feature. |
 | **Events** | The fleet event log (same data as `GET /api/v1/events`, with the SSE stream for live updates). |
+| **Audit** | The fleet audit history (`GET /api/v1/audit`): accepted and rejected mutations with actor, target, node, and outcome, plus a text filter over the stored records. |
 | **Settings** | Console preferences and connection settings. |
 
 ## Reading the console the way the API works
@@ -54,6 +55,21 @@ the distributed-runtime spec fields — the `rescale` opt-in for redistributing
 keyed state across a changed parallelism, and per-task `resources` requests
 (`cpu_millicores`, `memory_bytes`) that participate in placement accounting —
 as form controls, serializing both back to their absent form when cleared.
+
+## Node maintenance actions
+
+The overview cards expose three node actions for fleet maintenance. Each one
+asks for confirmation before it fires:
+
+- **Drain** (`POST /api/v1/nodes/{id}/drain`) evacuates the node's
+  placements to other nodes — use it before taking a node offline.
+- **Maintain** (`POST /api/v1/nodes/{id}/maintenance`) marks the node as in
+  maintenance so placement stops assigning new work to it.
+- **Resume** (`DELETE /api/v1/nodes/{id}/maintenance`) returns the node to
+  active duty.
+
+While a node is not `active`, its overview card shows the current state
+(`draining` or `maintenance`) as a badge next to the node name.
 
 ## Navigation and URLs
 

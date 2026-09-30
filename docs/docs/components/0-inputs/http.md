@@ -5,7 +5,7 @@ sidebar_label: HTTP
 
 # HTTP
 
-The HTTP input runs as an Axum HTTP server and accepts POST requests sent to `address`+`path`. The request body (JSON) is decoded and forwarded into the stream processing pipeline. Optional CORS and Basic/Bearer authentication are supported. Bind failures surface synchronously: if the listen address cannot be bound (for example, the port is already in use), `connect` fails with an explicit error instead of starting silently; if the listener stops at runtime, reads report a disconnection so the engine can re-bind.
+The HTTP input runs as an Axum HTTP server and accepts POST requests sent to `address`+`path`. The request body (JSON) is decoded and forwarded into the stream processing pipeline. Optional CORS and Basic/Bearer authentication are supported. Bind failures surface synchronously: if the listen address cannot be bound (for example, the port is already in use), `connect` fails with an explicit error instead of starting silently; if the listener stops at runtime, reads report a disconnection so the engine can re-bind. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

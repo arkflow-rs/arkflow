@@ -5,7 +5,7 @@ sidebar_label: WebSocket
 
 # WebSocket
 
-The WebSocket input connects to a remote WebSocket server as a client, decodes each inbound message, and forwards it into the pipeline. The current implementation supports client mode only.
+The WebSocket input connects to a remote WebSocket server as a client, decodes each inbound message, and forwards it into the pipeline. The current implementation supports client mode only. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

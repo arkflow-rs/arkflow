@@ -5,7 +5,7 @@ sidebar_label: NATS
 
 # NATS
 
-The NATS input connects to a NATS server and supports two modes: regular subscriptions (regular) and JetStream pull consumers (jet_stream).
+The NATS input connects to a NATS server and supports two modes: regular subscriptions (regular) and JetStream pull consumers (jet_stream). As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

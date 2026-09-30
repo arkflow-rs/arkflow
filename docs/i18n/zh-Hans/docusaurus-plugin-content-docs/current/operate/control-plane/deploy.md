@@ -66,7 +66,9 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 - **standby** 只服务 `/health`、`/readiness`、`/liveness` 与 metrics 导出;其余 operator 与 agent 路由一律返回 `503 hub_standby`,readiness 报告未就绪并携带角色。请在实例前置负载均衡或 VIP,把流量路由到 `/readiness` 健康的那个后端——Agent 保持单一 `hub_url`,会向当选实例重新注册。
 - 接管时,晋升的 standby 在开始服务前**先从持久库重载控制面视图(作业、版本、checkpoint、操作、rollout)**并清空节点注册表;Agent 通过既有重连循环重新注册。leader 丢失租约(续约失败或存储不可达)时立即让位并停止派发。
 
-运维假设:时钟需 NTP 对齐(TTL 应远大于偏移),故障接管窗口以租约 TTL 加一个探测周期为界(默认约 15s + 5s)。每次接管都可通过围栏 epoch 观测(`/api/v1/system` 报告 `ha.role` 与 `ha.epoch`;readiness 携带相同字段;转换以 `hub.leadership` 事件进入事件流)。leader 丢租约时已在途的写仅受该窗口约束——存储级全量写围栏属于后续 HA 阶段。
+运维假设:时钟需 NTP 对齐(TTL 应远大于偏移),故障接管窗口以租约 TTL 加一个探测周期为界(默认约 15s + 5s)。每次接管都可通过围栏 epoch 观测(`/api/v1/system` 报告 `ha.role` 与 `ha.epoch`;readiness 携带相同字段;转换以 `hub.leadership` 事件进入事件流)。
+
+**存储级写围栏。** 每条控制面写都被包进一个围栏信封:携带持有者的租约 epoch,并在写入实际执行时对照租约行复查。接管推进 epoch 后,旧 leader 仍在途的写不会落库,而是以显式的 `stale leader` 错误被拒绝;operator/agent HTTP 路由把该拒绝呈现为 `503`、problem code 为 `stale_leader`——应向当选 leader 重试。HA 关闭(未设置 `ARKFLOW_HUB_HA_ENABLED`)时写入不加围栏,与单实例模式完全一致。
 
 ### OIDC JWT 联邦
 
@@ -109,6 +111,13 @@ claims 映射到既有 RBAC 模型:`sub` 作为主 id;角色 claim 接受数组�
 自带的 `console/Dockerfile` 构建静态资源并通过 Nginx 提供服务。其 `/api/` 与 `/metrics`
 位置代理到 `arkflow-hub:8080` 服务;请将其部署在带有 TLS 和认证层的私有网络上。
 不要把 API 或携带令牌的控制台直接暴露在公共互联网上。ArkFlow 的默认绑定地址仅限本地。
+
+向镜像构建传入令牌时,请显式使用构建参数——`docker build --build-arg
+VITE_API_TOKEN=... .`——而不要依赖本地 `.env` 文件:`.dockerignore` 排除了
+`.env*`(`.env.example` 除外),凭据文件因此无法进入构建上下文或镜像层。
+由于 Vite 会把 `VITE_API_TOKEN` 内联进公开的 JavaScript bundle,任何能加载
+控制台的人都能提取它;请仅在受信网络使用,生产环境优先采用 OIDC 认证
+(不设置该令牌)。
 
 ## 从以健康检查为中心的控制台迁移
 

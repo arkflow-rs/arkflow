@@ -5,7 +5,7 @@ sidebar_label: MQTT
 
 # MQTT
 
-MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并接收实时消息。
+MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并接收实时消息。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
 
 ## 配置
 

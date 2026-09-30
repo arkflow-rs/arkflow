@@ -5,7 +5,7 @@ sidebar_label: HTTP
 
 # HTTP
 
-HTTP 输入(Input)以 Axum HTTP 服务器的形式运行,接受发送到 `address`+`path` 的 POST 请求。请求体(JSON)会被解码并转发到流处理流水线(Pipeline)。支持可选的 CORS 以及 Basic/Bearer 认证。bind 失败同步可见:监听地址无法绑定(例如端口已被占用)时,`connect` 以显式错误失败而非静默启动;监听器运行期停止时,read 返回断连错误,引擎可重新绑定。
+HTTP 输入(Input)以 Axum HTTP 服务器的形式运行,接受发送到 `address`+`path` 的 POST 请求。请求体(JSON)会被解码并转发到流处理流水线(Pipeline)。支持可选的 CORS 以及 Basic/Bearer 认证。bind 失败同步可见:监听地址无法绑定(例如端口已被占用)时,`connect` 以显式错误失败而非静默启动;监听器运行期停止时,read 返回断连错误,引擎可重新绑定。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
 
 ## 配置
 

@@ -118,9 +118,17 @@ Operational assumptions: clocks must be NTP-aligned (the TTL must dwarf the
 skew), and the failover window is bounded by the lease TTL plus one probe
 (default ≈ 15s + 5s). Fencing epochs make each takeover observable
 (`/api/v1/system` reports `ha.role` and `ha.epoch`; readiness carries the same
-block; transitions appear in the event stream as `hub.leadership`). Writes
-already in flight when a leader loses the lease are fenced only by this
-window — full storage-level write fencing is a later HA stage.
+block; transitions appear in the event stream as `hub.leadership`).
+
+**Storage-level write fencing.** Every control-plane write is wrapped in a
+fencing envelope that carries the holder's lease epoch and re-checks it
+against the lease row when the write executes. When a takeover bumps the
+epoch, writes still in flight from the old leader are rejected with an
+explicit `stale leader` error instead of landing; the operator/agent HTTP
+routes surface that rejection as `503` with problem code `stale_leader` —
+retry against the elected leader. With HA disabled
+(`ARKFLOW_HUB_HA_ENABLED` unset) writes run unfenced, exactly as in
+single-instance mode.
 
 ### OIDC JWT federation
 
@@ -182,6 +190,14 @@ Nginx. Its `/api/` and `/metrics` locations proxy to an `arkflow-hub:8080`
 service; deploy it on a private network with TLS and an authentication layer.
 Do not expose the API or the token-bearing console directly to the public
 internet. The ArkFlow default bind address is local-only.
+
+Pass the token to the image build explicitly as a build argument —
+`docker build --build-arg VITE_API_TOKEN=... .` — never through a local
+`.env` file: `.dockerignore` excludes `.env*` (except `.env.example`) so
+credential files cannot enter the build context or image layers. Because
+Vite inlines `VITE_API_TOKEN` into the public JavaScript bundle, anyone who
+can load the console can extract it; use it only on trusted networks and
+prefer OIDC authentication in production (leave the token unset).
 
 ## Migration from the health-centric console
 

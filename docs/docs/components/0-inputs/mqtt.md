@@ -5,7 +5,7 @@ sidebar_label: MQTT
 
 # MQTT
 
-The MQTT input connects to an MQTT broker, subscribes to one or more topics, and receives real-time messages.
+The MQTT input connects to an MQTT broker, subscribes to one or more topics, and receives real-time messages. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
 
 ## Configuration
 

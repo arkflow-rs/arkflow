@@ -16,7 +16,7 @@ description: ArkFlow 文档页。
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `memory` |
-| capacity | integer | yes | — | 允许累积的最大消息条数。持有量达到该值后,写入会等待(背压),直到读者释放。 |
+| capacity | integer | yes | — | 允许累积的最大消息条数。持有量达到该值后,写入会等待(背压),直到读者释放。必须至少为 1——`0` 会在构建期被拒绝。 |
 | timeout | duration | yes | — | 刷新已累积批次前的最长等待时间,即使尚未达到 `capacity` 也会触发刷新。示例:`1ms`、`1s`、`1m`、`1h`。 |
 
 ## 示例
