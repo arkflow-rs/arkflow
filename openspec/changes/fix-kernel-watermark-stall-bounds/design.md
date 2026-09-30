@@ -32,3 +32,9 @@
 ## Open Questions
 
 无。
+
+## CR 三轮增补（2026-09-29）
+
+- **驱逐结算是三路排空的共享队列**：`pending_eviction_acks` 为 `Arc<Mutex<Vec>>`——离 runtime 路径直接入队；spawned 结算**失败**时回推入队（重试/上报面：`abort_held`、`finish`、`take_held_acknowledgements`），不因 warn 而丢弃。
+- **outstanding 结算上界（默认 1024，测试可注入）**：持续溢出 + 慢 abort 不得无界累积游离任务与滞留 ack；超界时该次观测显式失败（fail-closed）——与驱逐路径已接受的任务失败语义一致。
+- **finish 成功路径排空重试队列**：离 runtime 嵌入者溢出后正常关停也会结算被驱逐 ack。

@@ -35,3 +35,4 @@
 - [x] 6.5 测试缺口：`clamp_forwarded_watermark` 提为具名函数 + 单测（初版零覆盖的核心承诺）；`default_timeout_unfreezes_a_silent_input_only_past_the_threshold` 用真实默认常量钉住 5 分钟阈值的两侧语义
 - [x] 6.6 工件一致性：design 决策 6 改为与实现一致（10s 节流已引入）、新增决策 7（VecDeque）、决策 3 补 B1/B2 修正；`.openspec.yaml` 日期修正
 - [x] 6.7 CR 二轮：修复 6.4 的静默失败（spec 替换锚不匹配未生效——补"驱逐毒化同组兄弟确认"场景与 B2 如实表述，本次以 Edit 精确落地并验证）；`take_held_acknowledgements` 一并排空 `pending_eviction_acks`（离 runtime 嵌入者的 pending abort 不再滞留卡 barrier）；修正驱逐测试的误导注释（held 行不重灌 tracker）；warn 措辞补"同投递内排队兄弟可能立即失败"
+- [x] 6.8 CR 三轮（CodeRabbit 三 Major）：①驱逐 spawn 结算加 outstanding 上界（默认 1024，测试可注入），超界观测显式 fail-closed——持续溢出+慢结算不再无界累积游离任务与滞留 ack；②spawn 结算失败时 ack 回推共享重试队列（abort_held/finish/take 三路排空），不再"警告后丢弃"；③finish 成功路径排空离 runtime 队列的驱逐 ack。三个行为各有测试钉住（fail-closed / 失败保留+重试浮出 / 离 runtime finish 结算）
