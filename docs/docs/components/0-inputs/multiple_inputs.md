@@ -7,6 +7,8 @@ sidebar_label: Multiple Inputs
 
 Multiple Inputs merges several independent input components into a single logical stream. All child inputs are read concurrently, and messages enter the same pipeline in arrival order. Each child input may carry a `name`, which is written to `__meta_source` so downstream stages can distinguish the origin.
 
+Messages are forwarded through a bounded internal channel (capacity 1024, the same bound as the pipeline's inter-stage edges): when the pipeline cannot keep up, the child readers wait on send and the slowdown propagates back to the sources instead of growing memory without limit.
+
 ## Configuration
 
 | Field | Type | Required | Default | Description |
@@ -45,4 +47,6 @@ input:
 ## Notes
 
 - Every non-empty `name` must be unique; duplicates or empty names cause the build to fail.
-- If any child input returns `EOF` or `Disconnection`, that sub-stream ends while the others continue.
+- If any child input returns `EOF`, the whole merged input is treated as end-of-stream (the pipeline finishes normally); a `Disconnection` from any child triggers a reconnect of the whole input — all children are reconnected and their readers restarted.
+- When the engine reconnects this input (after a `Disconnection`), the previous set of child readers is stopped and awaited before a fresh set spawns — a child input is never read by two tasks at once, so reconnects do not duplicate deliveries.
+- A child input error is surfaced to the pipeline once (the reader for that child then exits); retry and reconnect decisions stay with the engine's input error handling.

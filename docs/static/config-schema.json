@@ -1137,6 +1137,7 @@
             },
             "inputs": {
               "type": "array",
+              "minItems": 1,
               "description": "List of input components to combine.",
               "items": {
                 "type": "object",
