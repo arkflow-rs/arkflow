@@ -736,12 +736,17 @@ impl EventTimeGate {
     /// Take ownership of acknowledgements retained by held rows.  Callers
     /// that need to await them should use this synchronous extraction first so
     /// the gate mutex can be released before the futures are polled.
+    /// Eviction acks queued off-runtime (no tokio handle to spawn on) are
+    /// drained with them, so an embedder driving the gate outside a runtime
+    /// cannot strand a pending abort and stall barrier draining forever.
     pub fn take_held_acknowledgements(&mut self) -> Vec<std::sync::Arc<dyn Ack>> {
         self.held_rows = 0;
-        std::mem::take(&mut self.held)
+        let mut acks: Vec<std::sync::Arc<dyn Ack>> = std::mem::take(&mut self.held)
             .into_iter()
             .map(|pending| pending.ack)
-            .collect()
+            .collect();
+        acks.append(&mut self.pending_eviction_acks);
+        acks
     }
 
     /// Compatibility hook for callers of the pre-kernel gate API. Acks now
@@ -2025,10 +2030,11 @@ mod cut_consistency_tests {
         );
         assert_eq!(gate.held_row_totals_for_test(), (1, 1, 1));
 
-        // A later row advances the watermark (held rows drive the tracker
-        // too) past the survivor's window end, releasing the SURVIVOR's row
-        // (2_600); the evicted delivery (2_500) is gone. Raise the cap first
-        // so the advancing row itself is not evicted.
+        // A later row advances the tracker watermark (observe feeds only the
+        // CURRENT batch to the tracker; held rows are not re-fed) past the
+        // survivor's window end, releasing the SURVIVOR's row (2_600); the
+        // evicted delivery (2_500) is gone. Raise the cap first so the
+        // advancing row itself is not evicted.
         gate.set_held_row_cap_for_test(10);
         let released = gate.observe(0, nullable_batch(vec![Some(3_600)])).unwrap();
         assert_eq!(times_of(&released), vec![Some(2_600)]);

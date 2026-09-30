@@ -34,3 +34,4 @@
 - [x] 6.4 B2：spec 场景/docs en/zh/design 的"重启后经 WAL 重放"改为如实表述（重放行落后于已恢复水位、按 late 策略处置，Drop 即丢；abort 波及整投递）；spec 增补"驱逐毒化同组兄弟确认"场景
 - [x] 6.5 测试缺口：`clamp_forwarded_watermark` 提为具名函数 + 单测（初版零覆盖的核心承诺）；`default_timeout_unfreezes_a_silent_input_only_past_the_threshold` 用真实默认常量钉住 5 分钟阈值的两侧语义
 - [x] 6.6 工件一致性：design 决策 6 改为与实现一致（10s 节流已引入）、新增决策 7（VecDeque）、决策 3 补 B1/B2 修正；`.openspec.yaml` 日期修正
+- [x] 6.7 CR 二轮：修复 6.4 的静默失败（spec 替换锚不匹配未生效——补"驱逐毒化同组兄弟确认"场景与 B2 如实表述，本次以 Edit 精确落地并验证）；`take_held_acknowledgements` 一并排空 `pending_eviction_acks`（离 runtime 嵌入者的 pending abort 不再滞留卡 barrier）；修正驱逐测试的误导注释（held 行不重灌 tracker）；warn 措辞补"同投递内排队兄弟可能立即失败"

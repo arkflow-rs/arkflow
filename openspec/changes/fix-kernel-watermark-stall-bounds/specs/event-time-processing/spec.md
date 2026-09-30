@@ -21,12 +21,17 @@
 
 ### Requirement: event-time gate 的持有量 SHALL 有界
 
-event-time gate 因等待 watermark 而持有的行 SHALL 有累计行数上限（默认 1,048,576）：超限时 SHALL 从最旧的持有批开始驱逐，被驱逐行的 ack SHALL 以 abort 结算（不确认、可经 WAL 重放），并 SHALL 以节流日志记录累计驱逐规模。上限未触达时持有语义不变（watermark 推进即释放）。
+event-time gate 因等待 watermark 而持有的行 SHALL 有累计行数上限（默认 1,048,576）：超限时 SHALL 从最旧的持有批开始驱逐并以其 ack 的 abort 结算，节流日志 SHALL 记录累计驱逐规模与后果语义。abort 结算 SHALL 波及该投递的整个 fan-out 组——组内仍被下游持有的兄弟确认在停顿解除（或其在组内排队结算）时 SHALL 失败并按 at-least-once 重启任务（驱逐是防无界增长的最后兜底，接受该 ricochet）；驱逐后重启重放的行 SHALL 落后于已恢复水位并按既有 late 策略处置（Drop 策略即丢弃）。上限未触达时持有语义不变（watermark 推进即释放）。
 
 #### Scenario: 超限驱逐最旧持有
 
 - **WHEN** `held` 累计行数超过上限且 watermark 仍未推进
-- **THEN** 最旧的持有批被移除且其 ack 被 abort，内存占用回落到上限内，节流 warn 记录累计驱逐行数
+- **THEN** 最旧的持有批被移除且其 ack 被 abort（从不确认），内存占用回落到上限内，节流 warn 记录累计驱逐行数与 abort 的波及语义
+
+#### Scenario: 驱逐毒化同组兄弟确认
+
+- **WHEN** 被驱逐批与仍在下游持有的兄弟切片同属一个 fan-out 投递，停顿解除后兄弟尝试确认
+- **THEN** 兄弟确认失败（fan-out 已 abort），投递整体回滚、任务按 at-least-once 重启——该行为被显式接受并有测试钉住
 
 #### Scenario: 未超限时无驱逐
 
