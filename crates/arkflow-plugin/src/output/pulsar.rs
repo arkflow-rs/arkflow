@@ -370,9 +370,10 @@ mod tests {
     fn value_field_rejects_null_rows() {
         // Silently dropping nulls would shift later payloads onto the
         // previous row's topic when topics resolve per message.
-        let error = field_payloads(&utf8_batch(vec![Some("a"), None]), "col")
-            .err()
-            .expect("null rows must be rejected");
+        let error = match field_payloads(&utf8_batch(vec![Some("a"), None]), "col") {
+            Err(error) => error,
+            Ok(_) => panic!("null rows must be rejected"),
+        };
         assert!(error.to_string().contains("null"));
     }
 
@@ -384,9 +385,10 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1i64]))],
         )
         .expect("int batch");
-        let error = field_payloads(&Arc::new(MessageBatch::new_arrow(batch)), "n")
-            .err()
-            .expect("non-string/binary columns must be rejected");
+        let error = match field_payloads(&Arc::new(MessageBatch::new_arrow(batch)), "n") {
+            Err(error) => error,
+            Ok(_) => panic!("non-string/binary columns must be rejected"),
+        };
         assert!(error.to_string().contains("unsupported type"));
     }
 }
