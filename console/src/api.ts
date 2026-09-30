@@ -319,14 +319,20 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       void redirectToOidcLogin()
     }
     const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
-    throw {
-      code: body.code ?? 'request_failed',
-      message: body.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status }),
-      field: body.field,
-      stream_id: body.stream_id,
-      correlation_id: body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
-      status: response.status,
-    } satisfies ApiError
+    throw Object.assign(
+      new Error(
+        body.message ??
+          translate(currentLocale(), 'api.requestFailed', { status: response.status }),
+      ),
+      {
+        code: body.code ?? 'request_failed',
+        field: body.field,
+        stream_id: body.stream_id,
+        correlation_id:
+          body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
+        status: response.status,
+      },
+    )
   }
   return response.status === 204 ? (undefined as T) : ((await response.json()) as T)
 }

@@ -21,7 +21,7 @@ export function convertConfiguration(
   return stringifyYaml(value)
 }
 
-export function Configuration({ onError, nodeId }: { onError: (message: string) => void; nodeId?: string }) {
+export function Configuration({ onError, nodeId, canMutate = true }: { onError: (message: string) => void; nodeId?: string; canMutate?: boolean }) {
   const t = useT()
   const queryClient = useQueryClient()
   const confirm = useConfirm()
@@ -140,6 +140,7 @@ export function Configuration({ onError, nodeId }: { onError: (message: string) 
       toast.success(t('toast.accepted'))
     })
   const rollback = async (id: string) => {
+    if (!canMutate) return
     if (
       !(await confirm({
         title: t('config.confirmRollback', { id }),
