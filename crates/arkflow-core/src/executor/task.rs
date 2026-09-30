@@ -22,6 +22,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tracing::Instrument;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +44,36 @@ const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// collector's final drain flushes downstream, which can block on a full edge
 /// whose consumer already stopped.
 const COLLECTOR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound on one sink write: a hung external system fails the chain (and
+/// thereby unblocks shutdown) instead of parking the loop body forever.
+/// Generous for legitimately slow bulk uploads — this catches dead
+/// connections, not slow ones.
+const SINK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Test override for the sink-write bound (0 = use the default).
+#[cfg(test)]
+static SINK_WRITE_TIMEOUT_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn sink_write_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let override_ms = SINK_WRITE_TIMEOUT_OVERRIDE_MS.load(Ordering::Acquire);
+        if override_ms > 0 {
+            return std::time::Duration::from_millis(override_ms);
+        }
+    }
+    SINK_WRITE_TIMEOUT
+}
+
+/// Shrink the sink-write bound. Test-only.
+#[cfg(test)]
+pub(crate) fn override_sink_write_timeout_for_tests(timeout: std::time::Duration) {
+    SINK_WRITE_TIMEOUT_OVERRIDE_MS.store(
+        timeout.as_millis() as u64,
+        Ordering::Release,
+    );
+}
 
 /// Drive every chain in the graph to completion (cancellation or all-source
 /// end-of-stream). Connects inputs/outputs first and closes them after.
@@ -2729,7 +2761,23 @@ async fn process_chain(
                 .iter()
                 .map(|(batch, _)| batch.clone())
                 .collect::<Vec<_>>();
-            if let Err(error) = sink.write_batch(&output_batches).await {
+            // A hung external sink (dead connection) must not park the
+            // chain forever — this await sits in the loop body where the
+            // cancellation token is not polled, so it also blocks shutdown.
+            // The timeout cancels the write; any partial external effect is
+            // absorbed by at-least-once replay (same treatment as a write
+            // error).
+            let sink_timeout = sink_write_timeout();
+            let write = tokio::time::timeout(
+                sink_timeout,
+                sink.write_batch(&output_batches),
+            )
+            .await
+            .map_err(|_| {
+                Error::Process(format!("sink write timed out after {sink_timeout:?}"))
+            })
+            .and_then(|outcome| outcome);
+            if let Err(error) = write {
                 if let Some(metrics) = metrics {
                     metrics
                         .output_errors

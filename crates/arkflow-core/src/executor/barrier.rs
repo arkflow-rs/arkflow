@@ -7,6 +7,34 @@
 //! data. The [`BarrierCoordinator`] injects barriers on an interval and
 //! completes a checkpoint once every chain reports its snapshot.
 
+/// Bound on one state-backend snapshot join (see `snapshot_state`).
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Test override for the snapshot bound (0 = use the default).
+#[cfg(test)]
+static SNAPSHOT_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn snapshot_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let override_ms = SNAPSHOT_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Acquire);
+        if override_ms > 0 {
+            return std::time::Duration::from_millis(override_ms);
+        }
+    }
+    SNAPSHOT_TIMEOUT
+}
+
+/// Shrink the snapshot bound. Test-only.
+#[cfg(test)]
+pub(crate) fn override_snapshot_timeout_for_tests(timeout: std::time::Duration) {
+    SNAPSHOT_TIMEOUT_OVERRIDE_MS.store(
+        timeout.as_millis() as u64,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 use crate::checkpoint::{CheckpointBarrier, CheckpointCoordinator, TaskCheckpointAck};
 use crate::job::{JobId, JobVersion};
 use crate::state::{StateBackend, StateSnapshot};
@@ -359,6 +387,18 @@ impl BarrierCoordinator {
 /// Snapshot helper shared by chains: capture a state backend snapshot without
 /// blocking the caller's event loop (spawn_blocking-friendly).
 pub async fn snapshot_state(backend: Arc<dyn StateBackend>) -> Result<StateSnapshot, crate::Error> {
-    let handle = tokio::task::spawn_blocking(move || backend.snapshot()).await;
+    // Bounded join: a wedged state backend (e.g. a lock-starved redb)
+    // fails the round explicitly instead of freezing the chain and the
+    // round. The abandoned blocking task is read-only — if it completes
+    // late, its result is simply discarded.
+    let bound = snapshot_timeout();
+    let handle = tokio::time::timeout(
+        bound,
+        tokio::task::spawn_blocking(move || backend.snapshot()),
+    )
+    .await
+    .map_err(|_| {
+        crate::Error::Process(format!("state snapshot timed out after {bound:?}"))
+    })?;
     handle.map_err(|error| crate::Error::Process(format!("state snapshot task failed: {error}")))?
 }

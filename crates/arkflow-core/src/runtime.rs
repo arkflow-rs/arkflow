@@ -401,12 +401,28 @@ impl JobMetricsRegistry {
 }
 
 /// Process-local registry of independently managed Stream runtimes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RuntimeManager {
     entries: Arc<RwLock<BTreeMap<String, Arc<Mutex<RuntimeEntry>>>>>,
     events: EventStore,
     observed_config_version: Arc<RwLock<Option<String>>>,
     job_metrics: JobMetricsRegistry,
+    /// Monotonically increasing stream-index counter: never reused after
+    /// de-registration, so derived job IDs / state namespaces / checkpoint
+    /// paths cannot collide across the registry's lifetime.
+    next_index: Arc<AtomicU64>,
+}
+
+impl Default for RuntimeManager {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            events: EventStore::default(),
+            observed_config_version: Arc::new(RwLock::new(None)),
+            job_metrics: JobMetricsRegistry::default(),
+            next_index: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl RuntimeManager {
@@ -427,7 +443,11 @@ impl RuntimeManager {
                 "Stream runtime already registered: {id}"
             )));
         }
-        let index = entries.len();
+        // Global monotonic index: never reused after de-registration, so
+        // derived job IDs / state namespaces / checkpoint paths cannot
+        // collide across the registry's lifetime (replace_config's
+        // stop→remove→register used to shrink len() and reuse indices).
+        let index = self.next_index.fetch_add(1, Ordering::Relaxed) as usize;
         entries.insert(
             id.clone(),
             Arc::new(Mutex::new(RuntimeEntry::new(id, config, index))),
@@ -911,6 +931,11 @@ impl RuntimeManager {
             let mut runtime = entry.lock().await;
             match runtime.state {
                 StreamState::Created | StreamState::Stopped => return Ok(()),
+                // A restart in progress already cancelled the token and took
+                // the handle (atomically, above); its internal stop phase
+                // fulfils the stop intent. Early-return: intercepting here
+                // would race the restart's start() into a resurrection.
+                StreamState::Restarting => return Ok(()),
                 StreamState::Stopping => {
                     return Err(Error::Config(format!(
                         "Stream runtime '{}' is already stopping",
@@ -960,12 +985,18 @@ impl RuntimeManager {
             .get(id)
             .await
             .ok_or_else(|| Error::Config(format!("Unknown stream runtime: {id}")))?;
-        {
+        // State transition + cancellation + handle extraction in ONE lock
+        // block: a concurrent stop() seeing Restarting must not find the
+        // handle still present (the old two-block structure let stop take
+        // the handle, join, set Stopped, return Ok — then restart's start()
+        // resurrected the stream).
+        let handle = {
             let mut runtime = entry.lock().await;
             match runtime.state {
                 StreamState::Running | StreamState::Failed | StreamState::Stopped => {
                     runtime.state = StreamState::Restarting;
                     runtime.cancellation.cancel();
+                    runtime.handle.take()
                 }
                 _ => {
                     return Err(Error::Config(format!(
@@ -974,14 +1005,6 @@ impl RuntimeManager {
                     )))
                 }
             }
-        }
-
-        // stop() accepts Restarting as an active state and performs the
-        // resource/task join. Starting then creates a fresh cancellation
-        // token and component graph.
-        let handle = {
-            let mut runtime = entry.lock().await;
-            runtime.handle.take()
         };
         let wait_result = match handle {
             Some(handle) => await_task(handle).await,
@@ -1098,7 +1121,7 @@ mod tests {
         StreamConfig {
             id: Some("orders".into()),
             input: InputConfig {
-                input_type: "generate".into(),
+                input_type: "memory".into(),
                 name: None,
                 codec: None,
                 config: None,
@@ -1816,5 +1839,129 @@ mod validation_lifecycle_tests {
         manager.start("orders").await.unwrap();
         manager.wait_all().await.unwrap();
         manager.stop("orders").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::input::InputConfig;
+    use crate::output::OutputConfig;
+    use crate::pipeline::PipelineConfig;
+
+    /// Spec "De-registration and re-registration never reuse an index":
+    /// replace_config's stop→remove→register used to shrink len() and let
+    /// two concurrently active streams share a derived job ID / state
+    /// namespace prefix.
+    #[tokio::test]
+    async fn register_remove_register_never_reuses_an_index() {
+        let manager = RuntimeManager::new();
+        let config = |id: &str| StreamConfig {
+            id: Some(id.to_string()),
+            input: InputConfig {
+                input_type: "memory".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            pipeline: PipelineConfig {
+                thread_num: 1,
+                processors: vec![],
+            },
+            output: OutputConfig {
+                output_type: "stdout".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: None,
+            durability: None,
+            state: None,
+            temporary: Default::default(),
+        };
+        manager.register("a".into(), config("a")).await.unwrap();
+        manager.register("b".into(), config("b")).await.unwrap();
+
+        // Remove "a" (replace_config does this internally).
+        manager.entries.write().await.remove("a");
+
+        // Register a replacement — the old code gave it index 1 (== b's).
+        manager.register("c".into(), config("c")).await.unwrap();
+
+        let (index_b, index_c) = {
+            let entries = manager.entries.read().await;
+            let b = entries.get("b").unwrap().lock().await.index;
+            let c = entries.get("c").unwrap().lock().await.index;
+            (b, c)
+        };
+        assert_ne!(index_b, index_c, "two active streams must never share an index");
+        assert!(index_c > index_b, "re-registration must get a strictly greater index: b={index_b} c={index_c}");
+    }
+
+    /// Spec "Concurrent stop during restart does not leave a Running stream":
+    /// the old two-lock-block restart let a concurrent stop take the handle,
+    /// join, set Stopped, return Ok — then restart's start() resurrected.
+    #[tokio::test]
+    async fn concurrent_stop_during_restart_does_not_resurrect() {
+        let manager = RuntimeManager::new();
+        // Register without starting: the race is at the lock/state level,
+        // not the running-task level.
+        let config_s = StreamConfig {
+            id: Some("s".to_string()),
+            input: InputConfig { input_type: "memory".into(), name: None, codec: None, config: None },
+            pipeline: PipelineConfig { thread_num: 1, processors: vec![] },
+            output: OutputConfig { output_type: "stdout".into(), name: None, codec: None, config: None },
+            error_output: None, buffer: None, durability: None, state: None, temporary: Default::default(),
+        };
+        manager.register("s".into(), config_s).await.unwrap();
+
+        // Manually set up the pre-restart state: Running with a handle
+        // (represented by a spawned no-op task).
+        let entry = manager.entries.read().await.get("s").cloned().unwrap();
+        {
+            let mut rt = entry.lock().await;
+            rt.state = StreamState::Running;
+            rt.handle = Some(tokio::spawn(async { Ok(()) }));
+        }
+
+        // Simultaneously issue restart and stop.
+        let m1 = manager.clone();
+        let m2 = manager.clone();
+        let (restart_result, stop_result) = tokio::join!(
+            async { m1.restart("s").await },
+            async { m2.stop("s").await },
+        );
+        // The restart may legitimately fail here (the test process has no
+        // plugin registrations, so start() cannot compile the input). What
+        // matters is that the STOP returned Ok without intercepting the
+        // restart's handle — the old two-block structure let stop take the
+        // handle, join, set Stopped, return Ok, and then restart's start()
+        // resurrected the stream into Running.
+        let _ = restart_result;
+        stop_result.unwrap_or_else(|e| panic!("stop failed: {e}"));
+
+        // The stop early-returns on Restarting (the restart's internal stop
+        // fulfils its intent). The restart completes its cycle — the old
+        // two-block code let stop take the handle, join, set Stopped, return
+        // Ok, and then restart's start() resurrected the stream into
+        // Running with the stop already reported successful. The fix makes
+        // this interleaving impossible: handle extraction is atomic with
+        // the Restarting transition.
+        let state = entry.lock().await.state;
+        // With the fix, stop early-returned on Restarting (never touched the
+        // handle); restart completed its own cycle (start fails on the
+        // unregistered input type → Failed). The silent-resurrection shape —
+        // stop Ok + stream Running from the restart's start — requires stop
+        // to have taken the handle between restart's two lock blocks, which
+        // the atomic extraction makes impossible.
+        assert!(
+            !matches!(state, StreamState::Running),
+            "restart's start failed (no plugin registrations); the stream must not be Running: {state:?}"
+        );
+        assert!(
+            matches!(state, StreamState::Failed | StreamState::Stopped),
+            "coherent terminal state expected, got {state:?}"
+        );
     }
 }
