@@ -5,7 +5,7 @@ sidebar_label: Pulsar
 
 # Pulsar
 
-Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscription)类型——exclusive / shared / failover / key_shared——并可选支持 Token 或 OAuth2 认证。
+Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscription)类型——exclusive / shared / failover / key_shared——并可选支持 Token 或 OAuth2 认证。新建订阅从最早的消息开始消费(既有积压会被读取,与 Kafka 输入的默认语义一致);即使 broker 停止投递新消息,消息确认(ack)也能在有界时间内完成。
 
 ## 配置
 

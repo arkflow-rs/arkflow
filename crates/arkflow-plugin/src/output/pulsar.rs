@@ -29,9 +29,15 @@ use arkflow_core::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::error;
+use tokio::sync::{Mutex, RwLock};
+
+/// How long a single message may wait for its broker receipt. The pulsar
+/// client reconnects internally and keeps receipts pending when the broker
+/// is unreachable, so an unbounded wait would hang `write` forever on
+/// broker loss instead of surfacing an error.
+const WRITE_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pulsar output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +59,13 @@ pub struct PulsarOutputConfig {
 pub struct PulsarOutput {
     config: PulsarOutputConfig,
     client: Arc<RwLock<Option<PulsarClient>>>,
-    producer: Arc<RwLock<Option<PulsarProducer>>>,
+    /// Producers are topic-bound at build time in pulsar 6.x (a build
+    /// without a topic fails with "topic not set"), and the topic is an
+    /// expression that can change per batch — so build one producer per
+    /// topic on first use and reuse it. Each producer gets its own lock:
+    /// the map lock only guards get-or-build, so one stalled topic's
+    /// bounded receipt wait cannot block sends to healthy topics.
+    producers: Arc<Mutex<HashMap<String, Arc<Mutex<PulsarProducer>>>>>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -63,9 +75,64 @@ impl PulsarOutput {
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
-            producer: Arc::new(RwLock::new(None)),
+            producers: Arc::new(Mutex::new(HashMap::new())),
             codec,
         })
+    }
+
+    /// Fetch (or build) the producer for a topic and send one payload,
+    /// awaiting the broker receipt before returning.
+    async fn send_to_topic(
+        &self,
+        client: &PulsarClient,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), Error> {
+        let producer = {
+            let mut producers = self.producers.lock().await;
+            match producers.get(topic) {
+                Some(producer) => Arc::clone(producer),
+                None => {
+                    let producer = client
+                        .producer()
+                        .with_topic(topic)
+                        .build()
+                        .await
+                        .map_err(|e| {
+                            Error::Connection(format!(
+                                "Failed to create Pulsar producer for topic {topic}: {e}"
+                            ))
+                        })?;
+                    let producer = Arc::new(Mutex::new(producer));
+                    producers.insert(topic.to_string(), Arc::clone(&producer));
+                    producer
+                }
+            }
+        };
+
+        let mut producer = producer.lock().await;
+
+        // `send_non_blocking` only enqueues; the returned future resolves
+        // with the broker receipt. Awaiting it is what makes write reliable
+        // — fire-and-forget would report success for messages the broker
+        // never accepted. The wait is bounded so a lost broker surfaces as
+        // an error instead of an indefinite hang (the client itself keeps
+        // reconnecting and never fails the pending receipt).
+        let receipt = producer
+            .send_non_blocking(payload)
+            .await
+            .map_err(|e| Error::Process(format!("Failed to send to Pulsar topic {topic}: {e}")))?;
+        tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, receipt)
+            .await
+            .map_err(|_| {
+                Error::Connection(format!(
+                    "Timed out waiting for Pulsar receipt on topic {topic}"
+                ))
+            })?
+            .map_err(|e| {
+                Error::Process(format!("Pulsar broker rejected message on topic {topic}: {e}"))
+            })?;
+        Ok(())
     }
 }
 
@@ -103,56 +170,64 @@ impl Output for PulsarOutput {
         let mut client_guard = self.client.write().await;
         *client_guard = Some(client.clone());
 
-        // Create single producer
-        let producer = client
-            .producer()
-            .build()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to create producer: {}", e)))?;
-
-        let mut producer_guard = self.producer.write().await;
-        *producer_guard = Some(producer);
+        // Producers are built lazily per topic on first write; drop any
+        // producers left over from a previous connection.
+        self.producers.lock().await.clear();
 
         Ok(())
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         // Check client connection
-        let client_guard = self.client.read().await;
-        let _client = client_guard
-            .as_ref()
-            .ok_or_else(|| Error::Connection("Pulsar client not connected".to_string()))?;
+        let client = {
+            let client_guard = self.client.read().await;
+            client_guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::Connection("Pulsar client not connected".to_string()))?
+        };
 
-        // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
-        if payloads.is_empty() {
+        // Payload selection: an explicit `value_field` takes the named
+        // column's value per row (binary or string), otherwise the codec
+        // (or the default binary-field) encoding applies.
+        let owned_payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            field_payloads(&msg, field)?
+        } else {
+            let payloads =
+                crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+            payloads.into_iter().map(|p| p.to_vec()).collect()
+        };
+        if owned_payloads.is_empty() {
             return Ok(());
         }
 
-        // Clone payloads to avoid lifetime issues
-        let owned_payloads: Vec<Vec<u8>> = payloads.into_iter().map(|p| p.to_vec()).collect();
+        // Resolve the topic per message, matching the kafka output's
+        // expression semantics: a scalar sends every message to the same
+        // topic, a vector is indexed per message.
+        let topics = self.config.topic.evaluate_expr(&msg).await?;
+        for (index, payload) in owned_payloads.into_iter().enumerate() {
+            let topic = match &topics {
+                crate::expr::EvaluateResult::Scalar(topic) => topic.clone(),
+                crate::expr::EvaluateResult::Vec(topics_vec) => topics_vec
+                    .get(index)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "pulsar topic expression resolved to {} topics for {} messages",
+                            topics_vec.len(),
+                            index + 1
+                        ))
+                    })?
+                    .clone(),
+            };
+            self.send_to_topic(&client, &topic, payload).await?;
+        }
 
-        // Get topics for each message
-        let topics_result = self.config.topic.evaluate_expr(&msg).await?;
-        let topics: Vec<String> = match topics_result {
-            crate::expr::EvaluateResult::Scalar(topic) => vec![topic],
-            crate::expr::EvaluateResult::Vec(topics_vec) => topics_vec,
-        };
-
-        // Use single producer
-        let mut producer_guard = self.producer.write().await;
-        let producer = producer_guard
-            .as_mut()
-            .ok_or_else(|| Error::Connection("Pulsar producer not initialized".to_string()))?;
-
-        self.send_messages_individually(producer, &topics, &owned_payloads)
-            .await
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
-        // Close producer if active
-        let mut producer_guard = self.producer.write().await;
-        *producer_guard = None;
+        // Close producers if active
+        self.producers.lock().await.clear();
 
         // Close Pulsar client
         let mut client_guard = self.client.write().await;
@@ -164,30 +239,54 @@ impl Output for PulsarOutput {
     }
 }
 
-impl PulsarOutput {
-    async fn send_messages_individually(
-        &self,
-        producer: &mut PulsarProducer,
-        _topics: &[String],
-        payloads: &[Vec<u8>],
-    ) -> Result<(), Error> {
-        for (index, payload) in payloads.iter().enumerate() {
-            // Send message to Pulsar without retry
-            match producer.send_non_blocking(payload.clone()).await {
-                Ok(_) => {
-                    tracing::debug!("Successfully sent message {} to Pulsar", index);
-                }
-                Err(e) => {
-                    error!("Failed to send message {} to Pulsar: {}", index, e);
-                    return Err(Error::Process(format!(
-                        "Failed to send message to Pulsar: {}",
-                        e
-                    )));
-                }
-            }
-        }
+/// One payload per row, taken from the named column. Binary columns are
+/// sent verbatim, string columns as their UTF-8 bytes; anything else fails
+/// closed rather than guessing a serialization.
+fn field_payloads(msg: &MessageBatchRef, field: &str) -> Result<Vec<Vec<u8>>, Error> {
+    use datafusion::arrow::array::{
+        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
+    };
+    use datafusion::arrow::datatypes::DataType;
 
-        Ok(())
+    let column = msg.column_by_name(field).ok_or_else(|| {
+        Error::Config(format!("pulsar value_field '{field}' not found in the batch"))
+    })?;
+    match column.data_type() {
+        DataType::Binary => Ok(column
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("checked binary column")
+            .iter()
+            .flatten()
+            .map(<[u8]>::to_vec)
+            .collect()),
+        DataType::LargeBinary => Ok(column
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("checked large binary column")
+            .iter()
+            .flatten()
+            .map(<[u8]>::to_vec)
+            .collect()),
+        DataType::Utf8 => Ok(column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("checked utf8 column")
+            .iter()
+            .flatten()
+            .map(|s| s.as_bytes().to_vec())
+            .collect()),
+        DataType::LargeUtf8 => Ok(column
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("checked large utf8 column")
+            .iter()
+            .flatten()
+            .map(|s| s.as_bytes().to_vec())
+            .collect()),
+        other => Err(Error::Config(format!(
+            "pulsar value_field '{field}' has unsupported type {other} (use a binary or string column)"
+        ))),
     }
 }
 
