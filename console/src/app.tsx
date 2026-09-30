@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { AppErrorBoundary } from './error-boundary'
 import {
   BrowserRouter,
   Navigate,
@@ -78,11 +79,13 @@ function AppProviders({ children }: { children: ReactNode }) {
 
 export function App() {
   return (
-    <AppProviders>
+    <AppErrorBoundary>
+      <AppProviders>
       <ConfirmProvider>
         <ConsoleShell />
       </ConfirmProvider>
     </AppProviders>
+    </AppErrorBoundary>
   )
 }
 
@@ -281,7 +284,7 @@ function ConsoleShell() {
           <Route path="/jobs" element={<Jobs onError={setError} canMutate={canMutate} />} />
           <Route
             path="/configuration"
-            element={<Configuration onError={setError} nodeId={selectedNode || undefined} />}
+            element={<Configuration onError={setError} nodeId={selectedNode || undefined} canMutate={canMutate} />}
           />
           <Route path="/rollouts" element={<Rollouts onError={setError} />} />
           <Route path="/components" element={<Components onError={setError} />} />
